@@ -669,7 +669,15 @@ fn an_interrupted_reduction_keeps_the_original() {
     let started = Instant::now();
     let report = thread::scope(|scope| {
         scope.spawn(|| {
-            thread::sleep(Duration::from_millis(500));
+            // Interrupt once `tmin` has written its output, not after a fixed delay: a slow
+            // runner can take longer than any fixed delay to start the script.
+            let output = fake.out(TMIN_DIR).join("minimized-from-00");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read(&output).is_ok_and(|bytes| bytes == b"good")
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
             interrupt.store(true, Ordering::SeqCst);
         });
         fake.run_with(
@@ -850,7 +858,10 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
         (
             full.replace("race_fixtures", "header_pursuit"),
             "unknown simulation fuzz target `header_pursuit`; expected one of \
-             discovery_wait_complete, header_sync_storage, race_fixtures",
+             block_decoded_retention, block_reactor_policy, block_work_funding, \
+             block_work_ownership, discovery_record_book, discovery_session_installation, \
+             discovery_verification_capacity, discovery_wait_complete, header_publisher_policy, \
+             header_reactor_policy, header_sync_storage, race_fixtures",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (

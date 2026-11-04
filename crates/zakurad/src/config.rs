@@ -104,6 +104,16 @@ impl ZakuradConfig {
         state_config.enable_zakura_header_seed_from_committed_blocks = self.network.v2_p2p();
         state_config.checkpoint_sync = self.consensus.checkpoint_sync;
         state_config.vct_fast_sync = self.consensus.vct_fast_sync_enabled();
+        // An unset read result limit serves every inbound peer's largest block request,
+        // up to its own 8 GiB ceiling. The peer memory budget funds QUIC windows, so a
+        // larger budget does not raise this limit.
+        state_config.read_result_byte_limit =
+            Some(state_config.read_result_byte_limit.unwrap_or_else(|| {
+                zakura_state::Config::read_result_byte_limit_for_peers(
+                    self.network.peerset_inbound_connection_limit(),
+                    zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES,
+                )
+            }));
         state_config
     }
 

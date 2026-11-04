@@ -293,6 +293,7 @@ impl DiskWriteBatch {
     ) -> Result<(), ValidateContextError> {
         let block_value_pool_change = finalized
             .block
+            .view()
             .chain_value_pool_change(
                 &db.network(),
                 &utxos_spent_by_block,
@@ -345,25 +346,26 @@ impl DiskWriteBatch {
         // amortize the fork-join cost; small blocks sum sequentially (see
         // PARALLEL_BLOCK_TX_THRESHOLD).
         let block_size = {
-            let transactions = &finalized.block.transactions;
+            let block_view = finalized.block.view();
+            let transaction_count = block_view.transactions().len();
             let transactions_size: usize =
-                if transactions.len() >= super::PARALLEL_BLOCK_TX_THRESHOLD {
+                if transaction_count >= super::PARALLEL_BLOCK_TX_THRESHOLD {
                     use rayon::prelude::*;
-                    transactions
-                        .par_iter()
+                    block_view
+                        .parallel_transactions()
                         .map(|transaction| transaction.zcash_serialized_size())
                         .sum()
                 } else {
-                    transactions
-                        .iter()
+                    block_view
+                        .transactions()
                         .map(|transaction| transaction.zcash_serialized_size())
                         .sum()
                 };
-            let tx_count_size = CompactSizeMessage::try_from(transactions.len())
+            let tx_count_size = CompactSizeMessage::try_from(transaction_count)
                 .expect("block must have a valid transaction count")
                 .zcash_serialized_size();
 
-            finalized.block.header.zcash_serialized_size() + tx_count_size + transactions_size
+            finalized.block.header().zcash_serialized_size() + tx_count_size + transactions_size
         };
 
         let _ = db.block_info_cf().with_batch_for_writing(self).zs_insert(

@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-10-23. Version 0.14.
+Status: draft for review, 2026-11-02. Version 0.15.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -30,7 +30,9 @@ factory and the endpoint inputs, so a simulation can replay a handshake byte
 for byte. It changes API-2, TLS-9 and ADM-10, and adds a §16 row; §17j lists
 each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
 come from the runtime a simulation controls; §17k explains it. Version 0.14
-adds the §16 row for byte-identical replay; §17l explains it.
+adds the §16 row for byte-identical replay; §17l explains it. Version 0.15
+adds API-10, credit holds, and lets CTRL-6 sit below CTRL-5; §17m lists each
+change.
 
 ## 0. Conventions
 
@@ -574,7 +576,7 @@ Rules for every key:
 | CTRL-3 | `congestion_controller` | enum `cubic` \| `new_reno` | `cubic` | — | `congestion_controller_factory` | MUST be set explicitly, even for the default. Changing the default needs the PLAN step 12 fleet A/B and a spec change. The driver wraps the factory per connection to observe the controller (OBS-12). |
 | CTRL-4 | `initial_window_bytes` | optional u64 | unset (`quinn-proto` default for the controller) | 14,720 – 16 MiB | `{Cubic,NewReno}Config::initial_window` | |
 | CTRL-5 | `stream_receive_window_bytes` | u32 | 16 MiB | 64 KiB – 256 MiB | `stream_receive_window` | The Iroh backend's constant |
-| CTRL-6 | `receive_window_bytes` | u32 | 32 MiB | ≥ CTRL-5, ≤ 1 GiB | `receive_window` | The Iroh backend's constant |
+| CTRL-6 | `receive_window_bytes` | u32 | 32 MiB | 64 KiB – 1 GiB | `receive_window` | The Iroh backend's constant; the window each connection starts with, which may be below CTRL-5 |
 | CTRL-7 | `send_window_bytes` | u64 | 32 MiB | 64 KiB – 1 GiB | `send_window` | The Iroh backend's constant |
 | CTRL-9 | `ack_frequency` | bool | `false` | — | `ack_frequency_config` | Sends ACK_FREQUENCY frames when `true` (WIRE-9) |
 | CTRL-10 | `idle_timeout_secs` | u32 | 150 | 30 – 600 | `max_idle_timeout` | The Iroh backend's constant. MUST exceed `keep_alive_interval_secs` × 3. |
@@ -595,24 +597,29 @@ These keys stay in `[network.zakura]` and keep their meaning:
 `listen_addr`, `max_connections` (92), `max_connections_per_ip` (16),
 `max_pending_handshakes` (32), `stream_open_rate_per_second`,
 `message_rate_per_second` and the handshake's `max_open_streams`.
-`peer_memory_budget_bytes` (8 GiB) joins them under CTRL-26.
+`peer_memory_budget_bytes` (15 GiB) joins them under CTRL-26.
 
-- **CTRL-26.** One live QUIC connection can make the node hold
+- **CTRL-26.** A QUIC connection in its handshake can make the node hold
   `receive_window_bytes + send_window_bytes` of flow-control credit, 64 MiB
-  at the defaults, whether or not the application reads. Per-stream receive
+  at the defaults, whether or not the application reads. Once the connection
+  negotiates its streams, the application raises its receive window once
+  (API-9) by the receive share of each stream kind it negotiated, so an
+  admitted connection holds that window plus `send_window_bytes`:
+  141,937,353 B at the defaults on Mainnet and Testnet. Per-stream receive
   windows sit inside the connection window and add nothing.
-  `zakura_quic::connection_memory_bytes` is the only implementation of this
-  formula. Queued datagrams are bounded per socket instead: each bound socket
+  `zakura_quic::connection_memory_bytes` is the only implementation of the
+  handshake cost, and `ConnectionMemory` in `zakura-network` of the admitted
+  cost. Queued datagrams are bounded per socket instead: each bound socket
   queues at most `SOCKET_DATAGRAM_QUEUE_BYTES` (256 MiB, DRV-3) however many
   connections it serves, closed ones included, and connection tasks drain it
   whether or not the application reads. A closed connection holds no stream
-  data once ADM-13 releases it. The node reserves one socket queue per bound
-  socket from `[network.zakura] peer_memory_budget_bytes`, and the rest
-  divided by the per-connection cost is the number of live connections it
-  funds, 124 at the defaults, which bind one socket. `max_pending_handshakes`
-  of them are headroom for handshakes not yet admitted and extra address
-  attempts of one dial, and the node admits the rest, 92 at the defaults.
-  ADM-12 holds the transport to the admitted cap plus that headroom, so every
+  data once ADM-13 releases it. The node reserves, from `[network.zakura]
+  peer_memory_budget_bytes`, one socket queue per bound socket and
+  `max_pending_handshakes` connections at the handshake cost. The rest
+  divided by the admitted connection's cost is the number of connections it
+  admits, 96 at the defaults, which bind one socket, so the default
+  `max_connections` of 92 is funded. ADM-12 holds the transport to the
+  admitted cap plus the handshake headroom, so every
   live connection the node holds is funded. Startup lowers a larger
   `max_connections` to the admitted count with a warning. It fails, naming
   `peer_memory_budget_bytes`, when the budget admits fewer than 16
@@ -622,8 +629,8 @@ These keys stay in `[network.zakura]` and keep their meaning:
   as at any cap. A smaller `max_connections` lowers that floor to match.
   Config load can't see the node key yet, so it counts one bootstrap identity
   fewer in case one is this node's own, and the endpoint applies the exact
-  floor. The budget never shrinks the windows, so it costs no per-connection
-  throughput.
+  floor. The budget never shrinks the windows or the shares, so it costs no
+  per-connection throughput.
 
   The budget counts flow-control credit and the socket datagram queues, not
   resident memory. Connection and stream bookkeeping, including that of the
@@ -804,7 +811,8 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   - `SendStream`: `write_all`, `write_chunk` (no copy), `set_priority`,
     `finish` and `reset`. `set_priority` maps to `quinn-proto`'s stream
     priority (higher first) and is ordered with the stream's writes;
-  - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end` and `stop`.
+  - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end`, `stop`
+    and `hold_credit` (API-10).
   The crate defines `WriteError`, `ReadError`, `ReadExactError`,
   `ReadToEndError` and `ClosedStream`. It re-exports `quinn-proto`'s `VarInt`,
   `ConnectionError`, `ConnectionStats`, `PathStats`, `UdpStats` and
@@ -854,6 +862,20 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     buffers nor a runtime per-stream receive window. The receive windows bound
     both: a peer holds at most `receive_window` of unread data per connection,
     and CTRL-26 bounds the sum across admitted connections.
+- **API-10.** Credit holds. `RecvStream::hold_credit(bytes)` returns a
+  `CreditHold` for bytes the application has read but still keeps. The
+  connection task subtracts every live hold from the receive window, so
+  unread bytes plus held bytes stay within the window `set_limits` gave.
+  - The hold travels with the stream's next command (read, stop or drop), so
+    the task applies it in order with the reads it covers. Read-ahead lets
+    a hold reach the task after its bytes were read, which can over-grant by
+    at most the stream's read-ahead (4 KiB) per stream.
+  - Dropping a `CreditHold` adds its bytes to a per-connection counter and
+    wakes the task only when the counter leaves zero. The task grows the
+    window by the released total once per drive loop.
+  - A shrink below the bytes already granted becomes `quinn-proto` debt that
+    later reads repay first, so the peer never gains credit while a hold
+    covers it.
 
 ## 13. Compatibility
 
@@ -980,6 +1002,7 @@ this release tolerates, and keep each hard change explicit.
 | GRO segments don't share an allocation | DRV-3 |
 | A stopped stream returns its credit; a cancelled `accept_bi` hands its stream to the next call | DRV-9, DRV-10 |
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
+| A shrink below granted credit becomes debt that reads repay before a new grant (pins `quinn-proto`); a greedy sender's delivered minus released bytes never exceed the window under random holds, reads and releases; releasing a hold unblocks a sender stuck on `DATA_BLOCKED` | API-10 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
 | `Acceptor::handle` runs while the attempt still counts as pending | ADM-7 |
 | Peers that fill a stream, get rejected and reconnect stay within the inbound cap and the closing allowance, and every slot frees once they stop | ADM-12, ADM-13 |
@@ -1298,3 +1321,26 @@ Changed:
   replay byte for byte, in one process and across processes, and that each
   seeded input, the seed and the UTC origin change the bytes while host time
   doesn't.
+
+## 17m. Changes in version 0.15
+
+The application keeps some frames after it reads them. Credit holds count
+those bytes against the receive window, so one window bounds unread and kept
+bytes together.
+
+Added:
+
+- **API-10.** `RecvStream::hold_credit` and `CreditHold`.
+- **§16.** Adds the credit-hold tests.
+
+Changed:
+
+- **API-5.** Lists `hold_credit`.
+- **CTRL-6.** The range is 64 KiB – 1 GiB. The rule that the connection
+  window is at least CTRL-5 is gone: a connection starts with its handshake
+  window, and the application raises it once it knows which streams the
+  connection carries.
+- **CTRL-26.** The budget charges an admitted connection its raised window,
+  the handshake window plus its negotiated streams' receive shares, and a
+  connection in its handshake only the handshake and send windows. The
+  default budget is 15 GiB.

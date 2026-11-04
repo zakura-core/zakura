@@ -4,6 +4,7 @@ use std::{
     fmt,
     fs::{self, canonicalize, remove_dir_all, DirEntry, ReadDir},
     io::ErrorKind,
+    num::{NonZeroU16, NonZeroU64},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -16,7 +17,7 @@ use serde::{
 use tokio::task::{spawn_blocking, JoinHandle};
 use tracing::Span;
 
-use zakura_chain::{common::default_cache_dir, parameters::Network};
+use zakura_chain::{block::MAX_BLOCK_BYTES, common::default_cache_dir, parameters::Network};
 
 use crate::{
     constants::{
@@ -31,6 +32,37 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// Maximum decoded bytes retained by disk-read blocks, transactions, headers, and
+    /// serialized blocks until each result's final holder drops it.
+    ///
+    /// Database clones share this limit. A read reserves an upper bound before it reads
+    /// its result, then settles to the measured bytes. Exhaustion returns a capacity
+    /// error. One reader can exceed this limit by one result when no other result is
+    /// retained, so one legal block always remains readable. This limit excludes the
+    /// transient parser memory that [`Self::read_concurrency_limit`] bounds, and all
+    /// disk usage.
+    ///
+    /// When unset, `zakurad` derives the limit from its inbound peer limit and its peer
+    /// memory budget with [`Self::read_result_byte_limit_for_peers`]. Other database
+    /// users assume [`DEFAULT_READ_RESULT_PEERS`] peers and
+    /// [`DEFAULT_READ_RESULT_CEILING_BYTES`].
+    pub read_result_byte_limit: Option<NonZeroU64>,
+
+    /// Maximum blocking data-read jobs admitted by one database instance.
+    ///
+    /// The default is 64. Cloned read services share this limit. Excess reads wait
+    /// asynchronously before entering Tokio's blocking queue. Cancelling a caller
+    /// does not release a slot while its admitted job still runs. `zakurad` adds
+    /// [`Self::read_worker_count`] blocking threads to Tokio's default pool, so
+    /// admitted reads never take threads from other blocking work.
+    ///
+    /// This limit covers read-service jobs, including owned block-range reads and
+    /// retained header-path acquisition. A separate fixed pool admits bounded
+    /// chain-tip and depth queries. Each job parses one result at a time, so this limit
+    /// also bounds transient parser memory. It does not bound returned payloads,
+    /// startup migrations, offline tools, or the writer thread.
+    pub read_concurrency_limit: NonZeroU16,
+
     /// The root directory for storing cached block data.
     ///
     /// If you change this directory, you might also want to change `network.cache_dir`.
@@ -463,9 +495,134 @@ impl Default for PruningConfig {
     }
 }
 
+/// The largest serialized block a reader can load, as bytes of parser memory.
+const MAX_BLOCK_PARSER_BYTES: u64 = 2 * MAX_BLOCK_BYTES;
+
+/// Decoded memory per serialized byte in a legal block, rounded up.
+///
+/// Small transactions have the largest ratio. Consensus requires an input and an
+/// output, which take about 60 wire bytes and a few hundred decoded bytes.
+pub(crate) const MAX_DECODED_BYTES_PER_WIRE_BYTE: u64 = 12;
+
+/// The decoded memory of one maximum-size block.
+const MAX_DECODED_BLOCK_BYTES: u64 = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+
+/// Inbound peers that [`Config::read_result_byte_limit`] serves when no peer limit is known:
+/// `zakura-network`'s default inbound limit, 100 initial target peers × 3.
+pub const DEFAULT_READ_RESULT_PEERS: usize = 300;
+
+/// The ceiling on the derived retained read limit: 8 GiB, the 2026-11-02 choice. The
+/// honest derivation for 300 peers is about 115 GB, which would never bind. It stays
+/// fixed, so raising `zakura-network`'s peer memory budget does not raise it.
+pub const DEFAULT_READ_RESULT_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Blocks one peer request can hold as read results: `zakurad`'s legacy
+/// `GETDATA_MAX_BLOCK_COUNT`, the largest per-peer block request the state serves.
+pub const READ_RESULT_BLOCKS_PER_PEER: u64 = 16;
+
+/// Why a configuration cannot fund its read workers and one legal result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReadCapacityError {
+    /// The retained limit cannot hold one decoded maximum-size block.
+    #[error("read_result_byte_limit {limit} is below the {required} bytes of one block")]
+    ResultLimitTooSmall {
+        /// Configured limit.
+        limit: u64,
+        /// Bytes of one decoded maximum-size block.
+        required: u64,
+    },
+    /// The sum of the partitions does not fit a byte count.
+    #[error("read capacity partitions overflow")]
+    Overflow,
+}
+
+impl Config {
+    /// The retained read limit for `inbound_peers` peers, clamped to `ceiling_bytes`.
+    ///
+    /// The derivation serves each peer's largest block request:
+    /// [`READ_RESULT_BLOCKS_PER_PEER`] decoded maximum-size blocks. With 300 peers this
+    /// is 300 × 16 × 24 MB = 115.2 GB. The decoded bound is 12 times the 2 MB serialized
+    /// size, so typical blocks retain far less.
+    ///
+    /// The derived bound exceeds the memory a node can spend on peers, so the limit is
+    /// clamped to the peer memory budget, 8 GiB by default. A refusal under the clamp is
+    /// a retryable capacity error: legacy `getdata` answers it with `notfound`, and no
+    /// path treats it as an invalid block or transaction. The clamp never goes below one
+    /// decoded maximum-size block, so one legal block always remains readable. A per-peer
+    /// memory budget will replace this derivation.
+    pub fn read_result_byte_limit_for_peers(
+        inbound_peers: usize,
+        ceiling_bytes: u64,
+    ) -> NonZeroU64 {
+        let peers = u64::try_from(inbound_peers).unwrap_or(u64::MAX).max(1);
+        let derived = peers
+            .saturating_mul(READ_RESULT_BLOCKS_PER_PEER)
+            .saturating_mul(MAX_DECODED_BLOCK_BYTES);
+        NonZeroU64::new(derived.min(ceiling_bytes.max(MAX_DECODED_BLOCK_BYTES)))
+            .expect("a decoded maximum-size block has a nonzero size")
+    }
+
+    /// The configured retained read limit, or the limit for [`DEFAULT_READ_RESULT_PEERS`]
+    /// clamped to [`DEFAULT_READ_RESULT_CEILING_BYTES`].
+    pub fn read_result_byte_limit(&self) -> NonZeroU64 {
+        self.read_result_byte_limit.unwrap_or_else(|| {
+            Self::read_result_byte_limit_for_peers(
+                DEFAULT_READ_RESULT_PEERS,
+                DEFAULT_READ_RESULT_CEILING_BYTES,
+            )
+        })
+    }
+
+    /// Blocking jobs one database admits at once: its data workers plus its control
+    /// workers. The runtime must reserve this many blocking threads beyond those that
+    /// other blocking work uses, or admitted jobs queue inside Tokio.
+    pub fn read_worker_count(&self) -> usize {
+        usize::from(self.read_concurrency_limit.get()) + crate::constants::CONTROL_READ_CONCURRENCY
+    }
+
+    /// Check that the read limits fund their workers and one legal result, then
+    /// return the bytes that bound read memory. Opening a database requires this check.
+    ///
+    /// Each partition in the sum has its own owner. Durable disk limits are not part of it.
+    pub fn read_memory_bound(&self) -> Result<u64, ReadCapacityError> {
+        let workers =
+            u64::try_from(self.read_worker_count()).map_err(|_| ReadCapacityError::Overflow)?;
+
+        let result_bytes = self.read_result_byte_limit().get();
+        if result_bytes < MAX_DECODED_BLOCK_BYTES {
+            return Err(ReadCapacityError::ResultLimitTooSmall {
+                limit: result_bytes,
+                required: MAX_DECODED_BLOCK_BYTES,
+            });
+        }
+
+        // A worker parses one block at a time: its raw rows and its decoded result.
+        let parser_bytes = workers
+            .checked_mul(MAX_BLOCK_PARSER_BYTES + MAX_DECODED_BLOCK_BYTES)
+            .ok_or(ReadCapacityError::Overflow)?;
+        let chain_tip_bytes = crate::constants::CHAIN_TIP_BLOCK_RETENTION
+            .checked_mul(MAX_DECODED_BLOCK_BYTES + MAX_BLOCK_PARSER_BYTES)
+            .ok_or(ReadCapacityError::Overflow)?;
+
+        [
+            // Retained results, under one shared budget.
+            result_bytes,
+            // Active parsers, which each worker bounds to one block at a time.
+            parser_bytes,
+            // Chain-tip blocks in their fixed count partition, including their parsers.
+            chain_tip_bytes,
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or(ReadCapacityError::Overflow)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
+            read_result_byte_limit: None,
+            read_concurrency_limit: NonZeroU16::new(64).expect("the default limit is nonzero"),
             cache_dir: default_cache_dir(),
             ephemeral: false,
             should_backup_non_finalized_state: true,
@@ -486,6 +643,113 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_read_memory_bound_sums_every_partition() {
+        let decoded_block = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+        assert_eq!(
+            Config::default().read_memory_bound(),
+            Ok(DEFAULT_READ_RESULT_CEILING_BYTES
+                + 68 * (MAX_BLOCK_PARSER_BYTES + decoded_block)
+                + crate::constants::CHAIN_TIP_BLOCK_RETENTION
+                    * (decoded_block + MAX_BLOCK_PARSER_BYTES))
+        );
+    }
+
+    #[test]
+    fn read_result_limit_serves_every_peer_request() {
+        let decoded_block = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(1000, u64::MAX).get(),
+            1000 * READ_RESULT_BLOCKS_PER_PEER * decoded_block
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(0, u64::MAX).get(),
+            READ_RESULT_BLOCKS_PER_PEER * decoded_block,
+            "a node without inbound peers can still serve one request"
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(
+                DEFAULT_READ_RESULT_PEERS,
+                DEFAULT_READ_RESULT_CEILING_BYTES
+            )
+            .get(),
+            DEFAULT_READ_RESULT_CEILING_BYTES,
+            "the peer memory budget clamps the 115.2 GB derivation"
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(1, DEFAULT_READ_RESULT_CEILING_BYTES).get(),
+            READ_RESULT_BLOCKS_PER_PEER * decoded_block,
+            "a derivation below the ceiling is kept"
+        );
+        assert_eq!(
+            Config::read_result_byte_limit_for_peers(300, 0).get(),
+            decoded_block,
+            "the clamp keeps one maximum-size block readable"
+        );
+        let configured = Config {
+            read_result_byte_limit: NonZeroU64::new(decoded_block),
+            ..Config::default()
+        };
+        assert_eq!(configured.read_result_byte_limit().get(), decoded_block);
+    }
+
+    #[test]
+    fn read_memory_bound_rejects_limits_that_cannot_fund_progress() {
+        // The runtime adds read threads to Tokio's pool, so the worker count has no
+        // thread ceiling: the largest limit only grows the parser term.
+        let decoded_block = MAX_BLOCK_BYTES * MAX_DECODED_BYTES_PER_WIRE_BYTE;
+        let workers = Config {
+            read_concurrency_limit: NonZeroU16::MAX,
+            ..Config::default()
+        };
+        assert_eq!(
+            workers.read_worker_count(),
+            usize::from(u16::MAX) + crate::constants::CONTROL_READ_CONCURRENCY
+        );
+        assert_eq!(
+            workers.read_memory_bound(),
+            Ok(DEFAULT_READ_RESULT_CEILING_BYTES
+                + (u64::from(u16::MAX) + 4) * (MAX_BLOCK_PARSER_BYTES + decoded_block)
+                + crate::constants::CHAIN_TIP_BLOCK_RETENTION
+                    * (decoded_block + MAX_BLOCK_PARSER_BYTES))
+        );
+        let result = Config {
+            read_result_byte_limit: Some(NonZeroU64::MIN),
+            ..Config::default()
+        };
+        assert!(matches!(
+            result.read_memory_bound(),
+            Err(ReadCapacityError::ResultLimitTooSmall { limit: 1, .. })
+        ));
+        let overflow = Config {
+            read_result_byte_limit: Some(NonZeroU64::MAX),
+            ..Config::default()
+        };
+        assert_eq!(
+            overflow.read_memory_bound(),
+            Err(ReadCapacityError::Overflow)
+        );
+    }
+
+    #[test]
+    fn read_limits_have_their_documented_defaults() {
+        let config = toml::from_str::<Config>("").unwrap();
+        assert_eq!(config.read_concurrency_limit.get(), 64);
+        assert_eq!(config.read_worker_count(), 68);
+        assert_eq!(config.read_result_byte_limit, None);
+        assert_eq!(
+            config.read_result_byte_limit(),
+            Config::read_result_byte_limit_for_peers(
+                DEFAULT_READ_RESULT_PEERS,
+                DEFAULT_READ_RESULT_CEILING_BYTES
+            )
+        );
+        assert_eq!(
+            config.read_result_byte_limit().get(),
+            DEFAULT_READ_RESULT_CEILING_BYTES
+        );
+    }
 
     #[test]
     fn optional_duration_preserves_config_toml() {

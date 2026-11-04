@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -20,6 +21,7 @@ use tower::load_shed::error::Overloaded;
 use tracing::Span;
 
 use zakura_chain::{block, serialization::SerializationError};
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
         ClientRequest, ErrorSlot,
     },
     peer_set::ActiveConnectionCounter,
-    protocol::external::Message,
+    protocol::external::{InventoryHash, Message},
     types::Nonce,
     PeerError, PeerSource, Request, Response,
 };
@@ -237,6 +239,145 @@ async fn connection_run_loop_message_ok() {
     connection_join_handle.abort();
     let outbound_message = peer_outbound_messages.next().await;
     assert_eq!(outbound_message, None);
+}
+
+/// An empty mempool reply releases the connection before the request timeout.
+#[tokio::test(start_paused = true)]
+async fn empty_mempool_reply_unblocks_queued_block_request() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, mut client_tx, _inbound_service, mut outbound, error_slot) =
+        new_test_connection();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let (mempool_tx, mempool_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::MempoolTransactionIds,
+            tx: mempool_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), outbound.next())
+            .await
+            .unwrap(),
+        Some(Message::Mempool),
+    );
+
+    let hash = block::Hash([1; 32]);
+    let (block_tx, block_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::BlocksByHash(IndexSet::from([hash])),
+            tx: block_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .unwrap();
+    assert!(outbound.next().now_or_never().is_none());
+
+    peer_tx.send(Ok(Message::Inv(Vec::new()))).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        assert_eq!(
+            mempool_rx.await.unwrap().unwrap(),
+            Response::TransactionIds(Vec::new()),
+        );
+        assert_eq!(
+            outbound.next().await,
+            Some(Message::GetData(vec![InventoryHash::Block(hash)])),
+        );
+    })
+    .await
+    .expect("an empty mempool reply must release the queued block request without a timeout");
+
+    assert!(error_slot.try_get_error().is_none());
+    drop(block_rx);
+    connection_task.abort();
+    assert!(connection_task.await.unwrap_err().is_cancelled());
+}
+
+/// A late empty mempool reply must not finish a later block-locator request.
+#[tokio::test(start_paused = true)]
+async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, mut client_tx, _inbound_service, mut outbound, error_slot) =
+        new_test_connection();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let (mempool_tx, mempool_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::MempoolTransactionIds,
+            tx: mempool_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), outbound.next())
+            .await
+            .unwrap(),
+        Some(Message::Mempool),
+    );
+    drop(mempool_rx);
+
+    let (find_tx, mut find_rx) = oneshot::channel();
+    client_tx
+        .send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: Vec::new(),
+                stop: None,
+            },
+            tx: find_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), outbound.next())
+            .await
+            .unwrap(),
+        Some(Message::GetBlocks {
+            known_blocks: Vec::new(),
+            stop: None,
+        }),
+    );
+
+    peer_tx.send(Ok(Message::Inv(Vec::new()))).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), &mut find_rx)
+            .await
+            .is_err(),
+        "the late empty mempool reply must leave the block-locator request pending",
+    );
+
+    let hashes = vec![block::Hash([1; 32]), block::Hash([2; 32])];
+    peer_tx
+        .send(Ok(Message::Inv(
+            hashes.iter().copied().map(InventoryHash::Block).collect(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), find_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Response::BlockHashes(hashes),
+    );
+
+    assert!(error_slot.try_get_error().is_none());
+    connection_task.abort();
+    assert!(connection_task.await.unwrap_err().is_cancelled());
 }
 
 /// Test that the connection run loop fails correctly when dropped
@@ -1183,9 +1324,13 @@ async fn block_gossip_slot_tracks_connection_write() {
 
     let _init_guard = zakura_test::init();
     let (mut peer_tx, peer_rx) = mpsc::channel(1);
-    let (connection, client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (mut connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = block_advert_rx;
     let gossip = BlockGossipPeer {
-        sender: client_tx,
+        sender: block_advert_tx,
+        address: None,
         uploads: connection.block_uploads.clone(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
@@ -1196,7 +1341,7 @@ async fn block_gossip_slot_tracks_connection_write() {
         .zcash_deserialize_into()
         .unwrap();
     let hash = block.hash();
-    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let slots = crate::peer::block_gossip::BlockUploadSlots::new(1);
     let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
     assert_eq!(
         outbound.next().await.unwrap(),
@@ -1210,23 +1355,82 @@ async fn block_gossip_slot_tracks_connection_write() {
         .expect_request(Request::BlocksByHash(IndexSet::from([hash])))
         .await
         .respond(Response::Blocks(vec![InventoryResponse::Available((
-            block.clone(),
+            block.clone().into(),
             None,
         ))]));
     tokio::task::yield_now().await;
     // The zero-capacity sink cannot flush its block until we read it below.
     tokio::time::advance(Duration::from_secs(4)).await;
     tokio::task::yield_now().await;
-    assert_eq!(slots.available_permits(), 0);
+    assert_eq!(slots.available_uploads(), 0);
     assert!(!advertisement.is_finished());
-    assert_eq!(outbound.next().await.unwrap(), Message::Block(block));
+    assert_eq!(outbound.next().await.unwrap(), Message::Block(block.into()));
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(749)).await;
     tokio::task::yield_now().await;
-    assert_eq!(slots.available_permits(), 0);
+    assert_eq!(slots.available_uploads(), 0);
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(advertisement.await.unwrap());
-    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(slots.available_uploads(), 1);
+    connection_task.abort();
+}
+
+/// A `headers` response keeps its state read charge until the wire send finishes.
+#[tokio::test(start_paused = true)]
+async fn tcp_headers_response_holds_read_admission_through_the_send() {
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
+    use zakura_node_services::block_memory::{HeaderHandle, ReadMemoryBudget};
+
+    let _init_guard = zakura_test::init();
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let pool = ReadMemoryBudget::new(std::num::NonZeroU64::MAX);
+    let header = pool
+        .try_reserve(
+            zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*block.header),
+        )
+        .unwrap()
+        .retain(*block.header)
+        .unwrap();
+
+    let known_blocks = vec![block.hash()];
+    peer_tx
+        .send(Ok(Message::GetHeaders {
+            known_blocks: known_blocks.clone(),
+            stop: None,
+        }))
+        .await
+        .unwrap();
+    inbound
+        .expect_request(Request::FindHeaders {
+            known_blocks,
+            stop: None,
+        })
+        .await
+        .respond(Response::BlockHeaders(vec![HeaderHandle::from(header)]));
+
+    tokio::task::yield_now().await;
+    assert!(
+        pool.retained_bytes() > 0,
+        "the zero-capacity sink cannot flush until the test reads it"
+    );
+    let Message::Headers(sent) = outbound.next().await.unwrap() else {
+        panic!("a headers response becomes a headers message")
+    };
+    assert_eq!(sent[0].header, block.header);
+    // The connection task finishes its flush and drops the handles on a later turn.
+    for _ in 0..16 {
+        if pool.retained_bytes() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(pool.retained_bytes(), 0);
     connection_task.abort();
 }
 
@@ -1234,13 +1438,16 @@ async fn block_gossip_slot_tracks_connection_write() {
 #[tokio::test(start_paused = true)]
 async fn truncated_block_request_releases_gossip_slot() {
     use crate::peer::block_gossip::BlockGossipPeer;
-    use std::sync::Arc;
 
     let _init_guard = zakura_test::init();
     let (mut peer_tx, peer_rx) = mpsc::channel(1);
-    let (connection, client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (mut connection, _client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let (block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = block_advert_rx;
     let gossip = BlockGossipPeer {
-        sender: client_tx,
+        sender: block_advert_tx,
+        address: None,
         uploads: connection.block_uploads.clone(),
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
@@ -1249,7 +1456,7 @@ async fn truncated_block_request_releases_gossip_slot() {
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let decoy = block::Hash([1; 32]);
     let hash = block::Hash([2; 32]);
-    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let slots = crate::peer::block_gossip::BlockUploadSlots::new(1);
     let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
     assert_eq!(
         outbound.next().await.unwrap(),
@@ -1264,6 +1471,1216 @@ async fn truncated_block_request_releases_gossip_slot() {
         .await
         .respond(Response::Blocks(Vec::new()));
     assert!(!advertisement.await.unwrap());
-    assert_eq!(slots.available_permits(), 1);
+    assert_eq!(slots.available_uploads(), 1);
     connection_task.abort();
+}
+
+/// A short bound for the tests below, whose connections use real time.
+const RESOURCE_TEST_BOUND: Duration = Duration::from_secs(5);
+
+/// Waits for the connection task to bring `budget`'s charge to `bytes`.
+async fn budget_reaches(budget: &crate::inbound_resources::InboundBudget, bytes: u64) {
+    while budget.used() != bytes {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn mainnet_blocks() -> [zakura_chain::block::Block; 2] {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    ]
+}
+
+/// Runs `test` under the bound that the tests below share.
+async fn within_resource_bound(test: impl std::future::Future<Output = ()>) {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(RESOURCE_TEST_BOUND, test)
+        .await
+        .expect("the connection handles its messages");
+}
+
+/// A running connection whose inbound budget holds one byte, so any real payload is
+/// above its capacity.
+struct BudgetedConnection {
+    peer_tx: mpsc::Sender<Result<Message, SerializationError>>,
+    client_tx: mpsc::Sender<ClientRequest>,
+    inbound: MockService<Request, Response, PanicAssertion>,
+    outbound: mpsc::Receiver<Message>,
+    error: ErrorSlot,
+    budget: crate::inbound_resources::InboundBudget,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn budgeted_connection() -> BudgetedConnection {
+    let (peer_tx, peer_rx) = mpsc::channel(1);
+    let (mut connection, client_tx, inbound, outbound, error) = new_test_connection();
+    let budget = crate::inbound_resources::InboundBudget::new(1);
+    connection.inbound_budget = budget.clone();
+    BudgetedConnection {
+        peer_tx,
+        client_tx,
+        inbound,
+        outbound,
+        error,
+        budget,
+        task: tokio::spawn(connection.run(peer_rx)),
+    }
+}
+
+impl BudgetedConnection {
+    /// Requests two blocks and returns them with the receiver of their response.
+    async fn request_two_blocks(
+        &mut self,
+    ) -> (
+        [BlockHandle; 2],
+        oneshot::Receiver<Result<Response, crate::peer::SharedPeerError>>,
+    ) {
+        let blocks = mainnet_blocks().map(|block| BlockHandle::from(Arc::new(block)));
+        let (tx, response) = oneshot::channel();
+        self.client_tx
+            .try_send(ClientRequest {
+                request: Request::BlocksByHash(blocks.iter().map(|block| block.hash()).collect()),
+                tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .expect("the connection accepts its first request");
+        assert!(matches!(
+            self.outbound.next().await,
+            Some(Message::GetData(items)) if items.len() == 2
+        ));
+        (blocks, response)
+    }
+}
+
+/// L.objects: a response to this node's own request charges every decoded block until
+/// its handoff. It never refuses, even above the budget's capacity.
+#[tokio::test]
+async fn tcp_response_blocks_charge_until_handoff_without_refusing() {
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+        let ([first, second], mut response) = tcp.request_two_blocks().await;
+        let first_bytes = first.decoded_bytes();
+
+        tcp.peer_tx.send(Ok(Message::Block(first))).await.unwrap();
+        budget_reaches(&tcp.budget, first_bytes).await;
+        assert!(matches!(response.try_recv(), Ok(None)));
+
+        tcp.peer_tx.send(Ok(Message::Block(second))).await.unwrap();
+        assert!(matches!(
+            response.await.unwrap().unwrap(),
+            Response::Blocks(blocks) if blocks.len() == 2
+        ));
+        budget_reaches(&tcp.budget, 0).await;
+        tcp.task.abort();
+    })
+    .await;
+}
+
+/// A cancelled request ends the charge for the payloads it already received.
+#[tokio::test]
+async fn cancelling_a_tcp_request_ends_its_response_charge() {
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+        let ([first, _second], response) = tcp.request_two_blocks().await;
+        let first_bytes = first.decoded_bytes();
+
+        tcp.peer_tx.send(Ok(Message::Block(first))).await.unwrap();
+        budget_reaches(&tcp.budget, first_bytes).await;
+        drop(response);
+        budget_reaches(&tcp.budget, 0).await;
+        tcp.task.abort();
+    })
+    .await;
+}
+
+/// L.objects: an unsolicited block has no retained owner, so it takes no charge.
+/// An unsolicited transaction drops on a saturated budget without faulting the peer,
+/// and otherwise holds its charge until its handler ends.
+#[tokio::test]
+async fn unsolicited_tcp_transactions_respect_the_budget() {
+    use zakura_chain::transaction::UnminedTx;
+
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+        let [block, _] = mainnet_blocks();
+        let transaction = UnminedTx::from(block.transactions[0].clone());
+
+        tcp.peer_tx
+            .send(Ok(Message::Block(Arc::new(block).into())))
+            .await
+            .unwrap();
+        let held = tcp.budget.try_charge(1).expect("the budget is idle");
+        tcp.peer_tx
+            .send(Ok(Message::Tx(transaction.clone())))
+            .await
+            .unwrap();
+
+        // A ping proves the connection finished the refused transaction and stays open.
+        tcp.peer_tx
+            .send(Ok(Message::Ping(Nonce::default())))
+            .await
+            .unwrap();
+        assert!(matches!(tcp.outbound.next().await, Some(Message::Pong(_))));
+        tcp.inbound.expect_no_requests().await;
+        assert!(tcp.error.try_get_error().is_none());
+        drop(held);
+
+        tcp.peer_tx
+            .send(Ok(Message::Tx(transaction.clone())))
+            .await
+            .unwrap();
+        let request = tcp
+            .inbound
+            .expect_request(Request::PushTransaction(transaction, None))
+            .await;
+        assert_eq!(
+            tcp.budget.used(),
+            1,
+            "the oversized item clamps to the budget"
+        );
+        request.respond(Response::Nil);
+        budget_reaches(&tcp.budget, 0).await;
+        tcp.task.abort();
+    })
+    .await;
+}
+
+/// L.headers: a `headers` response charges only its new allocations. A read handle
+/// keeps its own slot and is copied. A shared header has no slot and is not copied.
+#[tokio::test]
+async fn tcp_header_copies_charge_only_their_new_allocations() {
+    use zakura_node_services::block_memory::{HeaderHandle, ReadMemoryBudget};
+
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+
+        let [first, second] = mainnet_blocks();
+        let shared_header = second.header.clone();
+        let pool = ReadMemoryBudget::new(std::num::NonZeroU64::MAX);
+        let read_header = pool
+            .try_reserve(
+                zakura_node_services::block_memory::DecodedSize::decoded_size_bytes(&*first.header),
+            )
+            .unwrap()
+            .retain(*first.header)
+            .unwrap();
+        let headers = vec![
+            HeaderHandle::from(read_header),
+            HeaderHandle::from(shared_header.clone()),
+        ];
+
+        let (wire, copied_bytes) = crate::peer::connection::wire_headers(&headers);
+        assert!(Arc::ptr_eq(&wire[1].header, &shared_header));
+        assert_eq!(
+            copied_bytes,
+            crate::peer::connection::COPIED_HEADER_BYTES
+                + crate::inbound_resources::vec_retained_bytes(&wire)
+        );
+        drop(wire);
+
+        let known_blocks = vec![first.hash()];
+        tcp.peer_tx
+            .send(Ok(Message::GetHeaders {
+                known_blocks: known_blocks.clone(),
+                stop: None,
+            }))
+            .await
+            .unwrap();
+        tcp.inbound
+            .expect_request(Request::FindHeaders {
+                known_blocks,
+                stop: None,
+            })
+            .await
+            .respond(Response::BlockHeaders(headers));
+
+        budget_reaches(&tcp.budget, copied_bytes).await;
+        assert!(
+            pool.retained_bytes() > 0,
+            "the handle keeps its read charge"
+        );
+
+        let Some(Message::Headers(sent)) = tcp.outbound.next().await else {
+            panic!("a headers response becomes a headers message")
+        };
+        assert_eq!(sent.len(), 2);
+        drop(sent);
+        budget_reaches(&tcp.budget, 0).await;
+        while pool.retained_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+        tcp.task.abort();
+    })
+    .await;
+}
+
+/// C.1 to C.4, C.9, C.10, and L.mempool: a connection awaits each inbound service call
+/// before it reads the next message, so each connection adds one call to the static
+/// bound in `inbound_resources`.
+#[tokio::test]
+async fn a_tcp_connection_runs_one_inbound_call_at_a_time() {
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+        tcp.peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        let first = tcp
+            .inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await;
+
+        tcp.peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        tcp.inbound.expect_no_requests().await;
+
+        first.respond(Response::Nil);
+        tcp.inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await
+            .respond(Response::Nil);
+        tcp.task.abort();
+    })
+    .await;
+}
+
+/// L.mempool: an empty snapshot sends nothing, and a larger snapshot than one message
+/// allows sends exactly one message of the protocol's limit.
+#[tokio::test]
+async fn a_tcp_mempool_response_is_bounded() {
+    use zakura_chain::transaction::{self, UnminedTxId};
+
+    within_resource_bound(async {
+        let mut tcp = budgeted_connection();
+
+        tcp.peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        tcp.inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await
+            .respond(Response::Nil);
+        tcp.peer_tx
+            .send(Ok(Message::Ping(Nonce::default())))
+            .await
+            .unwrap();
+        assert!(matches!(tcp.outbound.next().await, Some(Message::Pong(_))));
+
+        let limit = usize::try_from(crate::MAX_TX_INV_IN_SENT_MESSAGE).unwrap();
+        let ids = vec![UnminedTxId::Legacy(transaction::Hash([1; 32])); limit + 1];
+        tcp.peer_tx.send(Ok(Message::Mempool)).await.unwrap();
+        tcp.inbound
+            .expect_request(Request::MempoolTransactionIds)
+            .await
+            .respond(Response::TransactionIds(ids));
+        assert!(matches!(
+            tcp.outbound.next().await,
+            Some(Message::Inv(items)) if items.len() == limit
+        ));
+        tcp.task.abort();
+    })
+    .await;
+}
+
+/// Lets spawned connection tasks run without advancing the paused clock.
+async fn settle() {
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Returns a client request for `request`, and the receiver for its response.
+fn client_request(
+    request: Request,
+) -> (
+    ClientRequest,
+    oneshot::Receiver<Result<Response, crate::SharedPeerError>>,
+) {
+    let (tx, rx) = oneshot::channel();
+    let request = ClientRequest {
+        request,
+        tx,
+        inv_collector: None,
+        transient_addr: None,
+        span: Span::none(),
+    };
+    (request, rx)
+}
+
+/// Returns a transaction and a block to use as peer responses.
+fn response_vectors() -> (
+    zakura_chain::transaction::UnminedTx,
+    std::sync::Arc<block::Block>,
+) {
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    let block: std::sync::Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    (block.transactions[0].clone().into(), block)
+}
+
+/// The request slot is busy exactly while a client request is outstanding, and responses,
+/// `notfound`, unsolicited messages and late responses still reach the right handler.
+#[tokio::test(start_paused = true)]
+async fn request_slot_tracks_responses_and_notfound() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, mut inbound, mut outbound, _error) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (tx, block) = response_vectors();
+    let txid = tx.id();
+
+    settle().await;
+    assert!(slot.is_free(), "a new connection can write a request");
+
+    // A transaction response holds the slot until it arrives.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    settle().await;
+    assert!(!slot.is_free(), "awaiting a transaction response");
+
+    // An unsolicited block advert goes to the inbound service and keeps the request outstanding.
+    peer_tx
+        .send(Ok(Message::Inv(vec![block.hash().into()])))
+        .await
+        .expect("connection is open");
+    inbound
+        .expect_request_that(
+            |request| matches!(request, Request::AdvertiseBlock(advert, _) if advert.hash == block.hash()),
+        )
+        .await
+        .respond(Response::Nil);
+    settle().await;
+    assert!(
+        !slot.is_free(),
+        "unsolicited messages do not end the request"
+    );
+
+    peer_tx
+        .send(Ok(Message::Tx(tx.clone())))
+        .await
+        .expect("connection is open");
+    let response = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the transaction");
+    assert!(matches!(response, Response::Transactions(ref txs) if txs.len() == 1));
+    settle().await;
+    assert!(slot.is_free(), "the response frees the slot");
+
+    // A `notfound` for the outstanding transaction ends the request with an error.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    peer_tx
+        .send(Ok(Message::NotFound(vec![txid.into()])))
+        .await
+        .expect("connection is open");
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("peer does not have the transaction");
+    assert!(error.inner_debug().contains("NotFoundResponse"));
+    settle().await;
+    assert!(slot.is_free(), "a notfound frees the slot");
+
+    // A late transaction response that arrives during a block request is handled as a pushed
+    // transaction, and does not complete the block request.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![block.hash().into()]))
+    );
+    peer_tx
+        .send(Ok(Message::Tx(tx.clone())))
+        .await
+        .expect("connection is open");
+    inbound
+        .expect_request_that(|request| matches!(request, Request::PushTransaction(..)))
+        .await
+        .respond(Response::Nil);
+    settle().await;
+    assert!(!slot.is_free(), "still awaiting the block");
+
+    peer_tx
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .expect("connection is open");
+    let response = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    assert!(matches!(response, Response::Blocks(ref blocks) if blocks.len() == 1));
+    settle().await;
+    assert!(slot.is_free(), "the block response frees the slot");
+
+    connection_task.abort();
+}
+
+/// Cancellation and timeouts free the request slot, and a disconnect leaves it busy.
+#[tokio::test(start_paused = true)]
+async fn request_slot_tracks_cancellation_timeout_and_disconnect() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, error_slot) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (tx, _block) = response_vectors();
+    let txid = tx.id();
+
+    // Cancelling the request frees the slot.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    settle().await;
+    assert!(!slot.is_free());
+    drop(response);
+    settle().await;
+    assert!(slot.is_free(), "cancellation frees the slot");
+
+    // A response timeout fails the request and frees the slot.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    tokio::time::advance(REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("request timed out");
+    assert_eq!(error.inner_debug(), "ConnectionReceiveTimeout");
+    settle().await;
+    assert!(slot.is_free(), "a timeout frees the slot");
+
+    // A disconnect fails the outstanding request and leaves the slot busy.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![txid.into()]))
+    );
+    peer_tx.close_channel();
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("connection closed");
+    assert_eq!(error.inner_debug(), "ConnectionClosed");
+    assert!(error_slot.try_get_error().is_some());
+    assert!(!slot.is_free(), "a failed connection cannot write requests");
+
+    let _ = connection_task.await;
+}
+
+/// A block request that spends half its timeout unanswered is recorded on the request slot, and a
+/// delivered block clears the record. Early cancellations and other requests leave it unset.
+#[tokio::test(start_paused = true)]
+async fn request_slot_records_unanswered_block_requests() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, mut outbound, _error) = new_test_connection();
+    let slot = connection.request_slot.clone();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (tx, block) = response_vectors();
+    let txid = tx.id();
+    let half_timeout = crate::constants::REQUEST_TIMEOUT / 2;
+
+    // A transaction request that times out says nothing about blocks.
+    let (request, response) = client_request(Request::TransactionsById([txid].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+    assert!(response.await.expect("connection responds").is_err());
+    settle().await;
+    assert!(!slot.block_request_unanswered());
+
+    // An early cancellation says nothing about the peer.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(half_timeout - Duration::from_secs(1)).await;
+    drop(response);
+    settle().await;
+    assert!(slot.is_free());
+    assert!(!slot.block_request_unanswered());
+
+    // A downloader's own timeout usually cancels just before the connection's timer fires.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(half_timeout).await;
+    drop(response);
+    settle().await;
+    assert!(slot.is_free());
+    assert!(slot.block_request_unanswered());
+
+    // A delivered block clears the record.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    peer_tx
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .expect("connection is open");
+    response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    settle().await;
+    assert!(!slot.block_request_unanswered());
+
+    // The connection's own timeout also records the request.
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    outbound.next().await.expect("request is written");
+    settle().await;
+    tokio::time::advance(crate::constants::REQUEST_TIMEOUT).await;
+    assert!(response.await.expect("connection responds").is_err());
+    settle().await;
+    assert!(slot.block_request_unanswered());
+
+    connection_task.abort();
+}
+
+/// Returns a block advert for `hash`, and the receiver for its write result.
+fn block_advert(
+    hash: block::Hash,
+) -> (
+    crate::peer::block_gossip::BlockAdvert,
+    tokio::sync::oneshot::Receiver<Result<(), crate::peer::block_gossip::BlockAdvertError>>,
+) {
+    let (result, delivery) = tokio::sync::oneshot::channel();
+    (
+        crate::peer::block_gossip::BlockAdvert { hash, result },
+        delivery,
+    )
+}
+
+/// Block adverts bypass pending responses without replacing their handlers or closing the client.
+///
+/// A peer at our tip never answers `getblocks`, so an advert queued behind it would otherwise
+/// wait for the request to time out.
+#[tokio::test]
+async fn block_advert_while_awaiting_response() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            mut connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        // Exercise the idle path before leaving a getblocks request awaiting its response.
+        let idle_hash = block::Hash([1; 32]);
+        let (advert, idle_delivery) = block_advert(idle_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        assert_eq!(
+            peer_outbound_messages.next().await,
+            Some(Message::Inv(vec![InventoryHash::Block(idle_hash)]))
+        );
+        idle_delivery.await.unwrap().unwrap();
+
+        let (request_tx, mut request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::FindBlocks {
+                    known_blocks: vec![idle_hash],
+                    stop: None,
+                },
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        assert!(matches!(
+            peer_outbound_messages.next().await,
+            Some(Message::GetBlocks { .. })
+        ));
+
+        let busy_hash = block::Hash([2; 32]);
+        let (advert, busy_delivery) = block_advert(busy_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        assert_eq!(
+            peer_outbound_messages.next().await,
+            Some(Message::Inv(vec![InventoryHash::Block(busy_hash)]))
+        );
+        busy_delivery.await.unwrap().unwrap();
+        assert!(request_rx.try_recv().unwrap().is_none());
+
+        // Closing only the advert channel must leave the original request alive.
+        drop(block_advert_tx);
+        let next_hash = block::Hash([3; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(next_hash)])))
+            .unwrap();
+        // A one-hash inv is also a block announcement, so it reaches the inbound service too.
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::AdvertiseBlock(next_hash.into(), None))
+                    .await
+                    .respond(Response::Nil);
+            },
+            async {
+                assert_eq!(
+                    request_rx.await.unwrap().unwrap(),
+                    Response::BlockHashes(vec![next_hash])
+                );
+            }
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("adverts and the original response finish before the request timeout");
+}
+
+/// A block advert sent as an ordinary client request is answered with an error, not written as
+/// an `inv`: only the advert queue writes adverts. The connection stays usable.
+#[tokio::test]
+async fn block_advert_as_ordinary_request_is_an_error() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let (request_tx, request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::AdvertiseBlock(block::Hash([5; 32]).into(), None),
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        let error = request_rx
+            .await
+            .unwrap()
+            .expect_err("an advert sent as an ordinary request fails");
+        assert_eq!(error.inner_debug(), "AdvertRequiresDedicatedService");
+        assert!(peer_outbound_messages.next().now_or_never().is_none());
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the request is answered before the request timeout");
+}
+
+/// A pending GetBlocks response must not be displaced by a simultaneous unsolicited advert.
+#[tokio::test]
+async fn getblocks_response_precedes_ready_block_advert() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            mut connection,
+            client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let response_hash = block::Hash([3; 32]);
+        let advert_hash = block::Hash([4; 32]);
+
+        // Queue both inputs before starting the loop, making selection order deterministic.
+        peer_tx
+            .try_send(Ok(Message::GetBlocks {
+                known_blocks: Vec::new(),
+                stop: None,
+            }))
+            .unwrap();
+        let (advert, _delivery) = block_advert(advert_hash);
+        block_advert_tx.try_send(advert).unwrap();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::FindBlocks {
+                        known_blocks: Vec::new(),
+                        stop: None,
+                    })
+                    .await
+                    .respond(Response::BlockHashes(vec![response_hash]));
+            },
+            async {
+                assert_eq!(
+                    peer_outbound_messages.next().await,
+                    Some(Message::Inv(vec![InventoryHash::Block(response_hash)]))
+                );
+                assert_eq!(
+                    peer_outbound_messages.next().await,
+                    Some(Message::Inv(vec![InventoryHash::Block(advert_hash)]))
+                );
+            }
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the response and advert are both delivered");
+}
+
+/// Sends a `FindBlocks` request on `client_tx` and waits for its `getblocks` to reach the wire.
+///
+/// Returns the receiver for the request's response.
+async fn send_find_blocks(
+    client_tx: &mut mpsc::Sender<ClientRequest>,
+    peer_outbound_messages: &mut mpsc::Receiver<Message>,
+) -> oneshot::Receiver<Result<Response, crate::peer::SharedPeerError>> {
+    let (request_tx, request_rx) = oneshot::channel();
+    client_tx
+        .try_send(ClientRequest {
+            request: Request::FindBlocks {
+                known_blocks: vec![block::Hash([1; 32])],
+                stop: None,
+            },
+            tx: request_tx,
+            inv_collector: None,
+            transient_addr: None,
+            span: Span::current(),
+        })
+        .unwrap();
+    assert!(matches!(
+        peer_outbound_messages.next().await,
+        Some(Message::GetBlocks { .. })
+    ));
+    request_rx
+}
+
+/// A one-hash block `inv` that arrives while `getblocks` is pending answers the request and is
+/// also handed to the inbound service as a block advert.
+///
+/// A peer announces a new block with a one-hash `inv`, which the connection cannot tell from a
+/// reply. If it were only the reply, the gossip downloader would never see the block, and the
+/// syncer would fetch it only after every request in its discovery round had finished.
+#[tokio::test]
+async fn single_block_inv_during_getblocks_is_also_gossiped() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let announced_hash = block::Hash([2; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
+            .unwrap();
+
+        // The reply is delivered before the advert reaches the inbound service.
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(vec![announced_hash])
+        );
+        inbound_service
+            .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
+            .await
+            .respond(Response::Nil);
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the response and the block advert are both delivered");
+}
+
+/// The `getblocks` reply is not lost when the inbound service sheds the block advert that the
+/// same one-hash `inv` produced, whether or not the overload policy then drops the connection.
+#[tokio::test]
+async fn single_block_inv_during_getblocks_survives_inbound_overload() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (connection, mut client_tx, mut inbound_service, mut peer_outbound_messages, _) =
+            new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let announced_hash = block::Hash([2; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
+            .unwrap();
+
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(vec![announced_hash])
+        );
+        inbound_service
+            .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
+            .await
+            .respond(Err(Overloaded::new()));
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the reply is delivered although the advert was shed");
+}
+
+/// A block `inv` with several hashes is a `getblocks` reply only, never a block advert.
+#[tokio::test]
+async fn multi_block_inv_during_getblocks_is_only_the_reply() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let hashes = vec![block::Hash([2; 32]), block::Hash([3; 32])];
+        peer_tx
+            .try_send(Ok(Message::Inv(
+                hashes.iter().copied().map(InventoryHash::Block).collect(),
+            )))
+            .unwrap();
+
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(hashes)
+        );
+        inbound_service.expect_no_requests().await;
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the reply is delivered without a block advert");
+}
+
+/// The `getblocks` reply still arrives when the inbound service fails the block advert that the
+/// same one-hash `inv` produced, and the connection stays open.
+#[tokio::test]
+async fn single_block_inv_during_getblocks_survives_inbound_error() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (mut peer_tx, peer_rx) = mpsc::channel(1);
+        let (
+            connection,
+            mut client_tx,
+            mut inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+
+        let announced_hash = block::Hash([2; 32]);
+        peer_tx
+            .try_send(Ok(Message::Inv(vec![InventoryHash::Block(announced_hash)])))
+            .unwrap();
+
+        tokio::join!(
+            async {
+                inbound_service
+                    .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
+                    .await
+                    .respond(Err("synthetic inbound service error"));
+            },
+            async {
+                assert_eq!(
+                    request_rx.await.unwrap().unwrap(),
+                    Response::BlockHashes(vec![announced_hash])
+                );
+            }
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        // The connection still serves requests after the failed advert.
+        let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+        let hashes = vec![block::Hash([3; 32]), block::Hash([4; 32])];
+        peer_tx
+            .try_send(Ok(Message::Inv(
+                hashes.iter().copied().map(InventoryHash::Block).collect(),
+            )))
+            .unwrap();
+        assert_eq!(
+            request_rx.await.unwrap().unwrap(),
+            Response::BlockHashes(hashes)
+        );
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        drop(client_tx);
+        connection_task.await.unwrap();
+    })
+    .await
+    .expect("the reply is delivered although the advert failed");
+}
+
+/// An unsolicited transaction completes a pending transaction batch before inbound processing,
+/// even when the inbound service fails. Both partial and not-found replies keep the connection
+/// usable for later requests.
+#[tokio::test]
+async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
+    use zakura_chain::{
+        serialization::ZcashDeserializeInto,
+        transaction::{self, UnminedTx, UnminedTxId},
+    };
+
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    let requested_block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let unrelated_block: block::Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let requested = UnminedTx::from(requested_block.transactions[0].clone());
+    let unrelated = UnminedTx::from(unrelated_block.transactions[0].clone());
+    let missing = UnminedTxId::from_legacy_id(transaction::Hash([9; 32]));
+    assert_ne!(requested.id(), unrelated.id());
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for received_requested in [false, true] {
+            let (mut peer_tx, peer_rx) = mpsc::channel(1);
+            let (
+                connection,
+                mut client_tx,
+                mut inbound_service,
+                mut peer_outbound_messages,
+                shared_error_slot,
+            ) = new_test_connection();
+            let connection_task = tokio::spawn(connection.run(peer_rx));
+            let (request_tx, request_rx) = oneshot::channel();
+            client_tx
+                .try_send(ClientRequest {
+                    request: Request::TransactionsById(HashSet::from([requested.id(), missing])),
+                    tx: request_tx,
+                    inv_collector: None,
+                    transient_addr: None,
+                    span: Span::current(),
+                })
+                .unwrap();
+            assert!(matches!(
+                peer_outbound_messages.next().await,
+                Some(Message::GetData(_))
+            ));
+
+            if received_requested {
+                peer_tx
+                    .send(Ok(Message::Tx(requested.clone())))
+                    .await
+                    .unwrap();
+            }
+            peer_tx
+                .send(Ok(Message::Tx(unrelated.clone())))
+                .await
+                .unwrap();
+
+            // Do not answer the inbound request until the transaction reply has arrived.
+            let response = request_rx.await.unwrap();
+            if received_requested {
+                assert_eq!(
+                    response.unwrap(),
+                    Response::Transactions(vec![
+                        crate::InventoryResponse::Available((requested.clone(), None)),
+                        crate::InventoryResponse::Missing(missing),
+                    ])
+                );
+            } else {
+                assert_eq!(
+                    response.unwrap_err().not_found_class(),
+                    Some(crate::NotFoundClass::Response)
+                );
+            }
+            inbound_service
+                .expect_request(Request::PushTransaction(unrelated.clone(), None))
+                .await
+                .respond(Err("synthetic inbound service error"));
+
+            let request_rx = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+            let hashes = vec![block::Hash([3; 32]), block::Hash([4; 32])];
+            peer_tx
+                .send(Ok(Message::Inv(
+                    hashes.iter().copied().map(InventoryHash::Block).collect(),
+                )))
+                .await
+                .unwrap();
+            assert_eq!(
+                request_rx.await.unwrap().unwrap(),
+                Response::BlockHashes(hashes)
+            );
+            assert!(shared_error_slot.try_get_error().is_none());
+
+            drop(client_tx);
+            connection_task.await.unwrap();
+        }
+    })
+    .await
+    .expect("transaction replies precede inbound failures and later requests still succeed");
+}
+
+/// A connection rechecks bans while a request is awaiting its response, and does not write an
+/// advert to a banned peer. The pending request and the connection are unaffected.
+#[tokio::test]
+async fn queued_block_advert_is_revoked_by_ban_while_awaiting_response() {
+    queued_block_advert_is_revoked_by_ban(BanAddressForm::Same).await;
+}
+
+/// A peer connected through its IPv4-mapped IPv6 address, as on a dual-stack listener, is
+/// still revoked by a ban recorded for its canonical IPv4 address.
+#[tokio::test]
+async fn queued_block_advert_is_revoked_by_canonical_ban_of_mapped_ipv6_peer() {
+    queued_block_advert_is_revoked_by_ban(BanAddressForm::MappedPeerCanonicalBan).await;
+}
+
+/// How the banned address relates to the connection's peer address.
+enum BanAddressForm {
+    /// The ban holds the connection's own peer address.
+    Same,
+    /// The peer connected as `::ffff:A.B.C.D`, and the ban holds `A.B.C.D`.
+    MappedPeerCanonicalBan,
+}
+
+async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        // The protected test connection has a real peer address that a ban can match.
+        let (
+            mut connection,
+            mut client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_protected_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let banned_ip = match form {
+            BanAddressForm::Same => connection
+                .connection_info
+                .connected_addr
+                .get_transient_addr()
+                .expect("the protected test connection has a peer address")
+                .ip(),
+            BanAddressForm::MappedPeerCanonicalBan => {
+                let canonical = std::net::Ipv4Addr::new(203, 0, 113, 7);
+                let mut info = (*connection.connection_info).clone();
+                info.connected_addr = crate::peer::ConnectedAddr::new_inbound_direct(
+                    std::net::SocketAddr::new(canonical.to_ipv6_mapped().into(), 8233).into(),
+                );
+                connection.connection_info = std::sync::Arc::new(info);
+                canonical.into()
+            }
+        };
+        connection.bans = crate::BannedIps::with_banned_ip(banned_ip);
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+
+        let (request_tx, mut request_rx) = oneshot::channel();
+        client_tx
+            .try_send(ClientRequest {
+                request: Request::FindBlocks {
+                    known_blocks: vec![block::Hash([1; 32])],
+                    stop: None,
+                },
+                tx: request_tx,
+                inv_collector: None,
+                transient_addr: None,
+                span: Span::current(),
+            })
+            .unwrap();
+        assert!(matches!(
+            peer_outbound_messages.next().await,
+            Some(Message::GetBlocks { .. })
+        ));
+
+        let (advert, delivery) = block_advert(block::Hash([2; 32]));
+        block_advert_tx.try_send(advert).unwrap();
+        assert!(matches!(
+            delivery.await.unwrap(),
+            Err(crate::peer::block_gossip::BlockAdvertError::AuthorizationRevoked)
+        ));
+        assert!(peer_outbound_messages.next().now_or_never().is_none());
+        assert!(request_rx.try_recv().unwrap().is_none());
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        connection_task.abort();
+    })
+    .await
+    .expect("the revoked advert is answered before the request timeout");
 }

@@ -12,15 +12,24 @@
 //! - the cached [`Chain`] or [`NonFinalizedState`], and
 //! - the shared finalized [`ZakuraDb`] reference.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock,
+    },
+};
+use zakura_node_services::block_memory::{
+    AdmissionFailure, BlockHandle, HeaderHandle, ReadMemoryExhausted, TransactionHandle,
+};
 
 use chrono::{DateTime, Utc};
 
 use zakura_chain::{
-    block::{self, Block, Height},
+    block::{self, Height},
     block_info::BlockInfo,
     serialization::ZcashSerialize as _,
-    transaction::{self, Transaction},
+    transaction::{self},
     transparent::{self, Utxo},
 };
 
@@ -43,21 +52,25 @@ pub fn any_block<'a, C: AsRef<Chain> + 'a>(
     mut chains: impl Iterator<Item = &'a C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<Block>> {
+) -> Result<Option<BlockHandle>, AdmissionFailure> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
     // check the most efficient alternative first. (`chain` is always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chains
-        .find_map(|c| c.as_ref().block(hash_or_height))
-        .map(|contextual| contextual.block.clone())
-        .or_else(|| db.block(hash_or_height))
+    if let Some(contextual) = chains.find_map(|c| c.as_ref().block(hash_or_height)) {
+        return Ok(Some(contextual.block.clone()));
+    }
+    db.block(hash_or_height)
 }
 
 /// Returns the [`Block`] with [`block::Hash`] or
 /// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
-pub fn block<C>(chain: Option<C>, db: &ZakuraDb, hash_or_height: HashOrHeight) -> Option<Arc<Block>>
+pub fn block<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<BlockHandle>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -70,7 +83,7 @@ pub fn block_and_size<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<(Arc<Block>, usize)>
+) -> Result<Option<(BlockHandle, usize)>, AdmissionFailure>
 where
     C: AsRef<Chain>,
 {
@@ -79,23 +92,26 @@ where
     // Since blocks are the same in the finalized and non-finalized state, we
     // check the most efficient alternative first. (`chain` is always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chain
+    if let Some(contextual) = chain
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
-        .map(|contextual| {
-            let size = contextual.block.zcash_serialize_to_vec().unwrap().len();
-            (contextual.block.clone(), size)
-        })
-        .or_else(|| db.block_and_size(hash_or_height))
+    {
+        let size = contextual.block.zcash_serialized_size();
+        return Ok(Some((contextual.block.clone(), size)));
+    }
+    db.block_and_size(hash_or_height)
 }
 
 /// Returns the [`block::Header`] with [`block::Hash`] or
 /// [`Height`], if it exists in the non-finalized `chain` or finalized `db`.
+///
+/// Finalized reads take no admission slot, so chain-context work cannot starve.
+/// Use [`block_header_result`] for a header that leaves its read job.
 pub fn block_header<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash_or_height: HashOrHeight,
-) -> Option<Arc<block::Header>>
+) -> Option<HeaderHandle>
 where
     C: AsRef<Chain>,
 {
@@ -107,8 +123,27 @@ where
     chain
         .as_ref()
         .and_then(|chain| chain.as_ref().block(hash_or_height))
-        .map(|contextual| contextual.block.header.clone())
-        .or_else(|| db.block_header(hash_or_height))
+        .map(|contextual| contextual.block.retained_header())
+        .or_else(|| db.block_header(hash_or_height).map(Into::into))
+}
+
+/// Reads a header that leaves its read job. A finalized header retains admission
+/// through its final holder. Capacity refusal is separate from missing data.
+pub fn block_header_result<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<HeaderHandle>, ReadMemoryExhausted>
+where
+    C: AsRef<Chain>,
+{
+    if let Some(contextual) = chain
+        .as_ref()
+        .and_then(|chain| chain.as_ref().block(hash_or_height))
+    {
+        return Ok(Some(contextual.block.retained_header()));
+    }
+    db.block_header_result(hash_or_height)
 }
 
 /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in the
@@ -117,7 +152,7 @@ fn transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<(Arc<Transaction>, Height, DateTime<Utc>)>
+) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {
@@ -126,14 +161,15 @@ where
     // Since transactions are the same in the finalized and non-finalized state,
     // we check the most efficient alternative first. (`chain` is always in
     // memory, but `db` stores transactions on disk, with a memory cache.)
-    chain
-        .and_then(|chain| {
-            chain
-                .as_ref()
-                .transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time))
-        })
-        .or_else(|| db.transaction(hash))
+    if let Some(transaction) = chain.and_then(|chain| {
+        chain
+            .as_ref()
+            .transaction(hash)
+            .map(|(tx, height, time)| (tx.clone(), height, time))
+    }) {
+        return Ok(Some(transaction));
+    }
+    db.transaction(hash)
 }
 
 /// Returns a [`MinedTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -142,7 +178,7 @@ pub fn mined_transaction<C>(
     chain: Option<C>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<MinedTx>
+) -> Result<Option<MinedTx>, ReadMemoryExhausted>
 where
     C: AsRef<Chain>,
 {
@@ -152,10 +188,10 @@ where
     // can only add overlapping blocks, and hashes are unique.
     let chain = chain.as_ref();
 
-    let (tx, height, time) = transaction(chain, db, hash)?;
-    let confirmations = 1 + tip_height(chain, db)?.0 - height.0;
-
-    Some(MinedTx::new(tx, height, confirmations, time))
+    let Some((tx, height, time)) = transaction(chain, db, hash)? else {
+        return Ok(None);
+    };
+    Ok(tip_height(chain, db).map(|tip| MinedTx::new(tx, height, 1 + tip.0 - height.0, time)))
 }
 
 /// Returns a [`AnyTx`] for a [`Transaction`] with [`transaction::Hash`],
@@ -165,7 +201,7 @@ pub fn any_transaction<'a>(
     chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Option<AnyTx> {
+) -> Result<Option<AnyTx>, ReadMemoryExhausted> {
     // # Correctness
     //
     // It is ok to do this lookup in multiple different calls. Finalized state updates
@@ -180,25 +216,29 @@ pub fn any_transaction<'a>(
     // still be used in find_map below.
     let mut chains = chains.peekable();
     let best_chain = chains.peek().copied();
-    let (tx, height, time, in_best_chain, containing_chain) = chains
-        .enumerate()
-        .find_map(|(i, chain)| {
-            chain
-                .as_ref()
-                .transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
-        })
-        .or_else(|| {
-            db.transaction(hash)
-                .map(|(tx, height, time)| (tx.clone(), height, time, true, None))
-        })?;
+    let in_memory = chains.enumerate().find_map(|(i, chain)| {
+        chain
+            .as_ref()
+            .transaction(hash)
+            .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
+    });
+    let transaction = match in_memory {
+        Some(transaction) => Some(transaction),
+        None => db
+            .transaction(hash)?
+            .map(|(tx, height, time)| (tx, height, time, true, None)),
+    };
+    let Some((tx, height, time, in_best_chain, containing_chain)) = transaction else {
+        return Ok(None);
+    };
 
     if in_best_chain {
-        let confirmations = 1 + tip_height(best_chain, db)?.0 - height.0;
-        Some(AnyTx::Mined(MinedTx::new(tx, height, confirmations, time)))
+        Ok(tip_height(best_chain, db)
+            .map(|tip| AnyTx::Mined(MinedTx::new(tx, height, 1 + tip.0 - height.0, time))))
     } else {
-        let block_hash = containing_chain?.block(height.into())?.hash;
-        Some(AnyTx::Side((tx, block_hash)))
+        Ok(containing_chain
+            .and_then(|chain| chain.block(height.into()))
+            .map(|block| AnyTx::Side((tx, block.hash))))
     }
 }
 
@@ -297,12 +337,144 @@ where
     }
 }
 
+/// The smallest number of parent inputs read in parallel.
+///
+/// Measured on Mainnet replays: below this, Rayon's overhead outweighs overlapping the reads,
+/// and at 32 a block with 29 transparent inputs was still about 1.3 ms slower than Zebra.
+const MIN_PARALLEL_PARENT_INPUT_READS: usize = 8;
+
+/// The smallest number of parent inputs read on [`PARENT_INPUT_READ_POOL`].
+///
+/// Measured on cold-cache Mainnet replays: from 128 inputs the deeper I/O queue made blocks 2-7%
+/// faster, while sending every parallel read through the wide pool made smaller blocks 1-3%
+/// slower.
+const MIN_WIDE_PARENT_INPUT_READS: usize = 128;
+
+/// A dedicated pool for reading the parent inputs of large blocks.
+///
+/// These reads mostly wait on disk when the UTXO set is not cached, so more threads than cores
+/// keep more reads in flight than the shared pool can. `None` if the threads could not be
+/// created, in which case large blocks read on the shared pool.
+static PARENT_INPUT_READ_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(64)
+        .thread_name(|i| format!("parent-input-read-{i}"))
+        .build()
+        .inspect_err(|error| {
+            tracing::warn!(
+                ?error,
+                "could not create the parent input read pool, using the shared pool"
+            )
+        })
+        .ok()
+});
+
+/// The most locking-script bytes a parent input check keeps for the transaction checks.
+///
+/// The check keeps this map while the block's transaction checks run, on top of the copies those
+/// checks already make, so it is kept small. A full 2 MB block of standard 25-byte scripts keeps
+/// at most about 1.2 MB. A block whose inputs all exist but pass this limit, valid or not, gets
+/// [`ParentInputs::Inconclusive`], so its transactions look their inputs up one by one, as they
+/// did before the check returned outputs. A missing input still gets [`ParentInputs::Missing`].
+const MAX_KEPT_PARENT_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// The result of reading one input in [`read_parent_inputs`].
+enum ParentInputRead {
+    /// The output, kept for the transaction checks.
+    Kept(Utxo),
+    /// The output exists, but keeping it would pass the byte limit.
+    Dropped,
+    /// The output is not unspent at the parent.
+    Missing,
+    /// Not read, because an earlier input is already known to be missing.
+    Skipped,
+}
+
+/// Reads `outpoints` with `lookup`, which returns an output if it is unspent at the parent.
+///
+/// Returns [`ParentInputs::Missing`] with the first missing input in `outpoints` order, or
+/// [`ParentInputs::Unspent`] if every input was found and their locking scripts fit in
+/// `max_kept_bytes`, or [`ParentInputs::Inconclusive`] otherwise. Repeated outpoints are read
+/// once, and inputs after one already known to be missing are not read, so an invalid block can't
+/// make this keep more than `max_kept_bytes` of scripts.
+fn read_parent_inputs(
+    outpoints: &[transparent::OutPoint],
+    max_kept_bytes: usize,
+    lookup: impl Fn(&transparent::OutPoint) -> Option<Utxo> + Sync,
+) -> ParentInputs {
+    let mut seen = HashSet::with_capacity(outpoints.len());
+    let outpoints: Vec<transparent::OutPoint> = outpoints
+        .iter()
+        .copied()
+        .filter(|outpoint| seen.insert(*outpoint))
+        .collect();
+
+    // The lowest index found missing so far. Only inputs after it are skipped, so every input
+    // before the first missing one is still read and the reported input stays first in order.
+    let first_missing = AtomicUsize::new(usize::MAX);
+    let kept_bytes = AtomicUsize::new(0);
+    let read = |(index, outpoint): (usize, &transparent::OutPoint)| {
+        if index > first_missing.load(Ordering::Relaxed) {
+            return ParentInputRead::Skipped;
+        }
+        let Some(utxo) = lookup(outpoint) else {
+            first_missing.fetch_min(index, Ordering::Relaxed);
+            return ParentInputRead::Missing;
+        };
+        let size = utxo.output.lock_script.as_raw_bytes().len();
+        let fits = kept_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
+                kept.checked_add(size)
+                    .filter(|&total| total <= max_kept_bytes)
+            })
+            .is_ok();
+        if fits {
+            ParentInputRead::Kept(utxo)
+        } else {
+            ParentInputRead::Dropped
+        }
+    };
+    let reads: Vec<ParentInputRead> = if outpoints.len() >= MIN_PARALLEL_PARENT_INPUT_READS {
+        use rayon::prelude::*;
+        let read_all = || outpoints.par_iter().enumerate().map(read).collect();
+        let wide_pool = (outpoints.len() >= MIN_WIDE_PARENT_INPUT_READS)
+            .then(|| PARENT_INPUT_READ_POOL.as_ref())
+            .flatten();
+        match wide_pool {
+            Some(pool) => pool.install(read_all),
+            None => read_all(),
+        }
+    } else {
+        outpoints.iter().enumerate().map(read).collect()
+    };
+
+    let mut utxos = HashMap::with_capacity(outpoints.len());
+    let mut complete = true;
+    for (outpoint, read) in outpoints.iter().zip(reads) {
+        match read {
+            ParentInputRead::Kept(utxo) => {
+                utxos.insert(*outpoint, utxo);
+            }
+            ParentInputRead::Missing => return ParentInputs::Missing(*outpoint),
+            // Skipped inputs only follow a missing one, which returns above.
+            ParentInputRead::Dropped | ParentInputRead::Skipped => complete = false,
+        }
+    }
+    if complete {
+        ParentInputs::Unspent(Arc::new(utxos))
+    } else {
+        ParentInputs::Inconclusive
+    }
+}
+
 /// Checks `outpoints` against the UTXO set at `parent`.
 ///
-/// Returns [`ParentInputs::Missing`] only if `parent` is the finalized tip, or if `parent` is in a
-/// non-finalized chain that continues the finalized tip. Finalization can remove an output that a
-/// block after `parent` spends, so callers must discard the result if the finalized tip changes
-/// during this read.
+/// Returns [`ParentInputs::Unspent`] with every spent output, or [`ParentInputs::Missing`] with
+/// the first missing input in `outpoints` order, as [`read_parent_inputs`] describes. Returns
+/// either one only if `parent` is the finalized tip, or if `parent` is in a non-finalized chain
+/// that continues the finalized tip. Finalization can remove an output that a block after
+/// `parent` spends, so callers must discard the result if the finalized tip changes during this
+/// read.
 pub fn parent_inputs(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
@@ -310,17 +482,15 @@ pub fn parent_inputs(
     parent: block::Hash,
     outpoints: &[transparent::OutPoint],
 ) -> ParentInputs {
-    let first_missing = |chain: Option<&Arc<Chain>>| {
-        outpoints
-            .iter()
-            .copied()
-            .find(|outpoint| unspent_utxo(chain, db, *outpoint).is_none())
-            .map_or(ParentInputs::Inconclusive, ParentInputs::Missing)
+    let read_inputs = |chain: Option<&Arc<Chain>>| {
+        read_parent_inputs(outpoints, MAX_KEPT_PARENT_INPUT_BYTES, |outpoint| {
+            unspent_utxo(chain, db, *outpoint)
+        })
     };
 
     // The database holds exactly the finalized tip's UTXO set.
     if parent == finalized_hash {
-        return first_missing(None);
+        return read_inputs(None);
     }
     // No chain can accept a child of a block below the finalized tip.
     if db.height(parent).is_some() {
@@ -348,7 +518,7 @@ pub fn parent_inputs(
             .blocks
             .values()
             .next()
-            .map(|root| root.block.header.previous_block_hash)
+            .map(|root| root.block.header().previous_block_hash)
             == Some(finalized_hash)
     } else {
         root_height <= finalized_height
@@ -358,7 +528,7 @@ pub fn parent_inputs(
         return ParentInputs::Inconclusive;
     }
 
-    first_missing(Some(&chain))
+    read_inputs(Some(&chain))
 }
 
 /// Returns the [`Hash`](transaction::Hash) of the transaction that spent an output at
@@ -466,4 +636,105 @@ pub fn any_block_info<'a, C: AsRef<Chain> + 'a>(
     chains
         .find_map(|chain| chain.as_ref().block_info(hash_or_height))
         .or_else(|| db.block_info(hash_or_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use zakura_chain::{amount::Amount, transparent::Script};
+
+    use super::*;
+
+    /// Returns `count` distinct outpoints.
+    fn outpoints(count: usize) -> Vec<transparent::OutPoint> {
+        (0..count)
+            .map(|index| transparent::OutPoint {
+                hash: transaction::Hash([7; 32]),
+                index: u32::try_from(index).expect("test counts fit in u32"),
+            })
+            .collect()
+    }
+
+    /// Returns an output with a `script_len`-byte locking script.
+    fn utxo(script_len: usize) -> Utxo {
+        Utxo::new(
+            transparent::Output {
+                value: Amount::zero(),
+                lock_script: Script::new(&vec![0; script_len]),
+            },
+            Height(1),
+            false,
+        )
+    }
+
+    /// Both parallel paths return every output, and report the first missing input in order.
+    #[test]
+    fn parallel_reads_keep_outputs_and_input_order() {
+        for count in [MIN_PARALLEL_PARENT_INPUT_READS, MIN_WIDE_PARENT_INPUT_READS] {
+            let inputs = outpoints(count);
+
+            let ParentInputs::Unspent(utxos) =
+                read_parent_inputs(&inputs, usize::MAX, |_| Some(utxo(1)))
+            else {
+                panic!("every input exists, so {count} inputs are unspent");
+            };
+            assert_eq!(utxos.len(), count);
+
+            let (first, second) = (inputs[count / 2], inputs[count - 1]);
+            assert_eq!(
+                read_parent_inputs(&inputs, usize::MAX, |outpoint| {
+                    (*outpoint != first && *outpoint != second).then(|| utxo(1))
+                }),
+                ParentInputs::Missing(first),
+                "{count} inputs"
+            );
+        }
+    }
+
+    /// Outputs past the byte limit make the check inconclusive, unless an input is missing.
+    #[test]
+    fn kept_output_bytes_are_limited() {
+        let inputs = outpoints(MIN_WIDE_PARENT_INPUT_READS);
+        let total = inputs.len() * 10;
+
+        assert!(matches!(
+            read_parent_inputs(&inputs, total, |_| Some(utxo(10))),
+            ParentInputs::Unspent(_)
+        ));
+        assert_eq!(
+            read_parent_inputs(&inputs, total - 1, |_| Some(utxo(10))),
+            ParentInputs::Inconclusive
+        );
+
+        let missing = inputs[inputs.len() - 1];
+        assert_eq!(
+            read_parent_inputs(&inputs, 0, |outpoint| (*outpoint != missing)
+                .then(|| utxo(10))),
+            ParentInputs::Missing(missing)
+        );
+    }
+
+    /// Repeated outpoints are read once, and inputs after a missing one are not read.
+    #[test]
+    fn repeated_and_later_inputs_are_not_read() {
+        let lookups = AtomicUsize::new(0);
+        let repeated = vec![outpoints(1)[0]; MIN_WIDE_PARENT_INPUT_READS];
+        read_parent_inputs(&repeated, usize::MAX, |_| {
+            lookups.fetch_add(1, Ordering::Relaxed);
+            Some(utxo(1))
+        });
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+
+        let lookups = AtomicUsize::new(0);
+        let inputs = outpoints(MIN_PARALLEL_PARENT_INPUT_READS - 1);
+        assert_eq!(
+            read_parent_inputs(&inputs, usize::MAX, |_| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+            ParentInputs::Missing(inputs[0])
+        );
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+    }
 }

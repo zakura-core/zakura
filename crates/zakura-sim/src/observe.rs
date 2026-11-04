@@ -3,7 +3,7 @@
 //! Checkers read only the [`ObservationLog`]. Each entry carries the step
 //! that appended it. Step 0 is setup, before the first pick.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::Label;
 
@@ -449,6 +449,10 @@ pub enum StorageFact {
         request: StorageRequest,
         /// A digest of the request.
         digest: String,
+        /// The header-sync reactor's port call that submitted it, or `None`
+        /// for an operation no reactor call's poll submitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
     },
     /// The caller dropped its call while the operation was pending.
     CallerDropped {
@@ -659,11 +663,15 @@ pub enum StorageFact {
         /// defers actions.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         deferred: Vec<StorageRequest>,
+        /// Those of `dropped` whose call still existed, which can leave no
+        /// drop receipt. Only header storage reports them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        callers_alive: Vec<u64>,
     },
 }
 
 /// A work owner with every field of its typed form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkOwner {
     /// `header`, `body-repair`, or `body` for block sync's body work.
     pub kind: String,
@@ -714,7 +722,7 @@ pub struct BodyScope {
 }
 
 /// A header work scope: a generation and the branch it pursues.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkScope {
     /// The header generation.
     pub header_generation: u64,
@@ -723,7 +731,7 @@ pub struct WorkScope {
 }
 
 /// A branch, by its anchor and target hashes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageBranch {
     /// The anchor's hash.
     pub anchor: String,
@@ -1160,10 +1168,9 @@ pub enum ReactorFact {
         /// The call's number.
         call: u64,
         /// How it ended: `replied`, `port-error`, `timed-out`,
-        /// `not-submitted` or `port-panicked`.
+        /// `not-submitted`, `port-panicked` or `dropped`.
         end: String,
-        /// The storage operation the call is paired with. The tap doesn't
-        /// pair calls, so it always logs `None`.
+        /// The storage operation the call is paired with.
         op: Option<u64>,
     },
     /// The reactor finished processing a call's completion.
@@ -1172,6 +1179,20 @@ pub enum ReactorFact {
         call: u64,
         /// Whether the call's future was caught panicking.
         panicked: bool,
+    },
+    /// A request joined a locator call in flight.
+    StorageJoined {
+        /// The call in flight.
+        call: u64,
+    },
+    /// The reactor refused a storage call before it started.
+    StorageRefused {
+        /// The refused call's number.
+        call: u64,
+        /// `locator`, `vct-context`, `prepare` or `apply`.
+        kind: String,
+        /// `locator-capacity`, `local-operation-busy` or `external-queue`.
+        cause: String,
     },
     /// An active request started.
     Started {
@@ -1443,6 +1464,8 @@ pub enum BlockSyncFact {
     },
     /// The sequencer's retained bodies.
     Sequencer {
+        /// Every runtime payload, independently of policy membership.
+        payloads: Vec<BlockSyncPayload>,
         /// Each reorder-buffer body.
         reorder: Vec<BlockSyncRetained>,
         /// Each `applying` body.
@@ -1450,8 +1473,43 @@ pub enum BlockSyncFact {
         /// Each submission the driver can still retain.
         submissions: Vec<BlockSyncSubmission>,
     },
+    /// The reactor completed a view, reset, or query transition.
+    Reactor {
+        /// The transition.
+        transition: crate::record::machine::ReactorAction,
+        /// The reactor's logical state after it.
+        state: BlockSyncReactorState,
+    },
     /// The sequencer task is dropping and takes no more bodies.
     SequencerClosed,
+}
+
+/// The reactor's logical state after a transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockSyncReactorState {
+    /// The accepted query awaiting a reply.
+    pub pending: Option<crate::record::machine::ReactorQuery>,
+    /// The next accepted query's ID.
+    pub next_query_id: Option<u64>,
+    /// Whether a retry deadline is armed.
+    pub retry_armed: bool,
+    /// Whether the next proposal owes a refused or failed query's force.
+    pub retry_forced: bool,
+    /// Whether the action channel reported closed.
+    pub dispatch_closed: bool,
+    /// The committed body-work authority, if the reactor has one.
+    pub scope: Option<crate::record::machine::BodyAuthority>,
+    /// Verified-tip mirror.
+    pub verified_tip: u32,
+    /// Query and scheduling floor.
+    pub request_floor: u32,
+    /// Header-tip mirror.
+    pub header_tip: u32,
+    /// Last `reset_epoch` the reactor reacted to.
+    pub reset_epoch: u64,
+    /// Last `reaction_epoch` the reactor reacted to.
+    pub reaction_epoch: u64,
 }
 
 /// A body one or more sequencer holders retain.
@@ -1559,9 +1617,22 @@ pub struct BlockSyncWorkItem {
     pub reserved_bytes: u64,
 }
 
+/// A payload read directly from sequencer runtime storage.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct BlockSyncPayload {
+    /// Runtime identity assigned before policy acceptance.
+    pub id: u64,
+    /// Attributed decoded size measured from the actual payload.
+    pub decoded_attributed_memory_bytes: u64,
+}
+
 /// A reorder-buffer or `applying` body in the sequencer's snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BlockSyncRetained {
+    /// Runtime payload identity.
+    pub payload_id: u64,
+    /// Decoded size recorded in sequencing policy.
+    pub policy_decoded_bytes: u64,
     /// The body.
     #[serde(flatten)]
     pub body: BlockSyncBody,
@@ -1837,6 +1908,62 @@ pub enum TransportFact {
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
+    /// A service session's lifecycle moved one step.
+    SessionLifecycle {
+        /// The service's primary stream kind.
+        kind: u16,
+        /// The step.
+        step: SessionStepFact,
+    },
+}
+
+/// A service session's lifecycle step, in [`TransportFact::SessionLifecycle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "step", rename_all = "kebab-case")]
+pub enum SessionStepFact {
+    /// A local open started.
+    AttemptStarted {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A local open failed before the session started.
+    AttemptFailed {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A member of an inbound offer finished setup.
+    MemberArrived {
+        /// The offer's wire ID, zero for a single-stream session.
+        wire_id: u64,
+        /// The member's stream kind.
+        member: u16,
+    },
+    /// An incomplete inbound offer expired and released its members.
+    OfferExpired {
+        /// The offer's wire ID.
+        wire_id: u64,
+    },
+    /// A generation started all its workers.
+    GenerationInstalled {
+        /// The generation.
+        generation: u64,
+        /// The attempt that opened it, or `None` for a peer-opened session.
+        attempt: Option<u64>,
+    },
+    /// The node refused a complete inbound generation and is retiring it.
+    GenerationParked {
+        /// The generation.
+        generation: u64,
+    },
+    /// Every worker of a generation finished.
+    GenerationExited {
+        /// The generation.
+        generation: u64,
+        /// Whether a local open started it.
+        opened_locally: bool,
+        /// Whether it was the service's current generation.
+        current: bool,
+    },
 }
 
 /// The credit one subscription update adds, in

@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/request.rs
++++ b/crates/zakura-state/src/request.rs
+@@ -2338,7 +2338,7 @@
+         let location = std::panic::Location::caller();
+         let spawn = move |slot: tokio::sync::OwnedSemaphorePermit| {
+             tokio::task::spawn_blocking(move || {
+-                let _slot = slot;
++                drop(slot);
+                 self.span.in_scope(move || {
+                     let result = f();
+                     self.timer

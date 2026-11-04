@@ -37,7 +37,7 @@ use crate::zakura::{
         sample::WireSample,
         BlockHash, HeightLe, WireError,
     },
-    Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen,
+    Cadence, Credit, Frame, MessageRole, MessageRule, PayloadLen, ReactorBudget,
 };
 
 /// The three networks. Mainnet and Testnet share a header size.
@@ -833,6 +833,51 @@ fn every_network_selects_the_layout_for_its_header_size() {
             (layout[0].kind, layout[0].version, layout[0].capability),
             (5, 9, 1 << 10)
         );
+    }
+    on_every_network!(check);
+}
+
+/// Each budget holds its terms exactly, and each network selects the budget
+/// for its header size.
+///
+/// The receive share is the peer's `Status` cadence (602 × 122 bytes), one
+/// subscription's byte credit plus its largest page, and the peer's
+/// unreleased updates: `credit.objects + credit.bytes / smallest page` grants
+/// and one `Close` at 107 bytes each, and one `Open` at 523 bytes. The output
+/// share is one subscription's byte credit plus its largest page.
+#[test]
+fn every_budget_holds_its_terms() {
+    let status = 602 * 122;
+    let credit = 8 * 1024 * 1024;
+    let updates = |smallest: u64| (4_000 + credit / smallest + 1) * 107 + 523;
+    assert_eq!(updates(1_573), 999_154);
+    assert_eq!(updates(263), 3_841_395);
+
+    assert_eq!(
+        CommonMessage::BUDGET,
+        ReactorBudget {
+            receive: status + credit + 2_096_713 + 999_154,
+            output: credit + 2_096_713,
+        }
+    );
+    assert_eq!(CommonMessage::BUDGET.receive, 11_557_919);
+    assert_eq!(HEADER_SYNC_BUDGET, CommonMessage::BUDGET);
+    assert_eq!(
+        RegtestMessage::BUDGET,
+        ReactorBudget {
+            receive: status + credit + 1_348_082 + 3_841_395,
+            output: credit + 1_348_082,
+        }
+    );
+    assert_eq!(RegtestMessage::BUDGET.receive, 13_651_529);
+    assert_eq!(
+        (CommonMessage::BUDGET.output, RegtestMessage::BUDGET.output),
+        (10_485_321, 9_736_690)
+    );
+
+    /// Check `network`'s budget against the `HEADER_BYTES` family.
+    fn check<const HEADER_BYTES: usize>(network: &Network) {
+        assert_eq!(budget(network), Message::<HEADER_BYTES>::BUDGET);
     }
     on_every_network!(check);
 }

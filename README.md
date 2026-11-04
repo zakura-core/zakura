@@ -108,22 +108,35 @@ cargo install --locked zakura
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/zakura-core/zakura --tag v1.7.0 zakura
+cargo install --git https://github.com/zakura-core/zakura --tag v1.8.2 zakura
 ```
 
-Native x86-64 builds automatically use Pasta field assembly when the build
-CPU supports BMI2 and ADX. This selection happens at build time, so a local
-binary may not run on an older CPU. To build a binary for redistribution, use:
+Standard x86-64 builds enable Pasta field assembly through the default
+`x86_64-asm` Cargo feature. Both BMI2 and ADX CPU extensions are required;
+`RUSTFLAGS` is not needed:
+
+```sh
+cargo build --locked --release --package zakura
+```
+
+This selects assembly at build time, with no CPU detection in arithmetic calls.
+The node checks CPU compatibility once at startup and exits with a clear error
+when either extension is missing. Official release binaries and Docker images
+use the same default. AArch64 assembly selection is unchanged.
+
+For an older x86-64 CPU, enable the `portable` override:
 
 ```sh
 cargo build --locked --release --package zakura --features portable
 ```
 
-Official release binaries and Docker runtime images enable `portable` and do
-not require BMI2 or ADX for Pasta arithmetic. This feature does not override
-custom compiler flags such as `-C target-cpu=native`; avoid CPU-specific flags
-when building for other machines. Default local builds keep automatic assembly
-selection, including with `--release`.
+The `portable` feature wins when both Cargo features are enabled, including
+with `--all-features`. It only affects Pasta arithmetic: CPU-specific compiler
+flags such as `-C target-cpu=native` can still emit instructions elsewhere that
+require the build machine's CPU. Omit such flags when building a portable binary.
+
+Builds that disable default features can still select assembly explicitly with
+`--features x86_64-asm`, or through compiler target flags that enable BMI2 and ADX.
 
 You can start Zakura by running
 

@@ -102,8 +102,8 @@ jobs:
           grep -Eq 'uid=10001\(zebra\).*gid=10001\(zebra\)' <<< "$id_output"
 
           docker run --rm "$IMAGE" zakurad --version
-          docker run --rm "$IMAGE" zakura-rollback-state --help >/dev/null
-          docker run --rm "$IMAGE" zakura-prune-state --help >/dev/null
+          docker run --rm "$IMAGE" zakurad rollback-state --help >/dev/null
+          docker run --rm "$IMAGE" zakurad prune-state --help >/dev/null
 
       - name: Test default startup
         env:

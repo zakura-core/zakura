@@ -26,7 +26,9 @@ async fn peer_block_lookup_queries_all_active_chains() {
         let expected_block = expected_block.clone();
         async move {
             assert_eq!(request, zakura_state::Request::AnyChainBlock(hash.into()));
-            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(expected_block)))
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(Some(
+                expected_block.into(),
+            )))
         }
     });
     let state = Buffer::new(BoxService::new(state), 1);
@@ -35,7 +37,7 @@ async fn peer_block_lookup_queries_all_active_chains() {
         block_by_hash_or_pending(state, PendingBlockRegistry::default(), hash)
             .await
             .expect("the state lookup succeeds"),
-        Some(block),
+        Some(block.into()),
     );
 }
 
@@ -70,7 +72,7 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
         block_by_hash_or_pending(state, pending_blocks, hash)
             .await
             .expect("the pending lookup succeeds"),
-        Some(block),
+        Some(block.into()),
     );
     assert!(!state_called.load(Ordering::SeqCst));
 }
@@ -141,7 +143,9 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
             .iter()
             .find(|block| block.hash() == hash)
             .cloned();
-        async move { Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(block)) }
+        async move {
+            Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(block.map(Into::into)))
+        }
     });
 
     let sidecar: SocketAddr = "127.0.0.1:18233".parse()?;
@@ -163,10 +167,14 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
             DEFAULT_MAX_CONNS_PER_IP,
             Span::none(),
         ))),
-        block_download_peer_set: Buffer::new(
-            BoxService::new(MockService::build().for_unit_tests()),
+        block_download_peer_set: tower::util::BoxCloneSyncService::new(Buffer::new(
+            BoxService::new(MockService::build().for_unit_tests::<
+                zakura_network::Request,
+                zakura_network::Response,
+                crate::BoxError,
+            >()),
             1,
-        ),
+        )),
         block_verifier: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
         mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
         state: Buffer::new(BoxService::new(state), 1),
@@ -184,7 +192,7 @@ async fn zcashd_compat_block_requests_skip_the_byte_limit() -> Result<(), crate:
         Response::Blocks(
             blocks
                 .iter()
-                .map(|block| Available((block.clone(), None)))
+                .map(|block| Available((block.clone().into(), None)))
                 .collect(),
         )
     };

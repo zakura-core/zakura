@@ -436,7 +436,9 @@ where
                         .expect("the state returns at most `count` blocks, which is a u32");
 
                     for (height, data) in blocks {
-                        let send = response_sender.send(Ok(BlockAndHeight::new(height, data)));
+                        // The funded result stays alive until the bounded channel accepts this copy.
+                        let send =
+                            response_sender.send(Ok(BlockAndHeight::new(height, data.to_vec())));
                         match tokio::time::timeout(SEND_TIMEOUT, send).await {
                             Ok(Ok(())) => {}
                             Ok(Err(_)) => {

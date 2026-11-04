@@ -5,12 +5,13 @@
 // TODO: move these tests into tests::vectors and tests::prop modules.
 
 use std::{env, sync::Arc, time::Duration};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 use tokio::{runtime::Runtime, time::timeout};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{
-    block::{self, Block, CountedHeader, Height},
+    block::{self, Block, Height},
     chain_tip::ChainTip,
     fmt::SummaryDebug,
     parameters::{Network, NetworkUpgrade},
@@ -215,6 +216,384 @@ async fn await_block_info_waits_for_checkpoint_commit() {
     assert!(matches!(response, Response::BlockInfo(Some(_))));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charged() {
+    use zakura_node_services::block_memory::{
+        model::Probe, Admission, BlockHandle, DecodedBlockPool,
+    };
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let (mut state, read, tip, changes) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .unwrap();
+    let child: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let bytes = child.attributed_memory_size_bytes();
+    let hash = child.hash();
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+    let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
+    let probe = Probe::new(&child);
+    drop(
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(
+            BlockHandle::from(child),
+        )),
+    );
+    assert_eq!(state.finalized_state_queued_blocks.len(), 1);
+    assert_decoded_payload_retained(&probe, &pool, bytes);
+
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(genesis.into()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    timeout(limit, async {
+        while tip.best_tip_hash() != Some(hash) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the real writer commits the cancelled caller's child");
+    assert_decoded_payload_retained(&probe, &pool, bytes);
+    drop((state, read));
+    assert_decoded_payload_retained(&probe, &pool, bytes);
+    drop((tip, changes));
+    wait_for_decoded_payload_release(&probe, &pool, limit).await;
+}
+
+fn assert_decoded_payload_retained(
+    probe: &zakura_node_services::block_memory::model::Probe,
+    pool: &DecodedBlockPool,
+    bytes: u64,
+) {
+    let allocation = probe.read(1, std::slice::from_ref(pool)).unwrap();
+    assert!(bytes > 0);
+    assert!(
+        allocation.holders > 0,
+        "the retained payload has a settlement owner"
+    );
+    assert_eq!(allocation.pool, Some(0));
+    assert_eq!(
+        allocation.header_holders, 1,
+        "no raw header escapes its owner"
+    );
+    assert_eq!(
+        allocation.transaction_holders,
+        vec![1],
+        "no raw transaction escapes its owner"
+    );
+    assert_eq!(allocation.measured_bytes, Some(bytes));
+    assert_eq!(
+        pool.reserved_bytes(),
+        bytes,
+        "actual backend retention remains charged"
+    );
+}
+
+async fn wait_for_decoded_payload_release(
+    probe: &zakura_node_services::block_memory::model::Probe,
+    pool: &DecodedBlockPool,
+    limit: Duration,
+) {
+    timeout(limit, async {
+        while pool.reserved_bytes() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("backend teardown settles its final charge");
+    let allocation = probe.read(1, std::slice::from_ref(pool)).unwrap();
+    assert_eq!(allocation.holders, 0, "no owner survives settlement");
+    assert_eq!(
+        allocation.header_holders, 0,
+        "no header survives the final owner"
+    );
+    assert_eq!(
+        allocation.transaction_holders,
+        vec![0],
+        "no transaction survives the final owner"
+    );
+    assert_eq!(
+        pool.reserved_bytes(),
+        0,
+        "the final owner settles its charge"
+    );
+}
+
+/// Cloned service reads and native range reads share the database's live worker cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
+    use crate::{request::TimedSpan, ReadRequest, ReadResponse};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use zakura_chain::{diagnostic::CodeTimer, serialization::ZcashSerialize};
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let config = Config {
+        read_concurrency_limit: std::num::NonZeroU16::MIN,
+        ..Config::ephemeral()
+    };
+    let (mut state, read, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis: Arc<Block> = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap(),
+    );
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let workers = read.db.read_worker_capacity();
+    let active = Arc::new(AtomicBool::new(false));
+    let running = active.clone();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let first = TimedSpan::new(
+        CodeTimer::start_desc("blocked_state_read"),
+        tracing::Span::none(),
+    )
+    .spawn_blocking(workers.clone(), move || {
+        running.store(true, Ordering::SeqCst);
+        started.send(()).unwrap();
+        release_rx.recv_timeout(limit).unwrap();
+        running.store(false, Ordering::SeqCst);
+        Ok(())
+    });
+    timeout(limit, started_rx).await.unwrap().unwrap();
+    drop(first);
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(
+        workers.slots.available_permits(),
+        0,
+        "the cancelled caller leaves its worker charged"
+    );
+
+    let ReadResponse::Tip(Some((height, hash))) = timeout(
+        Duration::from_secs(1),
+        read.clone().oneshot(ReadRequest::Tip),
+    )
+    .await
+    .expect("control read must progress while the data worker stays occupied")
+    .unwrap() else {
+        panic!("the control read returns the stored tip")
+    };
+    assert_eq!((height, hash), (Height(0), genesis.hash()));
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(workers.slots.available_permits(), 0);
+
+    let mut block_reader = read.clone();
+    let mut block_read = block_reader
+        .ready()
+        .await
+        .unwrap()
+        .call(ReadRequest::Block(Height(0).into()));
+    assert!(
+        timeout(Duration::from_millis(100), &mut block_read)
+            .await
+            .is_err(),
+        "ordinary state reads must wait for the shared worker slot"
+    );
+    let mut range_reader = read.clone();
+    let range_read = range_reader.read_owned_block_range(Height(0), 1, u32::MAX, (), |_| false);
+    tokio::pin!(range_read);
+    assert!(
+        timeout(Duration::from_millis(100), &mut range_read)
+            .await
+            .is_err(),
+        "owned range reads must wait for the shared worker slot"
+    );
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(workers.slots.available_permits(), 0);
+
+    release.send(()).unwrap();
+    let ReadResponse::Block(Some(block)) = timeout(limit, block_read).await.unwrap().unwrap()
+    else {
+        panic!("the admitted read returns the stored genesis block")
+    };
+    assert_eq!(block.hash(), genesis.hash());
+    let (blocks, ()) = timeout(limit, range_read)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts();
+    assert_eq!(
+        blocks,
+        vec![(Height(0), genesis.zcash_serialize_to_vec().unwrap())]
+    );
+    assert!(!active.load(Ordering::SeqCst));
+    assert_eq!(
+        workers.slots.available_permits(),
+        1,
+        "completed workers release their slots"
+    );
+}
+
+/// Each real state snapshot or read result keeps its allocation charged after
+/// invalidation and writer shutdown. The final drop releases the actual payloads.
+#[tokio::test(flavor = "multi_thread")]
+async fn retired_state_snapshots_and_read_results_keep_decoded_ownership() {
+    use zakura_node_services::block_memory::{
+        model::Probe, Admission, BlockHandle, DecodedBlockPool,
+    };
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    for (keep, name) in ["snapshot", "range", "block", "header", "transaction"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut chain = v4_coinbase_mainnet_chain();
+        let mut state = state_with_finalized_parent(&chain).await;
+        let read = state.read_service.clone();
+        let child = Arc::try_unwrap(chain.pop().unwrap()).unwrap();
+        let bytes = child.attributed_memory_size_bytes();
+        let hash = child.hash();
+        let transaction_hash = child.transactions[0].hash();
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+        let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&child);
+        let child = SemanticallyVerifiedBlock::from(BlockHandle::from(child));
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(child, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        wait_for_idle_writer(&state, limit).await;
+
+        let mut snapshot = Some(read.latest_non_finalized_state());
+        assert_eq!(
+            snapshot
+                .as_ref()
+                .unwrap()
+                .best_chain()
+                .unwrap()
+                .block(hash.into())
+                .unwrap()
+                .hash,
+            hash
+        );
+        let mut range = Some(read.block_range_snapshot().unwrap());
+        assert_eq!(
+            range
+                .as_ref()
+                .unwrap()
+                .block_and_size(&read.db, Height(2))
+                .unwrap()
+                .unwrap()
+                .0
+                .hash(),
+            hash
+        );
+        let crate::ReadResponse::Block(Some(block)) = timeout(
+            limit,
+            read.clone().oneshot(crate::ReadRequest::Block(hash.into())),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("the live block is readable")
+        };
+        let crate::ReadResponse::BlockHeader { header, .. } = timeout(
+            limit,
+            read.clone()
+                .oneshot(crate::ReadRequest::BlockHeader(hash.into())),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("the live header is readable")
+        };
+        let crate::ReadResponse::Transaction(Some(transaction)) = timeout(
+            limit,
+            read.clone()
+                .oneshot(crate::ReadRequest::Transaction(transaction_hash)),
+        )
+        .await
+        .unwrap()
+        .unwrap() else {
+            panic!("the live transaction is readable")
+        };
+        let (mut block, mut header, mut transaction) =
+            (Some(block), Some(header), Some(transaction.tx));
+        assert_decoded_payload_retained(&probe, &pool, bytes);
+
+        timeout(limit, state.ready()).await.unwrap().unwrap();
+        timeout(limit, state.call(Request::InvalidateBlock(hash)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            timeout(
+                limit,
+                read.clone().oneshot(crate::ReadRequest::Block(hash.into()))
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            crate::ReadResponse::Block(None)
+        ));
+        if keep != 0 {
+            drop(snapshot.take());
+        }
+        if keep != 1 {
+            drop(range.take());
+        }
+        if keep != 2 {
+            drop(block.take());
+        }
+        if keep != 3 {
+            drop(header.take());
+        }
+        if keep != 4 {
+            drop(transaction.take());
+        }
+        drop((state, read));
+
+        tracing::info!(retained = name, "checking retention after writer shutdown");
+        if let Some(snapshot) = &snapshot {
+            assert_eq!(
+                snapshot
+                    .best_chain()
+                    .unwrap()
+                    .block(hash.into())
+                    .unwrap()
+                    .hash,
+                hash
+            );
+        }
+        if let Some(block) = &block {
+            assert_eq!(block.hash(), hash);
+        }
+        if let Some(header) = &header {
+            assert_eq!(header.hash(), hash);
+        }
+        if let Some(transaction) = &transaction {
+            assert_eq!(transaction.hash(), transaction_hash);
+        }
+        assert_decoded_payload_retained(&probe, &pool, bytes);
+        drop((snapshot, range, block, header, transaction));
+        wait_for_decoded_payload_release(&probe, &pool, limit).await;
+    }
+}
+
 /// Returns Mainnet blocks 0..=2 with v4 coinbases, so block 2 can reach the non-finalized state.
 fn v4_coinbase_mainnet_chain() -> Vec<Arc<Block>> {
     let mut chain: Vec<Arc<Block>> = Vec::new();
@@ -246,6 +625,63 @@ async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
         assert!(matches!(result, Ok(Ok(_))), "checkpoint commit: {result:?}");
     }
     state
+}
+
+/// Capacity refusal must precede the writer's logical and durable operator change.
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_tip_capacity_refuses_invalidation_before_changing_the_writer() {
+    use zakura_node_services::block_memory::AdmissionFailure;
+    let _guard = zakura_test::init();
+    let deadline = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+    let child = chain.last().unwrap().clone();
+    let hash = child.hash();
+    timeout(
+        deadline,
+        state.queue_and_commit_to_non_finalized_state(SemanticallyVerifiedBlock::from(child), None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    wait_for_idle_writer(&state, deadline).await;
+    let read = state.read_service.clone();
+    let mut tips: Vec<_> = (0..crate::constants::CHAIN_TIP_BLOCK_RETENTION)
+        .map(|_| super::finalized_chain_tip(&read.db).unwrap().unwrap())
+        .collect();
+
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    let error = timeout(deadline, state.call(Request::InvalidateBlock(hash)))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::error::InvalidateError>(),
+        Some(crate::error::InvalidateError::BlockAdmission(
+            AdmissionFailure::Capacity
+        ))
+    ));
+
+    // This request reads the writer's actual chain set, not its last published snapshot.
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    timeout(deadline, state.call(Request::PreciousBlock(hash)))
+        .await
+        .unwrap()
+        .expect("capacity refusal must leave the writer's block eligible");
+    assert_eq!(
+        read.best_tip().unwrap().1,
+        hash,
+        "capacity refusal must preserve the writer selected tip"
+    );
+
+    drop(tips.pop());
+    timeout(deadline, state.ready()).await.unwrap().unwrap();
+    timeout(deadline, state.call(Request::InvalidateBlock(hash)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.best_tip().unwrap().1, chain[1].hash());
 }
 
 fn await_block_info_error(result: Result<Response, BoxError>) -> crate::AwaitBlockInfoError {
@@ -540,7 +976,7 @@ impl Fixture {
             &self.non_finalized,
             &self.finalized.db,
             crate::BlockCommitmentData {
-                block: child,
+                block: child.into(),
                 auth_data_root: None,
             },
         )
@@ -638,13 +1074,21 @@ fn prepared_relay_preflight_rejects_time_at_or_below_median() {
             .take(11)
             .last()
             .expect("the context has a median-time window")
-            .header
+            .unwrap()
+            .view()
+            .header()
             .time;
     Arc::make_mut(&mut Arc::make_mut(&mut child).header).time = too_early;
     let relevant_data =
         super::any_ancestor_blocks(&fixture.non_finalized, &fixture.finalized.db, parent_hash)
             .take(POW_ADJUSTMENT_BLOCK_SPAN)
-            .map(|block| (block.header.difficulty_threshold, block.header.time));
+            .map(|block| {
+                let block = block.unwrap();
+                (
+                    block.view().header().difficulty_threshold,
+                    block.view().header().time,
+                )
+            });
     let expected_target =
         AdjustedDifficulty::new_from_block(&child, &fixture.network, relevant_data)
             .expect("the context derives an expected target")
@@ -727,9 +1171,14 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
     // `child` extends the finalized tip, so it can be committed as soon as it is queued.
     // `grandchild` can only be released by `child`.
     let child = chain[2].clone().prepare();
-    assert_eq!(child.block.header.previous_block_hash, chain[1].hash());
+    assert_eq!(
+        child.block.view().header().previous_block_hash,
+        chain[1].hash()
+    );
 
-    let mut grandchild_block = (*child.block).clone();
+    let mut grandchild_block = crate::tests::copy_block_fixture(&child.block)
+        .as_ref()
+        .clone();
     Arc::make_mut(&mut grandchild_block.header).previous_block_hash = child.hash;
     let grandchild = Arc::new(grandchild_block).prepare();
     let (grandchild_tx, _grandchild_rx) = tokio::sync::oneshot::channel();
@@ -743,7 +1192,9 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
     // Fill the rest of the queue with blocks whose parents this state will never have.
     let mut orphan_count = 0_u64;
     while !state_service.non_finalized_state_queued_blocks.is_full() {
-        let mut orphan_block = (*child.block).clone();
+        let mut orphan_block = crate::tests::copy_block_fixture(&child.block)
+            .as_ref()
+            .clone();
         Arc::make_mut(&mut orphan_block.header)
             .previous_block_hash
             .0[..8]
@@ -802,7 +1253,7 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
         .zcash_deserialize_into()
         .expect("the child block vector decodes");
     let block = block.prepare();
-    let ancestor = block.block.header.previous_block_hash;
+    let ancestor = block.block.view().header().previous_block_hash;
     state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
     let unrelated = block::Hash([0xff; 32]);
     state.remember_failed_ancestor(unrelated, unrelated, NonFinalizedWriteFailureKind::Invalid);
@@ -1556,11 +2007,9 @@ async fn test_populated_state_responds_correctly(
         .collect();
 
     let block_hashes: Vec<block::Hash> = blocks.iter().map(|block| block.hash()).collect();
-    let block_headers: Vec<CountedHeader> = blocks
+    let block_headers: Vec<zakura_node_services::block_memory::HeaderHandle> = blocks
         .iter()
-        .map(|block| CountedHeader {
-            header: block.header.clone(),
-        })
+        .map(|block| block.header.clone().into())
         .collect();
 
     for (ind, block) in blocks.into_iter().enumerate() {
@@ -1589,12 +2038,12 @@ async fn test_populated_state_responds_correctly(
 
         transcript.push((
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block.clone()))),
+            Ok(Response::Block(Some(block.clone().into()))),
         ));
 
         transcript.push((
             Request::Block(height.into()),
-            Ok(Response::Block(Some(block.clone()))),
+            Ok(Response::Block(Some(block.clone().into()))),
         ));
 
         // Spec: transactions in the genesis block are ignored.
@@ -2154,7 +2603,7 @@ proptest! {
     fn some_block_less_than_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(4, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Canopy)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));
@@ -2171,7 +2620,7 @@ proptest! {
             .coinbase_height()
             .expect("chain contains valid blocks");
 
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(
@@ -2209,7 +2658,7 @@ proptest! {
 
         let response = crate::service::check::legacy_chain(
             nu_activation_height,
-            chain.clone().into_iter().rev(),
+            chain.clone().into_iter().rev().map(|block| Ok(block.into())),
             &network,
             TEST_LEGACY_CHAIN_LIMIT,
         ).map_err(|error| error.to_string());
@@ -2228,7 +2677,7 @@ proptest! {
     fn at_least_one_transaction_with_valid_network_upgrade(
         (network, nu_activation_height, chain) in partial_nu5_chain_strategy(5, true, UNDER_LEGACY_CHAIN_LIMIT, NetworkUpgrade::Nu5)
     ) {
-        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev(), &network, TEST_LEGACY_CHAIN_LIMIT)
+        let response = crate::service::check::legacy_chain(nu_activation_height, chain.into_iter().rev().map(|block| Ok(block.into())), &network, TEST_LEGACY_CHAIN_LIMIT)
             .map_err(|error| error.to_string());
 
         prop_assert_eq!(response, Ok(()));
@@ -2295,7 +2744,7 @@ proptest! {
 
         let mut expected_non_finalized_value_pool = Ok(expected_finalized_value_pool?);
         for block in non_finalized_blocks {
-            let utxos = block.new_outputs.clone();
+            let utxos = block.new_outputs.as_ref().clone();
             let block_value_pool = &block.block.chain_value_pool_change(&network, &transparent::utxos_from_ordered_utxos(utxos), None)?;
             expected_non_finalized_value_pool += *block_value_pool;
 
@@ -2687,7 +3136,7 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
             Some(admission.clone()),
             0,
         ));
-        state.send_ready_non_finalized_queued(parent);
+        state.send_ready_non_finalized(parent, None);
         (admission, rx)
     };
 
@@ -2873,7 +3322,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[1].hash(),
                 vec![coinbase(1)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[1]),
             ),
             (
                 blocks[1].hash(),
@@ -2916,7 +3365,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[5].hash(),
                 vec![coinbase(1), coinbase(3), coinbase(5)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[1, 3, 5]),
             ),
             (
                 blocks[5].hash(),
@@ -2927,18 +3376,34 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
             (
                 blocks[4].hash(),
                 vec![coinbase(3)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[3]),
             ),
             (
                 blocks[4].hash(),
                 vec![coinbase(5)],
                 ParentInputs::Missing(coinbase(5)),
             ),
+            // Multiple missing inputs still report the first in request order.
+            (
+                blocks[4].hash(),
+                vec![coinbase(3), missing, coinbase(5)],
+                ParentInputs::Missing(missing),
+            ),
+            (
+                blocks[4].hash(),
+                vec![coinbase(1), coinbase(3), coinbase(5), missing],
+                ParentInputs::Missing(coinbase(5)),
+            ),
+            (
+                blocks[4].hash(),
+                vec![coinbase(5), missing],
+                ParentInputs::Missing(coinbase(5)),
+            ),
             // The finalized tip excludes non-finalized outputs.
             (
                 blocks[1].hash(),
                 vec![coinbase(1)],
-                ParentInputs::Inconclusive,
+                unspent_coinbases(&blocks, &[1]),
             ),
             (
                 blocks[1].hash(),
@@ -2955,27 +3420,52 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
     .await;
 }
 
+/// Returns the [`ParentInputs::Unspent`] result for the coinbase output of each block in `heights`.
+fn unspent_coinbases(blocks: &[Arc<Block>], heights: &[usize]) -> ParentInputs {
+    ParentInputs::Unspent(Arc::new(
+        heights
+            .iter()
+            .map(|&height| {
+                let coinbase = &blocks[height].transactions[0];
+                (
+                    transparent::OutPoint {
+                        hash: coinbase.hash(),
+                        index: 0,
+                    },
+                    transparent::Utxo::new(
+                        coinbase.outputs()[0].clone(),
+                        Height(u32::try_from(height).expect("test heights are small")),
+                        true,
+                    ),
+                )
+            })
+            .collect(),
+    ))
+}
+
 async fn check_parent_inputs(
     state: &mut StateService,
     cases: impl IntoIterator<Item = (block::Hash, Vec<transparent::OutPoint>, ParentInputs)>,
 ) {
     use tower::{Service, ServiceExt};
     for (parent, outpoints, expected) in cases {
-        let response = state
-            .ready()
-            .await
-            .expect("state is ready")
-            .call(Request::CheckParentInputs {
-                parent,
-                outpoints: outpoints.into(),
-            })
-            .await
-            .expect("the input read succeeds");
-        assert_eq!(
-            response,
-            Response::ParentInputs(expected),
-            "parent {parent:?}"
-        );
+        for outpoints in [outpoints.clone(), outpoints.repeat(64)] {
+            let response = state
+                .ready()
+                .await
+                .expect("state is ready")
+                .call(Request::CheckParentInputs {
+                    parent,
+                    outpoints: outpoints.into(),
+                })
+                .await
+                .expect("the input read succeeds");
+            assert_eq!(
+                response,
+                Response::ParentInputs(expected.clone()),
+                "parent {parent:?}"
+            );
+        }
     }
 }
 
@@ -3041,8 +3531,31 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
     // Sanity: the aligned view proves coinbase(2) present at block 5.
     assert_eq!(
         read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
-        ParentInputs::Inconclusive
+        unspent_coinbases(&blocks, &[2])
     );
+
+    // Repeated inputs against a real chain must still report the first missing input in order.
+    // The parallel paths are covered with distinct inputs in `read::block::tests`.
+    for len in [8, 128] {
+        let mut outpoints: Vec<_> = [1, 2, 3]
+            .into_iter()
+            .cycle()
+            .take(len)
+            .map(coinbase)
+            .collect();
+        assert_eq!(
+            read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[3].hash(), &outpoints),
+            unspent_coinbases(&blocks, &[1, 2, 3]),
+            "{len} inputs"
+        );
+        outpoints[len / 2] = coinbase(5);
+        outpoints[len - 1] = coinbase(4);
+        assert_eq!(
+            read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[3].hash(), &outpoints),
+            ParentInputs::Missing(coinbase(5)),
+            "{len} inputs"
+        );
+    }
 
     // Gap: drop block 2 from the chain, so neither the chain nor the database has it.
     let mut gapped = (**nfs_a.best_chain().expect("best chain")).clone();
@@ -3093,12 +3606,12 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         (
             blocks[5].hash(),
             vec![coinbase(1), coinbase(2), coinbase(5)],
-            ParentInputs::Inconclusive,
+            unspent_coinbases(&blocks, &[1, 2, 5]),
         ),
         (
             blocks[4].hash(),
             vec![coinbase(2), coinbase(4)],
-            ParentInputs::Inconclusive,
+            unspent_coinbases(&blocks, &[2, 4]),
         ),
         (
             blocks[4].hash(),
@@ -3118,7 +3631,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         (
             blocks[2].hash(),
             vec![coinbase(2)],
-            ParentInputs::Inconclusive,
+            unspent_coinbases(&blocks, &[2]),
         ),
         (
             blocks[1].hash(),
@@ -3341,6 +3854,348 @@ async fn rejected_checkpoint_body_fails_descendants_with_a_retryable_error() {
     .await
     .expect("the honest commit completes")
     .expect("the honest body for the same height commits");
+}
+
+/// Opens an ephemeral NU5-from-height-1 Regtest state with genesis committed, which accepts
+/// semantically verified blocks from height 1.
+async fn nu5_state_with_genesis() -> (StateService, Network, Arc<Block>) {
+    use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height(0), 0)
+        .await
+        .expect("the ephemeral state opens");
+    let genesis = block::genesis::regtest_genesis_block();
+    timeout(
+        Duration::from_secs(10),
+        (&mut state).oneshot(Request::CommitCheckpointVerifiedBlock(
+            genesis.clone().into(),
+        )),
+    )
+    .await
+    .expect("the genesis commit completes")
+    .expect("genesis commits");
+    (state, network, genesis)
+}
+
+/// Builds a height-1 child of `genesis` with a v5 coinbase followed by `extra`, whose header
+/// commits to its authorizing data.
+fn nu5_child_of_genesis(
+    network: &Network,
+    genesis: &Arc<Block>,
+    extra: Vec<zakura_chain::transaction::Transaction>,
+) -> Arc<Block> {
+    use zakura_chain::block::CHAIN_HISTORY_ACTIVATION_RESERVED;
+
+    nu5_child(
+        network,
+        genesis,
+        Height(1),
+        &CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        extra,
+    )
+}
+
+/// Builds a child of `parent` at `height` with a v5 coinbase followed by `extra`, whose header
+/// commits to its authorizing data over the parent's `history_root`.
+fn nu5_child(
+    network: &Network,
+    parent: &Arc<Block>,
+    height: Height,
+    history_root: &block::ChainHistoryMmrRootHash,
+    extra: Vec<zakura_chain::transaction::Transaction>,
+) -> Arc<Block> {
+    use zakura_chain::{
+        block::ChainHistoryBlockTxAuthCommitmentHash,
+        transaction::arbitrary::transaction_to_fake_v5,
+    };
+
+    let mut child = parent.make_fake_child();
+    let block = Arc::make_mut(&mut child);
+    let coinbase = transaction_to_fake_v5(&block.transactions[0], network, height);
+    block.transactions = std::iter::once(coinbase)
+        .chain(extra)
+        .map(Arc::new)
+        .collect();
+    let header = Arc::make_mut(&mut block.header);
+    header.merkle_root = block.transactions.iter().collect();
+    header.time += chrono::Duration::seconds(1);
+    let commitment: [u8; 32] = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        history_root,
+        &child.auth_data_root(),
+    )
+    .into();
+    child.set_block_commitment(commitment)
+}
+
+/// Returns `block` with different coinbase authorizing data under the same header.
+///
+/// A v5 transaction ID does not commit to `scriptSig` (ZIP 244), so the Merkle root and block
+/// hash stay the same while the authorizing data root changes.
+fn with_altered_auth_data(block: &Arc<Block>) -> Arc<Block> {
+    let mut mismatched = block.clone();
+    let coinbase = &mut Arc::make_mut(&mut mismatched).transactions[0];
+    match &mut Arc::make_mut(coinbase).inputs_mut()[0] {
+        transparent::Input::Coinbase { data, .. } => data.push(0x42),
+        input => panic!("the first input is the coinbase input: {input:?}"),
+    }
+    assert_eq!(mismatched.hash(), block.hash());
+    assert_eq!(
+        mismatched.header.merkle_root,
+        mismatched.transactions.iter().collect()
+    );
+    assert_ne!(mismatched.auth_data_root(), block.auth_data_root());
+    mismatched
+}
+
+/// Asks `state` whether `block`'s header commits to its authorizing data.
+async fn check(state: &mut StateService, block: Arc<Block>) -> crate::AuthDataCommitment {
+    let call = state.oneshot(Request::CheckAuthDataCommitment(
+        crate::BlockCommitmentData {
+            block: block.into(),
+            auth_data_root: None,
+        },
+    ));
+    match timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the check completes")
+        .expect("the check succeeds")
+    {
+        Response::AuthDataCommitment(commitment) => commitment,
+        response => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// The authorizing data check finds a parent in the non-finalized state, not just at the
+/// finalized tip, and uses that parent's history tree.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_data_commitment_check_uses_a_non_finalized_parent() {
+    use crate::AuthDataCommitment;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let parent = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    timeout(
+        Duration::from_secs(10),
+        (&mut state).oneshot(Request::CommitSemanticallyVerifiedBlock(
+            parent.clone().prepare(),
+        )),
+    )
+    .await
+    .expect("the parent commit completes")
+    .expect("the parent commits");
+
+    let history_root = state
+        .read_service
+        .latest_non_finalized_state()
+        .best_chain()
+        .expect("the parent is in the non-finalized state")
+        .history_block_commitment_tree()
+        .hash()
+        .expect("the parent's history tree is not empty");
+    let child = nu5_child(&network, &parent, Height(2), &history_root, Vec::new());
+
+    assert_eq!(
+        check(&mut state, child.clone()).await,
+        AuthDataCommitment::Bound
+    );
+    let mismatched = check(&mut state, with_altered_auth_data(&child)).await;
+    assert!(
+        matches!(
+            mismatched,
+            AuthDataCommitment::Mismatch(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ),
+        "{mismatched:?}"
+    );
+}
+
+/// The authorizing data check compares a body with its header's NU5 commitment over the
+/// parent's history tree, and reports when that context is unusable.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_data_commitment_check_uses_the_parent_history_tree() {
+    use crate::AuthDataCommitment;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let matching = nu5_child_of_genesis(&network, &genesis, Vec::new());
+    let mismatched = with_altered_auth_data(&matching);
+    // No state has this parent.
+    let orphan = matching.make_fake_child();
+    // The parent tree is empty, and this height is neither its successor nor the Heartwood
+    // activation that lets an empty tree stand in.
+    let mut skipped = Block::clone(&orphan);
+    Arc::make_mut(&mut skipped.header).previous_block_hash = genesis.hash();
+
+    assert_eq!(check(&mut state, matching).await, AuthDataCommitment::Bound);
+    let mismatched = check(&mut state, mismatched).await;
+    assert!(
+        matches!(
+            mismatched,
+            AuthDataCommitment::Mismatch(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ),
+        "{mismatched:?}"
+    );
+    assert_eq!(
+        check(&mut state, orphan).await,
+        AuthDataCommitment::Unavailable
+    );
+    assert_eq!(
+        check(&mut state, Arc::new(skipped)).await,
+        AuthDataCommitment::Unavailable
+    );
+}
+
+/// Commits `block` as semantically verified and returns its contextual validation error.
+async fn commit_failing_semantic_block(
+    state: &mut StateService,
+    block: Arc<Block>,
+) -> ValidateContextError {
+    let error = timeout(
+        Duration::from_secs(10),
+        state.oneshot(Request::CommitSemanticallyVerifiedBlock(block.prepare())),
+    )
+    .await
+    .expect("the commit completes")
+    .expect_err("the body fails contextual validation");
+    let error = error
+        .downcast_ref::<crate::CommitSemanticallyVerifiedError>()
+        .expect("semantic commits fail with the semantic commit error type");
+    match error.inner() {
+        CommitBlockError::ValidateContextError(error) => (**error).clone(),
+        error => panic!("unexpected commit error: {error:?}"),
+    }
+}
+
+/// A contextual failure in a body whose authorizing data its header does not commit to is
+/// reported as that mismatch, even when the failing rule runs before the commitment check.
+///
+/// From v6, anchors are authorizing data and are checked before `hashBlockCommitments`, so the
+/// earlier rule would otherwise be reported instead of the mismatch. A missing transparent output
+/// takes the same early path here.
+#[tokio::test(flavor = "multi_thread")]
+async fn early_contextual_failures_defer_to_the_auth_data_commitment() {
+    use zakura_chain::transaction::LockTime;
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let missing_input = zakura_chain::transaction::Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: zakura_chain::transaction::Hash([9; 32]),
+                index: 0,
+            },
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let matching = nu5_child_of_genesis(&network, &genesis, vec![missing_input]);
+    let mismatched = with_altered_auth_data(&matching);
+
+    let mismatched = commit_failing_semantic_block(&mut state, mismatched).await;
+    assert!(mismatched.is_auth_commitment_mismatch(), "{mismatched:?}");
+
+    // The same header with its committed body fails on its own.
+    let matching = commit_failing_semantic_block(&mut state, matching).await;
+    assert!(
+        matches!(
+            matching,
+            ValidateContextError::MissingTransparentOutput { .. }
+        ),
+        "{matching:?}"
+    );
+}
+
+/// A v6 anchor is authorizing data, and state checks anchors before `hashBlockCommitments`. When
+/// the header does not commit to a body's anchor, its unknown-anchor failure must be reported as
+/// the commitment mismatch.
+#[tokio::test(flavor = "multi_thread")]
+async fn v6_anchor_failures_defer_to_the_auth_data_commitment() {
+    use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
+    use zakura_chain::{
+        amount::Amount,
+        at_least_one, ironwood,
+        orchard::{self, tree},
+        primitives::Halo2Proof,
+        transaction::{LockTime, Transaction},
+    };
+
+    fn anchor(byte: u8) -> tree::Root {
+        let mut bytes = [0; 32];
+        bytes[0] = byte;
+        tree::Root::try_from(bytes).expect("a small anchor is canonical")
+    }
+
+    let _init_guard = zakura_test::init();
+    let (mut state, network, genesis) = nu5_state_with_genesis().await;
+    let action = any::<ironwood::Action>()
+        .new_tree(&mut TestRunner::default())
+        .expect("the action strategy creates a value")
+        .current();
+    // No tree in this state has this anchor.
+    let ironwood_spend = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood::ShieldedData {
+            flags: orchard::Flags::ENABLE_SPENDS,
+            value_balance: Amount::zero(),
+            shared_anchor: anchor(1),
+            proof: Halo2Proof(vec![0; ::orchard::Proof::expected_proof_size(1)]),
+            actions: at_least_one![ironwood::AuthorizedAction {
+                action,
+                spend_auth_sig: [0u8; 64].into(),
+            }],
+            binding_sig: [0u8; 64].into(),
+        }),
+    };
+    let matching = nu5_child_of_genesis(&network, &genesis, vec![ironwood_spend]);
+
+    let mut mismatched = matching.clone();
+    let spend = &mut Arc::make_mut(&mut mismatched).transactions[1];
+    let Transaction::V6 {
+        ironwood_shielded_data: Some(shielded_data),
+        ..
+    } = Arc::make_mut(spend)
+    else {
+        unreachable!("the second transaction is the v6 Ironwood spend");
+    };
+    shielded_data.shared_anchor = anchor(2);
+    assert_eq!(mismatched.hash(), matching.hash());
+    assert_eq!(
+        mismatched.header.merkle_root,
+        mismatched.transactions.iter().collect()
+    );
+    assert_ne!(mismatched.auth_data_root(), matching.auth_data_root());
+
+    let mismatched = commit_failing_semantic_block(&mut state, mismatched).await;
+    assert!(mismatched.is_auth_commitment_mismatch(), "{mismatched:?}");
+
+    // The same header with its committed body fails on its own.
+    let matching = commit_failing_semantic_block(&mut state, matching).await;
+    assert!(
+        matches!(matching, ValidateContextError::UnknownIronwoodAnchor { .. }),
+        "{matching:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3828,4 +4683,163 @@ async fn precious_block_request_fails_fast_during_checkpoint_sync() {
         error,
         crate::PreciousError::ProcessingCheckpointedBlocks
     ));
+}
+
+/// A block whose parent the write task can build on goes straight to the write task, without
+/// passing through the orphan queue, and its outputs stay visible to UTXO lookups.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_with_a_ready_parent_skips_the_orphan_queue() {
+    use std::sync::Mutex;
+
+    use metrics::{
+        Counter, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+
+    #[derive(Default)]
+    struct QueueSizes {
+        values: Mutex<Vec<f64>>,
+    }
+
+    impl GaugeFn for QueueSizes {
+        fn increment(&self, _value: f64) {
+            panic!("the orphan queue reports its absolute size");
+        }
+
+        fn decrement(&self, _value: f64) {
+            panic!("the orphan queue reports its absolute size");
+        }
+
+        fn set(&self, value: f64) {
+            self.values.lock().unwrap().push(value);
+        }
+    }
+
+    #[derive(Default)]
+    struct QueueRecorder {
+        sizes: Arc<QueueSizes>,
+    }
+
+    impl Recorder for QueueRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {
+        }
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(
+            &self,
+            _key: KeyName,
+            _unit: Option<Unit>,
+            _description: SharedString,
+        ) {
+        }
+
+        fn register_counter(&self, _key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            Counter::noop()
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            if key.name() == "state.memory.queued.block.count" {
+                Gauge::from_arc(self.sizes.clone())
+            } else {
+                Gauge::noop()
+            }
+        }
+
+        fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            Histogram::noop()
+        }
+    }
+
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state opens");
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Finish the checkpoint handoff the way `try_handoff_to_non_finalized_write` does.
+    drop(state.block_write_sender.finalized.take());
+    state.non_finalized_block_write_sent_hashes =
+        crate::service::queued_blocks::SentHashes::default();
+    state
+        .non_finalized_block_write_sent_hashes
+        .can_fork_chain_at_hashes = true;
+    let (sender, mut writer) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(sender);
+
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let prepared = block.clone().prepare();
+    let (hash, outpoint) = (
+        prepared.hash,
+        *prepared
+            .new_outputs
+            .keys()
+            .next()
+            .expect("the block creates outputs"),
+    );
+
+    let recorder = QueueRecorder::default();
+    let _response = metrics::with_local_recorder(&recorder, || {
+        state.queue_and_commit_to_non_finalized_state(prepared, None)
+    });
+    assert!(
+        recorder
+            .sizes
+            .values
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|size| *size == 0.0),
+        "a ready block must never temporarily enter the orphan queue"
+    );
+
+    match writer
+        .try_recv()
+        .expect("the block is sent to the write task")
+    {
+        crate::service::write::NonFinalizedWriteMessage::Commit { queued, .. } => {
+            assert_eq!(queued.0.hash, hash)
+        }
+        _ => panic!("expected a commit message"),
+    }
+    assert!(
+        state
+            .non_finalized_state_queued_blocks
+            .get_mut(&hash)
+            .is_none(),
+        "the block was never left in the orphan queue"
+    );
+    assert!(
+        state
+            .non_finalized_block_write_sent_hashes
+            .utxo(&outpoint)
+            .is_some(),
+        "the block's outputs are available while it is being written"
+    );
+
+    let mut orphan = (*block).clone();
+    Arc::make_mut(&mut orphan.header).previous_block_hash = block::Hash([9; 32]);
+    let orphan = Arc::new(orphan).prepare();
+    let orphan_hash = orphan.hash;
+    let _orphan_response = metrics::with_local_recorder(&recorder, || {
+        state.queue_and_commit_to_non_finalized_state(orphan, None)
+    });
+    assert!(
+        recorder.sizes.values.lock().unwrap().contains(&1.0),
+        "the recorder must observe a block waiting for an unknown parent"
+    );
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .get_mut(&orphan_hash)
+        .is_some());
+    assert!(writer.try_recv().is_err());
 }

@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, TransactionHandle};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1126,7 +1127,7 @@ where
     let parent = block.header.previous_block_hash;
     let block = Arc::new(block);
     let request = zakura_consensus::Request::Prepare {
-        block: block.clone(),
+        block: block.clone().into(),
         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
     };
 
@@ -1803,9 +1804,12 @@ where
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
         };
+        // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
+        // runs only after the reservation rejects duplicate and over-capacity submissions.
+        let size = block.zcash_serialized_size();
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
+            block: block.clone().into(),
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -1838,6 +1842,7 @@ where
                             let event = MinedBlockEvent::Early {
                                 hash: block_hash,
                                 height,
+                                size,
                                 submitted_at,
                                 submission,
                                 pending: registration.signal(),
@@ -1866,6 +1871,7 @@ where
                     .send(MinedBlockEvent::Committed {
                         hash: block_hash,
                         height,
+                        size,
                     })
                     .is_err()
                 {
@@ -2387,9 +2393,12 @@ where
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => {
-                    Ok(GetBlockResponse::Raw(block.into()))
-                }
+                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
+                    block
+                        .zcash_serialize_to_vec()
+                        .expect("serialization to memory cannot fail")
+                        .into(),
+                )),
                 zakura_state::ReadResponse::Block(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
@@ -2477,14 +2486,14 @@ where
                 ),
                 zakura_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
-                    let block_time = block.header.time;
+                    let block_time = block.header().time;
                     let transactions = block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .map(|tx| {
                             GetBlockTransaction::Object(Box::new(
                                 TransactionObject::from_transaction(
-                                    tx.clone(),
+                                    tx,
                                     Some(height),
                                     Some(confirmations),
                                     &network,
@@ -2625,18 +2634,28 @@ where
             .clone()
             .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
             .await
-            .map_err(|_| "block height not in best chain")
-            .map_error(
-                // ## Compatibility with `zcashd`.
-                //
-                // Since this function is reused by getblock(), we return the errors
-                // expected by it (they differ whether a hash or a height was passed).
-                if hash_or_height.hash().is_some() {
-                    server::error::LegacyCode::InvalidAddressOrKey
+            .map_err(|error| {
+                if is_read_capacity_refusal(&*error) {
+                    // A capacity refusal says nothing about the block, so the caller can retry.
+                    ErrorObject::new(
+                        server::error::LegacyCode::OutOfMemory,
+                        "state read capacity is temporarily exhausted, retry later",
+                    )
                 } else {
-                    server::error::LegacyCode::InvalidParameter
-                },
-            )?
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    ErrorObject::new(
+                        if hash_or_height.hash().is_some() {
+                            server::error::LegacyCode::InvalidAddressOrKey
+                        } else {
+                            server::error::LegacyCode::InvalidParameter
+                        },
+                        "block height not in best chain",
+                    )
+                }
+            })?
         else {
             panic!("unexpected response to BlockHeader request")
         };
@@ -2955,7 +2974,7 @@ where
                             Some(mined.block_time),
                         ),
                         _ => {
-                            let raw_tx: Arc<Transaction> = tx.into();
+                            let raw_tx: TransactionHandle = tx.into();
                             (raw_tx, None, None, None)
                         }
                     };
@@ -3019,7 +3038,7 @@ where
                     }
                 }
             } else {
-                let tx: Arc<Transaction> = tx.into();
+                let tx: TransactionHandle = tx.into();
                 let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),
@@ -3401,7 +3420,6 @@ where
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
-        let sync_status = self.gbt.sync_status();
         let read_state = self.read_state.clone();
 
         if let Some(HexData(block_proposal_bytes)) = parameters
@@ -3413,11 +3431,10 @@ where
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
-                sync_status,
+                self.gbt.prepared_candidates(),
                 parameters
                     .as_ref()
-                    .and_then(|params| params.work_id.as_deref())
-                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
+                    .and_then(|params| params.work_id.as_deref()),
             )
             .await;
         }
@@ -3459,7 +3476,7 @@ where
                 //
                 // Optional TODO:
                 // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                check_synced_to_tip(&self.network, latest_chain_tip.clone())?;
                 // TODO: return an error if we have no peers, like `zcashd` does,
                 //       and add a developer config that mines regardless of how many peers we have.
                 // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
@@ -3805,23 +3822,26 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block) => block,
-            Err(error) => {
-                tracing::info!(
-                    ?error,
-                    "submit block failed: block bytes could not be deserialized into a structurally valid block"
-                );
+        let block = match self
+            .gbt
+            .prepared_candidates()
+            .decode_submitted(&block_bytes)
+        {
+            Some(block) => block,
+            None => match block_bytes.zcash_deserialize_into::<Block>() {
+                Ok(block) => Arc::new(block),
+                Err(error) => {
+                    tracing::info!(
+                        ?error,
+                        "submit block failed: block bytes could not be deserialized into a structurally valid block"
+                    );
 
-                return Ok(SubmitBlockErrorResponse::Rejected.into());
-            }
+                    return Ok(SubmitBlockErrorResponse::Rejected.into());
+                }
+            },
         };
-        self.run_mined_block_lifecycle(
-            Arc::new(block),
-            submitted_at,
-            MinedBlockSubmission::FullBlock,
-        )
-        .await
+        self.run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::FullBlock)
+            .await
     }
 
     async fn submit_solution(

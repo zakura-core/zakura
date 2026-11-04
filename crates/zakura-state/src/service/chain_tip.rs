@@ -6,6 +6,7 @@
 //! * [ChainTipChange] to `await` specific changes to the chain tip.
 
 use std::{fmt, sync::Arc};
+use zakura_node_services::block_memory::TransactionHandle;
 
 use chrono::{DateTime, Utc};
 use futures::TryFutureExt;
@@ -16,7 +17,7 @@ use zakura_chain::{
     block,
     chain_tip::ChainTip,
     parameters::{Network, NetworkUpgrade},
-    transaction::{self, Transaction},
+    transaction::{self},
 };
 
 use crate::{
@@ -26,6 +27,8 @@ use crate::{
 
 use TipAction::*;
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -60,7 +63,13 @@ pub struct ChainTipBlock {
     pub time: DateTime<Utc>,
 
     /// The block transactions.
-    pub transactions: Vec<Arc<Transaction>>,
+    #[cfg_attr(
+        any(test, feature = "proptest-impl"),
+        proptest(
+            strategy = "any::<Vec<Arc<transaction::Transaction>>>().prop_map(|transactions| transactions.into_iter().map(Into::into).collect())"
+        )
+    )]
+    pub transactions: Vec<TransactionHandle>,
 
     /// The mined transaction IDs of the transactions in `block`,
     /// in the same order as `block.transactions`.
@@ -118,10 +127,10 @@ impl From<ContextuallyVerifiedBlock> for ChainTipBlock {
         Self {
             hash,
             height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
+            time: block.header().time,
+            transactions: block.transactions().collect(),
             transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
+            previous_block_hash: block.header().previous_block_hash,
         }
     }
 }
@@ -142,10 +151,10 @@ impl From<SemanticallyVerifiedBlock> for ChainTipBlock {
         Self {
             hash,
             height,
-            time: block.header.time,
-            transactions: block.transactions.clone(),
+            time: block.header().time,
+            transactions: block.transactions().collect(),
             transaction_hashes,
-            previous_block_hash: block.header.previous_block_hash,
+            previous_block_hash: block.header().previous_block_hash,
         }
     }
 }
@@ -358,8 +367,7 @@ impl LatestChainTip {
     /// while holding the receiver lock as briefly as possible.
     ///
     /// This helper method is a shorter way to borrow the value from the [`watch::Receiver`] and
-    /// extract some information from it, while also adding the current chain tip block's fields as
-    /// records to the current span.
+    /// extract some information from it.
     ///
     /// A single read lock is acquired to clone `T`, and then released after the clone.
     /// See the performance note on [`WatchReceiver::with_watch_data`].
@@ -373,68 +381,38 @@ impl LatestChainTip {
     where
         F: FnOnce(&ChainTipBlock) -> U,
     {
-        let span = tracing::Span::current();
-
-        let register_span_fields = |chain_tip_block: Option<&ChainTipBlock>| {
-            span.record(
-                "height",
-                tracing::field::debug(chain_tip_block.map(|block| block.height)),
-            );
-            span.record(
-                "hash",
-                tracing::field::debug(chain_tip_block.map(|block| block.hash)),
-            );
-            span.record(
-                "time",
-                tracing::field::debug(chain_tip_block.map(|block| block.time)),
-            );
-            span.record(
-                "previous_hash",
-                tracing::field::debug(chain_tip_block.map(|block| block.previous_block_hash)),
-            );
-            span.record(
-                "transaction_count",
-                tracing::field::debug(chain_tip_block.map(|block| block.transaction_hashes.len())),
-            );
-        };
-
-        self.receiver.with_watch_data(|chain_tip_block| {
-            // TODO: replace with Option::inspect when it stabilises
-            //       https://github.com/rust-lang/rust/issues/91345
-            register_span_fields(chain_tip_block.as_ref());
-
-            chain_tip_block.as_ref().map(f)
-        })
+        self.receiver
+            .with_watch_data(|chain_tip_block| chain_tip_block.as_ref().map(f))
     }
 }
 
 impl ChainTip for LatestChainTip {
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_height(&self) -> Option<block::Height> {
         self.with_chain_tip_block(|block| block.height)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_hash(&self) -> Option<block::Hash> {
         self.with_chain_tip_block(|block| block.hash)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_height_and_hash(&self) -> Option<(block::Height, block::Hash)> {
         self.with_chain_tip_block(|block| (block.height, block.hash))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_block_time(&self) -> Option<DateTime<Utc>> {
         self.with_chain_tip_block(|block| block.time)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_height_and_block_time(&self) -> Option<(block::Height, DateTime<Utc>)> {
         self.with_chain_tip_block(|block| (block.height, block.time))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     fn best_tip_mined_transaction_ids(&self) -> Arc<[transaction::Hash]> {
         self.with_chain_tip_block(|block| block.transaction_hashes.clone())
             .unwrap_or_else(|| Arc::new([]))

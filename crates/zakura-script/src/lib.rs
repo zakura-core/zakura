@@ -10,7 +10,7 @@ mod encoding_tests;
 mod tests;
 
 use core::fmt;
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 use thiserror::Error;
 
@@ -86,13 +86,14 @@ fn parse_zip244_hash_type(raw_hash_type: i32) -> Option<HashType> {
 }
 
 /// A preprocessed Transaction which can be used to verify scripts within said
-/// Transaction.
+/// Transaction. The cache retains its input handle so runtime ownership can
+/// survive a caller's cancellation while a script worker still uses the cache.
 #[derive(Debug)]
-pub struct CachedFfiTransaction {
+pub struct CachedFfiTransaction<T = Arc<zakura_chain::transaction::Transaction>> {
     /// The deserialized Zebra transaction.
     ///
     /// This field is private so that `transaction`, and `all_previous_outputs` always match.
-    transaction: Arc<zakura_chain::transaction::Transaction>,
+    transaction: T,
 
     /// The outputs from previous transactions that match each input in the transaction
     /// being verified.
@@ -102,12 +103,12 @@ pub struct CachedFfiTransaction {
     sighasher: SigHasher,
 }
 
-impl CachedFfiTransaction {
+impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransaction<T> {
     /// Construct a `CachedFfiTransaction` from a `Transaction` and the outputs
     /// from previous transactions that match each input in the transaction
     /// being verified.
     pub fn new(
-        transaction: Arc<zakura_chain::transaction::Transaction>,
+        transaction: T,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
         nu: NetworkUpgrade,
     ) -> Result<Self, Error> {
@@ -292,7 +293,7 @@ impl Sigops for zakura_chain::transaction::UnminedTx {
     }
 }
 
-impl Sigops for CachedFfiTransaction {
+impl<T: Deref<Target = zakura_chain::transaction::Transaction>> Sigops for CachedFfiTransaction<T> {
     fn scripts(&self) -> impl Iterator<Item = Vec<u8>> {
         self.transaction.scripts()
     }

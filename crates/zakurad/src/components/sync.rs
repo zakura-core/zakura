@@ -8,6 +8,7 @@ use std::{
     convert,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -53,7 +54,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-use downloads::{AlwaysHedge, Downloads, NotFoundKind};
+use downloads::{AlwaysHedge, Downloads, NotFoundKind, ParentWait};
 use legacy_trace::{peer_addr_label, LegacySyncTrace};
 
 pub use downloads::VERIFICATION_PIPELINE_SCALING_MULTIPLIER;
@@ -108,6 +109,37 @@ const TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
 
 /// Maximum requeues of one block after a transient verification timeout in a sync round.
 const BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT: usize = 3;
+
+/// Bounds a download task's wait for the parent of a block whose authorizing data binding was
+/// unconfirmed, including state readiness. The state's own limit only covers the request.
+const UNCONFIRMED_BINDING_PARENT_WAIT: Duration = zs::constants::AWAIT_BLOCK_INFO_TIMEOUT;
+
+/// Returns a [`ParentWait`] that asks `state` to wait for a block to commit, bounded by
+/// [`UNCONFIRMED_BINDING_PARENT_WAIT`].
+fn state_parent_wait<ZS>(state: ZS) -> ParentWait
+where
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ZS::Future: Send + 'static,
+{
+    ParentWait(Arc::new(move |parent| {
+        let state = state.clone();
+        // Boxing lets rustc prove this future is `Send` for spawned callers.
+        futures::FutureExt::boxed(async move {
+            matches!(
+                timeout(
+                    UNCONFIRMED_BINDING_PARENT_WAIT,
+                    state.oneshot(zs::Request::AwaitBlockInfo(parent)),
+                )
+                .await,
+                Ok(Ok(zs::Response::BlockInfo(Some(_))))
+            )
+        })
+    }))
+}
 
 /// Minimum UTXO lookup timeouts without a verified block before the syncer restarts.
 const MIN_UTXO_RACE_DROPS_BEFORE_RESTART: usize = 4;
@@ -714,6 +746,90 @@ pub struct Config {
     pub debug_blocksync_throughput_target_height: Option<u32>,
 }
 
+/// The most block verifications that every sync and gossip path can submit together.
+///
+/// The verifier router has no admission of its own, so its callers hold the shared bound
+/// as a static partition. This allowance keeps a configured limit from turning the
+/// partition into an unbounded backlog.
+pub const MAX_BACKEND_BLOCK_VERIFICATIONS: usize = 100_000;
+
+/// Why configured verification limits do not fit the node's shared allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BackendExecutionError {
+    /// The limits overflow when the partition scales or adds them.
+    #[error("block verification concurrency limits overflow")]
+    Overflow,
+    /// The sum of the limits exceeds [`MAX_BACKEND_BLOCK_VERIFICATIONS`].
+    #[error(
+        "block verification concurrency limits total {total}, \
+         above the {MAX_BACKEND_BLOCK_VERIFICATIONS} node allowance"
+    )]
+    AboveAllowance {
+        /// Configured sum.
+        total: usize,
+    },
+}
+
+impl Config {
+    /// Check that the sync and gossip paths fit one verifier allowance, then return
+    /// the block verifications they can hold together on `network`.
+    ///
+    /// The verifier router is one backend. Legacy sync, native block sync, and gossip each
+    /// hold their own limit. Each term is the effective limit at runtime: the configured
+    /// limit raised to its minimum, then scaled by the largest lookahead multiplier of any
+    /// network upgrade.
+    pub fn backend_verification_total(
+        &self,
+        network: &Network,
+    ) -> Result<usize, BackendExecutionError> {
+        let multiplier = network
+            .activation_list()
+            .into_keys()
+            .map(|height| lookahead_limit_multiplier(network, height))
+            .max()
+            .unwrap_or(1);
+        let checkpoint = self
+            .checkpoint_verify_concurrency_limit
+            .max(MIN_CHECKPOINT_CONCURRENCY_LIMIT);
+        let legacy_checkpoint = checkpoint
+            .checked_mul(multiplier)
+            .and_then(|limit| limit.checked_mul(VERIFICATION_PIPELINE_SCALING_MULTIPLIER + 1))
+            .ok_or(BackendExecutionError::Overflow)?;
+        let legacy_full = self
+            .full_verify_concurrency_limit
+            .max(MIN_CONCURRENCY_LIMIT)
+            .checked_mul(multiplier)
+            .ok_or(BackendExecutionError::Overflow)?;
+        // The native driver keeps room for two complete checkpoint ranges.
+        let native_applies = self
+            .zakura_block_apply_concurrency_limit
+            .max(MIN_CONCURRENCY_LIMIT)
+            .max(
+                2 * self.checkpoint_verify_concurrency_limit.clamp(
+                    MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+                    zakura_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
+                ),
+            );
+        let total = [
+            // Legacy sync's checkpoint verifications, including its pipeline scaling.
+            legacy_checkpoint,
+            // Legacy sync's full verifications.
+            legacy_full,
+            // Native block sync's combined applies.
+            native_applies,
+            // Gossiped block downloads that can reach verification.
+            crate::components::inbound::downloads::MAX_INBOUND_CONCURRENCY,
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(BackendExecutionError::Overflow)?;
+        if total > MAX_BACKEND_BLOCK_VERIFICATIONS {
+            return Err(BackendExecutionError::AboveAllowance { total });
+        }
+        Ok(total)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -859,7 +975,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZS::Future: Send,
+    ZS::Future: Send + 'static,
     ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -981,7 +1097,7 @@ where
         + Sync
         + Clone
         + 'static,
-    ZS::Future: Send,
+    ZS::Future: Send + 'static,
     ZV: Service<zakura_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -1067,10 +1183,13 @@ where
             expose_peer_addresses,
         );
 
+        let parent_wait = state_parent_wait(state.clone());
+
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
             latest_chain_tip.clone(),
+            parent_wait,
             past_lookahead_limit_sender,
             max(
                 checkpoint_verify_concurrency_limit,
@@ -1231,7 +1350,7 @@ where
         self.trace
             .checkpoint_handoff(Some(handoff_state_tip), Height(0));
         block_sync_handoff
-            .finish_legacy_bootstrap()
+            .finish_legacy_bootstrap_if_pending()
             .map_err(|error| eyre!("genesis apply handoff failed: {error}"))?;
         info!(
             "Zakura block sync replacement completed genesis bootstrap; \
@@ -1407,7 +1526,7 @@ where
             let mut ahead: HeightDiff = 0;
             let mut run_parent: Option<block::Hash> = None;
             for counted in headers {
-                let hash = counted.header.hash();
+                let hash = counted.hash();
                 // `state_contains` errs only if the state service is gone; treat
                 // an error as "known" so a failing probe never forces a fallback.
                 if self.state_contains(hash).await.unwrap_or(true) {
@@ -1415,7 +1534,7 @@ where
                     run_parent = Some(hash);
                     continue;
                 }
-                let parent = counted.header.previous_block_hash;
+                let parent = counted.previous_block_hash;
                 let anchored = match run_parent {
                     Some(run_parent) => parent == run_parent,
                     None => self.state_contains(parent).await.unwrap_or(false),
@@ -2554,6 +2673,8 @@ where
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
     /// the block cannot verify in this round. The syncer drops that block without a restart.
+    /// A block whose authorizing data binding is still unconfirmed after the download task waited
+    /// for its parent is dropped the same way, without scoring its supplier.
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2592,6 +2713,16 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+        }
+
+        // The download task already waited for the parent and verified the body again.
+        if let Some((hash, parent)) = response.as_ref().err().and_then(Self::unconfirmed_binding) {
+            debug!(
+                ?hash,
+                ?parent,
+                "block parent did not commit in time to confirm its binding, dropping block"
+            );
+            return Ok(());
         }
 
         let unavailable_parent = response.as_ref().err().and_then(Self::unavailable_parent);
@@ -2992,6 +3123,22 @@ where
         )
     }
 
+    /// Returns the block and parent hashes of a verification failure whose authorizing data
+    /// binding is still unconfirmed after the download task waited for the parent.
+    fn unconfirmed_binding(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
+        match error {
+            BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block { source },
+                hash,
+                ..
+            } => match **source {
+                VerifyBlockError::AuthDataUnconfirmed { parent, .. } => Some((*hash, parent)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns the block and parent hashes of a UTXO lookup timeout whose parent is not in a
     /// chain that can accept the block.
     fn unavailable_parent(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
@@ -3023,6 +3170,11 @@ where
         let peer = block_error_peer_label(e, expose_peer_addresses);
 
         match e {
+            // The handler drops the block without restarting the round.
+            e if Self::unconfirmed_binding(e).is_some() => {
+                debug!(error = ?e, %peer, "block binding stays unconfirmed, continuing sync");
+                false
+            }
             // The retry handler bounds these races without cancelling the parent's commit.
             e if Self::is_utxo_lookup_timeout(e)
                 || Self::is_post_checkpoint_verify_timeout(e)
@@ -3059,6 +3211,14 @@ where
                     %peer,
                     "block height is behind the current state tip, \
                      assuming the syncer will eventually catch up to the state, continuing"
+                );
+                false
+            }
+            BlockDownloadVerifyError::BelowMinimumWork { .. } => {
+                debug!(
+                    error = ?e,
+                    %peer,
+                    "block target is easier than the Mainnet admission floor, continuing sync"
                 );
                 false
             }

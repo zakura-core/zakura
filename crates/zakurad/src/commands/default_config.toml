@@ -64,6 +64,10 @@ internal_miner = false
 optimistic_block_inventory = true
 
 [network]
+advert_window_full_size_bytes = 1572864
+advert_window_max = 64
+advert_window_min = 32
+advert_window_small_size_bytes = 102400
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
 expose_peer_addresses = false
@@ -108,7 +112,7 @@ max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 nat_traversal = false
-peer_memory_budget_bytes = 8589934592
+peer_memory_budget_bytes = 16106127360
 stream_open_rate_per_second = 32
 
 [network.zakura.quic]
@@ -145,6 +149,7 @@ cache_dir = "@STATE_CACHE_DIR@"
 debug_skip_non_finalized_state_backup_task = false
 delete_old_database = true
 ephemeral = false
+read_concurrency_limit = 64
 should_backup_non_finalized_state = true
 storage_mode = "archive"
 

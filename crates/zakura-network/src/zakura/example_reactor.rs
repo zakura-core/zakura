@@ -19,12 +19,15 @@
 //! 3. **Codec.** [`ExampleMessage`] implements [`WireMessage`] as plain
 //!    `match`es from message type to payload item. [`WatchMessage`] is the
 //!    family of `WATCH_ONLY`'s rows, on the same codec.
-//! 4. **Exchange.** `exchange` serves ranges through `Serve`, downloads them
+//! 4. **Exchange.** `exchange` splits into a pure `ExchangeState`, which owns
+//!    the exchange policy, and `ExchangeIO`, which owns the streams and the
+//!    regulation tools. IO serves ranges through `Serve`, downloads them
 //!    through `Reservations`, and paces `Status` through `CadenceSender`. One
-//!    function bounds a range's response for both sides. It pushes watched
+//!    function bounds a range's response for both sides. IO pushes watched
 //!    items through `Publications` and receives them through `Subscriptions`.
 //! 5. **Tests.** The generated suites run once for each message family and once
 //!    for each layout. The reactor writes no bound or header test of its own.
+//!    A proptest checks `ExchangeState` against an independent model.
 
 use std::time::Duration;
 

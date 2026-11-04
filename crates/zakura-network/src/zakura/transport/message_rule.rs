@@ -25,6 +25,7 @@ use crate::zakura::handshake::LOCAL_MAX_IDLE_TIMEOUT_MILLIS;
 #[cfg(doc)]
 use super::Stream;
 
+pub(crate) mod budget;
 pub(crate) mod frame_filter;
 pub(crate) mod layout;
 

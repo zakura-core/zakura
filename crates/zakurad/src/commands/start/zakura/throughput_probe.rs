@@ -77,7 +77,7 @@ impl BlocksyncThroughputProbe {
     /// exactly as a real commit's frontier would be).
     pub(crate) fn apply_block(
         &self,
-        block: &block::Block,
+        block: &block::BlockRef,
     ) -> (BlockApplyResult, Option<BlockSyncFrontiers>) {
         let Some(height) = block.coinbase_height() else {
             let hash = block.hash();

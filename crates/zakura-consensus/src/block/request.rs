@@ -1,8 +1,6 @@
 //! Block verifier request type.
 
-use std::sync::Arc;
-
-use zakura_chain::block::Block;
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_state::BlockAdmission;
 
 /// Identifies who supplied a prepared mining candidate.
@@ -18,22 +16,22 @@ pub enum PreparedCandidateSource {
 /// A request to the chain or block verifier
 pub enum Request {
     /// Performs semantic validation, then asks the state to perform contextual validation and commit the block
-    Commit(Arc<Block>),
+    Commit(BlockHandle),
     /// Reuses prepared mining work when possible, then commits the solved block.
     CommitMined {
         /// The solved block.
-        block: Arc<Block>,
+        block: BlockHandle,
         /// State write-queue admission notification.
         admission: BlockAdmission,
     },
     /// Performs semantic validation but skips checking proof of work,
     /// then asks the state to perform contextual validation.
     /// Does not commit the block to the state.
-    CheckProposal(Arc<Block>),
+    CheckProposal(BlockHandle),
     /// Validates and caches a mining candidate without checking proof of work.
     Prepare {
         /// The unsolved candidate block.
-        block: Arc<Block>,
+        block: BlockHandle,
         /// The source that supplied the candidate.
         source: PreparedCandidateSource,
     },
@@ -41,13 +39,14 @@ pub enum Request {
 
 impl Request {
     /// Returns inner block
-    pub fn block(&self) -> Arc<Block> {
-        Arc::clone(match self {
+    pub fn block(&self) -> BlockHandle {
+        match self {
             Request::Commit(block) => block,
             Request::CommitMined { block, .. } => block,
             Request::CheckProposal(block) => block,
             Request::Prepare { block, .. } => block,
-        })
+        }
+        .clone()
     }
 
     /// Returns `true` if the request is a proposal

@@ -21,6 +21,8 @@ pub enum Category {
     Storage,
     /// A scripted peer's action.
     Peer,
+    /// Apply one pure machine input.
+    Machine,
     /// Advance virtual time.
     Time,
 }
@@ -34,6 +36,7 @@ impl Category {
             Category::Drop => "drop",
             Category::Storage => "storage",
             Category::Peer => "peer",
+            Category::Machine => "machine",
             Category::Time => "advance-time",
         }
     }
@@ -93,6 +96,11 @@ impl Identity {
     /// Scripted peer `peer` taking `action`.
     pub fn peer(peer: &str, action: &str) -> Self {
         Identity::other(Category::Peer, format!("{peer}:{action}"))
+    }
+
+    /// Applying operation `step` in a pure machine history.
+    pub fn machine(name: &str, step: u64) -> Self {
+        Self::other(Category::Machine, format!("{name}:{step}"))
     }
 
     /// An identity of a category without an `at`.

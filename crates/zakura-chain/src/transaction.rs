@@ -42,7 +42,7 @@ use crate::parameters::TX_V6_VERSION_GROUP_ID;
 use crate::{
     amount::{Amount, Error as AmountError, NegativeAllowed, NonNegative},
     block, ironwood,
-    memory::{vec_capacity_bytes, AttributedMemorySize},
+    memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
     parameters::{
         Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
@@ -173,6 +173,22 @@ pub enum Transaction {
         /// The Ironwood data for this transaction, if any.
         ironwood_shielded_data: Option<ironwood::ShieldedData>,
     },
+}
+
+impl AsRef<Transaction> for Transaction {
+    fn as_ref(&self) -> &Transaction {
+        self
+    }
+}
+
+impl Transaction {
+    /// Returns the bytes this transaction's inline value and heap allocations occupy.
+    ///
+    /// This is deterministic accounting, not an exact process RSS measurement.
+    pub fn retained_memory_size_bytes(&self) -> u64 {
+        crate::memory::inline_size_bytes::<Self>()
+            .saturating_add(AttributedMemorySize::attributed_memory_size_bytes(self))
+    }
 }
 
 impl AttributedMemorySize for Transaction {
@@ -359,6 +375,14 @@ impl ShieldedActionCounts {
 }
 
 impl Transaction {
+    /// Measure this decoded transaction's inline value and nested allocations.
+    ///
+    /// This is deterministic attribution, not exact process memory. It excludes
+    /// allocator overhead and `Arc` control blocks.
+    pub fn decoded_memory_size_bytes(&self) -> u64 {
+        inline_size_bytes::<Self>().saturating_add(self.attributed_memory_size_bytes())
+    }
+
     // identifiers and hashes
 
     /// Compute the hash (mined transaction ID) of this transaction.
@@ -1858,6 +1882,36 @@ impl Transaction {
         &self,
         nu: NetworkUpgrade,
     ) -> Result<zcash_primitives::transaction::Transaction, crate::Error> {
+        let branch_id = self.librustzcash_branch_id(nu)?;
+        Ok(zcash_primitives::transaction::Transaction::read(
+            &self.zcash_serialize_to_vec()?[..],
+            branch_id,
+        )?)
+    }
+
+    /// Converts [`Transaction`] to the data of a
+    /// [`zcash_primitives::transaction::Transaction`], without computing its transaction ID.
+    ///
+    /// Checks `nu` as [`Self::to_librustzcash`] does.
+    pub(crate) fn to_librustzcash_data(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<
+        zcash_primitives::transaction::TransactionData<zcash_primitives::transaction::Authorized>,
+        crate::Error,
+    > {
+        let branch_id = self.librustzcash_branch_id(nu)?;
+        Ok(zcash_primitives::transaction::TransactionData::read(
+            &self.zcash_serialize_to_vec()?[..],
+            branch_id,
+        )?)
+    }
+
+    /// Returns `nu`'s consensus branch ID, if this transaction can belong to `nu`.
+    fn librustzcash_branch_id(
+        &self,
+        nu: NetworkUpgrade,
+    ) -> Result<consensus::BranchId, crate::Error> {
         if self.network_upgrade().is_some_and(|tx_nu| tx_nu != nu) {
             return Err(crate::Error::InvalidConsensusBranchId);
         }
@@ -1866,14 +1920,7 @@ impl Transaction {
             return Err(crate::Error::InvalidConsensusBranchId);
         };
 
-        let Ok(branch_id) = consensus::BranchId::try_from(branch_id) else {
-            return Err(crate::Error::InvalidConsensusBranchId);
-        };
-
-        Ok(zcash_primitives::transaction::Transaction::read(
-            &self.zcash_serialize_to_vec()?[..],
-            branch_id,
-        )?)
+        consensus::BranchId::try_from(branch_id).map_err(|_| crate::Error::InvalidConsensusBranchId)
     }
 
     // Common Sapling & Orchard Properties

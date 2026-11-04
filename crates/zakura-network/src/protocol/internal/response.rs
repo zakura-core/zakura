@@ -1,14 +1,22 @@
 //! Zebra's internal peer message response format.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, time::Duration};
+use zakura_node_services::block_memory::BlockHandle;
+
+#[cfg(any(test, feature = "proptest-impl"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "proptest-impl"))]
+use zakura_chain::block::Block;
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     transaction::{UnminedTx, UnminedTxId},
 };
 
 use crate::{meta_addr::MetaAddr, protocol::internal::InventoryResponse, PeerSocketAddr};
 
+#[cfg(any(test, feature = "proptest-impl"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
@@ -52,7 +60,15 @@ pub enum Response {
     /// The list contains zero or more block headers.
     //
     // TODO: make this into an IndexMap - an ordered unique list of headers (#2244)
-    BlockHeaders(Vec<block::CountedHeader>),
+    ///
+    /// A header read from state keeps its read admission through each holder.
+    BlockHeaders(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "header_responses()")
+        )]
+        Vec<zakura_node_services::block_memory::HeaderHandle>,
+    ),
 
     /// A list of unmined transaction IDs.
     ///
@@ -71,8 +87,14 @@ pub enum Response {
     /// When Zebra doesn't have a block or transaction, it always sends `notfound`.
     /// `zcashd` sometimes sends no response, and sometimes sends `notfound`.
     //
-    // TODO: make this into a HashMap<block::Hash, InventoryResponse<Arc<Block>, ()>> - a unique list (#2244)
-    Blocks(Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>),
+    // TODO: make this into a HashMap<block::Hash, InventoryResponse<zakura_node_services::block_memory::BlockHandle, ()>> - a unique list (#2244)
+    Blocks(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "block_responses()")
+        )]
+        Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>,
+    ),
 
     /// A list of found unmined transactions, and missing unmined transaction IDs.
     ///
@@ -151,4 +173,32 @@ impl Response {
     pub fn is_inventory_download(&self) -> bool {
         matches!(self, Response::Blocks(_) | Response::Transactions(_))
     }
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
+fn header_responses() -> impl Strategy<Value = Vec<zakura_node_services::block_memory::HeaderHandle>>
+{
+    any::<Vec<block::CountedHeader>>().prop_map(|headers| {
+        headers
+            .into_iter()
+            .map(|counted| counted.header.into())
+            .collect()
+    })
+}
+
+#[cfg(any(test, feature = "proptest-impl"))]
+fn block_responses(
+) -> impl Strategy<Value = Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>>
+{
+    any::<Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>>().prop_map(
+        |responses| {
+            responses
+                .into_iter()
+                .map(|response| match response {
+                    Available((block, peer)) => Available((block.into(), peer)),
+                    Missing(hash) => Missing(hash),
+                })
+                .collect()
+        },
+    )
 }

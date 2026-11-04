@@ -11,7 +11,7 @@ use std::{
 use eyre::Report;
 use tokio::time::{self, timeout};
 use tower::{
-    util::{BoxCloneService, BoxService},
+    util::{BoxCloneService, BoxCloneSyncService, BoxService},
     ServiceBuilder, ServiceExt,
 };
 
@@ -3759,7 +3759,7 @@ async fn setup_with_mempool_config(
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
-        Buffer::new(BoxService::new(peer_set.clone()), 1),
+        BoxCloneSyncService::new(Buffer::new(BoxService::new(peer_set.clone()), 1)),
         state_service.clone(),
         BoxCloneService::new(read_only_state_service),
         Buffer::new(BoxService::new(tx_verifier.clone()), 1),
@@ -3818,6 +3818,7 @@ async fn setup_with_mempool_config(
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cancel_handles_drained_after_verification_timeout() {
     use futures::stream::StreamExt;
+    use tokio::sync::Notify;
     use tower::timeout::Timeout;
     use zakura_node_services::mempool::Gossip;
 
@@ -3841,6 +3842,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         false,
         u64::MAX,
         PeerCooldowns::default(),
+        Arc::new(Notify::new()),
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

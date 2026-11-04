@@ -445,7 +445,12 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
-        async move {
+        let observation = zakura_jsonl_trace::pipeline::Context::block(hash);
+        let result_observation = observation.clone();
+        zakura_jsonl_trace::pipeline::scope(observation, async move {
+            zakura_jsonl_trace::pipeline::event("block_verification_started", || serde_json::json!({
+                "height": block.coinbase_height().map(|height| height.0), "proposal": request.is_proposal(),
+            }));
             let result: Result<block::Hash, VerifyBlockError> = async {
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let _receipt = receipt;
@@ -875,7 +880,12 @@ where
                 }
                 result => result,
             }
-        }
+        })
+        .inspect(move |result| {
+            zakura_jsonl_trace::pipeline::event_for(result_observation.as_ref(), "block_verification_finished", || serde_json::json!({
+                "ok": result.is_ok(),
+            }));
+        })
         .instrument(span)
         .boxed()
     }

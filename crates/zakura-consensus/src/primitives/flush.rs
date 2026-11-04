@@ -82,6 +82,9 @@ struct Progress {
 
     /// The [`Verifier::bit`]s of the batch workers that received an item.
     queued: u8,
+
+    /// Correlation retained across cancellation and shared batch-worker task boundaries.
+    observation: Option<zakura_jsonl_trace::pipeline::Context>,
 }
 
 impl Progress {
@@ -109,6 +112,7 @@ impl BlockFlush {
         let pending = Arc::new(Mutex::new(Progress {
             pending: shielded_transactions,
             queued: 0,
+            observation: zakura_jsonl_trace::pipeline::current(),
         }));
 
         BLOCKS
@@ -116,16 +120,33 @@ impl BlockFlush {
             .expect("block flush registry mutex should not be poisoned")
             .insert(key, pending);
 
+        zakura_jsonl_trace::pipeline::event("block_flush_registered", || {
+            serde_json::json!({
+                "shielded_transactions": shielded_transactions,
+            })
+        });
         Self { key }
     }
 }
 
 impl Drop for BlockFlush {
     fn drop(&mut self) {
-        BLOCKS
+        let removed = BLOCKS
             .lock()
             .expect("block flush registry mutex should not be poisoned")
             .remove(&self.key);
+        if let Some(pending) = removed {
+            let observation = pending
+                .lock()
+                .expect("block flush progress mutex should not be poisoned")
+                .observation
+                .clone();
+            zakura_jsonl_trace::pipeline::event_for(
+                observation.as_ref(),
+                "block_flush_registration_ended",
+                || serde_json::json!({}),
+            );
+        }
     }
 }
 
@@ -185,14 +206,21 @@ impl Queueing {
 
 impl Drop for Queueing {
     fn drop(&mut self) {
-        let Some(queued) = self
-            .0
-            .lock()
-            .expect("block flush progress mutex should not be poisoned")
-            .release()
-        else {
-            return;
+        let (queued, observation) = {
+            let mut progress = self
+                .0
+                .lock()
+                .expect("block flush progress mutex should not be poisoned");
+            let Some(queued) = progress.release() else {
+                return;
+            };
+            (queued, progress.observation.clone())
         };
+        zakura_jsonl_trace::pipeline::event_for(observation.as_ref(), "flush_unit_ready", || {
+            serde_json::json!({
+                "queued_verifiers": queued,
+            })
+        });
 
         // The progress lock is released first: queueing a flush can wait on a batch service lock.
         for verifier in Verifier::ALL {

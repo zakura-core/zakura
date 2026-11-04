@@ -496,18 +496,25 @@ where
             UnminedTxId::Legacy(_) => None,
         };
         let span = tracing::debug_span!("tx", ?tx_id);
+        let observation =
+            zakura_jsonl_trace::pipeline::Context::transaction(tx_id.mined_id(), req.is_mempool());
+        let result_observation = observation.clone();
         // Taken before the future first runs, so a delayed poll still holds the block's flush.
-        let queueing = match &req {
-            Request::Block {
-                known_outpoint_hashes,
-                ..
-            } if tx.has_shielded_data() => {
-                primitives::flush::Queueing::for_transaction(known_outpoint_hashes)
-            }
-            Request::Block { .. } | Request::Mempool { .. } => None,
-        };
+        let queueing =
+            zakura_jsonl_trace::pipeline::sync_scope(observation.clone(), || match &req {
+                Request::Block {
+                    known_outpoint_hashes,
+                    ..
+                } if tx.has_shielded_data() => {
+                    primitives::flush::Queueing::for_transaction(known_outpoint_hashes)
+                }
+                Request::Block { .. } | Request::Mempool { .. } => None,
+            });
 
-        async move {
+        zakura_jsonl_trace::pipeline::scope(observation, async move {
+            zakura_jsonl_trace::pipeline::event("verification_started", || serde_json::json!({
+                "shielded": tx.has_shielded_data(), "version": tx.version(),
+            }));
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
@@ -717,6 +724,7 @@ where
                 Some(queueing) => queueing.scope(build_checks),
                 None => build_checks(),
             }?;
+            zakura_jsonl_trace::pipeline::event("checks_built", || serde_json::json!({}));
             drop(queueing);
 
             tracing::trace!(?tx_id, "awaiting async checks...");
@@ -765,8 +773,11 @@ where
             };
 
             Ok(rsp)
-        }
+        })
             .inspect(move |result| {
+                zakura_jsonl_trace::pipeline::event_for(result_observation.as_ref(), "verification_finished", || serde_json::json!({
+                    "ok": result.is_ok(),
+                }));
                 // Hide the transaction data to avoid filling the logs
                 tracing::trace!(?tx_id, result = ?result.as_ref().map(|_tx| ()), "got tx verify result");
             })

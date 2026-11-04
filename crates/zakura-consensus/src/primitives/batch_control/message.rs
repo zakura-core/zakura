@@ -13,12 +13,14 @@ pub(crate) enum Message<Request, Fut> {
         tx: Tx<Fut>,
         span: tracing::Span,
         _permit: OwnedSemaphorePermit,
+        observation: zakura_jsonl_trace::pipeline::BatchRequest,
     },
 
     /// An explicit request to flush the pending batch.
     Flush {
         span: tracing::Span,
         _permit: OwnedSemaphorePermit,
+        observation: zakura_jsonl_trace::pipeline::BatchRequest,
     },
 }
 

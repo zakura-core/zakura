@@ -242,10 +242,17 @@ where
             },
         };
 
+        let observation = zakura_jsonl_trace::pipeline::batch_request();
+        zakura_jsonl_trace::pipeline::event("flush_enqueued", || {
+            serde_json::json!({
+                "worker": std::any::type_name::<T>(), "request_id": observation.id,
+            })
+        });
         self.tx
             .send(Message::Flush {
                 span: tracing::Span::current(),
                 _permit,
+                observation,
             })
             .map(|()| true)
             .map_err(|_| self.get_worker_error())
@@ -379,11 +386,18 @@ where
         // acquired, so we can freely allocate a oneshot.
         let (tx, rx) = oneshot::channel();
 
+        let observation = zakura_jsonl_trace::pipeline::batch_request();
+        zakura_jsonl_trace::pipeline::event("batch_request_enqueue", || {
+            serde_json::json!({
+                "worker": std::any::type_name::<T>(), "request_id": observation.id,
+            })
+        });
         match self.tx.send(Message::Item {
             request,
             tx,
             span,
             _permit,
+            observation,
         }) {
             Err(_) => ResponseFuture::failed(self.get_worker_error()),
             Ok(_) => ResponseFuture::new(rx),

@@ -613,6 +613,10 @@ where
             };
 
             trace!(?txid, "got tx");
+            let observation = zakura_jsonl_trace::pipeline::Context::transaction(txid.mined_id(), true);
+            zakura_jsonl_trace::pipeline::event_for(observation.as_ref(), "body_received", || serde_json::json!({
+                "shielded": tx.transaction().has_shielded_data(), "version": tx.transaction().version(),
+            }));
 
             // A peer can enter a cooldown after this download was queued, and
             // the crawler queues downloads without checking the cooldowns.

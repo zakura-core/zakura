@@ -962,6 +962,16 @@ impl Service<Request> for Mempool {
                             );
 
                             if let Ok(inserted_id) = insert_result {
+                                let observation =
+                                    zakura_jsonl_trace::pipeline::Context::transaction(
+                                        inserted_id.mined_id(),
+                                        true,
+                                    );
+                                zakura_jsonl_trace::pipeline::event_for(
+                                    observation.as_ref(),
+                                    "mempool_inserted",
+                                    || serde_json::json!({}),
+                                );
                                 // Save transaction ids that we will send to peers
                                 send_to_peers_ids.insert(inserted_id);
                             } else {

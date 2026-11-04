@@ -53,6 +53,11 @@ where
     /// The total weight of pending requests sent to `service`, since the last batch flush.
     pending_items_weight: usize,
 
+    /// Observation identities and item count for the current batch, without changing its policy.
+    trace_worker: Option<u64>,
+    trace_batch: Option<u64>,
+    trace_items: usize,
+
     /// The timer for the pending batch, if it has any items.
     ///
     /// The timer is started when the first entry of a new batch is
@@ -120,6 +125,9 @@ where
             rx,
             service,
             pending_items_weight: 0,
+            trace_worker: zakura_jsonl_trace::pipeline::next_id(),
+            trace_batch: None,
+            trace_items: 0,
             pending_batch_timer: None,
             concurrent_batches: FuturesUnordered::new(),
             failed: None,
@@ -134,7 +142,12 @@ where
     }
 
     /// Process a single worker request.
-    async fn process_req(&mut self, req: Request, tx: message::Tx<T::Future>) {
+    async fn process_req(
+        &mut self,
+        req: Request,
+        tx: message::Tx<T::Future>,
+        observation: zakura_jsonl_trace::pipeline::BatchRequest,
+    ) {
         if let Some(ref error) = self.failed {
             tracing::trace!(
                 ?error,
@@ -146,6 +159,24 @@ where
 
         match self.service.ready().await {
             Ok(svc) => {
+                if self.pending_items_weight == 0 {
+                    self.trace_batch = zakura_jsonl_trace::pipeline::next_id();
+                    self.trace_items = 0;
+                }
+                self.trace_items = self.trace_items.saturating_add(1);
+                let trace_worker = self.trace_worker;
+                let trace_batch = self.trace_batch;
+                let request_weight = req.request_weight().max(1);
+                zakura_jsonl_trace::pipeline::event_for(
+                    observation.context.as_ref(),
+                    "batch_item_received",
+                    || {
+                        serde_json::json!({
+                            "worker": std::any::type_name::<T>(), "worker_id": trace_worker,
+                            "batch_id": trace_batch, "request_id": observation.id, "weight": request_weight,
+                        })
+                    },
+                );
                 // Floor each item at weight 1 so `pending_items_weight == 0` always
                 // means "no queued items": a zero-weight item must still start the
                 // batch timer and be flushed. See `RequestWeight::request_weight`.
@@ -156,9 +187,8 @@ where
                 // service has already been given, stranding their response futures.
                 // Saturating keeps the counter above `max_items_weight_in_batch`, so
                 // the run loop flushes the batch instead.
-                self.pending_items_weight = self
-                    .pending_items_weight
-                    .saturating_add(req.request_weight().max(1));
+                self.pending_items_weight =
+                    self.pending_items_weight.saturating_add(request_weight);
                 let rsp = svc.call(req.into());
                 let _ = tx.send(Ok(rsp));
             }
@@ -177,8 +207,13 @@ where
     ///
     /// Waits until the inner service is ready,
     /// then stores a future which resolves when the batch finishes.
-    async fn flush_service(&mut self) {
+    async fn flush_service(&mut self, reason: &'static str) {
         if self.pending_items_weight == 0 {
+            zakura_jsonl_trace::pipeline::event("batch_flush_empty", || {
+                serde_json::json!({
+                    "worker": std::any::type_name::<T>(), "worker_id": self.trace_worker, "reason": reason,
+                })
+            });
             tracing::trace!("skipping flush for empty batch");
             self.pending_batch_timer = None;
             return;
@@ -189,13 +224,32 @@ where
             return;
         }
 
+        let trace_worker = self.trace_worker;
+        let trace_batch = self.trace_batch;
+        let trace_weight = self.pending_items_weight;
+        let trace_items = self.trace_items;
         match self.service.ready().await {
             Ok(ready_service) => {
+                let started = zakura_jsonl_trace::pipeline::enabled().then(std::time::Instant::now);
+                zakura_jsonl_trace::pipeline::event("batch_flush", || {
+                    serde_json::json!({
+                        "worker": std::any::type_name::<T>(), "worker_id": trace_worker,
+                        "batch_id": trace_batch, "weight": trace_weight, "items": trace_items, "reason": reason,
+                    })
+                });
                 let flush_future = ready_service.call(BatchControl::Flush);
-                self.concurrent_batches.push(flush_future.boxed());
+                self.concurrent_batches.push(flush_future.inspect(move |result| {
+                    zakura_jsonl_trace::pipeline::event("batch_finished", || serde_json::json!({
+                        "worker": std::any::type_name::<T>(), "worker_id": trace_worker,
+                        "batch_id": trace_batch, "ok": result.is_ok(),
+                        "elapsed_ns": started.map(|start| u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)),
+                    }));
+                }).boxed());
 
                 // Now we have an empty batch.
                 self.pending_items_weight = 0;
+                self.trace_batch = None;
+                self.trace_items = 0;
                 self.pending_batch_timer = None;
             }
             Err(error) => {
@@ -247,7 +301,7 @@ where
                     );
 
                     // TODO: use a batch-specific span to instrument this future.
-                    self.flush_service().await;
+                    self.flush_service("latency").await;
                 },
 
                 maybe_msg = self.rx.recv(), if self.can_spawn_new_batches() => match maybe_msg {
@@ -255,6 +309,7 @@ where
                         request,
                         tx,
                         span,
+                        observation,
                         ..
                     }) => {
                         tracing::trace!(
@@ -266,7 +321,7 @@ where
 
                         let is_new_batch = self.pending_items_weight == 0;
 
-                        self.process_req(request, tx)
+                        self.process_req(request, tx, observation)
                             // Apply the provided span to request processing.
                             .instrument(span)
                             .await;
@@ -281,7 +336,7 @@ where
                             );
 
                             // TODO: use a batch-specific span to instrument this future.
-                            self.flush_service().await;
+                            self.flush_service("size").await;
                         } else if is_new_batch {
                             tracing::trace!(
                                 pending_items_weight = self.pending_items_weight,
@@ -301,7 +356,11 @@ where
                             );
                         }
                     }
-                    Some(Message::Flush { span, .. }) => {
+                    Some(Message::Flush { span, observation, .. }) => {
+                        zakura_jsonl_trace::pipeline::event_for(observation.context.as_ref(), "flush_received", || serde_json::json!({
+                            "worker": std::any::type_name::<T>(), "worker_id": self.trace_worker,
+                            "batch_id": self.trace_batch, "request_id": observation.id,
+                        }));
                         tracing::trace!(
                             pending_items_weight = self.pending_items_weight,
                             batch_deadline = ?self.pending_batch_timer.as_ref().map(|sleep| sleep.deadline()),
@@ -309,7 +368,7 @@ where
                             "explicit batch flush received",
                         );
 
-                        self.flush_service().instrument(span).await;
+                        self.flush_service("explicit").instrument(span).await;
                     }
                     None => {
                         tracing::trace!("batch channel closed and emptied, exiting worker task");

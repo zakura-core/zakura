@@ -17,6 +17,7 @@ fn the_last_release_returns_the_queued_verifiers() {
     let mut progress = Progress {
         pending: 2,
         queued: Verifier::Sapling.bit() | Verifier::Halo2Nu6_3Onward.bit(),
+        observation: None,
     };
 
     assert_eq!(progress.release(), None);

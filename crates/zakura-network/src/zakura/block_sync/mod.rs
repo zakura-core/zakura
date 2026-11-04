@@ -94,7 +94,9 @@ pub use request::BlockSizeEstimate;
 #[cfg(any(test, zakura_sim))]
 pub use service::{block_sync_serving_limit, block_sync_streams};
 pub use service::{BlockSyncPeerSession, BlockSyncService};
-pub(crate) use service::{BLOCK_SYNC_SERVICE_STREAMS, MAX_BS_FRAME_BYTES};
+pub(crate) use service::BLOCK_SYNC_SERVICE_STREAMS;
+#[cfg(test)]
+pub(crate) use service::MAX_BS_FRAME_BYTES;
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use source::DetachedReadSession;
 pub use source::{BlockRangeRead, BlockRangeReadLease, BlockRangeReadResult, BlockRangeSource};

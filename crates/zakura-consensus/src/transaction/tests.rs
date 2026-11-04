@@ -1324,9 +1324,17 @@ async fn mempool_request_with_missing_input_is_rejected() {
 #[tokio::test]
 async fn mempool_lookup_refusal_stays_distinct_from_a_missing_input() {
     let net = Network::Mainnet;
+    // The mempool rejects an unsupported version before it looks up any input.
     let (height, tx) = transactions_from_blocks(net.block_iter())
-        .find(|(_, tx)| !(tx.is_coinbase() || tx.inputs().is_empty()))
-        .expect("At least one non-coinbase transaction with transparent inputs in test vectors");
+        .find(|(_, tx)| {
+            tx.version() >= 4
+                && !tx.is_coinbase()
+                && !tx.inputs().is_empty()
+                && !tx.lock_time_is_time()
+        })
+        .expect(
+            "test vectors include a supported non-coinbase transaction with transparent inputs and no time lock",
+        );
 
     for elapsed in [false, true] {
         let state = service_fn(move |_: zakura_state::Request| async move {

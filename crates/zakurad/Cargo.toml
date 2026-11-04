@@ -39,16 +39,6 @@ name = "zakurad"
 path = "src/bin/zakurad/main.rs"
 test = false
 
-[[bin]]
-name = "zakura-prune-state"
-path = "src/bin/zakura-prune-state/main.rs"
-test = false
-
-[[bin]]
-name = "zakura-rollback-state"
-path = "src/bin/zakura-rollback-state/main.rs"
-test = false
-
 # `cargo release` settings
 [package.metadata.release]
 pre-release-replacements = [

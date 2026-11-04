@@ -2284,9 +2284,6 @@ async fn getblocks_response_precedes_ready_block_advert() {
 async fn block_advert_is_written_during_a_run_of_peer_messages() {
     use crate::peer::connection::WAITING_ADVERT_PRIORITY_DELAY;
 
-    /// Peer messages answered while an advert waits, enough to show its messages go first.
-    const PEER_MESSAGES_FIRST: usize = 8;
-
     let _init_guard = zakura_test::init();
 
     let (
@@ -2316,32 +2313,7 @@ async fn block_advert_is_written_during_a_run_of_peer_messages() {
         }
         let (advert, delivery) = block_advert(advert_hash);
         block_advert_tx.try_send(advert).unwrap();
-
-        // The clock only moves when this test moves it, so the delay has not passed.
-        for _ in 0..PEER_MESSAGES_FIRST {
-            assert!(
-                matches!(peer_outbound_messages.next().await, Some(Message::Pong(_))),
-                "peer messages go first until the advert has waited the priority delay",
-            );
-        }
-
-        tokio::time::advance(WAITING_ADVERT_PRIORITY_DELAY).await;
-        // The connection may have answered one more ping before it saw the clock move.
-        let mut pongs_after_delay = 0;
-        loop {
-            match peer_outbound_messages.next().await {
-                Some(Message::Pong(_)) => pongs_after_delay += 1,
-                Some(Message::Inv(inv)) => {
-                    assert_eq!(inv, vec![InventoryHash::Block(advert_hash)]);
-                    break;
-                }
-                other => panic!("unexpected message to the peer: {other:?}"),
-            }
-            assert!(
-                pongs_after_delay <= 1,
-                "the advert goes before the next peer message once the delay has passed",
-            );
-        }
+        assert_advert_written_after_delay(&mut peer_outbound_messages, advert_hash).await;
         delivery.await.unwrap().unwrap();
     }
 
@@ -2389,6 +2361,88 @@ async fn block_advert_is_written_during_a_run_of_peer_messages() {
 
     connection_task.abort();
     drop(client_tx);
+}
+
+/// The same holds while a request of ours is pending, the busy loop's realistic case: a peer
+/// that streams messages after our `getblocks` cannot keep a queued block advert from being
+/// written, and our request stays pending.
+#[tokio::test(start_paused = true)]
+async fn block_advert_is_written_during_a_run_of_peer_messages_while_a_request_is_pending() {
+    let _init_guard = zakura_test::init();
+
+    let (
+        mut connection,
+        mut client_tx,
+        _inbound_service,
+        mut peer_outbound_messages,
+        shared_error_slot,
+    ) = new_test_connection();
+    let (block_advert_tx, block_advert_rx) =
+        tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = block_advert_rx;
+
+    // The peer is silent until our request is on the wire, then always has a ping ready.
+    let (wake_peer, peer_woken) = oneshot::channel();
+    let pings = futures::stream::once(peer_woken)
+        .flat_map(|_| futures::stream::repeat_with(|| Ok(Message::Ping(Nonce::default()))));
+    let connection_task = tokio::spawn(connection.run(pings));
+
+    let mut response = send_find_blocks(&mut client_tx, &mut peer_outbound_messages).await;
+    wake_peer.send(()).unwrap();
+
+    let advert_hash = block::Hash([5; 32]);
+    let (advert, delivery) = block_advert(advert_hash);
+    block_advert_tx.try_send(advert).unwrap();
+    assert_advert_written_after_delay(&mut peer_outbound_messages, advert_hash).await;
+    delivery.await.unwrap().unwrap();
+
+    assert!(
+        matches!(response.try_recv(), Ok(None)),
+        "the request is still pending after the advert is written",
+    );
+    assert!(shared_error_slot.try_get_error().is_none());
+
+    connection_task.abort();
+    drop(client_tx);
+}
+
+/// Peer messages answered while an advert waits, enough to show its messages go first.
+const PEER_MESSAGES_FIRST: usize = 8;
+
+/// Asserts that the peer's pings are answered first while the clock stands still, and that the
+/// `inv` for `advert_hash` goes before the next pong once the clock has moved by the priority
+/// delay.
+async fn assert_advert_written_after_delay(
+    peer_outbound_messages: &mut mpsc::Receiver<Message>,
+    advert_hash: block::Hash,
+) {
+    use crate::peer::connection::WAITING_ADVERT_PRIORITY_DELAY;
+
+    // The clock only moves when this test moves it, so the delay has not passed.
+    for _ in 0..PEER_MESSAGES_FIRST {
+        assert!(
+            matches!(peer_outbound_messages.next().await, Some(Message::Pong(_))),
+            "peer messages go first until the advert has waited the priority delay",
+        );
+    }
+
+    tokio::time::advance(WAITING_ADVERT_PRIORITY_DELAY).await;
+    // The connection may have answered one more ping before it saw the clock move.
+    let mut pongs_after_delay = 0;
+    loop {
+        match peer_outbound_messages.next().await {
+            Some(Message::Pong(_)) => pongs_after_delay += 1,
+            Some(Message::Inv(inv)) => {
+                assert_eq!(inv, vec![InventoryHash::Block(advert_hash)]);
+                break;
+            }
+            other => panic!("unexpected message to the peer: {other:?}"),
+        }
+        assert!(
+            pongs_after_delay <= 1,
+            "the advert goes before the next peer message once the delay has passed",
+        );
+    }
 }
 
 /// Sends a `FindBlocks` request on `client_tx` and waits for its `getblocks` to reach the wire.

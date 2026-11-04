@@ -582,6 +582,11 @@ impl From<Request> for InboundMessage {
 /// a large request of ours, would otherwise keep an advert queued past the advertiser's wait
 /// ([`BLOCK_REQUEST_WAIT`]). A third of that wait leaves the advert time to be written and the
 /// peer time to request the block.
+///
+/// The wait is checked between messages, so one message whose handling outlasts the
+/// advertiser's wait still expires the advert. The response to a `getdata` writes each block
+/// inline under [`REQUEST_TIMEOUT`](crate::constants::REQUEST_TIMEOUT) per block, so a peer that
+/// reads slowly can hold its connection's loop for minutes with one message.
 const WAITING_ADVERT_PRIORITY_DELAY: Duration = BLOCK_REQUEST_WAIT.checked_div(3).unwrap();
 
 /// Where a connection reads our requests from, and the authorization it rechecks before
@@ -1156,12 +1161,18 @@ where
         }
     }
 
+    /// Returns how long peer messages have kept a block advert waiting, once that is at least
+    /// [`WAITING_ADVERT_PRIORITY_DELAY`].
+    fn overdue_advert_wait(&self) -> Option<Duration> {
+        self.advert_waiting_since
+            .map(|since| since.elapsed())
+            .filter(|waited| *waited >= WAITING_ADVERT_PRIORITY_DELAY)
+    }
+
     /// Returns whether a waiting block advert goes before the next peer message, because it has
     /// waited for [`WAITING_ADVERT_PRIORITY_DELAY`] while peer messages went first.
     fn block_advert_is_due(&self) -> bool {
-        self.advert_waiting_since
-            .is_some_and(|since| since.elapsed() >= WAITING_ADVERT_PRIORITY_DELAY)
-            && !self.block_advert_rx.is_empty()
+        self.overdue_advert_wait().is_some() && !self.block_advert_rx.is_empty()
     }
 
     /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
@@ -1177,6 +1188,14 @@ where
             )
             .increment(1);
             return;
+        }
+
+        if let Some(waited) = self.overdue_advert_wait() {
+            metrics::counter!("peer.block_gossip.advert_priority_writes").increment(1);
+            debug!(
+                ?waited,
+                "writing a block advert ahead of the peer's messages"
+            );
         }
 
         metrics::counter!(

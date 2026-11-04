@@ -18,7 +18,10 @@ use crate::{
     serialization::{
         sha256d, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
-    transaction::{arbitrary::v5_transactions, LockTime, Transaction},
+    transaction::{
+        arbitrary::{fake_v6_with_orchard_and_ironwood_actions, v5_transactions},
+        LockTime, Transaction,
+    },
     transparent,
     work::equihash::Solution,
 };
@@ -819,5 +822,99 @@ fn time_check_fixed() {
             .expect_err("the time should be invalid as a block header time");
         // Invert the check, leading to a valid time
         node_time_check(now, block_header_time).expect("the inverse comparison should be valid");
+    }
+}
+
+#[test]
+fn transaction_digests_match_separate_computation_across_parallel_cutoff() {
+    let _init_guard = zakura_test::init();
+
+    // Pre-v5 (genesis, Sapling era) and NU5 blocks, so both auth digest branches are covered.
+    let blocks: Vec<Block> = [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .map(|bytes| {
+        bytes
+            .zcash_deserialize_into()
+            .expect("block fixture deserializes")
+    })
+    .collect();
+    let mut transactions: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter().cloned())
+        .collect();
+    assert!(
+        transactions.iter().any(|tx| tx.version() >= 5),
+        "fixtures include v5 transactions"
+    );
+
+    let orchard_bundle = transactions
+        .iter()
+        .find_map(|tx| tx.orchard_shielded_data().cloned())
+        .expect("the NU5 fixture contains an Orchard bundle");
+    let v6_transactions: Vec<_> = [(1, 0), (0, 1), (1, 1)]
+        .into_iter()
+        .map(|(orchard_actions, ironwood_actions)| {
+            let mut transaction =
+                fake_v6_with_orchard_and_ironwood_actions(Nu6_3, orchard_actions, ironwood_actions);
+            let Transaction::V6 {
+                orchard_shielded_data,
+                ironwood_shielded_data,
+                ..
+            } = Arc::make_mut(&mut transaction)
+            else {
+                unreachable!("the V6 fixture helper returns a V6 transaction");
+            };
+            // Use fixed vector bytes in each populated slot so the fixture is deterministic.
+            if orchard_shielded_data.is_some() {
+                *orchard_shielded_data = Some(Box::new(orchard_bundle.clone()));
+            }
+            if ironwood_shielded_data.is_some() {
+                *ironwood_shielded_data = Some(orchard_bundle.clone());
+            }
+            transaction
+        })
+        .collect();
+    transactions.extend(v6_transactions.iter().cloned());
+    let mixes = [
+        ("Orchard-only V6", &v6_transactions[0..1]),
+        ("Ironwood-only V6", &v6_transactions[1..2]),
+        ("both pools V6", &v6_transactions[2..3]),
+        ("mixed V6", v6_transactions.as_slice()),
+        ("mixed versions", transactions.as_slice()),
+    ];
+
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("the test thread pool starts");
+
+        for (mix, transactions) in mixes {
+            for count in [1, 63, 64, 65, 129] {
+                let mut block = blocks[0].clone();
+                block.transactions = transactions.iter().cycle().take(count).cloned().collect();
+
+                let digests = pool.install(|| block.transaction_digests());
+
+                let expected_hashes: Vec<_> = block.transactions().map(|tx| tx.hash()).collect();
+                let expected_auth: Vec<_> =
+                    block.transactions().map(|tx| tx.auth_digest()).collect();
+                let expected_ids: Vec<_> = block.transactions().map(|tx| tx.unmined_id()).collect();
+                let context = format!("{mix}: {count} transactions with {threads} workers");
+
+                assert_eq!(digests.hashes.as_ref(), expected_hashes, "{context}");
+                assert_eq!(digests.auth_digests, expected_auth, "{context}");
+                assert_eq!(
+                    digests.unmined_ids().collect::<Vec<_>>(),
+                    expected_ids,
+                    "{context}"
+                );
+                assert_eq!(digests.auth_data_root, block.auth_data_root(), "{context}");
+            }
+        }
     }
 }

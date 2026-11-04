@@ -26,7 +26,7 @@ use zakura_chain::{
     serialization::{ZcashDeserialize, ZcashDeserializeInto},
     transaction::{
         arbitrary::{transaction_to_fake_v5, v5_transactions},
-        LockTime, Transaction,
+        LockTime, Transaction, UnminedTxId,
     },
     work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
 };
@@ -37,41 +37,6 @@ use crate::{block::check::subsidy_is_valid, transaction};
 use super::*;
 
 mod nsm_fees;
-
-#[test]
-fn transaction_hashes_preserve_block_order_across_parallel_cutoff() {
-    let blocks: Vec<_> = [
-        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
-        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
-    ]
-    .into_iter()
-    .map(|bytes| Block::zcash_deserialize(bytes).expect("the block fixture deserializes"))
-    .collect();
-    let transactions: Vec<_> = blocks
-        .iter()
-        .flat_map(|block| block.transactions.iter().cloned())
-        .collect();
-
-    for threads in [1, 4] {
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()
-            .expect("the test thread pool starts");
-
-        for count in [0, 1, 63, 64, 65, 129] {
-            let mut block = blocks[0].clone();
-            block.transactions = transactions.iter().cycle().take(count).cloned().collect();
-            let expected: Arc<[_]> = block.transactions().map(|tx| tx.hash()).collect();
-            let actual = pool.install(|| transaction_hashes(&block));
-
-            assert_eq!(
-                actual, expected,
-                "{count} transactions with {threads} workers"
-            );
-        }
-    }
-}
 
 fn prepared_test_verifier(
     network: &Network,
@@ -268,10 +233,15 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
                 zs::Request::CheckParentInputs { .. } => {
                     zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
                 }
-                zs::Request::CheckAuthDataCommitment(_) if matches!(binding, Binding::Stalled) => {
-                    std::future::pending().await
-                }
-                zs::Request::CheckAuthDataCommitment(_) => {
+                zs::Request::CheckAuthDataCommitment(commitment) => {
+                    assert_eq!(
+                        commitment.auth_data_root,
+                        Some(commitment.block.auth_data_root()),
+                        "the binding check reuses the delivered body's root"
+                    );
+                    if matches!(binding, Binding::Stalled) {
+                        return std::future::pending().await;
+                    }
                     zs::Response::AuthDataCommitment(match binding {
                         Binding::Bound => zs::AuthDataCommitment::Bound,
                         Binding::Mismatch => zs::AuthDataCommitment::Mismatch(
@@ -332,6 +302,42 @@ async fn nu5_semantic_failures_defer_to_the_auth_data_commitment() {
             }
         }
     }
+}
+
+/// Failures before digest computation still ask state to compute the body's root.
+#[tokio::test]
+async fn auth_data_binding_without_precomputation_requests_recomputation() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+    let expected_hash = block.hash();
+    let state = service_fn(move |request: zs::Request| async move {
+        let zs::Request::CheckAuthDataCommitment(commitment) = request else {
+            panic!("the binding check only requests the body commitment");
+        };
+        assert_eq!(commitment.block.hash(), expected_hash);
+        assert_eq!(commitment.auth_data_root, None);
+        Ok::<_, BoxError>(zs::Response::AuthDataCommitment(
+            zs::AuthDataCommitment::Mismatch(
+                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                    actual: [0x42; 32],
+                    expected: [0x24; 32],
+                },
+            ),
+        ))
+    });
+    let error = confirm_auth_data_binding(
+        state,
+        &network,
+        block.into(),
+        None,
+        VerifyBlockError::Transaction(TransactionError::Halo2VerificationFailed),
+    )
+    .await;
+    assert!(error.is_auth_commitment_mismatch(), "{error:?}");
 }
 
 /// Duplicate spends and nullifiers are part of the transaction ID, so a semantic duplicate stays
@@ -466,6 +472,250 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     }
     Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
     block
+}
+
+/// An invalid header time is rejected before the transaction Merkle root or transaction checks.
+#[tokio::test]
+async fn quick_header_time_failure_precedes_bad_merkle_root() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, None);
+    let header = Arc::make_mut(&mut block.header);
+    header.time = Utc::now()
+        .checked_add_signed(chrono::Duration::hours(3))
+        .expect("three hours fits in the supported time range");
+    header.merkle_root.0[0] ^= 1;
+    let block = Arc::new(block);
+
+    for proposal in [false, true] {
+        let state = service_fn(|request: zs::Request| async move {
+            match request {
+                zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+                _ => panic!("invalid header time needs no contextual or binding check"),
+            }
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("invalid header time must precede transaction verification");
+        });
+        let request = if proposal {
+            Request::CheckProposal(block.clone().into())
+        } else {
+            Request::Commit(block.clone().into())
+        };
+        let error = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        )
+        .oneshot(request)
+        .await
+        .expect_err("a future header time is rejected");
+        assert!(matches!(error, VerifyBlockError::Time(_)), "{error:?}");
+    }
+}
+
+/// Proposals fail cheap body checks immediately; committed bodies must first match the header.
+#[tokio::test]
+async fn quick_body_failures_preserve_committed_merkle_binding() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zakura_chain::parameters::ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT;
+    use zakura_chain::transaction::arbitrary::fake_v5_with_orchard_actions;
+    use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+
+    let _init_guard = zakura_test::init();
+    let network = zip234_test_network(Height(100));
+    let mut bad_coinbase = zip234_test_block(&network, Height(1), Amount::zero());
+    bad_coinbase
+        .transactions
+        .push(Arc::new(v5_coinbase_transaction(
+            NetworkUpgrade::Nu7,
+            Height(2),
+            &network,
+        )));
+    let mut over_limit = zip234_test_block(&network, Height(1), Amount::zero());
+    let mut transaction = fake_v5_with_orchard_actions(
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1)
+            .expect("the action count fits in usize"),
+    );
+    let Transaction::V5 {
+        network_upgrade, ..
+    } = Arc::make_mut(&mut transaction)
+    else {
+        unreachable!("the V5 fixture helper returns a V5 transaction");
+    };
+    *network_upgrade = NetworkUpgrade::Nu7;
+    over_limit.transactions.push(transaction);
+    let cases = [
+        (bad_coinbase, TransactionError::CoinbaseAfterFirst),
+        (
+            over_limit,
+            TransactionError::OrchardActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            },
+        ),
+    ];
+
+    for (mut block, expected) in cases {
+        Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+        for matching_root in [false, true] {
+            let mut block = block.clone();
+            if !matching_root {
+                Arc::make_mut(&mut block.header).merkle_root.0[0] ^= 1;
+            }
+            let block = Arc::new(block);
+            for proposal in [false, true] {
+                let binding_checks = Arc::new(AtomicUsize::new(0));
+                let state = {
+                    let binding_checks = binding_checks.clone();
+                    service_fn(move |request: zs::Request| {
+                        let binding_checks = binding_checks.clone();
+                        async move {
+                            Ok::<_, BoxError>(match request {
+                                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                                zs::Request::CheckAuthDataCommitment(commitment) => {
+                                    assert!(!proposal && matching_root);
+                                    assert_eq!(
+                                        commitment.auth_data_root,
+                                        Some(commitment.block.auth_data_root())
+                                    );
+                                    binding_checks.fetch_add(1, Ordering::SeqCst);
+                                    zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
+                                }
+                                _ => panic!("cheap failures precede contextual validation"),
+                            })
+                        }
+                    })
+                };
+                let transaction =
+                    service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+                        panic!("cheap body failures must precede transaction verification");
+                    });
+                let request = if proposal {
+                    Request::CheckProposal(block.clone().into())
+                } else {
+                    Request::Commit(block.clone().into())
+                };
+                let error = SemanticBlockVerifier::new(
+                    &network,
+                    crate::transaction::boxed_state(state),
+                    crate::transaction::boxed_transaction_verifier(transaction),
+                )
+                .oneshot(request)
+                .await
+                .expect_err("the invalid body is rejected");
+                if !proposal && !matching_root {
+                    assert_eq!(
+                        error.body_verification_class(),
+                        BodyVerificationClass::PayloadMismatch(
+                            BodyCommitmentKind::TransactionMerkleRoot
+                        ),
+                        "{error:?}"
+                    );
+                } else if matches!(expected, TransactionError::CoinbaseAfterFirst) {
+                    assert!(
+                        matches!(error, VerifyBlockError::Block {
+                        source: BlockError::Transaction(ref found)
+                    } if *found == expected),
+                        "{error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, VerifyBlockError::Transaction(ref found)
+                        if *found == expected),
+                        "{error:?}"
+                    );
+                }
+                assert_eq!(
+                    binding_checks.load(Ordering::SeqCst),
+                    usize::from(!proposal && matching_root)
+                );
+            }
+        }
+    }
+}
+
+/// The block verifier hashes each transaction's ZIP-244 tree once, and hands the results to the
+/// transaction verifier and the state instead of letting each recompute them.
+#[tokio::test]
+async fn verifier_passes_precomputed_transaction_ids_and_auth_data_root() {
+    use std::sync::Mutex;
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let block = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+    assert!(block.transactions.iter().all(|tx| tx.version() == 5));
+
+    let proposed = Arc::new(Mutex::new(None));
+    let state = {
+        let proposed = proposed.clone();
+        service_fn(move |request: zs::Request| {
+            let proposed = proposed.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckParentInputs { .. } => {
+                        zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                    }
+                    zs::Request::CheckBlockProposalValidity(block) => {
+                        *proposed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+                        zs::Response::ValidBlockProposal
+                    }
+                    _ => panic!("unexpected state request: {request:?}"),
+                };
+                Ok::<_, BoxError>(response)
+            }
+        })
+    };
+    let requested_ids = Arc::new(Mutex::new(Vec::new()));
+    let transaction = {
+        let requested_ids = requested_ids.clone();
+        service_fn(move |request: tx::Request| {
+            let requested_ids = requested_ids.clone();
+            async move {
+                let tx::Request::Block {
+                    transaction_id,
+                    ref transaction,
+                    ..
+                } = request
+                else {
+                    panic!("block verification sends block transaction requests");
+                };
+                requested_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((transaction_id, transaction.unmined_id()));
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            }
+        })
+    };
+    let mut verifier = SemanticBlockVerifier::new(
+        &network,
+        crate::transaction::boxed_state(state),
+        crate::transaction::boxed_transaction_verifier(transaction),
+    );
+
+    prepare_for_test(&mut verifier, block.clone()).await;
+
+    let requested_ids = requested_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(requested_ids.len(), block.transactions.len());
+    for (supplied, recomputed) in requested_ids.iter() {
+        assert!(matches!(supplied, UnminedTxId::Witnessed(_)));
+        assert_eq!(supplied, recomputed);
+    }
+    let proposed = proposed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("the verifier sends the block to state");
+    assert_eq!(proposed.auth_data_root, Some(block.auth_data_root()));
 }
 
 #[test]
@@ -750,6 +1000,7 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                     admission: zs::BlockAdmission::pending(),
                 },
             ] {
+                let is_proposal = request.is_proposal();
                 let result = verifier
                     .ready()
                     .await
@@ -759,7 +1010,15 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                 let Err(VerifyBlockError::Block { source: error }) = result else {
                     panic!("{description}: expected block rejection, got {result:?}");
                 };
-                assert_eq!(error, expected, "{description}");
+                if is_proposal && matches!(expected, BlockError::DuplicateTransaction) {
+                    assert_eq!(
+                        error,
+                        BlockError::Transaction(TransactionError::CoinbaseAfterFirst),
+                        "the duplicate coinbase fails before proposal hashing"
+                    );
+                } else {
+                    assert_eq!(error, expected, "{description}");
+                }
                 assert!(
                     verifier
                         .prepared_candidates

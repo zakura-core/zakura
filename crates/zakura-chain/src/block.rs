@@ -13,7 +13,7 @@ use halo2::pasta::pallas;
 
 use crate::{
     amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed},
-    block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
+    block::merkle::{auth_digest_or_placeholder, AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
     fmt::DisplayToDebug,
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
@@ -22,10 +22,13 @@ use crate::{
     sapling,
     serialization::TrustedPreallocate,
     sprout,
-    transaction::Transaction,
+    transaction::{self, AuthDigest, Transaction, UnminedTxId, WtxId},
     transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
+
+/// The smallest transaction count that repays parallel hashing overhead in measured block mixes.
+const PARALLEL_TRANSACTION_HASHES_MIN: usize = 64;
 
 mod commitment;
 mod error;
@@ -70,6 +73,30 @@ pub struct Block {
     pub header: Arc<Header>,
     /// The block transactions.
     pub transactions: Vec<Arc<Transaction>>,
+}
+
+/// A block's transaction digests, in block order, from [`BlockRef::transaction_digests`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionDigests {
+    /// Each transaction's mined ID.
+    pub hashes: Arc<[transaction::Hash]>,
+    /// Each transaction's ZIP-244 authorizing-data digest, `None` before v5.
+    pub auth_digests: Vec<Option<AuthDigest>>,
+    /// The ZIP-244 authorizing-data root over `auth_digests`.
+    pub auth_data_root: AuthDataRoot,
+}
+
+impl TransactionDigests {
+    /// Each transaction's unmined ID, in block order.
+    pub fn unmined_ids(&self) -> impl ExactSizeIterator<Item = UnminedTxId> + '_ {
+        self.hashes
+            .iter()
+            .zip(&self.auth_digests)
+            .map(|(&id, auth_digest)| match *auth_digest {
+                None => UnminedTxId::Legacy(id),
+                Some(auth_digest) => UnminedTxId::Witnessed(WtxId { id, auth_digest }),
+            })
+    }
 }
 
 /// Read-only block access that does not expose shared header or transaction handles.
@@ -505,6 +532,39 @@ impl BlockRef {
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<AuthDataRoot>()
+    }
+
+    /// Compute every transaction ID, every ZIP-244 authorizing-data digest and the
+    /// authorizing-data root, walking each v5/v6 transaction's ZIP-244 data once.
+    ///
+    /// Blocks with fewer than 64 transactions, and single-worker Rayon pools, hash on
+    /// the calling thread, where splitting costs more than it saves.
+    pub fn transaction_digests(&self) -> TransactionDigests {
+        use rayon::prelude::*;
+
+        let (hashes, auth_digests): (Vec<_>, Vec<_>) = if self.0.transactions.len()
+            < PARALLEL_TRANSACTION_HASHES_MIN
+            || rayon::current_num_threads() == 1
+        {
+            self.transactions()
+                .map(Transaction::txid_and_auth_digest)
+                .unzip()
+        } else {
+            self.parallel_transactions()
+                .map(Transaction::txid_and_auth_digest)
+                .unzip()
+        };
+
+        let auth_data_root = auth_digests
+            .iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect();
+
+        TransactionDigests {
+            hashes: hashes.into(),
+            auth_digests,
+            auth_data_root,
+        }
     }
 }
 

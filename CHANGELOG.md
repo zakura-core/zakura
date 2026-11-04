@@ -11,6 +11,37 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-11-04
+
+### Changed
+
+- Block verification starts shielded transaction checks before transparent ones, shortening verification of mixed blocks
+  ([#1922](https://github.com/zakura-core/zakura/pull/1922)).
+- JSON-RPC 2.0 calls with one unescaped string argument, such as `submitblock`,
+  no longer copy and re-encode parameters before the server reads them
+  ([#1957](https://github.com/zakura-core/zakura/pull/1957)).
+- Committing a mined block now reuses the chain state the node already built when it validated
+  that block's template as a proposal, instead of building it a second time. Cached proposal
+  chains are released when their parent leaves the live state, even if proposals stop arriving
+  ([#1963](https://github.com/zakura-core/zakura/pull/1963)).
+- Updated Common dependencies to 5.1.0, bringing Orchard and Sapling signature
+  verification improvements
+  ([#1964](https://github.com/zakura-core/zakura/pull/1964)).
+- Block verification flushes partial Sapling and Orchard proof batches as soon as the block's shielded transactions have
+  queued them, instead of after every transaction has started, so mixed blocks verify their proofs alongside the
+  transparent checks ([#1968](https://github.com/zakura-core/zakura/pull/1968)).
+- Classify the accumulated compatible performance and dependency improvements as
+  a patch release for the node; published libraries retain their independent
+  API version requirements ([#1971](https://github.com/zakura-core/zakura/pull/1971)).
+
+<!-- release-readiness: allow-patch; reason: The Changed entries since v1.8.1 are backwards-compatible performance and dependency improvements. Existing node configurations, RPC behavior, and consensus rules remain compatible. Published library API changes are versioned independently. -->
+
+### Security
+
+- Reject mempool transactions with unknown shielded anchors or already-spent
+  nullifiers before submitting proof verification to the shared block verifiers
+  ([#1962](https://github.com/zakura-core/zakura/pull/1962)).
+
 ## [1.8.1] - 2026-11-03
 
 ### Changed

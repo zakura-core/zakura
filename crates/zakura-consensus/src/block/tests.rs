@@ -38,6 +38,41 @@ use super::*;
 
 mod nsm_fees;
 
+#[test]
+fn transaction_hashes_preserve_block_order_across_parallel_cutoff() {
+    let blocks: Vec<_> = [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .map(|bytes| Block::zcash_deserialize(bytes).expect("the block fixture deserializes"))
+    .collect();
+    let transactions: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter().cloned())
+        .collect();
+
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("the test thread pool starts");
+
+        for count in [0, 1, 63, 64, 65, 129] {
+            let mut block = blocks[0].clone();
+            block.transactions = transactions.iter().cycle().take(count).cloned().collect();
+            let expected: Arc<[_]> = block.transactions().map(|tx| tx.hash()).collect();
+            let actual = pool.install(|| transaction_hashes(&block));
+
+            assert_eq!(
+                actual, expected,
+                "{count} transactions with {threads} workers"
+            );
+        }
+    }
+}
+
 fn prepared_test_verifier(
     network: &Network,
 ) -> impl Service<Request, Response = block::Hash, Error = VerifyBlockError> {

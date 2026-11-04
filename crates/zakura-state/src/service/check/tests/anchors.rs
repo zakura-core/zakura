@@ -72,8 +72,8 @@ fn check_sprout_anchors() {
 
     let unmined_txs: Vec<_> = block_2
         .block
-        .transactions
-        .iter()
+        .view()
+        .transactions()
         .map(UnminedTx::from)
         .collect();
 
@@ -299,8 +299,8 @@ fn check_sapling_anchors() {
 
     let unmined_txs: Vec<_> = block2
         .block
-        .transactions
-        .iter()
+        .view()
+        .transactions()
         .map(UnminedTx::from)
         .collect();
 

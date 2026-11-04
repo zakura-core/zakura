@@ -76,9 +76,8 @@ impl ContextuallyVerifiedBlock {
 
         let zero_spent_utxos = block
             .block
-            .transactions
-            .iter()
-            .map(AsRef::as_ref)
+            .view()
+            .transactions()
             .flat_map(Transaction::inputs)
             .flat_map(transparent::Input::outpoint)
             .map(|outpoint| (outpoint, zero_utxo.clone()))
@@ -109,6 +108,7 @@ impl ContextuallyVerifiedBlock {
         } = block.into();
 
         Self {
+            header: Arc::new(*block.header()),
             block,
             hash,
             height,

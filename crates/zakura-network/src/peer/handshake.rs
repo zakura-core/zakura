@@ -39,6 +39,7 @@ use zakura_node_services::task::erased;
 
 use crate::{
     constants,
+    inbound_resources::{InboundBudget, TCP_INBOUND_RETAINED_BYTES},
     meta_addr::MetaAddrChange,
     peer::{
         CancelHeartbeatTask, Client, ClientRequest, Connection, ConnectionRequests, ErrorSlot,
@@ -95,6 +96,9 @@ where
     /// canonicalized for IPv4-mapped matching. Empty when unconfigured.
     protected_peer_ips: Arc<HashSet<IpAddr>>,
 
+    /// Funds decoded TCP payloads across this node's connections.
+    inbound_budget: InboundBudget,
+
     /// The live ban list, rechecked by each connection before it writes a block advert.
     bans: BannedIps,
 
@@ -144,6 +148,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector.clone(),
             peer_registry: self.peer_registry.clone(),
             protected_peer_ips: self.protected_peer_ips.clone(),
+            inbound_budget: self.inbound_budget.clone(),
             bans: self.bans.clone(),
             parent_span: self.parent_span.clone(),
         }
@@ -674,6 +679,7 @@ where
             zakura_handshake_connector: self.zakura_handshake_connector,
             peer_registry: self.peer_registry,
             protected_peer_ips: self.protected_peer_ips.unwrap_or_default(),
+            inbound_budget: InboundBudget::new(TCP_INBOUND_RETAINED_BYTES),
             bans: self.bans.unwrap_or_default(),
             parent_span: Span::current(),
         })
@@ -1540,6 +1546,7 @@ where
             connected_addr,
             connection_tracker,
         } = req;
+        let inbound_budget = self.inbound_budget.clone();
 
         let addr_label = connected_addr.addr_label(self.config.expose_peer_addresses);
         let negotiator_span = debug_span!(
@@ -1869,6 +1876,7 @@ where
                 connection_info.clone(),
                 addr_label,
                 alternate_addrs.collect(),
+                inbound_budget,
             );
 
             let block_uploads = server.block_uploads.clone();

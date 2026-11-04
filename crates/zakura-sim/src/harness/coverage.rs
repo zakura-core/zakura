@@ -211,12 +211,20 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
-        property: "header/reactor-policy",
+        property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_handoff_input_holds_payload_inventory_agrees",
+        ),
+        bypass: Bypass::Planted("lost-payload-release"),
+    },
+    Coverage {
+        property: "block/decoded-retention",
         passing: passes(
             "tests/replay_exact.rs",
-            "reactor_machine_records_and_replays_without_transport",
+            "decoded_retention_replays_final_holders_in_a_fresh_process",
         ),
-        bypass: Bypass::Planted("locator-call-settles-without-removal"),
+        bypass: Bypass::Planted("raw-transaction-escape"),
     },
     Coverage {
         property: "block/reactor-policy",
@@ -243,6 +251,22 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("missing-published-charge"),
     },
     Coverage {
+        property: "header/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("locator-call-settles-without-removal"),
+    },
+    Coverage {
+        property: "header/publisher-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "publisher_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("lost-credit"),
+    },
+    Coverage {
         property: super::NO_TASK_PANIC,
         passing: passes("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
         bypass: Bypass::Test(sim_test(
@@ -261,6 +285,30 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/timer-cancel", "timer_cancel_witness"),
     race("race/ab-ba", "ab_ba_witness"),
     race("race/abort-without-join", "abort_without_join_witness"),
+    Coverage {
+        property: "discovery/record-book",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_book_records_and_replays_signed_samples",
+        ),
+        bypass: Bypass::Planted("skip-book-eviction"),
+    },
+    Coverage {
+        property: "discovery/session-installation",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_state_records_and_replays_installations",
+        ),
+        bypass: Bypass::Planted("install-superseded-result"),
+    },
+    Coverage {
+        property: crate::domain::discovery::VERIFICATION_CAPACITY,
+        passing: passes(
+            "tests/discovery.rs",
+            "verification_results_keep_their_slots",
+        ),
+        bypass: Bypass::Planted("release-before-install"),
+    },
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: passes("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),

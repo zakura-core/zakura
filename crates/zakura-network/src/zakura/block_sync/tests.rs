@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     future,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use proptest::{prop_assert, prop_assert_eq};
 
@@ -14,10 +15,10 @@ use super::{
     config::{
         BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
         DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
-        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
-        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
-        MAX_BS_RESPONSE_BYTES, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
+        DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
+        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
@@ -28,7 +29,7 @@ use super::{
     request::*,
     sequencer::*,
     sequencer_task::{
-        initial_view, SequencedBody, SequencerControlInput, SequencerTask, SequencerView,
+        initial_view, SequencedBody, SequencerControlInput, SequencerIO, SequencerView,
     },
     state::*,
     work_queue::WorkQueue,
@@ -199,7 +200,15 @@ fn header_tip_startup(
     header_tip: watch::Receiver<(block::Height, block::Hash)>,
     config: ZakuraBlockSyncConfig,
 ) -> BlockSyncStartup {
-    let mut startup = BlockSyncStartup::new(frontiers, best_header_tip, header_tip, config);
+    let mut startup = BlockSyncStartup::new(
+        frontiers,
+        best_header_tip,
+        header_tip,
+        (config)
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
+        config,
+    );
     startup.committed_views = Some(startup_committed_view(frontiers, best_header_tip));
     startup
 }
@@ -341,6 +350,9 @@ fn committed_block_sync_startup(
         frontiers,
         best_header_tip,
         committed_views,
+        (config)
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         config,
     );
 
@@ -540,6 +552,7 @@ async fn committed_views_are_the_sole_production_frontier_source() {
         legacy_frontiers,
         legacy_header,
         snapshot_rx,
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.header_tip.is_none());
@@ -628,6 +641,7 @@ async fn empty_state_body_queries_bound_the_header_bootstrap_wait() {
         },
         (finalized.height, finalized.hash),
         snapshot_rx,
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -716,6 +730,7 @@ async fn past_genesis_body_queries_ignore_far_ahead_header_quiet_period() {
         },
         (header.height, header.hash),
         snapshot_rx,
+        test_decoded_pool(),
         ZakuraBlockSyncConfig::default(),
     );
     let (_handle, mut actions, reactor_task) =
@@ -787,7 +802,7 @@ async fn startup_body_cooldown_survives_the_first_work_refresh() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (_snapshots, receiver) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.committed_views = Some(receiver);
     let (handle, _actions, reactor_task) =
         spawn_block_sync_reactor(startup).expect("valid block-sync config");
@@ -819,7 +834,7 @@ async fn operator_body_retry_is_exact_deduplicated_and_requires_a_supplier() {
     let view = committed_view(snapshot, 0);
     let scope = zakura_header_chain::BodyWorkAuthority::for_view(&view);
     let (snapshot_tx, snapshot_rx) = watch::channel(Some(view));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -949,7 +964,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
         .expect("the fixture contains a persistent body alarm");
     let (_snapshot_tx, snapshot_rx) = watch::channel(Some(committed_view(snapshot, 0)));
     let config = ZakuraBlockSyncConfig::default();
-    let mut startup = BlockSyncStartup::inert(config.clone());
+    let mut startup = BlockSyncStartup::inert(config.clone()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -1038,7 +1053,7 @@ async fn dropped_status_received_still_restarts_body_alarm_on_requery() {
     let header = zakura_header_chain::Frontier::new(block::Height(10), block::Hash([0x55; 32]));
     let (_snapshot_tx, snapshot_rx) =
         watch::channel(Some(committed_view(alarmed_committed_snapshot(header), 0)));
-    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default());
+    let mut startup = BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap();
     startup.frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(9),
         verified_block_tip: block::Height(9),
@@ -1269,7 +1284,6 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1294,7 +1308,6 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -1819,9 +1832,10 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(default.max_blocks_per_response, None);
     assert_eq!(default.advertised_max_blocks_per_response(), 1);
     assert_eq!(default.max_inflight_requests, 32000);
+    assert_eq!(default.max_inflight_block_bytes, None);
     assert_eq!(
-        default.max_inflight_block_bytes,
-        DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES
+        default.inflight_block_bytes(),
+        default.derived_max_inflight_block_bytes(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
     );
     assert_eq!(
         default.max_reorder_lookahead_bytes,
@@ -1987,7 +2001,7 @@ fn ignored_max_blocks_per_response_warns_only_above_one() {
 #[test]
 fn config_validate_rejects_degenerate_values() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 0,
+        max_inflight_block_bytes: Some(0),
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -2002,13 +2016,13 @@ fn config_validate_rejects_degenerate_values() {
     // release their reservation at receipt, so the budget only has to exceed one
     // floor request (checked below the floor-request bound in `validate`).
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR - 1),
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_ok());
 
     config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
         max_reorder_lookahead_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2049,6 +2063,39 @@ fn config_validate_rejects_degenerate_values() {
 }
 
 #[test]
+fn config_without_inflight_block_bytes_derives_them_and_round_trips() {
+    // A config without the key, like every default config written before the
+    // budget was derived, loads unset and writes the key back out unset.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_requests = 32000
+        "#,
+    )
+    .expect("a config without max_inflight_block_bytes loads");
+    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, None);
+    let written = toml::to_string(&config).expect("the config serializes");
+    assert!(!written.contains("max_inflight_block_bytes"));
+
+    // An old config that wrote the former 6 GiB default keeps it.
+    let config: crate::Config = toml::from_str(
+        r#"
+        [zakura.block_sync]
+        max_inflight_block_bytes = 6442450944
+        "#,
+    )
+    .expect("a config with the old default loads");
+    let block_sync = config.zakura.block_sync.clone().for_node_connections(4);
+    assert_eq!(block_sync.inflight_block_bytes(), 6 << 30);
+    let written = toml::to_string(&config).expect("the config serializes");
+    let reread: crate::Config = toml::from_str(&written).expect("the config reloads");
+    assert_eq!(
+        reread.zakura.block_sync.max_inflight_block_bytes,
+        Some(6 << 30)
+    );
+}
+
+#[test]
 fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
     // An older config with a small `max_inflight_block_bytes` (e.g. the stored
     // `v4.5.0-zakura-blocksync.toml` 256 MiB value) loads unchanged: the request
@@ -2064,7 +2111,7 @@ fn config_deserialize_keeps_below_range_floor_inflight_block_bytes() {
     const {
         assert!(268435456u64 < BS_CHECKPOINT_RANGE_BYTE_FLOOR);
     }
-    assert_eq!(config.zakura.block_sync.max_inflight_block_bytes, 268435456);
+    assert_eq!(config.zakura.block_sync.inflight_block_bytes(), 268435456);
 }
 
 #[test]
@@ -2085,7 +2132,7 @@ fn config_deserialize_clamps_sub_floor_request_inflight_block_bytes() {
         "test premise: the stored value is at or below one floor request"
     );
     assert_eq!(
-        config.zakura.block_sync.max_inflight_block_bytes,
+        config.zakura.block_sync.inflight_block_bytes(),
         request_floor + 1
     );
 }
@@ -2106,7 +2153,7 @@ fn a_budget_above_one_block_is_kept() {
     }
     assert_eq!(
         config.zakura.block_sync.max_inflight_block_bytes,
-        16_777_216
+        Some(16_777_216)
     );
     assert_eq!(config.zakura.block_sync.validate(), Ok(()));
 }
@@ -2883,7 +2930,7 @@ fn admit_grant(
 #[test]
 fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 40_000_000,
+        max_inflight_block_bytes: Some(40_000_000),
         max_reorder_lookahead_bytes: 500,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2950,7 +2997,7 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
 #[test]
 fn admission_counts_inflight_to_sequencer_bytes() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -2986,7 +3033,7 @@ fn admission_counts_inflight_to_sequencer_bytes() {
 #[test]
 fn total_resident_plateaus_under_commit_stall() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3022,7 +3069,7 @@ fn total_resident_plateaus_under_commit_stall() {
 #[test]
 fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3075,7 +3122,7 @@ fn outstanding_reservations_are_charged_at_wire_size() {
     // at their wire size. Charging them nothing makes in-flight volume invisible to the
     // byte gate until it is already resident.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3140,7 +3187,7 @@ fn floor_backpressures_when_download_floor_escalates_past_commit() {
     // once the resident-memory look-ahead budget is full, while the commit window stays
     // fundable so a pinned checkpoint range can assemble and commit can drain.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         // Large enough that the byte (memory) cap, not the block cap, is what bites here.
         ..ZakuraBlockSyncConfig::default()
@@ -3222,7 +3269,7 @@ fn exempt_take_never_spans_the_commit_window_boundary() {
     // resident gate, sized only by the in-flight budget. The clamp is structural
     // (gate-independent), so it holds whether or not the gate is full.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64_000_000,
+        max_inflight_block_bytes: Some(64_000_000),
         max_reorder_lookahead_bytes: 1_000,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -3298,7 +3345,7 @@ fn commit_window_stays_fundable_at_exact_floor() {
     };
 
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_inflight_block_bytes: Some(BS_CHECKPOINT_RANGE_BYTE_FLOOR),
         max_reorder_lookahead_bytes: 1,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -4348,7 +4395,7 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
 
@@ -4478,7 +4525,7 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
         .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_millis(400);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let (tip_tx, tip_rx) = genesis_tip_channel();
     let mut startup = genesis_startup(tip_rx, config.clone());
@@ -4592,7 +4639,7 @@ async fn check_cold_probe_deadline(expired: bool) {
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
     config.request_timeout = Duration::from_millis(300);
     config.floor_rescue_timeout = Duration::from_millis(120);
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 64);
 
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
@@ -4971,8 +5018,126 @@ fn reorder_drains_only_contiguous_prefix_and_reports_dropped_bytes() {
 
 // ---- Sequencer commit pipeline ----
 
-fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> Sequencer {
-    Sequencer::new(block::Height(verified_tip), submitted_apply_limit)
+/// Drive the production payload owner beside the real sequencing policy.
+struct TestSequencer {
+    policy: Sequencer,
+    payloads: sequencer_task::SequencerPayloads,
+}
+
+struct TestSubmission {
+    intent: SubmitItem,
+    block: BlockHandle,
+}
+
+impl std::ops::Deref for TestSubmission {
+    type Target = SubmitItem;
+    fn deref(&self) -> &Self::Target {
+        &self.intent
+    }
+}
+
+impl std::ops::Deref for TestSequencer {
+    type Target = Sequencer;
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
+impl TestSequencer {
+    fn settle_payloads(&mut self) {
+        self.payloads.apply(self.policy.take_payload_changes());
+        assert_eq!(
+            self.payloads.retained_ids().collect::<BTreeSet<_>>(),
+            self.policy.retained_ids().collect::<BTreeSet<_>>(),
+            "runtime payloads match every retained policy identity",
+        );
+    }
+
+    /// Run one policy mutation, then apply its payload changes and check the inventory.
+    fn settled<T>(&mut self, mutate: impl FnOnce(&mut Sequencer) -> T) -> T {
+        let result = mutate(&mut self.policy);
+        self.settle_payloads();
+        result
+    }
+
+    fn with_decoded_window_cap(mut self, height: block::Height, bytes: u64) -> Self {
+        self.policy = self.policy.with_decoded_window_cap(height, bytes);
+        self
+    }
+
+    fn accept_body(
+        &mut self,
+        height: block::Height,
+        hash: block::Hash,
+        body: Arc<block::Block>,
+        bytes: u64,
+        peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        let previous = body.header.previous_block_hash;
+        self.accept_buffered_body(
+            test_work_owner(),
+            zakura_header_chain::SourceId::from_digest([1; 32]),
+            height,
+            hash,
+            previous,
+            BufferedBlockBody::from_decoded_block(body, None),
+            bytes,
+            None,
+            peer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_buffered_body(
+        &mut self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        height: block::Height,
+        hash: block::Hash,
+        previous: block::Hash,
+        body: BufferedBlockBody,
+        bytes: u64,
+        estimate: Option<u64>,
+        peer: ZakuraPeerId,
+    ) -> AcceptOutcome {
+        let facts = self.payloads.insert(body);
+        let result = self.policy.accept_buffered_body(
+            owner, source, height, hash, previous, facts, bytes, estimate, peer,
+        );
+        if matches!(result, AcceptOutcome::Redundant { .. }) {
+            self.payloads.release(facts.id);
+        }
+        self.settle_payloads();
+        result
+    }
+
+    fn prepare_submit(&mut self, height: block::Height) -> Option<TestSubmission> {
+        self.settle_payloads();
+        let facts = self.policy.submission_body(height)?;
+        let materialized = self
+            .payloads
+            .materialize(
+                facts.id,
+                &test_decoded_pool(),
+                admission::submission_decode_admission(self.policy.verified_tip(), height),
+            )
+            .unwrap();
+        let intent = self
+            .policy
+            .prepare_submit(height, facts.id, materialized.decoded_bytes)?;
+        self.settle_payloads();
+        Some(TestSubmission {
+            intent,
+            block: materialized.block,
+        })
+    }
+}
+
+fn test_sequencer(verified_tip: u32, submitted_apply_limit: usize) -> TestSequencer {
+    TestSequencer {
+        policy: Sequencer::new(block::Height(verified_tip), submitted_apply_limit),
+        payloads: Default::default(),
+    }
 }
 
 #[test]
@@ -5045,7 +5210,9 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
             covered: block::Height(2)
         }
     );
-    assert!(seq.drain_ready_into_applying().is_empty());
+    assert!(seq
+        .settled(|policy| policy.drain_ready_into_applying())
+        .is_empty());
     assert!(seq.reorder_contains(block::Height(2)));
     assert_eq!(seq.reorder_decoded_attributed_memory_bytes(), 0);
     assert_eq!(
@@ -5066,7 +5233,7 @@ fn sequencer_retains_raw_bytes_for_non_contiguous_backlog() {
         }
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2)]
     );
     assert_eq!(seq.applying_hash(block::Height(2)), Some(block2.hash()));
@@ -5122,7 +5289,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     }
 
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_len(), 3);
@@ -5140,7 +5307,7 @@ fn sequencer_bounds_decoded_bodies_to_submission_window() {
     assert_eq!(seq.decoded_applying_count(), limit);
 
     // Rolling a submission back also rolls its body out of the decode window.
-    seq.unsubmit(block::Height(1), 1);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), 1));
     assert_eq!(seq.decoded_applying_count(), limit - 1);
 }
 
@@ -5150,7 +5317,7 @@ fn capped_sequencer_with_blocks_1_to_3(
     max_checkpoint_height: u32,
     max_decoded_bytes: u64,
     wire_bytes: u64,
-) -> (Sequencer, Vec<Arc<block::Block>>) {
+) -> (TestSequencer, Vec<Arc<block::Block>>) {
     let mut seq = test_sequencer(0, 8)
         .with_decoded_window_cap(block::Height(max_checkpoint_height), max_decoded_bytes);
     let blocks = mainnet_blocks_1_to_3();
@@ -5170,14 +5337,14 @@ fn capped_sequencer_with_blocks_1_to_3(
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     (seq, blocks)
 }
 
 /// Submit every currently submittable height the way the sequencer task does,
 /// rechecking the measured decoded window before each one, and return the
 /// dispatch items.
-fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
+fn submit_all(seq: &mut TestSequencer) -> Vec<TestSubmission> {
     let mut items = Vec::new();
     for height in seq.submittable_heights() {
         if !seq.submission_fits_decoded_window(height) {
@@ -5189,9 +5356,15 @@ fn submit_all(seq: &mut Sequencer) -> Vec<SubmitItem> {
 }
 
 /// Retire a submission the way a committed apply completion does.
-fn finish_committed(seq: &mut Sequencer, item: &SubmitItem) {
-    seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+fn finish_committed(seq: &mut TestSequencer, item: &TestSubmission) {
+    seq.settled(|policy| policy.remove_applying(item.height));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
 }
 
 #[test]
@@ -5326,7 +5499,7 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
         );
     }
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.applying_buffered_bytes(), 600);
@@ -5346,36 +5519,36 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
     check(&seq, "submit 1,2");
 
     // Roll back the submit for height 1.
-    seq.unsubmit(block::Height(1), item1.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item1.token));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     check(&seq, "unsubmit 1");
 
     // Detaching the still-submitted height 2 does not release the driver-owned
     // decoded body or its submission-window charge.
-    seq.remove_applying(block::Height(2));
+    seq.settled(|policy| policy.remove_applying(block::Height(2)));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
     assert_eq!(seq.applying_buffered_bytes(), 400);
     check(&seq, "detach submitted 2");
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item2.owner,
         item2.source,
         item2.token,
         item2.height,
         item2.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     check(&seq, "finish detached 2");
 
     // Commit through height 1: releases the applied body (height 1) from `applying`.
-    seq.advance_verified_tip(block::Height(1), true);
+    seq.settled(|policy| policy.advance_verified_tip(block::Height(1), true));
     assert_eq!(seq.applying_buffered_bytes(), 300);
     check(&seq, "advance_verified_tip");
 
     // Reset drops all applying state; there are no in-flight submissions left.
-    seq.reset_to(block::Height(0), false);
+    seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(seq.applying_buffered_bytes(), 0);
     assert_eq!(seq.applying_decoded_attributed_memory_bytes(), 0);
     assert_eq!(seq.in_flight_submission_count(), 0);
@@ -5395,6 +5568,17 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("403 test bodies fit in usize");
     assert_eq!(submission_limit, 401);
 
+    use zakura_node_services::block_memory::{Admission, BlockHandle};
+    const BACKEND_BLOCKS: u64 = 2;
+    let pool = ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(BACKEND_BLOCKS)
+        .unwrap();
+    let backend: Vec<_> = (0..BACKEND_BLOCKS)
+        .map(|_| {
+            let block = Arc::try_unwrap(mainnet_block(&BLOCK_MAINNET_1_BYTES)).unwrap();
+            BlockHandle::Owned(pool.try_admit(block, Admission::WithinLimit).unwrap())
+        })
+        .collect();
     let blocks = fake_sequential_blocks(BLOCK_COUNT);
     let frontiers = genesis_frontiers();
     let body_input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5404,8 +5588,9 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + 128);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
     let budget = ByteBudget::new(1);
-    let task = SequencerTask::new(
-        Sequencer::new(block::Height(0), submission_limit),
+    let task = SequencerIO::new(
+        Sequencer::new(block::Height(0), submission_limit)
+            .with_decoded_window_cap(block::Height(BLOCK_COUNT), 1),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
         actions_tx,
@@ -5421,6 +5606,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
+        pool.clone(),
     );
     let task = tokio::spawn(task.run());
 
@@ -5434,10 +5620,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
                 height,
                 block.hash(),
                 block.header.previous_block_hash,
-                BufferedBlockBody::from_decoded_block(
-                    block.clone(),
-                    Some(raw_block_payload(block)),
-                ),
+                BufferedBlockBody::RawFramePayload(raw_block_payload(block)),
                 u64::from(block_size(block)),
                 None,
                 peer(1),
@@ -5480,7 +5663,16 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             action => panic!("unexpected action before initial submissions complete: {action:?}"),
         }
     }
+    assert_eq!(
+        pool.reserved_blocks(),
+        BACKEND_BLOCKS + submission_limit_u64,
+        "backend retention must leave room for the complete checkpoint range"
+    );
     for (index, (_, block)) in initial_submissions.iter().enumerate() {
+        assert!(
+            matches!(block, BlockHandle::Owned(_)),
+            "raw checkpoint bodies acquire real retention ownership"
+        );
         assert_eq!(
             block.coinbase_height(),
             Some(block::Height(
@@ -5580,13 +5772,32 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     .expect("stale completions settle with a refilled checkpoint submission window");
 
     task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        pool.reserved_blocks(),
+        BACKEND_BLOCKS + submission_limit_u64 + 1,
+        "completed submissions stay charged while driver and backend handles remain"
+    );
+    let held_bytes: u64 = backend
+        .iter()
+        .chain(initial_submissions.iter().map(|(_, block)| block))
+        .chain(std::iter::once(&block_402))
+        .map(|block| block.attributed_memory_size_bytes())
+        .sum();
+    assert_eq!(pool.reserved_bytes(), held_bytes);
+    drop(initial_submissions);
+    drop(block_402);
+    assert_eq!(pool.reserved_blocks(), BACKEND_BLOCKS);
+    drop(backend);
+    assert_eq!(pool.reserved_blocks(), 0);
+    assert_eq!(pool.reserved_bytes(), 0);
 }
 
 /// Wait up to `timeout` for the next `SubmitBlock`, skipping other actions.
 async fn next_submission(
     actions_rx: &mut mpsc::Receiver<BlockSyncAction>,
     timeout: Duration,
-) -> Option<(BlockApplyToken, Arc<block::Block>)> {
+) -> Option<(BlockApplyToken, BlockHandle)> {
     time::timeout(timeout, async {
         loop {
             let action = actions_rx
@@ -5628,7 +5839,7 @@ impl CappedSequencerTask {
         let (actions_tx, actions_rx) = mpsc::channel(8);
         let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
         let budget = ByteBudget::new(1);
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
                 .with_decoded_window_cap(block::Height(0), max_decoded_bytes),
             Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
@@ -5646,6 +5857,7 @@ impl CappedSequencerTask {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
+            test_decoded_pool(),
         );
         Self {
             body_tx,
@@ -6090,7 +6302,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
     let (actions_tx, mut actions_rx) = mpsc::channel(submission_limit + DETACHED_PREFIX);
     let (view_tx, mut view_rx) = watch::channel(initial_view(frontiers));
     let budget = ByteBudget::new(1);
-    let task = SequencerTask::new(
+    let task = SequencerIO::new(
         Sequencer::new(block::Height(0), submission_limit),
         Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
         Arc::new(PeerRegistry::new()),
@@ -6107,6 +6319,7 @@ async fn detached_checkpoint_duplicates_refill_current_submission_window() {
         view_tx,
         CHANNEL_TIMEOUT,
         ZakuraTrace::noop(),
+        test_decoded_pool(),
     );
     let task = tokio::spawn(task.run());
 
@@ -6290,7 +6503,7 @@ struct DetachedWindow {
         zakura_header_chain::BodyWorkOwner,
         zakura_header_chain::SourceId,
         BlockApplyToken,
-        Arc<block::Block>,
+        BlockHandle,
     )>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -6313,7 +6526,7 @@ impl DetachedWindow {
         let body_input_decoded_attributed_memory_bytes =
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let budget = ByteBudget::new(1);
-        let task = SequencerTask::new(
+        let task = SequencerIO::new(
             Sequencer::new(block::Height(0), submission_limit),
             Arc::new(WorkQueue::new(block::Height(0), budget)),
             Arc::new(PeerRegistry::new()),
@@ -6330,6 +6543,7 @@ impl DetachedWindow {
             view_tx,
             Self::CHANNEL_TIMEOUT,
             ZakuraTrace::noop(),
+            test_decoded_pool(),
         );
         let mut window = Self {
             blocks: fake_sequential_blocks(block_count),
@@ -6549,7 +6763,7 @@ async fn stale_completions_ahead_of_their_epoch_change_wake_no_invalid_work() {
 fn a_raw_body_reports_its_decode_estimate_until_submitted() {
     let blocks = fake_sequential_blocks(1);
     let block = &blocks[0];
-    let mut sequencer = Sequencer::new(block::Height(0), 1);
+    let mut sequencer = test_sequencer(0, 1);
     sequencer.accept_buffered_body(
         test_work_owner(),
         zakura_header_chain::SourceId::from_digest([1; 32]),
@@ -6561,7 +6775,7 @@ fn a_raw_body_reports_its_decode_estimate_until_submitted() {
         None,
         peer(0),
     );
-    let _ = sequencer.drain_ready_into_applying();
+    let _ = sequencer.settled(|policy| policy.drain_ready_into_applying());
 
     assert_eq!(
         sequencer.submission_decode_charge_at(block::Height(1)),
@@ -6604,7 +6818,10 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     // Only the contiguous prefix above the floor (height 1) drains.
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying()),
+        vec![block::Height(1)]
+    );
     assert_eq!(seq.floor(), block::Height(1));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.applying_len(), 1);
@@ -6617,7 +6834,7 @@ fn sequencer_drains_contiguous_prefix_into_applying_and_advances_floor() {
         peer(0),
     );
     assert_eq!(
-        seq.drain_ready_into_applying(),
+        seq.settled(|policy| policy.drain_ready_into_applying()),
         vec![block::Height(2), block::Height(3)]
     );
     assert_eq!(seq.floor(), block::Height(3));
@@ -6632,7 +6849,11 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    assert_eq!(seq.drain_ready_into_applying().len(), 3);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying())
+            .len(),
+        3
+    );
     // The submission window of 2 caps the eligible heights.
     assert_eq!(
         seq.submittable_heights(),
@@ -6645,7 +6866,7 @@ fn sequencer_submits_within_window_and_rolls_back_on_unsubmit() {
     // The window is now full, so nothing else is submittable.
     assert!(seq.submittable_heights().is_empty());
     // Rolling back a failed dispatch frees the slot and re-offers the height.
-    seq.unsubmit(block::Height(2), item2.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(2), item2.token));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.submittable_heights(), vec![block::Height(2)]);
 }
@@ -6670,25 +6891,25 @@ fn sequencer_completed_duplicate_releases_attached_decode_window_slot() {
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert!(seq.submittable_heights().is_empty());
 
     // A duplicate completion can arrive before the frontier proving that block
     // advances. Keep its applying entry attached, but drop the decoded copy and
     // free the global submission slot because the driver released its Arc.
-    assert!(seq.finish_attached_submission(
+    assert!(seq.settled(|policy| policy.finish_attached_submission(
         item.owner,
         item.source,
         item.token,
         item.height,
         item.hash
-    ));
+    )));
     assert!(seq.applying_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.decoded_applying_count(), 0);
@@ -6702,15 +6923,21 @@ fn sequencer_records_and_decrements_submitted_applies() {
     let hash = block.hash();
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     seq.accept_body(block::Height(1), hash, block, 100, peer(0));
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert!(seq.has_submitted_apply(block::Height(1), hash));
     assert!(seq.submitted_contains(block::Height(1)));
-    seq.remove_applying(item.height);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    seq.settled(|policy| policy.remove_applying(item.height));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
     assert!(!seq.has_submitted_apply(block::Height(1), hash));
     assert!(!seq.submitted_contains(block::Height(1)));
 }
@@ -6732,12 +6959,12 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 is applying");
-    seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+    seq.settled(|policy| policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes));
     assert!(seq.submitted_contains(block::Height(1)));
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6748,7 +6975,10 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "submitted-apply window is full"
     );
 
-    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert_eq!(
+        seq.settled(|policy| policy.release_applied_through(block::Height(1))),
+        100
+    );
     assert!(!seq.submitted_contains(block::Height(1)));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
@@ -6761,13 +6991,13 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
         "detached driver submission still occupies the decode window"
     );
 
-    assert!(!seq.finish_submission(
+    assert!(!seq.settled(|policy| policy.finish_submission(
         item.owner,
         item.source,
         item.token,
         item.height,
         block::Hash([99; 32])
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6778,16 +7008,28 @@ fn sequencer_frontier_release_keeps_in_flight_submission_charged_until_completio
             .expect("incremented test request ID is nonzero"),
         ..item.owner
     };
-    assert!(!seq.finish_submission(wrong_owner, item.source, item.token, item.height, item.hash));
-    assert!(!seq.finish_submission(
+    assert!(!seq.settled(|policy| policy.finish_submission(
+        wrong_owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
+    assert!(!seq.settled(|policy| policy.finish_submission(
         item.owner,
         zakura_header_chain::SourceId::from_digest([99; 32]),
         item.token,
         item.height,
         item.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
-    assert!(seq.finish_submission(item.owner, item.source, item.token, item.height, item.hash));
+    assert!(seq.settled(|policy| policy.finish_submission(
+        item.owner,
+        item.source,
+        item.token,
+        item.height,
+        item.hash
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6816,13 +7058,13 @@ fn sequencer_advance_verified_tip_releases_bytes_and_reports_change() {
     );
     // Advancing the verified tip drops buffered bodies at or below it and reports
     // their bytes for the reactor to release.
-    let advance = seq.advance_verified_tip(block::Height(2), false);
+    let advance = seq.settled(|policy| policy.advance_verified_tip(block::Height(2), false));
     assert!(advance.changed);
     assert_eq!(advance.release_bytes, 300);
     assert_eq!(seq.verified_tip(), block::Height(2));
     assert!(seq.floor() >= block::Height(2));
     // A no-op advance to the same tip frees nothing and reports unchanged.
-    let advance = seq.advance_verified_tip(block::Height(2), false);
+    let advance = seq.settled(|policy| policy.advance_verified_tip(block::Height(2), false));
     assert!(!advance.changed);
     assert_eq!(advance.release_bytes, 0);
 }
@@ -6838,7 +7080,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
         100,
         peer(0),
     );
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     seq.accept_body(
         block::Height(2),
         blocks[1].hash(),
@@ -6848,7 +7090,7 @@ fn sequencer_reset_clears_buffers_and_pins_floor_and_tip() {
     );
     // Reset drops everything (one applying@100 + one reorder@200) and pins the
     // floor/tip to the reset target.
-    let released = seq.reset_to(block::Height(0), false);
+    let released = seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(released, 300);
     assert_eq!(seq.floor(), block::Height(0));
     assert_eq!(seq.verified_tip(), block::Height(0));
@@ -6869,14 +7111,16 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
 
     let old_items: Vec<_> = seq
         .submittable_heights()
         .into_iter()
         .map(|height| {
             let item = seq.prepare_submit(height).expect("height is applying");
-            seq.record_submitted_apply(item.height, item.hash, item.decoded_bytes);
+            seq.settled(|policy| {
+                policy.record_submitted_apply(item.height, item.hash, item.decoded_bytes)
+            });
             item
         })
         .collect();
@@ -6884,7 +7128,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.in_flight_submission_count(), 2);
 
     // Keep `old_items` alive to model the driver's pending/in-flight Arc<Block>s.
-    seq.reset_to(block::Height(0), false);
+    seq.settled(|policy| policy.reset_to(block::Height(0), false));
     assert_eq!(seq.applying_len(), 0);
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200);
@@ -6899,7 +7143,7 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, replacement.hash(), replacement, 100, peer(1));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     assert!(
         seq.submittable_heights().is_empty(),
         "replacement bodies must not exceed the live decode window"
@@ -6909,13 +7153,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
 
     let first = &old_items[0];
     assert!(
-        !seq.finish_submission(
+        !seq.settled(|policy| policy.finish_submission(
             first.owner,
             first.source,
             first.token,
             first.height,
             block::Hash([99; 32])
-        ),
+        )),
         "a mismatched completion must not release a detached charge"
     );
     assert_eq!(seq.in_flight_submission_count(), 2);
@@ -6923,13 +7167,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
         seq.applying_decoded_attributed_memory_bytes(),
         decoded_attributed_memory_bytes_before_completion
     );
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         first.owner,
         first.source,
         first.token,
         first.height,
         first.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6939,13 +7183,13 @@ fn sequencer_reset_keeps_detached_submissions_charged_until_matching_completions
     assert_eq!(seq.submittable_heights().len(), 1);
 
     let second = &old_items[1];
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         second.owner,
         second.source,
         second.token,
         second.height,
         second.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(
         seq.applying_decoded_attributed_memory_bytes(),
@@ -6963,18 +7207,21 @@ fn sequencer_reject_drops_successors_and_rolls_floor_back() {
         let height = block::Height(index as u32 + 1);
         seq.accept_body(height, block.hash(), block.clone(), 100, peer(0));
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     assert_eq!(seq.floor(), block::Height(3));
     // A reject at height 2 drops applying >= 2 (200 bytes) and rolls the floor
     // back below 2, never below the verified tip.
-    let released = seq.release_applying_blocks_from(block::Height(2));
+    let released = seq.settled(|policy| policy.release_applying_blocks_from(block::Height(2)));
     assert_eq!(released, 200);
     assert!(seq.applying_contains(block::Height(1)));
     assert!(!seq.applying_contains(block::Height(2)));
-    seq.reset_floor_below(block::Height(2));
+    seq.settled(|policy| policy.reset_floor_below(block::Height(2)));
     assert_eq!(seq.floor(), block::Height(1));
     // The committed prefix at or below height 1 is releasable.
-    assert_eq!(seq.release_applied_through(block::Height(1)), 100);
+    assert_eq!(
+        seq.settled(|policy| policy.release_applied_through(block::Height(1))),
+        100
+    );
     assert_eq!(seq.applying_len(), 0);
 }
 
@@ -6992,7 +7239,7 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
             peer(0),
         );
     }
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     // Submit heights 2 and 3 so the released prefix (>= 2) is all submitted work.
     let item2 = seq
         .prepare_submit(block::Height(2))
@@ -7003,7 +7250,7 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
     assert_eq!(seq.in_flight_submission_count(), 2);
     assert_eq!(seq.in_flight_submission_bytes(), 200 + 300);
 
-    let released = seq.release_applying_blocks_from(block::Height(2));
+    let released = seq.settled(|policy| policy.release_applying_blocks_from(block::Height(2)));
     assert_eq!(released, 500);
     assert_eq!(seq.applying_len(), 1);
     // Only unsubmitted height 1 survives in `applying`, but both decoded
@@ -7025,21 +7272,21 @@ fn sequencer_rejection_release_keeps_detached_submissions_charged() {
         seq.in_flight_submission_bytes_scanned()
     );
 
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item2.owner,
         item2.source,
         item2.token,
         item2.height,
         item2.hash
-    ));
+    )));
     assert_eq!(seq.submittable_heights(), vec![block::Height(1)]);
-    assert!(seq.finish_submission(
+    assert!(seq.settled(|policy| policy.finish_submission(
         item3.owner,
         item3.source,
         item3.token,
         item3.height,
         item3.hash
-    ));
+    )));
     assert_eq!(seq.in_flight_submission_count(), 0);
 }
 
@@ -7051,7 +7298,7 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     let mut seq = test_sequencer(0, 4);
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     seq.accept_body(block::Height(1), block.hash(), block.clone(), 100, peer(0));
-    seq.drain_ready_into_applying();
+    seq.settled(|policy| policy.drain_ready_into_applying());
     let item = seq
         .prepare_submit(block::Height(1))
         .expect("height 1 applying");
@@ -7060,7 +7307,7 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
 
     // A rollback carrying a non-matching token is ignored: the submission and the
     // counters are untouched.
-    seq.unsubmit(block::Height(1), item.token + 1);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token + 1));
     assert_eq!(seq.in_flight_submission_count(), 1);
     assert_eq!(seq.in_flight_submission_bytes(), 100);
     assert_eq!(
@@ -7073,12 +7320,12 @@ fn sequencer_unsubmit_ignores_stale_or_mismatched_token() {
     );
 
     // The matching rollback frees the slot exactly once.
-    seq.unsubmit(block::Height(1), item.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
 
     // Replaying the now-stale token must not decrement a second time.
-    seq.unsubmit(block::Height(1), item.token);
+    seq.settled(|policy| policy.unsubmit(block::Height(1), item.token));
     assert_eq!(seq.in_flight_submission_count(), 0);
     assert_eq!(seq.in_flight_submission_bytes(), 0);
     assert_eq!(
@@ -7125,7 +7372,10 @@ fn sequencer_keeps_whole_body_for_contiguous_height() {
             covered: block::Height(1)
         }
     );
-    assert_eq!(seq.drain_ready_into_applying(), vec![block::Height(1)]);
+    assert_eq!(
+        seq.settled(|policy| policy.drain_ready_into_applying()),
+        vec![block::Height(1)]
+    );
     // The drained body is inside the submission window, so the kept decoded
     // block is submitted directly, not a re-decode of the raw payload.
     let submitted = seq
@@ -7216,7 +7466,6 @@ fn outstanding_three_block_range() -> OutstandingBlockRange {
     };
     let now = Instant::now();
     OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request,
         queued_at: now,
         deadline: now,
@@ -7322,7 +7571,7 @@ proptest::proptest! {
         reserved_blocks in 0u64..20,
     ) {
         let config = ZakuraBlockSyncConfig {
-            max_inflight_block_bytes: 64_000_000,
+            max_inflight_block_bytes: Some(64_000_000),
             max_reorder_lookahead_bytes: 1_000,
             ..ZakuraBlockSyncConfig::default()
         };
@@ -7594,7 +7843,6 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     let funding = budget.reserve_owned(request.estimated_bytes).unwrap();
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
-        write_status: work_queue::RequestWriteStatus::written_for_tests(),
         request,
         queued_at: now,
         deadline: now,
@@ -7703,9 +7951,10 @@ async fn inert_reactor_parks_after_header_tip_watch_closes() {
 /// reactor, where its sender would hold the session's reservation.
 #[tokio::test]
 async fn reactor_drops_a_session_cancelled_before_it_connects() {
-    let (handle, _actions, reactor_task) =
-        spawn_block_sync_reactor(BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()))
-            .expect("valid block-sync config");
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(
+        BlockSyncStartup::inert(ZakuraBlockSyncConfig::default()).unwrap(),
+    )
+    .expect("valid block-sync config");
     let (send, mut outbound) = framed_channel(1);
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -8135,7 +8384,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
-        accounting: ByteBudget::new(config.max_inflight_block_bytes).reader(),
+        accounting: ByteBudget::new(config.inflight_block_bytes()).reader(),
         events,
         lifecycle,
         needed_query_failures,
@@ -8520,7 +8769,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     let mut config = immediate_body_download_config();
     // One block's size hint of budget: size-based reservation now means one
     // advertised body fills the budget, throttling to one in-flight request.
-    config.max_inflight_block_bytes = u64::from(block1_size);
+    config.max_inflight_block_bytes = Some(u64::from(block1_size));
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(41);
@@ -8652,7 +8901,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 4;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 4);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(73);
@@ -8803,7 +9052,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
     let mut config = immediate_body_download_config();
     // Budget holds exactly one worst-case share, so a hint-sized re-reservation
     // would have left no headroom for an underestimated body.
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
@@ -9036,7 +9285,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
     let mut config = immediate_body_download_config();
     // One block's size hint of budget: size-based reservation now means one
     // advertised body fills the budget, throttling to one in-flight request.
-    config.max_inflight_block_bytes = u64::from(block1_size);
+    config.max_inflight_block_bytes = Some(u64::from(block1_size));
 
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = header_tip_startup(
@@ -9263,7 +9512,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 2;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(43);
@@ -9434,7 +9683,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let block_bytes = block_size(&block);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
 
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
     let peer_id = peer(42);
@@ -9726,7 +9975,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
     // of that body releases the whole reservation and the routine must issue the
     // next GetBlocks without any external nudge.
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES;
+    config.max_inflight_block_bytes = Some(BS_PER_BLOCK_WORST_CASE_BYTES);
     config.request_timeout = Duration::from_secs(300);
     let blocks = mainnet_blocks_1_to_3();
     let (tip_tx, handle, mut actions, reactor_task, service) = spawn_genesis_service(config);
@@ -9911,7 +10160,7 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
     let budget_blocks = 3u32;
     let heights = 12u32;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(u64::from(budget_blocks) * BS_PER_BLOCK_WORST_CASE_BYTES),
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -9973,7 +10222,7 @@ async fn reactor_tiny_estimates_fit_one_worst_case_budget_block() {
     // requests, because each reserves its size hint (clamped to the 1 KiB floor),
     // not a worst-case share. All 4 advertised heights are requested at once.
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES),
         initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
         ..ZakuraBlockSyncConfig::default()
     };
@@ -10322,7 +10571,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
     config.peer_limits.inbound_queue_depth = 1;
     // Hold the whole flood in flight at once so nothing pauses on the byte
     // budget; the inbound flood, not the budget, is what this test exercises.
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     // A dropped body must not be quietly re-requested and healed before the
     // deadline — that would hide the very regression this test guards.
     config.request_timeout = Duration::from_secs(300);
@@ -10642,7 +10891,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     };
 
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
     config.peer_limits.inbound_queue_depth = 128;
@@ -10872,7 +11121,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 #[tokio::test]
 async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11003,7 +11252,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_submitted_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11129,7 +11378,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
 async fn reactor_forward_reset_preserves_future_outstanding_body() {
     // Open the probe cap so heights 2 and 3 are both outstanding at the reset.
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11224,7 +11473,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11332,7 +11581,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
 #[tokio::test]
 async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_flight_apply() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -11736,7 +11985,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 #[tokio::test]
 async fn reactor_fast_forward_reset_releases_abandoned_budget_and_keeps_peer() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -12015,7 +12264,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
 #[tokio::test]
 async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES),
         ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -12386,7 +12635,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
 async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalidity() {
     let request_bytes: u32 = 10_000;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
+        max_inflight_block_bytes: Some(BS_PER_BLOCK_WORST_CASE_BYTES * 2),
         ..immediate_body_download_config()
     };
 
@@ -12897,8 +13146,9 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     let blocks = mainnet_blocks_1_to_3();
     // Open the probe cap so all three heights are outstanding at the reanchor.
     let mut config = fill_loop_mechanics_config();
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13397,8 +13647,9 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     let blocks = mainnet_blocks_1_to_3();
     // Open the probe cap so all three heights are outstanding when height 1 commits.
     let mut config = fill_loop_mechanics_config();
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13492,8 +13743,9 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for all three bodies.
-    config.max_inflight_block_bytes =
-        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64");
+    config.max_inflight_block_bytes = Some(
+        BS_PER_BLOCK_WORST_CASE_BYTES * u64::try_from(blocks.len()).expect("block count fits u64"),
+    );
     config.request_timeout = Duration::from_secs(300);
 
     let initial = test_committed_snapshot(
@@ -13601,7 +13853,7 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
 async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
     let blocks = fake_sequential_blocks(4);
     let mut config = immediate_body_download_config();
-    config.max_inflight_block_bytes = u64::MAX;
+    config.max_inflight_block_bytes = Some(u64::MAX);
     config.max_submitted_block_applies = 2;
     config.request_timeout = Duration::from_secs(300);
 

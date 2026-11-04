@@ -445,7 +445,7 @@ impl BlockScenario {
             config.max_inflight_requests = limit;
         }
         if let Some(bytes) = self.max_inflight_block_bytes {
-            config.max_inflight_block_bytes = bytes;
+            config.max_inflight_block_bytes = Some(bytes);
         }
         if let Some(bytes) = self.max_reorder_lookahead_bytes {
             config.max_reorder_lookahead_bytes = bytes;

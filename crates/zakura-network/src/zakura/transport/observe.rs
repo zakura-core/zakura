@@ -95,6 +95,15 @@ pub enum TransportEvent {
         /// Frames the service may queue for the writer.
         outbound_depth: usize,
     },
+    /// A service session lifecycle moved one step, with its exact identities.
+    SessionLifecycle {
+        /// The connection.
+        conn_id: ZakuraConnId,
+        /// The service's primary stream kind.
+        kind: u16,
+        /// The step.
+        step: crate::zakura::SessionStep,
+    },
     /// The reader has a frame's 8 header bytes, before any check of them.
     HeaderRead {
         /// The connection.

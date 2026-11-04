@@ -435,6 +435,19 @@ impl Config {
         self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
     }
 
+    /// The most bytes that TCP decoders can hold for incomplete messages across every
+    /// allowed connection.
+    ///
+    /// This partition follows from the connection limit, because each connection's
+    /// decoder holds at most one incomplete message. The decoder cannot wait for
+    /// shared capacity, so the connection limit is the enforced bound. Handshaking
+    /// connections have a smaller body limit, so this also covers them.
+    pub fn tcp_ingress_bound_bytes(&self) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        (self.peerset_total_connection_limit() as u64)
+            .saturating_mul(crate::zakura::TCP_INGRESS_BUDGET.receive)
+    }
+
     /// Returns the initial seed peer hostnames for the configured network.
     pub fn initial_peer_hostnames(&self) -> IndexSet<String> {
         match &self.network {
@@ -1464,10 +1477,15 @@ impl<'de> Deserialize<'de> for Config {
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
         if p2p_stack.resolve(&network).runs_zakura() {
+            zakura
+                .validate_stream_receive_window()
+                .map_err(de::Error::custom)?;
+        }
+        if p2p_stack.resolve(&network).runs_zakura() {
             // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
             // lowers a larger cap after tracing starts so its warning is logged.
             zakura
-                .budgeted_max_connections()
+                .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
         }
 

@@ -905,7 +905,7 @@ fn a_changed_difficulty_threshold_is_not_reused() {
 
     let reworked = solve(&child).set_work(11).prepare();
     assert_ne!(
-        reworked.block.header.difficulty_threshold,
+        reworked.block.header().difficulty_threshold,
         child.header.difficulty_threshold,
     );
 

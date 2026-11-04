@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
-    sync::Arc,
     time::Instant,
 };
 
@@ -21,6 +20,7 @@ use zakura_network::zakura::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSizeEstimate, BlockSyncAction,
     BlockSyncBlockMeta, BlockSyncEvent, BlockSyncHandle, ZakuraEndpoint, ZakuraTrace,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use crate::components::sync;
 
@@ -46,7 +46,7 @@ struct PendingBlockApply {
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
     class: BlockApplyClass,
-    block: Arc<block::Block>,
+    block: BlockHandle,
     operation: Option<super::BlockApplyOperation>,
 }
 
@@ -555,16 +555,16 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 token,
                 block,
             } => {
-                let class = block_apply_class(block.as_ref(), max_checkpoint_height);
+                let class = block_apply_class(block.view(), max_checkpoint_height);
                 let height = block.coinbase_height();
                 if block_sync_handoff.is_yielded_to_legacy() {
-                    abandon_block_apply(&block_sync, owner, source, token, block.as_ref(), &trace);
+                    abandon_block_apply(&block_sync, owner, source, token, block.view(), &trace);
                     continue;
                 }
                 trace.trace_block_submit_queued(
                     token,
                     class,
-                    block.as_ref(),
+                    block.view(),
                     if throughput_probe.is_some() {
                         pending_probe_applies.len()
                     } else {
@@ -610,7 +610,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     continue;
                 }
                 let Some(operation) = block_sync_handoff.queue_apply() else {
-                    abandon_block_apply(&block_sync, owner, source, token, block.as_ref(), &trace);
+                    abandon_block_apply(&block_sync, owner, source, token, block.view(), &trace);
                     continue;
                 };
                 debug!(operation_id = ?operation.id(), token, "queued native block apply operation");
@@ -650,7 +650,7 @@ fn abandon_block_apply(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
-    block: &block::Block,
+    block: &block::BlockRef,
     trace: &ZakuraTrace,
 ) -> BlockApplyResult {
     let Some((height, expected_hash, result, event)) =
@@ -672,7 +672,7 @@ pub(crate) fn abandoned_block_apply_finished_event(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
-    block: &block::Block,
+    block: &block::BlockRef,
 ) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
     let height = block.coinbase_height()?;
     let hash = block.hash();
@@ -711,7 +711,7 @@ fn abandoned_pending_apply_finished_events(
             pending.owner,
             pending.source,
             pending.token,
-            pending.block.as_ref(),
+            pending.block.view(),
         ) {
             events.push(event);
         } else {
@@ -1089,7 +1089,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 pending.owner,
                 pending.source,
                 pending.token,
-                pending.block.as_ref(),
+                pending.block.view(),
                 &trace,
             );
             continue;
@@ -1124,6 +1124,13 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 tokio::select! {
                     biased;
                     completed = &mut apply => {
+                        // Only a committed block's remaining holders belong to the
+                        // backend. After any other result, detached verifier work such
+                        // as a queued script check can still hold the block, so its last
+                        // holder ends the pipeline share when it drops.
+                        if completed.result == BlockApplyResult::Committed {
+                            transfer_block.leave_pipeline();
+                        }
                         accepted
                             .take()
                             .expect("accepted operation has one terminal result")
@@ -1136,12 +1143,13 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                         // arrives, and state queues a full commit until its parent commits.
                         // Legacy fallback uses the same verifier and state, so it can complete
                         // that work after this driver transfers completion responsibility.
+                        transfer_block.leave_pipeline();
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,
                             transfer_source,
                             transfer_token,
-                            transfer_block.as_ref(),
+                            transfer_block.view(),
                             &transfer_trace,
                         );
                         accepted
@@ -1158,14 +1166,16 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                         BlockApplyCompletion { class, result }
                     }
                     () = abandon.cancelled() => {
-                        // Shutdown outwaited its drain bound. Dropping the
-                        // verifier future releases the body.
+                        // Shutdown outwaited its drain bound. Dropping the verifier
+                        // future releases its holders, but detached verifier work can
+                        // still hold the body, so its last holder ends the pipeline
+                        // share when it drops.
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,
                             transfer_source,
                             transfer_token,
-                            transfer_block.as_ref(),
+                            transfer_block.view(),
                             &transfer_trace,
                         );
                         accepted
@@ -1238,7 +1248,7 @@ fn release_pending_probe_applies(
             pending.owner,
             pending.source,
             pending.token,
-            pending.block.as_ref(),
+            pending.block.view(),
             trace,
         );
     }
@@ -1344,7 +1354,7 @@ where
 }
 
 pub(crate) fn block_apply_class(
-    block: &block::Block,
+    block: &block::BlockRef,
     max_checkpoint_height: block::Height,
 ) -> BlockApplyClass {
     if block
@@ -1367,7 +1377,7 @@ pub(crate) async fn apply_block_sync_body<BlockVerifier, ReadState>(
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
     token: BlockApplyToken,
-    block: Arc<block::Block>,
+    block: BlockHandle,
     class: BlockApplyClass,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
@@ -1404,7 +1414,7 @@ where
     // advance its in-memory synthetic frontier, discarding the body.
     let outcome = match throughput_probe.as_ref() {
         Some(probe) => {
-            let (result, _) = probe.apply_block(block.as_ref());
+            let (result, _) = probe.apply_block(block.view());
             probe_body_outcome(owner, source, expected_hash, result)
         }
         None => {
@@ -1442,7 +1452,7 @@ pub(crate) async fn commit_block_sync_body<BlockVerifier>(
     block_verifier: BlockVerifier,
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
-    block: Arc<block::Block>,
+    block: BlockHandle,
     _class: BlockApplyClass,
 ) -> BlockApplyOutcome
 where
@@ -1462,7 +1472,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     block_verifier: BlockVerifier,
-    block: Arc<block::Block>,
+    block: BlockHandle,
     class: BlockApplyClass,
     trace: &ZakuraTrace,
     owner: zakura_header_chain::BodyWorkOwner,
@@ -1862,7 +1872,10 @@ mod tests {
 
     use std::{
         future::{ready, Ready},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         task::{Context, Poll},
         time::Duration,
     };
@@ -1916,6 +1929,9 @@ mod tests {
                 .await
                 .expect("block-sync driver exits cleanly");
             self.reactor_task.abort();
+            if let Err(error) = self.reactor_task.await {
+                assert!(error.is_cancelled(), "reactor shutdown failed: {error}");
+            }
         }
     }
 
@@ -1940,6 +1956,9 @@ mod tests {
             },
             (block::Height(0), block::Hash([0; 32])),
             tip_rx,
+            (zakura_network::zakura::ZakuraBlockSyncConfig::default())
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
             zakura_network::zakura::ZakuraBlockSyncConfig::default(),
         );
         let (block_sync, _reactor_actions, reactor_task) =
@@ -1989,7 +2008,7 @@ mod tests {
                 owner: test_owner(),
                 source: test_source(),
                 token,
-                block: mainnet_block(&BLOCK_MAINNET_1_BYTES),
+                block: mainnet_block(&BLOCK_MAINNET_1_BYTES).into(),
             })
             .await
             .expect("block-sync driver action channel stays open");
@@ -2064,6 +2083,239 @@ mod tests {
         );
 
         drop(lease);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_checkpoint_releases_after_unadmitted_fallback() {
+        use zakura_node_services::block_memory::{model::Probe, Admission, DecodedBlockPool};
+
+        let block: block::Block = BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("block vector parses");
+        let bytes = block.attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+        let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&block);
+        let ready_polls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier = BackpressuredVerifier {
+            ready_polls: ready_polls.clone(),
+            calls: calls.clone(),
+        };
+        let handoff = SyncCoordinator::new();
+        let driver = spawn_checkpoint_driver(verifier, handoff.clone(), ZakuraTrace::noop());
+        driver
+            .actions
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_owner(),
+                source: test_source(),
+                token: 1,
+                block: block.into(),
+            })
+            .await
+            .unwrap();
+        wait_for_count(&ready_polls, 1, "owned checkpoint readiness").await;
+        assert_eq!(
+            pool.reserved_bytes(),
+            bytes,
+            "the pending driver retains its charge"
+        );
+
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            handoff.acquire_legacy_fallback(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        driver.shutdown().await;
+        let allocation = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+        assert_eq!(allocation.holders, 0, "no driver owner survives shutdown");
+        assert_eq!(allocation.header_holders, 0);
+        assert_eq!(allocation.transaction_holders, vec![0]);
+        assert_eq!(
+            pool.reserved_bytes(),
+            0,
+            "unadmitted fallback drops both driver holders"
+        );
+        drop(lease);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owned_checkpoint_keeps_downstream_charge_after_driver_fallback() {
+        use zakura_node_services::block_memory::{model::Probe, Admission, DecodedBlockPool};
+
+        let block: block::Block = BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("block vector parses");
+        let transaction_hash = block.transactions[0].hash();
+        let bytes = block.attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+        let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&block);
+        let (retained_tx, mut retained_rx) = mpsc::unbounded_channel();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let retained_tx = retained_tx.clone();
+            async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    panic!("unexpected request: {request:?}");
+                };
+                retained_tx.send(block.transaction(0).unwrap()).unwrap();
+                std::future::pending::<()>().await;
+                Ok::<_, zakura_consensus::BoxError>(block.hash())
+            }
+        });
+        let handoff = SyncCoordinator::new();
+        let driver = spawn_checkpoint_driver(verifier, handoff.clone(), ZakuraTrace::noop());
+        driver
+            .actions
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_owner(),
+                source: test_source(),
+                token: 2,
+                block: block.into(),
+            })
+            .await
+            .unwrap();
+        let transaction = tokio::time::timeout(Duration::from_secs(1), retained_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            handoff.acquire_legacy_fallback(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        driver.shutdown().await;
+        let allocation = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+        assert!(
+            allocation.holders > 0,
+            "the downstream payload retains its owner"
+        );
+        assert_eq!(allocation.header_holders, 1);
+        assert_eq!(allocation.transaction_holders, vec![1]);
+        assert_eq!(allocation.measured_bytes, Some(bytes));
+        assert_eq!(
+            transaction.hash(),
+            transaction_hash,
+            "the downstream payload remains readable"
+        );
+        assert_eq!(
+            pool.reserved_bytes(),
+            bytes,
+            "driver fallback must not release downstream retention"
+        );
+        drop(transaction);
+        let allocation = probe.read(1, std::slice::from_ref(&pool)).unwrap();
+        assert_eq!(allocation.holders, 0);
+        assert_eq!(allocation.header_holders, 0);
+        assert_eq!(allocation.transaction_holders, vec![0]);
+        assert_eq!(
+            pool.reserved_bytes(),
+            0,
+            "the last downstream holder settles the charge"
+        );
+        drop(lease);
+    }
+
+    /// Apply an owned block through a verifier that keeps a transaction handle,
+    /// as a detached script check or the backend does, and returns `reply`.
+    /// Returns once the driver has dropped its own holders.
+    async fn apply_with_retained_transaction(
+        reply: fn(block::Hash) -> Result<block::Hash, zakura_consensus::BoxError>,
+    ) -> (
+        zakura_node_services::block_memory::DecodedBlockPool,
+        zakura_node_services::block_memory::TransactionHandle,
+        u64,
+        TestDriver,
+    ) {
+        use zakura_node_services::block_memory::{model::Probe, Admission, DecodedBlockPool};
+
+        let block: block::Block = BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .expect("block vector parses");
+        let bytes = block.attributed_memory_size_bytes();
+        let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+        let block = pool.try_admit(block, Admission::WithinLimit).unwrap();
+        let probe = Probe::new(&block);
+        let (retained_tx, mut retained_rx) = mpsc::unbounded_channel();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let retained_tx = retained_tx.clone();
+            async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    panic!("unexpected request: {request:?}");
+                };
+                retained_tx.send(block.transaction(0).unwrap()).unwrap();
+                reply(block.hash())
+            }
+        });
+        let driver = spawn_checkpoint_driver(verifier, SyncCoordinator::new(), ZakuraTrace::noop());
+        driver
+            .actions
+            .send(BlockSyncAction::SubmitBlock {
+                owner: test_owner(),
+                source: test_source(),
+                token: 3,
+                block: block.into(),
+            })
+            .await
+            .unwrap();
+        let transaction = tokio::time::timeout(Duration::from_secs(1), retained_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probe.read(1, std::slice::from_ref(&pool)).unwrap().holders > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver drops its holders after the apply");
+        (pool, transaction, bytes, driver)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_apply_keeps_pipeline_share_until_detached_holder_drops() {
+        let (pool, transaction, bytes, driver) = apply_with_retained_transaction(|_| {
+            Err(zakura_consensus::VerifyBlockError::Block {
+                source: zakura_consensus::BlockError::NoTransactions,
+            }
+            .into())
+        })
+        .await;
+        assert_eq!(
+            pool.pipeline_bytes(),
+            bytes,
+            "a detached holder of a rejected block keeps its pipeline share"
+        );
+        let version = pool.capacity_version();
+
+        drop(transaction);
+        assert_eq!(pool.pipeline_bytes(), 0);
+        assert_eq!(pool.reserved_bytes(), 0);
+        assert!(
+            pool.capacity_version() > version,
+            "the last holder's release wakes admission"
+        );
+        driver.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_apply_leaves_pipeline_while_backend_holds_block() {
+        let (pool, transaction, bytes, driver) = apply_with_retained_transaction(Ok).await;
+        assert_eq!(
+            pool.pipeline_bytes(),
+            0,
+            "a committed block's backend holder is past the pipeline"
+        );
+        assert_eq!(pool.reserved_bytes(), bytes);
+
+        drop(transaction);
+        assert_eq!(pool.reserved_bytes(), 0);
         driver.shutdown().await;
     }
 
@@ -2245,7 +2497,7 @@ mod tests {
                 source: test_source(),
                 token: 11,
                 class: BlockApplyClass::Full,
-                block: block1,
+                block: block1.into(),
                 operation: None,
             },
             PendingBlockApply {
@@ -2253,7 +2505,7 @@ mod tests {
                 source: test_source(),
                 token: 12,
                 class: BlockApplyClass::Full,
-                block: block2,
+                block: block2.into(),
                 operation: None,
             },
         ]);

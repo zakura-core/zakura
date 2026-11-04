@@ -23,7 +23,7 @@ pub use super::{
     },
     regulated::session::AdmittedRange,
     reorder::RetainedBody,
-    sequencer::{SequencerOwnership, SubmissionOwnership},
+    sequencer::{PayloadOwnership, SequencerOwnership, SubmissionOwnership},
     state::{RequestKey, RequestOwnership, RequestedHeight},
     work_queue::{RequestWritePhase, WorkItemOwnership, WorkItemPlace},
     BlockApplyToken,
@@ -208,6 +208,9 @@ pub enum BlockEvent {
 /// One step of a request's frame write.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RequestStep {
+    /// Admission moved the exact charge for the request's retained run from the
+    /// budget into unpublished funding.
+    Funded,
     /// The request reserved its heights and queued its frame.
     Published,
     /// Transport started writing the frame.
@@ -330,6 +333,24 @@ impl ObserverSlot {
 }
 
 impl SequencerOwnership {
+    /// Check runtime payload membership against policy, preserving duplicate allocations.
+    /// Driver submissions have separate lifetimes and are excluded from this comparison.
+    pub fn payloads_match_policy(&self) -> bool {
+        let mut actual = self.payloads.clone();
+        let mut expected: Vec<_> = self
+            .reorder
+            .iter()
+            .chain(&self.applying)
+            .map(|body| PayloadOwnership {
+                id: body.payload_id,
+                decoded_attributed_memory_bytes: body.policy_decoded_bytes,
+            })
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        actual == expected
+    }
+
     /// Each holder in this snapshot and the body it holds: one entry per
     /// reorder-buffer body, `applying` body and submission.
     pub fn holders(&self) -> Vec<(Holder, HeldBody)> {

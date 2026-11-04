@@ -55,6 +55,101 @@ use super::{check, Request, Verifier};
 #[cfg(test)]
 mod prop;
 
+#[tokio::test]
+async fn cancelled_owned_transaction_verification_keeps_queued_script_charge() {
+    use std::task::{Context, Waker};
+    use zakura_node_services::block_memory::{Admission, DecodedBlockPool};
+
+    let block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_434873_BYTES[..]).unwrap();
+    let height = block.coinbase_height().unwrap();
+    let time = block.header.time;
+    let index = block
+        .transactions
+        .iter()
+        .position(|tx| {
+            matches!(
+                tx.as_ref(),
+                Transaction::V4 {
+                    joinsplit_data: None,
+                    sapling_shielded_data: None,
+                    ..
+                }
+            ) && !tx.is_coinbase()
+        })
+        .expect("the block contains a transparent V4 spend");
+    let bytes = block.attributed_memory_size_bytes();
+    let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
+    let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
+    let transaction = owner.transaction(index).unwrap();
+    let known_utxos: HashMap<_, _> = transaction
+        .spent_outpoints()
+        .map(|outpoint| {
+            (
+                outpoint,
+                transparent::OrderedUtxo {
+                    utxo: transparent::Utxo {
+                        output: transparent::Output {
+                            value: 0.try_into().unwrap(),
+                            lock_script: transparent::Script::new(&[]),
+                        },
+                        height: Height(1),
+                        from_coinbase: false,
+                    },
+                    tx_index_in_block: 0,
+                },
+            )
+        })
+        .collect();
+    let known_outpoint_hashes = known_utxos.keys().map(|outpoint| outpoint.hash).collect();
+    let mut verifier = Verifier::new_for_tests(
+        &Network::Mainnet,
+        service_fn(|_| async { panic!("all spent outputs are supplied by the request") }),
+    );
+    let mut future = verifier.call(Request::Block {
+        transaction_hash: transaction.hash(),
+        transaction,
+        known_utxos: Arc::new(known_utxos),
+        known_outpoint_hashes: Arc::new(known_outpoint_hashes),
+        parent_utxos: Arc::new(HashMap::new()),
+        height,
+        time,
+    });
+    drop(owner);
+    let workers = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    workers.install(|| {
+        let result = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        assert!(
+            result.is_pending(),
+            "verification must queue script work: {result:?}"
+        );
+        drop(future);
+        assert_eq!(
+            pool.reserved_bytes(),
+            bytes,
+            "the transaction verifier must pass ownership to its queued script jobs"
+        );
+    });
+    timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let available = pool.capacity().notified();
+            tokio::pin!(available);
+            available.as_mut().enable();
+            if pool.reserved_bytes() == 0 {
+                break;
+            }
+            available.await;
+        }
+    })
+    .await
+    .expect("queued script workers release their ownership");
+}
+
 mod mempool_precheck;
 
 /// Returns the timeout duration for tests, extended when running under coverage
@@ -110,7 +205,7 @@ fn block_lookup_fixture_from(
     });
     let request = Request::Block {
         transaction_hash: transaction.hash(),
-        transaction,
+        transaction: transaction.into(),
         known_outpoint_hashes: Arc::new(HashSet::new()),
         known_utxos: Arc::new(known_utxos),
         parent_utxos: Arc::new(HashMap::new()),
@@ -458,6 +553,9 @@ async fn block_utxo_lookup_refills_window_and_cancels_on_drop() {
 async fn mempool_utxo_lookups_remain_serial_and_preserve_input_order() {
     let (block_request, expected) = block_lookup_fixture(4, 0);
     let transaction = block_request.transaction();
+    let super::TransactionHandle::Shared(mempool_transaction) = &transaction else {
+        panic!("the fixture supplies a shared transaction");
+    };
     let outpoints: Vec<_> = transaction
         .inputs()
         .iter()
@@ -486,7 +584,7 @@ async fn mempool_utxo_lookups_remain_serial_and_preserve_input_order() {
         async move { response.await.unwrap() }
     });
     let request = Request::Mempool {
-        transaction: transaction.clone().into(),
+        transaction: mempool_transaction.clone().into(),
         height: Height(2),
     };
     let lookup = Verifier::spent_utxos(
@@ -1221,6 +1319,49 @@ async fn mempool_request_with_missing_input_is_rejected() {
     }
 }
 
+/// Only a lookup timeout reports a missing input. A state refusal reports the state as
+/// unavailable, so a mempool caller cannot mistake lost capacity for missing data.
+#[tokio::test]
+async fn mempool_lookup_refusal_stays_distinct_from_a_missing_input() {
+    let net = Network::Mainnet;
+    // The mempool rejects an unsupported version before it looks up any input.
+    let (height, tx) = transactions_from_blocks(net.block_iter())
+        .find(|(_, tx)| {
+            tx.version() >= 4
+                && !tx.is_coinbase()
+                && !tx.inputs().is_empty()
+                && !tx.lock_time_is_time()
+        })
+        .expect(
+            "test vectors include a supported non-coinbase transaction with transparent inputs and no time lock",
+        );
+
+    for elapsed in [false, true] {
+        let state = service_fn(move |_: zakura_state::Request| async move {
+            Err::<zakura_state::Response, BoxError>(if elapsed {
+                tower::timeout::error::Elapsed::new().into()
+            } else {
+                zakura_node_services::block_memory::AdmissionFailure::Capacity.into()
+            })
+        });
+        let error = Verifier::new_for_tests(&net, state)
+            .oneshot(Request::Mempool {
+                transaction: tx.clone().into(),
+                height,
+            })
+            .await
+            .unwrap_err();
+        if elapsed {
+            assert_eq!(error, TransactionError::TransparentInputNotFound);
+        } else {
+            assert!(
+                matches!(error, TransactionError::StateUnavailable(_)),
+                "{error}"
+            );
+        }
+    }
+}
+
 /// A present transparent input with an unlocked lock time is accepted.
 #[tokio::test]
 async fn mempool_request_with_present_input_is_accepted() {
@@ -1745,7 +1886,7 @@ async fn dont_skip_verification_of_block_transactions_in_mempool() {
 
     let make_request = |known_outpoint_hashes| Request::Block {
         transaction_hash: tx_hash,
-        transaction: Arc::new(tx),
+        transaction: Arc::new(tx).into(),
         known_outpoint_hashes,
         known_utxos: Arc::new(HashMap::new()),
         parent_utxos: Arc::new(HashMap::new()),
@@ -2161,7 +2302,7 @@ async fn v5_transaction_is_rejected_before_nu5_activation() {
             verifier
                 .oneshot(Request::Block {
                     transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx),
+                    transaction: Arc::new(tx).into(),
                     known_utxos: Arc::new(HashMap::new()),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2189,7 +2330,7 @@ async fn v5_transaction_is_accepted_after_nu5_activation() {
         let verif_res = Verifier::new_for_tests(&net, state)
             .oneshot(Request::Block {
                 transaction_hash: tx.hash(),
-                transaction: Arc::new(tx),
+                transaction: Arc::new(tx).into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2244,7 +2385,7 @@ async fn v4_transaction_with_transparent_transfer_is_accepted() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2291,7 +2432,7 @@ async fn v4_transaction_with_last_valid_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2339,7 +2480,7 @@ async fn v4_coinbase_transaction_with_low_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2389,7 +2530,7 @@ async fn v4_transaction_with_too_low_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2442,7 +2583,7 @@ async fn v4_transaction_with_exceeding_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2498,7 +2639,7 @@ async fn v4_coinbase_transaction_with_exceeding_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2552,7 +2693,7 @@ async fn v4_coinbase_transaction_is_accepted() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2610,7 +2751,7 @@ async fn v4_transaction_with_transparent_transfer_is_rejected_by_the_script() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2667,7 +2808,7 @@ async fn v4_transaction_with_conflicting_transparent_spend_is_rejected() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2738,7 +2879,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction: Arc::new(transaction),
+                transaction: Arc::new(transaction).into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2814,7 +2955,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction: Arc::new(transaction),
+                transaction: Arc::new(transaction).into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2876,7 +3017,7 @@ async fn v5_transaction_with_transparent_transfer_is_accepted() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2939,7 +3080,7 @@ async fn block_transaction_with_parent_utxos_skips_state_lookups() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(parent_utxos),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -2988,7 +3129,7 @@ async fn v5_transaction_with_last_valid_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3037,7 +3178,7 @@ async fn v5_coinbase_transaction_expiry_height() {
         .clone()
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3061,7 +3202,7 @@ async fn v5_coinbase_transaction_expiry_height() {
         .clone()
         .oneshot(Request::Block {
             transaction_hash: new_transaction.hash(),
-            transaction: Arc::new(new_transaction.clone()),
+            transaction: Arc::new(new_transaction.clone()).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3093,7 +3234,7 @@ async fn v5_coinbase_transaction_expiry_height() {
         .clone()
         .oneshot(Request::Block {
             transaction_hash: new_transaction.hash(),
-            transaction: Arc::new(new_transaction.clone()),
+            transaction: Arc::new(new_transaction.clone()).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3134,7 +3275,7 @@ async fn v5_coinbase_transaction_expiry_height() {
         .clone()
         .oneshot(Request::Block {
             transaction_hash: new_transaction.hash(),
-            transaction: Arc::new(new_transaction.clone()),
+            transaction: Arc::new(new_transaction.clone()).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3188,7 +3329,7 @@ async fn v5_transaction_with_too_low_expiry_height() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3242,7 +3383,7 @@ async fn v5_transaction_with_exceeding_expiry_height() {
     let verification_result = Verifier::new_for_tests(&network, state)
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction.clone()),
+            transaction: Arc::new(transaction.clone()).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3299,7 +3440,7 @@ async fn v5_coinbase_transaction_is_accepted() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3359,7 +3500,7 @@ async fn v5_transaction_with_transparent_transfer_is_rejected_by_the_script() {
     let result = verifier
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
-            transaction: Arc::new(transaction),
+            transaction: Arc::new(transaction).into(),
             known_utxos: Arc::new(known_utxos),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3409,7 +3550,7 @@ async fn v5_transaction_with_conflicting_transparent_spend_is_rejected() {
         let verification_result = Verifier::new_for_tests(&network, state)
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction: Arc::new(transaction),
+                transaction: Arc::new(transaction).into(),
                 known_utxos: Arc::new(known_utxos),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3455,7 +3596,7 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3544,7 +3685,7 @@ async fn v4_with_joinsplit_is_rejected_for_modification(
             .clone()
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction: transaction.clone(),
+                transaction: transaction.clone().into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3597,7 +3738,7 @@ fn v4_and_v5_with_sapling_spends() {
             test_timeout(),
             verifier.oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3638,7 +3779,7 @@ fn v4_and_v5_with_sapling_spends() {
                     test_timeout(),
                     verifier.oneshot(Request::Block {
                         transaction_hash: tx.hash(),
-                        transaction: Arc::new(tx),
+                        transaction: Arc::new(tx).into(),
                         known_utxos: Arc::new(HashMap::new()),
                         parent_utxos: Arc::new(HashMap::new()),
                         known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3836,7 +3977,7 @@ fn v4_with_invalid_sapling_proof_returns_typed_error() {
             test_timeout(),
             transaction_verifier.oneshot(Request::Block {
                 transaction_hash,
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes,
@@ -3943,7 +4084,7 @@ fn v4_with_duplicate_sapling_spends() {
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -3990,7 +4131,7 @@ fn v4_with_sapling_outputs_and_no_spends() {
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4046,7 +4187,7 @@ fn sapling_output_with_invalid_ephemeral_key_is_rejected() {
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4117,7 +4258,7 @@ fn sapling_v4_output_with_invalid_value_commitment_is_rejected_after_roundtrip()
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4172,7 +4313,7 @@ fn sapling_coinbase_output_with_invalid_value_commitment_is_rejected() {
         let result = verifier
             .oneshot(Request::Block {
                 transaction_hash: transaction.hash(),
-                transaction,
+                transaction: transaction.into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4258,7 +4399,7 @@ fn sapling_spends_with_invalid_value_commitments_are_rejected_after_roundtrip() 
             let result = verifier
                 .oneshot(Request::Block {
                     transaction_hash: transaction.hash(),
-                    transaction,
+                    transaction: transaction.into(),
                     known_utxos: Arc::new(HashMap::new()),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4474,7 +4615,7 @@ async fn v5_with_duplicate_sapling_spends() {
             verifier
                 .oneshot(Request::Block {
                     transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx),
+                    transaction: Arc::new(tx).into(),
                     known_utxos: Arc::new(HashMap::new()),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4537,7 +4678,7 @@ async fn v5_with_duplicate_orchard_action() {
             verifier
                 .oneshot(Request::Block {
                     transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx),
+                    transaction: Arc::new(tx).into(),
                     known_utxos: Arc::new(HashMap::new()),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -4843,7 +4984,7 @@ async fn orchard_disabling_soft_fork_rejects_orchard_actions_in_blocks_and_mempo
     )
     .oneshot(Request::Block {
         transaction_hash: tx.hash(),
-        transaction: Arc::new(tx.clone()),
+        transaction: Arc::new(tx.clone()).into(),
         known_utxos: Arc::new(HashMap::new()),
         parent_utxos: Arc::new(HashMap::new()),
         known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -5033,7 +5174,7 @@ fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_height()
         let accept_response = accept_verifier
             .oneshot(Request::Block {
                 transaction_hash: tx.hash(),
-                transaction: Arc::new(tx.clone()),
+                transaction: Arc::new(tx.clone()).into(),
                 known_utxos: Arc::new(HashMap::new()),
                 parent_utxos: Arc::new(HashMap::new()),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -5060,7 +5201,7 @@ fn orchard_disabling_soft_fork_accepts_orchard_actions_below_activation_height()
         )
         .oneshot(Request::Block {
             transaction_hash: tx.hash(),
-            transaction: Arc::new(tx),
+            transaction: Arc::new(tx).into(),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -5197,7 +5338,7 @@ async fn v5_consensus_branch_ids() {
                 .clone()
                 .oneshot(Request::Block {
                     transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx.clone()),
+                    transaction: Arc::new(tx.clone()).into(),
                     known_utxos: known_utxos.clone(),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -5266,7 +5407,7 @@ async fn v5_consensus_branch_ids() {
                 .clone()
                 .oneshot(Request::Block {
                     transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx.clone()),
+                    transaction: Arc::new(tx.clone()).into(),
                     known_utxos: known_utxos.clone(),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -5326,7 +5467,7 @@ async fn v5_consensus_branch_ids() {
                 .clone()
                 .oneshot(Request::Block {
                     transaction_hash: tx.hash(),
-                    transaction: Arc::new(tx.clone()),
+                    transaction: Arc::new(tx.clone()).into(),
                     known_utxos: known_utxos.clone(),
                     parent_utxos: Arc::new(HashMap::new()),
                     known_outpoint_hashes: Arc::new(HashSet::new()),
@@ -6294,7 +6435,7 @@ async fn block_with_garbage_orchard_proofs_is_rejected() {
         .clone()
         .oneshot(Request::Block {
             transaction_hash: tx_hash,
-            transaction: Arc::new(garbage_tx),
+            transaction: Arc::new(garbage_tx).into(),
             known_outpoint_hashes: Arc::new([input_outpoint.hash].into()),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
@@ -6371,7 +6512,7 @@ async fn block_transaction_past_expiry_height_is_rejected() {
         test_timeout(),
         verifier.clone().oneshot(Request::Block {
             transaction_hash: tx_hash,
-            transaction: Arc::new(tx.clone()),
+            transaction: Arc::new(tx.clone()).into(),
             known_outpoint_hashes: Arc::new([input_outpoint.hash].into()),
             known_utxos: Arc::new(HashMap::new()),
             parent_utxos: Arc::new(HashMap::new()),
@@ -6827,7 +6968,7 @@ async fn verify(
 fn block_request(tx: &Transaction, height: block::Height) -> Request {
     Request::Block {
         transaction_hash: tx.hash(),
-        transaction: Arc::new(tx.clone()),
+        transaction: Arc::new(tx.clone()).into(),
         known_outpoint_hashes: Arc::new(HashSet::new()),
         known_utxos: Arc::new(HashMap::new()),
         parent_utxos: Arc::new(HashMap::new()),

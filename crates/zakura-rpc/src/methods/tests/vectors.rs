@@ -1,6 +1,7 @@
 //! Fixed test vectors for RPC methods.
 
 use std::{str::FromStr, sync::Arc};
+use zakura_node_services::block_memory::HeaderHandle;
 
 use futures::FutureExt;
 use tower::buffer::Buffer;
@@ -1080,6 +1081,49 @@ async fn rpc_getblock() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+/// A header read refused for lack of capacity reports a retryable error, not a missing
+/// block. Other state errors keep the `zcashd` missing-block error.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblockheader_reports_read_capacity_refusal_as_retryable() {
+    let _init_guard = zakura_test::init();
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = mock_rpc(
+        Mainnet,
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 8),
+        NoChainTip,
+        rx,
+    );
+
+    for (state_error, code) in [
+        (
+            BoxError::from(zakura_node_services::block_memory::ReadMemoryExhausted),
+            crate::server::error::LegacyCode::OutOfMemory,
+        ),
+        (
+            BoxError::from("block is missing"),
+            crate::server::error::LegacyCode::InvalidParameter,
+        ),
+    ] {
+        let rpc = rpc.clone();
+        let header = tokio::spawn(async move { rpc.get_block_header("1".to_string(), None).await });
+        read_state
+            .expect_request(ReadRequest::BlockHeader(Height(1).into()))
+            .await
+            .respond(Err::<ReadResponse, _>(state_error));
+        let error = header
+            .await
+            .expect("the RPC task does not panic")
+            .expect_err("a failed header read fails the RPC");
+        assert_eq!(error.code(), ErrorCode::from(code).code());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
     let _init_guard = zakura_test::init();
@@ -1131,7 +1175,7 @@ async fn rpc_getblock_includes_empty_ironwood_tree_after_nu6_3_activation() {
         .expect_request(ReadRequest::BlockHeader(hash_or_height))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1334,7 +1378,7 @@ async fn rpc_getblockheader_preserves_historical_tree_error() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1399,7 +1443,7 @@ async fn rpc_getblock_serves_pre_activation_empty_trees() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1503,7 +1547,7 @@ async fn rpc_getblock_preserves_historical_tree_error() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash,
             height,
             next_block_hash: None,
@@ -1596,7 +1640,7 @@ async fn rpc_z_get_treestate_absent_band_is_an_error() {
         .expect_request(ReadRequest::BlockHeader(height.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block.header.clone(),
+            header: HeaderHandle::Shared(block.header.clone()),
             hash: block_hash,
             height,
             next_block_hash: None,
@@ -2116,7 +2160,7 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
         .expect_request(ReadRequest::BlockHeader(block_hash.into()))
         .await
         .respond(ReadResponse::BlockHeader {
-            header: block_header,
+            header: HeaderHandle::Shared(block_header),
             hash: block_hash,
             height: zakura_chain::block::Height(0),
             next_block_hash: None,
@@ -2134,7 +2178,7 @@ async fn rpc_getblock_side_chain_verbosity2_does_not_panic() {
     read_state
         .expect_request_that(|req| matches!(req, ReadRequest::BlockAndSize(_)))
         .await
-        .respond(ReadResponse::BlockAndSize(Some((block, block_size))));
+        .respond(ReadResponse::BlockAndSize(Some((block.into(), block_size))));
     read_state
         .expect_request_that(|req| matches!(req, ReadRequest::OrchardTree(_)))
         .await
@@ -3748,7 +3792,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     assert!(rpc.mining_template_rejected(&work_id));
     assert!(!rpc.mining_template_rejected("newer-work"));
     let fallback = verifier.expect_request_that(|request| {
-        matches!(request, zakura_consensus::Request::Prepare { block, .. } if block.transactions.len() == 1)
+        matches!(request, zakura_consensus::Request::Prepare { block, .. } if block.view().transactions().len() == 1)
     }).await;
     assert!(
         !long_poll.is_finished(),

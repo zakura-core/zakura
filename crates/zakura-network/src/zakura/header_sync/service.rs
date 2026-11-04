@@ -14,7 +14,7 @@ use zakura_rt::{
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
     events::*,
-    pipe::run_peer,
+    peer::run_peer,
     v9::{
         CommonMessage, Cursor, LeaseOwner, Publisher, RegtestMessage, SubscribeError,
         SubscribeHeaders, Subscriber,
@@ -447,9 +447,7 @@ impl PeerSession {
             .try_reserve_guarded()
             .map_err(|error| match error {
                 GuardedReserveError::Full => OrderedSendError::Full,
-                GuardedReserveError::Closed | GuardedReserveError::Unsupported => {
-                    OrderedSendError::Closed
-                }
+                GuardedReserveError::Closed => OrderedSendError::Closed,
             })
     }
 }

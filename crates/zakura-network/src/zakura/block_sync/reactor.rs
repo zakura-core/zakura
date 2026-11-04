@@ -10,7 +10,7 @@ use crate::zakura::{
 use rand_10::Rng;
 use state::{
     admission_decision, block_sync_frontiers, body_completion_authority,
-    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired, ActionClass,
+    empty_state_header_quiet_required, floor_cancel_avoids_peer, floor_claim_expired,
     AuthorityUpdate, BootstrapGate, FrontierUpdate, HintUpdate, NeededReply, QueryOpening,
     QueryPlan, QueryStart, ReactorProgress, ReactorState, ViewReaction, WorkFacts, WorkReads,
 };
@@ -20,6 +20,7 @@ use zakura_quic::NodeId;
 use zakura_rt::sync::atomic::{AtomicU64, Ordering};
 
 mod state;
+pub(super) use state::ActionClass;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use state::{
     replay_block_query_bytes, replay_block_reactor_bytes, trace_block_reactor_bytes,
@@ -228,7 +229,7 @@ pub fn spawn_block_sync_reactor(
     let mut retry_jitter_seed = [0u8; 32];
     zakura_rt::rand::rng().fill_bytes(&mut retry_jitter_seed);
 
-    let sequencer_task = SequencerTask::new(
+    let sequencer_task = SequencerIO::new(
         sequencer,
         state.work_queue.clone(),
         registry.clone(),
@@ -245,6 +246,7 @@ pub fn spawn_block_sync_reactor(
         sequencer_view_tx,
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
+        startup.decoded_pool.clone(),
     )
     .with_initial_state_version(initial_state_version)
     .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
@@ -263,6 +265,7 @@ pub fn spawn_block_sync_reactor(
     // The shared download primitives every pipe-routine is wired with at spawn
     // (`service::add_peer`), carried through the handle.
     let routine_wiring = RoutineWiring {
+        decoded_pool: startup.decoded_pool.clone(),
         request_pool: crate::zakura::regulation::ReservationPool::new(BS_REQUEST_POOL_ENTRIES)
             .expect("the protocol request ceiling is positive and representable"),
         serving: Arc::new(super::regulated::session::Serving::new(
@@ -1792,11 +1795,7 @@ impl ReactorIO {
         // control capacity in one semaphore operation. The Sequencer sends
         // concurrently, so a separate capacity check has a race.
         let class = ActionClass::of(&action);
-        let permits = match class {
-            ActionClass::Required => 1,
-            ActionClass::Optional => BS_ACTION_CONTROL_RESERVE + 1,
-        };
-        let mut permits = match self.actions.try_reserve_many(permits) {
+        let mut permits = match self.actions.try_reserve_many(class.permits()) {
             Ok(permits) => permits,
             Err(mpsc::error::TrySendError::Full(())) => {
                 return Err(match class {

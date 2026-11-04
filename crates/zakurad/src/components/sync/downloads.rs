@@ -781,7 +781,7 @@ where
                 // discard a height-rewritten body as a benign old block: unattributed,
                 // unscored, and not requeued. See `crate::components::auth_download_height`.
                 if let Some(expected_height) = tip_child_mismatch(
-                    block.header.previous_block_hash,
+                    block.header().previous_block_hash,
                     block_height,
                     best_tip,
                 ) {
@@ -835,7 +835,7 @@ where
 
                 // Admission must precede shared flow-control changes: a rejected
                 // body must not pause or resume downloads using its claimed height.
-                if !has_sufficient_work(&chain_network, tip_height, block_height, block.header.difficulty_threshold) {
+                if !has_sufficient_work(&chain_network, tip_height, block_height, block.header().difficulty_threshold) {
                     metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
                     return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
                 }

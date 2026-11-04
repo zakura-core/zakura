@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, TransactionHandle};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -1126,7 +1127,7 @@ where
     let parent = block.header.previous_block_hash;
     let block = Arc::new(block);
     let request = zakura_consensus::Request::Prepare {
-        block: block.clone(),
+        block: block.clone().into(),
         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
     };
 
@@ -1808,7 +1809,7 @@ where
         let size = block.zcash_serialized_size();
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
+            block: block.clone().into(),
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -2392,9 +2393,12 @@ where
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => {
-                    Ok(GetBlockResponse::Raw(block.into()))
-                }
+                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
+                    block
+                        .zcash_serialize_to_vec()
+                        .expect("serialization to memory cannot fail")
+                        .into(),
+                )),
                 zakura_state::ReadResponse::Block(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
@@ -2482,14 +2486,14 @@ where
                 ),
                 zakura_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
-                    let block_time = block.header.time;
+                    let block_time = block.header().time;
                     let transactions = block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .map(|tx| {
                             GetBlockTransaction::Object(Box::new(
                                 TransactionObject::from_transaction(
-                                    tx.clone(),
+                                    tx,
                                     Some(height),
                                     Some(confirmations),
                                     &network,
@@ -2630,18 +2634,28 @@ where
             .clone()
             .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
             .await
-            .map_err(|_| "block height not in best chain")
-            .map_error(
-                // ## Compatibility with `zcashd`.
-                //
-                // Since this function is reused by getblock(), we return the errors
-                // expected by it (they differ whether a hash or a height was passed).
-                if hash_or_height.hash().is_some() {
-                    server::error::LegacyCode::InvalidAddressOrKey
+            .map_err(|error| {
+                if is_read_capacity_refusal(&*error) {
+                    // A capacity refusal says nothing about the block, so the caller can retry.
+                    ErrorObject::new(
+                        server::error::LegacyCode::OutOfMemory,
+                        "state read capacity is temporarily exhausted, retry later",
+                    )
                 } else {
-                    server::error::LegacyCode::InvalidParameter
-                },
-            )?
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    ErrorObject::new(
+                        if hash_or_height.hash().is_some() {
+                            server::error::LegacyCode::InvalidAddressOrKey
+                        } else {
+                            server::error::LegacyCode::InvalidParameter
+                        },
+                        "block height not in best chain",
+                    )
+                }
+            })?
         else {
             panic!("unexpected response to BlockHeader request")
         };
@@ -2960,7 +2974,7 @@ where
                             Some(mined.block_time),
                         ),
                         _ => {
-                            let raw_tx: Arc<Transaction> = tx.into();
+                            let raw_tx: TransactionHandle = tx.into();
                             (raw_tx, None, None, None)
                         }
                     };
@@ -3024,7 +3038,7 @@ where
                     }
                 }
             } else {
-                let tx: Arc<Transaction> = tx.into();
+                let tx: TransactionHandle = tx.into();
                 let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),

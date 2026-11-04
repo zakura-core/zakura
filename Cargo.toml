@@ -105,6 +105,7 @@ rand_10 = { package = "rand", version = "0.10" }
 rand_chacha_10 = { package = "rand_chacha", version = "0.10" }
 rand_core_10 = { package = "rand_core", version = "0.10" }
 rayon = "1.10"
+ref-cast = "1.0.25"
 reddsa = { version = "=5.1.0", package = "zakura-reddsa" }
 redjubjub = { version = "=5.1.0", package = "zakura-redjubjub" }
 regex = "1.11"

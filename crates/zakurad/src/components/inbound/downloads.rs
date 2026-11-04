@@ -1039,7 +1039,7 @@ where
             // the new block until the next sync round, which is what leaves a mining backend
             // issuing work on an obsolete tip.
             if let Some(expected_height) =
-                tip_child_mismatch(block.header.previous_block_hash, block_height, best_tip)
+                tip_child_mismatch(block.header().previous_block_hash, block_height, best_tip)
             {
                 debug!(
                     ?hash,
@@ -1092,7 +1092,7 @@ where
                 &chain_network,
                 tip_height,
                 block_height,
-                block.header.difficulty_threshold,
+                block.header().difficulty_threshold,
             ) {
                 metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
                 return Err((
@@ -1105,7 +1105,7 @@ where
             // verify can start a recovery, and before the source lock, so a recovery is not
             // delayed by earlier blocks from the same source.
             if kind == DownloadKind::Advertised {
-                let parent = block.header.previous_block_hash;
+                let parent = block.header().previous_block_hash;
                 let one_hop_from_tip = tip_height
                     .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
                     .is_some_and(|max_height| block_height <= max_height);
@@ -1119,7 +1119,7 @@ where
                     );
 
                 if parent_is_missing {
-                    let header = block.header.clone();
+                    let header = *block.header();
                     let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
                         zakura_consensus::proof_of_work_is_valid(
                             &header,
@@ -1453,7 +1453,7 @@ mod tests {
                     .cloned()
                     .expect("test network has a block for the requested hash");
 
-                Ok(zn::Response::Blocks(vec![Available((block, None))]))
+                Ok(zn::Response::Blocks(vec![Available((block.into(), None))]))
             }
         }));
 
@@ -1656,7 +1656,10 @@ mod tests {
                 else {
                     return Err("unexpected network request".into());
                 };
-                Ok(zn::Response::Blocks(vec![Available((substitute, None))]))
+                Ok(zn::Response::Blocks(vec![Available((
+                    substitute.into(),
+                    None,
+                ))]))
             }
         }));
 
@@ -1770,7 +1773,7 @@ mod tests {
                 let block = block.clone();
                 async move {
                     Ok(zn::Response::Blocks(vec![Available((
-                        block,
+                        block.into(),
                         Some(advertiser_addr),
                     ))]))
                 }

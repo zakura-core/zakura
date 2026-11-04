@@ -34,6 +34,7 @@ use zakura_chain::{
     transparent,
 };
 
+pub use zakura_node_services::block_memory::TransactionHandle;
 use zakura_node_services::mempool;
 use zakura_script::{CachedFfiTransaction, Sigops};
 use zakura_state as zs;
@@ -205,7 +206,7 @@ pub enum Request {
         /// The mined ID of `transaction`, which the caller must compute from it.
         transaction_hash: transaction::Hash,
         /// The transaction itself.
-        transaction: Arc<Transaction>,
+        transaction: TransactionHandle,
         /// Set of transaction hashes that create new transparent outputs.
         known_outpoint_hashes: Arc<HashSet<transaction::Hash>>,
         /// Additional UTXOs which are known at the time of verification.
@@ -300,10 +301,10 @@ impl From<VerifiedUnminedTx> for Response {
 
 impl Request {
     /// The transaction to verify that's in this request.
-    pub fn transaction(&self) -> Arc<Transaction> {
+    pub fn transaction(&self) -> TransactionHandle {
         match self {
             Request::Block { transaction, .. } => transaction.clone(),
-            Request::Mempool { transaction, .. } => transaction.transaction().clone(),
+            Request::Mempool { transaction, .. } => transaction.transaction().clone().into(),
         }
     }
 
@@ -829,7 +830,7 @@ where
     /// - vec of `Output`s in the same order as the matching inputs in the `tx`,
     /// - vec of `Outpoint`s spent by a mempool `tx` that were not found in the best chain's utxo set.
     async fn spent_utxos(
-        tx: Arc<Transaction>,
+        tx: TransactionHandle,
         req: Request,
         state: Timeout<ZS>,
         mempool: Option<Timeout<Mempool>>,
@@ -869,9 +870,17 @@ where
                         .clone()
                         .oneshot(zs::Request::UnspentBestChainUtxo(*outpoint));
 
-                    let zakura_state::Response::UnspentBestChainUtxo(utxo) = query
-                        .await
-                        .map_err(|_| TransactionError::TransparentInputNotFound)?
+                    // A lookup failure other than a timeout, such as a read capacity
+                    // refusal, is not a verdict on the transaction.
+                    let zakura_state::Response::UnspentBestChainUtxo(utxo) =
+                        query.await.map_err(|boxed_error| {
+                            match boxed_error.downcast::<Elapsed>() {
+                                Ok(_) => TransactionError::TransparentInputNotFound,
+                                Err(boxed_error) => {
+                                    TransactionError::StateUnavailable(boxed_error.to_string())
+                                }
+                            }
+                        })?
                     else {
                         unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
                     };
@@ -1035,7 +1044,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
@@ -1158,7 +1167,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
@@ -1247,7 +1256,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
@@ -1318,7 +1327,7 @@ where
     fn verify_transparent_inputs_and_outputs(
         request: &Request,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
 

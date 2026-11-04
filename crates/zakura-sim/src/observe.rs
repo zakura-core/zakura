@@ -1464,6 +1464,8 @@ pub enum BlockSyncFact {
     },
     /// The sequencer's retained bodies.
     Sequencer {
+        /// Every runtime payload, independently of policy membership.
+        payloads: Vec<BlockSyncPayload>,
         /// Each reorder-buffer body.
         reorder: Vec<BlockSyncRetained>,
         /// Each `applying` body.
@@ -1615,9 +1617,22 @@ pub struct BlockSyncWorkItem {
     pub reserved_bytes: u64,
 }
 
+/// A payload read directly from sequencer runtime storage.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct BlockSyncPayload {
+    /// Runtime identity assigned before policy acceptance.
+    pub id: u64,
+    /// Attributed decoded size measured from the actual payload.
+    pub decoded_attributed_memory_bytes: u64,
+}
+
 /// A reorder-buffer or `applying` body in the sequencer's snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BlockSyncRetained {
+    /// Runtime payload identity.
+    pub payload_id: u64,
+    /// Decoded size recorded in sequencing policy.
+    pub policy_decoded_bytes: u64,
     /// The body.
     #[serde(flatten)]
     pub body: BlockSyncBody,
@@ -1893,6 +1908,62 @@ pub enum TransportFact {
     },
     /// The connection's workers drained and its peer was unregistered.
     TornDown,
+    /// A service session's lifecycle moved one step.
+    SessionLifecycle {
+        /// The service's primary stream kind.
+        kind: u16,
+        /// The step.
+        step: SessionStepFact,
+    },
+}
+
+/// A service session's lifecycle step, in [`TransportFact::SessionLifecycle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "step", rename_all = "kebab-case")]
+pub enum SessionStepFact {
+    /// A local open started.
+    AttemptStarted {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A local open failed before the session started.
+    AttemptFailed {
+        /// The attempt.
+        attempt: u64,
+    },
+    /// A member of an inbound offer finished setup.
+    MemberArrived {
+        /// The offer's wire ID, zero for a single-stream session.
+        wire_id: u64,
+        /// The member's stream kind.
+        member: u16,
+    },
+    /// An incomplete inbound offer expired and released its members.
+    OfferExpired {
+        /// The offer's wire ID.
+        wire_id: u64,
+    },
+    /// A generation started all its workers.
+    GenerationInstalled {
+        /// The generation.
+        generation: u64,
+        /// The attempt that opened it, or `None` for a peer-opened session.
+        attempt: Option<u64>,
+    },
+    /// The node refused a complete inbound generation and is retiring it.
+    GenerationParked {
+        /// The generation.
+        generation: u64,
+    },
+    /// Every worker of a generation finished.
+    GenerationExited {
+        /// The generation.
+        generation: u64,
+        /// Whether a local open started it.
+        opened_locally: bool,
+        /// Whether it was the service's current generation.
+        current: bool,
+    },
 }
 
 /// The credit one subscription update adds, in

@@ -328,11 +328,11 @@ pub(crate) fn assert_core(
         report.peak_budget_reserved
             <= scenario
                 .config
-                .max_inflight_block_bytes
+                .inflight_block_bytes()
                 .saturating_add(overdraft_slack),
         "peak reserved bytes {} exceeded the in-flight request budget {} (+{} floor-overdraft slack)",
         report.peak_budget_reserved,
-        scenario.config.max_inflight_block_bytes,
+        scenario.config.inflight_block_bytes(),
         overdraft_slack,
     );
 

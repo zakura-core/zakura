@@ -179,6 +179,13 @@ mod machine_tests {
         record::machine::{FailurePhase, FixtureStep, MachineFailure, MachineStep},
     };
 
+    fn fixture(record: &mut StepRecord) -> &mut FixtureStep {
+        match record.machine.as_deref_mut() {
+            Some(MachineStep::Fixture(step)) => step,
+            other => panic!("the record holds fixture evidence, not {other:?}"),
+        }
+    }
+
     #[test]
     fn runtime_funding_evidence_preserves_retained_owners_and_drain() {
         let history = zakura_network::zakura::trace_work_funding_bytes(&[
@@ -283,13 +290,6 @@ mod machine_tests {
                 serde_json::from_str::<Record>(&json).unwrap(),
                 Record::Step(changed)
             );
-        }
-    }
-
-    fn fixture(record: &mut StepRecord) -> &mut FixtureStep {
-        match record.machine.as_deref_mut() {
-            Some(MachineStep::Fixture(step)) => step,
-            other => panic!("the record holds fixture evidence, not {other:?}"),
         }
     }
 

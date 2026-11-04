@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/read/block.rs
++++ b/crates/zakura-state/src/service/read/block.rs
+@@ -137,7 +137,7 @@
+     {
+         return Ok(Some(contextual.block.retained_header()));
+     }
+-    db.block_header_result(hash_or_height)
++    Ok(db.block_header(hash_or_height).map(Into::into))
+ }
+ 
+ /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in the

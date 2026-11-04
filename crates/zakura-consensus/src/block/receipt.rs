@@ -8,7 +8,8 @@ use std::{
     },
 };
 
-use zakura_chain::block::{self, Block};
+use zakura_chain::block;
+use zakura_node_services::block_memory::BlockHandle;
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 
@@ -46,8 +47,8 @@ pub(super) struct ReceiptRegistry(Arc<Mutex<HashMap<block::Hash, Vec<Entry>>>>);
 #[derive(Debug)]
 struct Entry {
     /// The delivered body, held while a verification of it is active. The delivering
-    /// verification holds the same block for at least as long.
-    block: Arc<Block>,
+    /// verification holds the same block, and its decoded-memory charge, for at least as long.
+    block: BlockHandle,
     order: u64,
     callers: usize,
 }
@@ -56,7 +57,7 @@ struct Entry {
 pub(super) struct ReceiptGuard {
     registry: Arc<Mutex<HashMap<block::Hash, Vec<Entry>>>>,
     /// The hash and body this receipt is registered under, or `None` for an untracked receipt.
-    registered: Option<(block::Hash, Arc<Block>)>,
+    registered: Option<(block::Hash, BlockHandle)>,
     pub(super) order: u64,
 }
 
@@ -64,28 +65,28 @@ impl ReceiptRegistry {
     /// Called synchronously by the verifier before returning its request future.
     ///
     /// `hash` is `block`'s hash.
-    pub(super) fn register(&self, hash: block::Hash, block: &Arc<Block>) -> ReceiptGuard {
+    pub(super) fn register(&self, hash: block::Hash, block: &BlockHandle) -> ReceiptGuard {
         let mut active = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bodies = active.entry(hash).or_default();
-        // `Arc` equality compares the blocks, after checking for the same allocation.
+        // Handle equality compares the blocks, skipping headers and transactions they share.
         let (order, registered) =
             if let Some(entry) = bodies.iter_mut().find(|entry| entry.block == *block) {
                 entry.callers = entry
                     .callers
                     .checked_add(1)
                     .expect("each active caller owns memory, so its count fits in usize");
-                (entry.order, Some((hash, Arc::clone(&entry.block))))
+                (entry.order, Some((hash, entry.block.clone())))
             } else if bodies.len() < MAX_BODIES_PER_HASH {
                 let order = next_receipt_order(&NEXT_RECEIPT_ORDER);
                 bodies.push(Entry {
-                    block: Arc::clone(block),
+                    block: block.clone(),
                     order,
                     callers: 1,
                 });
-                (order, Some((hash, Arc::clone(block))))
+                (order, Some((hash, block.clone())))
             } else {
                 (next_receipt_order(&NEXT_RECEIPT_ORDER), None)
             };
@@ -111,7 +112,7 @@ impl Drop for ReceiptGuard {
             .expect("a live guard has a registered receipt");
         let index = bodies
             .iter()
-            .position(|entry| Arc::ptr_eq(&entry.block, block))
+            .position(|entry| std::ptr::eq(entry.block.view(), block.view()))
             .expect("a live guard holds the body its receipt is registered under");
         bodies[index].callers -= 1;
         // This guard still holds the body, so removing the entry does not free it under the lock.
@@ -127,10 +128,11 @@ impl Drop for ReceiptGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::serialization::ZcashDeserializeInto;
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
 
     /// Registers `block` the way the verifier does, under its hash.
     fn register(registry: &ReceiptRegistry, block: Arc<Block>) -> ReceiptGuard {
+        let block = BlockHandle::from(block);
         registry.register(block.hash(), &block)
     }
 

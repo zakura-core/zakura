@@ -26,6 +26,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod node_envelope;
 mod peer_memory;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
@@ -42,6 +43,8 @@ pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
 pub use peer_memory::*;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use regulation::{replay_cadence_bytes, CadenceReplaySummary};
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
@@ -548,7 +551,9 @@ fn resume_task_panic<T>(
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use header_sync::{
-    trace_header_reactor_bytes, HeaderMachineFailure, HeaderMachinePhase, HeaderReactorHistory,
+    trace_header_publisher_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
+    HeaderMachinePhase, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView, HeaderReactorHistory,
     HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
     HeaderReactorView,
 };

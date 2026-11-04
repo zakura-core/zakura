@@ -1,13 +1,23 @@
+//! The header-sync peer routine: one session's reader.
+//!
+//! [`PeerState`] routes each admitted message. This module holds the
+//! stream, the trust boundary that admits and decodes each frame, and the
+//! publisher task the reader watches.
+
 use zakura_chain::{block, parameters::Network};
 use zakura_rt::{sync::CancellationToken, task::JoinHandle};
 
 use super::{
-    events::{Event, HeaderSyncHandle},
+    events::HeaderSyncHandle,
     service::PeerSession,
-    v9::{message_type, Headers, Message, Publisher},
+    v9::{Headers, Message, Publisher},
     wire::{HeaderSyncWireError, TreeAuxWire},
 };
-use crate::zakura::{wire_codec::decode_frame, FramedRecv, SinkReject};
+use crate::zakura::{wire_codec::decode_frame, Frame, FramedRecv, SinkReject};
+
+mod state;
+
+use state::{admits_before_decode, PeerInput, PeerOutput, PeerState};
 
 /// Run the sole peer-owned header-sync session reader.
 ///
@@ -24,8 +34,7 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
     mut recv: FramedRecv,
     cancel: CancellationToken,
 ) -> Result<(), SinkReject> {
-    let peer = session.peer_id().clone();
-    let session_id = session.session_id();
+    let state = PeerState::new(session.peer_id().clone(), session.session_id());
     loop {
         let frame = zakura_rt::select! {
             biased;
@@ -43,68 +52,71 @@ pub(super) async fn run_peer<const HEADER_BYTES: usize>(
                 None => return Ok(()),
             },
         };
-        let payload_len = frame.payload.len();
-        if matches!(
-            frame.message_type,
-            message_type::HEADERS | message_type::HEADERS_OUTCOME
-        ) {
-            session
-                .subscriber()
-                .admit(&frame)
-                .map_err(|fault| violation(&handle, &session, fault.label(), fault))?;
-        }
-        let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
-            .map_err(|error| violation(&handle, &session, "malformed_message", error))?;
-        let event = match message {
-            Message::Status(status) => {
-                session.subscriber().observe(&status);
-                Event::Status {
-                    peer: peer.clone(),
-                    session_id,
-                    status,
-                }
-            }
-            Message::SubscribeHeaders(update) => {
+        let input = admit::<HEADER_BYTES>(&handle, &session, frame)?;
+        match state.on_input(input) {
+            PeerOutput::Apply(update) => {
                 publisher
                     .apply(&update)
                     .await
                     .map_err(|fault| violation(&handle, &session, "subscription_update", fault))?;
-                continue;
             }
-            Message::Headers(page) => {
-                check_records(&page, &handle.network)
-                    .map_err(|error| violation(&handle, &session, "malformed_message", error))?;
-                let admitted = session
-                    .subscriber()
-                    .receive_page(&page, payload_len)
-                    .map_err(|fault| violation(&handle, &session, fault.label(), fault))?;
-                Event::Page {
-                    peer: peer.clone(),
-                    session_id,
-                    page,
-                    admitted,
+            PeerOutput::Forward(event) => {
+                zakura_rt::select! {
+                    biased;
+                    () = cancel.cancelled() => return Ok(()),
+                    result = handle.send(event) => {
+                        result.map_err(|error| SinkReject::local(error.to_string()))?;
+                    }
                 }
-            }
-            Message::HeadersOutcome(outcome) => {
-                let ended = session
-                    .subscriber()
-                    .receive_outcome(&outcome)
-                    .map_err(|fault| violation(&handle, &session, fault.label(), fault))?;
-                Event::Outcome {
-                    peer: peer.clone(),
-                    session_id,
-                    ended,
-                }
-            }
-        };
-        zakura_rt::select! {
-            biased;
-            () = cancel.cancelled() => return Ok(()),
-            result = handle.send(event) => {
-                result.map_err(|error| SinkReject::local(error.to_string()))?;
             }
         }
     }
+}
+
+/// Admit and decode one `frame` at the session's trust boundary.
+///
+/// The subscriber checks a page or outcome header against its credit before
+/// the payload is decoded. A decoded `Status` updates the subscriber's caps,
+/// a page passes its network-dependent record checks and the subscriber's
+/// page checks, and an outcome passes the subscriber's window check. A frame
+/// that breaks a rule is a protocol violation.
+fn admit<const HEADER_BYTES: usize>(
+    handle: &HeaderSyncHandle,
+    session: &PeerSession,
+    frame: Frame,
+) -> Result<PeerInput, SinkReject> {
+    let payload_len = frame.payload.len();
+    if admits_before_decode(frame.message_type) {
+        session
+            .subscriber()
+            .admit(&frame)
+            .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+    }
+    let message = decode_frame::<Message<HEADER_BYTES>>(&frame)
+        .map_err(|error| violation(handle, session, "malformed_message", error))?;
+    Ok(match message {
+        Message::Status(status) => {
+            session.subscriber().observe(&status);
+            PeerInput::Status(status)
+        }
+        Message::SubscribeHeaders(update) => PeerInput::Update(update),
+        Message::Headers(page) => {
+            check_records(&page, &handle.network)
+                .map_err(|error| violation(handle, session, "malformed_message", error))?;
+            let admitted = session
+                .subscriber()
+                .receive_page(&page, payload_len)
+                .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+            PeerInput::Page { page, admitted }
+        }
+        Message::HeadersOutcome(outcome) => {
+            let ended = session
+                .subscriber()
+                .receive_outcome(&outcome)
+                .map_err(|fault| violation(handle, session, fault.label(), fault))?;
+            PeerInput::Outcome(ended)
+        }
+    })
 }
 
 /// Check each schema-1 record against its header's height and the network's

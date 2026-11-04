@@ -10,6 +10,7 @@ use tokio::time::timeout;
 use tracing::Instrument;
 
 use zakura_chain::{
+    block::Block,
     local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
     parameters::Network::*,
     serialization::ZcashDeserialize,
@@ -81,7 +82,7 @@ async fn checkpoint_completion_notifies_handoff_without_another_caller() -> Resu
             committed_tip.0,
             crate::transaction::boxed_state(state),
         );
-        let response = verifier.call(blocks[1].clone());
+        let response = verifier.call(blocks[1].clone().into());
         let response = if drop_response {
             drop(response);
             None
@@ -165,7 +166,7 @@ async fn checkpoint_handoff_only_notifies_at_configured_boundary() -> Result<(),
             assert_eq!(
                 timeout(
                     Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-                    verifier.call(block.clone())
+                    verifier.call(block.clone().into())
                 )
                 .await??,
                 block.hash()
@@ -226,7 +227,7 @@ async fn checkpoint_handoff_survives_a_delayed_buffer_worker() -> Result<(), Rep
         crate::transaction::boxed_state(state),
     )
     .map_err(|error| eyre!(error))?;
-    let response = verifier.call(genesis);
+    let response = verifier.call(genesis.into());
     tokio::select! {
         started = started_rx.recv() => started.expect("the checkpoint commit starts"),
         _ = &mut worker => panic!("the verifier keeps the state buffer open"),
@@ -294,7 +295,7 @@ async fn failed_handoff_check_preserves_committed_checkpoint_progress() -> Resul
         .map_err(|error| eyre!(error))?;
         let result = timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            verifier.call(genesis.clone()),
+            verifier.call(genesis.clone().into()),
         )
         .await?;
         assert_eq!(result?, hash);
@@ -359,7 +360,7 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
     .in_scope(|| {
         timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block0.clone()),
+            ready_verifier_service.call(block0.clone().into()),
         )
     });
     // TODO(teor || jlusby): check error kind
@@ -461,7 +462,7 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
         .in_scope(|| {
             timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-                ready_verifier_service.call(block.clone()),
+                ready_verifier_service.call(block.clone().into()),
             )
         });
         // TODO(teor || jlusby): check error kind
@@ -556,7 +557,7 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
                 .ready()
                 .map_err(|error| eyre!(error))
                 .await?
-                .call(block),
+                .call(block.into()),
         )
         .await
         .expect("generated checkpoint verification should not time out")
@@ -672,8 +673,8 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
         crate::transaction::boxed_state(state_service),
     )?;
 
-    let block0_result = verifier.ready().await?.call(block0);
-    let block1_result = verifier.ready().await?.call(block1);
+    let block0_result = verifier.ready().await?.call(block0.into());
+    let block1_result = verifier.ready().await?.call(block1.into());
     let (block0_result, block1_result) = tokio::join!(
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block0_result),
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block1_result),
@@ -732,8 +733,8 @@ async fn checkpoint_negative_parent_deficit_resets_the_verifier() -> Result<(), 
         crate::transaction::boxed_state(state_service),
     )?;
 
-    let block0_result = verifier.ready().await?.call(block0);
-    let block1_result = verifier.ready().await?.call(block1);
+    let block0_result = verifier.ready().await?.call(block0.into());
+    let block1_result = verifier.ready().await?.call(block1.into());
     let (block0_result, block1_result) = tokio::join!(
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block0_result),
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block1_result),
@@ -901,7 +902,7 @@ async fn continuous_blockchain(
             // Set up the verification future for the current block.
             let verify_future = timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-                ready_verifier_service.call(block.clone()),
+                ready_verifier_service.call(block.clone().into()),
             );
 
             // Spawn the verification future in the background.
@@ -1031,7 +1032,7 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
     .in_scope(|| {
         timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block415000.clone()),
+            ready_verifier_service.call(block415000.clone().into()),
         )
     });
     // TODO(teor || jlusby): check error kind
@@ -1124,7 +1125,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     .in_scope(|| {
         timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(bad_block0.clone()),
+            ready_verifier_service.call(bad_block0.clone().into()),
         )
     });
     // We can't await the future yet, because bad blocks aren't cleared
@@ -1157,7 +1158,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     .in_scope(|| {
         timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(bad_block0.clone()),
+            ready_verifier_service.call(bad_block0.clone().into()),
         )
     });
     // We can't await the future yet, because bad blocks aren't cleared
@@ -1189,7 +1190,7 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     .in_scope(|| {
         timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(good_block0.clone()),
+            ready_verifier_service.call(good_block0.clone().into()),
         )
     });
     // TODO(teor || jlusby): check error kind
@@ -1350,7 +1351,7 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         .in_scope(|| {
             timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-                ready_verifier_service.call(block.clone()),
+                ready_verifier_service.call(block.clone().into()),
             )
         });
 
@@ -1444,7 +1445,7 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
     .in_scope(|| {
         timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block0.clone()),
+            ready_verifier_service.call(block0.clone().into()),
         )
     });
     // TODO(teor || jlusby): check error kind
@@ -1533,7 +1534,7 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     let mut first_range = FuturesUnordered::new();
     for (block, _height, _hash) in &blockchain[..=3] {
         let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-        first_range.push(ready.call(block.clone()));
+        first_range.push(ready.call(block.clone().into()));
     }
     timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
         while let Some(result) = first_range.next().await {
@@ -1555,19 +1556,19 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     // Keep the first height-4 future pending so we can drive its NewerRequest
     // error (and the resulting reset) after the range has verified.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let superseded_height_4 = ready.call(block4.clone());
+    let superseded_height_4 = ready.call(block4.clone().into());
 
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let height_5 = ready.call(block5);
+    let height_5 = ready.call(block5.into());
 
     // Resubmit height 4 while it is still queued: replaces the older request
     // with NewerRequest on the superseded oneshot.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let replacement_height_4 = ready.call(block4);
+    let replacement_height_4 = ready.call(block4.into());
 
     // Completing the continuous chain verifies (3, 6] and advances progress.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let height_6 = ready.call(block6);
+    let height_6 = ready.call(block6.into());
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
         PreviousCheckpoint(block::Height(6)),
@@ -1592,7 +1593,7 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     // The next call applies any queued reset. Correct behavior keeps progress
     // at PreviousCheckpoint(6) so the following range can still form.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let height_7 = ready.call(blockchain[7].0.clone());
+    let height_7 = ready.call(blockchain[7].0.clone().into());
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1606,7 +1607,7 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     final_range.push(height_7);
     for (block, _height, _hash) in &blockchain[8..=10] {
         let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-        final_range.push(ready.call(block.clone()));
+        final_range.push(ready.call(block.clone().into()));
     }
     // The replacement height-4 / 5 / 6 commits from the prior range should also
     // succeed; poll them alongside the final range.
@@ -1679,14 +1680,14 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
     )
     .map_err(|error| eyre!(error))?;
 
-    let side_chain = verifier.call(blocks[4].clone());
+    let side_chain = verifier.call(blocks[4].clone().into());
     // Model a competing block after basic validation without mining another valid PoW.
     let side_hash = block::Hash([0xAA; 32]);
     verifier.queued.get_mut(&block::Height(4)).unwrap()[0].block =
         CheckpointVerifiedBlock::new(blocks[4].clone(), Some(side_hash), None);
     let mut commits = FuturesUnordered::new();
     for block in &blocks[4..=6] {
-        commits.push(verifier.call(block.clone()));
+        commits.push(verifier.call(block.clone().into()));
     }
     assert_eq!(
         verifier.previous_checkpoint_height(),
@@ -1698,7 +1699,7 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
     ));
 
     // This call applies any reset while the state tip remains at height 3.
-    commits.push(verifier.call(blocks[7].clone()));
+    commits.push(verifier.call(blocks[7].clone().into()));
     assert_eq!(
         verifier.previous_checkpoint_height(),
         PreviousCheckpoint(block::Height(6)),
@@ -1706,7 +1707,7 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
     );
     assert_eq!(verifier.reset_generation, 0);
     for block in &blocks[8..=10] {
-        commits.push(verifier.call(block.clone()));
+        commits.push(verifier.call(block.clone().into()));
     }
     release_commits.send_replace(true);
     timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
@@ -1865,12 +1866,12 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let height_5 = ready.call(blockchain[5].0.clone());
+    let height_5 = ready.call(blockchain[5].0.clone().into());
     let ready = checkpoint_verifier
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let height_6 = ready.call(blockchain[6].0.clone());
+    let height_6 = ready.call(blockchain[6].0.clone().into());
 
     checkpoint_verifier
         .reset_sender
@@ -1884,7 +1885,7 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let height_4 = ready.call(blockchain[4].0.clone());
+    let height_4 = ready.call(blockchain[4].0.clone().into());
     assert_eq!(checkpoint_verifier.reset_generation, 1);
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1904,7 +1905,7 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let retry_height_5 = ready.call(blockchain[5].0.clone());
+    let retry_height_5 = ready.call(blockchain[5].0.clone().into());
 
     assert_eq!(checkpoint_verifier.reset_generation, 2);
     assert_eq!(
@@ -1956,7 +1957,7 @@ async fn dropped_response_must_preserve_failed_commit_reset() -> Result<(), Repo
         crate::transaction::boxed_state(state),
     )
     .map_err(|error| eyre!(error))?;
-    let response = verifier.call(block);
+    let response = verifier.call(block.into());
     assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
     drop(response);
     release.send_replace(true);

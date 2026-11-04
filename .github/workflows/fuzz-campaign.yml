@@ -1,0 +1,155 @@
+name: Fuzz campaign
+
+# One bounded campaign per target of one fuzz package. `scripts/check-fuzz-campaign.py`
+# emits the matrix from `qa/suite.toml` and the package's `Cargo.toml` tables. Each
+# package's own workflow holds its schedule.
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: The fuzz package's directory under qa/fuzz/.
+        required: true
+        type: string
+      label:
+        description: The prefix of the corpus cache keys and artifact names.
+        required: true
+        type: string
+      weekly_cron:
+        description: The schedule that runs the longer campaign.
+        required: true
+        type: string
+      timeout_minutes:
+        description: The time limit of one target's job.
+        required: true
+        type: number
+      nightly:
+        description: The toolchain that cargo-fuzz builds with.
+        required: true
+        type: string
+      rustflags:
+        description: Compiler flags for the target's build.
+        required: false
+        type: string
+        default: -D warnings
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.13.2
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+  RUSTFLAGS: ${{ inputs.rustflags }}
+
+jobs:
+  plan:
+    name: Plan the campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - id: matrix
+        env:
+          PACKAGE: ${{ inputs.package }}
+        run: echo "matrix=$(python3 scripts/check-fuzz-campaign.py --matrix "${PACKAGE}")" >> "${GITHUB_OUTPUT}"
+
+  fuzz:
+    name: ${{ matrix.target }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      RSS_MB: ${{ matrix.rss_mb }}
+      ASAN_OPTIONS: detect_leaks=${{ matrix.detect_leaks }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: ${{ inputs.nightly }}
+          cache: true
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Hash the harness's input versions
+        id: versions
+        if: matrix.harness != ''
+        env:
+          HARNESS: ${{ matrix.harness }}
+        # The harness's generator, scenario bytes, trace format and contract versions
+        # together decide what an input's bytes mean.
+        run: |
+          versions="$(cargo xtask sim-versions --sim "${HARNESS}")"
+          echo "key=$(printf '%s' "${versions}" | sha256sum | cut -c1-16)" >> "${GITHUB_OUTPUT}"
+      - name: Restore the target's corpus
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 #v4.2.3
+        with:
+          path: qa/fuzz/${{ inputs.package }}/corpus/${{ matrix.target }}
+          # Bytes mean something only to their decoder, so a new decoder starts a new
+          # corpus. A simulator target's decoder is its harness's input versions.
+          key: ${{ inputs.label }}-fuzz-corpus-${{ matrix.target }}-${{ matrix.decoder || steps.versions.outputs.key || hashFiles('crates/zakura-sim/src/record.rs') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ inputs.label }}-fuzz-corpus-${{ matrix.target }}-${{ matrix.decoder || steps.versions.outputs.key || hashFiles('crates/zakura-sim/src/record.rs') }}-
+      - name: Add the harness's committed seeds
+        if: matrix.harness != ''
+        env:
+          HARNESS: ${{ matrix.harness }}
+          PACKAGE: ${{ inputs.package }}
+        run: cargo xtask sim-seeds --sim "${HARNESS}" --out "qa/fuzz/${PACKAGE}/corpus/${TARGET}"
+      - name: Replay the corpus in a fresh process
+        working-directory: qa/fuzz/${{ inputs.package }}
+        run: |
+          mkdir -p "corpus/${TARGET}"
+          cargo fuzz run --fuzz-dir . "${TARGET}" "corpus/${TARGET}" -- \
+            -runs=0 \
+            -rss_limit_mb="${RSS_MB}"
+      - name: Run bounded campaign
+        working-directory: qa/fuzz/${{ inputs.package }}
+        env:
+          NORMAL_SECONDS: ${{ matrix.seconds }}
+          WEEKLY_SECONDS: ${{ matrix.weekly_seconds }}
+          SCHEDULE: ${{ github.event.schedule }}
+          WEEKLY_CRON: ${{ inputs.weekly_cron }}
+          MAX_LEN: ${{ matrix.max_len }}
+          DETECT_LEAKS: ${{ matrix.detect_leaks }}
+        run: |
+          seconds="${NORMAL_SECONDS}"
+          if [ "${SCHEDULE}" = "${WEEKLY_CRON}" ]; then
+            seconds="${WEEKLY_SECONDS}"
+          fi
+          # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+          # `-max_len=0` lets libFuzzer choose, for a target whose suite row sets no limit.
+          cargo fuzz run --fuzz-dir . "${TARGET}" -- \
+            -max_total_time="${seconds}" \
+            -rss_limit_mb="${RSS_MB}" \
+            -max_len="${MAX_LEN}" \
+            -detect_leaks="${DETECT_LEAKS}"
+      - name: Replay crash artifacts in a fresh process
+        if: failure()
+        working-directory: qa/fuzz/${{ inputs.package }}
+        run: |
+          for artifact in artifacts/"${TARGET}"/*; do
+            [ -f "${artifact}" ] || continue
+            # A second failure confirms the artifact; the campaign already failed the job.
+            cargo fuzz run --fuzz-dir . "${TARGET}" "${artifact}" -- -runs=1 || true
+          done
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: ${{ inputs.label }}-fuzz-${{ matrix.target }}-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: qa/fuzz/${{ inputs.package }}/artifacts/${{ matrix.target }}

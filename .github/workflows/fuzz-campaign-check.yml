@@ -1,0 +1,28 @@
+name: Fuzz campaign check
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-campaign-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Every target and coverage row is registered
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the check
+        run: python3 -m unittest scripts/tests/test_check_fuzz_campaign.py
+      - name: Check the fuzz campaign wiring
+        run: python3 scripts/check-fuzz-campaign.py

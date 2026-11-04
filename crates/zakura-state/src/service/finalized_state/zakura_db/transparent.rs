@@ -15,7 +15,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::RangeInclusive,
-    sync::Arc,
 };
 
 use rocksdb::ColumnFamily;
@@ -584,7 +583,7 @@ impl DiskWriteBatch {
         Self::prepare_transparent_address_balance_updates(
             network,
             *height,
-            &block.transactions,
+            block.view().transactions(),
             spent_utxos_by_outpoint,
             &mut address_balances,
         );
@@ -605,7 +604,7 @@ impl DiskWriteBatch {
         );
 
         // Index the transparent addresses that spent in each transaction
-        for (tx_index, transaction) in block.transactions.iter().enumerate() {
+        for (tx_index, transaction) in block.view().transactions().enumerate() {
             let spending_tx_location = TransactionLocation::from_usize(*height, tx_index);
 
             self.prepare_spending_transparent_tx_ids_batch(
@@ -676,7 +675,7 @@ impl DiskWriteBatch {
     fn prepare_transparent_address_balance_updates(
         network: &Network,
         height: Height,
-        transactions: &[Arc<Transaction>],
+        transactions: impl IntoIterator<Item = impl AsRef<Transaction>>,
         spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
         address_balances: &mut AddressBalanceLocationUpdates,
     ) {
@@ -688,10 +687,11 @@ impl DiskWriteBatch {
             addr_locs: &mut HashMap<transparent::Address, T>,
             network: &Network,
             height: Height,
-            transactions: &[Arc<Transaction>],
+            transactions: impl IntoIterator<Item = impl AsRef<Transaction>>,
             spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
         ) {
-            for (tx_index, transaction) in transactions.iter().enumerate() {
+            for (tx_index, transaction) in transactions.into_iter().enumerate() {
+                let transaction = transaction.as_ref();
                 // Debit transparent inputs first. Coinbase inputs have no outpoint, so
                 // `filter_map(Input::outpoint)` skips them.
                 for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {

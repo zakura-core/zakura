@@ -1454,9 +1454,10 @@ impl StatusSchedule {
 
 // ---- action classes ----
 
-/// How much action-channel capacity an action may use.
+/// How much action-channel capacity an action may use. The reactor and the
+/// Sequencer both send on the channel, so both apply this rule.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(super) enum ActionClass {
+pub(in crate::zakura::block_sync) enum ActionClass {
     /// Reactor control: needed-block queries and body-availability requests.
     /// It may use the protected control reserve.
     Required,
@@ -1465,11 +1466,21 @@ pub(super) enum ActionClass {
 }
 
 impl ActionClass {
-    pub(super) fn of(action: &BlockSyncAction) -> Self {
+    pub(in crate::zakura::block_sync) fn of(action: &BlockSyncAction) -> Self {
         if matches!(action, BlockSyncAction::Misbehavior { .. }) {
             Self::Optional
         } else {
             Self::Required
+        }
+    }
+
+    /// Permits to take in one semaphore operation. An optional action also
+    /// takes the control reserve, which returns to the channel when the unused
+    /// permits drop.
+    pub(in crate::zakura::block_sync) fn permits(self) -> usize {
+        match self {
+            Self::Required => 1,
+            Self::Optional => super::BS_ACTION_CONTROL_RESERVE + 1,
         }
     }
 }

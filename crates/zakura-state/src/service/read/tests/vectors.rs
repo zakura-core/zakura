@@ -1,6 +1,7 @@
 //! Fixed test vectors for the ReadStateService.
 
 use std::sync::Arc;
+use zakura_node_services::block_memory::TransactionHandle;
 
 use tower::ServiceExt;
 use zakura_chain::{
@@ -90,11 +91,11 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
         let block_cases = vec![
             (
                 ReadRequest::Block(block.hash().into()),
-                Ok(ReadResponse::Block(Some(block.clone()))),
+                Ok(ReadResponse::Block(Some(block.clone().into()))),
             ),
             (
                 ReadRequest::Block(block.coinbase_height().unwrap().into()),
-                Ok(ReadResponse::Block(Some(block.clone()))),
+                Ok(ReadResponse::Block(Some(block.clone().into()))),
             ),
         ];
 
@@ -110,7 +111,7 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
             let transaction_cases = vec![(
                 ReadRequest::Transaction(transaction.hash()),
                 Ok(ReadResponse::Transaction(Some(MinedTx {
-                    tx: transaction.clone(),
+                    tx: TransactionHandle::Shared(transaction.clone()),
                     height: block.coinbase_height().unwrap(),
                     confirmations: 1 + tip_height.0 - block.coinbase_height().unwrap().0,
                     block_time: block.header.time,
@@ -688,7 +689,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.chain_iter(),
         &finalized_state.db,
         side_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_some(),
         "any_block should find side chain block by hash"
@@ -700,7 +702,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.best_chain(),
         &finalized_state.db,
         side_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_none(),
         "block should NOT find side chain block by hash"
@@ -711,7 +714,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.chain_iter(),
         &finalized_state.db,
         best_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_some(),
         "any_block should find best chain block by hash"
@@ -723,7 +727,8 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         non_finalized_state.best_chain(),
         &finalized_state.db,
         best_hash.into(),
-    );
+    )
+    .unwrap();
     assert!(
         found.is_some(),
         "block should find best chain block by hash"

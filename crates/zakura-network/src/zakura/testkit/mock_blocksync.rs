@@ -219,7 +219,7 @@ impl MockApplyFrontier {
         }
     }
 
-    pub(crate) fn apply(&self, block: &block::Block) -> MockApplyOutcome {
+    pub(crate) fn apply(&self, block: &block::BlockRef) -> MockApplyOutcome {
         let height = block
             .coinbase_height()
             .expect("synthetic block has a coinbase height");
@@ -422,7 +422,7 @@ impl HarnessConfig {
     fn block_sync_config(&self) -> ZakuraBlockSyncConfig {
         ZakuraBlockSyncConfig {
             max_inflight_requests: u32::from(self.max_inflight),
-            max_inflight_block_bytes: u64::MAX,
+            max_inflight_block_bytes: Some(u64::MAX),
             max_submitted_block_applies: usize::from(self.max_inflight)
                 .saturating_mul(
                     usize::try_from(self.max_blocks_per_response).expect("u32 fits usize"),

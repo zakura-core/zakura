@@ -132,11 +132,18 @@ impl PreparedProposal {
             .expect("a proposal chain holds the block its validation pushed");
 
         // The transaction IDs already match, so this compares the authorizing data as well.
-        if proposal.block.transactions != solved.block.transactions {
+        if !proposal
+            .block
+            .view()
+            .transactions()
+            .eq(solved.block.view().transactions())
+        {
             return Err(NotPrepared::TransactionsDiffer);
         }
 
-        if proposal.block.header.difficulty_threshold != solved.block.header.difficulty_threshold {
+        if proposal.block.header().difficulty_threshold
+            != solved.block.header().difficulty_threshold
+        {
             return Err(NotPrepared::DifficultyThresholdDiffers);
         }
 
@@ -222,7 +229,7 @@ impl ProposalResults {
                 }
             });
         let entry = Entry {
-            parent_hash: proposal.block.header.previous_block_hash,
+            parent_hash: proposal.block.header().previous_block_hash,
             transaction_hashes: proposal.transaction_hashes.clone(),
             spent_utxos: Arc::clone(&proposal.spent_outputs),
             prepared_proposal,
@@ -274,7 +281,7 @@ impl ProposalResults {
         let entries = &mut cache.entries;
         let index = entries.iter().position(|entry| {
             entry.matches(
-                block.block.header.previous_block_hash,
+                block.block.header().previous_block_hash,
                 &block.transaction_hashes,
             )
         })?;

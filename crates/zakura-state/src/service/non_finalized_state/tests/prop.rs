@@ -34,8 +34,8 @@ fn spent_utxos(
 
     block
         .block
-        .transactions
-        .iter()
+        .view()
+        .transactions()
         .flat_map(|transaction| transaction.inputs())
         .filter_map(transparent::Input::outpoint)
         .map(|outpoint| {
@@ -210,8 +210,8 @@ fn forked_equals_pushed_genesis() -> Result<()> {
                 prop_assert_eq!(
                     block
                         .block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .flat_map(|t| t.inputs())
                         .filter_map(|i| i.outpoint())
                         .count(),
@@ -788,7 +788,7 @@ fn finished_prepared_chain_equals_pushed_solved_block() -> Result<()> {
         let proposal_history_root = prepared_chain.history_block_commitment_tree().hash();
 
         // Solve it: mining sets the nonce and the solution, and may move the time on.
-        let mut solved = Block::clone(&proposal.block);
+        let mut solved = Block::clone(&crate::tests::copy_block_fixture(&proposal.block));
         let header = Arc::make_mut(&mut solved.header);
         header.nonce = [0x5a; 32].into();
         header.time += chrono::Duration::seconds(1);

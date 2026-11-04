@@ -840,6 +840,9 @@ impl BlockNode {
             },
             (frontiers.header_best.height, frontiers.header_best.hash),
             engine.subscribe_views(),
+            (config)
+                .decoded_block_pool(10_000)
+                .expect("fixture decoded allowance fits"),
             config,
         );
         startup.max_checkpoint_height = Some(LAST_CHECKPOINT);
@@ -1397,7 +1400,7 @@ impl Topology {
             },
             source,
             token: u64::MAX,
-            block: body.block,
+            block: body.block.into(),
         };
         self.node_service()
             .take_received(action, &mut VecDeque::new());

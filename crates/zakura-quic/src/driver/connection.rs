@@ -74,6 +74,7 @@ pub(crate) struct ConnTaskParams<S> {
 /// The connection's limits as last set (API-9).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurrentLimits {
+    /// The receive window before held credit (API-10).
     pub(crate) receive_window: u64,
     pub(crate) send_window: u64,
     pub(crate) max_bidi_streams: u64,
@@ -140,6 +141,11 @@ struct ConnTask<S: UdpIo> {
     /// The peer's IP as of the last path check (PATH-3).
     path_ip: IpAddr,
     limits: CurrentLimits,
+    /// Every credit hold this task applied, and every release it took
+    /// (API-10). The window leaves out their difference. Separate totals keep
+    /// a release that arrives before its hold from being lost.
+    credit_held: u64,
+    credit_released: u64,
     /// When the load snapshot was last published, and whether it is stale.
     load_published: Option<Instant>,
     load_stale: bool,
@@ -201,6 +207,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         slot,
     } = params;
     let mut socket_generation = socket.subscribe();
+    let credit = shared.clone();
     let mut task = ConnTask {
         handle,
         conn,
@@ -217,6 +224,8 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         drained_sent: false,
         path_ip: canonical_ip(admitted.ip()),
         limits,
+        credit_held: 0,
+        credit_released: 0,
         load_published: None,
         load_stale: false,
         last_send_warning: None,
@@ -340,6 +349,8 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
                 task.conn.local_address_changed();
             }
             Ok(()) = socket_generation.changed() => {}
+            // The next drive adds the released credit back (API-10).
+            () = credit.credit_released() => {}
             _ = sampler.tick() => task.sample(),
             () = &mut publish, if publish_deadline.is_some() => publish_deadline = None,
             event = datagrams.recv() => match event {
@@ -470,6 +481,7 @@ impl<S: UdpIo> ConnTask<S> {
 
     /// Moves every pending output: app events, datagrams and endpoint events.
     fn drive(&mut self) {
+        self.update_credit(0);
         if self
             .conn
             .poll_timeout()
@@ -767,12 +779,25 @@ impl<S: UdpIo> ConnTask<S> {
                     self.serve_openers();
                 }
             }
-            ConnCmd::Read { id, max, reply } => {
+            ConnCmd::Read {
+                id,
+                max,
+                hold,
+                reply,
+            } => {
+                // Before the read, so the bytes it takes pay the hold first.
+                self.update_credit(hold);
                 self.reads.insert(id, (reply, max));
                 self.serve_reader(id);
             }
-            ConnCmd::Stop { id, code } => self.stop(id, code),
-            ConnCmd::DropRecv { id } => self.stop(id, VarInt::from_u32(0)),
+            ConnCmd::Stop { id, code, hold } => {
+                self.update_credit(hold);
+                self.stop(id, code);
+            }
+            ConnCmd::DropRecv { id, hold } => {
+                self.update_credit(hold);
+                self.stop(id, VarInt::from_u32(0));
+            }
             ConnCmd::Close { code, reason } => self.close(code, reason),
             ConnCmd::Stats { reply } => {
                 let _ = reply.send(self.stats());
@@ -786,9 +811,8 @@ impl<S: UdpIo> ConnTask<S> {
 
     fn set_limits(&mut self, limits: ConnLimits) {
         if let Some(bytes) = limits.receive_window {
-            self.conn
-                .set_receive_window(VarInt::from_u64(bytes).unwrap_or(VarInt::MAX));
             self.limits.receive_window = bytes;
+            self.apply_receive_window();
         }
         if let Some(bytes) = limits.send_window {
             self.conn.set_send_window(bytes);
@@ -799,6 +823,37 @@ impl<S: UdpIo> ConnTask<S> {
                 .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(streams));
             self.limits.max_bidi_streams = u64::from(streams);
         }
+    }
+
+    /// Takes a reader's new `hold` and every release since the last update
+    /// into the receive window (API-10).
+    ///
+    /// quinn-proto counts a shrink as debt that later reads pay before they
+    /// grant the peer more credit, so the bytes the reader takes next return
+    /// no credit until the hold drops. A grow grants the released credit at
+    /// once.
+    fn update_credit(&mut self, hold: u64) {
+        let released = self.shared.take_released_credit();
+        if hold == 0 && released == 0 {
+            return;
+        }
+        self.credit_held = self.credit_held.saturating_add(hold);
+        self.credit_released = self.credit_released.saturating_add(released);
+        self.apply_receive_window();
+    }
+
+    /// The credit that live holds keep from the peer.
+    fn outstanding_credit(&self) -> u64 {
+        self.credit_held.saturating_sub(self.credit_released)
+    }
+
+    fn apply_receive_window(&mut self) {
+        let window = self
+            .limits
+            .receive_window
+            .saturating_sub(self.outstanding_credit());
+        self.conn
+            .set_receive_window(VarInt::from_u64(window).unwrap_or(VarInt::MAX));
     }
 
     fn stop(&mut self, id: StreamId, code: VarInt) {
@@ -989,7 +1044,8 @@ impl<S: UdpIo> ConnTask<S> {
                 }
             }
         }
-        // Reading frees receive window; the next drive() sends the credit.
+        // Reading pays any held credit first, then frees receive window; the
+        // next drive() sends the credit.
         let _ = chunks.finalize();
         if end.is_some() {
             // Read to the end or reset: quinn-proto buffers nothing more.
@@ -1172,19 +1228,23 @@ mod tests {
     /// A task for a client connection that hasn't sent anything yet, and the
     /// client endpoint that routes its datagrams.
     fn client_task() -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
+        client_task_with(quinn_proto::TransportConfig::default())
+    }
+
+    /// [`client_task`] with `transport` on the client connection.
+    fn client_task_with(
+        transport: quinn_proto::TransportConfig,
+    ) -> (quinn_proto::Endpoint, ConnTask<TokioUdpIo>) {
         let key = NodeSecretKey::from_bytes(&[1; 32]);
         let crypto = tls::TlsConfig::new(&key)
             .client_config(key.public(), &[b"test"])
             .unwrap();
         let mut endpoint = quinn_proto::Endpoint::new(Arc::default(), None, true, None);
         let admitted = "127.0.0.1:12345".parse().unwrap();
+        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(transport));
         let (handle, conn) = endpoint
-            .connect(
-                now(),
-                quinn_proto::ClientConfig::new(Arc::new(crypto)),
-                admitted,
-                tls::UNSENT_SERVER_NAME,
-            )
+            .connect(now(), config, admitted, tls::UNSENT_SERVER_NAME)
             .unwrap();
         let shared = ConnShared::new(admitted, Arc::new(AtomicUsize::new(0)));
         let to_endpoint = mpsc::unbounded_channel().0;
@@ -1215,6 +1275,8 @@ mod tests {
             drained_sent: false,
             path_ip: canonical_ip(admitted.ip()),
             limits,
+            credit_held: 0,
+            credit_released: 0,
             load_published: None,
             load_stale: false,
             last_send_warning: None,
@@ -1244,11 +1306,17 @@ mod tests {
 
     /// A server endpoint that accepts the test client.
     fn server_endpoint() -> quinn_proto::Endpoint {
+        server_endpoint_with(quinn_proto::TransportConfig::default())
+    }
+
+    /// [`server_endpoint`] with `transport` on accepted connections.
+    fn server_endpoint_with(transport: quinn_proto::TransportConfig) -> quinn_proto::Endpoint {
         let key = NodeSecretKey::from_bytes(&[1; 32]);
         let crypto = tls::TlsConfig::new(&key)
             .server_config(vec![b"test".to_vec()])
             .unwrap();
-        let config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+        let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(Arc::new(transport));
         quinn_proto::Endpoint::new(Arc::default(), Some(Arc::new(config)), true, None)
     }
 
@@ -1308,6 +1376,236 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// The connection and stream receive windows of a [`CreditPair`] client.
+    const WINDOW: u64 = 64 * 1024;
+
+    /// A connected client task with [`WINDOW`] as both receive windows, and a
+    /// server peer that sends on one bidirectional stream as fast as the
+    /// client's credit allows.
+    struct CreditPair {
+        client: quinn_proto::Endpoint,
+        task: ConnTask<TokioUdpIo>,
+        server: quinn_proto::Endpoint,
+        accepted: Option<(ConnectionHandle, quinn_proto::Connection)>,
+        stream: StreamId,
+        /// Bytes the peer's send stream took, at least what reached the client.
+        sent: u64,
+    }
+
+    impl CreditPair {
+        fn connected() -> Self {
+            let mut client_transport = quinn_proto::TransportConfig::default();
+            client_transport
+                .receive_window(VarInt::from_u64(WINDOW).unwrap())
+                .stream_receive_window(VarInt::from_u64(WINDOW).unwrap());
+            // A congestion window far above WINDOW, so flow control alone
+            // limits the peer and every pump delivers what it sent.
+            let mut server_transport = quinn_proto::TransportConfig::default();
+            let mut cubic = quinn_proto::congestion::CubicConfig::default();
+            cubic.initial_window(64 * WINDOW);
+            server_transport.congestion_controller_factory(Arc::new(cubic));
+            let (client, mut task) = client_task_with(client_transport);
+            task.limits.receive_window = WINDOW;
+            let mut pair = Self {
+                client,
+                task,
+                server: server_endpoint_with(server_transport),
+                accepted: None,
+                stream: StreamId::new(quinn_proto::Side::Server, Dir::Bi, 0),
+                sent: 0,
+            };
+            pair.pump();
+            assert!(!pair.task.conn.is_handshaking());
+            let opened = pair.peer().streams().open(Dir::Bi).unwrap();
+            assert_eq!(opened, pair.stream);
+            pair
+        }
+
+        fn peer(&mut self) -> &mut quinn_proto::Connection {
+            &mut self.accepted.as_mut().unwrap().1
+        }
+
+        fn pump(&mut self) {
+            pump(
+                &mut self.client,
+                &mut self.task,
+                &mut self.server,
+                &mut self.accepted,
+            );
+        }
+
+        /// Writes until the peer's flow control blocks, delivers the bytes and
+        /// returns how many the peer took.
+        fn fill(&mut self) -> u64 {
+            let stream = self.stream;
+            let mut took = 0;
+            while let Ok(written) = self.peer().send_stream(stream).write(&[7; 4096]) {
+                // usize fits in u64 on supported targets.
+                took += written as u64;
+            }
+            self.sent += took;
+            self.pump();
+            took
+        }
+
+        /// Reads up to `max` bytes straight from quinn-proto, bypassing the
+        /// task, and delivers the credit the read frees.
+        fn read_direct(&mut self, max: u64) -> u64 {
+            let mut stream = self.task.conn.recv_stream(self.stream);
+            let mut chunks = stream.read(true).unwrap();
+            let mut read = 0;
+            // usize holds WINDOW on supported targets.
+            while let Ok(Some(chunk)) = chunks.next((max - read) as usize) {
+                read += chunk.bytes.len() as u64;
+                if read == max {
+                    break;
+                }
+            }
+            let _ = chunks.finalize();
+            self.pump();
+            read
+        }
+    }
+
+    /// API-10 relies on quinn-proto 0.11 counting a shrink below granted
+    /// credit as debt that reads repay before they grant the peer more, and
+    /// granting a grow at once.
+    #[tokio::test]
+    async fn a_receive_window_shrink_is_debt_that_reads_repay() {
+        let mut pair = CreditPair::connected();
+        assert_eq!(pair.fill(), WINDOW);
+        let _ = pair.task.conn.streams().accept(Dir::Bi).unwrap();
+
+        // Hold a quarter: reading it repays the debt and grants nothing.
+        let quarter = WINDOW / 4;
+        pair.task
+            .conn
+            .set_receive_window(VarInt::from_u64(WINDOW - quarter).unwrap());
+        assert_eq!(pair.read_direct(quarter), quarter);
+        assert_eq!(pair.fill(), 0);
+
+        // Releasing it grants the quarter back without a read.
+        pair.task
+            .conn
+            .set_receive_window(VarInt::from_u64(WINDOW).unwrap());
+        pair.pump();
+        assert_eq!(pair.fill(), quarter);
+
+        // Without a hold, a read grants its bytes.
+        assert_eq!(pair.read_direct(quarter), quarter);
+        assert_eq!(pair.fill(), quarter);
+    }
+
+    /// API-10: with a greedy peer and random holds, reads and releases, the
+    /// bytes the peer sent minus the bytes whose credit came back never
+    /// exceed the receive window, and every release returns its credit.
+    #[tokio::test]
+    async fn held_credit_bounds_a_greedy_peer() {
+        for seed in 1..=8u64 {
+            let mut pair = CreditPair::connected();
+            pair.fill();
+            let (reply, accepted) = oneshot::channel();
+            pair.task.handle_cmd(ConnCmd::AcceptBi { reply });
+            assert_eq!(accepted.await.unwrap().unwrap(), pair.stream);
+
+            let mut rng = seed;
+            let mut next = |bound: u64| {
+                // xorshift64: a fixed sequence per seed.
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % bound
+            };
+            let mut holds = Vec::new();
+            let mut released = 0;
+            // The unread bytes of the frame the latest hold covers.
+            let mut frame_left = 0;
+            let mut read = None;
+            for _ in 0..400 {
+                if read.is_none() && next(3) != 0 {
+                    let (max, hold) = match (frame_left, next(2)) {
+                        (0, 0) => (next(WINDOW / 4) + 1, 0),
+                        (0, _) => {
+                            let frame = next(WINDOW / 4) + 1;
+                            holds.push(frame);
+                            frame_left = frame;
+                            (frame, frame)
+                        }
+                        (left, _) => (left, 0),
+                    };
+                    let (reply, result) = oneshot::channel();
+                    pair.task.handle_cmd(ConnCmd::Read {
+                        id: pair.stream,
+                        // usize holds WINDOW on supported targets.
+                        max: max as usize,
+                        hold,
+                        reply,
+                    });
+                    read = Some((result, frame_left > 0));
+                } else if !holds.is_empty() {
+                    // Any hold, the unfinished frame's included.
+                    // usize holds the hold count on supported targets.
+                    let hold = holds.swap_remove(next(holds.len() as u64) as usize);
+                    pair.task.shared.release_credit(hold);
+                    pair.task.update_credit(0);
+                    released += hold;
+                }
+                pair.pump();
+                pair.task.process_events();
+                if let Some((result, in_frame)) = read.as_mut() {
+                    if let Ok(reply) = result.try_recv() {
+                        let chunks = reply.unwrap().unwrap();
+                        // usize fits in u64 on supported targets.
+                        let n: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                        if *in_frame {
+                            frame_left -= n;
+                        } else {
+                            released += n;
+                        }
+                        read = None;
+                    }
+                }
+                pair.fill();
+                assert!(
+                    pair.sent.saturating_sub(released) <= WINDOW,
+                    "seed {seed}: sent {} released {released}",
+                    pair.sent
+                );
+            }
+
+            // Every release returns its credit: with no hold left, reads
+            // alone keep the peer sending.
+            for hold in holds.drain(..) {
+                pair.task.shared.release_credit(hold);
+            }
+            pair.task.update_credit(0);
+            assert_eq!(pair.task.outstanding_credit(), 0);
+            let before = pair.sent;
+            pair.task.reads.clear();
+            pair.read_direct(WINDOW);
+            pair.fill();
+            assert!(pair.sent > before, "seed {seed}");
+        }
+    }
+
+    /// API-10: read-ahead can deliver a frame before its hold reaches the
+    /// task, so a release can arrive first. The window still ends where it
+    /// started, instead of losing the hold for good.
+    #[tokio::test]
+    async fn a_release_before_its_hold_leaves_no_credit_held() {
+        let mut task = task();
+        task.update_credit(100);
+        task.shared.release_credit(40);
+        task.update_credit(0);
+        assert_eq!(task.outstanding_credit(), 60);
+        // The second hold's release overtakes it.
+        task.shared.release_credit(60 + 25);
+        task.update_credit(0);
+        assert_eq!(task.outstanding_credit(), 0);
+        task.update_credit(25);
+        assert_eq!(task.outstanding_credit(), 0);
     }
 
     /// ADM-13: closing stops every receive half that may buffer data, the

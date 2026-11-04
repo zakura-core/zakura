@@ -1,6 +1,7 @@
 //! Semantic evidence from transport-free machine drivers.
 
 use serde::{Deserialize, Serialize};
+use zakura_network::zakura::{BookStep, DiscoverySessionStep, DriverFailure};
 
 use crate::observe::{BlockSyncReactorState, WorkOwner, WorkScope};
 
@@ -29,25 +30,85 @@ pub enum MachineStep {
     /// [`crate::harness::fixtures`] tests the simulator. No production machine
     /// records it.
     Fixture(FixtureStep),
-    /// Header reactor scheduling and locator policy, with its independent model.
-    HeaderReactor(HeaderReactorStep),
     /// Logical block-work ownership and its independent model.
     Work(WorkStep),
     /// Runtime block-work funding and retained request/receipt owners.
     WorkFunding(WorkFundingStep),
+    /// Decoded allocations retained by block, header, and transaction owners.
+    DecodedRetention(DecodedRetentionStep),
+    /// Header reactor scheduling and locator policy, with its independent model.
+    HeaderReactor(HeaderReactorStep),
     /// Reactor query and view policy and its independent model.
     Reactor(ReactorStep),
+    /// The real discovery book, its independent model, and its signed samples.
+    DiscoveryBook(BookStep),
+    /// Discovery's real session and hint owner and its independent model.
+    DiscoveryState(DiscoverySessionStep),
+    /// Header publisher credit and terminal policy, with its independent model.
+    HeaderPublisher(HeaderPublisherStep),
+}
+
+/// Decoder-v1 evidence for the decoded-block runtime owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecodedRetentionStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// Whether this boundary follows explicit handle drain.
+    pub drain: bool,
+    /// Independent allocation reads and actual pool counters.
+    pub actual: Option<zakura_node_services::block_memory::model::RetentionView>,
+    /// The independent model's retained handle graph and expected pool charges.
+    pub expected: zakura_node_services::block_memory::model::RetentionView,
+    /// The model's disagreement. An unavailable capture or a driver panic is
+    /// marked as no property detection.
+    pub failure: Option<MachineFailure>,
+}
+
+impl From<zakura_node_services::block_memory::model::RetentionStep> for DecodedRetentionStep {
+    /// A capture error is driver evidence. A captured view that differs from the
+    /// model is the property's failure.
+    fn from(value: zakura_node_services::block_memory::model::RetentionStep) -> Self {
+        let failure = match (&value.capture_error, &value.actual) {
+            (Some(message), _) => Some(MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message: message.clone(),
+            }),
+            (None, None) => Some(MachineFailure {
+                property_failure: false,
+                phase: FailurePhase::Invariant,
+                message: "decoded owner allocation capture is missing".into(),
+            }),
+            (None, Some(actual)) => (actual != &value.expected).then(|| MachineFailure {
+                property_failure: true,
+                phase: FailurePhase::Invariant,
+                message: format!("expected {:?}, actual {actual:?}", value.expected),
+            }),
+        };
+        Self {
+            input: value.input,
+            drain: value.drain,
+            actual: value.actual,
+            expected: value.expected,
+            failure,
+        }
+    }
 }
 
 impl MachineStep {
     /// The failure that stopped the run at this operation, if any.
     pub fn failure(&self) -> Option<MachineFailure> {
         match self {
+            Self::DiscoveryBook(step) => step.failure.clone().map(Into::into),
+            Self::DiscoveryState(step) => step.failure.clone().map(Into::into),
             Self::Fixture(step) => step.failure.clone(),
-            Self::HeaderReactor(step) => step.failure.clone(),
             Self::Work(step) => step.failure.clone(),
             Self::WorkFunding(step) => step.failure.clone(),
             Self::Reactor(step) => step.failure.clone(),
+            Self::DecodedRetention(step) => step.failure.clone(),
+            Self::HeaderReactor(step) => step.failure.clone(),
+            Self::HeaderPublisher(step) => step.failure.clone(),
         }
     }
 }
@@ -74,12 +135,88 @@ pub struct MachineFailure {
     pub message: String,
 }
 
+impl From<DriverFailure> for MachineFailure {
+    /// Discovery's drivers catch an operation and its model comparison together,
+    /// so each failure reports one phase.
+    fn from(failure: DriverFailure) -> Self {
+        Self {
+            property_failure: failure.property_failure,
+            phase: FailurePhase::Invariant,
+            message: failure.message,
+        }
+    }
+}
+
 /// One operation of a fixture machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureStep {
     /// Original causal bytes.
     pub input: Vec<u8>,
+    /// First failure, if this operation stopped the run.
+    pub failure: Option<MachineFailure>,
+}
+
+/// Body-work authority, including every generation that controls eligibility.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodyAuthority {
+    /// Selected header branch and generation.
+    pub header: WorkScope,
+    /// Verified-body generation.
+    pub verified_generation: u64,
+    /// Selected-lineage epoch.
+    pub body_work_epoch: u64,
+}
+
+/// One retained item, read from the owner or independently derived by its model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkItem {
+    /// Block height.
+    pub height: u32,
+    /// Whether the item occupies the in-flight map.
+    pub in_flight: bool,
+    /// Authority that selected the item.
+    pub scope: BodyAuthority,
+    /// Exact request owner, including its authority.
+    pub owner: Option<WorkOwner>,
+    /// Whether publication remains pending.
+    pub provisional: bool,
+    /// Estimated request bytes.
+    pub estimate: u64,
+    /// Retained charge.
+    pub charge: u64,
+}
+
+/// A queue view at a completed or interrupted transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkView {
+    /// Download floor.
+    pub floor: u32,
+    /// Current selection authority.
+    pub authority: Option<BodyAuthority>,
+    /// Entries sorted by height and location; duplicate heights remain visible.
+    pub items: Vec<WorkItem>,
+    /// Maintained total, or independently summed model charges.
+    pub reserved: u64,
+    /// Charges scanned from retained entries.
+    pub scanned: u64,
+    /// Charged bytes and item count above the floor.
+    pub above_floor: (u64, u64),
+}
+
+/// One decoder-v1 block ownership operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkStep {
+    /// Original causal bytes, including a short final operation.
+    pub input: Vec<u8>,
+    /// State read from the production pure owner.
+    pub actual: WorkView,
+    /// State derived independently by the model.
+    pub expected: WorkView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -200,139 +337,56 @@ pub struct HeaderReactorStep {
     pub failure: Option<MachineFailure>,
 }
 
-impl From<zakura_network::zakura::HeaderMachineFailure> for MachineFailure {
-    fn from(value: zakura_network::zakura::HeaderMachineFailure) -> Self {
-        use zakura_network::zakura::HeaderMachinePhase as Phase;
-        Self {
-            property_failure: value.property_failure,
-            phase: match value.phase {
-                Phase::Transition => FailurePhase::Transition,
-                Phase::Invariant => FailurePhase::Invariant,
-            },
-            message: value.message,
-        }
-    }
-}
-
-impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
-    fn from(value: zakura_network::zakura::HeaderReactorView) -> Self {
-        Self {
-            sessions: value
-                .sessions
-                .into_iter()
-                .map(|session| ReactorSessionView {
-                    peer: session.peer,
-                    status: session.status.map(|hash| hash.to_string()),
-                    spent: session.spent,
-                    unproductive_requests: session.unproductive_requests,
-                })
-                .collect(),
-            reads: value
-                .reads
-                .into_iter()
-                .map(|read| ReactorReadView {
-                    peer: read.peer,
-                    call: CallRef {
-                        number: read.call.0,
-                        kind: read.call.1.into(),
-                    },
-                })
-                .collect(),
-            calls: value
-                .calls
-                .into_iter()
-                .map(|(number, kind)| CallRef {
-                    number,
-                    kind: kind.into(),
-                })
-                .collect(),
-            revision: value.revision,
-            suppliers: value.suppliers,
-            paused: value.paused,
-            repair: value.repair,
-            stall: value.stall.map(|stall| ReactorStallView {
-                generation: stall.generation,
-                since_millis: stall.since_millis,
-                last_trace_millis: stall.last_trace_millis,
-                reported: stall.reported,
-            }),
-            cached_deferred: value.cached_deferred,
-            next_deadline_millis: value.next_deadline_millis,
-        }
-    }
-}
-
-impl From<zakura_network::zakura::HeaderReactorStep> for HeaderReactorStep {
-    fn from(value: zakura_network::zakura::HeaderReactorStep) -> Self {
-        Self {
-            input: value.input,
-            actual: value.actual.into(),
-            expected: value.expected.into(),
-            failure: value.failure.map(Into::into),
-        }
-    }
-}
-
-/// Body-work authority, including every generation that controls eligibility.
+/// One subscription in a publisher state view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BodyAuthority {
-    /// Selected header branch and generation.
-    pub header: WorkScope,
-    /// Verified-body generation.
-    pub verified_generation: u64,
-    /// Selected-lineage epoch.
-    pub body_work_epoch: u64,
+pub struct PublisherSubscriptionView {
+    /// The subscription's ID.
+    pub id: u64,
+    /// Credit granted so far: headers and bytes.
+    pub granted: (u64, u64),
+    /// Credit consumed so far: headers and bytes.
+    pub consumed: (u64, u64),
+    /// Sent pages the subscriber has not acknowledged.
+    pub unacknowledged: usize,
+    /// The height of the cursor the next page follows.
+    pub last_height: u32,
+    /// The hash of the cursor the next page follows, in hex.
+    pub last_hash: String,
+    /// Whether the subscriber sent `Close`.
+    pub closing: bool,
 }
 
-/// One retained item, read from the owner or independently derived by its model.
+/// A publisher state view, read from the owner or derived by its model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkItem {
-    /// Block height.
-    pub height: u32,
-    /// Whether the item occupies the in-flight map.
-    pub in_flight: bool,
-    /// Authority that selected the item.
-    pub scope: BodyAuthority,
-    /// Exact request owner, including its authority.
-    pub owner: Option<WorkOwner>,
-    /// Whether publication remains pending.
-    pub provisional: bool,
-    /// Estimated request bytes.
-    pub estimate: u64,
-    /// Retained charge.
-    pub charge: u64,
+pub struct HeaderPublisherView {
+    /// Live and closing subscriptions, by ID.
+    pub subscriptions: Vec<PublisherSubscriptionView>,
+    /// Tombstones held.
+    pub tombstones: usize,
+    /// The subscription of the job in progress.
+    pub job: Option<u64>,
+    /// Subscriptions whose terminal outcome waits to be written, in order.
+    pub terminals: Vec<u64>,
+    /// Whether a terminal outcome is being written.
+    pub writing: bool,
+    /// Subscription slots held.
+    pub slots: usize,
+    /// Why the publisher stopped, if it did.
+    pub exit: Option<String>,
 }
 
-/// A queue view at a completed or interrupted transition.
+/// One decoder-v2 header publisher operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkView {
-    /// Download floor.
-    pub floor: u32,
-    /// Current selection authority.
-    pub authority: Option<BodyAuthority>,
-    /// Entries sorted by height and location; duplicate heights remain visible.
-    pub items: Vec<WorkItem>,
-    /// Maintained total, or independently summed model charges.
-    pub reserved: u64,
-    /// Charges scanned from retained entries.
-    pub scanned: u64,
-    /// Charged bytes and item count above the floor.
-    pub above_floor: (u64, u64),
-}
-
-/// One decoder-v1 block ownership operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkStep {
+pub struct HeaderPublisherStep {
     /// Original causal bytes, including a short final operation.
     pub input: Vec<u8>,
-    /// State read from the production pure owner.
-    pub actual: WorkView,
+    /// State read from the production owner.
+    pub actual: HeaderPublisherView,
     /// State derived independently by the model.
-    pub expected: WorkView,
+    pub expected: HeaderPublisherView,
     /// First failure, if this operation stopped the run.
     pub failure: Option<MachineFailure>,
 }
@@ -531,6 +585,20 @@ impl From<zakura_network::zakura::WorkOwnershipFailure> for MachineFailure {
             phase: match value.phase {
                 WorkOwnershipPhase::Transition => FailurePhase::Transition,
                 WorkOwnershipPhase::Invariant => FailurePhase::Invariant,
+            },
+            message: value.message,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderMachineFailure> for MachineFailure {
+    fn from(value: zakura_network::zakura::HeaderMachineFailure) -> Self {
+        use zakura_network::zakura::HeaderMachinePhase as Phase;
+        Self {
+            property_failure: value.property_failure,
+            phase: match value.phase {
+                Phase::Transition => FailurePhase::Transition,
+                Phase::Invariant => FailurePhase::Invariant,
             },
             message: value.message,
         }
@@ -779,11 +847,70 @@ impl From<zakura_network::zakura::ReactorSnapshot> for BlockSyncReactorState {
     }
 }
 
+impl From<zakura_network::zakura::HeaderReactorView> for HeaderReactorView {
+    fn from(value: zakura_network::zakura::HeaderReactorView) -> Self {
+        Self {
+            sessions: value
+                .sessions
+                .into_iter()
+                .map(|session| ReactorSessionView {
+                    peer: session.peer,
+                    status: session.status.map(|hash| hash.to_string()),
+                    spent: session.spent,
+                    unproductive_requests: session.unproductive_requests,
+                })
+                .collect(),
+            reads: value
+                .reads
+                .into_iter()
+                .map(|read| ReactorReadView {
+                    peer: read.peer,
+                    call: CallRef {
+                        number: read.call.0,
+                        kind: read.call.1.into(),
+                    },
+                })
+                .collect(),
+            calls: value
+                .calls
+                .into_iter()
+                .map(|(number, kind)| CallRef {
+                    number,
+                    kind: kind.into(),
+                })
+                .collect(),
+            revision: value.revision,
+            suppliers: value.suppliers,
+            paused: value.paused,
+            repair: value.repair,
+            stall: value.stall.map(|stall| ReactorStallView {
+                generation: stall.generation,
+                since_millis: stall.since_millis,
+                last_trace_millis: stall.last_trace_millis,
+                reported: stall.reported,
+            }),
+            cached_deferred: value.cached_deferred,
+            next_deadline_millis: value.next_deadline_millis,
+        }
+    }
+}
+
 impl From<zakura_network::zakura::ReactorMachineView> for ReactorView {
     fn from(value: zakura_network::zakura::ReactorMachineView) -> Self {
         Self {
             state: value.state.into(),
             retry_after_ms: value.retry_after_ms,
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderReactorStep> for HeaderReactorStep {
+    fn from(value: zakura_network::zakura::HeaderReactorStep) -> Self {
+        Self {
+            input: value.input,
+            actual: value.actual.into(),
+            expected: value.expected.into(),
+            failure: value.failure.map(Into::into),
         }
     }
 }
@@ -797,5 +924,81 @@ impl From<zakura_network::zakura::BlockReactorStep> for ReactorStep {
             expected: value.expected.into(),
             failure: value.failure.map(Into::into),
         }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderPublisherView> for HeaderPublisherView {
+    fn from(value: zakura_network::zakura::HeaderPublisherView) -> Self {
+        Self {
+            subscriptions: value
+                .subscriptions
+                .into_iter()
+                .map(|subscription| PublisherSubscriptionView {
+                    id: subscription.id,
+                    granted: subscription.granted,
+                    consumed: subscription.consumed,
+                    unacknowledged: subscription.unacknowledged,
+                    last_height: subscription.last_height,
+                    last_hash: subscription.last_hash.to_string(),
+                    closing: subscription.closing,
+                })
+                .collect(),
+            tombstones: value.tombstones,
+            job: value.job,
+            terminals: value.terminals,
+            writing: value.writing,
+            slots: value.slots,
+            exit: value.exit.map(str::to_owned),
+        }
+    }
+}
+
+impl From<zakura_network::zakura::HeaderPublisherStep> for HeaderPublisherStep {
+    fn from(value: zakura_network::zakura::HeaderPublisherStep) -> Self {
+        Self {
+            input: value.input,
+            actual: value.actual.into(),
+            expected: value.expected.into(),
+            failure: value.failure.map(Into::into),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_node_services::block_memory::model::{trace_retention_bytes, RetentionStep};
+
+    use super::*;
+
+    fn retention_step() -> RetentionStep {
+        trace_retention_bytes(&[0, 0, 0, 0]).remove(0)
+    }
+
+    #[test]
+    fn missing_allocation_capture_is_not_a_resource_violation() {
+        let mut step = retention_step();
+        step.actual = None;
+        let failure = MachineStep::DecodedRetention(step.into())
+            .failure()
+            .unwrap();
+        assert!(!failure.property_failure);
+        assert_eq!(
+            failure.message,
+            "decoded owner allocation capture is missing"
+        );
+    }
+
+    #[test]
+    fn a_retention_view_mismatch_is_the_property_failure() {
+        let mut step = retention_step();
+        assert_eq!(
+            MachineStep::DecodedRetention(step.clone().into()).failure(),
+            None
+        );
+        step.actual.as_mut().unwrap().pools[0].bytes += 1;
+        let failure = MachineStep::DecodedRetention(step.into())
+            .failure()
+            .unwrap();
+        assert!(failure.property_failure);
     }
 }

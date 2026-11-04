@@ -764,7 +764,7 @@ impl HeaderChainWriter {
                         "checkpoint full-state height does not extend the verified header frontier",
                     )
                 })?
-            || block.block.header.previous_block_hash != snapshot.frontiers.verified_best.hash
+            || block.block.header().previous_block_hash != snapshot.frontiers.verified_best.hash
         {
             return Err(HeaderChainStoreError::Incoherent(
                 "checkpoint full state does not extend the verified header frontier",
@@ -774,7 +774,7 @@ impl HeaderChainWriter {
         let path = vec![VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: Arc::new(*block.block.header()),
         }];
         let evidence = checkpoint_finality_evidence(snapshot.state_version, accepted);
         let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
@@ -1053,7 +1053,7 @@ fn verified_path(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: block.header.clone(),
         })
         .collect()
 }
@@ -1065,7 +1065,7 @@ fn verified_headers(state: &NonFinalizedState) -> Vec<VerifiedHeaderRef> {
         .map(|block| VerifiedHeaderRef {
             height: block.height,
             hash: block.hash,
-            header: block.block.header.clone(),
+            header: block.header.clone(),
         })
         .collect::<Vec<_>>();
     headers.sort_unstable_by_key(|header| (header.height, header.hash.0));
@@ -1097,7 +1097,7 @@ fn verified_side_paths(
                 .map(|block| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: block.block.header.clone(),
+                    header: block.header.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1179,7 +1179,7 @@ fn verified_path_through(
                 .map(|(_, block)| VerifiedHeaderRef {
                     height: block.height,
                     hash: block.hash,
-                    header: block.block.header.clone(),
+                    header: block.header.clone(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -1644,7 +1644,7 @@ fn validate_and_commit_non_finalized_with_metrics(
         initial_checks_start.elapsed(),
     );
     let result = initial_checks.and_then(|()| {
-        let parent_hash = prepared.block.header.previous_block_hash;
+        let parent_hash = prepared.block.header().previous_block_hash;
 
         if finalized_state.finalized_tip_hash() == parent_hash {
             non_finalized_state.commit_new_chain_with_metrics(
@@ -1733,7 +1733,7 @@ fn update_latest_chain_channels(
 
 fn update_channels_after_operator_change(
     non_finalized_state: &NonFinalizedState,
-    finalized_state: &FinalizedState,
+    finalized_tip: Option<ChainTipBlock>,
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
     backup_dir_path: Option<&Path>,
@@ -1743,13 +1743,7 @@ fn update_channels_after_operator_change(
             non_finalized_state.write_to_backup(backup_dir_path);
         }
         non_finalized_state.publish(non_finalized_state_sender);
-        chain_tip_sender.clear_best_non_finalized_tip(
-            finalized_state
-                .db
-                .tip_block()
-                .map(CheckpointVerifiedBlock::from)
-                .map(ChainTipBlock::from),
-        );
+        chain_tip_sender.clear_best_non_finalized_tip(finalized_tip);
     } else {
         update_latest_chain_channels(
             non_finalized_state,
@@ -3094,6 +3088,14 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
+                        }
+                    };
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
                         staged.invalidate_block(hash).and_then(|result| {
@@ -3109,7 +3111,7 @@ impl WriteBlockWorkerTask {
                     if result.is_ok() {
                         update_channels_after_operator_change(
                             non_finalized_state,
-                            finalized_state,
+                            finalized_tip,
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
@@ -3157,7 +3159,7 @@ impl WriteBlockWorkerTask {
                             }
                             update_channels_after_operator_change(
                                 non_finalized_state,
-                                finalized_state,
+                                None,
                                 chain_tip_sender,
                                 non_finalized_state_sender,
                                 backup_dir_path.as_deref(),
@@ -3173,6 +3175,14 @@ impl WriteBlockWorkerTask {
                     write_slot: _write_slot,
                 } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
+                    // Acquire the fallback before committing any operator change.
+                    let finalized_tip = match super::finalized_chain_tip(&finalized_state.db) {
+                        Ok(finalized_tip) => finalized_tip,
+                        Err(error) => {
+                            let _ = rsp_tx.send(Err(error.into()));
+                            continue;
+                        }
+                    };
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
                         staged
@@ -3201,7 +3211,7 @@ impl WriteBlockWorkerTask {
                             .evicted_blocks(non_finalized_state);
                         update_channels_after_operator_change(
                             non_finalized_state,
-                            finalized_state,
+                            finalized_tip,
                             chain_tip_sender,
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
@@ -3235,7 +3245,7 @@ impl WriteBlockWorkerTask {
                     .record(writer_queue_duration);
             }
             let child_hash = queued_child.hash;
-            let parent_hash = queued_child.block.header.previous_block_hash;
+            let parent_hash = queued_child.block.header().previous_block_hash;
             let child_height = queued_child.height;
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
 

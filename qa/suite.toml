@@ -191,11 +191,31 @@ covers = [
 smoke-secs = 60
 timeout-secs = 1800
 
-# The header-chain targets, with header-fuzz.yml's limits.
+# Each package's scheduled campaign. `scripts/check-fuzz-campaign.py --matrix` joins
+# these defaults with each target's `campaign-*` overrides and its `args`, so a
+# target's limits have one home. A target without `-max_len` lets libFuzzer choose.
+[campaign.header-chain]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
+[campaign.p2p]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
+[campaign.sim]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 4096
+
+# The header-chain targets. Their `args` also set their campaign's limits.
 [[target]]
 package = "header-chain"
 name = "fork_transitions"
 smoke-secs = 60
+campaign-seconds = 1800
+campaign-weekly-seconds = 7200
 args = ["-rss_limit_mb=4096", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
@@ -214,8 +234,8 @@ args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
 # RocksDB keeps process-global allocations after each temporary database
-# closes, so the exit-time leak check is off too, as header-fuzz.yml and the
-# package's README say.
+# closes, so the exit-time leak check is off too, as the package's README
+# says.
 [[target]]
 package = "header-chain"
 name = "recovery_rows"
@@ -223,6 +243,22 @@ smoke-secs = 60
 args = ["-rss_limit_mb=4096", "-max_len=256", "-detect_leaks=0"]
 env = ["ASAN_OPTIONS=detect_leaks=0"]
 timeout-secs = 2700
+
+# The P2P machine targets, with qa/fuzz/p2p's input limit. Each replay reads
+# at most 512 bytes.
+[[target]]
+package = "p2p"
+name = "service_session"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "cadence"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512"]
+timeout-secs = 1800
 
 [[excluded-target]]
 package = "rpc"
@@ -479,15 +515,7 @@ owner = "G2b/E2b"
 plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
 
 # Preserved machine drivers run without the simulator. The semantic work
-# and header reactor targets use the shared artifact pipeline without starting
-# Sim or QUIC.
-[[target]]
-package = "sim"
-name = "header_reactor_policy"
-smoke-secs = 60
-args = ["-max_len=512"]
-timeout-secs = 1800
-
+# target uses the shared artifact pipeline without starting Sim or QUIC.
 [[target]]
 package = "p2p"
 name = "block_peer_registry"
@@ -504,6 +532,13 @@ timeout-secs = 1800
 
 [[target]]
 package = "p2p"
+name = "discovery_session"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
 name = "block_query"
 smoke-secs = 60
 args = ["-max_len=512"]
@@ -511,7 +546,42 @@ timeout-secs = 1800
 
 [[target]]
 package = "p2p"
+name = "discovery_redial"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_fill"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_query"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
 name = "block_reactor"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_request_lifecycle"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_candidate"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800
@@ -525,6 +595,13 @@ timeout-secs = 1800
 
 [[target]]
 package = "sim"
+name = "discovery_record_book"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
 name = "block_work_funding"
 smoke-secs = 60
 args = ["-max_len=512"]
@@ -532,7 +609,62 @@ timeout-secs = 1800
 
 [[target]]
 package = "sim"
+name = "discovery_session_installation"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_decoded_retention"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_sequencer_evidence"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_sequencer_order"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_sequencer_reset"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "header_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
 name = "block_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "discovery_verification_capacity"
+smoke-secs = 60
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "header_publisher_policy"
 smoke-secs = 60
 args = ["-max_len=512"]
 timeout-secs = 1800

@@ -91,7 +91,9 @@ pub use events::{
 #[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
 pub use peer_routine::routine_accepts_body;
 pub use reactor::spawn_block_sync_reactor;
+pub(crate) use regulated::session::serving_limits as getblocks_serving_limits;
 pub use request::BlockSizeEstimate;
+pub(crate) use service::BLOCK_SYNC_SERVICE_STREAMS;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
 pub use service::{
@@ -142,6 +144,13 @@ fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
         verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
         body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
     }
+}
+
+#[cfg(test)]
+fn test_decoded_pool() -> zakura_node_services::block_memory::DecodedBlockPool {
+    ZakuraBlockSyncConfig::default()
+        .decoded_block_pool(10_000)
+        .expect("fixture decoded allowance fits")
 }
 
 #[cfg(test)]
@@ -209,7 +218,19 @@ pub use reactor::{
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_routine::{replay_block_fill_bytes, BlockFillReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use peer_routine::{replay_request_lifecycle_bytes, RequestLifecycleReplaySummary};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
 pub use peer_registry::{
     replay_peer_registry_bytes, replay_retry_authority_bytes, PeerRegistryReplaySummary,
     RetryAuthorityReplaySummary,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use sequencer_task::{
+    replay_sequencer_evidence_bytes, replay_sequencer_order_bytes, replay_sequencer_reset_bytes,
+    SequencerReplaySummary,
 };

@@ -843,7 +843,8 @@ fn every_network_selects_the_layout_for_its_header_size() {
 /// The receive share is the peer's `Status` cadence (602 × 122 bytes), one
 /// subscription's byte credit plus its largest page, and the peer's
 /// unreleased updates: `credit.objects + credit.bytes / smallest page` grants
-/// and one `Close` at 107 bytes each, and one `Open` at 523 bytes.
+/// and one `Close` at 107 bytes each, and one `Open` at 523 bytes. The output
+/// share is one subscription's byte credit plus its largest page.
 #[test]
 fn every_budget_holds_its_terms() {
     let status = 602 * 122;
@@ -852,12 +853,11 @@ fn every_budget_holds_its_terms() {
     assert_eq!(updates(1_573), 999_154);
     assert_eq!(updates(263), 3_841_395);
 
-    let output = 64 * 1024 * 1024;
     assert_eq!(
         CommonMessage::BUDGET,
         ReactorBudget {
             receive: status + credit + 2_096_713 + 999_154,
-            output,
+            output: credit + 2_096_713,
         }
     );
     assert_eq!(CommonMessage::BUDGET.receive, 11_557_919);
@@ -866,10 +866,14 @@ fn every_budget_holds_its_terms() {
         RegtestMessage::BUDGET,
         ReactorBudget {
             receive: status + credit + 1_348_082 + 3_841_395,
-            output,
+            output: credit + 1_348_082,
         }
     );
     assert_eq!(RegtestMessage::BUDGET.receive, 13_651_529);
+    assert_eq!(
+        (CommonMessage::BUDGET.output, RegtestMessage::BUDGET.output),
+        (10_485_321, 9_736_690)
+    );
 
     /// Check `network`'s budget against the `HEADER_BYTES` family.
     fn check<const HEADER_BYTES: usize>(network: &Network) {

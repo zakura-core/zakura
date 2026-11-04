@@ -14,7 +14,8 @@ use zakura_sim::{
     domain::block_sync::{
         BodyHolder, Limits, Lookahead, OwnerInput, OwnerModel, RequestedHeight,
         BUDGET_LEDGERS_AGREE, ESTIMATE_CEILING, ESTIMATE_FLOOR, LOOKAHEAD_OVERSHOOT_BOUND,
-        RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND, TEARDOWN_RETURNS_BASELINE,
+        PAYLOAD_INVENTORY_AGREES, RESERVED_BYTE_BOUND, RETAINED_BYTE_BOUND,
+        TEARDOWN_RETURNS_BASELINE,
     },
     harness::{
         block_sync::{BlockScenario, HandoffPause, MirrorSpec, Ports, Storage},
@@ -72,6 +73,12 @@ fn the_paused_handoffs_input_holds_reserved_byte_bound() {
     holds(committed(PAUSED_HANDOFFS_INPUT), RESERVED_BYTE_BOUND);
 }
 
+/// The production node captures every runtime payload through receipt and teardown.
+#[test]
+fn the_handoff_input_holds_payload_inventory_agrees() {
+    holds(committed(HANDOFF_INPUT), PAYLOAD_INVENTORY_AGREES);
+}
+
 /// D2's `h > 0` witness (P5.1, P5.3): with routines paused in their
 /// handoffs, the byte budget passes `M + 2·B` and stays within
 /// `M + 2·B + h·B`. Three paused routines and a fourth's charge take it to
@@ -89,7 +96,11 @@ fn paused_handoffs_pass_m_plus_2b_within_the_handoff_allowance() {
     let limits = Limits::of(&witness.scenario.node_config(), 4, 2_000);
     let peak = reserved.peaks["reserved-estimate-bytes"];
     let handoffs = reserved.peaks["open-handoffs"];
-    assert!(peak > limits.reserved_bound(0), "{:?}", reserved.peaks);
+    assert!(
+        peak > limits.reserved_bound(0),
+        "handoff preemption must reach the extra handoff allowance: {:?}",
+        reserved.peaks
+    );
     assert!(
         peak <= limits.reserved_bound(handoffs),
         "{:?}",
@@ -370,6 +381,8 @@ fn every_worker_count_holds_the_resource_bounds() {
         for mirrors in [2, 4] {
             let scenario = BlockScenario {
                 workers: Some(workers),
+                // Receipt availability adds preemption points before quiescence.
+                steps: Some(64_000),
                 mirrors: BlockScenario::short_budget().mirrors[..mirrors].to_vec(),
                 ..BlockScenario::short_budget()
             };
@@ -710,6 +723,8 @@ fn a_snapshot_that_differs_from_the_holder_events_is_a_gap() {
         bytes: 3,
     };
     let snapshot = |holders: &[BodyHolder]| OwnerInput::Snapshot {
+        payloads: Vec::new(),
+        expected_payloads: Vec::new(),
         holders: holders.iter().map(|holder| (*holder, 5, 3)).collect(),
     };
     let mut owners = model();

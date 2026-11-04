@@ -32,7 +32,7 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: LazyLock<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block2))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });
@@ -53,7 +53,7 @@ static COMMIT_FINALIZED_BLOCK_TESTNET: LazyLock<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block2))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });

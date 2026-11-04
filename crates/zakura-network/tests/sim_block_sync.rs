@@ -180,6 +180,9 @@ fn startup(
         },
         (frontiers.header_best.height, frontiers.header_best.hash),
         views,
+        ZakuraBlockSyncConfig::default()
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         ZakuraBlockSyncConfig::default(),
     );
     assert!(startup.state_queries_enabled, "the constructor's default");
@@ -1171,7 +1174,8 @@ fn check_budget_chain(events: &[BlockEvent]) -> Result<(), String> {
     }
 }
 
-/// Every published request reaches `Written`, after `Started`.
+/// Every request is funded, then published, and reaches `Written` after
+/// `Started`.
 fn check_request_steps(events: &[BlockEvent]) -> Result<(), String> {
     let mut steps: Vec<(_, Vec<RequestStep>)> = Vec::new();
     for event in events {
@@ -1185,11 +1189,12 @@ fn check_request_steps(events: &[BlockEvent]) -> Result<(), String> {
     for (owner, list) in &steps {
         let position = |wanted| list.iter().position(|step| *step == wanted);
         match (
+            position(RequestStep::Funded),
             position(RequestStep::Published),
             position(RequestStep::Started),
             position(RequestStep::Written),
         ) {
-            (Some(0), Some(started), Some(written)) if started < written => {}
+            (Some(0), Some(1), Some(started), Some(written)) if started < written => {}
             _ => return Err(format!("{owner:?} took {list:?}")),
         }
     }
@@ -1276,7 +1281,10 @@ fn phase_after(step: RequestStep) -> Option<RequestWritePhase> {
         RequestStep::Started => Some(RequestWritePhase::Started),
         RequestStep::Written => Some(RequestWritePhase::Written),
         RequestStep::Expired => Some(RequestWritePhase::Skipped),
-        RequestStep::Dropped(_) | RequestStep::DeliveryFailed | RequestStep::Reset => None,
+        RequestStep::Funded
+        | RequestStep::Dropped(_)
+        | RequestStep::DeliveryFailed
+        | RequestStep::Reset => None,
     }
 }
 
@@ -1880,8 +1888,12 @@ fn a_request_that_times_out_unwritten_reports_its_expiry() {
         })
         .collect();
     assert_eq!(
-        steps[..2],
-        [RequestStep::Published, RequestStep::Expired],
+        steps[..3],
+        [
+            RequestStep::Funded,
+            RequestStep::Published,
+            RequestStep::Expired,
+        ],
         "the request expired while queued, before any reset or drop"
     );
     check_request_snapshots(&a).unwrap();

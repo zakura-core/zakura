@@ -193,7 +193,7 @@ Two gates, checked together in `lookahead_over_budget`:
   config knob).
 
 This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
-default 6 GiB, tracked by `ByteBudget`): that bounds outstanding request
+derived as `x × C`, 2,944 MiB at the defaults, tracked by `ByteBudget`): that bounds outstanding request
 reservations — charged at issuance, released at receipt (or timeout/watchdog/
 reset/floor GC) — while the request look-ahead gate paces incoming work.
 
@@ -312,7 +312,7 @@ so only a reader that sees no request in transition can compare them.
 | Knob | Default | Notes |
 | --- | --- | --- |
 | `max_reorder_lookahead_bytes` | 1.5 GiB | resident-memory target; serialized pools are charged at wire size and decoded windows at the calibrated multiple; clamped up to ~802 MB |
-| `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
+| `max_inflight_block_bytes` | unset: `x × C` (92 × 32 MiB = 2,944 MiB) | outstanding-request wire budget, released at receipt (separate from the resident gate) |
 | `max_blocks_per_response` | 1 (fixed) | deprecated and ignored; requests always carry one block, and serving answers a larger request with a one-block prefix |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
 | `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |

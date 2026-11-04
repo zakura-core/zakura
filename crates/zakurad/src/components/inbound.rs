@@ -14,6 +14,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
@@ -26,7 +27,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
@@ -226,9 +227,9 @@ async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<Arc<Block>>, zn::BoxError> {
+) -> Result<Option<BlockHandle>, zn::BoxError> {
     if let Some(block) = pending_blocks.get(hash) {
-        return Ok(Some(block));
+        return Ok(Some(block.into()));
     }
 
     let response = state
@@ -673,7 +674,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();
@@ -683,13 +684,18 @@ impl Service<zn::Request> for Inbound {
                             break;
                         }
 
-                        let block = block_by_hash_or_pending(
+                        let block = match block_by_hash_or_pending(
                             state.clone(),
                             pending_blocks.clone(),
                             hash,
                         )
-                        .await?;
-                        if let Some(block) = &block {
+                        .await
+                        {
+                            Ok(block) => Some(block),
+                            Err(error) if is_read_capacity_refusal(&*error) => None,
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(Some(block)) = &block {
                             state_lookup_bytes = state_lookup_bytes
                                 .saturating_add(block.zcash_serialized_size());
                         }
@@ -705,6 +711,12 @@ impl Service<zn::Request> for Inbound {
                         //
                         // If there was a database error, return the error,
                         // and stop processing further chunks.
+                        let Some(block) = block else {
+                            // The state refused the read for lack of capacity. Peers cannot
+                            // rely on `notfound`, but it lets them retry elsewhere sooner.
+                            blocks.push(Missing(hash));
+                            continue;
+                        };
                         match block {
                             Some(block) => {
                                 // If checking the serialized size of the block performs badly,

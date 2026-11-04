@@ -1,0 +1,12 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index f80874e5f..fc509efb8 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -2694,7 +2694,6 @@ impl ZakuraDiscoveryBook {
+             }
+             let new_relay = relay_of(entry.source, node_id);
+             if new_relay != old_relay {
+-                self.unattribute(old_relay);
+                 self.attribute(new_relay);
+             }
+             return Ok(outcome);

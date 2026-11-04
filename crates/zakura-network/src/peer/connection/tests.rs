@@ -170,6 +170,7 @@ fn new_test_connection_with_protection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        crate::inbound_resources::InboundBudget::new(1 << 30),
     );
 
     (
@@ -245,6 +246,7 @@ fn new_never_closing_test_connection<A>(
         Arc::new(connection_info),
         addr_label,
         Vec::new(),
+        crate::inbound_resources::InboundBudget::new(1 << 30),
     );
 
     (connection, client_tx, shared_error_slot)

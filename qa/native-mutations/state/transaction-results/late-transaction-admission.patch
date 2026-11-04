@@ -1,0 +1,13 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -605,9 +605,7 @@ impl ZakuraDb {
+     /// Reserve an upper bound on `raw`'s decoded transaction, decode it, and settle
+     /// the reservation to the decoded size.
+     fn decode_transaction(&self, raw: &RawBytes) -> Result<TransactionHandle, ReadMemoryExhausted> {
+-        let reservation = self.read_capacity.memory.try_reserve(
+-            byte_count(raw.raw_bytes().len()).saturating_mul(MAX_DECODED_BYTES_PER_WIRE_BYTE),
+-        )?;
++        let reservation = self.read_capacity.memory.try_reserve(0)?;
+         Ok(reservation
+             .retain(Transaction::from_bytes(raw.raw_bytes()))?
+             .into())

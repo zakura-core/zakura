@@ -1,0 +1,4 @@
+# Stops evicting at the book limit, so a relay can grow the book without bound.
+input = "crates/zakura-sim/tests/fixtures/discovery-record-book.bin"
+# The harness drives discovery state and the transport types under it.
+checks = ["crates/zakura-network/src/zakura"]

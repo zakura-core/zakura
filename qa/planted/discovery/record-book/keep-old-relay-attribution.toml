@@ -1,0 +1,4 @@
+# Keeps the old relay charged after an update moves the entry to a new relay.
+input = "crates/zakura-sim/tests/fixtures/discovery-record-book.bin"
+# The harness drives discovery state and the transport types under it.
+checks = ["crates/zakura-network/src/zakura"]

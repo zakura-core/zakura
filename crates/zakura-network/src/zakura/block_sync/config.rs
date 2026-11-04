@@ -1,4 +1,5 @@
 use super::{wire::*, work_queue::OwnerReservationCap, *};
+use zakura_node_services::block_memory::DecodedBlockPool;
 
 /// Blocks this node requests per `GetBlocks` message and advertises per response.
 ///
@@ -30,8 +31,6 @@ pub const DEFAULT_BS_INITIAL_INFLIGHT: u32 = 64;
 pub const MAX_BS_INFLIGHT_REQUESTS: u32 = 32_768;
 /// Default total response byte target advertised per range response.
 pub const DEFAULT_BS_MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
-/// Default global byte budget for outstanding block-request reservations.
-pub const DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// Worst-case serialized bytes reserved per requested block body.
 ///
 /// Block-sync reserves a per-block size estimate at send time (this worst case
@@ -256,7 +255,13 @@ pub struct ZakuraBlockSyncConfig {
     /// Maximum estimated bytes reserved for outstanding block-body requests: a
     /// DoS/pacing bound on in-flight wire data, released at receipt. Received
     /// bodies are bounded by `max_reorder_lookahead_bytes` instead.
-    pub max_inflight_block_bytes: u64,
+    ///
+    /// Unset, the node derives it from the per-peer cwnd cap: `x × C`, with `x`
+    /// the connections that can carry block sync
+    /// ([`Self::derived_max_inflight_block_bytes`]). That is 92 × 32 MiB at the
+    /// defaults. A configured value replaces the derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inflight_block_bytes: Option<u64>,
     /// Maximum estimated *resident* memory of look-ahead block bodies retained
     /// by the download pipeline. Serialized backlog and reservations are charged
     /// at wire size; decoded input/submission windows add
@@ -344,6 +349,22 @@ pub struct ZakuraBlockSyncConfig {
     pub floor_bypass_slots: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
+    /// The most unsent `GetBlocks` response bytes this node holds across every
+    /// serving session.
+    ///
+    /// Unset uses the derived budget: the inbound plus outbound `peer_limits`
+    /// sessions, clamped to the admitted connections, times one session's output
+    /// budget. One session's budget is twice the default QUIC send window or the
+    /// largest response, whichever is larger: 64 MiB at defaults, so the node budget
+    /// is 92 × 64 MiB = 5.75 GiB. Every session can then hold its whole budget at
+    /// once, so a fast reader never pauses another peer's serving. These
+    /// bytes are reserved before each response is produced and held until its last frame
+    /// is written; idle sessions hold nothing.
+    ///
+    /// A smaller value bounds this memory more tightly, but lets peers that read
+    /// at full speed pause each other's serving. A value below one session's budget
+    /// rises to that budget.
+    pub node_serve_output_bytes: Option<u64>,
 }
 
 fn deserialize_ignored_replace_legacy_syncer<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -362,7 +383,7 @@ impl Default for ZakuraBlockSyncConfig {
             max_inflight_requests: DEFAULT_BS_MAX_INFLIGHT,
             initial_inflight_requests: DEFAULT_BS_INITIAL_INFLIGHT,
             max_response_bytes: DEFAULT_BS_MAX_RESPONSE_BYTES,
-            max_inflight_block_bytes: DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+            max_inflight_block_bytes: None,
             max_reorder_lookahead_bytes: DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
             floor_peer_avoid_cooldown: DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
             max_submitted_block_applies: MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
@@ -388,6 +409,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
+            node_serve_output_bytes: None,
         }
     }
 }
@@ -432,6 +454,57 @@ impl ZakuraBlockSyncConfig {
     pub fn submitted_apply_limit(&self) -> usize {
         self.max_submitted_block_applies
             .max(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+    }
+
+    /// Fund decoded allocations through the pipeline and the caller's backend allowance.
+    /// Four submission windows cover input, applying, driver overlap, and replacement
+    /// headroom. Peer slots cover synchronous handoffs outside those collections.
+    /// Retiring holders keep their slots. The count funds the pipeline, peer
+    /// handoffs and `backend_blocks` current backend blocks. It does not fund
+    /// prior backend generations that state readers still hold.
+    /// [`Self::decoded_pipeline_byte_bound`] limits the bytes before backend retention.
+    pub fn decoded_block_pool(
+        &self,
+        backend_blocks: u64,
+    ) -> Result<DecodedBlockPool, &'static str> {
+        self.decoded_block_allowance(backend_blocks).map(|blocks| {
+            DecodedBlockPool::for_pipeline(blocks, self.decoded_pipeline_byte_bound())
+        })
+    }
+
+    /// Return the block count that a [decoded pool](Self::decoded_block_pool) admits.
+    pub(crate) fn decoded_block_allowance(
+        &self,
+        backend_blocks: u64,
+    ) -> Result<std::num::NonZeroU64, &'static str> {
+        let windows = u64::try_from(self.submitted_apply_limit())
+            .ok()
+            .and_then(|count| count.checked_mul(4));
+        let peers = self
+            .peer_limits
+            .max_inbound_peers
+            .checked_add(self.peer_limits.max_outbound_peers)
+            .and_then(|count| u64::try_from(count).ok());
+        windows
+            .zip(peers)
+            .and_then(|(windows, peers)| windows.checked_add(peers))
+            .and_then(|count| count.checked_add(backend_blocks))
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or("decoded block-count allowance overflow")
+    }
+
+    /// Decoded bytes the pipeline may hold before gated work must wait or stay raw.
+    ///
+    /// This derives from what the reactor can request: the resident look-ahead budget,
+    /// one commit window of maximum-size blocks, and one response. The last two can
+    /// pass the look-ahead gate, so they carry the decoded multiple. The commit window
+    /// itself is exempt at submission and receipts fall back to raw bytes, so reaching
+    /// this bound delays only submissions above the window until earlier work finishes.
+    pub fn decoded_pipeline_byte_bound(&self) -> u64 {
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR
+            .saturating_add(u64::from(self.max_response_bytes))
+            .saturating_mul(super::admission::DESERIALIZED_MEM_FACTOR)
+            .saturating_add(self.effective_max_reorder_lookahead_bytes())
     }
 
     /// Return the resident look-ahead byte cap.
@@ -514,24 +587,55 @@ impl ZakuraBlockSyncConfig {
 
     /// The node in-flight byte budget derived from the per-peer cap:
     /// `x × C`, with `x` from [`Self::block_sync_connections`].
-    ///
-    /// `max_inflight_block_bytes` keeps its fixed default until node
-    /// composition passes the node's `max_connections` here.
     pub fn derived_max_inflight_block_bytes(&self, max_connections: usize) -> u64 {
         // Widening usize to u64 is lossless on every supported target.
         (self.block_sync_connections(max_connections) as u64)
             .saturating_mul(self.bbr_max_cwnd_bytes)
     }
 
+    /// The node in-flight byte budget: the configured `max_inflight_block_bytes`,
+    /// or [`Self::derived_max_inflight_block_bytes`] at the default connection
+    /// count until [`Self::for_node_connections`] sets it.
+    pub fn inflight_block_bytes(&self) -> u64 {
+        self.max_inflight_block_bytes.unwrap_or_else(|| {
+            self.derived_inflight_block_bytes(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
+        })
+    }
+
+    /// This config for a node that admits `max_connections`: an unset
+    /// in-flight byte budget becomes `x × C` for those connections, and an
+    /// unset serving output budget becomes one session's budget on each of
+    /// those `x` connections. A configured value stays.
+    pub fn for_node_connections(mut self, max_connections: usize) -> Self {
+        if self.max_inflight_block_bytes.is_none() {
+            self.max_inflight_block_bytes =
+                Some(self.derived_inflight_block_bytes(max_connections));
+        }
+        if self.node_serve_output_bytes.is_none() {
+            self.node_serve_output_bytes = Some(
+                super::regulated::session::derived_serving_limits(&self, max_connections)
+                    .node_output_bytes,
+            );
+        }
+        self
+    }
+
+    /// `x × C`, raised to just above one floor request so that a node without
+    /// block-sync peers still validates.
+    fn derived_inflight_block_bytes(&self, max_connections: usize) -> u64 {
+        self.derived_max_inflight_block_bytes(max_connections)
+            .max(self.floor_request_byte_reservation().saturating_add(1))
+    }
+
     /// Validate production-safety bounds after deserialization.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.max_inflight_block_bytes == 0 {
+        if self.inflight_block_bytes() == 0 {
             return Err("max_inflight_block_bytes must be greater than zero");
         }
         if self.max_reorder_lookahead_bytes == 0 {
             return Err("max_reorder_lookahead_bytes must be greater than zero");
         }
-        if self.max_inflight_block_bytes <= self.floor_request_byte_reservation() {
+        if self.inflight_block_bytes() <= self.floor_request_byte_reservation() {
             return Err("max_inflight_block_bytes must exceed one floor request");
         }
         if self.request_timeout < Duration::from_millis(1) {
@@ -545,6 +649,17 @@ impl ZakuraBlockSyncConfig {
         }
         if self.bbr_max_cwnd_bytes < self.bbr_min_cwnd_bytes {
             return Err("bbr_max_cwnd_bytes must be at least bbr_min_cwnd_bytes");
+        }
+        // The block-sync share sets the QUIC stream receive window, which
+        // can't exceed QUIC's ceiling.
+        match block_sync_reactor_budget(self.bbr_max_cwnd_bytes, self.floor_bypass_slots) {
+            Ok(budget) if budget.receive <= zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES => {}
+            _ => {
+                return Err(
+                    "bbr_max_cwnd_bytes and floor_bypass_slots must keep the block-sync \
+                     receive share within QUIC's 256 MiB stream receive window",
+                )
+            }
         }
         if self.max_requests_without_block_progress == 0 {
             return Err("max_requests_without_block_progress must be greater than zero");
@@ -614,14 +729,17 @@ impl ZakuraBlockSyncConfig {
     /// raise the budget to the smallest valid value and warn.
     pub fn clamp_inflight_block_bytes_to_request_floor(&mut self) {
         let request_floor = self.floor_request_byte_reservation();
-        if self.max_inflight_block_bytes > 0 && self.max_inflight_block_bytes <= request_floor {
+        if let Some(configured) = self
+            .max_inflight_block_bytes
+            .filter(|&bytes| bytes > 0 && bytes <= request_floor)
+        {
             tracing::warn!(
-                configured_max_inflight_block_bytes = self.max_inflight_block_bytes,
+                configured_max_inflight_block_bytes = configured,
                 floor_request_byte_reservation = request_floor,
                 "zakura.block_sync.max_inflight_block_bytes cannot cover one floor \
                  request; clamping it up so the node can start",
             );
-            self.max_inflight_block_bytes = request_floor.saturating_add(1);
+            self.max_inflight_block_bytes = Some(request_floor.saturating_add(1));
         }
     }
 
@@ -654,7 +772,7 @@ pub fn clamp_advertised_response_bytes(bytes: u32) -> u32 {
 #[cfg(test)]
 mod owner_cap_tests {
     use super::*;
-    use crate::zakura::DEFAULT_ZAKURA_BUDGETED_CONNECTIONS;
+    use crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS;
 
     #[test]
     fn the_default_cwnd_cap_carries_one_gigabit_at_250_milliseconds() {
@@ -683,12 +801,48 @@ mod owner_cap_tests {
     fn derived_inflight_bytes_count_block_sync_connections() {
         let config = ZakuraBlockSyncConfig::default();
         assert_eq!(
-            config.block_sync_connections(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS),
+            config.block_sync_connections(DEFAULT_ZAKURA_MAX_CONNECTIONS),
             92
         );
         assert_eq!(
-            config.derived_max_inflight_block_bytes(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS),
+            config.derived_max_inflight_block_bytes(DEFAULT_ZAKURA_MAX_CONNECTIONS),
             92 * DEFAULT_BS_BBR_MAX_CWND_BYTES
+        );
+        // Unset, the node budget derives from the connections the node admits,
+        // 2,944 MiB at the defaults instead of the old fixed 6 GiB.
+        assert_eq!(config.max_inflight_block_bytes, None);
+        assert_eq!(config.inflight_block_bytes(), 3_087_007_744);
+        assert_eq!(
+            config
+                .clone()
+                .for_node_connections(16)
+                .max_inflight_block_bytes,
+            Some(16 * DEFAULT_BS_BBR_MAX_CWND_BYTES)
+        );
+        // A configured budget stays.
+        let configured = ZakuraBlockSyncConfig {
+            max_inflight_block_bytes: Some(6 << 30),
+            ..config.clone()
+        };
+        assert_eq!(
+            configured.for_node_connections(16).inflight_block_bytes(),
+            6 << 30
+        );
+        // A node without block-sync peers still covers one floor request.
+        let no_peers = ZakuraBlockSyncConfig {
+            peer_limits: crate::zakura::ServicePeerLimits {
+                max_inbound_peers: 0,
+                max_outbound_peers: 0,
+                ..config.peer_limits
+            },
+            ..config.clone()
+        };
+        assert_eq!(
+            no_peers
+                .clone()
+                .for_node_connections(92)
+                .inflight_block_bytes(),
+            no_peers.floor_request_byte_reservation() + 1
         );
         // The peer limits bind when the node admits more connections.
         assert_eq!(config.block_sync_connections(10_000), 512);
@@ -707,5 +861,24 @@ mod owner_cap_tests {
             config.validate(),
             Err("bbr_max_cwnd_bytes must be at least bbr_min_cwnd_bytes")
         );
+    }
+
+    #[test]
+    fn validation_keeps_the_block_sync_share_within_the_quic_stream_window() {
+        let fixed = BLOCK_SYNC_REACTOR_BUDGET.receive - DEFAULT_BS_BBR_MAX_CWND_BYTES;
+        let largest_cwnd = zakura_quic::MAX_STREAM_RECEIVE_WINDOW_BYTES - fixed;
+        let mut config = ZakuraBlockSyncConfig {
+            bbr_max_cwnd_bytes: largest_cwnd,
+            ..ZakuraBlockSyncConfig::default()
+        };
+        assert_eq!(config.validate(), Ok(()));
+        config.bbr_max_cwnd_bytes += 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .starts_with("bbr_max_cwnd_bytes and floor_bypass_slots"));
+        config.bbr_max_cwnd_bytes = DEFAULT_BS_BBR_MAX_CWND_BYTES;
+        config.floor_bypass_slots = u32::MAX;
+        assert!(config.validate().is_err());
     }
 }

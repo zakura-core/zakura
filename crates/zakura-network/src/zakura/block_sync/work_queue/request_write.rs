@@ -264,6 +264,7 @@ impl TakenRequest {
             }
         };
         self.reporter = RequestReporter::new(&self.work, owner, &self.items, bytes);
+        report!(self.reporter, RequestStep::Funded);
         Ok(UnpublishedRequest {
             taken: self,
             owner,

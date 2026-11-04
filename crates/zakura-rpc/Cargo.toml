@@ -57,7 +57,7 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 hyper = { workspace = true, features = ["http1", "server"] }
-hyper-util = { workspace = true, features = ["server-auto", "service", "tokio"] }
+hyper-util = { workspace = true, features = ["service", "tokio"] }
 http-body-util = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }

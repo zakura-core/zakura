@@ -8,8 +8,10 @@ Wants=network-online.target
 Type=simple
 # No root. The collector reads the node over loopback RPC and metrics, reads the
 # node's RSS from /proc and its unit state from systemctl, and keeps its SQLite
-# database in its state directory.
-DynamicUser=yes
+# database in its state directory. A static system user rather than DynamicUser:
+# D-Bus cannot authenticate a dynamic UID, so `systemctl show` would fail.
+User=nu7-dashboard
+Group=nu7-dashboard
 StateDirectory=zakura-nu7-mainnet
 WorkingDirectory=/opt/zakura-nu7-mainnet
 ExecStart=/usr/bin/python3 /opt/zakura-nu7-mainnet/collector.py --db /var/lib/zakura-nu7-mainnet/dashboard.sqlite --host 127.0.0.1 --port 8095

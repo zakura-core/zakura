@@ -53,6 +53,7 @@ sudo install -m 644 deploy/nu7-mainnet/zakurad.service /etc/systemd/system/zakur
 # then `zstd -dc | tar -x`), owned by the `zakura` system user.
 
 # Collector and Caddy.
+sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin nu7-dashboard
 sudo install -d /opt/zakura-nu7-mainnet
 sudo install -m 644 deploy/nu7-mainnet/{collector.py,nu7_chain.py,nu7_store.py,page.html} /opt/zakura-nu7-mainnet/
 sudo install -m 644 deploy/nu7-mainnet/collector.service /etc/systemd/system/zakura-nu7-mainnet-dashboard.service

@@ -2963,6 +2963,12 @@ impl Service<ReadRequest> for ReadStateService {
             .boxed();
         }
 
+        let perf_context = match &req {
+            ReadRequest::CheckAuthDataCommitment(commitment) => {
+                zakura_chain::diagnostic::block_perf::Context::for_hash(commitment.block.hash())
+            }
+            _ => None,
+        };
         let request_handler = move || match req {
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.cached_size())),
@@ -3767,7 +3773,16 @@ impl Service<ReadRequest> for ReadStateService {
             }
         };
 
-        timed_span.spawn_blocking(workers, request_handler)
+        timed_span.spawn_blocking(workers, move || {
+            use zakura_chain::diagnostic::block_perf::{Context, Stage};
+            let stage = if perf_context.as_ref().is_some_and(Context::is_error_binding) {
+                Stage::Error
+            } else {
+                Stage::Commitment
+            };
+            let _scope = Context::enter(perf_context, stage);
+            request_handler()
+        })
     }
 }
 

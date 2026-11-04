@@ -523,8 +523,6 @@ pub struct Topology {
     last_id: Cell<u64>,
     /// The node under test's tap, told of its shutdown.
     tap: Option<TapShutdown>,
-    /// Set once a `Shutdown` step stopped the node under test.
-    stopped: Cell<bool>,
 }
 
 impl Topology {
@@ -541,7 +539,6 @@ impl Topology {
             effects,
             last_id: Cell::new(0),
             tap: None,
-            stopped: Cell::new(false),
         }
     }
 
@@ -569,17 +566,10 @@ impl Topology {
     }
 
     /// Stops the node under test, as zakurad's shutdown ends header sync:
-    /// tells its tap, closes every link to it, so its sessions end, and
-    /// cancels its reactor, which retires its work and drops its pending
-    /// calls. A second shutdown is a failure.
+    /// closes every link to it, so its sessions end, and cancels its
+    /// reactor, which retires its work and drops its pending calls. Its tap
+    /// was told at the step's pick.
     fn shutdown(&self) {
-        if self.stopped.replace(true) {
-            self.fail("the node is already shut down".to_owned());
-            return;
-        }
-        if let Some(tap) = &self.tap {
-            tap.begin();
-        }
         // Cancelling can be a scheduling point, so the links are copied
         // first. Every link has the node under test at one end.
         let links = self.effects.links.borrow().clone();
@@ -760,13 +750,16 @@ pub struct ControlStep {
 /// its trigger holds. A harness task carries each one out on its next step,
 /// since linking takes locks that tasks hold across scheduling points, where
 /// only a task can wait. So a pick only queues the action, and triggers
-/// count the effect.
+/// count the effect. Every check on a step runs at its pick, so a run cut
+/// off before the task takes the step still fails an invalid one.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
     predicates: Rc<RefCell<Predicates>>,
     /// The next step to offer.
     next: usize,
+    /// Set once a `Shutdown` step was picked.
+    shut_down: bool,
     to_task: mpsc::Sender<ControlStep>,
 }
 
@@ -792,20 +785,11 @@ impl Control {
                 };
                 match step.action {
                     ControlAction::Close => link().close(),
-                    ControlAction::Relink if topology.stopped.get() => {
-                        topology.fail(format!("relinking {} after the shutdown", step.peer));
-                    }
                     ControlAction::Relink => {
                         let link = link();
                         topology.link(link.dialer, link.listener);
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
-                    ControlAction::Shutdown if step.peer != topology.nodes[0].name => {
-                        topology.fail(format!(
-                            "a shutdown names the node under test, not {}",
-                            step.peer
-                        ));
-                    }
                     ControlAction::Shutdown => topology.shutdown(),
                 }
             }
@@ -815,6 +799,7 @@ impl Control {
             topology,
             predicates,
             next: 0,
+            shut_down: false,
             to_task,
         }
     }
@@ -848,16 +833,36 @@ impl ActionSource for Control {
         }
     }
 
-    /// Queues the next step for the control task. A shutdown of the node
-    /// under test counts as begun from its pick, before the task takes it.
+    /// Checks the next step and queues it for the control task. A shutdown
+    /// that doesn't name the node under test, a second shutdown, and a
+    /// relink after one fail the run here instead. A shutdown counts as
+    /// begun from its pick, before the task takes it.
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
-        let step = &self.script[self.next];
-        if step.action == ControlAction::Shutdown && step.peer == self.topology.nodes[0].name {
+        let step = self.script[self.next].clone();
+        self.next += 1;
+        let invalid = match step.action {
+            ControlAction::Shutdown if step.peer != self.topology.nodes[0].name => Some(format!(
+                "a shutdown names the node under test, not {}",
+                step.peer
+            )),
+            ControlAction::Shutdown if self.shut_down => {
+                Some("the node is already shut down".to_owned())
+            }
+            ControlAction::Relink if self.shut_down => {
+                Some(format!("relinking {} after the shutdown", step.peer))
+            }
+            _ => None,
+        };
+        if let Some(why) = invalid {
+            self.topology.fail(why);
+            return;
+        }
+        if step.action == ControlAction::Shutdown {
+            self.shut_down = true;
             self.topology.expect_shutdown();
         }
         self.to_task
-            .try_send(self.script[self.next].clone())
+            .try_send(step)
             .expect("the channel holds the whole script, and the task outlives the run");
-        self.next += 1;
     }
 }

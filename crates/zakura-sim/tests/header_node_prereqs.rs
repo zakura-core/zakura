@@ -204,24 +204,33 @@ fn a_run_cut_off_at_the_shutdown_pick_fails() {
     assert!(failure.contains("ShutdownIncomplete"), "{failure}");
 }
 
-/// A shutdown step must name the node under test, and a relink after the
-/// shutdown fails the run, since the node takes no new sessions.
+/// A shutdown step must name the node under test, and a second shutdown or
+/// a relink after one fails the run. Each fails at its own pick, so a run
+/// cut off before the control task takes the step still rejects it.
 #[test]
-fn a_shutdown_rejects_a_mirror_and_a_later_relink() {
-    for controls in [
-        vec![step(
-            "mirror-0",
-            ControlAction::Shutdown,
-            Trigger::VirtualTime(0),
-        )],
-        vec![
-            step("node", ControlAction::Shutdown, Trigger::VirtualTime(0)),
-            step("mirror-0", ControlAction::Relink, Trigger::VirtualTime(0)),
-        ],
+fn a_shutdown_rejects_a_mirror_a_second_shutdown_and_a_later_relink() {
+    let shutdown = || step("node", ControlAction::Shutdown, Trigger::VirtualTime(0));
+    for (controls, invalid) in [
+        (
+            vec![step(
+                "mirror-0",
+                ControlAction::Shutdown,
+                Trigger::VirtualTime(0),
+            )],
+            "peer:mirror-0:shutdown",
+        ),
+        (vec![shutdown(), shutdown()], "peer:node:shutdown"),
+        (
+            vec![
+                shutdown(),
+                step("mirror-0", ControlAction::Relink, Trigger::VirtualTime(0)),
+            ],
+            "peer:mirror-0:relink",
+        ),
     ] {
         let scenario = scenario(Vec::new(), controls);
         let ports = Storage::prepare(&scenario);
-        let failure = run_prepared::<Storage>(
+        let error = run_prepared::<Storage>(
             &scenario,
             ports,
             inputs(1, 64).remove(0),
@@ -230,7 +239,12 @@ fn a_shutdown_rejects_a_mirror_and_a_later_relink() {
         )
         .map(|report| format!("{:?}", report.end))
         .expect_err("the step can't take effect");
-        assert!(failure.to_string().contains("ControlFailed"), "{failure}");
+        assert!(error.to_string().contains("ControlFailed"), "{error}");
+        let zakura_sim::harness::HarnessError::Run { report, .. } = error else {
+            panic!("the run itself fails");
+        };
+        let last = report.picks.last().map(|pick| pick.identity.as_str());
+        assert_eq!(last, Some(invalid), "the run ends at the invalid pick");
     }
 }
 

@@ -124,10 +124,9 @@ impl Run {
         &self.view.adoption
     }
 
-    /// The status rule over the sessions still live at the run's end.
+    /// The status rule over the node's sessions.
     fn status(&self) -> Acceptance {
-        self.adoption()
-            .status(|session| self.view.live_sessions.contains(&session))
+        self.adoption().status(&self.view.sessions)
     }
 }
 
@@ -267,9 +266,9 @@ fn sweep(rule: &str, check: impl Fn(&Run) -> Acceptance) -> Tally {
 }
 
 /// The witness runs as designed. The held read was submitted before the
-/// growth's apply completed, and completed after it. The node adopted A3,
-/// then A5 and A7 under two newer generations, queued statuses on both
-/// sessions, published each tip, and dispatched a locator after the first
+/// growth's apply completed, and completed after it, under a generation the
+/// node held before the growth. The node adopted A3, then A5 and A7 under
+/// two newer generations, queued a status for each tip on both sessions, published each tip, and dispatched a locator after the first
 /// new adoption, so every rule has something to judge.
 #[test]
 fn the_grow_witness_holds_a_read_across_the_growth() {
@@ -281,6 +280,24 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
         let is_apply =
             |request: &StorageRequest| matches!(request, StorageRequest::ApplyHeaderTarget { .. });
         let (read_at, read_done) = nth(&run.report, 1, is_read).expect("the node serves");
+        let read_generation = run
+            .report
+            .log
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.obs {
+                Observation::Storage {
+                    instance: 0,
+                    fact:
+                        StorageFact::Submitted {
+                            request: StorageRequest::ReadHeaderPath { scope, .. },
+                            ..
+                        },
+                    ..
+                } => Some(scope.header_generation),
+                _ => None,
+            })
+            .expect("the node reads a path");
         let (_, grown) = nth(&run.report, 2, is_apply).expect("the node applies the growth");
         let grown = grown.expect("the growth's apply completes");
         let read_done = read_done.expect("the held read completes");
@@ -303,13 +320,29 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
             generations.windows(2).all(|pair| pair[0] < pair[1]),
             "{generations:?}"
         );
+        // The held read is from before the growth, which adopts a newer
+        // generation while it's held.
+        assert!(
+            generations[..2].contains(&read_generation),
+            "read under {read_generation}, adopted {generations:?}"
+        );
 
         let facts = run.adoption().facts();
         let count = |is: &dyn Fn(&AdoptionFact) -> bool| {
             facts.iter().filter(|stamped| is(&stamped.fact)).count()
         };
         assert!(count(&|fact| matches!(fact, AdoptionFact::TipPublished { .. })) >= 3);
-        assert!(count(&|fact| matches!(fact, AdoptionFact::StatusQueued { .. })) >= 6);
+        for session in &run.view.sessions {
+            let queued = count(&|fact| {
+                matches!(fact, AdoptionFact::StatusQueued { session_id, .. }
+                    if *session_id == session.session_id)
+            });
+            assert!(
+                queued >= 3,
+                "session {} got {queued} statuses",
+                session.session_id
+            );
+        }
         let second = facts
             .iter()
             .filter(|stamped| matches!(stamped.fact, AdoptionFact::Adopted(_)))
@@ -319,7 +352,15 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
         assert!(facts.iter().any(|stamped| {
             stamped.at >= second && matches!(stamped.fact, AdoptionFact::LocatorDispatched { .. })
         }));
-        assert_eq!(run.view.live_sessions.len(), 2, "both links stay up");
+        assert_eq!(run.view.sessions.len(), 2);
+        assert!(
+            run.view
+                .sessions
+                .iter()
+                .all(|session| session.until.is_none()),
+            "both links stay up: {:?}",
+            run.view.sessions
+        );
     }
 }
 

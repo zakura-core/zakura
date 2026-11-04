@@ -11,7 +11,8 @@
 //! connection holds the handshake window, every reactor's receive share and the send
 //! window in QUIC, and each kind's raw and output gates hold that kind's shares of
 //! frames. Handshakes hold the handshake and send windows, and each bound socket its
-//! datagram queue. The peer memory budget is the ceiling on the QUIC part.
+//! datagram queue. The peer memory budget is the ceiling on the QUIC part. An
+//! embedder's custom stream kinds take the `other` share, as on a live connection.
 //!
 //! A held raw frame's bytes sit both in its connection's receive window and in its
 //! kind's raw gate, so the retained bound counts them twice. The second count funds a
@@ -115,17 +116,20 @@ impl NodeEnvelope {
         })
     }
 
-    /// The envelope of a node with this configuration, or an error if the peer
-    /// memory budget can't fund its connections.
+    /// The envelope of a node with this configuration that also serves
+    /// `custom_kinds`, or an error if the peer memory budget can't fund its
+    /// connections.
     pub(crate) fn for_node(
         config: &Config,
         limits: &ZakuraLocalLimits,
+        custom_kinds: &[u16],
         decoded_backend_blocks: u64,
     ) -> Result<Self, NodeEnvelopeError> {
         let block_sync = &config.zakura.block_sync;
-        let quic_bytes = config
-            .zakura
-            .quic_memory_bytes(&config.network, limits.max_connections);
+        let quic_bytes =
+            config
+                .zakura
+                .quic_memory_bytes(&config.network, limits.max_connections, custom_kinds);
         let budget_bytes = config.zakura.peer_memory_budget_bytes;
         if quic_bytes > u128::from(budget_bytes) {
             return Err(NodeEnvelopeError::PeerMemoryBudget {
@@ -135,7 +139,12 @@ impl NodeEnvelope {
         }
         Self::new(
             limits.transport_limits_for_kinds(
-                limits.reactor_shares().kinds.iter().map(|(kind, _)| *kind),
+                limits
+                    .reactor_shares()
+                    .kinds
+                    .iter()
+                    .map(|(kind, _)| *kind)
+                    .chain(custom_kinds.iter().copied()),
             ),
             quic_bytes,
             config.tcp_ingress_bound_bytes(),

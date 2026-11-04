@@ -354,7 +354,7 @@ fn the_peer_memory_budget_funds_the_whole_windows() {
     );
     let quic = config
         .zakura
-        .quic_memory_bytes(&config.network, limits.max_connections);
+        .quic_memory_bytes(&config.network, limits.max_connections, &[]);
     assert_eq!(
         envelope.transport_credit_bytes + u128::from(zakura_quic::SOCKET_DATAGRAM_QUEUE_BYTES),
         quic

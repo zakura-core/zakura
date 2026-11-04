@@ -108,7 +108,8 @@ fn stream(connection: &ConnectionResources, kind: Stream) -> StreamResources {
 fn the_default_node_config_composes() {
     let config = Config::default();
     let limits = ZakuraLocalLimits::from_config(&config);
-    let envelope = NodeEnvelope::for_node(&config, &limits, 16).expect("the default config fits");
+    let envelope =
+        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
 
     assert_eq!(
         limits.max_connections,
@@ -133,7 +134,7 @@ fn the_default_node_config_composes() {
         envelope.quic_bytes,
         config
             .zakura
-            .quic_memory_bytes(&config.network, limits.max_connections)
+            .quic_memory_bytes(&config.network, limits.max_connections, &[])
     );
     assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
     assert_eq!(
@@ -170,7 +171,8 @@ fn the_default_envelope_sums_the_reactor_shares() {
     );
     assert_eq!(u64::from(limits.quic.receive_window_bytes), 32 * MIB);
 
-    let envelope = NodeEnvelope::for_node(&config, &limits, 16).expect("the default config fits");
+    let envelope =
+        NodeEnvelope::for_node(&config, &limits, &[], 16).expect("the default config fits");
     let transport = ResourceEnvelope::new(
         limits.transport_limits_for_kinds(shares.kinds.iter().map(|(kind, _)| *kind)),
     );
@@ -184,6 +186,67 @@ fn the_default_envelope_sums_the_reactor_shares() {
     );
     // 92 × 141,937,353 + 32 × 64 MiB + 256 MiB.
     assert_eq!(envelope.quic_bytes, 15_474_155_580);
+}
+
+/// A custom stream kind takes the `other` share on a live connection, so the peer
+/// memory budget charges every connection for it, and the envelope counts its gates.
+#[test]
+fn custom_stream_kinds_charge_the_peer_memory_budget() {
+    const CUSTOM: &[u16] = &[40];
+    let mut config = Config::default();
+    let network = config.network.clone();
+    let native = ZakuraLocalLimits::from_config(&config).max_connections;
+    // A budget that funds the native kinds on exactly the default connections.
+    let native_quic = config.zakura.quic_memory_bytes(&network, native, &[]);
+    config.zakura.peer_memory_budget_bytes =
+        u64::try_from(native_quic).expect("the default QUIC envelope fits u64");
+    assert_eq!(
+        ZakuraLocalLimits::from_config(&config).max_connections,
+        native
+    );
+
+    // Widening usize to u128 is lossless on supported targets.
+    let other = u128::from(config.zakura.reactor_shares(&network).other.receive);
+    assert_eq!(
+        config.zakura.quic_memory_bytes(&network, native, CUSTOM),
+        native_quic + native as u128 * other
+    );
+
+    let limits = ZakuraLocalLimits::for_node(&config, CUSTOM);
+    assert!(limits.max_connections < native);
+    let node_id = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]).public();
+    assert_eq!(
+        config
+            .zakura
+            .budgeted_max_connections_for_node(&network, node_id, CUSTOM),
+        Ok(limits.max_connections)
+    );
+
+    assert!(matches!(
+        NodeEnvelope::for_node(
+            &config,
+            &ZakuraLocalLimits::from_config(&config),
+            CUSTOM,
+            16
+        ),
+        Err(NodeEnvelopeError::PeerMemoryBudget { .. })
+    ));
+    let envelope =
+        NodeEnvelope::for_node(&config, &limits, CUSTOM, 16).expect("the lowered cap fits");
+    assert!(envelope.quic_bytes <= u128::from(config.zakura.peer_memory_budget_bytes));
+    let native_kinds = || {
+        limits
+            .reactor_shares()
+            .kinds
+            .into_iter()
+            .map(|(kind, _)| kind)
+    };
+    let retained = |kinds: Vec<u16>| {
+        ResourceEnvelope::new(limits.transport_limits_for_kinds(kinds)).retained_frame_bytes()
+    };
+    let with_custom = retained(native_kinds().chain(CUSTOM.iter().copied()).collect());
+    assert_eq!(envelope.transport_bytes, with_custom);
+    assert!(with_custom > retained(native_kinds().collect()));
 }
 
 #[test]
@@ -211,12 +274,12 @@ fn the_byte_bound_adds_each_owner_once() {
 fn configured_serving_budgets_set_the_serve_output_bound() {
     let mut config = Config::default();
     let limits = ZakuraLocalLimits::from_config(&config);
-    let derived = NodeEnvelope::for_node(&config, &limits, 16)
+    let derived = NodeEnvelope::for_node(&config, &limits, &[], 16)
         .expect("the default config fits")
         .serve_output_bytes;
     config.zakura.block_sync.node_serve_output_bytes = Some(1 << 30);
     config.zakura.header_sync.node_serve_output_bytes = Some(1 << 30);
-    let configured = NodeEnvelope::for_node(&config, &limits, 16)
+    let configured = NodeEnvelope::for_node(&config, &limits, &[], 16)
         .expect("the configured budgets fit")
         .serve_output_bytes;
     assert_eq!(derived - configured, 2 * (512 * (64 << 20) - (1 << 30)));

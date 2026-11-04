@@ -480,13 +480,20 @@ impl ZakuraConfig {
     }
 
     /// What one connection on `network` costs the peer memory budget, when it
-    /// negotiates every reactor in [`Self::reactor_shares`].
-    pub fn connection_memory(&self, network: &Network) -> ConnectionMemory {
+    /// negotiates every reactor in [`Self::reactor_shares`] and every stream
+    /// kind in `custom_kinds`.
+    ///
+    /// A custom kind receives [`ReactorShares::other`], as it does on a live
+    /// connection. The service registry refuses a custom kind that repeats a
+    /// native one.
+    pub fn connection_memory(&self, network: &Network, custom_kinds: &[u16]) -> ConnectionMemory {
         let shares = self.reactor_shares(network);
         let kinds = shares
             .kinds
             .iter()
-            .fold(0_u64, |sum, (_, share)| sum.saturating_add(share.receive));
+            .map(|(_, share)| share.receive)
+            .chain(custom_kinds.iter().map(|kind| shares.share(*kind).receive))
+            .fold(0_u64, u64::saturating_add);
         ConnectionMemory::new(
             shares.control_receive_bytes,
             kinds,
@@ -496,11 +503,17 @@ impl ZakuraConfig {
 
     /// The QUIC memory the node can hold on `network` with `max_connections`
     /// admitted: every admitted connection, the handshake headroom, and the
-    /// bound sockets' queues. The peer memory budget is its ceiling.
-    pub fn quic_memory_bytes(&self, network: &Network, max_connections: usize) -> u128 {
+    /// bound sockets' queues. Each connection negotiates the native kinds and
+    /// `custom_kinds`. The peer memory budget is its ceiling.
+    pub fn quic_memory_bytes(
+        &self,
+        network: &Network,
+        max_connections: usize,
+        custom_kinds: &[u16],
+    ) -> u128 {
         budgeted_quic_bytes(
             self.bound_socket_count(),
-            self.connection_memory(network),
+            self.connection_memory(network, custom_kinds),
             max_connections,
             self.max_pending_handshakes.max(1),
         )
@@ -512,35 +525,39 @@ impl ZakuraConfig {
     ///
     /// The floor counts distinct bootstrap identities, as discovery does.
     /// Without the node key it can't tell whether one of them is this node, so
-    /// it counts one fewer: it never refuses a config that
+    /// it counts one fewer. It also charges only the native stream kinds. With
+    /// both choices, it never refuses a config that
     /// [`Self::budgeted_max_connections_for_node`] accepts.
     pub fn budgeted_max_connections(
         &self,
         network: &Network,
     ) -> Result<usize, PeerMemoryBudgetError> {
-        self.budgeted_max_connections_excluding(network, None)
+        self.budgeted_max_connections_excluding(network, None, &[])
     }
 
     /// Like [`Self::budgeted_max_connections`], but leaves `local_node_id` out
-    /// of the bootstrap count, exactly as discovery does.
+    /// of the bootstrap count, exactly as discovery does, and charges each
+    /// connection for `custom_kinds` too.
     pub fn budgeted_max_connections_for_node(
         &self,
         network: &Network,
         local_node_id: NodeId,
+        custom_kinds: &[u16],
     ) -> Result<usize, PeerMemoryBudgetError> {
-        self.budgeted_max_connections_excluding(network, Some(local_node_id))
+        self.budgeted_max_connections_excluding(network, Some(local_node_id), custom_kinds)
     }
 
     fn budgeted_max_connections_excluding(
         &self,
         network: &Network,
         local_node_id: Option<NodeId>,
+        custom_kinds: &[u16],
     ) -> Result<usize, PeerMemoryBudgetError> {
         budgeted_max_connections(
             self.max_connections,
             self.peer_memory_budget_bytes,
             self.bound_socket_count(),
-            self.connection_memory(network),
+            self.connection_memory(network, custom_kinds),
             match local_node_id {
                 Some(local_node_id) => {
                     remote_bootstrap_peer_count(&self.bootstrap_peers, local_node_id)
@@ -625,8 +642,15 @@ pub struct ZakuraLocalLimits {
 }
 
 impl ZakuraLocalLimits {
-    /// Build local handler limits from network configuration and handshake policy.
+    /// Build local handler limits from network configuration and handshake
+    /// policy, for a node that serves only the native stream kinds.
     pub fn from_config(config: &Config) -> Self {
+        Self::for_node(config, &[])
+    }
+
+    /// Like [`Self::from_config`], for a node that also serves `custom_kinds`.
+    /// The peer memory budget charges each connection for them.
+    pub fn for_node(config: &Config, custom_kinds: &[u16]) -> Self {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         Self {
             quic: config.zakura.quic.clone(),
@@ -639,7 +663,9 @@ impl ZakuraLocalLimits {
                 .min(budget_admitted_connections(
                     config.zakura.peer_memory_budget_bytes,
                     config.zakura.bound_socket_count(),
-                    config.zakura.connection_memory(&config.network),
+                    config
+                        .zakura
+                        .connection_memory(&config.network, custom_kinds),
                     config.zakura.max_pending_handshakes.max(1),
                 )),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
@@ -662,7 +688,7 @@ impl ZakuraLocalLimits {
     /// connection window starts at the handshake share, and the stream window
     /// holds the largest receive share.
     ///
-    /// The connection cap stays, so only [`Self::from_config`] calls this, with
+    /// The connection cap stays, so only [`Self::for_node`] calls this, with
     /// the shares that the cap was budgeted from.
     fn with_reactor_shares(mut self, shares: ReactorShares) -> Self {
         self.quic.receive_window_bytes =
@@ -4574,24 +4600,31 @@ async fn spawn_zakura_endpoint_inner(
         .map_err(super::BlockSyncStartError::InvalidConfig)?;
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
-    let budgeted_max_connections = config
-        .zakura
-        .budgeted_max_connections_for_node(&config.network, local_node_id)?;
+    let custom_kinds: Vec<u16> = custom_services
+        .iter()
+        .flat_map(|custom| custom.service.streams().iter().map(|stream| stream.kind))
+        .collect();
+    let budgeted_max_connections = config.zakura.budgeted_max_connections_for_node(
+        &config.network,
+        local_node_id,
+        &custom_kinds,
+    )?;
     if budgeted_max_connections < config.zakura.max_connections {
         warn!(
             max_connections = config.zakura.max_connections,
             budgeted_max_connections,
             peer_memory_budget_bytes = config.zakura.peer_memory_budget_bytes,
-            connection_memory = ?config.zakura.connection_memory(&config.network),
+            connection_memory = ?config.zakura.connection_memory(&config.network, &custom_kinds),
             "lowering [network.zakura] max_connections to what peer_memory_budget_bytes \
              admits at the configured QUIC windows and reactor shares; raise the budget or \
              lower max_connections to silence this"
         );
     }
-    let limits = ZakuraLocalLimits::from_config(config);
+    let limits = ZakuraLocalLimits::for_node(config, &custom_kinds);
     let node_envelope = crate::zakura::node_envelope::NodeEnvelope::for_node(
         config,
         &limits,
+        &custom_kinds,
         header_sync_driver_startup
             .as_ref()
             .map_or(0, |startup| startup.decoded_backend_blocks),

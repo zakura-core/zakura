@@ -307,7 +307,7 @@ mod tests {
             144_030_963
         );
         let config = ZakuraConfig::default();
-        assert_eq!(config.connection_memory(&mainnet()), mainnet_memory);
+        assert_eq!(config.connection_memory(&mainnet(), &[]), mainnet_memory);
         assert_eq!(QuicConfig::default().connection_memory_bytes(), HANDSHAKE);
 
         assert_eq!(DEFAULT_ZAKURA_MAX_CONNECTIONS, 92);
@@ -321,7 +321,7 @@ mod tests {
             Network::new_default_testnet(),
             Network::new_regtest(Default::default()),
         ] {
-            let quic = config.quic_memory_bytes(&network, DEFAULT_ZAKURA_MAX_CONNECTIONS);
+            let quic = config.quic_memory_bytes(&network, DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]);
             assert!(
                 quic <= u128::from(DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES),
                 "{network:?}"
@@ -333,13 +333,14 @@ mod tests {
             );
         }
         assert_eq!(
-            config.quic_memory_bytes(&mainnet(), DEFAULT_ZAKURA_MAX_CONNECTIONS),
+            config.quic_memory_bytes(&mainnet(), DEFAULT_ZAKURA_MAX_CONNECTIONS, &[]),
             15_474_155_580
         );
         assert_eq!(
             config.quic_memory_bytes(
                 &Network::new_regtest(Default::default()),
-                DEFAULT_ZAKURA_MAX_CONNECTIONS
+                DEFAULT_ZAKURA_MAX_CONNECTIONS,
+                &[],
             ),
             15_666_767_700
         );
@@ -391,7 +392,7 @@ mod tests {
         };
         config.block_sync.bbr_max_cwnd_bytes = 64 << 20;
         assert_eq!(
-            config.connection_memory(&mainnet()).admitted_bytes,
+            config.connection_memory(&mainnet(), &[]).admitted_bytes,
             CONNECTION + (32 << 20)
         );
         assert!(config.budgeted_max_connections(&mainnet()).unwrap() < 96);
@@ -437,7 +438,7 @@ mod tests {
         let outsider = NodeSecretKey::from_bytes(&[99; 32]).public();
         assert_eq!(
             config
-                .budgeted_max_connections_for_node(&mainnet(), outsider)
+                .budgeted_max_connections_for_node(&mainnet(), outsider, &[])
                 .unwrap_err()
                 .required,
             33
@@ -445,7 +446,7 @@ mod tests {
         // Leaving this node's own entry out lowers the floor to match discovery.
         assert_eq!(
             config
-                .budgeted_max_connections_for_node(&mainnet(), node_ids[0])
+                .budgeted_max_connections_for_node(&mainnet(), node_ids[0], &[])
                 .unwrap_err()
                 .required,
             31
@@ -507,7 +508,7 @@ mod tests {
         assert_eq!(
             config
                 .zakura
-                .budgeted_max_connections_for_node(&mainnet(), node_ids[0]),
+                .budgeted_max_connections_for_node(&mainnet(), node_ids[0], &[]),
             Ok(18)
         );
         assert_eq!(ZakuraLocalLimits::from_config(&config).max_connections, 18);

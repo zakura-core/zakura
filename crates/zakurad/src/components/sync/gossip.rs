@@ -56,11 +56,11 @@ const BLOCK_SIZE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// committed one has buried.
 pub(super) const MAX_WAITING_MINED: usize = 16;
 
-/// How many announcements one protocol sends at once.
+/// How many of this node's own blocks one protocol announces at once.
 ///
 /// With a peer connected, every block is sent as soon as it arrives, so this only matters for a
 /// run of submissions faster than their announcements finish: later ones wait their turn instead
-/// of each starting a task.
+/// of each starting a task. The committed tip is not held back by them.
 pub(super) const MAX_ACTIVE_BROADCASTS: usize = 16;
 
 /// Which waiting announcement a block replaces.
@@ -85,6 +85,16 @@ struct EarlyMined {
 
     /// Which RPC method submitted the block.
     submission: MinedBlockSubmission,
+}
+
+/// Which waiting mined block makes room when the queue is full.
+#[derive(Clone, Copy, Debug)]
+enum Eviction {
+    /// The one accepted first, when a newer block arrives.
+    Oldest,
+
+    /// The one accepted last, when an older block goes back to waiting.
+    Newest,
 }
 
 /// A block announcement waiting for a peer that can receive it.
@@ -232,8 +242,9 @@ struct Protocol<ZN> {
     /// most [`MAX_WAITING_MINED`] of them.
     mined: VecDeque<Announcement>,
 
-    /// The height of the newest block this node mined and committed. Every own block below it is
-    /// buried, so it is neither kept waiting nor put back after a dispatch.
+    /// The height of the newest block this node mined and committed. Every own block below it,
+    /// other than the best chain tip, is buried: it is neither kept waiting nor put back after a
+    /// dispatch.
     newest_committed_mined: Option<block::Height>,
 
     /// The wait for a peer, while this protocol has an announcement to send.
@@ -268,15 +279,14 @@ where
         }
     }
 
-    /// Returns whether this protocol has an announcement waiting for a peer.
-    fn is_waiting(&self) -> bool {
-        self.tip.is_some() || !self.mined.is_empty()
-    }
-
-    /// Returns whether a newer committed block of this node's own has buried `announcement`.
-    fn is_buried(&self, announcement: &Announcement) -> bool {
-        self.newest_committed_mined
-            .is_some_and(|newest| announcement.height < newest)
+    /// Returns whether a newer committed block of this node's own has buried `announcement`. The
+    /// best tip is never buried: a block that committed above it on a side chain implies nothing
+    /// about it.
+    fn is_buried(&self, announcement: &Announcement, best_tip: Option<block::Hash>) -> bool {
+        best_tip != Some(announcement.hash)
+            && self
+                .newest_committed_mined
+                .is_some_and(|newest| announcement.height < newest)
     }
 
     /// Returns whether a block this node mined is waiting to be announced.
@@ -325,19 +335,22 @@ where
         self.tip = Some(announcement);
     }
 
-    /// Accepts a block this node mined.
+    /// Accepts a block this node mined, given the best chain tip `best_tip`.
     ///
     /// A committed block buries every waiting own block below its height, and a block below the
     /// newest committed one is not accepted: it is either an ancestor the newer block implies, or
-    /// on a fork this node left when it committed the newer block. Blocks at one height are kept
-    /// together, since neither implies the other. A committed block takes the place of its own
-    /// submission. When the queue is full, the oldest waiting block makes room.
-    fn accept_mined(&mut self, announcement: Announcement) {
+    /// on a fork this node left when it committed the newer block. The best tip is the exception
+    /// both ways: it is never buried, and when it commits below the newest own block, after a
+    /// switch to a fork with more work, the blocks on that fork are wanted again, so the newest
+    /// height is lowered to its own. Blocks at one height are kept together, since neither
+    /// implies the other. A committed block takes the place of its own submission. When the queue
+    /// is full, the oldest waiting block other than the best tip makes room.
+    fn accept_mined(&mut self, best_tip: Option<block::Hash>, announcement: Announcement) {
         if self.stopped {
             return;
         }
         self.prune(Instant::now());
-        if self.is_buried(&announcement) {
+        if self.is_buried(&announcement, best_tip) {
             debug!(
                 height = ?announcement.height,
                 hash = ?announcement.hash,
@@ -347,10 +360,14 @@ where
             return;
         }
         if announcement.early.is_none() {
-            self.newest_committed_mined = Some(announcement.height);
+            self.newest_committed_mined = if best_tip == Some(announcement.hash) {
+                Some(announcement.height)
+            } else {
+                self.newest_committed_mined.max(Some(announcement.height))
+            };
             let name = self.name;
             self.mined.retain(|waiting| {
-                let buried = waiting.height < announcement.height;
+                let buried = waiting.height < announcement.height && best_tip != Some(waiting.hash);
                 if buried {
                     debug!(
                         height = ?waiting.height,
@@ -371,24 +388,40 @@ where
             return;
         }
         if self.mined.len() >= MAX_WAITING_MINED {
-            if let Some(oldest) = self.mined.pop_front() {
-                debug!(
-                    height = ?oldest.height,
-                    hash = ?oldest.hash,
-                    protocol = self.name,
-                    "dropping the oldest waiting mined block announcement: too many are waiting",
-                );
-            }
+            self.evict_waiting_mined(best_tip, Eviction::Oldest);
         }
         self.mined.push_back(announcement);
+    }
+
+    /// Drops one waiting mined block to make room for another, keeping the best tip.
+    fn evict_waiting_mined(&mut self, best_tip: Option<block::Hash>, eviction: Eviction) {
+        let not_tip = |waiting: &Announcement| best_tip != Some(waiting.hash);
+        let index = match eviction {
+            Eviction::Oldest => self.mined.iter().position(not_tip),
+            Eviction::Newest => self.mined.iter().rposition(not_tip),
+        };
+        if let Some(evicted) = index.and_then(|index| self.mined.remove(index)) {
+            debug!(
+                height = ?evicted.height,
+                hash = ?evicted.hash,
+                protocol = self.name,
+                "dropping a waiting mined block announcement: too many are waiting",
+            );
+        }
     }
 
     /// Takes the next announcement to send.
     ///
     /// This node's own blocks go first, oldest first: a miner's next template waits on them. The
-    /// tip waiting as a mined block too is one announcement.
+    /// tip waiting as a mined block too is one announcement. Once [`MAX_ACTIVE_BROADCASTS`] own
+    /// blocks are being sent, only the tip goes: it is not held up by a run of submissions.
     fn take_next(&mut self) -> Option<Announcement> {
-        let next = self.mined.pop_front().or_else(|| self.tip.take())?;
+        let mined = if self.active < MAX_ACTIVE_BROADCASTS {
+            self.mined.pop_front()
+        } else {
+            None
+        };
+        let next = mined.or_else(|| self.tip.take())?;
         if self.tip.as_ref().is_some_and(|tip| tip.hash == next.hash) {
             self.tip = None;
         }
@@ -398,9 +431,10 @@ where
     /// Puts a dispatched announcement back, if it is still an announcement this protocol wants.
     ///
     /// One that ran out of time, one that failed verification, a tip that is no longer the tip,
-    /// and a mined block that a newer committed one has buried are all dropped instead, except
-    /// that a mined block which is the best tip is still wanted: its tip event was consumed when
-    /// it was sent. A mined block goes back ahead of the blocks accepted after it.
+    /// and a mined block that a newer committed one has buried are all dropped instead. A mined
+    /// block goes back ahead of the blocks accepted after it, and the newest of them makes room
+    /// when the queue is full. A committed block takes the place of its own submission that is
+    /// still waiting; otherwise a block that is already waiting is not put back twice.
     fn restore(&mut self, announcement: Announcement, best_tip: Option<block::Hash>) {
         if self.stopped || !announcement.is_current(Instant::now()) {
             return;
@@ -412,12 +446,21 @@ where
                 }
             }
             Slot::Mined => {
-                let buried = self.is_buried(&announcement) && best_tip != Some(announcement.hash);
-                if buried
-                    || self.is_waiting_mined(&announcement.hash)
-                    || self.mined.len() >= MAX_WAITING_MINED
-                {
+                if self.is_buried(&announcement, best_tip) {
                     return;
+                }
+                if let Some(waiting) = self
+                    .mined
+                    .iter_mut()
+                    .find(|waiting| waiting.hash == announcement.hash)
+                {
+                    if waiting.early.is_some() && announcement.early.is_none() {
+                        *waiting = announcement;
+                    }
+                    return;
+                }
+                if self.mined.len() >= MAX_WAITING_MINED {
+                    self.evict_waiting_mined(best_tip, Eviction::Newest);
                 }
                 self.mined.push_front(announcement);
             }
@@ -451,10 +494,13 @@ where
     /// Starts or drops the wait for a peer, to match the waiting announcements.
     ///
     /// One wait covers every waiting announcement: a newer block replaces a waiting one without
-    /// restarting it. A protocol already sending [`MAX_ACTIVE_BROADCASTS`] announcements does not
-    /// wait: the next completion is an event, after which the wait starts.
+    /// restarting it. A protocol already sending [`MAX_ACTIVE_BROADCASTS`] announcements waits
+    /// only for the tip: the next completion is an event, after which the wait for the rest
+    /// starts.
     fn match_readiness(&mut self) {
-        if self.stopped || !self.is_waiting() || self.active >= MAX_ACTIVE_BROADCASTS {
+        let wants_peer =
+            self.tip.is_some() || (!self.mined.is_empty() && self.active < MAX_ACTIVE_BROADCASTS);
+        if self.stopped || !wants_peer {
             self.ready = None;
         } else if self.ready.is_none() {
             self.ready = Some(self.service.clone().ready_oneshot().boxed());
@@ -710,8 +756,9 @@ where
                     }
                 };
                 announcement.log_accepted();
+                let best_tip = chain_state.latest_chain_tip().best_tip_hash();
                 for protocol in &mut protocols {
-                    protocol.accept_mined(announcement.clone());
+                    protocol.accept_mined(best_tip, announcement.clone());
                 }
             }
 
@@ -1373,13 +1420,19 @@ mod tests {
         let older = block::Hash([6; 32]);
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(
-            waiting,
-            block::Height(2),
-            1_000,
-            Some(early(PendingBlockSignal::valid_for_tests())),
-        ));
-        protocol.accept_mined(Announcement::mined(older, block::Height(1), 1_000, None));
+        protocol.accept_mined(
+            None,
+            Announcement::mined(
+                waiting,
+                block::Height(2),
+                1_000,
+                Some(early(PendingBlockSignal::valid_for_tests())),
+            ),
+        );
+        protocol.accept_mined(
+            None,
+            Announcement::mined(older, block::Height(1), 1_000, None),
+        );
 
         let next = protocol.take_next().expect("a submission is waiting");
         assert_eq!(next.hash, waiting);
@@ -1397,8 +1450,14 @@ mod tests {
         let second = block::Hash([22; 32]);
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(first, block::Height(2), 1_000, None));
-        protocol.accept_mined(Announcement::mined(second, block::Height(2), 1_000, None));
+        protocol.accept_mined(
+            None,
+            Announcement::mined(first, block::Height(2), 1_000, None),
+        );
+        protocol.accept_mined(
+            None,
+            Announcement::mined(second, block::Height(2), 1_000, None),
+        );
 
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(first));
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(second));
@@ -1413,15 +1472,27 @@ mod tests {
         let late = block::Hash([26; 32]);
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(lower, block::Height(2), 1_000, None));
-        protocol.accept_mined(Announcement::mined(
-            submitted,
-            block::Height(3),
-            1_000,
-            Some(early(PendingBlockSignal::valid_for_tests())),
-        ));
-        protocol.accept_mined(Announcement::mined(newest, block::Height(4), 1_000, None));
-        protocol.accept_mined(Announcement::mined(late, block::Height(3), 1_000, None));
+        protocol.accept_mined(
+            None,
+            Announcement::mined(lower, block::Height(2), 1_000, None),
+        );
+        protocol.accept_mined(
+            None,
+            Announcement::mined(
+                submitted,
+                block::Height(3),
+                1_000,
+                Some(early(PendingBlockSignal::valid_for_tests())),
+            ),
+        );
+        protocol.accept_mined(
+            Some(newest),
+            Announcement::mined(newest, block::Height(4), 1_000, None),
+        );
+        protocol.accept_mined(
+            None,
+            Announcement::mined(late, block::Height(3), 1_000, None),
+        );
 
         assert_eq!(
             protocol.take_next().map(|next| next.hash),
@@ -1440,9 +1511,15 @@ mod tests {
         let second = block::Hash([28; 32]);
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(first, block::Height(2), 1_000, None));
+        protocol.accept_mined(
+            None,
+            Announcement::mined(first, block::Height(2), 1_000, None),
+        );
         let first_sent = protocol.take_next().expect("the first block is waiting");
-        protocol.accept_mined(Announcement::mined(second, block::Height(2), 1_000, None));
+        protocol.accept_mined(
+            None,
+            Announcement::mined(second, block::Height(2), 1_000, None),
+        );
 
         protocol.restore(first_sent, None);
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(first));
@@ -1450,23 +1527,125 @@ mod tests {
     }
 
     #[test]
-    fn a_buried_mined_block_that_is_the_tip_is_put_back() {
+    fn a_buried_mined_block_that_is_the_tip_again_is_put_back() {
         let tip = block::Hash([30; 32]);
-        let side = block::Hash([31; 32]);
+        let higher = block::Hash([31; 32]);
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(tip, block::Height(2), 1_000, None));
+        protocol.accept_mined(
+            Some(tip),
+            Announcement::mined(tip, block::Height(2), 1_000, None),
+        );
         let tip_sent = protocol.take_next().expect("the block is waiting");
-        // A higher own block committed on a side chain, so the sent block is still the tip.
-        protocol.accept_mined(Announcement::mined(side, block::Height(3), 1_000, None));
+        protocol.accept_mined(
+            Some(higher),
+            Announcement::mined(higher, block::Height(3), 1_000, None),
+        );
 
+        // A chain switch made the sent block the best tip again while it was being sent.
         protocol.restore(tip_sent, Some(tip));
         assert_eq!(
             protocol.take_next().map(|next| next.hash),
             Some(tip),
             "the best tip is still wanted, since its tip event was consumed when it was sent",
         );
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(higher));
+    }
+
+    #[test]
+    fn a_waiting_best_tip_is_not_buried_by_a_block_on_a_side_chain() {
+        let lower = block::Hash([32; 32]);
+        let tip = block::Hash([33; 32]);
+        let side = block::Hash([40; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            Some(lower),
+            Announcement::mined(lower, block::Height(1), 1_000, None),
+        );
+        protocol.accept_mined(
+            Some(tip),
+            Announcement::mined(tip, block::Height(2), 1_000, None),
+        );
+        // A higher own block committed on a side chain with less work, so the tip is unchanged.
+        protocol.accept_mined(
+            Some(tip),
+            Announcement::mined(side, block::Height(3), 1_000, None),
+        );
+
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(tip));
         assert_eq!(protocol.take_next().map(|next| next.hash), Some(side));
+        assert!(
+            protocol.take_next().is_none(),
+            "the block below the tip is buried"
+        );
+    }
+
+    #[test]
+    fn a_chain_switch_to_a_lower_tip_accepts_blocks_below_the_old_tip() {
+        let old_tip = block::Hash([34; 32]);
+        let new_tip = block::Hash([35; 32]);
+        let submitted = block::Hash([36; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            Some(old_tip),
+            Announcement::mined(old_tip, block::Height(3), 1_000, None),
+        );
+        // The chain switched to a fork with more work whose tip is lower, and this node mined on
+        // it.
+        protocol.accept_mined(
+            Some(new_tip),
+            Announcement::mined(new_tip, block::Height(2), 1_000, None),
+        );
+        protocol.accept_mined(
+            Some(new_tip),
+            Announcement::mined(
+                submitted,
+                block::Height(2),
+                1_000,
+                Some(early(PendingBlockSignal::valid_for_tests())),
+            ),
+        );
+
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(old_tip));
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(new_tip));
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(submitted));
+    }
+
+    #[test]
+    fn a_committed_block_put_back_replaces_its_waiting_submission() {
+        let hash = block::Hash([37; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            None,
+            Announcement::mined(
+                hash,
+                block::Height(2),
+                1_000,
+                Some(early(PendingBlockSignal::valid_for_tests())),
+            ),
+        );
+        let submission_sent = protocol.take_next().expect("the submission is waiting");
+        protocol.accept_mined(
+            Some(hash),
+            Announcement::mined(hash, block::Height(2), 1_000, None),
+        );
+        let committed_sent = protocol
+            .take_next()
+            .expect("the committed block is waiting");
+
+        // Both found no peer, the submission first.
+        protocol.restore(submission_sent, Some(hash));
+        protocol.restore(committed_sent, Some(hash));
+
+        let next = protocol.take_next().expect("the block is waiting");
+        assert!(
+            next.early.is_none() && next.tracked,
+            "the committed announcement took the place of its submission",
+        );
+        assert!(protocol.take_next().is_none());
     }
 
     #[test]
@@ -1475,12 +1654,10 @@ mod tests {
 
         let mut protocol = protocol();
         for index in 1..=MAX_WAITING_MINED + 1 {
-            protocol.accept_mined(Announcement::mined(
-                hash(index),
-                block::Height(2),
-                1_000,
+            protocol.accept_mined(
                 None,
-            ));
+                Announcement::mined(hash(index), block::Height(2), 1_000, None),
+            );
         }
 
         assert_eq!(protocol.mined.len(), MAX_WAITING_MINED);
@@ -1492,14 +1669,63 @@ mod tests {
     }
 
     #[test]
+    fn the_best_tip_is_not_dropped_from_a_full_mined_queue() {
+        let hash = |index: usize| block::Hash([u8::try_from(index).expect("small index"); 32]);
+
+        let mut protocol = protocol();
+        for index in 1..=MAX_WAITING_MINED + 1 {
+            // The first block stays the best tip: the later ones are its equal-work siblings.
+            protocol.accept_mined(
+                Some(hash(1)),
+                Announcement::mined(hash(index), block::Height(2), 1_000, None),
+            );
+        }
+
+        assert_eq!(protocol.mined.len(), MAX_WAITING_MINED);
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(hash(1)));
+        assert_eq!(
+            protocol.take_next().map(|next| next.hash),
+            Some(hash(3)),
+            "the oldest block other than the best tip made room",
+        );
+    }
+
+    #[test]
+    fn a_block_put_back_on_a_full_mined_queue_drops_the_newest_waiting_block() {
+        let hash = |index: usize| block::Hash([u8::try_from(index).expect("small index"); 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            Some(hash(1)),
+            Announcement::mined(hash(1), block::Height(2), 1_000, None),
+        );
+        let first_sent = protocol.take_next().expect("the first block is waiting");
+        for index in 2..=MAX_WAITING_MINED + 1 {
+            protocol.accept_mined(
+                Some(hash(1)),
+                Announcement::mined(hash(index), block::Height(2), 1_000, None),
+            );
+        }
+
+        protocol.restore(first_sent, Some(hash(1)));
+        assert_eq!(protocol.mined.len(), MAX_WAITING_MINED);
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(hash(1)));
+        let rest: Vec<_> =
+            std::iter::from_fn(|| protocol.take_next().map(|next| next.hash)).collect();
+        assert_eq!(
+            rest,
+            (2..=MAX_WAITING_MINED).map(hash).collect::<Vec<_>>(),
+            "the newest waiting block made room",
+        );
+    }
+
+    #[test]
     fn a_protocol_sending_the_active_bound_does_not_wait_for_a_peer() {
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(
-            block::Hash([29; 32]),
-            block::Height(2),
-            1_000,
+        protocol.accept_mined(
             None,
-        ));
+            Announcement::mined(block::Hash([29; 32]), block::Height(2), 1_000, None),
+        );
 
         protocol.active = MAX_ACTIVE_BROADCASTS;
         protocol.match_readiness();
@@ -1511,25 +1737,47 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_tip_is_sent_past_the_active_bound() {
+        let mined = block::Hash([38; 32]);
+        let tip = block::Hash([39; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            None,
+            Announcement::mined(mined, block::Height(2), 1_000, None),
+        );
+        protocol.accept_tip(Announcement::tip(tip, block::Height(3)));
+        protocol.active = MAX_ACTIVE_BROADCASTS;
+
+        protocol.match_readiness();
+        assert!(protocol.ready.is_some(), "the tip waits for a peer");
+        let next = protocol.take_next().expect("the tip is sent");
+        assert_eq!((next.hash, next.slot), (tip, Slot::Tip));
+        assert!(
+            protocol.take_next().is_none(),
+            "the mined block waits for a completion",
+        );
+
+        protocol.active -= 1;
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(mined));
+    }
+
+    #[test]
     fn a_rejected_submission_does_not_block_a_committed_block() {
         let submitted = block::Hash([11; 32]);
         let committed = block::Hash([12; 32]);
         let (pending, failure) = PendingBlockSignal::waiting_for_tests();
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(
-            submitted,
-            block::Height(3),
-            1_000,
-            Some(early(pending)),
-        ));
-        failure.fail();
-        protocol.accept_mined(Announcement::mined(
-            committed,
-            block::Height(2),
-            1_000,
+        protocol.accept_mined(
             None,
-        ));
+            Announcement::mined(submitted, block::Height(3), 1_000, Some(early(pending))),
+        );
+        failure.fail();
+        protocol.accept_mined(
+            None,
+            Announcement::mined(committed, block::Height(2), 1_000, None),
+        );
 
         let next = protocol
             .take_next()
@@ -1544,9 +1792,15 @@ mod tests {
         let newer = block::Hash([14; 32]);
 
         let mut protocol = protocol();
-        protocol.accept_mined(Announcement::mined(older, block::Height(2), 1_000, None));
+        protocol.accept_mined(
+            None,
+            Announcement::mined(older, block::Height(2), 1_000, None),
+        );
         let older_sent = protocol.take_next().expect("the older block is waiting");
-        protocol.accept_mined(Announcement::mined(newer, block::Height(3), 1_000, None));
+        protocol.accept_mined(
+            Some(newer),
+            Announcement::mined(newer, block::Height(3), 1_000, None),
+        );
         let newer_sent = protocol.take_next().expect("the newer block is waiting");
 
         protocol.restore(older_sent, None);

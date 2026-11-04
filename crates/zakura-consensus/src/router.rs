@@ -65,9 +65,13 @@ const VERIFIER_BUFFER_BOUND: usize = 5;
 ///
 /// The block verifier sends every transaction in a block through this buffer, so a large block
 /// queues thousands of requests at once. With a few slots, the block verifier and the buffer's
-/// worker take turns for each transaction instead of overlapping. A slot holds one queued request,
-/// so a full buffer costs a few megabytes at most. Mempool verification has its own concurrency
-/// limit, so it doesn't rely on this bound for backpressure.
+/// worker take turns for each transaction instead of overlapping.
+///
+/// Queued requests share their transaction and output data with the block that holds them, so a
+/// slot adds only its own bookkeeping. The queue is first in, first out, so a mempool request that
+/// arrives behind a block's requests waits for their verifier setup, about a microsecond each.
+/// Mempool verification has its own concurrency limit, so it doesn't rely on this bound for
+/// backpressure.
 const TRANSACTION_VERIFIER_BUFFER_BOUND: usize = 4096;
 
 /// The block verifier router routes requests to either the checkpoint verifier or the

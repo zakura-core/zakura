@@ -595,7 +595,6 @@ impl ReactorState {
             .vct_repair
             .current()
             .filter(|task| task.repair_generation == record.generation)
-            .cloned()
         else {
             self.vct_repair_stall = None;
             return None;
@@ -608,6 +607,8 @@ impl ReactorState {
         if !trace && !report {
             return None;
         }
+        // Copy the task, with its supplier history, only when output is due.
+        let task = task.clone();
         let best_peer_tip = self
             .peers
             .values()

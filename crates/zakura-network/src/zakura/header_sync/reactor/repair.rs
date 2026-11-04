@@ -96,7 +96,7 @@ impl HeaderSyncReactor {
             self.emit_vct_repair_state(&task, "retry", Some(retry.attribution.label()));
             if let Some(predecessor) = vct_repair_predecessor(&task) {
                 self.note_vct_repair_stall(
-                    &task,
+                    task.repair_generation,
                     predecessor,
                     VctSupplierRejections::default(),
                     retry.attribution.stall_outcome(),
@@ -116,7 +116,7 @@ impl HeaderSyncReactor {
     /// operator sees only that the repair made no progress.
     pub(super) fn note_vct_repair_stall(
         &mut self,
-        task: &RepairRequirement,
+        repair_generation: u64,
         predecessor: zakura_header_chain::Frontier,
         rejections: VctSupplierRejections,
         outcome: VctRepairStallOutcome,
@@ -131,13 +131,8 @@ impl HeaderSyncReactor {
         if outcome == VctRepairStallOutcome::NoEligibleSupplier {
             metrics::counter!("sync.header.vct.repair.no_supplier.total").increment(1);
         }
-        self.state.record_repair_stall(
-            task.repair_generation,
-            predecessor,
-            rejections,
-            outcome,
-            now,
-        );
+        self.state
+            .record_repair_stall(repair_generation, predecessor, rejections, outcome, now);
         self.refresh_vct_repair_stall(now);
     }
 
@@ -340,7 +335,8 @@ impl HeaderSyncReactor {
         if let Some(task) = self.state.vct_repair.current_mut() {
             task.resume_retry(now);
         }
-        let Some(task) = self.state.vct_repair.ready().cloned() else {
+        // Borrow the task for the candidate pass so its supplier history is not copied.
+        let Some(task) = self.state.vct_repair.ready() else {
             return;
         };
         let RepairPolicyState::Ready { context } = &task.state else {
@@ -349,6 +345,7 @@ impl HeaderSyncReactor {
         let Some(predecessor) = context.locator.entries().first().copied() else {
             return;
         };
+        let (owner, repair_generation) = (task.owner, task.repair_generation);
         let desired_count = u32::try_from(context.selected_header_count())
             .expect("a VCT repair range fits the transition header limit");
         let limits = RepairSupplierLimits {
@@ -367,13 +364,14 @@ impl HeaderSyncReactor {
                 subscription_live: handles.session.subscriber().live().is_some(),
             })
         });
-        let mut pass = repair_candidates(&task, context, limits, suppliers);
+        let mut pass = repair_candidates(task, context, limits, suppliers);
+        let context = context.clone();
         for peer in &pass.closing {
             self.close_subscription(peer);
         }
         if pass.candidates.is_empty() {
             self.note_vct_repair_stall(
-                &task,
+                repair_generation,
                 predecessor,
                 pass.rejections,
                 VctRepairStallOutcome::NoEligibleSupplier,
@@ -385,7 +383,7 @@ impl HeaderSyncReactor {
         let mut local_capacity_unavailable = false;
         let mut local_send_failure = false;
         for candidate in pass.candidates {
-            match self.try_repair_candidate(&task, context, candidate) {
+            match self.try_repair_candidate(owner, repair_generation, &context, candidate) {
                 RepairAttempt::Finished => return,
                 RepairAttempt::NoLocalCapacity => local_capacity_unavailable = true,
                 RepairAttempt::SendFailed { local } => {
@@ -396,18 +394,14 @@ impl HeaderSyncReactor {
         }
         let rejections = pass.rejections;
         if local_send_failure {
-            let deferred = self
-                .state
-                .vct_repair
-                .get_mut(task.owner)
-                .is_some_and(|task| {
-                    task.defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
-                        .is_ok()
-                });
+            let deferred = self.state.vct_repair.get_mut(owner).is_some_and(|task| {
+                task.defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
+                    .is_ok()
+            });
             if deferred {
-                if let Some(current) = self.state.vct_repair.get(task.owner).cloned() {
+                if let Some(current) = self.state.vct_repair.get(owner) {
                     self.note_vct_repair_stall(
-                        &current,
+                        current.repair_generation,
                         predecessor,
                         rejections,
                         VctRepairStallOutcome::LocalSendFailure,
@@ -417,7 +411,7 @@ impl HeaderSyncReactor {
             }
             return;
         }
-        if let Some(current) = self.state.vct_repair.get(task.owner).cloned() {
+        if let Some(current) = self.state.vct_repair.get(owner) {
             let stall_outcome = if rejections.send_failed > 0 {
                 Some(VctRepairStallOutcome::SupplierSendFailure)
             } else if local_capacity_unavailable {
@@ -426,21 +420,29 @@ impl HeaderSyncReactor {
                 None
             };
             if let Some(stall_outcome) = stall_outcome {
-                self.note_vct_repair_stall(&current, predecessor, rejections, stall_outcome, now);
+                self.note_vct_repair_stall(
+                    current.repair_generation,
+                    predecessor,
+                    rejections,
+                    stall_outcome,
+                    now,
+                );
             }
         }
         if local_capacity_unavailable {
-            let _ = self.state.vct_repair.get_mut(task.owner).and_then(|task| {
+            let _ = self.state.vct_repair.get_mut(owner).and_then(|task| {
                 task.defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
                     .ok()
             });
         }
     }
 
-    /// Reserve for, send, and start `task`'s repair request to `candidate`.
+    /// Reserve for, send, and start the repair request of `owner` and
+    /// `repair_generation` for `context` to `candidate`.
     pub(super) fn try_repair_candidate(
         &mut self,
-        task: &RepairRequirement,
+        owner: zakura_header_chain::BodyWorkOwner,
+        repair_generation: u64,
         context: &zakura_header_chain::VctRepairContext,
         candidate: RepairCandidate,
     ) -> RepairAttempt {
@@ -493,7 +495,7 @@ impl HeaderSyncReactor {
                 return match vct_send_retry_attribution(&error) {
                     VctRepairRetryAttribution::Supplier
                     | VctRepairRetryAttribution::ExcludedInput => {
-                        if let Some(current) = self.state.vct_repair.get_mut(task.owner) {
+                        if let Some(current) = self.state.vct_repair.get_mut(owner) {
                             let _ = current.record_failed_source(source);
                         }
                         self.state.rotate_supplier(source);
@@ -513,21 +515,21 @@ impl HeaderSyncReactor {
         self.emit_header_request(
             &peer,
             session.session_id(),
-            task.owner.header,
+            owner.header,
             request_id,
             request_target.hash,
             &selected_context.locator,
             request_count,
             AuxSchema::V1,
         );
-        let wire_owner = task.owner.authority.bind(
+        let wire_owner = owner.authority.bind(
             session.session_id(),
             NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
         );
         if self
             .state
             .vct_repair
-            .assign(task.owner, wire_owner, selected_context.clone(), advertised)
+            .assign(owner, wire_owner, selected_context.clone(), advertised)
             .is_err()
         {
             self.close_subscription(&peer);
@@ -550,7 +552,7 @@ impl HeaderSyncReactor {
                 ActiveHeaderRequest::new(
                     HeaderTargetPurpose::SelectedAuxiliaryRepair {
                         selected_target: request_target,
-                        repair_generation: task.repair_generation,
+                        repair_generation,
                     },
                     peer.clone(),
                     source,

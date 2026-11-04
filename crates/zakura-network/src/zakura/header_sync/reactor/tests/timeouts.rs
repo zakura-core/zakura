@@ -1438,7 +1438,7 @@ fn generation_stall_escalation_owns_a_maintenance_deadline() {
     let now = Instant::now();
 
     reactor.note_vct_repair_stall(
-        &task,
+        task.repair_generation,
         anchor,
         VctSupplierRejections::default(),
         VctRepairStallOutcome::LocalFailure,

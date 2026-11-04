@@ -2473,7 +2473,7 @@ impl HeaderSyncReactor {
                         );
                         if let Some(predecessor) = vct_repair_predecessor(&task) {
                             self.note_vct_repair_stall(
-                                &task,
+                                task.repair_generation,
                                 predecessor,
                                 VctSupplierRejections::default(),
                                 VctRepairStallOutcome::LocalOperationPending,

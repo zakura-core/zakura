@@ -442,7 +442,8 @@ def watch(helper, thread, state_path):
             if event and event not in events:
                 message = f"Mainnet digest comparison monitor: {event}. Inspect the owned collector at /var/lib/zakura-digest-compare/pr2022 on us-east-0 and continue the authorized comparison plan. This is a status event, not a new authorization."
                 queued = subprocess.run(["codex", "queue", "--thread", thread, "--message", message, "--resume"], capture_output=True, text=True, timeout=30)
-                if queued.returncode or "warning" in queued.stderr.lower():
+                active_writer = "already has an active writer" in queued.stderr and "Queued message" in queued.stdout
+                if queued.returncode or ("warning" in queued.stderr.lower() and not active_writer):
                     raise RuntimeError("native chat wake failed: " + queued.stderr[-1000:])
                 events.add(event)
                 state_path.write_text(json.dumps(sorted(events)))

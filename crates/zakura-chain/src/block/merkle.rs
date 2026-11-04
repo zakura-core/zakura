@@ -139,6 +139,20 @@ fn hash(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
     w.finish()
 }
 
+/// Merkle levels with at least this many nodes hash their pairs on the rayon pool.
+///
+/// Each pair costs about a microsecond without SHA instructions, so smaller levels stay serial.
+const PARALLEL_MERKLE_LEVEL_MIN: usize = 256;
+
+/// Hashes one Merkle level chunk into its parent node, pairing a lone last node with itself.
+fn hash_pair(chunk: &[[u8; 32]]) -> [u8; 32] {
+    match chunk {
+        [h1, h2] => hash(h1, h2),
+        [h1] => hash(h1, h1),
+        _ => unreachable!("chunks(2)"),
+    }
+}
+
 fn auth_data_hash(h1: &[u8; 32], h2: &[u8; 32]) -> [u8; 32] {
     // > Non-leaf hashes in this tree are BLAKE2b-256 hashes personalized by
     // > the string "ZcashAuthDatHash".
@@ -212,16 +226,19 @@ impl std::iter::FromIterator<transaction::Hash> for Root {
     where
         I: IntoIterator<Item = transaction::Hash>,
     {
+        use rayon::prelude::*;
+
         let mut hashes = hashes.into_iter().map(|hash| hash.0).collect::<Vec<_>>();
         while hashes.len() > 1 {
-            hashes = hashes
-                .chunks(2)
-                .map(|chunk| match chunk {
-                    [h1, h2] => hash(h1, h2),
-                    [h1] => hash(h1, h1),
-                    _ => unreachable!("chunks(2)"),
-                })
-                .collect();
+            hashes = if hashes.len() >= PARALLEL_MERKLE_LEVEL_MIN {
+                hashes
+                    .par_chunks(2)
+                    .with_min_len(PARALLEL_MERKLE_LEVEL_MIN / 8)
+                    .map(hash_pair)
+                    .collect()
+            } else {
+                hashes.chunks(2).map(hash_pair).collect()
+            };
         }
         Self(hashes[0])
     }
@@ -423,6 +440,34 @@ mod tests {
                     .map(|tx| tx.hash())
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    /// Trees large enough to take the parallel level path get the same root as a serial build,
+    /// including odd-sized levels that pair their last node with itself.
+    #[test]
+    fn parallel_levels_match_serial_root() {
+        for leaves in [
+            PARALLEL_MERKLE_LEVEL_MIN - 1,
+            PARALLEL_MERKLE_LEVEL_MIN,
+            PARALLEL_MERKLE_LEVEL_MIN + 1,
+            2_301,
+        ] {
+            let hashes: Vec<[u8; 32]> = (0..leaves)
+                .map(|i| {
+                    let mut leaf = [0; 32];
+                    leaf[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+                    leaf
+                })
+                .collect();
+
+            let mut level = hashes.clone();
+            while level.len() > 1 {
+                level = level.chunks(2).map(hash_pair).collect();
+            }
+
+            let root: Root = hashes.into_iter().map(transaction::Hash).collect();
+            assert_eq!(root.0, level[0], "{leaves} leaves");
         }
     }
 

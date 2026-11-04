@@ -51,6 +51,12 @@ const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// Bounds the failure-path read that checks a body's authorizing data binding.
 const AUTH_DATA_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Blocks with at least this many transactions hash their transaction IDs on the rayon pool.
+///
+/// Smaller blocks hash in well under a millisecond, so they stay on the calling thread rather than
+/// wait on a pool shared with proof verification.
+const PARALLEL_TRANSACTION_HASH_MIN: usize = 128;
+
 /// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -562,7 +568,19 @@ where
 
                 // Precomputing this avoids duplicating transaction hash computations.
                 let transaction_hashes: Arc<[_]> =
-                    block.view().transactions().map(|t| t.hash()).collect();
+                    if block.view().transactions().len() >= PARALLEL_TRANSACTION_HASH_MIN {
+                        use rayon::prelude::*;
+
+                        block
+                            .view()
+                            .parallel_transactions()
+                            .with_min_len(PARALLEL_TRANSACTION_HASH_MIN / 4)
+                            .map(|t| t.hash())
+                            .collect::<Vec<_>>()
+                            .into()
+                    } else {
+                        block.view().transactions().map(|t| t.hash()).collect()
+                    };
 
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
 

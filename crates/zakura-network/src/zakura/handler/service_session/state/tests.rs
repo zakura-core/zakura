@@ -188,6 +188,54 @@ fn losing_or_duplicate_remote_offers_are_rejected_before_reservation() {
     assert!(losing.rejects_remote_offer());
 }
 
+/// A local open in flight holds the service: no second reopen starts, and the
+/// collision winner rejects a peer's offer as if its own session existed.
+#[test]
+fn an_open_in_flight_holds_the_service_until_it_ends() {
+    let winner = ConnectionRoles {
+        is_initiator: true,
+        i_open_collision_winner: true,
+    };
+    let mut session = ServiceSessionState::new(test_ordered_stream(), REOPEN, winner);
+    assert!(session.may_reopen(false));
+    session.begin_attempt();
+    assert!(!session.may_reopen(false), "one open at a time");
+    assert!(session.rejects_remote_offer());
+    assert_eq!(session.remote_completed(2), RemoteCompletion::ParkCollision);
+    assert!(session.accepts_local_open(false));
+    assert!(
+        !session.accepts_local_open(true),
+        "a cancelled connection installs nothing"
+    );
+    session.open_failed();
+    assert!(session.may_reopen(false), "a failed open frees the service");
+    assert!(!session.rejects_remote_offer());
+}
+
+/// The collision loser adopts a peer session that completes while its own
+/// open is in flight, and that open then installs nothing.
+#[test]
+fn a_lost_collision_during_an_open_drops_the_open() {
+    let mut session = state(test_ordered_stream());
+    session.begin_attempt();
+    assert!(
+        !session.rejects_remote_offer(),
+        "the loser adopts the peer's stream"
+    );
+    assert_eq!(
+        session.remote_completed(2),
+        RemoteCompletion::AdoptCollision
+    );
+    assert_eq!(
+        session.remote_demand(2, DemandWait::OpenNow),
+        RemoteDemand::Adopt
+    );
+    assert!(!session.accepts_local_open(false));
+    session.open_failed();
+    assert_eq!(session.remote_session_id, Some(2));
+    assert_eq!(session.local_session_id, None);
+}
+
 /// A parked generation's late exit cannot remove the replacement adopted after it.
 #[test]
 fn an_old_generation_exit_leaves_the_replacement_active() {

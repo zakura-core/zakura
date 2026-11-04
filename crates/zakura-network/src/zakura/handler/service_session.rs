@@ -329,29 +329,37 @@ pub(super) fn spawn_service_session(
     admitted
 }
 
+/// One locally opened stream whose prelude is written, before the service
+/// reserves a session for it.
+///
+/// Retaining this value keeps its transport stream permit charged. Dropping it
+/// stops the stream through `SetupIo` and releases its resource ownership.
+pub(super) struct OpenedStream {
+    io: SetupIo,
+    stream: Stream,
+    prelude: StreamPrelude,
+    stream_id: u64,
+    permit: OwnedSemaphorePermit,
+    resources: StreamResources,
+}
+
 impl ZakuraProtocolHandler {
-    /// Complete local setup of one outbound stream without starting its worker.
+    /// Open one outbound stream and write its prelude, without reserving its
+    /// service or starting its worker.
     ///
     /// Reserve a transport stream slot, open a bidirectional stream, and write its
     /// prelude under bounded waits. For a multi-stream session, the caller supplies the same
-    /// nonzero `session_id` for every member and attaches their shared service resources
-    /// afterward. The returned value retains the stream slot until handoff or drop.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare_ordered_stream(
+    /// nonzero `session_id` for every member. The peer paces both waits through
+    /// stream credit, so the caller runs this beside the connection reactor.
+    pub(super) async fn open_ordered_stream(
         &self,
         connection: &Connection,
         stream: Stream,
         session_id: Option<u64>,
         stream_sem: &Arc<Semaphore>,
         resources: &ConnectionResources,
-        message_buckets: &mut MessageRateBuckets,
         limits: ZakuraConnectionLimits,
-        connection_token: CancellationToken,
-        close_cause: CloseCause,
-        freshness_tx: watch::Sender<Instant>,
-        conn: ZakuraConnTrace,
-        peer_id: ZakuraPeerId,
-    ) -> Result<PreparedStream, ZakuraHandlerError> {
+    ) -> Result<OpenedStream, ZakuraHandlerError> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let permit = stream_sem
             .clone()
@@ -386,6 +394,38 @@ impl ZakuraProtocolHandler {
         )
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("ordered stream prelude write"))??;
+        Ok(OpenedStream {
+            io,
+            stream,
+            prelude,
+            stream_id,
+            permit,
+            resources: stream_resources,
+        })
+    }
+
+    /// Complete local setup of one opened stream without starting its worker.
+    /// The returned value retains the stream slot until handoff or drop.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_opened_stream(
+        &self,
+        opened: OpenedStream,
+        message_buckets: &mut MessageRateBuckets,
+        limits: ZakuraConnectionLimits,
+        connection_token: CancellationToken,
+        close_cause: CloseCause,
+        freshness_tx: watch::Sender<Instant>,
+        conn: ZakuraConnTrace,
+        peer_id: ZakuraPeerId,
+    ) -> PreparedStream {
+        let OpenedStream {
+            io,
+            stream,
+            prelude,
+            stream_id,
+            permit,
+            resources,
+        } = opened;
         // All members spend the same message-rate budget, so splitting a service
         // across several streams does not double its allowance.
         let bucket_kind = self
@@ -414,7 +454,7 @@ impl ZakuraProtocolHandler {
             message_bucket,
             cadence,
             precheck: PrecheckSlot::default(),
-            resources: stream_resources,
+            resources,
             stream_token: connection_token.child_token(),
             connection_token,
             close_cause,
@@ -422,12 +462,12 @@ impl ZakuraProtocolHandler {
         };
         metrics::counter!("zakura.p2p.stream.accepted", "stream_kind" => stream_kind_label(stream.kind)).increment(1);
         conn.trace_stream("accepted", stream_id, Some(stream_kind_label(stream.kind)));
-        Ok(PreparedStream {
+        PreparedStream {
             io,
             stream,
             prelude,
             context,
-        })
+        }
     }
 }
 

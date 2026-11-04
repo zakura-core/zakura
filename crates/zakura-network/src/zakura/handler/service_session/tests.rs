@@ -2291,3 +2291,58 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
     }
     Ok(())
 }
+
+/// Take one of the peer's stream credits on the client's connection, the
+/// side that reopens sessions in [`Fixture`]. Holding the returned stream
+/// without writing to it withholds the credit: the peer never learns of the
+/// stream, so it issues no replacement credit until the stream drops.
+async fn hold_stream_credit(fixture: &Fixture) -> Result<(SendStream, RecvStream), BoxError> {
+    Ok(timeout(TEST_TIMEOUT, fixture.connection.open_bi()).await??)
+}
+
+/// A reopen whose `open_bi` waits for stream credit leaves the connection
+/// reactor running: cancelling the connection ends it at once, without
+/// waiting for the open's own deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_waiting_for_stream_credit_leaves_the_connection_reactor_running(
+) -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let mut fixture = Fixture::start_with_config(false, Some(2), true).await?;
+    let (client, _server) = fixture.sessions().await?;
+    client.cancel.cancel();
+    // The session's streams return their credits before the 250 ms reopen
+    // backoff ends, and this takes one, so the reopen's second member waits.
+    let _held = hold_stream_credit(&fixture).await?;
+    tokio::time::sleep(state::ORDERED_STREAM_REOPEN_BACKOFF * 4).await;
+    assert!(fixture.client_sessions.try_recv().is_err());
+
+    let cancelled = Instant::now();
+    client.connection_cancel.cancel();
+    timeout(Duration::from_secs(2), &mut fixture.serving)
+        .await
+        .expect("the reactor sees the cancellation while the reopen waits")??;
+    assert!(cancelled.elapsed() < OUTBOUND_STREAM_WRITE_TIMEOUT);
+    timeout(TEST_TIMEOUT, fixture.client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, fixture.server.shutdown()).await?;
+    Ok(())
+}
+
+/// A reopen that waited for stream credit installs its session once the
+/// credit returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopen_completes_once_withheld_stream_credit_returns() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let mut fixture = Fixture::start_with_config(false, Some(2), true).await?;
+    let (client, _server) = fixture.sessions().await?;
+    client.cancel.cancel();
+    let held = hold_stream_credit(&fixture).await?;
+    tokio::time::sleep(state::ORDERED_STREAM_REOPEN_BACKOFF * 4).await;
+    assert!(fixture.client_sessions.try_recv().is_err());
+
+    drop(held);
+    let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
+    assert_eq!(replacement_client.conn_id, client.conn_id);
+    assert_ne!(replacement_client.id, client.id);
+    exchange(&mut replacement_client, &mut replacement_server).await?;
+    fixture.close().await
+}

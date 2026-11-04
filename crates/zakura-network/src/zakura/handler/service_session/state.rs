@@ -280,6 +280,10 @@ pub(in crate::zakura::handler) struct ServiceSessionState {
     reopen_state: SessionReopenState,
     /// Local opens started on this connection, which name each attempt in traces.
     open_attempts: u64,
+    /// Whether a local open has started and not yet installed or failed. The
+    /// open's transport IO runs beside the connection reactor, so a peer's
+    /// session of the same service can complete meanwhile.
+    open_in_flight: bool,
 }
 
 impl ServiceSessionState {
@@ -298,13 +302,37 @@ impl ServiceSessionState {
             reopen_attempts: 0,
             reopen_state: SessionReopenState::Idle,
             open_attempts: 0,
+            open_in_flight: false,
         }
     }
 
-    /// Name a new local open. Returns its attempt, counted from 1.
+    /// Name a new local open. Returns its attempt, counted from 1. The open
+    /// stays in flight until [`Self::opened`] or [`Self::open_failed`].
     pub(in crate::zakura::handler) fn begin_attempt(&mut self) -> u64 {
         self.open_attempts = self.open_attempts.saturating_add(1);
+        self.open_in_flight = true;
         self.open_attempts
+    }
+
+    /// A local open ended without installing a generation.
+    pub(in crate::zakura::handler) fn open_failed(&mut self) {
+        self.open_in_flight = false;
+    }
+
+    /// Whether a local open whose streams are ready may install its
+    /// generation: the connection is live and no peer session took the service
+    /// while the open ran.
+    pub(in crate::zakura::handler) fn accepts_local_open(
+        &self,
+        connection_cancelled: bool,
+    ) -> bool {
+        !connection_cancelled && self.remote_session_id.is_none()
+    }
+
+    /// Whether this endpoint holds the service locally: an installed local
+    /// generation or an open in flight.
+    fn has_local_claim(&self) -> bool {
+        self.local_session_id.is_some() || self.open_in_flight
     }
 
     /// The service's primary stream.
@@ -323,31 +351,37 @@ impl ServiceSessionState {
 
     /// Whether a peer-opened stream must be dropped before reserving capacity:
     /// a remote session still owns its slot, or this side wins the collision
-    /// with its own session.
+    /// with its own session or open.
     pub(in crate::zakura::handler) fn rejects_remote_offer(&self) -> bool {
         self.remote_session_id.is_some()
-            || (self.roles.i_open_collision_winner && self.local_session_id.is_some())
+            || (self.roles.i_open_collision_winner && self.has_local_claim())
     }
 
     /// Whether a fired reopen wait may check demand: the connection is live,
-    /// this endpoint opens the service, and no generation is active.
+    /// this endpoint opens the service, no generation is active, and no local
+    /// open is in flight.
     pub(in crate::zakura::handler) fn may_reopen(&self, connection_cancelled: bool) -> bool {
-        !connection_cancelled && self.opens_locally() && !self.has_active_session()
+        !connection_cancelled
+            && self.opens_locally()
+            && !self.has_active_session()
+            && !self.open_in_flight
     }
 
     /// Adopt a locally opened generation. The caller drops any reopen wait.
     pub(in crate::zakura::handler) fn opened(&mut self, session_id: u64) {
         self.clear_wait();
+        self.open_in_flight = false;
         self.local_session_id = Some(session_id);
     }
 
     /// Record a complete inbound generation, unless this endpoint wins the
-    /// collision with its own.
+    /// collision with its own session or open. A lost collision with an open
+    /// in flight leaves that open to be dropped; see [`Self::accepts_local_open`].
     pub(in crate::zakura::handler) fn remote_completed(
         &mut self,
         session_id: u64,
     ) -> RemoteCompletion {
-        let is_collision = self.local_session_id.is_some();
+        let is_collision = self.has_local_claim();
         // The deterministic winner keeps its own stream and parks the peer's.
         // The loser falls through and adopts the peer's stream.
         if is_collision && self.roles.i_open_collision_winner {

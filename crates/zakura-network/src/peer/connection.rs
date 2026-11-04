@@ -862,7 +862,10 @@ where
 
             // A block advert that peer messages have kept waiting goes before the next one.
             self.note_waiting_advert();
-            let advert_due = self.block_advert_is_due();
+            // The turn's one decision: a due advert goes before the next peer message, and the
+            // write counts it as such with the wait decided on here.
+            let overdue_advert_wait = self.overdue_advert_wait();
+            let advert_due = overdue_advert_wait.is_some();
             match self.state {
                 State::AwaitingRequest => {
                     trace!("awaiting client request or peer message");
@@ -917,7 +920,7 @@ where
                         msg = peer_rx.next(), if !advert_due => Either::Left(msg),
                         // A closed advert channel disables only this branch.
                         Some(advert) = self.block_advert_rx.recv() => {
-                            self.send_block_advert(advert).await;
+                            self.send_block_advert(advert, overdue_advert_wait).await;
                             continue;
                         }
                         req = self.client_rx.next() => Either::Right(req),
@@ -1039,7 +1042,7 @@ where
                         }
                         msg = peer_rx.next().instrument(span.clone()), if !advert_due => msg,
                         Some(advert) = self.block_advert_rx.recv() => {
-                            self.send_block_advert(advert).await;
+                            self.send_block_advert(advert, overdue_advert_wait).await;
                             continue;
                         }
                     };
@@ -1161,25 +1164,26 @@ where
         }
     }
 
-    /// Returns how long peer messages have kept a block advert waiting, once that is at least
-    /// [`WAITING_ADVERT_PRIORITY_DELAY`].
+    /// Returns how long peer messages have kept the waiting block adverts queued, once that is
+    /// at least [`WAITING_ADVERT_PRIORITY_DELAY`]: the next advert then goes before the next
+    /// peer message. `None` while the queue is empty or its wait is shorter.
     fn overdue_advert_wait(&self) -> Option<Duration> {
+        if self.block_advert_rx.is_empty() {
+            return None;
+        }
         self.advert_waiting_since
             .map(|since| since.elapsed())
             .filter(|waited| *waited >= WAITING_ADVERT_PRIORITY_DELAY)
     }
 
-    /// Returns whether a waiting block advert goes before the next peer message, because it has
-    /// waited for [`WAITING_ADVERT_PRIORITY_DELAY`] while peer messages went first.
-    fn block_advert_is_due(&self) -> bool {
-        self.overdue_advert_wait().is_some() && !self.block_advert_rx.is_empty()
-    }
-
     /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
     /// acknowledges it once the local write completes.
     ///
+    /// `overdue_wait` is how long the queue had waited when this turn decided that the advert
+    /// goes before the next peer message, or `None` when it goes out in a gap between them.
+    ///
     /// Does not change the state of any request that is awaiting its response.
-    async fn send_block_advert(&mut self, advert: BlockAdvert) {
+    async fn send_block_advert(&mut self, advert: BlockAdvert, overdue_wait: Option<Duration>) {
         if advert.result.is_closed() {
             metrics::counter!("peer.canceled").increment(1);
             metrics::counter!(
@@ -1190,10 +1194,10 @@ where
             return;
         }
 
-        if let Some(waited) = self.overdue_advert_wait() {
+        if let Some(queue_waited) = overdue_wait {
             metrics::counter!("peer.block_gossip.advert_priority_writes").increment(1);
             debug!(
-                ?waited,
+                ?queue_waited,
                 "writing a block advert ahead of the peer's messages"
             );
         }

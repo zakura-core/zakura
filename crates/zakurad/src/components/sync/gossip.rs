@@ -10,9 +10,16 @@
 //! block, and the first peer to connect is sent the current tip and this node's own mined block
 //! instead of the whole backlog.
 //!
+//! Announcements finish in any order, so a late completion of an older block never displaces a
+//! newer block's waiting announcement or its delivery record.
+//!
 //! [`block::Hash`]: zakura_chain::block::Hash
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    time::Duration,
+};
 
 use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use thiserror::Error;
@@ -207,6 +214,10 @@ struct Protocol<ZN> {
     /// The latest block this node mined waiting for a peer.
     mined: Option<Announcement>,
 
+    /// The latest block this node mined that took the mined slot, so a dispatched announcement
+    /// of an older one is not put back.
+    latest_mined: Option<block::Hash>,
+
     /// The wait for a peer, while this protocol has an announcement to send.
     ready: Option<BoxFuture<'static, Result<ZN, BoxError>>>,
 
@@ -228,6 +239,7 @@ where
             service,
             tip: None,
             mined: None,
+            latest_mined: None,
             ready: None,
             broadcasts: MinedBlockBroadcasts::default(),
             stopped: false,
@@ -239,20 +251,39 @@ where
         self.tip.is_some() || self.mined.is_some()
     }
 
-    /// Accepts the committed best chain tip, unless this protocol is already announcing that
-    /// block as a mined block.
+    /// Accepts the committed best chain tip.
+    ///
+    /// A tip this protocol is already announcing as a mined block is not accepted, and the tip
+    /// still waiting is dropped, since that announcement covers the tip. The one retry of a
+    /// failed mined announcement keeps its mined priority over the same block's tip event.
     fn accept_tip(&mut self, announcement: Announcement) {
         if self.stopped {
             return;
         }
         if self.broadcasts.is_in_flight(&announcement.hash)
-            || self.broadcasts.delivered() == Some(announcement.hash)
+            || self.broadcasts.was_delivered(&announcement.hash)
         {
             debug!(
                 height = ?announcement.height,
                 hash = ?announcement.hash,
                 protocol = self.name,
                 "skipping committed block announcement: it is announced as a mined block",
+            );
+            // The mined announcement is this protocol's announcement of the tip, so whatever tip
+            // was still waiting is older and obsolete.
+            self.tip = None;
+            return;
+        }
+        if self
+            .tip
+            .as_ref()
+            .is_some_and(|waiting| waiting.hash == announcement.hash && waiting.mined)
+        {
+            debug!(
+                height = ?announcement.height,
+                hash = ?announcement.hash,
+                protocol = self.name,
+                "keeping the mined retry of the committed tip",
             );
             return;
         }
@@ -265,11 +296,12 @@ where
             return;
         }
         match &self.mined {
-            // A different block committed while this node's submission is still waiting. The
-            // submitted block is the one peers need next, and the committed block is announced by
-            // the committed-tip path if it is the tip.
+            // A different block committed while this node's submission is still waiting and
+            // still worth sending. The submitted block is the one peers need next, and the
+            // committed block is announced by the committed-tip path if it is the tip.
             Some(waiting)
                 if waiting.early.is_some()
+                    && waiting.is_current(Instant::now())
                     && waiting.hash != announcement.hash
                     && announcement.early.is_none() =>
             {
@@ -282,7 +314,10 @@ where
             }
             // Otherwise the newest mined block replaces the waiting one: either a newer
             // submission, or this block's own commitment.
-            _ => self.mined = Some(announcement),
+            _ => {
+                self.latest_mined = Some(announcement.hash);
+                self.mined = Some(announcement);
+            }
         }
     }
 
@@ -301,12 +336,17 @@ where
     /// Puts a dispatched announcement back, if it is still the announcement this protocol wants.
     ///
     /// A block replaced by a newer one, one that ran out of time, one that failed verification,
-    /// and a tip that is no longer the tip are all dropped instead.
+    /// a tip that is no longer the tip, and a mined block that is no longer the latest one are
+    /// all dropped instead.
     fn restore(&mut self, announcement: Announcement, best_tip: Option<block::Hash>) {
         if self.stopped || !announcement.is_current(Instant::now()) {
             return;
         }
-        if announcement.slot == Slot::Tip && best_tip != Some(announcement.hash) {
+        let still_wanted = match announcement.slot {
+            Slot::Tip => best_tip == Some(announcement.hash),
+            Slot::Mined => self.latest_mined == Some(announcement.hash),
+        };
+        if !still_wanted {
             return;
         }
         let waiting = match announcement.slot {
@@ -865,29 +905,42 @@ fn finish_broadcast<ZN>(
     protocol.accept_tip(Announcement::retry(hash, height, size));
 }
 
-/// Counts the protocols that have announced the latest committed mined block.
+/// How many delivered mined blocks a delivery record remembers.
+///
+/// Announcements finish in any order, so one remembered block is not enough: a slower
+/// announcement of an older block would erase a newer block's record. Sixteen outlasts every
+/// announcement that can still be in flight, since the RPC admits at most that many submissions
+/// at once.
+const RECENT_DELIVERIES: usize = 16;
+
+/// Counts the protocols that have announced each recently committed mined block.
 ///
 /// Every protocol shares one committed-tip path, so that path is only suppressed once every
 /// protocol has announced the block.
 #[derive(Debug, Default)]
 struct MinedDeliveries {
-    /// The block the counted announcements are for.
-    hash: Option<block::Hash>,
-
-    /// How many protocols have announced [`Self::hash`].
-    protocols: usize,
+    /// How many protocols have announced each block, oldest block first, at most
+    /// [`RECENT_DELIVERIES`] blocks.
+    recent: VecDeque<(block::Hash, usize)>,
 }
 
 impl MinedDeliveries {
     /// Records one protocol's announcement of `hash`, returning whether all `protocols` have
     /// announced it.
     fn delivered(&mut self, hash: block::Hash, protocols: usize) -> bool {
-        if self.hash != Some(hash) {
-            self.hash = Some(hash);
-            self.protocols = 0;
-        }
-        self.protocols += 1;
-        self.protocols >= protocols
+        let index = match self.recent.iter().position(|(recent, _)| *recent == hash) {
+            Some(index) => index,
+            None => {
+                if self.recent.len() >= RECENT_DELIVERIES {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back((hash, 0));
+                self.recent.len() - 1
+            }
+        };
+        let (_, count) = &mut self.recent[index];
+        *count += 1;
+        *count >= protocols
     }
 }
 
@@ -901,8 +954,9 @@ struct MinedBlockBroadcasts {
     /// accumulate.
     in_flight: HashMap<block::Hash, usize>,
 
-    /// The most recent hash whose mined-block announcement succeeded.
-    delivered: Option<block::Hash>,
+    /// The hashes whose mined-block announcement succeeded, oldest first, at most
+    /// [`RECENT_DELIVERIES`] of them.
+    delivered: VecDeque<block::Hash>,
 }
 
 impl MinedBlockBroadcasts {
@@ -914,9 +968,9 @@ impl MinedBlockBroadcasts {
         self.in_flight.contains_key(hash)
     }
 
-    /// Returns the most recent hash whose mined-block announcement succeeded.
-    fn delivered(&self) -> Option<block::Hash> {
-        self.delivered
+    /// Returns whether a mined-block announcement of `hash` succeeded recently.
+    fn was_delivered(&self, hash: &block::Hash) -> bool {
+        self.delivered.contains(hash)
     }
 
     /// Records a completed announcement.
@@ -932,26 +986,34 @@ impl MinedBlockBroadcasts {
         }
 
         if succeeded {
-            self.delivered = Some(hash);
+            if !self.was_delivered(&hash) {
+                if self.delivered.len() >= RECENT_DELIVERIES {
+                    self.delivered.pop_front();
+                }
+                self.delivered.push_back(hash);
+            }
             return false;
         }
 
-        !self.is_in_flight(&hash) && self.delivered != Some(hash)
+        !self.is_in_flight(&hash) && !self.was_delivered(&hash)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        next_gossip_event, Announcement, BroadcastCompleted, GossipEvent, MinedBlockBroadcasts,
-        MinedDeliveries, Outcome, Slot,
+        next_gossip_event, Announcement, BroadcastCompleted, EarlyMined, GossipEvent,
+        MinedBlockBroadcasts, MinedDeliveries, Outcome, Protocol, Slot, RECENT_DELIVERIES,
     };
 
     use std::future;
 
     use tokio::sync::mpsc;
+    use tower::util::BoxCloneService;
     use zakura_chain::block;
-    use zakura_rpc::MinedBlockEvent;
+    use zakura_rpc::{MinedBlockEvent, MinedBlockSubmission, PendingBlockSignal};
+
+    use crate::BoxError;
 
     // Repeat the vector so removing `biased;` reliably exposes randomized
     // selection among the ready events.
@@ -1084,7 +1146,53 @@ mod tests {
         assert!(!broadcasts.finish(hash, true));
         assert!(!broadcasts.finish(hash, false));
         assert!(!broadcasts.is_in_flight(&hash));
-        assert_eq!(broadcasts.delivered(), Some(hash));
+        assert!(broadcasts.was_delivered(&hash));
+    }
+
+    #[test]
+    fn a_late_success_for_an_older_mined_block_keeps_the_newer_delivery() {
+        let older = block::Hash([7; 32]);
+        let newer = block::Hash([8; 32]);
+        let mut broadcasts = MinedBlockBroadcasts::default();
+
+        broadcasts.start(older);
+        broadcasts.start(newer);
+        assert!(!broadcasts.finish(newer, true));
+        assert!(!broadcasts.finish(older, true));
+
+        assert!(broadcasts.was_delivered(&newer));
+        assert!(broadcasts.was_delivered(&older));
+        assert!(
+            !broadcasts.finish(newer, false),
+            "a delivered block needs no retry",
+        );
+    }
+
+    #[test]
+    fn delivery_records_remember_a_bounded_number_of_blocks() {
+        let mut broadcasts = MinedBlockBroadcasts::default();
+        let mut deliveries = MinedDeliveries::default();
+        let hash = |index: usize| block::Hash([u8::try_from(index).expect("small index"); 32]);
+
+        for index in 0..=RECENT_DELIVERIES {
+            broadcasts.finish(hash(index), true);
+            assert!(!deliveries.delivered(hash(index), 2));
+        }
+
+        assert!(
+            !broadcasts.was_delivered(&hash(0)),
+            "the oldest is forgotten"
+        );
+        assert!(broadcasts.was_delivered(&hash(1)));
+        assert!(broadcasts.was_delivered(&hash(RECENT_DELIVERIES)));
+        assert!(
+            deliveries.delivered(hash(RECENT_DELIVERIES), 2),
+            "the newest count is kept"
+        );
+        assert!(
+            !deliveries.delivered(hash(0), 2),
+            "the oldest count starts again",
+        );
     }
 
     #[test]
@@ -1106,30 +1214,164 @@ mod tests {
     }
 
     #[test]
+    fn a_late_delivery_of_an_older_mined_block_does_not_reset_the_count() {
+        let older = block::Hash([9; 32]);
+        let newer = block::Hash([10; 32]);
+        let mut deliveries = MinedDeliveries::default();
+
+        assert!(!deliveries.delivered(newer, 2));
+        assert!(!deliveries.delivered(older, 2));
+        assert!(
+            deliveries.delivered(newer, 2),
+            "the older block's late delivery kept the newer block's count",
+        );
+    }
+
+    /// A protocol whose service answers every advertisement.
+    fn protocol(
+    ) -> Protocol<BoxCloneService<zakura_network::Request, zakura_network::Response, BoxError>>
+    {
+        Protocol::new(
+            "legacy",
+            BoxCloneService::new(tower::service_fn(|_: zakura_network::Request| async {
+                Ok::<_, BoxError>(zakura_network::Response::Nil)
+            })),
+        )
+    }
+
+    /// A submission of a block that is not committed yet.
+    fn early(pending: PendingBlockSignal) -> EarlyMined {
+        EarlyMined {
+            pending,
+            submitted_at: std::time::Instant::now(),
+            submission: MinedBlockSubmission::FullBlock,
+        }
+    }
+
+    #[test]
     fn a_waiting_submission_survives_an_older_block_committing() {
         let waiting = block::Hash([5; 32]);
         let older = block::Hash([6; 32]);
 
-        let mut submission = Announcement::mined(waiting, block::Height(2), 1_000, None);
-        submission.early = Some(super::EarlyMined {
-            pending: zakura_rpc::PendingBlockSignal::valid_for_tests(),
-            submitted_at: std::time::Instant::now(),
-            submission: zakura_rpc::MinedBlockSubmission::FullBlock,
-        });
-        submission.tracked = false;
-
-        let mut protocol = super::Protocol::new(
-            "legacy",
-            tower::service_fn(|_: zakura_network::Request| async {
-                Ok::<_, crate::BoxError>(zakura_network::Response::Nil)
-            }),
-        );
-        protocol.accept_mined(submission);
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(
+            waiting,
+            block::Height(2),
+            1_000,
+            Some(early(PendingBlockSignal::valid_for_tests())),
+        ));
         protocol.accept_mined(Announcement::mined(older, block::Height(1), 1_000, None));
 
         let next = protocol.take_next().expect("a submission is waiting");
         assert_eq!(next.hash, waiting);
         assert_eq!(next.slot, Slot::Mined);
         assert!(protocol.take_next().is_none(), "the older block is dropped");
+    }
+
+    #[test]
+    fn a_rejected_submission_does_not_block_a_committed_block() {
+        let submitted = block::Hash([11; 32]);
+        let committed = block::Hash([12; 32]);
+        let (pending, failure) = PendingBlockSignal::waiting_for_tests();
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(
+            submitted,
+            block::Height(3),
+            1_000,
+            Some(early(pending)),
+        ));
+        failure.fail();
+        protocol.accept_mined(Announcement::mined(
+            committed,
+            block::Height(2),
+            1_000,
+            None,
+        ));
+
+        let next = protocol
+            .take_next()
+            .expect("the committed block is waiting");
+        assert_eq!(next.hash, committed);
+        assert_eq!(next.slot, Slot::Mined);
+    }
+
+    #[test]
+    fn a_mined_block_replaced_while_it_was_being_sent_is_not_put_back() {
+        let older = block::Hash([13; 32]);
+        let newer = block::Hash([14; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(older, block::Height(2), 1_000, None));
+        let older_sent = protocol.take_next().expect("the older block is waiting");
+        protocol.accept_mined(Announcement::mined(newer, block::Height(3), 1_000, None));
+        let newer_sent = protocol.take_next().expect("the newer block is waiting");
+
+        protocol.restore(older_sent, None);
+        assert!(
+            protocol.take_next().is_none(),
+            "the older block was replaced while it was being sent",
+        );
+
+        protocol.restore(newer_sent, None);
+        let next = protocol.take_next().expect("the newer block is put back");
+        assert_eq!(next.hash, newer);
+    }
+
+    #[test]
+    fn a_committed_tip_announced_as_a_mined_block_clears_the_waiting_tip() {
+        let older = block::Hash([15; 32]);
+        let mined = block::Hash([16; 32]);
+        let newest = block::Hash([17; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_tip(Announcement::tip(older, block::Height(2)));
+        protocol.broadcasts.start(mined);
+        protocol.accept_tip(Announcement::tip(mined, block::Height(3)));
+        assert!(
+            protocol.take_next().is_none(),
+            "the mined announcement in flight covers the tip",
+        );
+
+        protocol.broadcasts.finish(mined, true);
+        protocol.accept_tip(Announcement::tip(older, block::Height(2)));
+        protocol.accept_tip(Announcement::tip(mined, block::Height(3)));
+        assert!(
+            protocol.take_next().is_none(),
+            "the delivered mined announcement covers the tip",
+        );
+
+        protocol.accept_tip(Announcement::tip(newest, block::Height(4)));
+        let next = protocol.take_next().expect("a newer tip is announced");
+        assert_eq!(next.hash, newest);
+        assert!(!next.mined);
+    }
+
+    #[test]
+    fn a_committed_tip_keeps_the_waiting_retry_of_the_same_block() {
+        let hash = block::Hash([18; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_tip(Announcement::retry(hash, block::Height(3), Some(1_000)));
+        protocol.accept_tip(Announcement::tip(hash, block::Height(3)));
+
+        let next = protocol.take_next().expect("the retry is waiting");
+        assert_eq!(next.hash, hash);
+        assert!(next.mined, "the retry keeps its mined priority");
+        assert_eq!(next.size, Some(1_000));
+    }
+
+    #[test]
+    fn a_newer_tip_replaces_a_waiting_retry() {
+        let older = block::Hash([19; 32]);
+        let newer = block::Hash([20; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_tip(Announcement::retry(older, block::Height(3), Some(1_000)));
+        protocol.accept_tip(Announcement::tip(newer, block::Height(4)));
+
+        let next = protocol.take_next().expect("the newer tip is waiting");
+        assert_eq!(next.hash, newer);
+        assert!(!next.mined);
     }
 }

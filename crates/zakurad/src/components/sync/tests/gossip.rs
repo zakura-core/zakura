@@ -669,6 +669,11 @@ impl GatedGossipSetup {
     fn connect_peers(&self) {
         self.peers.send_replace(true);
     }
+
+    /// Takes the legacy protocol's peers away, so its next announcement waits for one.
+    fn disconnect_peers(&self) {
+        self.peers.send_replace(false);
+    }
 }
 
 /// Starts a gossip task with no legacy peer connected, and Zakura peers only `with_native`.
@@ -895,6 +900,123 @@ async fn a_newer_tip_does_not_cancel_an_active_announcement() {
     setup
         .legacy
         .expect_request(Request::AdvertiseBlock(without_size(&block_three), None))
+        .await
+        .respond(Response::Nil);
+    setup.legacy.expect_no_requests().await;
+}
+
+/// A mined block announcement whose peers all disappear before it is sent waits for the next
+/// peer, like a committed tip's does.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_mined_announcement_without_peers_at_dispatch_waits_for_the_next_peer() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let block_two = mainnet_block(2);
+
+    setup.vanishing.store(1, Ordering::SeqCst);
+    setup.connect_peers();
+    setup.mined(&block_two);
+
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .await
+        .respond(Response::Nil);
+    setup.legacy.expect_no_requests().await;
+}
+
+/// A slower announcement of an older mined block finishing after a newer block's does not make
+/// the committed-tip path announce the newer block again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_late_mined_completion_does_not_reannounce_the_newer_block_as_the_tip() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let block_two = mainnet_block(2);
+    let block_three = mainnet_block(3);
+    let block_four = mainnet_block(4);
+
+    setup.connect_peers();
+    setup.mined(&block_two);
+    let older = setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .await;
+    setup.mined(&block_three);
+    let newer = setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_three)))
+        .await;
+
+    // The newer block's announcement finishes first.
+    newer.respond(Response::Nil);
+    tokio::time::sleep(TIP_PROCESSING_DELAY).await;
+    older.respond(Response::Nil);
+    tokio::time::sleep(TIP_PROCESSING_DELAY).await;
+
+    // A checkpoint commit publishes its tip after the mined block event.
+    setup.commit(&block_two).await;
+    setup.commit(&block_three).await;
+    setup.legacy.expect_no_requests().await;
+
+    // A dead gossip task would also send nothing. Require it to relay the next tip.
+    setup.commit(&block_four).await;
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseBlock(without_size(&block_four), None))
+        .await
+        .respond(Response::Nil);
+}
+
+/// A submission that is rejected while it waits for a peer does not keep a block that commits in
+/// the meantime from being announced.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_committed_block_replaces_a_rejected_submission_that_is_still_waiting() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let block_two = mainnet_block(2);
+    let block_three = mainnet_block(3);
+
+    let failure = setup.submitted(&block_three);
+    tokio::time::sleep(TIP_PROCESSING_DELAY).await;
+
+    // Rejecting the submission wakes nothing, so the committed block's event is what finds the
+    // rejected submission still waiting. Nothing yields between these steps.
+    failure.fail();
+    setup.mined(&block_two);
+    setup.connect_peers();
+
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .await
+        .respond(Response::Nil);
+    setup.legacy.expect_no_requests().await;
+}
+
+/// The retry of a failed mined block announcement keeps its mined priority when the block's own
+/// tip event reaches it while it waits for a peer.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_late_committed_tip_keeps_the_mined_retry_waiting() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let block_two = mainnet_block(2);
+
+    setup.connect_peers();
+    setup.mined(&block_two);
+    let failing = setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .await;
+
+    // The peers go away, so the retry waits for one, and the tip is published only now, so its
+    // event reaches the waiting retry.
+    setup.disconnect_peers();
+    setup.chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
+    failing.respond_error("the peer went away".into());
+    tokio::time::sleep(TIP_PROCESSING_DELAY * 2).await;
+
+    setup.connect_peers();
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
     setup.legacy.expect_no_requests().await;

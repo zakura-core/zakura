@@ -30,7 +30,8 @@ use super::{LegacyGossipFrame, ZakuraGossipBroadcast, ZakuraSupervisorHandle};
 /// Ready once a session can take a frame, which may be a session with a full queue, like a busy
 /// legacy peer. A block is recorded as seen, and kept for replay to later peers, only once a
 /// session queued it; a block already seen, sent earlier or relayed from a peer, is not sent
-/// again. Requests other than block advertisements fail.
+/// again. A submitted block that the chain has not committed yet is never kept for replay, since
+/// the chain can still reject it. Requests other than block advertisements fail.
 pub(crate) struct ZakuraBlockAdvertiser {
     broadcast: ZakuraGossipBroadcast,
     readiness: Readiness,
@@ -68,9 +69,11 @@ impl ZakuraBlockAdvertiser {
         })
     }
 
+    /// Sends `frame` to the open sessions, keeping a committed block for replay to later peers.
     async fn advertise(
         broadcast: ZakuraGossipBroadcast,
         frame: LegacyGossipFrame,
+        committed: bool,
     ) -> Result<Response, BoxError> {
         if broadcast.unseen(&frame).await.is_none() {
             return Ok(Response::Nil);
@@ -79,7 +82,9 @@ impl ZakuraBlockAdvertiser {
         let fanout = broadcast.outbound.fan_out_to_peers(&frame, None);
         if fanout.delivered > 0 {
             broadcast.mark_seen(&frame).await;
-            broadcast.outbound.remember_latest_block(&frame);
+            if committed {
+                broadcast.outbound.remember_latest_block(&frame);
+            }
             return Ok(Response::Nil);
         }
         if fanout.attempted == 0 || !broadcast.outbound.has_open_session() {
@@ -152,6 +157,7 @@ impl Service<Request> for ZakuraBlockAdvertiser {
         Box::pin(Self::advertise(
             broadcast,
             LegacyGossipFrame::AdvertiseBlock(block.hash),
+            !block.submitted,
         ))
     }
 }
@@ -166,7 +172,7 @@ mod tests {
 
     use crate::{
         peer::NoEligibleBlockPeers,
-        protocol::internal::{Request, Response},
+        protocol::internal::{AdvertisedBlock, Request, Response},
         zakura::{
             framed_channel,
             legacy_gossip::{
@@ -437,6 +443,46 @@ mod tests {
         assert!(
             format!("{clone:?}").contains("idle"),
             "a clone establishes its own readiness"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_does_not_keep_a_submitted_block_for_replay(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_session, mut receiver) = insert_session(&broadcast.outbound, 10, 1);
+        let hash = block_hash(10);
+
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseMinedBlock(AdvertisedBlock::submitted(
+                hash, 1_000,
+            )))
+            .await?;
+        assert_eq!(
+            recv_advert(&mut receiver).await?,
+            hash,
+            "a submitted block is announced to the peers connected now"
+        );
+        assert!(
+            !is_unseen(&broadcast, hash).await,
+            "a delivered submission is recorded as seen"
+        );
+        assert_eq!(
+            latest_block(&broadcast.outbound),
+            None,
+            "a block the chain can still reject is not kept for later peers"
+        );
+
+        let (later, mut later_receiver) = insert_session(&broadcast.outbound, 11, 1);
+        broadcast
+            .outbound
+            .replay_latest_block_to_peer(later)
+            .await?;
+        assert!(
+            later_receiver.try_recv().is_err(),
+            "a later peer is not sent the submitted block"
         );
         Ok(())
     }

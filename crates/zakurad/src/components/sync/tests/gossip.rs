@@ -32,7 +32,11 @@ use zakura_state::{
 };
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use crate::components::sync::{self, gossip::BLOCK_GOSSIP_TIMEOUT, BlockGossipError, SyncStatus};
+use crate::components::sync::{
+    self,
+    gossip::{BLOCK_GOSSIP_TIMEOUT, MAX_ACTIVE_BROADCASTS, MAX_WAITING_MINED},
+    BlockGossipError, SyncStatus,
+};
 
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
@@ -40,6 +44,11 @@ const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 /// tips that the state can size carry it.
 fn with_size(block: &Block) -> AdvertisedBlock {
     AdvertisedBlock::new(block.hash(), block.zcash_serialized_size())
+}
+
+/// The advertisement of `block` as a submission the chain has not committed yet.
+fn submitted_with_size(block: &Block) -> AdvertisedBlock {
+    AdvertisedBlock::submitted(block.hash(), block.zcash_serialized_size())
 }
 
 /// The advertisement of a committed tip whose size the state does not have.
@@ -363,7 +372,9 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
         .expect("the early mined block notification is accepted");
 
     peer_set
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .expect_request(Request::AdvertiseMinedBlock(submitted_with_size(
+            &block_two,
+        )))
         .await
         .respond(Response::Nil);
 
@@ -728,11 +739,12 @@ async fn setup_gated_gossip_test(with_native: bool) -> GatedGossipSetup {
     }
 }
 
-/// A run of commits with nobody to advertise to leaves one announcement per slot: the first peer
-/// to connect is sent the current tip and this node's own block, not the whole backlog.
+/// A run of commits with nobody to advertise to leaves the current tip and this node's newest
+/// own block: each committed own block buries the lower ones, so the first peer to connect is
+/// sent those two, not the whole backlog.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn commits_without_peers_keep_only_the_latest_tip_and_mined_block() {
-    /// Repeats of mainnet blocks 2 to 10, so the task sees many more tip changes than slots.
+    /// Repeats of mainnet blocks 2 to 10, so the task sees many more tip changes than it keeps.
     const CYCLES: u32 = 20;
 
     let mut setup = setup_gated_gossip_test(false).await;
@@ -851,7 +863,9 @@ async fn a_submitted_child_is_announced_while_its_parent_is_the_tip() {
     let _failure = setup.submitted(&block_three);
     setup
         .legacy
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_three)))
+        .expect_request(Request::AdvertiseMinedBlock(submitted_with_size(
+            &block_three,
+        )))
         .await
         .respond(Response::Nil);
 }
@@ -867,7 +881,9 @@ async fn a_committed_block_is_announced_after_its_submission() {
     let _failure = setup.submitted(&block_two);
     setup
         .legacy
-        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .expect_request(Request::AdvertiseMinedBlock(submitted_with_size(
+            &block_two,
+        )))
         .await
         .respond(Response::Nil);
 
@@ -1019,5 +1035,108 @@ async fn a_late_committed_tip_keeps_the_mined_retry_waiting() {
         .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
+    setup.legacy.expect_no_requests().await;
+}
+
+/// Another solution to `block`'s template: the same block with `nonce` in its header, so it has
+/// the same height and a different hash.
+fn same_height_variant(block: &Block, nonce: u8) -> Arc<Block> {
+    let mut header = *block.header;
+    header.nonce = [nonce; 32].into();
+    Arc::new(Block {
+        header: Arc::new(header),
+        transactions: block.transactions.clone(),
+    })
+}
+
+/// Two of this node's own blocks at one height are independent: neither implies the other, so
+/// the first peer to connect is sent both.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn equal_height_mined_blocks_are_both_announced_to_the_first_peer() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let template = mainnet_block(2);
+    let first = same_height_variant(&template, 1);
+    let second = same_height_variant(&template, 2);
+
+    setup.mined(&first);
+    setup.mined(&second);
+    setup.legacy.expect_no_requests().await;
+
+    setup.connect_peers();
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&first)))
+        .await
+        .respond(Response::Nil);
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&second)))
+        .await
+        .respond(Response::Nil);
+    setup.legacy.expect_no_requests().await;
+}
+
+/// The blocks waiting for a peer are bounded: past the bound, the oldest makes room.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn waiting_mined_blocks_are_bounded() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let template = mainnet_block(2);
+    let variants: Vec<_> = (1..=MAX_WAITING_MINED + 1)
+        .map(|nonce| same_height_variant(&template, u8::try_from(nonce).expect("small nonce")))
+        .collect();
+
+    for block in &variants {
+        setup.mined(block);
+    }
+    setup.legacy.expect_no_requests().await;
+
+    setup.connect_peers();
+    for block in &variants[1..] {
+        setup
+            .legacy
+            .expect_request(Request::AdvertiseMinedBlock(with_size(block)))
+            .await
+            .respond(Response::Nil);
+    }
+    setup.legacy.expect_no_requests().await;
+}
+
+/// A run of this node's own blocks is sent a bounded number at a time: the rest wait until an
+/// announcement finishes.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_run_of_mined_blocks_is_announced_a_bounded_number_at_a_time() {
+    let mut setup = setup_gated_gossip_test(false).await;
+    let template = mainnet_block(2);
+    let variants: Vec<_> = (1..=MAX_ACTIVE_BROADCASTS + 1)
+        .map(|nonce| same_height_variant(&template, u8::try_from(nonce).expect("small nonce")))
+        .collect();
+
+    setup.connect_peers();
+    let mut active = Vec::new();
+    for block in &variants[..MAX_ACTIVE_BROADCASTS] {
+        setup.mined(block);
+        active.push(
+            setup
+                .legacy
+                .expect_request(Request::AdvertiseMinedBlock(with_size(block)))
+                .await,
+        );
+    }
+
+    // Every announcement slot is busy, so one more block waits.
+    setup.mined(&variants[MAX_ACTIVE_BROADCASTS]);
+    setup.legacy.expect_no_requests().await;
+
+    active.remove(0).respond(Response::Nil);
+    setup
+        .legacy
+        .expect_request(Request::AdvertiseMinedBlock(with_size(
+            &variants[MAX_ACTIVE_BROADCASTS],
+        )))
+        .await
+        .respond(Response::Nil);
+    for responder in active {
+        responder.respond(Response::Nil);
+    }
     setup.legacy.expect_no_requests().await;
 }

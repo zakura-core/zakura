@@ -233,8 +233,18 @@ fn build_header_sync_reactor(
         last_snapshot_refresh_trace_at: Cell::new(None),
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
+        observe!(reactor, ReactorEvent::adopted(snapshot));
         reactor.emit_snapshot_observed(None, snapshot);
     }
+    // The returned handle holds the watch's only receiver, so it sees this value.
+    observe!(
+        reactor,
+        ReactorEvent::TipPublished {
+            height: initial_tip.0,
+            hash: initial_tip.1,
+            delivered: true,
+        }
+    );
     reactor.schedule_current_vct_repair();
     Ok((handle, actions_rx, reactor))
 }
@@ -2269,6 +2279,7 @@ impl HeaderSyncReactor {
         if self.committed_snapshot.as_ref() == Some(&snapshot) {
             return;
         }
+        observe!(self, ReactorEvent::adopted(&snapshot));
 
         self.state.bump_scheduling_revision();
         let header_authority_changed = self.committed_snapshot.as_ref().is_some_and(|old| {
@@ -2305,7 +2316,16 @@ impl HeaderSyncReactor {
             }
         }
         if old_tip != Some(new_tip) {
-            let _ = self.tip.send((new_tip.height, new_tip.hash));
+            #[cfg_attr(not(any(test, zakura_sim)), allow(unused_variables))]
+            let delivered = self.tip.send((new_tip.height, new_tip.hash)).is_ok();
+            observe!(
+                self,
+                ReactorEvent::TipPublished {
+                    height: new_tip.height,
+                    hash: new_tip.hash,
+                    delivered,
+                }
+            );
             self.publish_peer_state();
         }
         self.refresh_statuses();
@@ -2353,6 +2373,14 @@ impl HeaderSyncReactor {
         };
         match session.try_send_status(status.clone()) {
             Ok(()) => {
+                observe!(
+                    self,
+                    ReactorEvent::StatusQueued {
+                        peer: peer.clone(),
+                        session_id: session.session_id(),
+                        status: status.clone(),
+                    }
+                );
                 self.emit_status(
                     hs_trace::HEADER_STATUS_SENT,
                     peer,
@@ -2376,6 +2404,13 @@ impl HeaderSyncReactor {
                     .and_then(|handles| handles.status_publisher.as_mut())
                 {
                     publisher.record_failed(now);
+                    observe!(
+                        self,
+                        ReactorEvent::StatusDeferred {
+                            peer: peer.clone(),
+                            session_id: session.session_id(),
+                        }
+                    );
                 }
                 tracing::debug!(?peer, ?error, "failed to queue header-sync Status");
                 self.emit_queue_send_failed(peer, &session, "Status", &error, None);

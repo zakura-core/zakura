@@ -8,8 +8,10 @@
 //! `Sim::new` by [`preload`], since a run's scenario clock would otherwise
 //! decide whether the fixture headers validate. [`policy`] holds individual
 //! operations, and gates `Control` steps, until chosen events happen. A
-//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
+//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts,
+//! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
 
+pub mod adoption;
 mod pair;
 pub mod policy;
 pub mod tap;
@@ -613,6 +615,22 @@ impl Topology {
         };
         self.effects.links.borrow_mut().push(link.clone());
         link
+    }
+
+    /// The sessions still admitted from the links' side: each peer's newest
+    /// link that no one closed. A relink replaces a peer's session, and a
+    /// node that drops a session closes its link.
+    pub fn live_sessions(&self) -> BTreeSet<u64> {
+        let links = self.effects.links.borrow();
+        let mut newest = std::collections::BTreeMap::new();
+        for link in links.iter() {
+            newest.insert(link.peer.as_str(), link);
+        }
+        newest
+            .into_values()
+            .filter(|link| !link.is_closed())
+            .map(|link| link.session_id)
+            .collect()
     }
 
     /// The newest link between the node under test and the node named

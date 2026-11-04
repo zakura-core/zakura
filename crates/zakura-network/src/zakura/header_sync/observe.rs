@@ -1,18 +1,23 @@
 //! Synchronous header-sync reactor events for simulator tests.
 //!
 //! The reactor reports its port calls, active-request starts and
-//! retirements, and refused offers to an installed [`HeaderSyncObserver`].
+//! retirements, refused offers, the committed state it adopts and what it
+//! publishes from that state to an installed [`HeaderSyncObserver`].
 //! This module exists only in test and `zakura_sim` builds. Production builds
 //! compile none of it, and the reactor's `observe!` macro drops its tokens.
 
 use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, task};
 
-use zakura_chain::block;
-use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId};
+use zakura_chain::{block, work::difficulty::U256};
+use zakura_header_chain::{
+    BodyWorkOwner, EngineSnapshot, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, SourceId, StateVersion,
+};
 use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
 use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
+    Status,
 };
 pub use super::{
     reactor::HeaderRequestTerminal,
@@ -160,6 +165,51 @@ pub enum ReactorEvent {
         /// `peer`'s current session when the violation was dispatched.
         current: Option<u64>,
     },
+    /// The reactor adopted a committed snapshot as the state it schedules and
+    /// publishes from: once at construction, then each time it observes a
+    /// different one. Reported before the reactor retires the work the
+    /// snapshot makes obsolete, so every later event follows from it.
+    SnapshotAdopted {
+        /// The snapshot's durable state version.
+        state_version: StateVersion,
+        /// The selected-header work generation that new work captures.
+        header_generation: HeaderGeneration,
+        /// The finality anchor.
+        finalized: Frontier,
+        /// The selected header tip.
+        header_best: Frontier,
+        /// Work after the anchor through `header_best`, as `Status` carries it.
+        suffix_work: U256,
+        /// The lowest height the node retains headers for.
+        oldest_retained: block::Height,
+    },
+    /// The reactor queued `status` on `peer`'s session.
+    StatusQueued {
+        /// The peer.
+        peer: ZakuraPeerId,
+        /// The session the status went to.
+        session_id: u64,
+        /// The queued advertisement.
+        status: Status,
+    },
+    /// The session's output queue refused a due `Status`, and the reactor
+    /// scheduled a retry of its latest desired status.
+    StatusDeferred {
+        /// The peer.
+        peer: ZakuraPeerId,
+        /// The session that refused it.
+        session_id: u64,
+    },
+    /// The reactor published a selected header tip on its tip watch: the
+    /// watch's initial value at construction, then each send.
+    TipPublished {
+        /// The tip's height.
+        height: block::Height,
+        /// The tip's hash.
+        hash: block::Hash,
+        /// Whether a receiver saw it. A send with no live receiver is lost.
+        delivered: bool,
+    },
 }
 
 impl ReactorEvent {
@@ -168,6 +218,18 @@ impl ReactorEvent {
         Self::Started {
             request: RequestRef::of(active),
             purpose: active.purpose.clone(),
+        }
+    }
+
+    /// A `SnapshotAdopted` event for `snapshot`.
+    pub(crate) fn adopted(snapshot: &EngineSnapshot) -> Self {
+        Self::SnapshotAdopted {
+            state_version: snapshot.state_version,
+            header_generation: snapshot.header_generation,
+            finalized: snapshot.frontiers.finalized,
+            header_best: snapshot.frontiers.header_best,
+            suffix_work: snapshot.header_best_score.suffix_work.as_u256(),
+            oldest_retained: snapshot.oldest_retained_height,
         }
     }
 

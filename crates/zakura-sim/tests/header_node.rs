@@ -294,6 +294,8 @@ impl HasView for Planted {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Default::default(),
+            adoption: Default::default(),
+            live_sessions: Default::default(),
         }
     }
 }

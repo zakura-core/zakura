@@ -20,6 +20,11 @@
 //! the call still existed, or the run fails as `UnpairedDrop`. A run that ends
 //! before the teardown is done leaves that open.
 //!
+//! The reactor's adopted state and what it publishes from it stay out of the
+//! log too. The tap keeps them, with the generations of its `Started` and
+//! locator `Dispatched` events, in an [`AdoptionEvidence`] that the harness's
+//! view reads.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -42,7 +47,10 @@ use zakura_rt::sim::RunId;
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::controlled::ControlledPort;
 
-use super::pair::{PairError, Pairer};
+use super::{
+    adoption::{AdoptionEvidence, AdoptionFact},
+    pair::{PairError, Pairer},
+};
 use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
@@ -86,6 +94,8 @@ struct TapState {
     buffer: Mutex<Buffer>,
     /// Checks each call's identity and retained headers as events arrive.
     work: Mutex<WorkCheck>,
+    /// The reactor's adopted state and what it published, for the view.
+    adoption: AdoptionEvidence,
 }
 
 /// The tap's ownership check, and the first rule a history broke.
@@ -180,6 +190,18 @@ impl HeaderSyncObserver for TapObserver {
     fn observe(&self, event: ReactorEvent) {
         let state = &self.0;
         let in_run = zakura_rt::sim::run_id() == Some(state.run);
+        if let Some(fact) = AdoptionFact::of(&event) {
+            let unlogged = fact.is_unlogged();
+            // Only a live reactor adopts state or publishes, so none of it
+            // happens in the run's own shutdown.
+            match zakura_scheduler::hooks::now().filter(|_| in_run) {
+                Some(now) => state.adoption.record(now.since_start(), fact),
+                None => state.refused.store(true, Ordering::Relaxed),
+            }
+            if unlogged {
+                return;
+            }
+        }
         // Ownership events stay out of the observation log, whose format pinned
         // Plans fix.
         if matches!(
@@ -252,6 +274,7 @@ impl ReactorTap {
                 unwound: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 work: Mutex::default(),
+                adoption: AdoptionEvidence::default(),
             }))
         });
         let state = observer.0.clone();
@@ -283,6 +306,11 @@ impl ReactorTap {
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
         self.pairer.facts(facts);
+    }
+
+    /// The reactor's adoption facts, which the tap fills as they happen.
+    pub fn adoption(&self) -> AdoptionEvidence {
+        self.state.adoption.clone()
     }
 }
 
@@ -504,6 +532,9 @@ impl ActionSource for ReactorTap {
         // text names neither.
         if log.run() != self.id.run {
             return Err("ForeignRun: reactor tap registered with another run".to_owned());
+        }
+        if let Some(now) = zakura_scheduler::hooks::now() {
+            self.state.adoption.reach(now.since_start());
         }
         let events = mem::take(&mut self.state.buffer().events);
         let last = events.last().map_or(self.delivered, |(seq, _, _)| *seq);

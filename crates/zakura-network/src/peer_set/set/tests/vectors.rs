@@ -1673,9 +1673,10 @@ fn block_advertiser_peer_list_is_republished_only_on_membership_change() {
     });
 }
 
-/// The block advertiser waits for a peer instead of failing while none is connected.
+/// The block advertiser is unready while no peer is connected, instead of accepting an
+/// advertisement that would wait.
 #[test]
-fn block_advertiser_waits_for_a_connected_peer() {
+fn block_advertiser_is_unready_without_a_connected_peer() {
     let (runtime, _init_guard) = zakura_test::init_async();
     let _guard = runtime.enter();
     tokio::time::pause();
@@ -1690,15 +1691,82 @@ fn block_advertiser_waits_for_a_connected_peer() {
             .with_minimum_peer_version(minimum_peer_version)
             .build();
         let mut advertiser = peer_set.block_advertiser();
-        let broadcast =
-            advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32]).into()));
+
         assert!(
-            tokio::time::timeout(Duration::from_secs(60), broadcast)
+            tokio::time::timeout(Duration::from_secs(60), advertiser.ready())
                 .await
                 .is_err(),
-            "the advertisement waits for a peer"
+            "readiness waits for a peer",
+        );
+
+        // A caller that dispatches anyway, because its peers went away after it was ready, is
+        // told so instead of waiting again.
+        let error = advertiser
+            .advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32]).into()))
+            .await
+            .expect_err("no peer can receive the advertisement");
+        assert!(
+            error.is::<crate::NoEligibleBlockPeers>(),
+            "unexpected error: {error:?}",
         );
     });
+}
+
+/// A peer connecting through the peer set's owner makes the block advertiser ready, and the
+/// advertisement that was waiting for a peer reaches it.
+#[tokio::test(start_paused = true)]
+async fn a_connecting_peer_receives_the_waiting_advertisement() {
+    let _init = zakura_test::init();
+    timeout(Duration::from_secs(10), async {
+        let (discovery, discovered) = futures::channel::mpsc::unbounded();
+        let (minimum_peer_version, _best_tip_height) =
+            MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+        let (peers, _peer_set_guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum_peer_version)
+            .build();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (_ordinary, adverts) = crate::peer_set::driver::spawn(peers, shutdown.clone());
+
+        let address: PeerSocketAddr = "127.0.0.1:8233".parse::<SocketAddr>().unwrap().into();
+        let (client, mut handle) = ClientTestHarness::build()
+            .with_version(CURRENT_NETWORK_PROTOCOL_VERSION)
+            .with_connected_addr(ConnectedAddr::InboundDirect { addr: address })
+            .finish();
+
+        let hash = block::Hash([11; 32]);
+        let broadcast = tokio::spawn(
+            adverts
+                .clone()
+                .oneshot(Request::AdvertiseMinedBlock(hash.into())),
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            recv_advertise_block(&mut handle),
+            None,
+            "the advertisement waits for a peer",
+        );
+
+        discovery
+            .unbounded_send(Ok::<_, BoxError>(Change::Insert(address, client.into())))
+            .unwrap();
+
+        let mut advertised = None;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            advertised = recv_advertise_block(&mut handle);
+            if advertised.is_some() {
+                break;
+            }
+        }
+        assert_eq!(advertised, Some(hash), "the new peer receives the block");
+        assert!(broadcast.await.unwrap().is_ok());
+        shutdown.cancel();
+    })
+    .await
+    .expect("a connecting peer wakes the waiting advertisement");
 }
 
 /// Idle maintenance admits new connections and preserves the accepted generation on duplicates.

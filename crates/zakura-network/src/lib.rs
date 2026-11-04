@@ -183,11 +183,11 @@ pub use crate::{
     config::{CacheDir, Config, P2pStack},
     meta_addr::{PeerAddrState, PeerSocketAddr},
     peer::{
-        Client, ConnectedAddr, ConnectionInfo, HandshakeError, NotFoundClass, PeerError,
-        SharedPeerError,
+        Client, ConnectedAddr, ConnectionInfo, HandshakeError, NoEligibleBlockPeers, NotFoundClass,
+        PeerError, SharedPeerError,
     },
     peer_registry::ConnectedPeer,
-    peer_set::init_with_zakura,
+    peer_set::{init_with_zakura, BlockAdvertisementServices},
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},
         internal::{AdvertisedBlock, InventoryResponse, PeerSource, Request, Response},

@@ -1372,7 +1372,7 @@ impl StartCmd {
     ///
     /// Returns the node's error after logging it.
     pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
-        let runtime = new_runtime();
+        let runtime = new_runtime(config.mirrored_state_config().read_worker_count());
 
         info!("Starting zakurad");
 

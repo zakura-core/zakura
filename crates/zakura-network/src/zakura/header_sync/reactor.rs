@@ -782,18 +782,7 @@ impl HeaderSyncReactor {
             previous.is_some(),
             "sessions and schedules share their keys"
         );
-        observe!(
-            self,
-            ReactorEvent::SessionAdmitted {
-                peer: peer.clone(),
-                session_id: self
-                    .sessions
-                    .get(&peer)
-                    .expect("the admitted peer was just installed")
-                    .session
-                    .session_id(),
-            }
-        );
+        observe!(self, ReactorEvent::SessionAdmitted { peer: peer.clone() });
         if let Some(previous) = previous {
             previous.session.cancel_token().cancel();
             if let Some((owner, source)) = replaced_repair.and_then(|(owner, source, phase)| {

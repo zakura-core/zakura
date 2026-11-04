@@ -1379,8 +1379,8 @@ fn no_observer_evaluates_nothing() {
     );
 }
 
-/// Each installed session reports its admission, a replacement included, and a
-/// refused one reports none.
+/// Each installed session reports its admission once, a replacement included,
+/// and a refused one reports none.
 #[test]
 fn admitted_sessions_are_observed() {
     let recorder = Arc::new(Recorder::default());
@@ -1390,26 +1390,25 @@ fn admitted_sessions_are_observed() {
         crate::zakura::ZakuraTrace::noop(),
     );
     let peer = ZakuraPeerId::new(vec![0x51; 32]).expect("the test peer ID has the required length");
+    let admitted = || {
+        recorder
+            .take_all()
+            .into_iter()
+            .filter(|event| matches!(event, ReactorEvent::SessionAdmitted { .. }))
+            .collect::<Vec<_>>()
+    };
+    let one = [ReactorEvent::SessionAdmitted { peer: peer.clone() }];
+
     let _first = connect(&mut reactor, &peer, 1);
+    assert_eq!(admitted(), one, "the first session is admitted");
     let _second = connect(&mut reactor, &peer, 2);
+    assert_eq!(admitted(), one, "its replacement is admitted");
     reactor.state.unproductive_peer_cooldowns.insert(
         peer.clone(),
         Instant::now() + std::time::Duration::from_secs(60),
     );
     let _refused = connect(&mut reactor, &peer, 3);
-
-    let admitted: Vec<_> = recorder
-        .take_all()
-        .into_iter()
-        .filter(|event| matches!(event, ReactorEvent::SessionAdmitted { .. }))
-        .collect();
-    assert_eq!(
-        admitted,
-        [1, 2].map(|session_id| ReactorEvent::SessionAdmitted {
-            peer: peer.clone(),
-            session_id,
-        })
-    );
+    assert_eq!(admitted(), [], "a refused readmission isn't");
 }
 
 /// The `Misbehavior` events in `events`.

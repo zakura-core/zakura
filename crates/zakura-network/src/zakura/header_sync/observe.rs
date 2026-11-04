@@ -164,8 +164,6 @@ pub enum ReactorEvent {
     SessionAdmitted {
         /// The admitted peer.
         peer: ZakuraPeerId,
-        /// The admitted session.
-        session_id: u64,
     },
     /// The reactor dispatched a violation by `peer` to storage.
     Misbehavior {

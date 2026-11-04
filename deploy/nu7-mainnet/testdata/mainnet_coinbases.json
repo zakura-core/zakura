@@ -1,0 +1,115 @@
+{
+ "note": "Coinbase transactions of four mainnet blocks (getrawtransaction verbosity 1) with the funding stream addresses getblocksubsidy listed.",
+ "coinbases": [
+  {
+   "height": 3541757,
+   "coinbase": "03fd0a3604f09fa693",
+   "vout": [
+    {
+     "valueZat": 125030000,
+     "addresses": [
+      "t1SEgZvXCu3ceE42qrq5pCeSq7HbLjX8NJv"
+     ]
+    },
+    {
+     "valueZat": 12500000,
+     "addresses": [
+      "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+     ]
+    }
+   ],
+   "fundingstreams": [
+    "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+   ],
+   "lockbox": [
+    {
+     "recipient": "Lockbox NU6",
+     "specification": "https://zips.z.cash/zip-0214",
+     "value": 0.1875,
+     "valueZat": 18750000
+    }
+   ]
+  },
+  {
+   "height": 3541764,
+   "coinbase": "03040b3604f09f8cb80d4d696e6564206279206a6d6631dbbd2954b09a5f1e",
+   "vout": [
+    {
+     "valueZat": 125100000,
+     "addresses": [
+      "t1PEp2GJLSdhDfCKqc2J211WKDUS1NfoQNy"
+     ]
+    },
+    {
+     "valueZat": 12500000,
+     "addresses": [
+      "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+     ]
+    }
+   ],
+   "fundingstreams": [
+    "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+   ],
+   "lockbox": [
+    {
+     "recipient": "Lockbox NU6",
+     "specification": "https://zips.z.cash/zip-0214",
+     "value": 0.1875,
+     "valueZat": 18750000
+    }
+   ]
+  },
+  {
+   "height": 3541777,
+   "coinbase": "03110b3622f09f8cb83a2047657420536c75696365792059616c6c20736c75696365792e78797a",
+   "vout": [
+    {
+     "valueZat": 12500000,
+     "addresses": [
+      "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+     ]
+    }
+   ],
+   "fundingstreams": [
+    "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+   ],
+   "lockbox": [
+    {
+     "recipient": "Lockbox NU6",
+     "specification": "https://zips.z.cash/zip-0214",
+     "value": 0.1875,
+     "valueZat": 18750000
+    }
+   ]
+  },
+  {
+   "height": 3541797,
+   "coinbase": "03250b3604f09fa693",
+   "vout": [
+    {
+     "valueZat": 125000000,
+     "addresses": [
+      "t1SEgZvXCu3ceE42qrq5pCeSq7HbLjX8NJv"
+     ]
+    },
+    {
+     "valueZat": 12500000,
+     "addresses": [
+      "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+     ]
+    }
+   ],
+   "fundingstreams": [
+    "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+   ],
+   "lockbox": [
+    {
+     "recipient": "Lockbox NU6",
+     "specification": "https://zips.z.cash/zip-0214",
+     "value": 0.1875,
+     "valueZat": 18750000
+    }
+   ]
+  }
+ ]
+}

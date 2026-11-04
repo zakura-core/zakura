@@ -15,7 +15,7 @@ network-wide rate.
 | Unit | Role |
 | --- | --- |
 | `zakurad.service` | The node, built from this branch so it exports the `zcash_chain_tip_*`, `zcash_chain_block_*`, `zcash_chain_nsm_*` and `zcash_chain_value_pool_*` metrics. RPC (`127.0.0.1:8232`), metrics (`127.0.0.1:9999`) and health (`127.0.0.1:8080`) stay on loopback; only P2P port 8233 is open. Config: `zakura.toml`. |
-| `zakura-nu7-mainnet-dashboard.service` | `collector.py` with `nu7_chain.py`, `nu7_store.py` and `page.html` under `/opt/zakura-nu7-mainnet`. Stores blocks, samples and events in `/var/lib/zakura-nu7-mainnet/dashboard.sqlite` and serves `/`, `/v1/dashboard` (window 1h, 6h, 24h or 7d) and `/healthz` on `127.0.0.1:8095`. Unit: `collector.service`. |
+| `zakura-nu7-mainnet-dashboard.service` | `collector.py` with `nu7_chain.py`, `nu7_daa.py`, `nu7_miners.py`, `nu7_store.py` and `page.html` under `/opt/zakura-nu7-mainnet`. Stores blocks, samples and events in `/var/lib/zakura-nu7-mainnet/dashboard.sqlite` and serves `/`, `/v1/dashboard` (window 1h, 6h, 24h or 7d) and `/healthz` on `127.0.0.1:8095`. Unit: `collector.service`. |
 | `caddy.service` | Publishes those three routes at the hostname with an automatic certificate. Config: `Caddyfile`. |
 
 The collector works against a stock release too: the per-block fee and NSM
@@ -28,6 +28,20 @@ columns stay empty until the instrumented node runs, and the page says so.
   attributed to blocks by delta; when two blocks land between scrapes the tip
   keeps the latest-block gauges and the block before it carries the remainder,
   marked `merged_from`, so totals stay exact.
+- Every stored block also gets its miner (the coinbase tag, or the largest
+  transparent payout that is not a funding stream; `nu7_miners.py`) and the
+  difficulty consensus required for it, recomputed from the stored headers by
+  `nu7_daa.py`, a bit-exact Python copy of the node's adjustment rule. A block
+  whose `bits` differ is a `daa_mismatch` event. The first start backfills
+  2016 blocks (about 42 h before NU7) as the miner baseline.
+- After every new tip the collector estimates the hashrate (work over time,
+  the same arithmetic as `getnetworksolps`), the next block's difficulty, the
+  expected block time at the tip, and projects difficulty and block time 1500
+  blocks ahead from the real chain. The first tip it sees also freezes a
+  3000-block projection from the activation height at the hashrate of the
+  last 1008 blocks (`meta.projection_fixed`), with a 300-run Monte Carlo band
+  computed once in the background. The page draws live difficulty against
+  both projections; the frozen one is the prediction made before activation.
 - Every 3 s it reads `getblockchaininfo`, re-checks the last stored hash to
   detect a reorg (rolling back the rows above the fork point), and stores each
   new block from `getblock` with `getblocksubsidy` and the tip's NSM balance.
@@ -55,7 +69,7 @@ sudo install -m 644 deploy/nu7-mainnet/zakurad.service /etc/systemd/system/zakur
 # Collector and Caddy.
 sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin nu7-dashboard
 sudo install -d /opt/zakura-nu7-mainnet
-sudo install -m 644 deploy/nu7-mainnet/{collector.py,nu7_chain.py,nu7_store.py,page.html} /opt/zakura-nu7-mainnet/
+sudo install -m 644 deploy/nu7-mainnet/{collector.py,nu7_chain.py,nu7_daa.py,nu7_miners.py,nu7_store.py,page.html} /opt/zakura-nu7-mainnet/
 sudo install -m 644 deploy/nu7-mainnet/collector.service /etc/systemd/system/zakura-nu7-mainnet-dashboard.service
 sudo install -m 644 deploy/nu7-mainnet/Caddyfile /etc/caddy/Caddyfile
 sudo systemctl daemon-reload
@@ -72,5 +86,6 @@ Redeploying the node restarts its counters; the collector records one
 curl -s 127.0.0.1:9999/metrics | grep -c '^zcash_chain_'
 curl -s 127.0.0.1:8095/healthz
 curl -s '127.0.0.1:8095/v1/dashboard?window=1h' | jq '.activation, .chain.intervals, .nsm'
-python3 deploy/nu7-mainnet/test_collector.py
+curl -s '127.0.0.1:8095/v1/dashboard?window=1h' | jq '.chain.expected, .projections.fixed.summary, .miners.table'
+python3 -m unittest discover -s deploy/nu7-mainnet -p 'test_*.py'
 ```

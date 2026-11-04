@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collector as collector_module  # noqa: E402
 import nu7_chain as chain  # noqa: E402
+import nu7_daa as daa  # noqa: E402
 from collector import BoundedHTTPServer, Collector, Handler  # noqa: E402
 from nu7_store import Store  # noqa: E402
 
@@ -116,26 +117,48 @@ class ChainArithmeticTests(unittest.TestCase):
 class FakeNode:
     """A node whose chain the test extends block by block."""
 
+    FUNDING_STREAM = "t3cFfPt1Bcvgez9ZbMBFWeZsskxTkPzGCow"
+    MINERS = [("/Mined by Luxor/", "t1PEp2GJLSdhDfCKqc2J211WKDUS1NfoQNy"), (None, "t1MKn34KBa8Xh4g8qU8psibBXvURafphVn7")]
+
     def __init__(self, tip=FAKE_ACTIVATION - 3, start_time=1_762_000_000):
         self.blocks = {}
         self.exposition = EXPOSITION
         self.nsm_balance = 55_768_414_957
-        for height in range(tip - 20, tip + 1):
-            self.blocks[height] = self.make_block(height, start_time + height * 75)
+        for height in range(tip - 130, tip + 1):
+            # The first 28 blocks are arbitrary; from then on the chain obeys the difficulty rule.
+            bits = "1c123456" if len(self.blocks) < 28 else f"{self.consensus_bits(height):08x}"
+            self.blocks[height] = self.make_block(height, start_time + height * 75, bits=bits)
         self.calls = []
 
-    def make_block(self, height, time, salt=""):
-        return {"hash": f"{height:08x}{salt}".ljust(64, "0"), "time": time, "bits": "1c123456",
-                "difficulty": 1000.0 + height, "size": 2000, "nTx": 3,
+    def make_block(self, height, time, salt="", bits="1c123456"):
+        return {"hash": f"{height:08x}{salt}".ljust(64, "0"), "time": time, "bits": bits,
+                "difficulty": daa.difficulty(int(bits, 16)), "size": 2000, "nTx": 3, "tx": [f"cb{height:08x}"],
                 "valuePools": [{"id": "lockbox", "chainValueZat": 123}, {"id": "orchard", "chainValueZat": 456}],
                 "chainSupply": {"chainValueZat": 999}}
+
+    def coinbase(self, height):
+        """The coinbase of block `height`: miners alternate by height, odd heights pay the miner shielded."""
+        tag, address = self.MINERS[height % 2]
+        scriptsig = bytes([3]) + height.to_bytes(3, "little") + (tag.encode() if tag else b"\x04\xf0\x9f\xa6\x93")
+        vout = [{"valueZat": 12_500_000, "scriptPubKey": {"addresses": [self.FUNDING_STREAM]}}]
+        if height % 4 != 1:
+            vout.insert(0, {"valueZat": 125_000_000, "scriptPubKey": {"addresses": [address]}})
+        return {"vin": [{"coinbase": scriptsig.hex()}], "vout": vout}
 
     def tip(self):
         return max(self.blocks)
 
-    def extend(self, interval=25, salt=""):
+    def consensus_bits(self, height):
+        """What the difficulty rule requires for `height` on this fake chain."""
+        context = [self.blocks[h] for h in range(height - 1, max(height - 114, min(self.blocks) - 1), -1)]
+        return daa.next_threshold([daa.expand_compact(int(b["bits"], 16)) for b in context],
+                                  [b["time"] for b in context], height, FAKE_ACTIVATION)
+
+    def extend(self, interval=25, salt="", bits=None):
         height = self.tip() + 1
-        self.blocks[height] = self.make_block(height, self.blocks[height - 1]["time"] + interval, salt)
+        if bits is None:
+            bits = f"{self.consensus_bits(height):08x}"
+        self.blocks[height] = self.make_block(height, self.blocks[height - 1]["time"] + interval, salt, bits)
         return height
 
     def reorg(self, depth):
@@ -155,7 +178,11 @@ class FakeNode:
         if method == "getblock":
             return self.blocks[int(params[0])]
         if method == "getblocksubsidy":
-            return {"miner": 0.2, "fundingstreamstotal": 0.05, "lockboxtotal": 0.01, "totalblocksubsidy": 0.26}
+            return {"miner": 0.2, "fundingstreamstotal": 0.05, "lockboxtotal": 0.01, "totalblocksubsidy": 0.26,
+                    "fundingstreams": [{"address": self.FUNDING_STREAM, "valueZat": 12_500_000}]}
+        if method == "getrawtransaction":
+            height = int(params[0][2:], 16)
+            return self.coinbase(height)
         if method == "getnetworksolps":
             return 12345
         if method == "getmempoolinfo":
@@ -176,12 +203,12 @@ class FakeNode:
         return None
 
 
-def new_collector(node, tmp):
+def new_collector(node, tmp, backfill=5):
     db = os.path.join(tmp, "test.sqlite")
     page = Path(tmp) / "page.html"
     page.write_text("<html>test</html>")
-    return Collector(node, db, activation_height=FAKE_ACTIVATION, backfill=5, page_path=page,
-                     clock=lambda: 1_770_000_000.0), Store(db)
+    return Collector(node, db, activation_height=FAKE_ACTIVATION, backfill=backfill, page_path=page,
+                     clock=lambda: 1_770_000_000.0, rolling_blocks=40, fixed_blocks=30, monte_carlo_runs=4), Store(db)
 
 
 class CollectorTests(unittest.TestCase):
@@ -191,6 +218,8 @@ class CollectorTests(unittest.TestCase):
         self.collector, self.store = new_collector(self.node, self.tmp.name)
 
     def tearDown(self):
+        if self.collector.monte_carlo_thread:
+            self.collector.monte_carlo_thread.join(timeout=30)
         self.store.close()
         self.tmp.cleanup()
 
@@ -208,6 +237,87 @@ class CollectorTests(unittest.TestCase):
                          (FAKE_ACTIVATION, "live", 25, 26_000_000))
         self.assertEqual(self.store.blocks_observed_since(0), 3)
         self.assertIn("activation", [e["kind"] for e in self.store.events_since(0)])
+
+    def test_blocks_get_their_miner_and_difficulty_verdict(self):
+        collector, store = new_collector(self.node, self.tmp.name, backfill=125)
+        collector.ingest_once(store)
+        tagged, untagged, shielded = store.block(496), store.block(495), store.block(497)
+        self.assertEqual((tagged["miner_id"], tagged["miner_tag"]), ("Luxor", "Mined by Luxor"))
+        self.assertEqual((untagged["miner_id"], untagged["miner_tag"]), ("addr:t1MKn3…hVn7", None))
+        self.assertEqual(shielded["miner_id"], "shielded:unknown", "no transparent payout and no tag")
+        self.assertEqual(store.block(497)["daa_ok"], 1)
+        self.assertIsNone(store.block(380)["daa_ok"], "too few stored predecessors to judge")
+        height = self.node.extend(interval=75)
+        collector.ingest_once(store)
+        row = store.block(height)
+        self.assertEqual((row["daa_ok"], row["expected_bits"]), (1, row["bits"]))
+        self.assertIsNotNone(row["expected_interval_s"])
+        tampered = self.node.extend(interval=75, bits="1c000001")
+        collector.ingest_once(store)
+        self.assertEqual(store.block(tampered)["daa_ok"], 0)
+        events = [e for e in store.events_since(0) if e["kind"] == "daa_mismatch"]
+        self.assertEqual([e["height"] for e in events], [tampered])
+        self.assertEqual(store.daa_check_counts(), (100, 99))
+        payload = collector.payload(store, "6h")
+        self.assertEqual(payload["chain"]["expected"]["modelChecked"], 100)
+        self.assertEqual(payload["chain"]["expected"]["nextBits"], f"{self.node.consensus_bits(tampered + 1):08x}")
+        table = {row["miner"]: row for row in payload["miners"]["table"]}
+        self.assertEqual(table["Luxor"]["status"], "new", "no blocks stored before the recent 300-block window yet")
+        self.assertGreater(table["Luxor"]["recentBlocks"], 40)
+        collector.monte_carlo_thread.join(timeout=30)
+        store.close()
+
+    def test_old_rows_are_annotated_in_passes(self):
+        self.collector.ingest_once(self.store)
+        self.store.connection.execute("UPDATE blocks SET miner_id = NULL, expected_interval_s = NULL")
+        self.assertEqual(self.store.blocks_without_annotation(10), list(range(FAKE_ACTIVATION - 8, FAKE_ACTIVATION - 2)))
+        self.assertEqual(self.collector.annotate_missing(self.store), 6)
+        self.assertEqual(self.store.block(FAKE_ACTIVATION - 5)["miner_id"], "addr:t1MKn3…hVn7")
+        self.assertEqual(self.collector.annotate_missing(self.store), 0, "rows without context are not retried")
+
+    def test_projections_are_frozen_once_and_roll_with_the_tip(self):
+        collector, store = new_collector(self.node, self.tmp.name, backfill=125)
+        collector.ingest_once(store)
+        collector.monte_carlo_thread.join(timeout=30)
+        fixed = store.meta("projection_fixed")
+        self.assertEqual((fixed["seed"], fixed["fromHeight"], len(fixed["curve"]), len(fixed["band"])), ("synthetic", FAKE_ACTIVATION, 30, 30))
+        self.assertEqual(fixed["curve"][0]["height"], FAKE_ACTIVATION)
+        frozen_at = fixed["frozenHeight"]
+        self.node.extend()
+        collector.ingest_once(store)
+        self.assertEqual(store.meta("projection_fixed")["frozenHeight"], frozen_at)
+        payload = collector.payload(store, "1h")
+        rolling = payload["projections"]["rolling"]
+        next_height = store.tip()["height"] + 1
+        self.assertEqual((rolling["fromHeight"], len(rolling["curve"])), (next_height, 40 + (FAKE_ACTIVATION - next_height)),
+                         "before activation the projection reaches 40 blocks past it")
+        self.assertEqual(payload["projections"]["fixed"]["band"][0]["height"], FAKE_ACTIVATION)
+        json.dumps(payload, allow_nan=False)
+        store.close()
+
+    def test_model_is_ready_after_a_restart_without_new_blocks(self):
+        self.collector.ingest_once(self.store)
+        restarted, store = new_collector(self.node, self.tmp.name)
+        self.assertEqual(restarted.ingest_once(store), 0)
+        self.assertIsNotNone(restarted.model.get("expected"))
+        self.assertEqual(restarted.model["rollingFrom"], self.node.tip() + 1)
+        store.close()
+
+    def test_schema_one_database_gains_the_new_columns(self):
+        path = os.path.join(self.tmp.name, "old.sqlite")
+        import sqlite3
+        old = sqlite3.connect(path)
+        old.execute("CREATE TABLE blocks (height INTEGER PRIMARY KEY, hash TEXT NOT NULL, time INTEGER NOT NULL, bits TEXT)")
+        old.execute("INSERT INTO blocks VALUES (1, 'aa', 100, '1c123456')")
+        old.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        old.execute("INSERT INTO meta VALUES ('schema_version', '1')")
+        old.commit()
+        old.close()
+        store = Store(path)
+        self.assertEqual(store.meta("schema_version"), 2)
+        self.assertIn("miner_id", store.block(1))
+        self.assertEqual(store.blocks_without_annotation(5), [1])
+        store.close()
 
     def test_reorg_replaces_rows_above_the_fork(self):
         self.collector.ingest_once(self.store)

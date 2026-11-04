@@ -9,7 +9,12 @@ Reads one local zakurad node and serves a public page plus a JSON API:
    store's `meta` table.
 2. The block loop polls `getblockchaininfo`, detects reorgs by re-checking the
    last stored hash, and stores every new best-chain block from `getblock`
-   with its subsidy and the tip's NSM balance.
+   with its subsidy, its miner (from the coinbase transaction), the difficulty
+   consensus required for it (`nu7_daa.next_threshold`, a mismatch is an
+   event) and the tip's NSM balance. After each new tip it refreshes the
+   difficulty model: hashrate, the next block's difficulty, the expected block
+   time and a projection of difficulty from current data; the first tip also
+   freezes a projection from the activation height (`meta.projection_fixed`).
 3. The sample loop records mempool, peer, latency and node-health samples.
 4. The HTTP server answers `/` (the page), `/v1/dashboard` (status plus the
    series for a time window) and `/healthz`, on localhost behind Caddy.
@@ -34,6 +39,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import nu7_chain as chain
+import nu7_daa as daa
+import nu7_miners as miners
 from nu7_store import Store
 
 LOG = logging.getLogger("nu7-mainnet")
@@ -47,6 +54,19 @@ RAW_MEMPOOL_MAX_TX = 5000
 RAW_MEMPOOL_MAX_SECONDS = 2.0
 RECENT_BLOCKS = 8
 INTERVAL_SAMPLE_BLOCKS = 300
+# Two weeks of 25 s blocks is far more; 2016 blocks is ~42 h before NU7, the miner baseline.
+DEFAULT_BACKFILL = 2016
+MINER_BASELINE_BLOCKS = 2016
+MINER_RECENT_BLOCKS = 300
+ANNOTATE_PER_PASS = 100
+HASHRATE_BLOCKS = 120
+PROJECTION_ROLLING_BLOCKS = 1500
+PROJECTION_FIXED_BLOCKS = 3000
+FIXED_HASHRATE_BLOCKS = 1008
+MONTE_CARLO_RUNS = 300
+PROJECTION_DETAIL_BLOCKS = 300
+PROJECTION_THIN_STEP = 10
+PAYLOAD_CACHE_SECONDS = 5.0
 FRESHNESS_SECONDS = 60
 WINDOWS = {"1h": 3600, "6h": 6 * 3600, "24h": 24 * 3600, "7d": 7 * 24 * 3600}
 MAX_CONCURRENT_REQUESTS = 16
@@ -118,12 +138,22 @@ class Collector:
     """Holds the loops' shared state; each loop opens its own store connection."""
 
     def __init__(self, sources, db_path, activation_height=chain.NU7_ACTIVATION_HEIGHT,
-                 backfill=INTERVAL_SAMPLE_BLOCKS, page_path=None, clock=time.time):
+                 backfill=INTERVAL_SAMPLE_BLOCKS, page_path=None, clock=time.time,
+                 rolling_blocks=PROJECTION_ROLLING_BLOCKS, fixed_blocks=PROJECTION_FIXED_BLOCKS,
+                 monte_carlo_runs=MONTE_CARLO_RUNS):
         self.sources = sources
         self.db_path = db_path
         self.activation_height = activation_height
         self.backfill = backfill
         self.clock = clock
+        self.rolling_blocks = rolling_blocks
+        self.fixed_blocks = fixed_blocks
+        self.monte_carlo_runs = monte_carlo_runs
+        self.model = {}
+        self.fixed_projection = None
+        self.monte_carlo_thread = None
+        self.annotation_attempted = set()
+        self.payload_cache = {}
         self.page = page_path.read_bytes() if page_path else b""
         self.lock = threading.Lock()
         self.metrics = {}
@@ -231,6 +261,8 @@ class Collector:
             start = stored["height"] + 1
         end = min(tip_height, start + MAX_BLOCKS_PER_PASS - 1)
         if start > end:
+            if not self.model:
+                self.update_model(store)
             return 0
         if end < tip_height and stored is not None:
             store.add_event("gap", height=start, detail=f"ingesting {start}..{tip_height} in passes")
@@ -238,6 +270,7 @@ class Collector:
         now = self.clock()
         for height in range(start, end + 1):
             row = self.block_row(height, previous, now)
+            row.update(self.block_annotations(store, height, row))
             if height == tip_height:
                 self.annotate_tip(row, info)
             if height >= self.activation_height and (previous is None or previous["height"] < self.activation_height):
@@ -249,6 +282,7 @@ class Collector:
             if pending:
                 store.update_block(height, pending)
             previous = row
+        self.update_model(store)
         return end - start + 1
 
     def rollback_reorg(self, store, stored):
@@ -300,19 +334,181 @@ class Collector:
             "chain_supply_zat": chain.whole((block.get("chainSupply") or {}).get("chainValueZat")),
             "nu7_active": int(height >= self.activation_height),
             "source": "live" if live else "backfill",
+            # Not stored: the block loop reads these to attribute the miner.
+            "coinbase_txid": (block.get("tx") or [None])[0],
+            "funding_stream_addresses": [],
         }
-        if live:
-            try:
-                subsidy = self.sources.rpc("getblocksubsidy", [height])
-                row.update({
-                    "subsidy_total_zat": chain.zec_to_zat(subsidy.get("totalblocksubsidy")),
-                    "subsidy_miner_zat": chain.zec_to_zat(subsidy.get("miner")),
-                    "subsidy_fs_zat": chain.zec_to_zat(subsidy.get("fundingstreamstotal")),
-                    "subsidy_lockbox_zat": chain.zec_to_zat(subsidy.get("lockboxtotal")),
-                })
-            except Exception as error:  # noqa: BLE001 - the subsidy is decoration
-                LOG.debug("getblocksubsidy %s failed: %s", height, error)
+        try:
+            subsidy = self.sources.rpc("getblocksubsidy", [height])
+            row.update({
+                "subsidy_total_zat": chain.zec_to_zat(subsidy.get("totalblocksubsidy")),
+                "subsidy_miner_zat": chain.zec_to_zat(subsidy.get("miner")),
+                "subsidy_fs_zat": chain.zec_to_zat(subsidy.get("fundingstreamstotal")),
+                "subsidy_lockbox_zat": chain.zec_to_zat(subsidy.get("lockboxtotal")),
+                "funding_stream_addresses": [stream.get("address") for stream in subsidy.get("fundingstreams") or []],
+            })
+        except Exception as error:  # noqa: BLE001 - the subsidy is decoration
+            LOG.debug("getblocksubsidy %s failed: %s", height, error)
         return row
+
+    def block_annotations(self, store, height, row):
+        """The miner of a block and the difficulty model's view of it, as columns to store.
+
+        The miner comes from the coinbase transaction (tag and payout address);
+        `expected_bits` is what consensus required given the stored blocks
+        below `height`, with a `daa_mismatch` event when the block differs;
+        `hashrate_solps` is the solution rate over the previous 120 blocks and
+        `expected_interval_s` the time this block was expected to take at it.
+        """
+        values = {}
+        coinbase = None
+        if row.get("coinbase_txid"):
+            try:
+                coinbase = self.sources.rpc("getrawtransaction", [row["coinbase_txid"], 1])
+            except Exception as error:  # noqa: BLE001 - pruned or unavailable: the miner stays unknown
+                LOG.debug("coinbase of %s unavailable: %s", height, error)
+        if coinbase:
+            inputs = coinbase.get("vin") or [{}]
+            tag = miners.coinbase_tag(inputs[0].get("coinbase"))
+            address = miners.miner_payout(coinbase.get("vout"), row.get("funding_stream_addresses"))
+            values.update({"miner_tag": tag, "miner_address": address, "miner_id": miners.miner_id(tag, address)})
+        context = store.headers_before(height, max(daa.CONTEXT_BLOCKS, HASHRATE_BLOCKS + 1))
+        window, _, _ = daa.rule_at(height, self.activation_height)
+        if row.get("bits") and len(context) >= window + daa.MEDIAN_TIME_SPAN:
+            expected = daa.next_threshold(
+                [daa.expand_compact(daa.parse_bits(bits)) for bits, _ in context],
+                [t for _, t in context], height, self.activation_height,
+            )
+            values["expected_bits"] = f"{expected:08x}"
+            values["daa_ok"] = int(expected == daa.parse_bits(row["bits"]))
+            if not values["daa_ok"]:
+                store.add_event("daa_mismatch", height=height,
+                                detail=f"consensus requires bits {expected:08x}, the block has {row['bits']}")
+        # The solution rate over the previous 120 blocks, or over what is stored when fewer.
+        rate = daa.hashrate(context, min(HASHRATE_BLOCKS, len(context) - 1)) if len(context) > 1 else None
+        if rate and row.get("bits"):
+            values["hashrate_solps"] = rate
+            values["expected_interval_s"] = daa.expected_interval(row["bits"], rate)
+        return values
+
+    def annotate_missing(self, store):
+        """Fill the miner and model columns of rows stored by an older collector, a few per pass."""
+        heights = [h for h in store.blocks_without_annotation(ANNOTATE_PER_PASS + len(self.annotation_attempted))
+                   if h not in self.annotation_attempted][:ANNOTATE_PER_PASS]
+        for height in heights:
+            self.annotation_attempted.add(height)
+            row = store.block(height)
+            if row is None:
+                continue
+            try:
+                block = self.sources.rpc("getblock", [str(height), 1])
+                subsidy = self.sources.rpc("getblocksubsidy", [height])
+            except Exception as error:  # noqa: BLE001 - leave the row for a later pass
+                LOG.debug("annotation of %s failed: %s", height, error)
+                continue
+            row["coinbase_txid"] = (block.get("tx") or [None])[0]
+            row["funding_stream_addresses"] = [stream.get("address") for stream in subsidy.get("fundingstreams") or []]
+            values = self.block_annotations(store, height, row)
+            if values:
+                store.update_block(height, values)
+        return len(heights)
+
+    # -- difficulty model ---------------------------------------------------
+
+    def update_model(self, store):
+        """Refresh hashrate, next-block difficulty, expected block time and the rolling projection from the stored chain."""
+        tip = store.tip()
+        if not tip or not tip.get("bits"):
+            return
+        next_height = tip["height"] + 1
+        context = store.headers_before(next_height, max(daa.CONTEXT_BLOCKS, FIXED_HASHRATE_BLOCKS + 1))
+        targets = [daa.expand_compact(daa.parse_bits(bits)) for bits, _ in context[:daa.CONTEXT_BLOCKS]]
+        times = [t for _, t in context[:daa.CONTEXT_BLOCKS]]
+        _, spacing, _ = daa.rule_at(next_height, self.activation_height)
+        projection_blocks = chain.daa_window(next_height, self.activation_height) if next_height > self.activation_height else INTERVAL_SAMPLE_BLOCKS
+        rate = daa.hashrate(context, min(projection_blocks, len(context) - 1)) if len(context) > 1 else None
+        rate120 = daa.hashrate(context, min(HASHRATE_BLOCKS, len(context) - 1)) if len(context) > 1 else None
+        next_bits = daa.next_threshold(targets, times, next_height, self.activation_height)
+        checked, matched = store.daa_check_counts()
+        expected = {
+            "hashrateSolps": rate120,
+            "hashrateBlocks": HASHRATE_BLOCKS,
+            "nodeSolps": tip.get("solps"),
+            "projectionHashrateSolps": rate,
+            "projectionHashrateBlocks": projection_blocks,
+            "equilibriumDifficulty": daa.difficulty(daa.equilibrium_bits(rate, spacing)) if rate else None,
+            "expectedIntervalSeconds": daa.expected_interval(tip["bits"], rate120) if rate120 else None,
+            "nextBits": f"{next_bits:08x}",
+            "nextDifficulty": daa.difficulty(next_bits),
+            "modelChecked": checked,
+            "modelMatched": matched,
+        }
+        # Before activation the projection reaches at least `rolling_blocks` past it.
+        horizon = self.rolling_blocks + max(0, self.activation_height - next_height)
+        rolling = daa.project(context, next_height, horizon, rate, self.activation_height) if rate else []
+        self.ensure_fixed_projection(store, context, tip)
+        with self.lock:
+            self.model = {"expected": expected, "rolling": rolling,
+                          "rollingFrom": next_height, "rollingHashrateSolps": rate}
+
+    def ensure_fixed_projection(self, store, context, tip):
+        """Freeze one projection from the activation height, the first time a tip is seen, and keep it.
+
+        Before activation the seed is a synthetic chain at the tip's difficulty
+        spaced by the expected block time at the hashrate of the last 1008
+        blocks; after it, the real blocks below the activation height. A
+        Monte Carlo band is added in the background once.
+        """
+        if self.fixed_projection is None:
+            self.fixed_projection = store.meta("projection_fixed")
+        if self.fixed_projection is not None:
+            return
+        if len(context) < 2:
+            return
+        if tip["height"] >= self.activation_height:
+            seed = store.headers_before(self.activation_height, daa.CONTEXT_BLOCKS)
+            if len(seed) < daa.CONTEXT_BLOCKS:
+                seed = None
+        else:
+            seed = None
+        rate_blocks = min(FIXED_HASHRATE_BLOCKS, len(context) - 1)
+        rate = daa.hashrate(context, rate_blocks)
+        if not rate:
+            return
+        bits0 = daa.parse_bits(tip["bits"])
+        if seed is None:
+            seed = daa.steady_context(bits0, rate, tip["time"])
+            seed_kind = "synthetic"
+        else:
+            seed_kind = "chain"
+        curve = daa.project(seed, self.activation_height, self.fixed_blocks, rate, self.activation_height)
+        fixed = {
+            "frozenAt": self.clock(), "frozenHeight": tip["height"], "bits0": f"{bits0:08x}",
+            "difficulty0": daa.difficulty(bits0), "hashrate0": rate, "hashrateBlocks": rate_blocks,
+            "seed": seed_kind, "fromHeight": self.activation_height, "curve": curve, "band": None,
+            "summary": daa.convergence_summary(curve, chain.POST_NU7_TARGET_SPACING),
+        }
+        store.set_meta("projection_fixed", fixed)
+        self.fixed_projection = fixed
+        self.monte_carlo_thread = threading.Thread(
+            target=self.monte_carlo_band, args=(seed, rate), daemon=True, name="monte-carlo")
+        self.monte_carlo_thread.start()
+
+    def monte_carlo_band(self, seed, rate):
+        try:
+            band = daa.monte_carlo(seed, self.activation_height, self.fixed_blocks, rate,
+                                   self.activation_height, runs=self.monte_carlo_runs)
+            with self.lock:
+                fixed = dict(self.fixed_projection or {})
+                fixed["band"] = band
+                self.fixed_projection = fixed
+            store = Store(self.db_path)
+            try:
+                store.set_meta("projection_fixed", fixed)
+            finally:
+                store.close()
+        except Exception as error:  # noqa: BLE001 - the band is decoration; the curve stands without it
+            LOG.warning("monte carlo band failed: %s", error)
 
     def annotate_tip(self, row, info):
         nsm = info.get("nsmValueBalanceZat")
@@ -328,6 +524,7 @@ class Collector:
         while not self.stop.is_set():
             try:
                 self.ingest_once(store)
+                self.annotate_missing(store)
             except Exception as error:  # noqa: BLE001 - an RPC failure must not stop the loop
                 LOG.warning("block ingest failed: %s", error)
             self.stop.wait(interval)
@@ -409,6 +606,18 @@ class Collector:
         with self.lock:
             return (now - self.metrics_at) < FRESHNESS_SECONDS and (now - self.rpc_ok_at) < FRESHNESS_SECONDS
 
+    def cached_payload(self, store, window="6h"):
+        """`payload`, reused for a few seconds per window: the page polls every 15 s and the API is public."""
+        now = self.clock()
+        with self.lock:
+            cached = self.payload_cache.get(window)
+        if cached and now - cached[0] < PAYLOAD_CACHE_SECONDS:
+            return cached[1]
+        payload = self.payload(store, window)
+        with self.lock:
+            self.payload_cache[window] = (now, payload)
+        return payload
+
     def payload(self, store, window="6h"):
         """The dashboard JSON: current status plus the series for `window`."""
         now = self.clock()
@@ -418,6 +627,8 @@ class Collector:
             info = self.chain_info or {}
             scrape_ms = self.scrape_ms
             metrics_at = self.metrics_at
+            model = self.model
+            fixed = self.fixed_projection
         m = chain.METRIC_NAMES
         tip = store.tip()
         height = tip["height"] if tip else None
@@ -442,6 +653,12 @@ class Collector:
         nsm_balance = tip.get("nsm_balance_zat") if tip else None
         if nsm_balance is None and isinstance(info.get("nsmValueBalanceZat"), int):
             nsm_balance = info["nsmValueBalanceZat"]
+        active = bool(height) and height >= self.activation_height
+        baseline_end = self.activation_height if active else max(1, (height or 0) - MINER_RECENT_BLOCKS)
+        baseline_rows = store.miner_rows(since_height=baseline_end - MINER_BASELINE_BLOCKS, until_height=baseline_end)
+        recent_rows = store.miner_rows(since_height=max(1, (height or 0) - MINER_RECENT_BLOCKS + 1))
+        baseline = miners.miner_shares(baseline_rows)
+        recent = miners.miner_shares(recent_rows)
         return {
             "schemaVersion": 1,
             "generatedAt": now,
@@ -485,6 +702,21 @@ class Collector:
                 "orchardActionLimit": chain.ORCHARD_BLOCK_ACTION_LIMIT,
                 "sizeLast": tip.get("size") if tip else None,
                 "txLast": tip.get("n_tx") if tip else None,
+                "expected": model.get("expected"),
+            },
+            "projections": {
+                "fixed": thin_projection(fixed),
+                "rolling": {
+                    "fromHeight": model.get("rollingFrom"),
+                    "hashrateSolps": model.get("rollingHashrateSolps"),
+                    "curve": thin_curve(model.get("rolling") or []),
+                },
+            },
+            "miners": {
+                "baseline": {"fromHeight": baseline_end - MINER_BASELINE_BLOCKS, "untilHeight": baseline_end,
+                             "blocks": baseline["blocks"]},
+                "recent": {"blocks": recent["blocks"], "lastBlocks": MINER_RECENT_BLOCKS},
+                "table": miners.miner_table(baseline, recent, now),
             },
             "nsm": {
                 "balanceZat": nsm_balance,
@@ -552,7 +784,12 @@ class Collector:
                     "subsidyTotalZat": "subsidy_total_zat", "nsmBalanceZat": "nsm_balance_zat",
                     "lockboxZat": "pool_lockbox_zat", "mergedFrom": "merged_from",
                     "nu7Active": "nu7_active", "feeSplitOk": "fee_split_ok",
+                    "bits": "bits", "expectedBits": "expected_bits", "daaOk": "daa_ok",
+                    "minerId": "miner_id", "observedAt": "observed_at",
+                    "hashrateSolps": "hashrate_solps", "expectedIntervalSeconds": "expected_interval_s",
                 }),
+                "minerBuckets": miners.miner_buckets(
+                    [row for row in blocks if row.get("miner_id")], bucket_seconds(window_seconds)),
                 "samples": columns(samples, {
                     "t": "t", "mempoolTx": "mempool_tx", "mempoolBytes": "mempool_bytes",
                     "mempoolFeeP10Zat": "mempool_fee_p10_zat", "mempoolFeeP50Zat": "mempool_fee_p50_zat",
@@ -569,6 +806,31 @@ class Collector:
 
 def seconds_to_ms(value):
     return None if value is None else value * 1000.0
+
+
+def bucket_seconds(window_seconds):
+    """Miner chart buckets: 10 minutes for an hour, an hour for a day, 6 hours for a week."""
+    if window_seconds <= 3600:
+        return 600
+    if window_seconds <= 6 * 3600:
+        return 1800
+    if window_seconds <= 24 * 3600:
+        return 3600
+    return 6 * 3600
+
+
+def thin_curve(curve):
+    """A projection with every point for the first 300 blocks and every tenth after, so the payload stays small."""
+    return curve[:PROJECTION_DETAIL_BLOCKS] + curve[PROJECTION_DETAIL_BLOCKS::PROJECTION_THIN_STEP]
+
+
+def thin_projection(fixed):
+    if not fixed:
+        return None
+    thinned = {key: value for key, value in fixed.items() if key not in ("curve", "band")}
+    thinned["curve"] = thin_curve(fixed.get("curve") or [])
+    thinned["band"] = thin_curve(fixed["band"]) if fixed.get("band") else None
+    return thinned
 
 
 def columns(rows, mapping):
@@ -698,7 +960,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "window must be one of " + ", ".join(WINDOWS)})
                 return
             try:
-                payload = collector.payload(self.server.store(), window)
+                payload = collector.cached_payload(self.server.store(), window)
             except Exception as error:  # noqa: BLE001 - report instead of dropping the connection
                 LOG.exception("dashboard payload failed")
                 self.send_json(500, {"error": str(error)})
@@ -737,8 +999,8 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8095)
     parser.add_argument("--activation-height", type=int, default=chain.NU7_ACTIVATION_HEIGHT)
-    parser.add_argument("--backfill", type=int, default=INTERVAL_SAMPLE_BLOCKS,
-                        help="blocks below the tip to load at startup")
+    parser.add_argument("--backfill", type=int, default=DEFAULT_BACKFILL,
+                        help="blocks below the tip to load at startup (the miner baseline)")
     parser.add_argument("--metrics-interval", type=float, default=2.0)
     parser.add_argument("--block-interval", type=float, default=3.0)
     parser.add_argument("--sample-interval", type=float, default=10.0)

@@ -163,7 +163,7 @@ pub const DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT: u32 = 100;
 /// lowest missing height is fetched even when every servable peer is at its cwnd.
 pub const DEFAULT_BS_FLOOR_BYPASS_SLOTS: u32 = 2;
 /// Default hard cap `C` on one peer's byte cwnd: the request bytes this node
-/// authorizes one peer to have outstanding, before the floor bypass.
+/// authorizes one peer session to have outstanding, before the floor bypass.
 ///
 /// A reservation lives from publication until its body arrives, so a peer
 /// carrying `R` bytes per second at round trip `T` needs `R·T` bytes reserved.
@@ -323,8 +323,10 @@ pub struct ZakuraBlockSyncConfig {
     pub bbr_min_cwnd_bytes: u64,
     /// Hard cap `C` on one peer's byte cwnd. The work queue also caps one
     /// session's published reservations at `C` plus the floor bypass (see
-    /// [`ZakuraBlockSyncConfig::owner_reservation_cap`]), so a peer never has
+    /// [`ZakuraBlockSyncConfig::owner_reservation_cap`]), so a session never has
     /// more request bytes outstanding than its share of the receive window.
+    /// A replaced peer's retiring session keeps its own reservations until its
+    /// routine exits.
     /// Must be at least `bbr_min_cwnd_bytes`.
     pub bbr_max_cwnd_bytes: u64,
     /// Delay-gradient down-adjust threshold, percent of RTprop.

@@ -22,7 +22,7 @@ use std::{
     future::Future,
     pin::pin,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -208,11 +208,11 @@ pub struct Effects {
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
-    /// When the node under test's side of each link first had its header-sync
-    /// session ended, since the run's start, by connection ID. A
-    /// [`PolicySource`] records it after every step, and virtual time moves
-    /// only in a step of its own, so this is the instant the session ended.
-    pub ended: Rc<RefCell<BTreeMap<u64, Duration>>>,
+    /// When the node under test's header-sync session on each link ended,
+    /// since the run's start, by connection ID. Each link's cancellation
+    /// hooks record it, inside the `cancel` that ends the session, so no
+    /// harness read touches a token.
+    pub ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -231,8 +231,6 @@ pub struct PolicySource {
     linked: usize,
     /// The connections recorded as closed.
     closed: BTreeSet<u64>,
-    /// The connections whose node-side session is recorded as ended.
-    ended: BTreeSet<u64>,
     /// How many growths are recorded.
     grown: usize,
 }
@@ -251,7 +249,6 @@ impl PolicySource {
             effects,
             linked: 0,
             closed: BTreeSet::new(),
-            ended: BTreeSet::new(),
             grown: 0,
         }
     }
@@ -342,15 +339,6 @@ impl ActionSource for PolicySource {
         for link in links.iter() {
             if link.is_closed() && self.closed.insert(link.conn_id) {
                 predicates.record_link(LinkEffect::Closed, &link.peer);
-            }
-            // Outside a task, reading a token is no scheduling point.
-            if link.session_ended() && self.ended.insert(link.conn_id) {
-                if let Some(now) = zakura_scheduler::hooks::now() {
-                    self.effects
-                        .ended
-                        .borrow_mut()
-                        .insert(link.conn_id, now.since_start());
-                }
             }
         }
         let grown = self.effects.grown.borrow();
@@ -495,10 +483,6 @@ pub struct Link {
     pub linked_at: Duration,
     /// Each side's connection token, dialer first.
     tokens: [CancellationToken; 2],
-    /// The node under test's header-sync session token on this link, a
-    /// child of its connection token. The node cancels it alone to refuse
-    /// or retire the session.
-    session: CancellationToken,
 }
 
 impl Link {
@@ -517,13 +501,6 @@ impl Link {
     /// open, so that isn't a closure.
     pub fn is_closed(&self) -> bool {
         self.tokens.iter().any(CancellationToken::is_cancelled)
-    }
-
-    /// Whether the node under test's session on this link ended: the
-    /// connection closed, or the node cancelled the session alone, as it
-    /// does to refuse or retire one.
-    pub fn session_ended(&self) -> bool {
-        self.is_closed() || self.session.is_cancelled()
     }
 }
 
@@ -622,7 +599,27 @@ impl Topology {
                 (from_dialer, to_dialer),
             ),
         ];
-        let mut session = None;
+        // The node's side of the session ends when either connection token is
+        // cancelled, or when the node cancels its own session token alone, as
+        // it does to refuse or retire the session. A hook runs inside that
+        // `cancel` and is no scheduling point, so it records the instant.
+        let ended = |token: &CancellationToken| {
+            let ended = self.effects.ended.clone();
+            token.on_cancel(move || {
+                // The run's own teardown cancels after its evidence froze.
+                let Some(now) = zakura_scheduler::hooks::now() else {
+                    return;
+                };
+                ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(id)
+                    .or_insert(now.since_start());
+            });
+        };
+        for token in &tokens {
+            ended(token);
+        }
         for ((local, remote, direction, streams), token) in sides.into_iter().zip(&tokens) {
             let peer = Peer::new_versioned(
                 id,
@@ -636,7 +633,7 @@ impl Topology {
                 token.clone(),
             );
             if local == 0 {
-                session = Some(peer.service_cancel_token());
+                ended(&peer.service_cancel_token());
             }
             self.nodes[local].service.add_peer(peer);
         }
@@ -651,20 +648,23 @@ impl Topology {
                 .expect("links are made inside a run")
                 .since_start(),
             tokens,
-            session: session.expect("every link has the node under test at one end"),
         };
         self.effects.links.borrow_mut().push(link.clone());
         link
     }
 
     /// Each link's session and how long it lasted, in link order. A session
-    /// ends when the node's side of it is cancelled, which closing its
-    /// connection also does, or when a later link to the same peer replaces
-    /// it, whichever comes first. The node refuses a session only by
-    /// cancelling it, so a session still open here was admitted.
+    /// ends when [`Effects::ended`] records it, or when a later link to the
+    /// same peer replaces it, whichever comes first. The node refuses a
+    /// session only by cancelling it, so a session still open here was
+    /// admitted.
     pub fn sessions(&self) -> Vec<SessionLife> {
         let links = self.effects.links.borrow();
-        let ended = self.effects.ended.borrow();
+        let ended = self
+            .effects
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         links
             .iter()
             .enumerate()

@@ -122,6 +122,10 @@ struct Announcement {
 
     /// When this announcement stops being worth sending.
     deadline: Instant,
+
+    /// The order in which its protocol accepted this mined block, so a block put back after a
+    /// dispatch goes back among the blocks accepted around it.
+    order: u64,
 }
 
 impl Announcement {
@@ -136,6 +140,7 @@ impl Announcement {
             early: None,
             tracked: false,
             deadline: Instant::now() + BLOCK_GOSSIP_TIMEOUT,
+            order: 0,
         }
     }
 
@@ -158,6 +163,7 @@ impl Announcement {
             tracked: early.is_none(),
             early,
             deadline: Instant::now() + BLOCK_GOSSIP_TIMEOUT,
+            order: 0,
         }
     }
 
@@ -174,6 +180,7 @@ impl Announcement {
             early: None,
             tracked: false,
             deadline: Instant::now() + BLOCK_GOSSIP_TIMEOUT,
+            order: 0,
         }
     }
 
@@ -254,6 +261,9 @@ struct Protocol<ZN> {
     /// This node's own blocks dispatched and not reported back yet.
     active: usize,
 
+    /// How many mined blocks this protocol has accepted, which orders the waiting ones.
+    accepted: u64,
+
     /// Committed mined-block announcements, so the committed-tip path does not duplicate them.
     broadcasts: MinedBlockBroadcasts,
 
@@ -275,6 +285,7 @@ where
             newest_committed_mined: None,
             ready: None,
             active: 0,
+            accepted: 0,
             broadcasts: MinedBlockBroadcasts::default(),
             stopped: false,
         }
@@ -346,7 +357,7 @@ where
     /// height is lowered to its own. Blocks at one height are kept together, since neither
     /// implies the other. A committed block takes the place of its own submission. When the queue
     /// is full, the oldest waiting block other than the best tip makes room.
-    fn accept_mined(&mut self, best_tip: Option<block::Hash>, announcement: Announcement) {
+    fn accept_mined(&mut self, best_tip: Option<block::Hash>, mut announcement: Announcement) {
         if self.stopped {
             return;
         }
@@ -385,12 +396,15 @@ where
             .iter_mut()
             .find(|waiting| waiting.hash == announcement.hash)
         {
+            announcement.order = waiting.order;
             *waiting = announcement;
             return;
         }
         if self.mined.len() >= MAX_WAITING_MINED {
             self.evict_waiting_mined(best_tip, Eviction::Oldest);
         }
+        announcement.order = self.accepted;
+        self.accepted += 1;
         self.mined.push_back(announcement);
     }
 
@@ -447,13 +461,17 @@ where
     ///
     /// One that ran out of time, one that failed verification, a tip that is no longer the tip,
     /// and a mined block that a newer committed one has buried are all dropped instead. A mined
-    /// block goes back ahead of the blocks accepted after it, and the newest of them makes room
-    /// when the queue is full. A committed block takes the place of its own submission that is
+    /// block goes back ahead of the blocks accepted after it, whichever order dispatched blocks
+    /// come back in, and the newest of them makes room when the queue is full. A committed block takes the place of its own submission that is
     /// still waiting; otherwise a block that is already waiting is not put back twice.
-    fn restore(&mut self, announcement: Announcement, best_tip: Option<block::Hash>) {
-        if self.stopped || !announcement.is_current(Instant::now()) {
+    fn restore(&mut self, mut announcement: Announcement, best_tip: Option<block::Hash>) {
+        let now = Instant::now();
+        if self.stopped || !announcement.is_current(now) {
             return;
         }
+        // Waiting blocks that are no longer worth sending must not count as the queue being
+        // full, or a current one would make room for the restored block instead.
+        self.prune(now);
         match announcement.slot {
             Slot::Tip => {
                 if best_tip == Some(announcement.hash) && self.tip.is_none() {
@@ -470,6 +488,7 @@ where
                     .find(|waiting| waiting.hash == announcement.hash)
                 {
                     if waiting.early.is_some() && announcement.early.is_none() {
+                        announcement.order = waiting.order;
                         *waiting = announcement;
                     }
                     return;
@@ -477,7 +496,12 @@ where
                 if self.mined.len() >= MAX_WAITING_MINED {
                     self.evict_waiting_mined(best_tip, Eviction::Newest);
                 }
-                self.mined.push_front(announcement);
+                let index = self
+                    .mined
+                    .iter()
+                    .position(|waiting| waiting.order > announcement.order)
+                    .unwrap_or(self.mined.len());
+                self.mined.insert(index, announcement);
             }
         }
     }
@@ -1521,6 +1545,41 @@ mod tests {
     }
 
     #[test]
+    fn blocks_put_back_in_dispatch_order_keep_the_parent_before_its_child() {
+        let parent = block::Hash([41; 32]);
+        let child = block::Hash([42; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            None,
+            Announcement::mined(parent, block::Height(2), 1_000, None),
+        );
+        let parent_sent = protocol.take_next().expect("the parent is waiting");
+        protocol.accept_mined(
+            None,
+            Announcement::mined(
+                child,
+                block::Height(3),
+                1_000,
+                Some(early(PendingBlockSignal::valid_for_tests())),
+            ),
+        );
+        let child_sent = protocol.take_next().expect("the child is waiting");
+
+        // Both found no peer, and the parent's announcement reported back first.
+        protocol.restore(parent_sent, None);
+        protocol.restore(child_sent, None);
+
+        assert_eq!(
+            protocol.take_next().map(|next| next.hash),
+            Some(parent),
+            "the first peer is sent the parent before its child",
+        );
+        assert_eq!(protocol.take_next().map(|next| next.hash), Some(child));
+        assert!(protocol.take_next().is_none());
+    }
+
+    #[test]
     fn an_equal_height_mined_block_is_put_back_ahead_of_later_ones() {
         let first = block::Hash([27; 32]);
         let second = block::Hash([28; 32]);
@@ -1702,6 +1761,42 @@ mod tests {
             protocol.take_next().map(|next| next.hash),
             Some(hash(3)),
             "the oldest block other than the best tip made room",
+        );
+    }
+
+    #[test]
+    fn a_block_put_back_on_a_full_mined_queue_makes_room_by_dropping_a_rejected_submission() {
+        let hash = |index: usize| block::Hash([u8::try_from(index).expect("small index"); 32]);
+        let (pending, failure) = PendingBlockSignal::waiting_for_tests();
+
+        let mut protocol = protocol();
+        protocol.accept_mined(
+            Some(hash(1)),
+            Announcement::mined(hash(1), block::Height(2), 1_000, None),
+        );
+        let first_sent = protocol.take_next().expect("the first block is waiting");
+        protocol.accept_mined(
+            None,
+            Announcement::mined(hash(2), block::Height(2), 1_000, Some(early(pending))),
+        );
+        for index in 3..=MAX_WAITING_MINED + 1 {
+            protocol.accept_mined(
+                Some(hash(1)),
+                Announcement::mined(hash(index), block::Height(2), 1_000, None),
+            );
+        }
+        // The submission is rejected while the first block is being sent.
+        failure.fail();
+
+        protocol.restore(first_sent, Some(hash(1)));
+        let waiting: Vec<_> =
+            std::iter::from_fn(|| protocol.take_next().map(|next| next.hash)).collect();
+        assert_eq!(
+            waiting,
+            std::iter::once(hash(1))
+                .chain((3..=MAX_WAITING_MINED + 1).map(hash))
+                .collect::<Vec<_>>(),
+            "the rejected submission made room, not a current block",
         );
     }
 

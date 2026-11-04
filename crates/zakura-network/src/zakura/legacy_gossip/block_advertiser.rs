@@ -38,7 +38,8 @@ const QUEUE_WAIT: Duration = Duration::from_secs(3);
 /// having refused the block. A block is recorded as seen, and kept for replay to later peers,
 /// only once a session queued it; a block already seen, sent earlier or relayed from a peer, is
 /// not sent again. A submitted block that the chain has not committed yet is never kept for
-/// replay, since the chain can still reject it. Requests other than block advertisements fail.
+/// replay, since the chain can still reject it; once it commits, its announcement keeps it for
+/// replay even though it is not sent again. Requests other than block advertisements fail.
 pub(crate) struct ZakuraBlockAdvertiser {
     broadcast: ZakuraGossipBroadcast,
     readiness: Readiness,
@@ -88,6 +89,11 @@ impl ZakuraBlockAdvertiser {
     ) -> Result<Response, BoxError> {
         let frame = LegacyGossipFrame::AdvertiseBlock(hash);
         if broadcast.unseen(&frame).await.is_none() {
+            // The block was already sent, as this node's submission or relayed from a peer. Now
+            // that it has committed, it is still the block a later peer should be sent.
+            if committed {
+                broadcast.outbound.remember_latest_block(&frame);
+            }
             return Ok(Response::Nil);
         }
 
@@ -540,6 +546,51 @@ mod tests {
         assert!(
             later_receiver.try_recv().is_err(),
             "a later peer is not sent the submitted block"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_keeps_a_submitted_block_for_replay_once_it_commits(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_session, mut receiver) = insert_session(&broadcast.outbound, 12, 2);
+        let hash = block_hash(12);
+
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseMinedBlock(AdvertisedBlock::submitted(
+                hash, 1_000,
+            )))
+            .await?;
+        assert_eq!(recv_advert(&mut receiver).await?, hash);
+        assert_eq!(latest_block(&broadcast.outbound), None);
+
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseMinedBlock(AdvertisedBlock::new(
+                hash, 1_000,
+            )))
+            .await?;
+        assert!(
+            receiver.try_recv().is_err(),
+            "a block already announced as a submission is not sent again when it commits"
+        );
+        assert_eq!(
+            latest_block(&broadcast.outbound),
+            Some(hash),
+            "the committed block is kept for later peers"
+        );
+
+        let (later, mut later_receiver) = insert_session(&broadcast.outbound, 13, 1);
+        broadcast
+            .outbound
+            .replay_latest_block_to_peer(later)
+            .await?;
+        assert_eq!(
+            recv_advert(&mut later_receiver).await?,
+            hash,
+            "a later peer is sent the committed block"
         );
         Ok(())
     }

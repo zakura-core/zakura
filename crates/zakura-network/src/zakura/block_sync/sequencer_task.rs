@@ -929,6 +929,8 @@ impl SequencerIO {
             verified_tip,
         } = acceptance
         {
+            // A refused deferral means a reset or the floor already removed this
+            // exact attempt, so the height has another path to a body.
             self.work
                 .defer_received_for_owner(owner, height, hash, bytes, verified_tip);
             metrics::counter!("sync.block.retention.deferred").increment(1);

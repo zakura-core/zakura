@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "13.0.1"
+version = "13.1.0"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -60,7 +60,7 @@ zcash_transparent = { workspace = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
 
-zakura-script = { path = "../zakura-script", version = "5.0.1" }
+zakura-script = { path = "../zakura-script", version = "5.0.2" }
 zakura-state = { path = "../zakura-state", version = "13.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.0.1" }
 zakura-chain = { path = "../zakura-chain", version = "11.0.0" }

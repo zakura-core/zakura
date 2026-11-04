@@ -834,3 +834,27 @@ fn liveness_grace_is_granted_once_per_no_progress_episode() {
         "disarm restores the grace",
     );
 }
+
+/// A peer at its no-progress request cap takes no request, so its slot
+/// publication shows no free slot, whatever its window allows.
+#[test]
+fn publish_slots_shows_no_free_slot_at_the_no_progress_cap() {
+    let config = ZakuraBlockSyncConfig::default();
+    let now = Instant::now();
+    let mut harness = Harness::new();
+    harness.state.received_status = true;
+    harness.state.servable_high = block::Height(MAX_HEIGHT);
+    harness.issue(1, 1, 1, now, now + LIVENESS_TIMEOUT);
+
+    assert!(
+        harness.state.window.available_slots_at(now) > 0,
+        "the window still has room, so only the no-progress cap refuses work",
+    );
+    assert_eq!(
+        harness.state.fill_limits(&config, now).err(),
+        Some(super::FillStop::InitialBlockProbeRequestCap),
+    );
+    let slots = harness.state.publish_slots(false, now);
+    assert_eq!(slots.available_slots, 0);
+    assert!(!harness.state.published_free_slots);
+}

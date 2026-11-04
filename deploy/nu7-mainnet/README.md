@@ -15,7 +15,7 @@ network-wide rate.
 | Unit | Role |
 | --- | --- |
 | `zakurad.service` | The node, built from this branch so it exports the `zcash_chain_tip_*`, `zcash_chain_block_*`, `zcash_chain_nsm_*` and `zcash_chain_value_pool_*` metrics. RPC (`127.0.0.1:8232`), metrics (`127.0.0.1:9999`) and health (`127.0.0.1:8080`) stay on loopback; only P2P port 8233 is open. Config: `zakura.toml`. |
-| `zakura-nu7-mainnet-dashboard.service` | `collector.py` with `nu7_chain.py`, `nu7_store.py` and `page.html` under `/opt/zakura-nu7-mainnet`. Stores blocks, samples and events in `/var/lib/zakura-nu7-mainnet/dashboard.sqlite` and serves `/`, `/v1/dashboard?window=1h|6h|24h|7d` and `/healthz` on `127.0.0.1:8095`. Unit: `collector.service`. |
+| `zakura-nu7-mainnet-dashboard.service` | `collector.py` with `nu7_chain.py`, `nu7_store.py` and `page.html` under `/opt/zakura-nu7-mainnet`. Stores blocks, samples and events in `/var/lib/zakura-nu7-mainnet/dashboard.sqlite` and serves `/`, `/v1/dashboard` (window 1h, 6h, 24h or 7d) and `/healthz` on `127.0.0.1:8095`. Unit: `collector.service`. |
 | `caddy.service` | Publishes those three routes at the hostname with an automatic certificate. Config: `Caddyfile`. |
 
 The collector works against a stock release too: the per-block fee and NSM

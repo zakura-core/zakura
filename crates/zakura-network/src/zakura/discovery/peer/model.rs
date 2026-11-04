@@ -128,7 +128,6 @@ impl Model {
             }),
             Line::Refresh => PeerInput::Refreshed {
                 sent: !choice.is_multiple_of(4),
-                unsettled: (choice / 4).is_multiple_of(2),
             },
             Line::Answers => PeerInput::AnswersSettled,
             Line::ShortLived => PeerInput::ShortLivedMarked,
@@ -181,10 +180,9 @@ impl Model {
                     (Line::Done, self.settle_open())
                 }
             }
-            (Line::Refresh, PeerInput::Refreshed { sent, unsettled }) => {
-                // A timed-out exchange gets one refresh interval to complete,
-                // and any delivered part gets its local processing.
-                let stalled = self.continued == Some(true) && !unsettled && !self.complete();
+            (Line::Refresh, PeerInput::Refreshed { sent }) => {
+                // A timed-out exchange gets one refresh interval to complete.
+                let stalled = self.continued == Some(true) && !self.complete();
                 if sent && !stalled {
                     (Line::Owners, then(PeerOutput::CheckSoleOwner))
                 } else {

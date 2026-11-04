@@ -138,10 +138,8 @@ pub(super) enum PeerInput {
     /// [`PeerOutput::CheckSoleOwner`] found this ownership.
     Owners(Ownership),
     /// [`PeerOutput::Refresh`] ended. `sent` is false once the session is
-    /// cancelled or gone. `unsettled` is true while the session holds an
-    /// answer or `Hello` that the peer delivered and this node has not
-    /// processed.
-    Refreshed { sent: bool, unsettled: bool },
+    /// cancelled or gone.
+    Refreshed { sent: bool },
     /// [`PeerOutput::WaitForAnswers`] ended.
     AnswersSettled,
     /// [`PeerOutput::MarkShortLived`] ran.
@@ -274,7 +272,7 @@ impl PeerState {
                 Phase::CheckingOwners | Phase::CheckingClose,
                 PeerInput::Owners(Ownership::Superseded),
             )
-            | (Phase::Refreshing, PeerInput::Refreshed { sent: false, .. }) => self.release(),
+            | (Phase::Refreshing, PeerInput::Refreshed { sent: false }) => self.release(),
             (Phase::CheckingOwners, PeerInput::Owners(Ownership::Sole)) => {
                 // Closing drops every unwritten answer, and the peer's
                 // exchange would end without it.
@@ -283,20 +281,15 @@ impl PeerState {
                     deadline: DISCOVERY_ANSWER_WRITE_DEADLINE,
                 })
             }
-            // A timed-out exchange that is still incomplete a full refresh
-            // interval later, with nothing delivered left to process, ends
-            // its session. The missing parts never reached this node, so a
-            // silent peer on a shared connection cannot hold a discovery
-            // slot. A delivered part that waits for local verification is
-            // never the peer's fault, and the session keeps refreshing.
-            (
-                Phase::Refreshing,
-                PeerInput::Refreshed {
-                    sent: true,
-                    unsettled: false,
-                },
-            ) if self.timed_out && !self.progress.complete() => self.release(),
-            (Phase::Refreshing, PeerInput::Refreshed { sent: true, .. }) => {
+            // A timed-out exchange still incomplete a full refresh interval
+            // later ends its session, so a silent peer on a shared connection
+            // cannot hold a discovery slot.
+            (Phase::Refreshing, PeerInput::Refreshed { sent: true })
+                if self.timed_out && !self.progress.complete() =>
+            {
+                self.release()
+            }
+            (Phase::Refreshing, PeerInput::Refreshed { sent: true }) => {
                 self.phase = Phase::CheckingOwners;
                 PeerStep::then(PeerOutput::CheckSoleOwner)
             }

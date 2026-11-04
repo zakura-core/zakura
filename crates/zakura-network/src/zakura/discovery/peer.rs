@@ -146,13 +146,9 @@ impl PeerIO {
                     current: self.handle.is_current_session(&self.slot.key).await,
                 },
                 PeerOutput::CheckSoleOwner => PeerInput::Owners(self.owners().await),
-                PeerOutput::Refresh { interval } => {
-                    let sent = self.refresh_after(interval).await;
-                    PeerInput::Refreshed {
-                        sent,
-                        unsettled: self.queries.holds_unsettled(),
-                    }
-                }
+                PeerOutput::Refresh { interval } => PeerInput::Refreshed {
+                    sent: self.refresh_after(interval).await,
+                },
                 PeerOutput::WaitForAnswers { deadline } => {
                     self.wait_for_answers(deadline).await;
                     PeerInput::AnswersSettled

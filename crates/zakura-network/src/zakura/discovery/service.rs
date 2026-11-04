@@ -3802,48 +3802,6 @@ mod tests {
         assert_close_held_until_settled(io, hello).await
     }
 
-    /// A `Hello` that waits for local verification is this node's delay, so a
-    /// timed-out session on a shared connection keeps refreshing, uncharged,
-    /// while it waits. Once the `Hello` settles and the exchange is still
-    /// incomplete, the next refresh ends the session, charged once.
-    #[tokio::test(start_paused = true)]
-    async fn a_hello_in_local_verification_keeps_a_shared_session_uncharged(
-    ) -> Result<(), crate::BoxError> {
-        let (handle, peer_id, _) = handle_with_session(78, 2).await?;
-        let (send, _peer_recv) = framed_channel(16);
-        let (mut io, states) = test_peer_io(handle.clone(), peer_id.clone(), send);
-        io.connection_owners = vec![Arc::new(TestConnectionOwner {
-            peer: peer_id.clone(),
-            conn_id: 2,
-        })];
-        let key = io.slot.key.clone();
-        let failed_attempts = || {
-            states
-                .lock()
-                .expect("discovery session-state mutex is never poisoned")
-                .records
-                .get(&(peer_id.clone(), 2))
-                .map(|record| record.failed_attempts)
-        };
-        let hello = io.queries.verifying_hello();
-        let session = tokio::spawn(io.run());
-
-        tokio::time::sleep(DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + 3 * SEND_INTERVAL).await;
-        assert!(
-            handle.is_current_session(&key).await,
-            "a delivered Hello in verification keeps the session"
-        );
-        assert_eq!(failed_attempts(), Some(0));
-
-        drop(hello);
-        tokio::time::timeout(SEND_INTERVAL + Duration::from_secs(1), session)
-            .await
-            .expect("the next refresh ends the stalled session")?;
-        assert!(!handle.is_current_session(&key).await);
-        assert_eq!(failed_attempts(), Some(1));
-        Ok(())
-    }
-
     #[tokio::test(start_paused = true)]
     async fn timed_out_close_waits_at_most_the_deadline() -> Result<(), crate::BoxError> {
         let (handle, peer_id, _) = handle_with_session(62, 2).await?;

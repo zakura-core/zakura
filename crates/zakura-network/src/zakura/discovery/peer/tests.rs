@@ -134,10 +134,7 @@ fn another_admitted_service_keeps_the_connection_and_the_session_refreshes() {
             then(REFRESH)
         );
         assert_eq!(
-            state.on_input(PeerInput::Refreshed {
-                sent: true,
-                unsettled: false
-            }),
+            state.on_input(PeerInput::Refreshed { sent: true }),
             then(PeerOutput::CheckSoleOwner)
         );
     }
@@ -146,10 +143,7 @@ fn another_admitted_service_keeps_the_connection_and_the_session_refreshes() {
         then(REFRESH)
     );
     assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: false,
-            unsettled: false
-        }),
+        state.on_input(PeerInput::Refreshed { sent: false }),
         then(END_OPEN),
         "a completed session that ends with its stream leaves the connection open"
     );
@@ -170,10 +164,7 @@ fn a_late_completion_settles_a_timed_out_session_as_a_success() {
     );
     complete(&mut state);
     assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: false,
-            unsettled: false
-        }),
+        state.on_input(PeerInput::Refreshed { sent: false }),
         charged(SessionCharge::Succeed, END_OPEN)
     );
 }
@@ -194,47 +185,7 @@ fn a_timed_out_exchange_still_incomplete_after_a_refresh_ends_charged() {
         then(REFRESH)
     );
     assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: true,
-            unsettled: false
-        }),
-        charged(SessionCharge::Fail, END_OPEN)
-    );
-}
-
-/// A timed-out exchange whose delivered part still waits for local processing
-/// is not charged at the refresh: the delay is this node's. Once nothing
-/// delivered is left and the exchange is still incomplete, the next refresh
-/// ends it charged.
-#[test]
-fn a_delivered_part_in_local_verification_keeps_a_timed_out_session() {
-    let mut state = waiting_session();
-    assert_eq!(
-        settle_initial(&mut state, InitialWait::TimedOut),
-        then(PeerOutput::CheckSoleOwner)
-    );
-    for _ in 0..3 {
-        assert_eq!(
-            state.on_input(PeerInput::Owners(Ownership::Shared)),
-            then(REFRESH)
-        );
-        assert_eq!(
-            state.on_input(PeerInput::Refreshed {
-                sent: true,
-                unsettled: true
-            }),
-            then(PeerOutput::CheckSoleOwner)
-        );
-    }
-    assert_eq!(
-        state.on_input(PeerInput::Owners(Ownership::Shared)),
-        then(REFRESH)
-    );
-    assert_eq!(
-        state.on_input(PeerInput::Refreshed {
-            sent: true,
-            unsettled: false
-        }),
+        state.on_input(PeerInput::Refreshed { sent: true }),
         charged(SessionCharge::Fail, END_OPEN)
     );
 }

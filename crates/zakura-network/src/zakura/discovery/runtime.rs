@@ -11,6 +11,7 @@ use super::protocol::{
     DiscoveryWireError, ZakuraDiscoveryConfig, ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig,
     ZakuraServiceId, DEFAULT_DISCOVERY_CONNECTION_HEADROOM,
 };
+use super::sequence_file::AuthoredSequenceFile;
 
 /// Services advertised in this node's discovery self-record.
 pub(crate) fn default_advertised_services() -> Vec<ZakuraServiceId> {
@@ -31,10 +32,13 @@ pub(crate) fn effective_discovery_connection_headroom(bootstrap_peer_count: usiz
 }
 
 /// Builds a discovery runtime handle from the local node identity and the
-/// negotiated network parameters.
+/// negotiated network parameters. With a `sequence_file`, the handle seeds its
+/// first self-record sequence from the stored one and stores each sequence it
+/// authors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_discovery_handle(
     secret_key: NodeSecretKey,
+    sequence_file: Option<AuthoredSequenceFile>,
     direct_addrs: Vec<SocketAddr>,
     advertised_services: Vec<ZakuraServiceId>,
     handshake: &ZakuraHandshakeConfig,
@@ -50,7 +54,7 @@ pub(crate) fn build_discovery_handle(
         zakura_protocol_max: handshake.zakura_protocol_max,
         network_id: handshake.network_id,
         chain_id: handshake.chain_id,
-        last_authored_sequence: None,
+        last_authored_sequence: sequence_file.as_ref().and_then(AuthoredSequenceFile::load),
     };
     let config = ZakuraDiscoveryConfig {
         max_zakura_connections,
@@ -59,5 +63,9 @@ pub(crate) fn build_discovery_handle(
         ),
         ..ZakuraDiscoveryConfig::default()
     };
-    ZakuraDiscoveryHandle::new(local_config, config, connected)
+    let handle = ZakuraDiscoveryHandle::new(local_config, config, connected)?;
+    Ok(match sequence_file {
+        Some(file) => handle.with_sequence_file(file),
+        None => handle,
+    })
 }

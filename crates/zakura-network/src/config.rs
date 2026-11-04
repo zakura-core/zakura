@@ -54,7 +54,8 @@ mod tests;
 pub use cache_dir::CacheDir;
 
 pub(crate) use cache_dir::{
-    default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
+    default_network_identity_dir, zakura_discovery_sequence_file_path,
+    zakura_node_secret_key_file_path as zakura_secret_key_file_path,
 };
 
 /// A sensitive secret-key override for Zakura P2P node identity.
@@ -811,6 +812,12 @@ impl Config {
         let key_file = zakura_secret_key_file_path(&self.identity_dir, &self.network);
 
         Ok(load_or_generate_zakura_secret_key(&key_file))
+    }
+
+    /// The file that holds the last discovery self-record sequence this node
+    /// authored, under [`identity_dir`](Self::identity_dir).
+    pub(crate) fn zakura_discovery_sequence_file(&self) -> PathBuf {
+        zakura_discovery_sequence_file_path(&self.identity_dir, &self.network)
     }
 
     /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer

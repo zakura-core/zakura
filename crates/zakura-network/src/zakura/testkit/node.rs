@@ -466,6 +466,7 @@ impl ZakuraTestNodeBuilder {
         advertised_services.extend(self.extra_advertised_services.clone());
         let discovery = build_discovery_handle(
             LocalEndpointFactory::secret_key(self.seed),
+            None,
             self.discovery_direct_addrs.clone(),
             advertised_services,
             &handshake_config,

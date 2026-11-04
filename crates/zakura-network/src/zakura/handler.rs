@@ -4644,6 +4644,9 @@ async fn spawn_zakura_endpoint_inner(
     let sought_services = sought_services_with_custom(&custom_services);
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
+        Some(discovery::AuthoredSequenceFile::new(
+            config.zakura_discovery_sequence_file(),
+        )),
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),
         &handshake_config,
@@ -7854,6 +7857,7 @@ mod tests {
             let (_connected_tx, connected) = watch::channel(Vec::new());
             let discovery = discovery::build_discovery_handle(
                 secret_key.clone(),
+                None,
                 discovery_direct_addrs(config, local_node_id),
                 Vec::new(),
                 &ZakuraHandshakeConfig::for_network_with_dev_cohort(&config.network, None),
@@ -9170,6 +9174,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         let discovery = crate::zakura::discovery::build_discovery_handle(
             NodeSecretKey::generate(),
+            None,
             Vec::new(),
             crate::zakura::discovery::default_advertised_services(),
             &handshake,

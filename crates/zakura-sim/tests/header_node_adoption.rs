@@ -333,15 +333,19 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
         };
         assert!(count(&|fact| matches!(fact, AdoptionFact::TipPublished { .. })) >= 3);
         for session in &run.view.sessions {
-            let queued = count(&|fact| {
-                matches!(fact, AdoptionFact::StatusQueued { session_id, .. }
-                    if *session_id == session.session_id)
-            });
-            assert!(
-                queued >= 3,
-                "session {} got {queued} statuses",
-                session.session_id
-            );
+            let mut tips: Vec<u32> = Vec::new();
+            for stamped in &facts {
+                if let AdoptionFact::StatusQueued {
+                    session_id, status, ..
+                } = &stamped.fact
+                {
+                    let tip = status.selected_tip_height.0;
+                    if *session_id == session.session_id && tips.last() != Some(&tip) {
+                        tips.push(tip);
+                    }
+                }
+            }
+            assert_eq!(tips, [3, 5, 7], "session {}", session.session_id);
         }
         let second = facts
             .iter()

@@ -295,7 +295,7 @@ impl HasView for Planted {
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Default::default(),
             adoption: Default::default(),
-            live_sessions: Default::default(),
+            sessions: Default::default(),
         }
     }
 }

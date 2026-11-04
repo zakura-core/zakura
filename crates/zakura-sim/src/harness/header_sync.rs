@@ -27,8 +27,11 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        adoption::AdoptionEvidence, policy, preload, tap::ReactorTap, Chain, Control, ControlStep,
-        DispatchFlag, Effects, HeaderNode, Policy, PolicySource, Topology,
+        adoption::{AdoptionEvidence, SessionLife},
+        policy, preload,
+        tap::ReactorTap,
+        Chain, Control, ControlStep, DispatchFlag, Effects, HeaderNode, Policy, PolicySource,
+        Topology,
     },
     scenario::Rejection,
     wire_node::{TransportTap, WireNode},
@@ -232,10 +235,10 @@ pub struct StorageView {
     pub honest_peers: Rc<BTreeSet<usize>>,
     /// The node's adopted state and what it published from it.
     pub adoption: AdoptionEvidence,
-    /// The node's sessions still admitted now, which the status rule
-    /// ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
+    /// Each of the node's sessions and how long it lasted, which the status
+    /// rule ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
     /// knows them, from its links.
-    pub live_sessions: BTreeSet<u64>,
+    pub sessions: Vec<SessionLife>,
 }
 
 impl HonestPeers for StorageView {
@@ -249,14 +252,14 @@ impl HasView for Storage {
     type View = StorageView;
 
     /// The node's port, the dispatch guard's flag, the node's adoption facts
-    /// and its live sessions.
+    /// and its sessions' lifetimes.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Rc::default(),
             adoption: self.adoption.clone(),
-            live_sessions: self.topology.live_sessions(),
+            sessions: self.topology.sessions(),
         }
     }
 }
@@ -497,14 +500,15 @@ impl HasView for HeaderWire {
 
     /// The node's port, the dispatch guard's flag, the honest peers and the
     /// node's adoption facts. Its sessions run over the network, so the view
-    /// names none live.
+    /// gives no lifetimes, and the status rule judges only what each queued
+    /// status advertises.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: self.honest.clone(),
             adoption: self.adoption.clone(),
-            live_sessions: BTreeSet::new(),
+            sessions: Vec::new(),
         }
     }
 }

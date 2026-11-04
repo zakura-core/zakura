@@ -18,7 +18,7 @@ pub mod tap;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::pin,
     rc::Rc,
@@ -45,6 +45,7 @@ use zakura_storage::header::{
 };
 
 use self::{
+    adoption::SessionLife,
     policy::{Hold, LinkEffect, Predicates, Trigger},
     tap::ReactorTap,
 };
@@ -207,6 +208,11 @@ pub struct Effects {
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
+    /// When each closed connection was first seen closed, since the run's
+    /// start, by connection ID. A [`PolicySource`] records it after every
+    /// step, and virtual time moves only in a step of its own, so this is
+    /// the instant the connection closed.
+    pub closed: Rc<RefCell<BTreeMap<u64, Duration>>>,
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -332,6 +338,12 @@ impl ActionSource for PolicySource {
         // A connection closes once, whoever cancels it and however often.
         for link in links.iter() {
             if link.is_closed() && self.closed.insert(link.conn_id) {
+                if let Some(now) = zakura_scheduler::hooks::now() {
+                    self.effects
+                        .closed
+                        .borrow_mut()
+                        .insert(link.conn_id, now.since_start());
+                }
                 predicates.record_link(LinkEffect::Closed, &link.peer);
             }
         }
@@ -473,6 +485,8 @@ pub struct Link {
     pub conn_id: u64,
     /// The header-sync session's ID, the same on both sides.
     pub session_id: u64,
+    /// When it was made, since the run's start.
+    pub linked_at: Duration,
     /// Each side's connection token, dialer first.
     tokens: [CancellationToken; 2],
 }
@@ -611,25 +625,40 @@ impl Topology {
             listener,
             conn_id: id,
             session_id: id,
+            linked_at: zakura_scheduler::hooks::now()
+                .expect("links are made inside a run")
+                .since_start(),
             tokens,
         };
         self.effects.links.borrow_mut().push(link.clone());
         link
     }
 
-    /// The sessions still admitted from the links' side: each peer's newest
-    /// link that no one closed. A relink replaces a peer's session, and a
-    /// node that drops a session closes its link.
-    pub fn live_sessions(&self) -> BTreeSet<u64> {
+    /// Each link's session and how long it lasted, in link order. A session
+    /// ends when its connection closes or when a later link to the same peer
+    /// replaces it, whichever comes first. The node refuses a session only by
+    /// closing its connection, so a session still open here was admitted.
+    pub fn sessions(&self) -> Vec<SessionLife> {
         let links = self.effects.links.borrow();
-        let mut newest = std::collections::BTreeMap::new();
-        for link in links.iter() {
-            newest.insert(link.peer.as_str(), link);
-        }
-        newest
-            .into_values()
-            .filter(|link| !link.is_closed())
-            .map(|link| link.session_id)
+        let closed = self.effects.closed.borrow();
+        links
+            .iter()
+            .enumerate()
+            .map(|(index, link)| {
+                let replaced = links[index + 1..]
+                    .iter()
+                    .find(|later| later.peer == link.peer)
+                    .map(|later| later.linked_at);
+                let until = match (closed.get(&link.conn_id).copied(), replaced) {
+                    (Some(closed), Some(replaced)) => Some(closed.min(replaced)),
+                    (closed, replaced) => closed.or(replaced),
+                };
+                SessionLife {
+                    session_id: link.session_id,
+                    from: link.linked_at,
+                    until,
+                }
+            })
             .collect()
     }
 

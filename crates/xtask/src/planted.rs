@@ -1300,9 +1300,10 @@ mod tests {
         }
     }
 
-    /// With `--targets`, a case runs through the fuzz target that runs its
-    /// input's harness: the discovery case through `discovery_wait_complete`,
-    /// and no block-sync case, since no target runs `block-sync/storage`.
+    /// With `--targets`, a case runs through a fuzz target that runs its
+    /// input's harness, such as the discovery wait case through
+    /// `discovery_wait_complete`. Checking each case keeps the test valid as
+    /// cases and targets are added.
     #[test]
     fn committed_cases_run_through_the_target_of_their_harness() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
@@ -1311,15 +1312,20 @@ mod tests {
         for case in cases(&repo_root).expect("the planted cases parse") {
             let harness = harness_of(&repo_root, &case.input).expect("the input has a sidecar");
             if let Some(target) = target_of(&harnesses, &harness) {
+                assert_eq!(
+                    harnesses.get(&target),
+                    Some(&Some(harness)),
+                    "{}: its target runs its harness",
+                    case.property
+                );
                 on_targets.insert(case.property, target);
             }
         }
         assert_eq!(
-            on_targets,
-            BTreeMap::from([(
-                "discovery/wait-complete-wakes".to_owned(),
-                "discovery_wait_complete".to_owned()
-            )])
+            on_targets
+                .get("discovery/wait-complete-wakes")
+                .map(String::as_str),
+            Some("discovery_wait_complete")
         );
     }
 

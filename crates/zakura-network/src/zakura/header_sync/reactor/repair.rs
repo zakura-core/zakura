@@ -454,6 +454,7 @@ impl HeaderSyncReactor {
         {
             return RepairAttempt::NoLocalCapacity;
         }
+        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let session = self
             .sessions
             .get(&peer)

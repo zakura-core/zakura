@@ -298,7 +298,8 @@ impl Subsystem for Storage {
 
     /// Spawns the node on its controlled port under the scenario's policy,
     /// with its reactor tapped, then each mirror, links each mirror to the
-    /// node once, and adds the `Control` source. Only the node is tapped.
+    /// node once, and adds the `Control` source. Only the node is tapped,
+    /// and its tap learns of a `Shutdown` step before the node stops.
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
         let effects = Effects::default();
@@ -309,6 +310,7 @@ impl Subsystem for Storage {
             effects.clone(),
         );
         let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
+        let shutdown = tap.shutdown();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -340,7 +342,7 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let topology = Rc::new(Topology::new(nodes, effects));
+        let topology = Rc::new(Topology::new(nodes, effects).with_tap(shutdown));
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),

@@ -9,6 +9,8 @@
 //! decide whether the fixture headers validate. [`policy`] holds individual
 //! operations, and gates `Control` steps, until chosen events happen. A
 //! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
+//! A `Shutdown` step stops the node under test on purpose, which its tap
+//! expects.
 
 mod pair;
 pub mod policy;
@@ -44,7 +46,7 @@ use zakura_storage::header::{
 
 use self::{
     policy::{Hold, LinkEffect, Predicates, Trigger},
-    tap::ReactorTap,
+    tap::{ReactorTap, TapShutdown},
 };
 use crate::{
     storage::{HeaderStorage, HEADER_SERVICE},
@@ -195,9 +197,14 @@ impl Policy {
 
 /// What tasks did to a [`Topology`], shared with the [`PolicySource`] that
 /// counts it for [`Trigger::Linked`], [`Trigger::Closed`] and
-/// [`Trigger::Grown`].
+/// [`Trigger::Grown`], and the names it counts tapped reactor facts under.
 #[derive(Clone, Default)]
 pub struct Effects {
+    /// Each node's peer identity and name, which [`Topology::new`] fills,
+    /// so [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`]
+    /// name the peer as the scenario does. A fact about a peer with no name
+    /// here counts for no trigger.
+    pub names: Rc<RefCell<Vec<(ZakuraPeerId, String)>>>,
     /// Every link made, in order.
     pub links: Rc<RefCell<Vec<Link>>>,
     /// Each peer whose chain grew, once per committed growth, in order.
@@ -291,6 +298,7 @@ impl ActionSource for PolicySource {
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         let before = log.entries().len();
         let stored = self.storage.observe(log);
+        let mut tapped_effects = Vec::new();
         // Drained even when storage failed, so a port panic the tap holds
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
@@ -305,6 +313,7 @@ impl ActionSource for PolicySource {
                         _ => None,
                     },
                 ));
+                tapped_effects = tap.take_effects();
                 tap.observe(log)
             }
             None => Ok(()),
@@ -320,6 +329,12 @@ impl ActionSource for PolicySource {
                 }
                 Observation::Reactor { event, .. } => predicates.record_reactor(event),
                 _ => {}
+            }
+        }
+        let names = self.effects.names.borrow();
+        for (effect, peer) in tapped_effects {
+            if let Some((_, name)) = names.iter().find(|(id, _)| *id == peer) {
+                predicates.record_link(effect, name);
             }
         }
         let links = self.effects.links.borrow();
@@ -381,6 +396,8 @@ pub struct HeaderNode {
     pub vct_repairs: watch::Sender<VctRootRepairStatus>,
     /// What the reactor was started with.
     pub startup: StartupFacts,
+    /// The reactor's shutdown token, which a `Shutdown` step cancels.
+    shutdown: CancellationToken,
 }
 
 /// The settings a [`HeaderNode`]'s reactor was started with, read from the
@@ -433,6 +450,7 @@ impl HeaderNode {
         startup.vct_root_repairs = Some(repairs);
         startup.header_chain_port = port.clone();
         startup.observer.0 = observer;
+        let shutdown = startup.shutdown.clone();
         let facts = StartupFacts {
             config: startup.config.clone(),
             request_timeout: startup.request_timeout,
@@ -454,6 +472,7 @@ impl HeaderNode {
             port,
             vct_repairs,
             startup: facts,
+            shutdown,
         }
     }
 }
@@ -502,17 +521,63 @@ pub struct Topology {
     /// The last connection and session ID handed out. A replacement needs
     /// both to be new, so one counter serves both.
     last_id: Cell<u64>,
+    /// The node under test's tap, told of its shutdown.
+    tap: Option<TapShutdown>,
+    /// Set once a `Shutdown` step stopped the node under test.
+    stopped: Cell<bool>,
 }
 
 impl Topology {
     /// `nodes`, with no links yet. Each link it makes, and each growth,
-    /// goes in `effects`.
+    /// goes in `effects`, which learns each node's name.
     pub fn new(nodes: Vec<HeaderNode>, effects: Effects) -> Self {
+        effects.names.borrow_mut().extend(
+            nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.name.clone())),
+        );
         Topology {
             nodes,
             effects,
             last_id: Cell::new(0),
+            tap: None,
+            stopped: Cell::new(false),
         }
+    }
+
+    /// This topology, telling `tap` before it stops the node under test.
+    pub fn with_tap(self, tap: TapShutdown) -> Self {
+        Topology {
+            tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// Records why a `Control` step couldn't take effect, which ends the
+    /// run as a harness failure.
+    fn fail(&self, why: String) {
+        self.effects.failure.borrow_mut().get_or_insert(why);
+    }
+
+    /// Stops the node under test, as zakurad's shutdown ends header sync:
+    /// tells its tap, closes every link to it, so its sessions end, and
+    /// cancels its reactor, which retires its work and drops its pending
+    /// calls. A second shutdown is a failure.
+    fn shutdown(&self) {
+        if self.stopped.replace(true) {
+            self.fail("the node is already shut down".to_owned());
+            return;
+        }
+        if let Some(tap) = &self.tap {
+            tap.begin();
+        }
+        // Cancelling can be a scheduling point, so the links are copied
+        // first. Every link has the node under test at one end.
+        let links = self.effects.links.borrow().clone();
+        for link in &links {
+            link.close();
+        }
+        self.nodes[0].shutdown.cancel();
     }
 
     /// Extends the selected chain of the node named `peer` by `len` fixture
@@ -647,6 +712,11 @@ pub enum ControlAction {
         /// The new headers.
         len: u32,
     },
+    /// Stop the node under test, which the step must name: close every link
+    /// to it and cancel its reactor. Its tap expects the reactor to go, and
+    /// checks it left no call or ownership open. A later relink, or a second
+    /// shutdown, fails the run.
+    Shutdown,
 }
 
 impl ControlAction {
@@ -656,6 +726,7 @@ impl ControlAction {
             ControlAction::Close => "close",
             ControlAction::Relink => "relink",
             ControlAction::Grow { .. } => "grow",
+            ControlAction::Shutdown => "shutdown",
         }
     }
 }
@@ -708,11 +779,21 @@ impl Control {
                 };
                 match step.action {
                     ControlAction::Close => link().close(),
+                    ControlAction::Relink if topology.stopped.get() => {
+                        topology.fail(format!("relinking {} after the shutdown", step.peer));
+                    }
                     ControlAction::Relink => {
                         let link = link();
                         topology.link(link.dialer, link.listener);
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
+                    ControlAction::Shutdown if step.peer != topology.nodes[0].name => {
+                        topology.fail(format!(
+                            "a shutdown names the node under test, not {}",
+                            step.peer
+                        ));
+                    }
+                    ControlAction::Shutdown => topology.shutdown(),
                 }
             }
         });

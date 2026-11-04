@@ -155,6 +155,15 @@ pub enum Trigger<K> {
     /// change in two steps, so only it counts, once per preparation, a
     /// repeated one included.
     Prepared(String),
+    /// The header node under test reserved header capacity for a request to
+    /// this peer, as its tap reports: once per reservation, for a round's
+    /// first request, each granted continuation and each repair request.
+    /// Never holds without a tap.
+    ReservationOpened(String),
+    /// The header node under test's reactor admitted a session from this
+    /// peer, as its tap reports: once per admission, the setup link's
+    /// included, so a replacement is the second. Never holds without a tap.
+    SessionAdmitted(String),
     /// This many milliseconds after the held operation's submission, or
     /// after the run's start in a control step. Time stops there.
     VirtualTime(u64),
@@ -213,9 +222,10 @@ pub(crate) enum Event {
     ReplyTaken,
 }
 
-/// A link effect a task made, as [`Trigger::Closed`], [`Trigger::Linked`],
-/// [`Trigger::Grown`], [`Trigger::Reset`] and [`Trigger::Prepared`] count
-/// it.
+/// A link effect a task made, or a reactor fact about one peer, as
+/// [`Trigger::Closed`], [`Trigger::Linked`], [`Trigger::Grown`],
+/// [`Trigger::Reset`], [`Trigger::Prepared`],
+/// [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`] count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkEffect {
     /// A link was made.
@@ -228,6 +238,10 @@ pub enum LinkEffect {
     Reset,
     /// An actor prepared a chain change's headers, to apply them later.
     Prepared,
+    /// The node under test reserved header capacity for a request to a peer.
+    ReservationOpened,
+    /// The node under test's reactor admitted a session from a peer.
+    SessionAdmitted,
 }
 
 /// What [`Predicates`] knows about one stage of an operation from that
@@ -448,6 +462,8 @@ impl<F: Family> Predicates<F> {
             Trigger::Grown(peer) => links(LinkEffect::Grown, peer),
             Trigger::Reset(peer) => links(LinkEffect::Reset, peer),
             Trigger::Prepared(peer) => links(LinkEffect::Prepared, peer),
+            Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
+            Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
             Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }

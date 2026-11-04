@@ -35,7 +35,8 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call, without retained-header ownership.
+    /// The events recorded since the last call, without retained-header ownership,
+    /// reservations or session admissions.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -44,6 +45,8 @@ impl Recorder {
                     event,
                     ReactorEvent::HeadersHeld { .. }
                         | ReactorEvent::HeadersEnded { .. }
+                        | ReactorEvent::ReservationOpened { .. }
+                        | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::CallEnded {
                             end: CallEnd::Dropped,
                             ..
@@ -1373,6 +1376,39 @@ fn no_observer_evaluates_nothing() {
             call: 1,
             panicked: false,
         }]
+    );
+}
+
+/// Each installed session reports its admission, a replacement included, and a
+/// refused one reports none.
+#[test]
+fn admitted_sessions_are_observed() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = ZakuraPeerId::new(vec![0x51; 32]).expect("the test peer ID has the required length");
+    let _first = connect(&mut reactor, &peer, 1);
+    let _second = connect(&mut reactor, &peer, 2);
+    reactor.state.unproductive_peer_cooldowns.insert(
+        peer.clone(),
+        Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let _refused = connect(&mut reactor, &peer, 3);
+
+    let admitted: Vec<_> = recorder
+        .take_all()
+        .into_iter()
+        .filter(|event| matches!(event, ReactorEvent::SessionAdmitted { .. }))
+        .collect();
+    assert_eq!(
+        admitted,
+        [1, 2].map(|session_id| ReactorEvent::SessionAdmitted {
+            peer: peer.clone(),
+            session_id,
+        })
     );
 }
 

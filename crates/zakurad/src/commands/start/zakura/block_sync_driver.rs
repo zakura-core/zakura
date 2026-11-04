@@ -12,6 +12,7 @@ use futures::{
 };
 use sha2::{Digest, Sha256};
 use tokio::{pin, select, sync::mpsc};
+use tokio_util::sync::CancellationToken;
 use tower::{util::BoxCloneService, Service, ServiceExt};
 use tracing::{debug, error, warn};
 
@@ -111,12 +112,33 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut deferred_actions = VecDeque::new();
     let mut shutting_down = false;
     let mut apply_phase = block_sync_handoff.subscribe_apply_phase();
+    let accounting_closed = block_sync.accounting_closed();
+    pin!(accounting_closed);
+    // Shutdown waits for accepted applies until this deadline, then abandons
+    // them. A checkpoint apply can wait for the rest of its range forever.
+    let mut drain_deadline = None;
+    let abandon_accepted = CancellationToken::new();
 
     loop {
+        if !shutting_down && block_sync.is_accounting_closed() {
+            error!("stopping the critical block-sync driver after local accounting failure");
+            shutting_down = true;
+            begin_shutdown(
+                &block_sync_handoff,
+                &block_sync,
+                &mut pending_applies,
+                &mut pending_probe_applies,
+                &mut deferred_actions,
+                &trace,
+            );
+        }
         if block_sync_handoff.is_yielded_to_legacy() {
             release_pending_applies(&block_sync, &mut pending_applies, &trace);
             release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-        } else if block_sync_handoff.zakura_owns_applies() && !pending_applies.is_empty() {
+        } else if !shutting_down
+            && block_sync_handoff.zakura_owns_applies()
+            && !pending_applies.is_empty()
+        {
             drain_pending_block_applies(
                 &block_sync_handoff,
                 &mut pending_applies,
@@ -133,19 +155,38 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 block_sync.clone(),
                 trace.clone(),
                 throughput_probe.clone(),
+                &abandon_accepted,
             );
         }
 
         if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
             shutting_down = true;
-            block_sync_handoff.request_apply_shutdown();
-            release_pending_applies(&block_sync, &mut pending_applies, &trace);
-            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-            deferred_actions.clear();
+            begin_shutdown(
+                &block_sync_handoff,
+                &block_sync,
+                &mut pending_applies,
+                &mut pending_probe_applies,
+                &mut deferred_actions,
+                &trace,
+            );
         }
 
         if shutting_down {
-            if let Some(completed) = in_flight_applies.next().await {
+            let deadline = *drain_deadline.get_or_insert_with(|| {
+                tokio::time::Instant::now() + ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT
+            });
+            let completed = select! {
+                completed = in_flight_applies.next() => completed,
+                () = tokio::time::sleep_until(deadline), if !abandon_accepted.is_cancelled() => {
+                    warn!(
+                        in_flight = in_flight_applies.len(),
+                        "abandoning block applies that outlived the shutdown drain"
+                    );
+                    abandon_accepted.cancel();
+                    continue;
+                }
+            };
+            if let Some(completed) = completed {
                 handle_completed_block_apply(
                     &block_sync_handoff,
                     completed,
@@ -163,6 +204,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
+                    &abandon_accepted,
                 );
                 continue;
             }
@@ -189,6 +231,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
+                    &abandon_accepted,
                 );
                 continue;
             }
@@ -202,12 +245,18 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             action
         } else {
             select! {
+                // The closure check at the top of the loop starts the drain.
+                _ = &mut accounting_closed => continue,
                 _ = &mut shutdown => {
                     shutting_down = true;
-                    block_sync_handoff.request_apply_shutdown();
-                    release_pending_applies(&block_sync, &mut pending_applies, &trace);
-                    release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
-                    deferred_actions.clear();
+                    begin_shutdown(
+                        &block_sync_handoff,
+                        &block_sync,
+                        &mut pending_applies,
+                        &mut pending_probe_applies,
+                        &mut deferred_actions,
+                        &trace,
+                    );
                     continue;
                 },
                 _ = block_sync_handoff.wait_for_zakura_ownership(),
@@ -244,6 +293,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         block_sync.clone(),
                         trace.clone(),
                         throughput_probe.clone(),
+                        &abandon_accepted,
                     );
                     continue;
                 }
@@ -267,6 +317,12 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             coalesce_stale_needed_block_queries(action, &mut actions, &mut deferred_actions);
 
         trace.trace_block_action_received(&action);
+        // Receiving an action can race with closure, including a capacity wake
+        // from dequeue. Recheck before authorizing its backend work.
+        if block_sync.is_accounting_closed() {
+            deferred_actions.push_front(action);
+            continue;
+        }
         match action {
             BlockSyncAction::RecordBodyUnavailable {
                 expected_version,
@@ -582,6 +638,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
+                    &abandon_accepted,
                 );
             }
         }
@@ -916,6 +973,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    abandon_accepted: &CancellationToken,
 ) where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -948,6 +1006,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
         block_sync,
         trace,
         throughput_probe,
+        abandon_accepted,
     );
 }
 
@@ -968,6 +1027,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    abandon_accepted: &CancellationToken,
 ) where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -1042,6 +1102,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         let transfer_token = pending.token;
         let transfer_block_sync = block_sync.clone();
         let transfer_trace = trace.clone();
+        let abandon = abandon_accepted.clone();
         let apply = apply_block_sync_body(
             block_verifier.clone(),
             latest_chain_tip.clone(),
@@ -1063,18 +1124,10 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 tokio::select! {
                     biased;
                     completed = &mut apply => {
-                        let terminal = match completed.result {
-                            BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
-                                super::BlockApplyTerminal::Committed
-                            }
-                            BlockApplyResult::Rejected
-                            | BlockApplyResult::Unavailable
-                            | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
-                        };
                         accepted
                             .take()
                             .expect("accepted operation has one terminal result")
-                            .complete(terminal);
+                            .complete(apply_terminal(completed.result));
                         completed
                     }
                     _ = transfer_handoff.wait_for_legacy_yield() => {
@@ -1104,11 +1157,55 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                         .increment(1);
                         BlockApplyCompletion { class, result }
                     }
+                    () = abandon.cancelled() => {
+                        // Shutdown outwaited its drain bound. Dropping the
+                        // verifier future releases the body.
+                        let result = abandon_block_apply(
+                            &transfer_block_sync,
+                            transfer_owner,
+                            transfer_source,
+                            transfer_token,
+                            transfer_block.as_ref(),
+                            &transfer_trace,
+                        );
+                        accepted
+                            .take()
+                            .expect("accepted operation has one terminal result")
+                            .complete(apply_terminal(result));
+                        BlockApplyCompletion { class, result }
+                    }
                 }
             }
             .boxed(),
         );
     }
+}
+
+/// The coordinator's terminal for an apply that ended with `result`.
+fn apply_terminal(result: BlockApplyResult) -> super::BlockApplyTerminal {
+    match result {
+        BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
+            super::BlockApplyTerminal::Committed
+        }
+        BlockApplyResult::Rejected | BlockApplyResult::Unavailable | BlockApplyResult::TimedOut => {
+            super::BlockApplyTerminal::Rejected
+        }
+    }
+}
+
+/// Stop new applies, release held applies and drop unauthorized deferred actions.
+fn begin_shutdown(
+    block_sync_handoff: &super::SyncCoordinator,
+    block_sync: &BlockSyncHandle,
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+    deferred_actions: &mut VecDeque<BlockSyncAction>,
+    trace: &ZakuraTrace,
+) {
+    block_sync_handoff.request_apply_shutdown();
+    release_pending_applies(block_sync, pending_applies, trace);
+    release_pending_probe_applies(block_sync, pending_probe_applies, trace);
+    deferred_actions.clear();
 }
 
 fn release_pending_applies(

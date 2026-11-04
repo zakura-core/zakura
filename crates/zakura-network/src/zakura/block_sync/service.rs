@@ -911,7 +911,6 @@ impl Service for BlockSyncService {
                             wiring.config,
                             !re_admitted_after_no_progress,
                             generation,
-                            wiring.budget,
                             wiring.work,
                             wiring.registry,
                             wiring.received_throughput,

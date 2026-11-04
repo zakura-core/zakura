@@ -104,10 +104,10 @@ async fn committed_payload_counts_once_across_frontier_and_completion_orderings(
                     let (actions, mut actions_rx) = mpsc::channel(16);
                     let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
                     let meter_start = Instant::now();
+                    let budget = ByteBudget::new(123);
                     let mut task = SequencerTask::new(
                         Sequencer::new(block::Height(0), 1),
-                        ByteBudget::new(123),
-                        Arc::new(WorkQueue::new(block::Height(0))),
+                        Arc::new(WorkQueue::new(block::Height(0), budget.clone())),
                         Arc::new(PeerRegistry::new()),
                         actions,
                         ThroughputMeter::new(meter_start),

@@ -1,4 +1,6 @@
 //! Block-level flushes of the shielded batch verifiers, once a block's shielded work is queued.
+//! A shielded transaction verified outside a block, such as a mempool transaction, is its own
+//! flush unit.
 //!
 //! The block verifier registers how many shielded transactions it is about to dispatch. Each
 //! shielded transaction holds a [`Queueing`] guard while it builds its checks, and each batch
@@ -153,6 +155,19 @@ impl Queueing {
             .get(&key(context))
             .cloned()
             .map(Self)
+    }
+
+    /// Returns the guard of a shielded transaction verified outside any block, such as a mempool
+    /// transaction.
+    ///
+    /// The transaction is its own flush unit: with no block boundary to wait for, the batch
+    /// workers that received its items are flushed once its checks are built and every batch
+    /// request they made is queued, instead of waiting for the batch latency bound.
+    pub(crate) fn for_standalone_transaction() -> Self {
+        Self(Arc::new(Mutex::new(Progress {
+            pending: 1,
+            queued: 0,
+        })))
     }
 
     /// Runs `f`, the synchronous construction of this transaction's checks, so that the batch

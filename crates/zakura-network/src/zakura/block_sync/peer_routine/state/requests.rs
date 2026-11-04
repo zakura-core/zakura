@@ -318,13 +318,35 @@ impl PeerState {
             .map(OutstandingBlockRange::is_complete)
     }
 
-    /// Record a wanted body that matches no outstanding request, typically one
-    /// that arrived just after its request timed out. It proves progress and
-    /// offsets that timeout's reliability charge. It feeds no delivery sample,
-    /// because its request's send time is gone.
-    pub(in super::super) fn record_late_body(&mut self, now: Instant, liveness_timeout: Duration) {
+    /// Record a wanted body at `height` that matches no outstanding request,
+    /// typically one that arrived just after its request timed out. It proves
+    /// progress. It offsets the reliability charge only of a timeout this
+    /// session charged for `height`, and only once. It feeds no delivery
+    /// sample, because its request's send time is gone.
+    ///
+    /// Returns whether the body offset a timeout.
+    pub(in super::super) fn record_late_body(
+        &mut self,
+        height: block::Height,
+        download_floor: block::Height,
+        now: Instant,
+        liveness_timeout: Duration,
+    ) -> bool {
         self.window.note_block_progress(now, liveness_timeout);
-        self.window.credit_late_delivery();
+        self.forget_timeouts_through(download_floor);
+        let credited = self.uncredited_timeouts.remove(&height);
+        if credited {
+            self.window.credit_late_delivery();
+        }
+        credited
+    }
+
+    /// Drop uncredited timeouts at or below `download_floor`, whose bodies are no
+    /// longer wanted.
+    fn forget_timeouts_through(&mut self, download_floor: block::Height) {
+        self.uncredited_timeouts = self
+            .uncredited_timeouts
+            .split_off(&block::Height(download_floor.0.saturating_add(1)));
     }
 
     /// Decide how an ending finishes the request that starts at its range's
@@ -407,9 +429,12 @@ impl PeerState {
 
     /// Retire due requests by how their write settled. Only a started write
     /// charges the peer with a timeout; a skipped write refunds its probe.
+    /// Each unreceived height of a timed-out request above `download_floor` can
+    /// later offset that timeout once, through [`Self::record_late_body`].
     pub(in super::super) fn expire_requests(
         &mut self,
         due: Vec<(RequestKey, WriteOutcome)>,
+        download_floor: block::Height,
     ) -> ExpiredRequests {
         let (skipped, timed_out): (Vec<_>, Vec<_>) = due
             .into_iter()
@@ -426,6 +451,16 @@ impl PeerState {
             .collect();
         if !timed_out.is_empty() {
             self.window.record_timeout(timed_out.len());
+            self.forget_timeouts_through(download_floor);
+            self.uncredited_timeouts
+                .extend(timed_out.iter().flat_map(|range| {
+                    range
+                        .request
+                        .expected_blocks
+                        .iter()
+                        .map(|expected| expected.height)
+                        .filter(|height| *height > download_floor && !range.has_received(*height))
+                }));
         }
         ExpiredRequests { skipped, timed_out }
     }

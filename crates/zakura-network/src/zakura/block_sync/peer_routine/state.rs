@@ -1,6 +1,10 @@
 //! Peer-local request policy for one block-sync session.
 
-use std::{collections::BTreeMap, num::NonZeroU64, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+    time::Duration,
+};
 
 use zakura_chain::block;
 use zakura_rt::time::Instant;
@@ -47,6 +51,10 @@ pub(super) struct PeerState {
     /// height `pending` (contestable by any other peer) but does not re-grab it
     /// itself — the peer-local retry bias. Pruned on expiry each fill pass.
     pub(super) retry_avoid: BTreeMap<block::Height, Instant>,
+    /// Heights whose requests timed out on this session and whose late body has
+    /// not offset that timeout yet. Heights at or below the download floor
+    /// leave, so the download window above the floor bounds this set.
+    pub(super) uncredited_timeouts: BTreeSet<block::Height>,
     /// Whether the last fill stopped because the node-wide request pool was
     /// empty, so the routine waits for a pool entry.
     pub(super) request_pool_waiting: bool,
@@ -116,6 +124,7 @@ impl PeerState {
             ),
             window,
             retry_avoid: BTreeMap::new(),
+            uncredited_timeouts: BTreeSet::new(),
             request_pool_waiting: false,
             allow_no_progress_park,
             status_reply_meter: RateMeter::new(config.status_refresh_interval),

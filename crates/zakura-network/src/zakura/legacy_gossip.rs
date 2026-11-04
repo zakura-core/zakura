@@ -115,6 +115,10 @@ const LEGACY_CLIENT_INVENTORY_SLOTS: usize = 256;
 /// Other requests that one request client runs at once. They have a partition of
 /// their own so saturated inventory fetches cannot delay chain discovery or Ping.
 const LEGACY_CLIENT_CONTROL_SLOTS: usize = 32;
+/// Requests that one request client runs at once. Each request holds at most one
+/// outbound compatibility exchange grant at a time.
+pub(super) const LEGACY_CLIENT_REQUEST_SLOTS: usize =
+    LEGACY_CLIENT_INVENTORY_SLOTS + LEGACY_CLIENT_CONTROL_SLOTS;
 const LEGACY_GOSSIP_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_FIRST_SEEN_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_FIRST_SEEN_CAPACITY: usize = 50_000;
@@ -2474,7 +2478,8 @@ impl ZakuraRequestClient {
             }
         };
         // The grant funds the frames and the decoder's reassembly copy. It ends when
-        // the raw response does. The caller's pipeline owns the decoded payloads.
+        // the raw response does, within this request's client slot, even if its
+        // connection has closed. The caller's pipeline owns the decoded payloads.
         let (frames, _grant) = response.into_parts();
         let mut response = match LegacyResponseCodec::decode_response(
             request_id,
@@ -8151,6 +8156,95 @@ mod tests {
         }
 
         node.shutdown().await;
+        Ok(())
+    }
+
+    /// Reconnect churn holds at most one compatibility grant per client request,
+    /// which the node's envelope counts. Each exchange here runs on a fresh
+    /// connection, as after a reconnect, and keeps a full grant after that
+    /// connection's resources drop, until its requester gives up. The live grants
+    /// outnumber the admitted connections but stop at the client's slots.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_churn_keeps_compat_grants_within_the_envelope() -> Result<(), BoxError> {
+        let grant_bytes = crate::zakura::COMPAT_EXCHANGE_BUDGET.receive;
+        let node = crate::zakura::transport::NodeResources::new(
+            crate::zakura::ReactorShares::from_quic(&zakura_quic::QuicConfig::default()),
+            legacy_gossip_streams().iter().copied(),
+            u32::MAX,
+        );
+        let (sender, mut receiver) = mpsc::channel(8);
+        let churn = node.clone();
+        tokio::spawn(async move {
+            while let Some(frame) = receiver.recv().await {
+                let crate::zakura::ZakuraOutboundFrame::Request { mut completion, .. } = frame;
+                let connection = churn.connection(ZAKURA_CAP_LEGACY_GOSSIP);
+                tokio::spawn(async move {
+                    let _grant = connection.admit_compat_response(grant_bytes).await;
+                    drop(connection);
+                    completion.closed().await;
+                });
+            }
+        });
+        let peer = ZakuraPeerId::new(vec![1; 32])?;
+        let supervisor = ZakuraSupervisorHandle::new(8);
+        supervisor
+            .register_handle_for_tests(ZakuraPeerHandle::new_for_tests(peer, sender))
+            .await;
+        let client = ZakuraRequestClient::new_with_trace_and_stream_rate(
+            supervisor,
+            ZakuraTrace::noop(),
+            u32::MAX,
+        );
+        let requests: Vec<_> = (0..LEGACY_CLIENT_INVENTORY_SLOTS + 8)
+            .map(|_| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    client
+                        .request(
+                            LegacyRequestFrame::BlocksByHash(vec![block_hash(1)]),
+                            None,
+                            false,
+                        )
+                        .await
+                })
+            })
+            .collect();
+        let installed = || node.owners().counts().installed;
+        timeout(TEST_NET_TIMEOUT, async {
+            while installed() < LEGACY_CLIENT_INVENTORY_SLOTS {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            installed(),
+            LEGACY_CLIENT_INVENTORY_SLOTS,
+            "the extra requests wait for client slots"
+        );
+
+        let mut limits =
+            crate::zakura::ZakuraLocalLimits::from_config(&crate::config::Config::default());
+        limits.max_connections = 8;
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let registry = crate::zakura::transport::ServiceRegistry::new(vec![Arc::new(test_sink(
+            inbound_tx,
+            LegacyGossipOutbound::default(),
+        ))])?;
+        let envelope = limits.resource_envelope(&registry);
+        assert!(installed() > limits.max_connections);
+        // Widening usize to u64 is lossless on supported targets.
+        assert!(installed() as u64 * grant_bytes <= envelope.compat_response_bytes);
+
+        for request in &requests {
+            request.abort();
+        }
+        timeout(TEST_NET_TIMEOUT, async {
+            while installed() > 0 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
         Ok(())
     }
 

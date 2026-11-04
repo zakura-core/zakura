@@ -677,7 +677,10 @@ impl ZakuraLocalLimits {
             }
         });
         let compat_exchange_bytes = if kinds.contains(&LEGACY_REQUEST_STREAM_KIND) {
-            COMPAT_EXCHANGE_BUDGET.receive
+            // Widening usize to u64 is lossless on supported targets.
+            COMPAT_EXCHANGE_BUDGET
+                .receive
+                .saturating_mul(super::legacy_gossip::LEGACY_CLIENT_REQUEST_SLOTS as u64)
         } else {
             0
         };
@@ -1420,7 +1423,8 @@ impl ZakuraPeerHandle {
     /// Open a request stream, write one frame, then return the response frames from the same stream.
     ///
     /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned value
-    /// funds its frames until it drops.
+    /// funds its frames until it drops. The node's resource envelope counts the
+    /// compatibility client's requests, so another caller bounds the values it keeps.
     pub async fn request(
         &self,
         stream_kind: u16,

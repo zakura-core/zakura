@@ -3302,16 +3302,21 @@ impl ZakuraProtocolHandler {
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
-                let admitted = match self
-                    .open_traced_session(
+                // The peer paces this open through stream credit. Local
+                // shutdown or eviction cancels the connection meanwhile, and
+                // dropping the open resets its streams and returns its permits.
+                let opened = zakura_rt::select! {
+                    biased;
+                    () = connection_token.cancelled() => break,
+                    opened = self.open_traced_session(
                         &open_context,
                         stream,
                         &mut session_io,
                         &mut workers,
                         &mut message_buckets,
-                    )
-                    .await
-                {
+                    ) => opened,
+                };
+                let admitted = match opened {
                     Ok(admitted) => admitted,
                     Err(ZakuraHandlerError::SessionFull) => {
                         // Demand is advisory: another connection can reserve the

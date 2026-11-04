@@ -200,6 +200,10 @@ struct Fixture {
     client_sessions: mpsc::Receiver<Peer>,
     server_siblings: mpsc::Receiver<Peer>,
     client_siblings: mpsc::Receiver<Peer>,
+    /// Stream credits the test took before the client's handler served.
+    held_credits: Vec<(SendStream, RecvStream)>,
+    /// Cancels every connection of the client's handler, as local shutdown does.
+    client_shutdown: CancellationToken,
 }
 
 impl Fixture {
@@ -230,6 +234,25 @@ impl Fixture {
         max_open_streams: Option<u16>,
         retired_sibling: bool,
         streams: &'static [Stream],
+    ) -> Result<Self, BoxError> {
+        Self::start_holding_credits(
+            fail_first_reservation,
+            max_open_streams,
+            retired_sibling,
+            streams,
+            0,
+        )
+        .await
+    }
+
+    /// Start after the client takes `held_credits` of the server's stream
+    /// credits, so the client's initial opens wait for credit.
+    async fn start_holding_credits(
+        fail_first_reservation: bool,
+        max_open_streams: Option<u16>,
+        retired_sibling: bool,
+        streams: &'static [Stream],
+        held_credits: usize,
     ) -> Result<Self, BoxError> {
         let mut local = ZakuraLocalLimits::from_config(&Config::default());
         if let Some(max_open_streams) = max_open_streams {
@@ -287,16 +310,21 @@ impl Fixture {
         );
         server.serve(server_handler)?;
         let address = LocalEndpointFactory::node_addr(&server).await;
-        let (connection, serving) = super::super::tests::connection::connect_and_serve(
-            &client,
-            address,
-            client_handler,
-            local,
-            P2P_V2_ALPN,
-            TEST_TIMEOUT,
-        )
-        .await?;
+        let client_shutdown = client_handler.shutdown.clone();
+        let (connection, held_credits, serving) =
+            super::super::tests::connection::connect_holding_credits_and_serve(
+                &client,
+                address,
+                client_handler,
+                local,
+                P2P_V2_ALPN,
+                TEST_TIMEOUT,
+                held_credits,
+            )
+            .await?;
         Ok(Self {
+            held_credits,
+            client_shutdown,
             server,
             client,
             connection,
@@ -2345,4 +2373,30 @@ async fn a_reopen_completes_once_withheld_stream_credit_returns() -> Result<(), 
     assert_ne!(replacement_client.id, client.id);
     exchange(&mut replacement_client, &mut replacement_server).await?;
     fixture.close().await
+}
+
+/// An initial open whose `open_bi` waits for stream credit still ends when
+/// the connection is cancelled, without waiting for the open's own deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_initial_open_waiting_for_stream_credit_ends_with_the_connection() -> Result<(), BoxError>
+{
+    let _guard = zakura_test::init();
+    let mut fixture =
+        Fixture::start_holding_credits(false, Some(2), true, &[DATA, REQUESTS], 2).await?;
+    assert_eq!(fixture.held_credits.len(), 2);
+    tokio::time::sleep(state::ORDERED_STREAM_REOPEN_BACKOFF * 4).await;
+    assert!(
+        fixture.client_sessions.try_recv().is_err(),
+        "the client's initial open waits for stream credit"
+    );
+
+    let cancelled = Instant::now();
+    fixture.client_shutdown.cancel();
+    timeout(Duration::from_secs(2), &mut fixture.serving)
+        .await
+        .expect("the initial open ends with the connection")??;
+    assert!(cancelled.elapsed() < OUTBOUND_STREAM_WRITE_TIMEOUT);
+    timeout(TEST_TIMEOUT, fixture.client.shutdown()).await?;
+    timeout(TEST_TIMEOUT, fixture.server.shutdown()).await?;
+    Ok(())
 }

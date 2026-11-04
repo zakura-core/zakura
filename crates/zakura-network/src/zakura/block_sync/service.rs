@@ -262,23 +262,27 @@ impl BlockSyncPeerSession {
 
     /// The inbound Status state an earlier stream-6 session of this
     /// connection left behind.
+    /// Reading claims the state for `generation`, so an older routine of
+    /// this connection can no longer write it.
     pub(super) fn received_status(
         &self,
+        generation: u64,
     ) -> Option<super::regulated::status_sender::ReceivedStatus> {
         self.status_sender
             .as_ref()
-            .and_then(|state| state.received())
+            .and_then(|state| state.received(generation))
     }
 
     /// Keep this session's inbound Status pacing with the connection, with
     /// the Status just applied, if any.
     pub(super) fn record_received_status(
         &self,
+        generation: u64,
         applied: Option<BlockSyncStatus>,
         pacing: super::regulated::status_sender::InboundStatusPacing,
     ) {
         if let Some(state) = &self.status_sender {
-            state.record_received(applied, pacing);
+            state.record_received(generation, applied, pacing);
         }
     }
 
@@ -1542,10 +1546,10 @@ mod regulated_frame_tests {
             range_bypass_available: false,
             pending: None,
         };
-        first.record_received(Some(received), pacing);
+        first.record_received(1, Some(received), pacing);
         let replacement = attach(1);
         assert_eq!(
-            replacement.received().map(|received| received.applied),
+            replacement.received(2).map(|received| received.applied),
             Some(received)
         );
         assert!(Arc::ptr_eq(&first, &replacement));
@@ -1560,7 +1564,7 @@ mod regulated_frame_tests {
         assert!(replacement.advertised(local).max_inflight_requests < local.max_inflight_requests);
         let new_connection = attach(2);
         assert!(!Arc::ptr_eq(&first, &new_connection));
-        assert!(new_connection.received().is_none());
+        assert!(new_connection.received(3).is_none());
         service.remove_peer(&peer, 1);
         assert!(!service
             .inner

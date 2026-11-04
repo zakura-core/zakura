@@ -79,6 +79,7 @@ async fn replacement_requests_from_cached_status_without_waiting_for_an_announce
     let (mut routine, mut outbound, _events) = super::tests::status_test_routine();
     let connection = Arc::new(StatusSender::new(u32::MAX, Duration::ZERO));
     connection.record_received(
+        0,
         Some(BlockSyncStatus {
             servable_high: block::Height(10),
             ..Default::default()

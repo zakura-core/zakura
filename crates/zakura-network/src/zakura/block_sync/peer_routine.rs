@@ -250,6 +250,7 @@ impl PeerRoutine {
             work.revocations(),
         );
         let handoff_blocked = registry.handoff_blocked_flag(&peer, generation);
+        registry.attach_outbound(&peer, generation, &session.request_sender());
         PeerRoutine {
             io: PeerIO {
                 decoded_pool,
@@ -365,7 +366,7 @@ impl PeerRoutine {
         let mut guard = block_sync_guard();
         // A stream replacement keeps the same connection advertisement. Waiting
         // for a fresh one would stall requests until the next cadence interval.
-        if let Some(received) = self.io.session.received_status() {
+        if let Some(received) = self.io.session.received_status(self.io.generation) {
             self.resume_status(received);
         }
         let result = self.run_inner(&mut guard).await;
@@ -714,9 +715,11 @@ impl PeerRoutine {
         }
         // The connection keeps the pacing, so a stream-6 replacement resumes it.
         let applied = matches!(update, StatusUpdate::Publish { .. }).then_some(status);
-        self.io
-            .session
-            .record_received_status(applied, self.state.status_pacing.clone());
+        self.io.session.record_received_status(
+            self.io.generation,
+            applied,
+            self.state.status_pacing.clone(),
+        );
         let StatusUpdate::Publish { send_reply } = update else {
             return;
         };
@@ -1838,6 +1841,85 @@ mod tests {
         ));
     }
 
+    /// Serving responses can fill a faster peer's outbound queue after its
+    /// routine published free slots. Floor preference reads the queue, so the
+    /// floor provider does not defer to a peer that cannot send.
+    #[tokio::test]
+    async fn floor_provider_does_not_defer_to_a_peer_with_a_full_outbound_queue() {
+        use super::super::peer_registry::SlotDiagnostics;
+
+        let (mut routine, mut outbound, _reactor_events) = status_test_routine();
+        routine.state.received_status = true;
+        routine.state.servable_low = block::Height(0);
+        routine.state.servable_high = block::Height(1);
+        let fast_peer = ZakuraPeerId::new(vec![8; 32]).unwrap();
+        let fast_generation = routine
+            .io
+            .registry
+            .admit_session(
+                &fast_peer,
+                routine.io.session.direction(),
+                &routine.config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let (fast_send, _fast_recv) = framed_channel(1);
+        routine
+            .io
+            .registry
+            .attach_outbound(&fast_peer, fast_generation, &fast_send);
+        for (peer, generation, latency) in [
+            (&routine.io.peer, routine.io.generation, 145),
+            (&fast_peer, fast_generation, 5),
+        ] {
+            routine.io.registry.upsert_status(
+                peer,
+                generation,
+                BlockSyncStatus {
+                    servable_low: block::Height(0),
+                    servable_high: block::Height(1),
+                    ..BlockSyncStatus::default()
+                },
+            );
+            routine.io.registry.publish_slots(
+                peer,
+                generation,
+                SlotDiagnostics {
+                    available_slots: 3,
+                    bbr_rtprop_ms: Some(latency),
+                    ..SlotDiagnostics::default()
+                },
+            );
+        }
+        // Another writer takes the fast peer's last queue slot after its publication.
+        let frame = BlockSyncMessage::Status(BlockSyncStatus::default())
+            .encode_frame()
+            .unwrap();
+        fast_send.try_send(frame).unwrap();
+        routine.io.work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Advertised(1_000),
+            )],
+        );
+
+        routine.try_fill();
+
+        let frame = outbound
+            .try_recv()
+            .expect("a full peer cannot carry the floor, so this one requests it");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).unwrap(),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(1),
+                count: 1
+            }
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn floor_ranking_change_wakes_a_deferred_routine() {
         use super::super::peer_registry::SlotDiagnostics;
@@ -2146,17 +2228,29 @@ mod tests {
         assert!(first_events.try_recv().is_err(), "the meter defers it");
 
         let (mut replacement, _outbound, mut events) = status_test_routine();
+        replacement.io.generation = first.io.generation + 1;
         replacement.io.session = replacement
             .io
             .session
             .clone()
-            .with_status_sender_for_test(connection);
+            .with_status_sender_for_test(Arc::clone(&connection));
         let received = replacement
             .io
             .session
-            .received_status()
+            .received_status(replacement.io.generation)
             .expect("the first stream stored its Status state");
         replacement.resume_status(received);
+
+        // The cancelled first routine still runs until its task ends. Its
+        // writes no longer reach the connection, so it cannot restore an
+        // allowance or a pending Status the replacement spends.
+        first.state.status_pacing.apply_meter.next_allowed = Instant::now();
+        first.handle_status(status);
+        let stored = connection
+            .received(replacement.io.generation)
+            .expect("the replacement keeps the stored state");
+        assert_eq!(stored.pacing.pending, Some(lowered));
+        assert_eq!(stored.pacing.apply_meter.next_allowed, closed_until);
         assert!(replacement.state.received_status);
         assert_eq!(replacement.state.servable_high, block::Height(3));
         assert_eq!(

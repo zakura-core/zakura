@@ -53,8 +53,18 @@ pub(in crate::zakura::block_sync) struct ReceivedStatus {
 #[derive(Debug)]
 pub(crate) struct StatusSender {
     sender: Mutex<CadenceSender<Message>>,
-    received: Mutex<Option<ReceivedStatus>>,
+    received: Mutex<StoredStatus>,
     max_inflight_requests: u32,
+}
+
+/// The stored inbound Status state and the routine generation that owns it.
+#[derive(Debug, Default)]
+struct StoredStatus {
+    /// The newest routine generation that read or wrote the state. A
+    /// replacement cancels its predecessor without waiting for it, so the
+    /// state refuses writes from an older generation.
+    owner: u64,
+    status: Option<ReceivedStatus>,
 }
 
 impl StatusSender {
@@ -67,7 +77,7 @@ impl StatusSender {
             .expect("the Status row declares a cadence");
         Self {
             sender: Mutex::new(sender),
-            received: Mutex::new(None),
+            received: Mutex::new(StoredStatus::default()),
             max_inflight_requests,
         }
     }
@@ -82,26 +92,40 @@ impl StatusSender {
 
     /// Store this connection's inbound Status pacing for a later stream-6
     /// session, with the Status just applied, if any. Pacing without an
-    /// applied Status has nothing to resume, so it is not kept.
+    /// applied Status has nothing to resume, so it is not kept. A write from
+    /// a `generation` older than the state's owner changes nothing, so a
+    /// cancelled routine cannot restore pacing its replacement already spent.
     pub(in crate::zakura::block_sync) fn record_received(
         &self,
+        generation: u64,
         applied: Option<BlockSyncStatus>,
         pacing: InboundStatusPacing,
     ) {
-        let mut received = self.received.lock().unwrap_or_else(PoisonError::into_inner);
-        match (applied, received.as_mut()) {
-            (Some(applied), _) => *received = Some(ReceivedStatus { applied, pacing }),
+        let mut stored = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        if generation < stored.owner {
+            return;
+        }
+        stored.owner = generation;
+        match (applied, stored.status.as_mut()) {
+            (Some(applied), _) => stored.status = Some(ReceivedStatus { applied, pacing }),
             (None, Some(received)) => received.pacing = pacing,
             (None, None) => {}
         }
     }
 
     /// The inbound Status state that an earlier stream-6 session stored.
-    pub(in crate::zakura::block_sync) fn received(&self) -> Option<ReceivedStatus> {
-        self.received
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    /// Reading makes `generation` the owner, so later writes from older
+    /// routines are refused. An older `generation` reads nothing.
+    pub(in crate::zakura::block_sync) fn received(
+        &self,
+        generation: u64,
+    ) -> Option<ReceivedStatus> {
+        let mut stored = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        if generation < stored.owner {
+            return None;
+        }
+        stored.owner = generation;
+        stored.status.clone()
     }
 
     /// Replace the pending Status and queue it if the cadence allows.

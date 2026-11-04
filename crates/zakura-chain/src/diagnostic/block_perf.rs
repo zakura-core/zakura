@@ -116,6 +116,7 @@ struct Data {
     contextual: Mutex<HashMap<&'static str, (u64, u64)>>,
     active: AtomicU64,
     ambiguous: AtomicU64,
+    error_binding: AtomicU64,
 }
 
 /// Cheap shared handle to one verification attempt's counters.
@@ -131,6 +132,16 @@ impl Context {
                 .as_ref()
                 .map(|(context, _)| context.clone())
         })
+    }
+
+    /// Mark an error-binding read whose state worker may execute without the async context.
+    pub fn mark_error_binding(&self) {
+        self.0.error_binding.store(1, Ordering::Release);
+    }
+
+    /// Whether this attempt is now confirming a failure's authorizing-data binding.
+    pub fn is_error_binding(&self) -> bool {
+        self.0.error_binding.load(Ordering::Acquire) != 0
     }
 
     /// Stage to preserve when forwarding work onto another thread.
@@ -260,10 +271,7 @@ impl Timer {
 
     fn new(context: Option<(Context, Stage)>, operation: Operation) -> Self {
         if let Some((context, stage)) = &context {
-            if !matches!(
-                (stage, operation),
-                (Stage::Finalized | Stage::Writer, Operation::Wall)
-            ) {
+            if !matches!(stage, Stage::Finalized | Stage::Writer) {
                 context.0.active.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -282,21 +290,43 @@ impl Drop for Timer {
             cell.calls.fetch_add(1, Ordering::Relaxed);
             cell.nanos
                 .fetch_add(nanos(self.start.elapsed()), Ordering::Relaxed);
-            if !matches!(
-                (stage, self.operation),
-                (Stage::Finalized | Stage::Writer, Operation::Wall)
-            ) {
+            if !matches!(stage, Stage::Finalized | Stage::Writer) {
                 context.0.active.fetch_sub(1, Ordering::AcqRel);
-            } else {
-                let payload = format!(
-                    "{{\"hash\":\"{}\",\"phase\":\"{}\",\"duration_ns\":{}}}",
-                    context.0.hash,
-                    stage.name(),
-                    nanos(self.start.elapsed())
-                );
-                tracing::info!(target: "zakura_block_perf", %payload, "block_perf_phase");
+            } else if matches!(self.operation, Operation::Wall) {
+                tracing::info!(target: "zakura_block_perf", payload = %context.phase_payload(*stage, self.start.elapsed()), "block_perf_phase");
             }
         }
+    }
+}
+
+impl Context {
+    fn phase_payload(&self, stage: Stage, duration: Duration) -> String {
+        let mut fields = vec![format!(
+            "\"hash\":\"{}\",\"phase\":\"{}\",\"duration_ns\":{}",
+            self.0.hash,
+            stage.name(),
+            nanos(duration)
+        )];
+        for operation in [
+            Operation::Id,
+            Operation::Auth,
+            Operation::Combined,
+            Operation::Root,
+            Operation::RootReuse,
+            Operation::RootRecompute,
+            Operation::Sighash,
+            Operation::Wall,
+        ] {
+            let cell = &self.0.cells[stage as usize * OPERATIONS + operation as usize];
+            fields.push(format!(
+                "\"{}_calls\":{},\"{}_ns\":{}",
+                operation.name(),
+                cell.calls.load(Ordering::Acquire),
+                operation.name(),
+                cell.nanos.load(Ordering::Acquire)
+            ));
+        }
+        format!("{{{}}}", fields.join(","))
     }
 }
 
@@ -325,6 +355,7 @@ impl Session {
             contextual: Mutex::new(HashMap::new()),
             active: AtomicU64::new(0),
             ambiguous: AtomicU64::new(0),
+            error_binding: AtomicU64::new(0),
         }));
         if let Some(previous) = BLOCKS
             .lock()
@@ -378,8 +409,8 @@ impl Session {
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
+impl Session {
+    fn payload(&self) -> String {
         let mut fields = vec![format!("\"hash\":\"{}\",\"height\":{},\"route\":\"{}\",\"outcome\":\"{}\",\"total_ns\":{},\"semantic_ns\":{},\"active\":{},\"tx\":{},\"pre_v5\":{},\"v5\":{},\"v6\":{},\"sapling\":{},\"orchard\":{}", self.context.0.hash, self.height.map(|height| height.to_string()).unwrap_or_else(|| "null".into()), self.route, self.outcome, nanos(self.start.elapsed()), self.semantic_ns.map(|n| n.to_string()).unwrap_or_else(|| "null".into()), self.context.0.active.load(Ordering::Acquire), self.mix[0], self.mix[1], self.mix[2], self.mix[3], self.mix[4], self.mix[5])];
         fields.push(format!(
             "\"schema\":1,\"sprout\":{},\"ironwood\":{}",
@@ -397,9 +428,7 @@ impl Drop for Session {
             Stage::Handoff,
             Stage::Commit,
             Stage::Commitment,
-            Stage::Finalized,
             Stage::Error,
-            Stage::Writer,
         ] {
             for operation in [
                 Operation::Id,
@@ -432,7 +461,13 @@ impl Drop for Session {
         for (name, (calls, ns)) in contextual.iter() {
             fields.push(format!("\"{name}_calls\":{calls},\"{name}_ns\":{ns}"));
         }
-        tracing::info!(target: "zakura_block_perf", payload = %format!("{{{}}}", fields.join(",")), "block_perf_finish");
+        format!("{{{}}}", fields.join(","))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        tracing::info!(target: "zakura_block_perf", payload = %self.payload(), "block_perf_finish");
         let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         if blocks
             .get(&self.context.0.hash)
@@ -513,6 +548,28 @@ mod tests {
         ));
         drop(registration);
         assert!(Context::for_request(&key).is_none());
+    }
+
+    #[test]
+    fn late_finalization_retains_its_counters_after_the_response_summary() {
+        let block = block();
+        let session = Session::new(Hash([16; 32]), &block, "test");
+        let context = session.context();
+        let primary: serde_json::Value = serde_json::from_str(&session.payload()).unwrap();
+        assert!(primary.get("finalized_auth_calls").is_none());
+        drop(session);
+        {
+            let _scope = Context::enter(Some(context.clone()), Stage::Finalized);
+            let _wall = context.stage(Stage::Finalized);
+            block.auth_data_root();
+        }
+        let late: serde_json::Value =
+            serde_json::from_str(&context.phase_payload(Stage::Finalized, Duration::ZERO)).unwrap();
+        assert_eq!(late["root_calls"], 1);
+        assert!(late["auth_calls"].as_u64().unwrap() > 0);
+        assert_eq!(late["wall_calls"], 1);
+        assert_eq!(context.0.active.load(Ordering::Acquire), 0);
+        assert_eq!(context.count(Stage::Commitment, Operation::Auth), 0);
     }
 
     #[test]

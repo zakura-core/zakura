@@ -332,7 +332,6 @@ fn spawn_capacity(sim: &mut Sim, evidence: &Arc<CapacityEvidence>) -> ZakuraDisc
     for (reader, name) in ["reader-0", "reader-1", "reader-2"].into_iter().enumerate() {
         let handle = handle.clone();
         let evidence = Arc::clone(evidence);
-        let handshake = handshake.clone();
         let author = 33 + u8::try_from(reader).expect("the fixture has few readers");
         sim.scheduler().spawn_root(name, async move {
             let now = utc_now()

@@ -559,6 +559,15 @@ impl Topology {
         self.effects.failure.borrow_mut().get_or_insert(why);
     }
 
+    /// Tells the node under test's tap that a `Shutdown` step was picked, so
+    /// a run that ends before the step takes effect fails as an unfinished
+    /// stop.
+    fn expect_shutdown(&self) {
+        if let Some(tap) = &self.tap {
+            tap.begin();
+        }
+    }
+
     /// Stops the node under test, as zakurad's shutdown ends header sync:
     /// tells its tap, closes every link to it, so its sessions end, and
     /// cancels its reactor, which retires its work and drops its pending
@@ -754,6 +763,7 @@ pub struct ControlStep {
 /// count the effect.
 pub struct Control {
     script: Vec<ControlStep>,
+    topology: Rc<Topology>,
     predicates: Rc<RefCell<Predicates>>,
     /// The next step to offer.
     next: usize,
@@ -771,7 +781,9 @@ impl Control {
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
         let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
+        let task_topology = topology.clone();
         sim.scheduler().spawn_root("control", async move {
+            let topology = task_topology;
             while let Some(step) = steps.recv().await {
                 let link = || {
                     topology
@@ -800,6 +812,7 @@ impl Control {
         });
         Control {
             script,
+            topology,
             predicates,
             next: 0,
             to_task,
@@ -835,7 +848,13 @@ impl ActionSource for Control {
         }
     }
 
+    /// Queues the next step for the control task. A shutdown of the node
+    /// under test counts as begun from its pick, before the task takes it.
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+        let step = &self.script[self.next];
+        if step.action == ControlAction::Shutdown && step.peer == self.topology.nodes[0].name {
+            self.topology.expect_shutdown();
+        }
         self.to_task
             .try_send(self.script[self.next].clone())
             .expect("the channel holds the whole script, and the task outlives the run");

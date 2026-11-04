@@ -171,6 +171,39 @@ fn a_shutdown_stops_the_node_and_passes_its_teardown_checks() {
     assert!(dropped > 0, "no plan stopped the node mid-prepare");
 }
 
+/// A run cut off right after it picks `Shutdown`, before the control task
+/// carries it out, fails as `ShutdownIncomplete`: the stop counts from its
+/// pick, so a run can't end with a chosen stop silently untaken. The test
+/// searches budgets for a run whose last step is that pick, with no drain.
+#[test]
+fn a_run_cut_off_at_the_shutdown_pick_fails() {
+    let scenario = scenario(
+        Vec::new(),
+        vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Shutdown,
+            when: None,
+        }],
+    );
+    let cut = (1..64)
+        .find_map(|budget| {
+            let config = zakura_sim::RunConfig {
+                budget,
+                drain_bound: 0,
+                ..zakura_sim::harness::header_sync::storage_config()
+            };
+            let mut sim = zakura_sim::Sim::new(config, PlanInput::Bytes(Vec::new()));
+            let storage = Storage::build(&mut sim, &scenario, Storage::prepare(&scenario));
+            let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+            drop(storage);
+            let last = report.picks.last().map(|pick| pick.identity.as_str());
+            (last == Some("peer:node:shutdown")).then_some(report)
+        })
+        .expect("some budget ends the run at the shutdown pick");
+    let failure = format!("{:?}", cut.end.harness);
+    assert!(failure.contains("ShutdownIncomplete"), "{failure}");
+}
+
 /// A shutdown step must name the node under test, and a relink after the
 /// shutdown fails the run, since the node takes no new sessions.
 #[test]

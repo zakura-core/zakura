@@ -182,6 +182,72 @@ impl ResourceEnvelope {
     }
 }
 
+/// A stream kind's share that can't hold the kind's largest frame.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "stream kind {kind}'s {direction} share of {share} bytes must hold its largest frame of \
+     {frame} bytes"
+)]
+pub(crate) struct ShareBelowFrame {
+    kind: u16,
+    direction: &'static str,
+    share: u64,
+    frame: u64,
+}
+
+/// Refuses `shares` if any kind in `streams` has a receive or output share
+/// below its largest frame, where no frame exceeds `max_frame_bytes`.
+///
+/// A frame above its gate takes the whole gate, so it would be charged less
+/// than it holds. [`NodeResources::new`] asserts the same rule.
+pub(crate) fn check_reactor_shares(
+    shares: &ReactorShares,
+    streams: impl IntoIterator<Item = Stream>,
+    max_frame_bytes: u32,
+) -> Result<(), ShareBelowFrame> {
+    check_kind_shares(shares, &registered_kinds(streams, max_frame_bytes))
+}
+
+/// Each kind in `streams`, the capability bits of its streams, and its largest
+/// frame up to `max_frame_bytes`.
+fn registered_kinds(
+    streams: impl IntoIterator<Item = Stream>,
+    max_frame_bytes: u32,
+) -> Vec<(u16, u64, u64)> {
+    let mut kinds: Vec<(u16, u64, u64)> = Vec::new();
+    for stream in streams {
+        let frame = u64::from(stream.frame_cap.min(max_frame_bytes));
+        match kinds.iter_mut().find(|(kind, ..)| *kind == stream.kind) {
+            Some((_, capabilities, largest)) => {
+                *capabilities |= stream.capability;
+                *largest = (*largest).max(frame);
+            }
+            None => kinds.push((stream.kind, stream.capability, frame)),
+        }
+    }
+    kinds
+}
+
+fn check_kind_shares(
+    shares: &ReactorShares,
+    kinds: &[(u16, u64, u64)],
+) -> Result<(), ShareBelowFrame> {
+    for &(kind, _, frame) in kinds {
+        let ReactorBudget { receive, output } = shares.share(kind);
+        for (direction, share) in [("receive", receive), ("output", output)] {
+            if share < frame {
+                return Err(ShareBelowFrame {
+                    kind,
+                    direction,
+                    share,
+                    frame,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The node-wide owners of transport resources.
 #[derive(Clone, Debug)]
 pub(crate) struct NodeResources {
@@ -206,29 +272,9 @@ impl NodeResources {
         streams: impl IntoIterator<Item = Stream>,
         max_frame_bytes: u32,
     ) -> Self {
-        let mut kinds: Vec<(u16, u64, u64)> = Vec::new();
-        for stream in streams {
-            let frame = u64::from(stream.frame_cap.min(max_frame_bytes));
-            match kinds.iter_mut().find(|(kind, ..)| *kind == stream.kind) {
-                Some((_, capabilities, largest)) => {
-                    *capabilities |= stream.capability;
-                    *largest = (*largest).max(frame);
-                }
-                None => kinds.push((stream.kind, stream.capability, frame)),
-            }
-        }
-        for (kind, _, largest) in &kinds {
-            let ReactorBudget { receive, output } = shares.share(*kind);
-            assert!(
-                receive >= *largest,
-                "stream kind {kind}'s receive share of {receive} bytes must hold its \
-                 largest frame of {largest} bytes"
-            );
-            assert!(
-                output >= *largest,
-                "stream kind {kind}'s output share of {output} bytes must hold its \
-                 largest frame of {largest} bytes"
-            );
+        let kinds = registered_kinds(streams, max_frame_bytes);
+        if let Err(error) = check_kind_shares(&shares, &kinds) {
+            panic!("{error}");
         }
         Self {
             shares: Arc::new(shares),

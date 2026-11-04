@@ -37,7 +37,7 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
 /// regulation needs (`minimum_ordered_queue_capacity`).
 const BLOCK_SYNC_INBOUND_QUEUE_DEPTH: usize = 8;
 
-const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
+pub(crate) const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
     version: ZAKURA_REGULATED_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,

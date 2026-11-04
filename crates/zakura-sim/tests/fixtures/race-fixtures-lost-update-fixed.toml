@@ -1,0 +1,8 @@
+# The committed fuzz input `race-fixtures-lost-update-fixed.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its three bytes pick
+# the `race/lost-update` fixture, its fixed variant and one worker.
+harness = "fixtures/all"
+generator = 1
+sha256 = "faee935763044f124d7526755a5058a33f9402a595994d59eddd4be8546ff201"
+scenario_sha256 = "5f5c17f4935810916758b7a0123fe7d58fd160c8420463e795f4e144cf81fa70"
+source = "crates/zakura-sim/tests/race_fixtures.rs"

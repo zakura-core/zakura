@@ -515,6 +515,38 @@ fn an_unconfirmed_original_is_rejected() {
     }
 }
 
+/// Confirming alone runs the original's checks and no `tmin`: a
+/// reproducing original is `confirmed`, and one that confirms another
+/// property is `original-rejected`.
+#[test]
+fn confirming_checks_the_original_without_tmin() {
+    for (original, status) in [
+        (ORIGINAL, Status::Confirmed),
+        (&b"other original"[..], Status::OriginalRejected),
+    ] {
+        let fake = Fake::new(original, &[b"good"]);
+        let started = Instant::now();
+        let preserved = preserve_original(&fake.request).unwrap();
+        let report = confirm_with(
+            &fake.request,
+            &fake.tools(TminScript::default()),
+            preserved,
+            started,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.status, status, "{report:#?}");
+        assert_eq!(
+            report.original.check.as_ref().map(|check| check.accepted),
+            Some(status == Status::Confirmed)
+        );
+        assert_eq!(report.reduction.end, ReductionEnd::NotRun);
+        assert_eq!(report.candidates, []);
+        assert!(!fake.out(TMIN_DIR).exists());
+        assert_eq!(fake.written()["status"], status.to_string());
+    }
+}
+
 /// When the wrapper itself fails, here on a `zakura-sim confirm` that
 /// refuses its arguments, the run still ends with a report: `error`, with
 /// the error as its reason, and the original kept. The command still fails.

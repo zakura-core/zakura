@@ -126,7 +126,7 @@ const MINED_RANDOM_INTERVAL: usize = 4;
 /// Allow the kernel send queue to drain after the framed block write completes.
 const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
 /// Peers that already have a block might never request it.
-const BLOCK_REQUEST_WAIT: Duration = Duration::from_secs(3);
+pub(super) const BLOCK_REQUEST_WAIT: Duration = Duration::from_secs(3);
 /// Bound both inbound service work and the subsequent block write.
 const BLOCK_UPLOAD_WAIT: Duration = Duration::from_secs(2 * REQUEST_TIMEOUT.as_secs());
 

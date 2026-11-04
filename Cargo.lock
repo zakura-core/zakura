@@ -3258,6 +3258,7 @@ dependencies = [
  "indexmap",
  "insta",
  "libc",
+ "memchr",
  "metrics",
  "proptest",
  "prost",

@@ -867,7 +867,7 @@ impl PeerRoutine {
             .into_iter()
             .map(|key| (key, self.io.writes.settle(key)))
             .collect();
-        let expired = self.state.expire_requests(due);
+        let expired = self.state.expire_requests(due, self.io.download_floor());
         if expired.is_empty() {
             return false;
         }
@@ -1290,13 +1290,20 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
-        // Also credit the reliability EWMA: this late body offsets the failure its own
-        // timeout charged, so a peer that merely slowed down (backlog draining past the
-        // per-request deadline but every body still arriving) keeps a reduced-but-nonzero
-        // window instead of being sealed to zero like a genuine dropper — which sends no
-        // late body to credit. This is the slow-vs-wedged distinction the seal relies on.
-        self.state
-            .record_late_body(Instant::now(), self.config.effective_liveness_timeout());
+        // Also credit the reliability EWMA when this body answers a request whose
+        // timeout this session charged: the credit offsets that failure once, so a peer
+        // that merely slowed down (backlog draining past the per-request deadline but
+        // every body still arriving) keeps a reduced-but-nonzero window instead of being
+        // sealed to zero like a genuine dropper — which sends no late body to credit.
+        // This is the slow-vs-wedged distinction the seal relies on. A body this session's
+        // timed-out requests never asked for earns no credit.
+        self.state.record_late_body(
+            height,
+            hash,
+            self.io.download_floor(),
+            Instant::now(),
+            self.config.effective_liveness_timeout(),
+        );
         // The progress clears any no-progress cap, so other routines may defer
         // the floor to this peer again.
         self.publish_slot_diagnostics();

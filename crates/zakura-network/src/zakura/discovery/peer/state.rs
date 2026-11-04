@@ -254,8 +254,8 @@ impl PeerState {
                 self.phase = Phase::CheckingOwners;
                 // The answers can wait behind the peer's serving queue and
                 // this node's verification slots, so a slow exchange is not
-                // the peer's fault. It continues like a completed one for one
-                // refresh interval, and is settled when its session ends.
+                // the peer's fault. It continues like a completed one, and is
+                // settled when its session ends.
                 let charge = completed.then_some(SessionCharge::Succeed);
                 PeerStep::new(charge, PeerOutput::CheckSoleOwner)
             }
@@ -280,14 +280,6 @@ impl PeerState {
                 PeerStep::then(PeerOutput::WaitForAnswers {
                     deadline: DISCOVERY_ANSWER_WRITE_DEADLINE,
                 })
-            }
-            // A timed-out exchange still incomplete a full refresh interval
-            // later ends its session, so a silent peer on a shared connection
-            // cannot hold a discovery slot.
-            (Phase::Refreshing, PeerInput::Refreshed { sent: true })
-                if self.timed_out && !self.progress.complete() =>
-            {
-                self.release()
             }
             (Phase::Refreshing, PeerInput::Refreshed { sent: true }) => {
                 self.phase = Phase::CheckingOwners;

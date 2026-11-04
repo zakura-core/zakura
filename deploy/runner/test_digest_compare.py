@@ -36,7 +36,16 @@ class ComparisonTests(unittest.TestCase):
         }
 
     def report(self, rows, profiles=None):
+        starts = [{**row, "event": "start"} for row in rows if row.get("event") == "finish"]
+        rows = starts + rows
         return comparison.summarize(rows, self.control, self.revisions, profiles or [])
+
+    def test_missing_start_and_lost_cursor_cannot_supply_primary_pairs(self):
+        rows = [self.row("baseline"), self.row("candidate")]
+        report = comparison.summarize(rows, self.control, self.revisions, [])
+        self.assertEqual(report["timing"]["all"]["pairs"], 0)
+        rows.append({"event": "resource", "node": "canada-0", "pid": 2, "lost_segments": 1})
+        self.assertEqual(self.report(rows)["timing"]["all"]["pairs"], 0)
 
     def test_identical_blocks_expose_removed_calls_and_paired_durations(self):
         report = self.report([self.row("baseline"), self.row("candidate")])
@@ -117,6 +126,18 @@ class ComparisonTests(unittest.TestCase):
             manifest.write_text(json.dumps({"approved": False}))
             with self.assertRaisesRegex(ValueError, "confirmation"):
                 comparison.activate(manifest, directory, "phase1")
+
+    def test_live_coverage_retains_losses_and_allows_delayed_sequence_rows(self):
+        def row(sequence):
+            return {"pid": 7, "sequence": sequence, "trace_drops": 0}
+        state = comparison.trace_coverage({}, [row(1), row(3)], 0, 0)
+        self.assertFalse(state["failed"])
+        state = comparison.trace_coverage(state, [row(2)], 0, 30)
+        self.assertFalse(comparison.trace_coverage(state, [], 0, 90)["failed"])
+        state = comparison.trace_coverage({}, [row(1), row(3)], 0, 0)
+        self.assertTrue(comparison.trace_coverage(state, [], 0, 90)["failed"])
+        state = comparison.trace_coverage({}, [], 1, 0)
+        self.assertTrue(comparison.trace_coverage(state, [], 0, 90)["failed"])
 
 
 class CursorTests(unittest.TestCase):

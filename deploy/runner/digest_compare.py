@@ -65,6 +65,36 @@ def complete_summary(payload):
             and bool(payload.get("commit_wall_calls")))
 
 
+def trace_coverage(previous, rows, lost_segments, now):
+    """Retain coverage failures and allow concurrent producers one minute to fill sequence gaps."""
+    state = dict(previous)
+    state["failed"] = bool(state.get("failed") or lost_segments)
+    processes = state.setdefault("processes", {})
+    for row in rows:
+        process = processes.setdefault(str(row["pid"]), {"last": None, "missing": {}})
+        if row.get("trace_drops"):
+            state["failed"] = True
+        sequence = row.get("sequence")
+        if sequence is None:
+            state["failed"] = True
+            continue
+        last = process["last"]
+        if last is not None and sequence > last + 1:
+            if sequence - last > 4096:
+                state["failed"] = True
+            else:
+                for missing in range(last + 1, sequence):
+                    process["missing"].setdefault(str(missing), now)
+        process["missing"].pop(str(sequence), None)
+        process["last"] = max(sequence, last if last is not None else sequence)
+    for process in processes.values():
+        if any(now - since > 60 for since in process["missing"].values()):
+            state["failed"] = True
+            process["missing"] = {}
+    state["processes"] = dict(list(processes.items())[-64:])
+    return state
+
+
 def eligible(row, control, profile_windows):
     payload = row["payload"]
     if row["event"] != "finish" or not complete_summary(payload):
@@ -98,10 +128,19 @@ def summarize(rows, control, revisions, profiles):
     hashes = {value["sha256"]: role for role, value in revisions.items()}
     sequences = {}
     drops = {}
+    lost_nodes = set()
+    attempts = {}
     for row in rows:
         if row.get("event") == "resource":
+            if row.get("lost_segments"):
+                # An evicted cursor can span process restarts; do not guess which PID lost rows.
+                lost_nodes.add(row["node"])
             continue
         key = (row["node"], row.get("pid"))
+        attempt = (*key, row.get("payload", {}).get("hash"))
+        if row.get("event") in {"start", "finish"}:
+            counts = attempts.setdefault(attempt, {"start": 0, "finish": 0})
+            counts[row["event"]] += 1
         if "sequence" in row:
             sequences.setdefault(key, set()).add(row["sequence"])
         drops[key] = max(drops.get(key, 0), row.get("trace_drops", 0))
@@ -135,7 +174,8 @@ def summarize(rows, control, revisions, profiles):
             if payload.get("wall_calls", 0) >= late.get(late_key, {}).get("wall_calls", 0):
                 late[late_key] = {**payload, "role": role}
             continue
-        if not role or key in incomplete or not eligible(row, control, profiles):
+        complete_attempt = attempts.get(attempt_key) == {"start": 1, "finish": 1}
+        if not role or key in incomplete or row["node"] in lost_nodes or not complete_attempt or not eligible(row, control, profiles):
             reason = payload.get("route", row.get("event", "unknown"))
             if row.get("event") in {"finish", "checkpoint"}:
                 excluded[reason] = excluded.get(reason, 0) + 1
@@ -251,13 +291,14 @@ def collect(manifest_path, output, helper):
                     result["round_trip_s"] = time.time() - request_started
                     pid_maps[node][str(result["pid"])] = result["binary_sha256"]
                     rows = result.pop("rows")
+                    coverage = trace_coverage(cursors.get(node, {}).get("coverage", {}), rows, result["lost_segments"], time.time())
                     for row in rows:
                         row.update(node=node, binary_sha256=pid_maps[node].get(str(row.get("pid"))))
                         loggers[node].info(json.dumps(row, separators=(",", ":")))
                         if row.get("event") == "finish" and row["payload"].get("outcome") == "accepted" and row["payload"].get("route") == "ordinary":
                             recent[node] = (recent[node] + [row])[-4:]
                     loggers[node].info(json.dumps({**result, "event": "resource", "node": node}, separators=(",", ":")))
-                    cursors[node] = {**result["cursor"], "pid_map": dict(list(pid_maps[node].items())[-64:])}
+                    cursors[node] = {**result["cursor"], "pid_map": dict(list(pid_maps[node].items())[-64:]), "coverage": coverage}
                     trace_state = trace_progress.get(node)
                     position = result["cursor"].get("position")
                     if trace_state is None or trace_state["position"] != position:
@@ -270,7 +311,7 @@ def collect(manifest_path, output, helper):
                     elif isinstance(height, int) and (previous["height"] is None or height > previous["height"]):
                         previous.update(height=height, changed_at=time.time(), advanced=True)
                     progress[node] = previous
-                    status["nodes"][node] = {**result, "recent_accepted": recent[node], "progress": previous, "trace_progress": trace_state}
+                    status["nodes"][node] = {**result, "recent_accepted": recent[node], "progress": previous, "trace_progress": trace_state, "coverage_failed": coverage["failed"]}
                 write_json(cursors_path, cursors)
                 phase = phase_at(time.time(), control["transitions"])
                 for node in HOSTS:
@@ -302,6 +343,8 @@ def collect(manifest_path, output, helper):
                 status["first_report_ready"] = report_path.exists()
                 issues = []
                 for node, health in status["nodes"].items():
+                    if health.get("coverage_failed"):
+                        issues.append(f"{node}: trace coverage lost; primary comparison is not qualified")
                     if phase != "swapping" and (health["service"] != "active" or health["rpc"].get("error")):
                         issues.append(f"{node}: node or RPC unhealthy")
                     if phase in {"phase1", "phase2"} and time.time() - health["progress"]["changed_at"] > 600:

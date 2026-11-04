@@ -1443,9 +1443,13 @@ impl ReactorIO {
         })
     }
 
-    /// Judges a body completion against the latest committed view, and returns
-    /// that view's body-work epoch. The epoch can be ahead of the last one this
-    /// reactor forwarded to the sequencer.
+    /// Judges a body completion against the committed view whose authority
+    /// this reactor last sent to the Sequencer, and returns that view's
+    /// body-work epoch.
+    ///
+    /// A newer view in the watch is not yet the Sequencer's: judging against it
+    /// would rebase the completion past retry state the Sequencer has not
+    /// rekeyed.
     fn body_completion_authority(
         &self,
         source: zakura_header_chain::SourceId,
@@ -1457,15 +1461,10 @@ impl ReactorIO {
         )>,
         Option<zakura_header_chain::BodyWorkEpoch>,
     ) {
-        let current = self
-            .startup
-            .committed_views
-            .as_ref()
-            .and_then(|snapshots| snapshots.borrow().clone());
-        let Some(current) = current else {
+        let Some(current) = self.state.committed_view() else {
             return (None, None);
         };
-        let semantic_completion = body_completion_authority(&current, source, owner)
+        let semantic_completion = body_completion_authority(current, source, owner)
             .inspect_err(|reason| {
                 metrics::counter!(
                     "sync.header_chain.stale_completion.total",

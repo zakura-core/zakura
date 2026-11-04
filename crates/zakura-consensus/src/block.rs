@@ -39,6 +39,7 @@ mod prepared;
 mod receipt;
 pub mod request;
 pub mod subsidy;
+mod verified_metrics;
 
 pub use request::{PreparedCandidateSource, Request};
 
@@ -743,6 +744,7 @@ where
                 // pending and wakes itself again, so a block with thousands of transactions
                 // re-wakes thousands of futures per poll. The loop does a little bookkeeping per
                 // result and still yields whenever no result is ready.
+                let mut transaction_fees = Vec::with_capacity(block.transactions().len());
                 while let Some(result) = tokio::task::unconstrained(async_checks.next()).await {
                     tracing::trace!(?result, remaining = async_checks.len());
                     let response = match result {
@@ -801,6 +803,7 @@ where
                     // Sum full non-coinbase fees before applying the aggregate NSM split.
                     if let Some(miner_fee) = response.miner_fee() {
                         block_transaction_fees += miner_fee;
+                        transaction_fees.push((response.tx_id().mined_id(), miner_fee));
                     }
                 }
 
@@ -834,6 +837,21 @@ where
                     deferred_pool_balance_change,
                     &network,
                 )?;
+
+                // Block templates and proposals are not chain blocks, so they are not
+                // reported. Blocks this node mined take the prepared fast path and are
+                // reported by the state's tip metrics only.
+                if prepared_source.is_none() && !request.is_proposal() {
+                    verified_metrics::record(verified_metrics::VerifiedBlock {
+                        block: block.view(),
+                        height,
+                        network: &network,
+                        block_transaction_fees,
+                        expected_block_subsidy,
+                        transaction_fees: &transaction_fees,
+                        transaction_hashes: &transaction_hashes,
+                    });
+                }
 
                 // Finally, submit the block for contextual verification.
                 let prepared_block = zs::SemanticallyVerifiedBlock {

@@ -61,6 +61,7 @@ use crate::service::{
     non_finalized_state::Chain,
 };
 
+mod tip_metrics;
 mod vct_authentication_sweep;
 mod vct_write_retry;
 
@@ -2973,6 +2974,7 @@ impl WriteBlockWorkerTask {
         // attributing the ancestor's validation failure to the descendant's peer.
         let mut rejected_ancestor_map: IndexMap<block::Hash, block::Hash> = IndexMap::new();
         let mut last_resource_stall_recovery = None;
+        let mut tip_metrics = tip_metrics::TipMetrics::default();
 
         loop {
             if let Err(error) =
@@ -3468,6 +3470,7 @@ impl WriteBlockWorkerTask {
             // These updates can't conflict, because this block write task makes sure that blocks
             // are committed in order.
             metrics::gauge!("zcash.chain.verified.block.height").set(tip_block_height.0 as f64);
+            tip_metrics.record_committed_tip(non_finalized_state, &finalized_state.db);
 
             tracing::trace!("finished processing queued block");
         }

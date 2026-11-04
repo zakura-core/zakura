@@ -3482,33 +3482,9 @@ impl ZakuraProtocolHandler {
         connection_token.cancel();
         drop(incoming_setup);
         drop(pending_sessions);
-        while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
-            .await
-            .ok()
-            .flatten()
-        {
-            if let Err(error) = joined {
-                debug!(?error, "Zakura stream worker failed during shutdown");
-            }
-        }
-        // The drain joined every worker only if it ended on an empty set
-        // rather than on its timeout.
-        #[cfg(any(test, zakura_sim))]
-        let drained = workers.is_empty();
-        workers.abort_all();
-        // An aborted worker keeps its owners until its task actually ends.
-        // Settle them before this connection returns its admission slot, so a
-        // replacement does not run beside the old generation's stream owners.
-        // The wait is bounded: a task that yields to no abort within the timeout
-        // cannot hold the slot, and the owner ledger keeps counting its owners.
-        while let Some(joined) = timeout(STREAM_WORKER_DRAIN_TIMEOUT, workers.join_next())
-            .await
-            .ok()
-            .flatten()
-        {
-            if let Err(error) = joined {
-                debug!(?error, "aborted Zakura stream worker ended");
-            }
+        let drained = drain_stream_workers(&mut workers).await;
+        if !drained {
+            debug!("aborted Zakura stream workers that outlasted the teardown drain");
         }
         cleanup_guard.cleanup_registered_peer().await;
         metrics::counter!("zakura.p2p.conn.closed.neutral").increment(1);
@@ -5541,9 +5517,19 @@ async fn request_stream_worker(
         result = context.resources.output.admit(result_bytes) => result,
     };
     for frame in response_frames {
-        if let Err(error) =
-            write_response_frame(&mut send, frame, context.limits, response_frame_cap).await
-        {
+        // Each write can wait on the peer's send credit, so it ends with the
+        // connection instead of holding teardown's drain.
+        let written = zakura_rt::select! {
+            biased;
+            _ = context.connection_token.cancelled() => return,
+            written = write_response_frame(
+                &mut send,
+                frame,
+                context.limits,
+                response_frame_cap,
+            ) => written,
+        };
+        if let Err(error) = written {
             debug!(?error, "failed to write Zakura request response frame");
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
             return;
@@ -5551,6 +5537,42 @@ async fn request_stream_worker(
     }
 
     let _ = send.finish();
+}
+
+/// Waits for `workers` to end, then aborts the rest and waits for those to
+/// end. Returns whether every worker ended before the abort.
+///
+/// An aborted worker keeps its owners until its task actually ends. Teardown
+/// settles them before its connection returns its admission slot, so a
+/// replacement does not run beside the old generation's stream owners. Each
+/// wait has one deadline, [`STREAM_WORKER_DRAIN_TIMEOUT`] after it starts, so
+/// workers that end one after another can't extend it. A task that yields to
+/// no abort within the timeout cannot hold the slot, and the owner ledger
+/// keeps counting its owners.
+async fn drain_stream_workers(workers: &mut JoinSet<()>) -> bool {
+    join_stream_workers(workers, "Zakura stream worker failed during shutdown").await;
+    let drained = workers.is_empty();
+    workers.abort_all();
+    join_stream_workers(workers, "aborted Zakura stream worker ended").await;
+    drained
+}
+
+/// Joins `workers` until none is left or [`STREAM_WORKER_DRAIN_TIMEOUT`]
+/// passes, logging each failed worker with `failure`.
+async fn join_stream_workers(workers: &mut JoinSet<()>, failure: &'static str) {
+    let deadline = Instant::now() + STREAM_WORKER_DRAIN_TIMEOUT;
+    while let Some(joined) = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        workers.join_next(),
+    )
+    .await
+    .ok()
+    .flatten()
+    {
+        if let Err(error) = joined {
+            debug!(?error, "{failure}");
+        }
+    }
 }
 
 async fn freshness_reaper(mut freshness_rx: watch::Receiver<Instant>, idle_timeout: Duration) {
@@ -8373,6 +8395,42 @@ mod tests {
         assert!(should_run_freshness_reaper(1, 1));
         assert!(should_run_freshness_reaper(1, 0));
         assert!(should_run_freshness_reaper(0, 0));
+    }
+
+    /// Teardown's drain has one deadline for each wait. Workers that ignore
+    /// cancellation and end one after another, each before a fresh
+    /// per-worker timeout would fire, can't hold the connection's admission
+    /// permit past twice the drain timeout, however many there are.
+    #[tokio::test(start_paused = true)]
+    async fn trickling_workers_cannot_extend_the_teardown_drain() {
+        let step = STREAM_WORKER_DRAIN_TIMEOUT * 9 / 10;
+        for count in [4, 64] {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission
+                .clone()
+                .try_acquire_owned()
+                .expect("the test takes the only permit");
+            let mut workers = JoinSet::new();
+            for worker in 1..=count {
+                workers.spawn(zakura_rt::time::sleep(step * worker));
+            }
+            let cancelled = Instant::now();
+            let teardown = tokio::spawn(async move {
+                let drained = drain_stream_workers(&mut workers).await;
+                drop(permit);
+                (drained, workers.len())
+            });
+
+            let _returned = admission.acquire().await.expect("the test never closes it");
+            let held = cancelled.elapsed();
+            assert!(
+                held <= 2 * STREAM_WORKER_DRAIN_TIMEOUT,
+                "{count} trickling workers held the admission permit for {held:?}"
+            );
+            let (drained, left) = teardown.await.expect("the teardown task never panics");
+            assert!(!drained, "the later workers outlast the first wait");
+            assert_eq!(left, 0, "the abort ends every sleeping worker");
+        }
     }
 
     #[tokio::test]

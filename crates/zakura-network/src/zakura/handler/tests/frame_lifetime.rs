@@ -453,3 +453,56 @@ async fn a_stalled_response_strands_at_most_its_kinds_output_share() -> Result<(
     link.close().await;
     Ok(())
 }
+
+/// Cancelling the connection ends a response whose write waits on the peer's
+/// send credit, and returns its output grant, long before the write timeout.
+/// Teardown's drain then doesn't wait on the peer.
+#[tokio::test]
+async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(), BoxError> {
+    const SLOW: Stream = test_stream(912, StreamMode::RequestResponse);
+    const OTHER: Stream = test_stream(913, StreamMode::RequestResponse);
+    // The peer's small stream window stalls a response of 400 frames.
+    let peer = LocalEndpointFactory::new().quic_config(QuicConfig {
+        stream_receive_window_bytes: 64 * 1024,
+        receive_window_bytes: 128 * 1024,
+        ..QuicConfig::default()
+    });
+    let mut link = Link::connect_with(peer).await?;
+    let connection = connection_gates(&[SLOW, OTHER], 1 << 20, 1 << 20);
+    let registry = Arc::new(ServiceRegistry::new(vec![Arc::new(AnsweringRequests {
+        streams: [SLOW, OTHER],
+        frames: 400,
+    })])?);
+    let output = OutputByteBudget::new(1 << 20)?;
+    let mut context = tabled_context(None, 128);
+    context.resources = stream_of(&connection, SLOW.kind);
+    context.resources.output = FrameGate::over(output.clone());
+    let cancel = context.connection_token.clone();
+    let (_peer_send, _peer_recv, send, recv) = link.open(&frame_bytes(1, 16)).await?;
+    let worker = AbortOnDropHandle::new(tokio::spawn(request_stream_worker(
+        send,
+        recv,
+        prelude_of(SLOW.kind, Some(1)),
+        context,
+        registry,
+    )));
+    timeout(TEST_TIMEOUT, async {
+        while output.granted() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    tokio::time::sleep(HELD).await;
+    assert!(
+        !worker.is_finished(),
+        "the peer's window stalls the response"
+    );
+
+    cancel.cancel();
+    timeout(HELD, worker)
+        .await
+        .map_err(|_| "cancellation ends the stalled write")??;
+    assert_eq!(output.granted(), 0);
+    link.close().await;
+    Ok(())
+}

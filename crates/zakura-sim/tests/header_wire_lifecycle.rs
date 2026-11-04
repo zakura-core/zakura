@@ -31,7 +31,7 @@ use zakura_sim::{
         DatagramOutcome, Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest,
         StorageResult, TransportFact,
     },
-    peer::{honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
+    peer::{adversary::Act, honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
     seed, Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
     StepCtx,
 };
@@ -863,6 +863,25 @@ fn saved_plans_replay_their_end_records() {
             plan.name()
         );
     }
+}
+
+/// `over-credit-objects` under eager delivery holds `sim/no-livelock`.
+/// Zero Plan bytes pick each step's first action by identity, and
+/// `deliver:` sorts first, so every datagram arrives the instant it's sent.
+/// The handshake, the 45 KB over-credit page the node must read before it
+/// can count objects, the close and the teardown then all run at 0 ns. That
+/// work is finite, bounded by the byte credit the node granted, so it isn't
+/// a spin.
+#[test]
+fn over_credit_objects_eager_delivery_holds_no_livelock() {
+    let input: Vec<u8> = SavedPlan::Act(Act::OverCreditObjects)
+        .tag()
+        .into_iter()
+        .chain([0; 8192])
+        .collect();
+    let (report, _, _) = replay(&input);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    assert_eq!(report.end.violation, None, "{:?}", report.end);
 }
 
 /// Rewrites every saved Plan: its input, its sidecar and its end record.

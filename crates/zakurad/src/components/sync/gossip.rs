@@ -837,7 +837,7 @@ fn finish_broadcast<ZN>(
     let protocol_count = protocols.len();
     let best_tip = chain_state.latest_chain_tip().best_tip_hash();
     let BroadcastCompleted {
-        protocol,
+        protocol: protocol_index,
         outcome,
         announcement,
     } = completed;
@@ -847,7 +847,7 @@ fn finish_broadcast<ZN>(
         announcement.size,
         announcement.tracked,
     );
-    let protocol = &mut protocols[protocol];
+    let protocol = &mut protocols[protocol_index];
 
     if outcome == Outcome::NoPeers {
         // Nothing was sent, so this is not a failed delivery and does not use up the one retry.
@@ -885,7 +885,7 @@ fn finish_broadcast<ZN>(
 
     if delivered {
         // Every protocol has the block, so its tip change needs no committed-tip announcement.
-        if deliveries.delivered(hash, protocol_count) {
+        if deliveries.delivered(hash, protocol_index, protocol_count) {
             chain_state.mark_last_change_hash(hash);
         }
         return;
@@ -913,21 +913,27 @@ fn finish_broadcast<ZN>(
 /// at once.
 const RECENT_DELIVERIES: usize = 16;
 
-/// Counts the protocols that have announced each recently committed mined block.
+/// Records which protocols have announced each recently committed mined block.
 ///
 /// Every protocol shares one committed-tip path, so that path is only suppressed once every
-/// protocol has announced the block.
+/// protocol has announced the block. A block can commit more than once, when the state evicted
+/// it and it was accepted again, so each protocol is remembered rather than counted: two
+/// announcements by one protocol do not stand in for the other protocol's.
 #[derive(Debug, Default)]
 struct MinedDeliveries {
-    /// How many protocols have announced each block, oldest block first, at most
-    /// [`RECENT_DELIVERIES`] blocks.
-    recent: VecDeque<(block::Hash, usize)>,
+    /// The protocols that have announced each block, one bit per protocol index, oldest block
+    /// first, at most [`RECENT_DELIVERIES`] blocks.
+    recent: VecDeque<(block::Hash, u64)>,
 }
 
 impl MinedDeliveries {
-    /// Records one protocol's announcement of `hash`, returning whether all `protocols` have
+    /// Records that `protocol` announced `hash`, returning whether all `protocols` have
     /// announced it.
-    fn delivered(&mut self, hash: block::Hash, protocols: usize) -> bool {
+    fn delivered(&mut self, hash: block::Hash, protocol: usize, protocols: usize) -> bool {
+        assert!(
+            protocol < protocols && protocols <= u64::BITS as usize,
+            "protocol {protocol} of {protocols} fits the announced-protocol bits"
+        );
         let index = match self.recent.iter().position(|(recent, _)| *recent == hash) {
             Some(index) => index,
             None => {
@@ -938,9 +944,10 @@ impl MinedDeliveries {
                 self.recent.len() - 1
             }
         };
-        let (_, count) = &mut self.recent[index];
-        *count += 1;
-        *count >= protocols
+        let (_, announced) = &mut self.recent[index];
+        *announced |= 1 << protocol;
+        let every_protocol = u64::MAX >> (u64::BITS as usize - protocols);
+        *announced == every_protocol
     }
 }
 
@@ -1176,7 +1183,7 @@ mod tests {
 
         for index in 0..=RECENT_DELIVERIES {
             broadcasts.finish(hash(index), true);
-            assert!(!deliveries.delivered(hash(index), 2));
+            assert!(!deliveries.delivered(hash(index), 0, 2));
         }
 
         assert!(
@@ -1186,12 +1193,12 @@ mod tests {
         assert!(broadcasts.was_delivered(&hash(1)));
         assert!(broadcasts.was_delivered(&hash(RECENT_DELIVERIES)));
         assert!(
-            deliveries.delivered(hash(RECENT_DELIVERIES), 2),
-            "the newest count is kept"
+            deliveries.delivered(hash(RECENT_DELIVERIES), 1, 2),
+            "the newest record is kept"
         );
         assert!(
-            !deliveries.delivered(hash(0), 2),
-            "the oldest count starts again",
+            !deliveries.delivered(hash(0), 1, 2),
+            "the oldest record starts again",
         );
     }
 
@@ -1202,14 +1209,31 @@ mod tests {
         let mut deliveries = MinedDeliveries::default();
 
         assert!(
-            !deliveries.delivered(hash, 2),
+            !deliveries.delivered(hash, 0, 2),
             "the second protocol has not announced the block yet",
         );
-        assert!(deliveries.delivered(hash, 2));
+        assert!(deliveries.delivered(hash, 1, 2));
 
         assert!(
-            !deliveries.delivered(other, 2),
-            "a newer block starts its own count",
+            !deliveries.delivered(other, 1, 2),
+            "a newer block starts its own record",
+        );
+    }
+
+    #[test]
+    fn a_protocol_announcing_a_block_twice_does_not_stand_in_for_the_other() {
+        let hash = block::Hash([5; 32]);
+        let mut deliveries = MinedDeliveries::default();
+
+        assert!(!deliveries.delivered(hash, 0, 2));
+        assert!(
+            !deliveries.delivered(hash, 0, 2),
+            "the block committed again and the same protocol announced it again, but the \
+             other protocol still has not",
+        );
+        assert!(
+            deliveries.delivered(hash, 1, 2),
+            "the other protocol's first announcement completes the record",
         );
     }
 
@@ -1219,11 +1243,11 @@ mod tests {
         let newer = block::Hash([10; 32]);
         let mut deliveries = MinedDeliveries::default();
 
-        assert!(!deliveries.delivered(newer, 2));
-        assert!(!deliveries.delivered(older, 2));
+        assert!(!deliveries.delivered(newer, 0, 2));
+        assert!(!deliveries.delivered(older, 0, 2));
         assert!(
-            deliveries.delivered(newer, 2),
-            "the older block's late delivery kept the newer block's count",
+            deliveries.delivered(newer, 1, 2),
+            "the older block's late delivery kept the newer block's record",
         );
     }
 

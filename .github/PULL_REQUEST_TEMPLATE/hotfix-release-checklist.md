@@ -31,6 +31,10 @@ announcement) apply on top of this checklist.
       for the exact tag it will release — the `Create release` workflow
       refuses to tag `v<version>` from any other branch. The `hotfix/v*`
       ruleset blocks deletion and force-pushes.
+- [ ] For `--mode branch` from a release made before the security-key
+      approval gate, merge or cherry-pick the gate change from `main` into the
+      branch first. Otherwise the branch's old workflow would publish on a
+      plain button approval, and `release-t0.sh` refuses to continue.
 - [ ] For an embargoed main-base hotfix, push the `hotfix/v<version>` branch
       to the public repository at T-0. Whatever the base, the hotfix process
       never pushes `release/v*` or `bump-v*` —
@@ -117,7 +121,8 @@ allows `hotfix/v*`).
   push `hotfix/v<version>` and dispatch from that branch. Use the exact tag
   and verify each step landed before the next.
 - [ ] Approve the `release` environment deployment when the script announces
-      it (right commit? right tag?). The workflow publishes a complete
+      it, with `scripts/approve-release.sh <run>` and your security key
+      (right commit? right tag?). The workflow publishes a complete
       pre-release and creates the protected tag; the tag push starts Docker
       publishing.
 - [ ] Update the release description from the changelog section.

@@ -253,6 +253,9 @@ never for anything public.
 - [ ] The `release` environment lists each release-capable maintainer as a
       required reviewer and **"Prevent self-review" is unchecked** — otherwise
       a solo release deadlocks at the approval gate.
+- [ ] Your security key is listed in `.github/release-signers`, is physically
+      with you, and you know its PIN. `scripts/approve-release.sh` needs it to
+      approve (see [release-approval.md](release-approval.md)).
 - [ ] The `release` environment's deployment branch policy includes
       `hotfix/v*`, and the `hotfix/v*` branch ruleset (block deletion and
       force-push) is active.
@@ -332,7 +335,7 @@ clock below is what it does when:
 | T-0 | Branch base: push `hotfix/vX.Y.Z`. Main base: open the public PR from `hotfix/vX.Y.Z` and squash-merge it into `main`. |
 | T+2 | Dispatch `Create release` **from the hotfix branch** (or `main`, for main base) with the exact tag. |
 | T+2–25 | Hands-off build. Meanwhile: fresh checkout for crates publish, final announcement text. |
-| T+25 | Approve the `release` environment (yourself — this is your deliberate stop-and-check point, not a formality: right commit? right tag?). |
+| T+25 | Approve the `release` environment with `scripts/approve-release.sh <run>` and your security key (yourself — this is your deliberate stop-and-check point, not a formality: right commit? right tag?). |
 | T+30 | Tag + complete pre-release published; tag-push run starts Docker publishing. |
 | T+30 | Start the crates publish loop (below) — it runs ~30–60 min, mostly waiting. |
 | T+35 | `make sign-release TAG=v<version>` (signs `SHA256SUMS.txt`, uploads `.minisig`). |
@@ -355,7 +358,14 @@ What Mode B trades, explicitly:
 
 - an **immutable tag exists before its binaries are verified**; if the
   post-tag build fails, the repair path is `release-binaries.yml`
-  `workflow_dispatch` with `publish_assets_to_release`. The tag dress
+  `workflow_dispatch` with `publish_assets_to_release`, dispatched from the
+  tag itself (`--ref vX.Y.Z`) so its build provenance names the tag's commit.
+  The run uses the workflow stored at that tag. For releases made before the
+  security-key approval gate, that older workflow also republishes the Docker
+  images, and for a stable release moves `zakuracore/zakura:latest` back to
+  it. It also checks out the tag by its short name, so first confirm no branch
+  shares the tag's name, or its provenance would name the tag's commit for
+  that branch's code. Repair such a release only when that is acceptable. The tag dress
   rehearsal of the same commit is what keeps this risk small — and juggling a
   repair alone is exactly the failure mode Mode A avoids;
 - until signing, the release page has no `SHA256SUMS.txt`/signature, so

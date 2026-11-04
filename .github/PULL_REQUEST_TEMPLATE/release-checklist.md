@@ -306,8 +306,10 @@ from `main`, entering the exact version tag, for example `v1.0.0-rc2`.
 The workflow verifies that the tag matches the `zakura` package version,
 then builds and verifies the assets without creating a tag.
 
-- [ ] Wait for the build and no-push Docker checks to pass, then approve the
-      `release` environment deployment when the script announces it. The
+- [ ] Wait for the build and no-push Docker checks to pass, then have a
+      release signer approve the `release` environment deployment with
+      `scripts/approve-release.sh <run>` when the script announces it
+      ([release-approval.md](../../docs/release-approval.md)). The
       workflow publishes a complete pre-release and creates the protected
       tag as its final step.
 - [ ] Review and update the new release description against the final changelog

@@ -254,7 +254,9 @@ The workflow must:
 3. deploy the release commit to `us-east-0` and verify that the service remains
    active with working RPC and no restarts for the settle window
 4. build and verify assets before tag creation
-5. wait for approval of the `release` environment
+5. wait for a release signer to approve the `release` environment with
+   `scripts/approve-release.sh` and their security key; an agent cannot
+   approve (`docs/release-approval.md`)
 6. create the immutable tag and GitHub pre-release
 7. publish the release assets; the tag push then triggers
    `release-binaries.yml`, which publishes the Docker images

@@ -1590,16 +1590,23 @@ impl HeaderSyncReactor {
     ) {
         self.finish_vct_local_operation(owner, HeaderTargetPhase::Applying);
         end_retained(&mut retained, HeaderWorkEnd::Stale);
-        let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
-            return;
-        };
-        if active.phase != HeaderTargetPhase::Applying
-            || active.source != source
-            || active.owner != owner
-            || !self.settles_current_call(&peer, retained.as_ref())
-        {
+        let settles_round = self.peer_work_queue.active(&peer).is_some_and(|active| {
+            active.phase == HeaderTargetPhase::Applying
+                && active.source == source
+                && active.owner == owner
+        }) && self.settles_current_call(&peer, retained.as_ref());
+        if !settles_round {
+            if let HeaderTargetAdmissionResult::Failed(error) = &result {
+                // The round retired, but the same identity still sent the headers.
+                self.handle_typed_failure(peer, source, Some(owner), error);
+            }
             return;
         }
+        let active = self
+            .peer_work_queue
+            .active(&peer)
+            .cloned()
+            .expect("the settled round is active");
         end_retained(&mut retained, HeaderWorkEnd::Settled);
         let is_repair = matches!(
             active.purpose,
@@ -1804,18 +1811,25 @@ impl HeaderSyncReactor {
     ) {
         self.finish_vct_local_operation(owner, HeaderTargetPhase::Preparing);
         end_retained(&mut retained, HeaderWorkEnd::Stale);
-        let Some(active) = self.peer_work_queue.active(&peer).cloned() else {
-            return;
-        };
-        let purpose = active.purpose;
-        let is_repair = matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. });
-        if active.phase != HeaderTargetPhase::Preparing
-            || active.source != source
-            || active.owner != owner
-            || !self.settles_current_call(&peer, retained.as_ref())
-        {
+        let settles_round = self.peer_work_queue.active(&peer).is_some_and(|active| {
+            active.phase == HeaderTargetPhase::Preparing
+                && active.source == source
+                && active.owner == owner
+        }) && self.settles_current_call(&peer, retained.as_ref());
+        if !settles_round {
+            if let HeaderTargetPreparationResult::Failed(error) = &result {
+                // The round retired, but the same identity still sent the headers.
+                self.handle_typed_failure(peer, source, Some(owner), error);
+            }
             return;
         }
+        let active = self
+            .peer_work_queue
+            .active(&peer)
+            .cloned()
+            .expect("the settled round is active");
+        let purpose = active.purpose;
+        let is_repair = matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. });
         if !self.preparation_has_authority(
             &peer,
             source,
@@ -2896,7 +2910,8 @@ impl HeaderSyncReactor {
     /// the session that did that work, while it is still current, and its
     /// subscription never acknowledges the failed cursor. The peer then waits
     /// out the readmission cooldown, so it cannot reconnect and restage the
-    /// same branch at once.
+    /// same branch at once. The cooldown holds even when that session or its
+    /// round already ended, because the same identity sent the work.
     ///
     /// In test and simulator builds, it reports `Misbehavior` with `owner`'s
     /// session as the origin, or else `reported`, the session of the message
@@ -2952,7 +2967,7 @@ impl HeaderSyncReactor {
                 .into(),
             );
         });
-        if faulted.is_some() {
+        if owner.is_some() {
             self.state.start_readmission_cooldown(
                 &peer,
                 Instant::now(),

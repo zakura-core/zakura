@@ -209,6 +209,54 @@ fn a_productive_response_resets_the_unproductive_counter() {
 }
 
 #[test]
+fn strikes_survive_session_replacement() {
+    let mut fixture = eviction_fixture(3, 7);
+    for _ in 0..2 {
+        fixture.time_out_one_request(7);
+    }
+    assert_eq!(fixture.unproductive_requests(), Some(2));
+
+    let replacement = CancellationToken::new();
+    let (send, _replacement_outbound) = framed_channel(8);
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(fixture.peer.clone(), 8, send, replacement.clone()),
+    ));
+    assert_eq!(
+        fixture.unproductive_requests(),
+        Some(2),
+        "replacing a session cannot reset its strikes"
+    );
+
+    fixture.time_out_one_request(8);
+    assert!(
+        !fixture.is_admitted() && replacement.is_cancelled(),
+        "the replacement's first strike reaches the limit"
+    );
+}
+
+#[test]
+fn a_disconnect_clears_strikes() {
+    let mut fixture = eviction_fixture(3, 7);
+    for _ in 0..2 {
+        fixture.time_out_one_request(7);
+    }
+    fixture
+        .reactor
+        .handle_peer_disconnected(&fixture.peer.clone(), 7, "test disconnect");
+
+    let (send, _outbound) = framed_channel(8);
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(
+            fixture.peer.clone(),
+            8,
+            send,
+            CancellationToken::new(),
+        ),
+    ));
+    assert_eq!(fixture.unproductive_requests(), Some(0));
+}
+
+#[test]
 fn a_strike_from_a_superseded_session_cannot_drop_its_replacement() {
     // One strike causes eviction.
     // A mis-scoped charge would therefore evict the replacement immediately.

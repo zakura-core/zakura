@@ -95,6 +95,9 @@ impl ReactorState {
     /// Install fresh scheduling facts for `peer`'s new session, and return
     /// whether they replace an earlier session's facts.
     ///
+    /// A replacement keeps the earlier session's unproductive-request strikes, so
+    /// replacing a session cannot reset them. Disconnecting still does.
+    ///
     /// A new peer joins the back of the repair supplier order. A replacement
     /// keeps its position until [`Self::requeue_supplier`] moves it.
     ///
@@ -104,10 +107,14 @@ impl ReactorState {
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
         self.bump_scheduling_revision();
-        let replaced = self
-            .peers
-            .insert(peer.clone(), PeerSchedule::default())
-            .is_some();
+        let previous = self.peers.insert(peer.clone(), PeerSchedule::default());
+        let replaced = previous.is_some();
+        if let Some(previous) = previous {
+            self.peers
+                .get_mut(peer)
+                .expect("the fresh schedule was just inserted")
+                .unproductive_requests = previous.unproductive_requests;
+        }
         if !replaced {
             self.vct_supplier_order.push_back(peer.clone());
         }
@@ -785,7 +792,8 @@ pub(super) struct PeerSchedule {
     /// stall, or repair preemption also keeps its offer until the blocker clears.
     /// Failed locator reads, sends, and ordinary attempts remain spent.
     pub(super) status_spent: bool,
-    /// Consecutive requests this session answered with nothing usable.
+    /// Consecutive requests this peer's sessions answered with nothing usable,
+    /// since it connected or last supplied usable work.
     pub(super) unproductive_requests: u32,
 }
 

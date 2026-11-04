@@ -333,23 +333,25 @@ where
         Some(next)
     }
 
-    /// Puts a dispatched announcement back, if it is still the announcement this protocol wants.
+    /// Puts a dispatched announcement back, if it is still an announcement this protocol wants.
     ///
     /// A block replaced by a newer one, one that ran out of time, one that failed verification,
-    /// a tip that is no longer the tip, and a mined block that is no longer the latest one are
-    /// all dropped instead.
-    fn restore(&mut self, announcement: Announcement, best_tip: Option<block::Hash>) {
+    /// and a tip that is no longer the tip are dropped instead. A mined block that a newer mined
+    /// block replaced goes back as the tip when it is still the tip: its own tip event was
+    /// consumed while it was being sent, so nothing else would announce it.
+    fn restore(&mut self, mut announcement: Announcement, best_tip: Option<block::Hash>) {
         if self.stopped || !announcement.is_current(Instant::now()) {
             return;
         }
-        let still_wanted = match announcement.slot {
-            Slot::Tip => best_tip == Some(announcement.hash),
-            Slot::Mined => self.latest_mined == Some(announcement.hash),
+        let is_tip = best_tip == Some(announcement.hash);
+        let slot = match announcement.slot {
+            Slot::Tip if is_tip => Slot::Tip,
+            Slot::Mined if self.latest_mined == Some(announcement.hash) => Slot::Mined,
+            Slot::Mined if is_tip => Slot::Tip,
+            Slot::Tip | Slot::Mined => return,
         };
-        if !still_wanted {
-            return;
-        }
-        let waiting = match announcement.slot {
+        announcement.slot = slot;
+        let waiting = match slot {
             Slot::Tip => &mut self.tip,
             Slot::Mined => &mut self.mined,
         };
@@ -1340,6 +1342,41 @@ mod tests {
         protocol.restore(newer_sent, None);
         let next = protocol.take_next().expect("the newer block is put back");
         assert_eq!(next.hash, newer);
+    }
+
+    #[test]
+    fn a_tip_whose_mined_announcement_found_no_peers_is_put_back_behind_a_newer_mined_block() {
+        let tip = block::Hash([18; 32]);
+        let newer = block::Hash([19; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(tip, block::Height(2), 1_000, None));
+        let sent = protocol.take_next().expect("the mined block is waiting");
+        protocol.broadcasts.start(sent.hash);
+        // Its tip event arrives while the mined announcement is being sent, so the mined
+        // announcement is the only announcement of the tip.
+        protocol.accept_tip(Announcement::tip(tip, block::Height(2)));
+        assert!(
+            protocol.take_next().is_none(),
+            "the tip is being announced as mined"
+        );
+        // A newer mined block replaces it as the latest mined block.
+        protocol.accept_mined(Announcement::mined(newer, block::Height(3), 1_000, None));
+
+        // Then the mined announcement comes back with nothing sent.
+        protocol.broadcasts.finish(sent.hash, false);
+        protocol.restore(sent, Some(tip));
+
+        let next = protocol
+            .take_next()
+            .expect("the newer mined block is waiting");
+        assert_eq!(next.hash, newer);
+        let next = protocol
+            .take_next()
+            .expect("the tip is put back although a newer mined block replaced it");
+        assert_eq!(next.hash, tip);
+        assert_eq!(next.slot, Slot::Tip);
+        assert!(next.mined, "it keeps its mined priority at the peers");
     }
 
     #[test]

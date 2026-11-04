@@ -406,6 +406,15 @@ impl FramedSend {
     pub fn max_capacity(&self) -> usize {
         self.queue.depth
     }
+
+    /// Whether the transport writer behind this queue has gone away, so nothing
+    /// queued here is written any more.
+    pub(crate) fn is_closed(&self) -> bool {
+        match &self.sender {
+            FramedSender::Plain(sender) => sender.is_closed(),
+            FramedSender::Queued(sender) => sender.is_closed(),
+        }
+    }
 }
 
 /// One reserved queue slot. Dropping it returns capacity without sending a frame.

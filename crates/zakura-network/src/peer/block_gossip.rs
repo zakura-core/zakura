@@ -17,6 +17,12 @@
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
 //! that never becomes the tip.
+//!
+//! Having someone to advertise to is readiness, not part of an advertisement: [`BlockAdvertiser`]
+//! is ready once a connected peer can take an `inv`, so a caller with nothing to send to holds one
+//! readiness operation instead of one waiting advertisement per block. An advertisement that is
+//! dispatched after its peers all disappear fails with [`NoEligibleBlockPeers`], and the caller
+//! decides whether the block is still worth advertising.
 
 use std::{
     collections::HashMap,
@@ -474,6 +480,37 @@ impl From<bool> for AdvertOutcome {
 #[error("block advertisement candidates lost authorization")]
 struct RevokedCandidates;
 
+/// Every connected peer that readiness found had gone by the time the advertisement was sent.
+///
+/// The advertiser does not wait for the next peer: the caller owns the block's deadline, and only
+/// it knows whether this block is still worth advertising when peers come back.
+#[derive(Debug, thiserror::Error)]
+#[error("no connected peer can receive a block advertisement")]
+pub struct NoEligibleBlockPeers;
+
+/// Returns whether `peer` can receive a block advertisement now.
+///
+/// A peer busy with another request is still eligible: its block advert queue is separate from
+/// its request queue, which is why this service exists beside the peer set.
+fn is_eligible(peer: &BlockGossipPeer, minimum_version: Version, bans: &BannedIps) -> bool {
+    peer.version >= minimum_version
+        && !peer.sender.is_closed()
+        && !peer.address.is_some_and(|addr| bans.contains(addr.ip()))
+}
+
+/// Returns every peer in `peers` that can receive a block advertisement now.
+fn eligible_peers(
+    peers: &[BlockGossipPeer],
+    minimum_version: Version,
+    bans: &BannedIps,
+) -> Vec<BlockGossipPeer> {
+    peers
+        .iter()
+        .filter(|peer| is_eligible(peer, minimum_version, bans))
+        .cloned()
+        .collect()
+}
+
 /// Advertises `hash` to `peers`, paced through their block uploads.
 ///
 /// Configured sidecars are all advertised at once, first. Other peers are advertised to at most
@@ -522,7 +559,6 @@ pub(crate) fn broadcast_block(
 /// The peer set only accepts a request once one of its peers is ready, and a peer awaiting a
 /// response is not ready. This advertiser instead uses the block advert queue of every connected
 /// peer, including busy ones, which the peer set publishes whenever it changes.
-#[derive(Clone, Debug)]
 pub(crate) struct BlockAdvertiser<C> {
     /// Every connected peer's block advert queue, as last published by the peer set.
     pub(crate) peers: watch::Receiver<Vec<BlockGossipPeer>>,
@@ -534,10 +570,58 @@ pub(crate) struct BlockAdvertiser<C> {
     pub(crate) bans: BannedIps,
     /// Acknowledged after the owner processes pending discovery and authorization events.
     pub(crate) refresh: Option<mpsc::Sender<oneshot::Sender<()>>>,
+    /// How far this handle has got towards having a peer to advertise to.
+    readiness: Readiness,
 }
 
-/// Always ready: an advertisement waits inside its own future for a connected peer, never for
-/// an idle one. Requests other than block advertisements fail.
+/// One handle's progress towards a peer that can receive a block advertisement.
+pub(crate) enum Readiness {
+    /// Nothing is known about the connected peers yet.
+    Idle,
+    /// Waiting for the peer set to have a peer that can receive an advertisement.
+    Waiting(BoxFuture<'static, Result<(), BoxError>>),
+    /// A peer could receive an advertisement, which authorizes one `call`.
+    Granted,
+}
+
+impl Readiness {
+    /// Returns the state's name, for logs.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Waiting(_) => "waiting for peers",
+            Self::Granted => "granted",
+        }
+    }
+}
+
+impl<C: Clone> Clone for BlockAdvertiser<C> {
+    /// Clones the handle without its wait: each handle establishes its own readiness.
+    fn clone(&self) -> Self {
+        Self {
+            peers: self.peers.clone(),
+            slots: self.slots.clone(),
+            fanout: self.fanout,
+            minimum_peer_version: self.minimum_peer_version.clone(),
+            bans: self.bans.clone(),
+            refresh: self.refresh.clone(),
+            readiness: Readiness::Idle,
+        }
+    }
+}
+
+impl<C> std::fmt::Debug for BlockAdvertiser<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockAdvertiser")
+            .field("connected_peers", &self.peers.borrow().len())
+            .field("readiness", &self.readiness.name())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ready once a connected peer can receive an advertisement, which may be a busy peer, but never
+/// an idle one: the peer set's readiness is for ordinary requests. Requests other than block
+/// advertisements fail.
 impl<C: ChainTip + Clone + Send + 'static> tower::Service<Request> for BlockAdvertiser<C> {
     type Response = Response;
     type Error = BoxError;
@@ -545,21 +629,62 @@ impl<C: ChainTip + Clone + Send + 'static> tower::Service<Request> for BlockAdve
 
     fn poll_ready(
         &mut self,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), BoxError>> {
-        std::task::Poll::Ready(Ok(()))
+        loop {
+            match &mut self.readiness {
+                // Latched, so repeated readiness polls do not repeat the handshake below.
+                Readiness::Granted => return std::task::Poll::Ready(Ok(())),
+                Readiness::Idle => {
+                    self.readiness = Readiness::Waiting(self.wait_for_eligible_peer())
+                }
+                Readiness::Waiting(waiting) => match waiting.poll_unpin(cx) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(Ok(())) => self.readiness = Readiness::Granted,
+                    std::task::Poll::Ready(Err(error)) => {
+                        self.readiness = Readiness::Idle;
+                        return std::task::Poll::Ready(Err(error));
+                    }
+                },
+            }
+        }
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        // A grant covers one advertisement: the next one waits for its own peers.
+        self.readiness = Readiness::Idle;
         self.advertise(request)
+    }
+}
+
+impl<C> BlockAdvertiser<C> {
+    /// Returns an advertiser for the connected peers that `peers` publishes.
+    pub(crate) fn new(
+        peers: watch::Receiver<Vec<BlockGossipPeer>>,
+        slots: BlockUploadSlots,
+        fanout: AdvertFanout,
+        minimum_peer_version: MinimumPeerVersion<C>,
+        bans: BannedIps,
+    ) -> Self {
+        Self {
+            peers,
+            slots,
+            fanout,
+            minimum_peer_version,
+            bans,
+            refresh: None,
+            readiness: Readiness::Idle,
+        }
     }
 }
 
 impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     /// Advertises the block in `request` to every eligible connected peer.
     ///
-    /// Waits for an authorized connected peer, refreshing candidates after revocation. The
-    /// caller owns the overall deadline and cancellation, including any wait for new peers.
+    /// Refreshes candidates after revocation, and fails with [`NoEligibleBlockPeers`] if no
+    /// connected peer can receive the advertisement, whether none was left when it was sent or
+    /// every peer it was sent to went away before taking it. The caller owns the overall deadline
+    /// and cancellation, and waits for new peers through [`poll_ready`](tower::Service::poll_ready).
     pub(crate) fn advertise(
         &mut self,
         request: Request,
@@ -580,10 +705,58 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         };
         let mut minimum = self.minimum_peer_version.clone();
         let bans = self.bans.clone();
-        let refresh = self.refresh.clone();
         let mut peers = self.peers.clone();
         let slots = self.slots.clone();
         let window = self.fanout.window(block.size);
+        async move {
+            let mut dispatching = true;
+            loop {
+                let minimum_version = minimum.current();
+                let candidates = eligible_peers(&peers.borrow_and_update(), minimum_version, &bans);
+                if candidates.is_empty() && dispatching {
+                    // Readiness found a peer, but it has gone again: the caller decides whether
+                    // this block is still worth advertising to whoever connects next.
+                    return Err(Box::new(NoEligibleBlockPeers) as BoxError);
+                }
+                dispatching = false;
+                if !candidates.is_empty() {
+                    match broadcast_block(candidates, block.hash, window, mined, slots.clone())
+                        .await
+                    {
+                        Err(error) if error.is::<RevokedCandidates>() => {}
+                        Err(error) => {
+                            let minimum_version = minimum.current();
+                            let any_left = peers
+                                .borrow()
+                                .iter()
+                                .any(|peer| is_eligible(peer, minimum_version, &bans));
+                            if any_left {
+                                return Err(error);
+                            }
+                            // Every peer it was sent to went away before taking it, so nothing
+                            // received it: that is the same as having had nobody to send to.
+                            return Err(Box::new(NoEligibleBlockPeers) as BoxError);
+                        }
+                        Ok(response) => return Ok(response),
+                    }
+                }
+                // Do not replay the same rejected snapshot or reset the caller's deadline.
+                peers.changed().await.map_err(|_| "peer set stopped")?;
+            }
+        }
+        .boxed()
+    }
+
+    /// Resolves once a connected peer can receive a block advertisement.
+    ///
+    /// Asks the peer set's owner to process pending discovery and authorization first, then waits
+    /// for a membership or authorization change rather than retrying on a timer.
+    fn wait_for_eligible_peer(&self) -> BoxFuture<'static, Result<(), BoxError>> {
+        let mut minimum = self.minimum_peer_version.clone();
+        let bans = self.bans.clone();
+        let mut bans_changed = bans.subscribe();
+        let refresh = self.refresh.clone();
+        let mut peers = self.peers.clone();
         async move {
             loop {
                 if let Some(refresh) = &refresh {
@@ -592,26 +765,17 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     ready.await.map_err(|_| "peer set stopped")?;
                 }
                 let minimum_version = minimum.current();
-                let candidates: Vec<_> = peers
+                let eligible = peers
                     .borrow_and_update()
                     .iter()
-                    .filter(|peer| {
-                        peer.version >= minimum_version
-                            && !peer.sender.is_closed()
-                            && !peer.address.is_some_and(|addr| bans.contains(addr.ip()))
-                    })
-                    .cloned()
-                    .collect();
-                if !candidates.is_empty() {
-                    match broadcast_block(candidates, block.hash, window, mined, slots.clone())
-                        .await
-                    {
-                        Err(error) if error.is::<RevokedCandidates>() => {}
-                        result => return result,
-                    }
+                    .any(|peer| is_eligible(peer, minimum_version, &bans));
+                if eligible {
+                    return Ok(());
                 }
-                // Do not replay the same rejected snapshot or reset the caller's deadline.
-                peers.changed().await.map_err(|_| "peer set stopped")?;
+                tokio::select! {
+                    changed = peers.changed() => changed.map_err(|_| "peer set stopped")?,
+                    changed = bans_changed.changed() => changed.map_err(|_| "ban list stopped")?,
+                }
             }
         }
         .boxed()
@@ -1563,6 +1727,7 @@ mod tests {
                 ),
                 bans: BannedIps::default(),
                 refresh: None,
+                readiness: Readiness::Idle,
             };
             let hash = block::Hash([61; 32]);
             let mut broadcast = tokio::spawn(tower::ServiceExt::oneshot(
@@ -1643,6 +1808,7 @@ mod tests {
                 minimum_peer_version: minimum,
                 bans: BannedIps::with_banned_ip(banned.ip()),
                 refresh: None,
+                readiness: Readiness::Idle,
             };
             let hash = block::Hash([72; 32]);
             let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
@@ -1668,6 +1834,210 @@ mod tests {
         .await
         .expect("selection uses current authorization after waiting");
     }
+    /// Readiness waits for a connected peer, and grants once one can receive an advertisement.
+    #[tokio::test(start_paused = true)]
+    async fn readiness_waits_for_a_connected_peer() {
+        let (published, peers) = watch::channel(Vec::new());
+        let mut advertiser = BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(1),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+            readiness: Readiness::Idle,
+        };
+
+        assert!(
+            timeout(
+                Duration::from_secs(60),
+                tower::ServiceExt::ready(&mut advertiser)
+            )
+            .await
+            .is_err(),
+            "readiness waits while no peer is connected",
+        );
+
+        let (peer, mut receiver) = peer();
+        published.send_replace(vec![peer]);
+        let hash = block::Hash([75; 32]);
+        let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+            advertiser,
+            Request::AdvertiseMinedBlock(hash.into()),
+        ));
+        accept(&mut receiver, hash).await;
+        assert!(broadcast.await.unwrap().is_ok());
+    }
+
+    /// A caller whose peers all disappear between readiness and dispatch is told so, instead of
+    /// waiting inside the advertisement for the next peer.
+    #[tokio::test(start_paused = true)]
+    async fn advertisement_without_peers_reports_no_eligible_peers() {
+        let (peer, mut receiver) = peer();
+        let (published, peers) = watch::channel(vec![peer]);
+        let mut advertiser = BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(1),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+            readiness: Readiness::Idle,
+        };
+
+        tower::ServiceExt::ready(&mut advertiser)
+            .await
+            .expect("a connected peer can receive an advertisement");
+        published.send_replace(Vec::new());
+
+        let error = tower::Service::call(
+            &mut advertiser,
+            Request::AdvertiseMinedBlock(block::Hash([76; 32]).into()),
+        )
+        .await
+        .expect_err("no connected peer can receive the advertisement");
+        assert!(
+            error.is::<NoEligibleBlockPeers>(),
+            "unexpected error: {error:?}",
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// A caller whose only peer drops while the advertisement is being sent is told that no peer
+    /// can receive it, so the block waits for the next peer instead of counting as a failed
+    /// delivery.
+    #[tokio::test(start_paused = true)]
+    async fn advertisement_whose_only_peer_drops_reports_no_eligible_peers() {
+        let (peer, mut receiver) = peer();
+        let (_published, peers) = watch::channel(vec![peer]);
+        let mut advertiser = BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(1),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+            readiness: Readiness::Idle,
+        };
+
+        tower::ServiceExt::ready(&mut advertiser)
+            .await
+            .expect("a connected peer can receive an advertisement");
+        let hash = block::Hash([78; 32]);
+        let broadcast = tokio::spawn(tower::Service::call(
+            &mut advertiser,
+            Request::AdvertiseMinedBlock(hash.into()),
+        ));
+        // The connection takes the advert, then goes away before writing it.
+        let advert = receiver
+            .recv()
+            .await
+            .expect("peer receives an advertisement");
+        assert_eq!(advert.hash, hash);
+        drop(advert);
+        drop(receiver);
+
+        let error = broadcast
+            .await
+            .unwrap()
+            .expect_err("the only peer went away");
+        assert!(
+            error.is::<NoEligibleBlockPeers>(),
+            "unexpected error: {error:?}",
+        );
+    }
+
+    /// An advertisement that a still-connected peer fails to write is a failed delivery, not a
+    /// missing peer: the caller's retry applies, and the block does not wait for another peer.
+    #[tokio::test(start_paused = true)]
+    async fn advertisement_a_connected_peer_fails_is_a_failed_delivery() {
+        let (peer, mut receiver) = peer();
+        let (_published, peers) = watch::channel(vec![peer]);
+        let mut advertiser = BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(1),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+            readiness: Readiness::Idle,
+        };
+
+        tower::ServiceExt::ready(&mut advertiser).await.unwrap();
+        let hash = block::Hash([79; 32]);
+        let broadcast = tokio::spawn(tower::Service::call(
+            &mut advertiser,
+            Request::AdvertiseMinedBlock(hash.into()),
+        ));
+        // The connection takes the advert but never writes it.
+        let advert = receiver
+            .recv()
+            .await
+            .expect("peer receives an advertisement");
+        assert_eq!(advert.hash, hash);
+        drop(advert);
+
+        let error = broadcast
+            .await
+            .unwrap()
+            .expect_err("the peer did not write the advertisement");
+        assert!(
+            !error.is::<NoEligibleBlockPeers>(),
+            "a connected peer that failed is not a missing peer: {error:?}",
+        );
+    }
+
+    /// A granted readiness covers one advertisement: the next one waits for its own peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_granted_readiness_covers_one_advertisement() {
+        let (peer, mut receiver) = peer();
+        let (published, peers) = watch::channel(vec![peer]);
+        let mut advertiser = BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(2),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+            readiness: Readiness::Idle,
+        };
+
+        tower::ServiceExt::ready(&mut advertiser).await.unwrap();
+        let hash = block::Hash([77; 32]);
+        let broadcast = tokio::spawn(tower::Service::call(
+            &mut advertiser,
+            Request::AdvertiseMinedBlock(hash.into()),
+        ));
+        accept(&mut receiver, hash).await;
+        assert!(broadcast.await.unwrap().is_ok());
+
+        published.send_replace(Vec::new());
+        assert!(
+            timeout(
+                Duration::from_secs(60),
+                tower::ServiceExt::ready(&mut advertiser)
+            )
+            .await
+            .is_err(),
+            "the next advertisement waits for its own peer",
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn revoked_wait_obeys_caller_deadline() {
         let (peer, mut receiver) = peer();
@@ -1683,6 +2053,7 @@ mod tests {
             ),
             bans: BannedIps::default(),
             refresh: None,
+            readiness: Readiness::Idle,
         };
         let hash = block::Hash([73; 32]);
         let deadline = timeout(

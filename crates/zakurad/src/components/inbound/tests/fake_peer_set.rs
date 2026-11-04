@@ -1693,7 +1693,8 @@ async fn setup_with_misbehavior_receiver(
         sync::gossip_best_tip_block_hashes(
             sync_status.clone(),
             chain_tip_change.clone(),
-            peer_set.clone(),
+            Some(peer_set.clone()),
+            None,
             read_only_state_service,
             Some(submitblock_channel.receiver()),
         )

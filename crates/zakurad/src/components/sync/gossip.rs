@@ -1,19 +1,38 @@
 //! A task that gossips newly verified [`block::Hash`]es to peers.
 //!
+//! Each peer-to-peer protocol holds at most two blocks waiting to be announced: the latest
+//! committed best chain tip, and the latest block this node mined. A newer block replaces the one
+//! waiting rather than queueing behind it, because a peer that missed the older block catches up
+//! through ordinary sync, while a peer that is sent a run of buried blocks can lose the one block
+//! it actually needs among them.
+//!
+//! So a node with nobody to announce to holds one wait for a peer per protocol, not one per
+//! block, and the first peer to connect is sent the current tip and this node's own mined block
+//! instead of the whole backlog.
+//!
+//! Announcements finish in any order, so a late completion of an older block never displaces a
+//! newer block's waiting announcement or its delivery record.
+//!
 //! [`block::Hash`]: zakura_chain::block::Hash
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    time::Duration,
+};
 
-use futures::TryFutureExt;
+use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network as zn;
-use zakura_node_services::task::spawn_erased;
-use zakura_rpc::MinedBlockEvent;
+use zakura_rpc::{MinedBlockEvent, MinedBlockSubmission, PendingBlockSignal};
 use zakura_state::{self as zs, ChainTipChange};
 
 use crate::{components::sync::SyncStatus, BoxError};
@@ -27,54 +46,447 @@ pub(super) const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
 /// fast; if it is slow, the broadcast proceeds without the size rather than waiting.
 const BLOCK_SIZE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// A spawned committed mined-block broadcast finished.
+/// Which waiting announcement a block replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MinedBlockBroadcastCompleted {
-    block: zn::AdvertisedBlock,
-    succeeded: bool,
+enum Slot {
+    /// The committed best chain tip.
+    Tip,
+
+    /// A block this node mined, which need not be the best chain tip.
+    Mined,
+}
+
+/// A block this node submitted, which is not committed yet.
+#[derive(Clone, Debug)]
+struct EarlyMined {
+    /// Reports whether the block is still valid, so a block that fails contextual verification
+    /// after it was announced stops being announced.
+    pending: PendingBlockSignal,
+
+    /// When the block was submitted, for the submission latency metric.
+    submitted_at: std::time::Instant,
+
+    /// Which RPC method submitted the block.
+    submission: MinedBlockSubmission,
+}
+
+/// A block announcement waiting for a peer that can receive it.
+#[derive(Clone, Debug)]
+struct Announcement {
+    /// The waiting announcement this one replaces.
+    slot: Slot,
+
+    hash: block::Hash,
+
+    height: block::Height,
+
+    /// The block's serialized size, read from the state at dispatch when it is not known here.
+    size: Option<usize>,
+
+    /// Sent as a mined block, which peers fetch from their lowest-latency connections first.
+    mined: bool,
+
+    /// Set while this node's own block has been submitted but not committed.
+    early: Option<EarlyMined>,
+
+    /// Counts towards the committed-tip suppression and its one retry.
+    tracked: bool,
+
+    /// When this announcement stops being worth sending.
+    deadline: Instant,
+}
+
+impl Announcement {
+    /// Returns an announcement of the committed best chain tip.
+    fn tip(hash: block::Hash, height: block::Height) -> Self {
+        Self {
+            slot: Slot::Tip,
+            hash,
+            height,
+            size: None,
+            mined: false,
+            early: None,
+            tracked: false,
+            deadline: Instant::now() + BLOCK_GOSSIP_TIMEOUT,
+        }
+    }
+
+    /// Returns an announcement of a block this node mined.
+    ///
+    /// A submitted block that is not committed yet is not tracked: its announcement must not
+    /// satisfy the announcement of the same block once it commits.
+    fn mined(
+        hash: block::Hash,
+        height: block::Height,
+        size: usize,
+        early: Option<EarlyMined>,
+    ) -> Self {
+        Self {
+            slot: Slot::Mined,
+            hash,
+            height,
+            size: Some(size),
+            mined: true,
+            tracked: early.is_none(),
+            early,
+            deadline: Instant::now() + BLOCK_GOSSIP_TIMEOUT,
+        }
+    }
+
+    /// Returns the one retry of a committed mined block whose announcement failed.
+    ///
+    /// Untracked, so the retry does not schedule another retry of its own.
+    fn retry(hash: block::Hash, height: block::Height, size: Option<usize>) -> Self {
+        Self {
+            slot: Slot::Tip,
+            hash,
+            height,
+            size,
+            mined: true,
+            early: None,
+            tracked: false,
+            deadline: Instant::now() + BLOCK_GOSSIP_TIMEOUT,
+        }
+    }
+
+    /// Logs the block this node is about to announce.
+    fn log_accepted(&self) {
+        let message = match (self.slot, self.early.is_some()) {
+            (Slot::Mined, true) => "announcing this node's submitted block",
+            (Slot::Mined, false) => "announcing this node's committed block",
+            (Slot::Tip, _) => "announcing the committed tip",
+        };
+        info!(
+            height = ?self.height,
+            hash = ?self.hash,
+            size = ?self.size,
+            "{message}",
+        );
+    }
+
+    /// Returns whether this block is still worth announcing at `now`.
+    fn is_current(&self, now: Instant) -> bool {
+        now < self.deadline
+            && self
+                .early
+                .as_ref()
+                .is_none_or(|early| early.pending.is_valid())
+    }
+}
+
+/// How a dispatched announcement ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// At least one peer was advertised to.
+    Delivered,
+
+    /// The advertisement failed, or ran out of time.
+    Failed,
+
+    /// Every connected peer had gone by the time the advertisement was sent, so nothing was sent.
+    NoPeers,
+}
+
+/// A dispatched announcement finished.
+#[derive(Debug)]
+struct BroadcastCompleted {
+    /// Which protocol sent it.
+    protocol: usize,
+
+    outcome: Outcome,
+
+    /// The announcement, so it can go back to waiting when no peer was left to send it to.
+    announcement: Announcement,
+}
+
+/// One peer-to-peer protocol's block announcements.
+struct Protocol<ZN> {
+    /// The protocol's name, for logs.
+    name: &'static str,
+
+    /// Advertises blocks to this protocol's peers. Ready once one of them can receive an
+    /// advertisement.
+    service: ZN,
+
+    /// The latest committed best chain tip waiting for a peer.
+    tip: Option<Announcement>,
+
+    /// The latest block this node mined waiting for a peer.
+    mined: Option<Announcement>,
+
+    /// The latest block this node mined that took the mined slot, so a dispatched announcement
+    /// of an older one is not put back.
+    latest_mined: Option<block::Hash>,
+
+    /// The wait for a peer, while this protocol has an announcement to send.
+    ready: Option<BoxFuture<'static, Result<ZN, BoxError>>>,
+
+    /// Committed mined-block announcements, so the committed-tip path does not duplicate them.
+    broadcasts: MinedBlockBroadcasts,
+
+    /// Set once this protocol's service stops answering, which ends its announcements.
+    stopped: bool,
+}
+
+impl<ZN> Protocol<ZN>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    fn new(name: &'static str, service: ZN) -> Self {
+        Self {
+            name,
+            service,
+            tip: None,
+            mined: None,
+            latest_mined: None,
+            ready: None,
+            broadcasts: MinedBlockBroadcasts::default(),
+            stopped: false,
+        }
+    }
+
+    /// Returns whether this protocol has an announcement waiting for a peer.
+    fn is_waiting(&self) -> bool {
+        self.tip.is_some() || self.mined.is_some()
+    }
+
+    /// Accepts the committed best chain tip.
+    ///
+    /// A tip this protocol is already announcing as a mined block is not accepted, and the tip
+    /// still waiting is dropped, since that announcement covers the tip. The one retry of a
+    /// failed mined announcement keeps its mined priority over the same block's tip event.
+    fn accept_tip(&mut self, announcement: Announcement) {
+        if self.stopped {
+            return;
+        }
+        if self.broadcasts.is_in_flight(&announcement.hash)
+            || self.broadcasts.was_delivered(&announcement.hash)
+        {
+            debug!(
+                height = ?announcement.height,
+                hash = ?announcement.hash,
+                protocol = self.name,
+                "skipping committed block announcement: it is announced as a mined block",
+            );
+            // The mined announcement is this protocol's announcement of the tip, so whatever tip
+            // was still waiting is older and obsolete.
+            self.tip = None;
+            return;
+        }
+        if self
+            .tip
+            .as_ref()
+            .is_some_and(|waiting| waiting.hash == announcement.hash && waiting.mined)
+        {
+            debug!(
+                height = ?announcement.height,
+                hash = ?announcement.hash,
+                protocol = self.name,
+                "keeping the mined retry of the committed tip",
+            );
+            return;
+        }
+        self.tip = Some(announcement);
+    }
+
+    /// Accepts a block this node mined, replacing the one waiting.
+    fn accept_mined(&mut self, announcement: Announcement) {
+        if self.stopped {
+            return;
+        }
+        match &self.mined {
+            // A different block committed while this node's submission is still waiting and
+            // still worth sending. The submitted block is the one peers need next, and the
+            // committed block is announced by the committed-tip path if it is the tip.
+            Some(waiting)
+                if waiting.early.is_some()
+                    && waiting.is_current(Instant::now())
+                    && waiting.hash != announcement.hash
+                    && announcement.early.is_none() =>
+            {
+                debug!(
+                    height = ?announcement.height,
+                    hash = ?announcement.hash,
+                    protocol = self.name,
+                    "keeping the waiting submitted block announcement",
+                );
+            }
+            // Otherwise the newest mined block replaces the waiting one: either a newer
+            // submission, or this block's own commitment.
+            _ => {
+                self.latest_mined = Some(announcement.hash);
+                self.mined = Some(announcement);
+            }
+        }
+    }
+
+    /// Takes the next announcement to send.
+    ///
+    /// This node's own block goes first: a miner's next template waits on it. Both slots holding
+    /// the same block is one announcement.
+    fn take_next(&mut self) -> Option<Announcement> {
+        let next = self.mined.take().or_else(|| self.tip.take())?;
+        if self.tip.as_ref().is_some_and(|tip| tip.hash == next.hash) {
+            self.tip = None;
+        }
+        Some(next)
+    }
+
+    /// Puts a dispatched announcement back, if it is still the announcement this protocol wants.
+    ///
+    /// A block replaced by a newer one, one that ran out of time, one that failed verification,
+    /// a tip that is no longer the tip, and a mined block that is no longer the latest one are
+    /// all dropped instead.
+    fn restore(&mut self, announcement: Announcement, best_tip: Option<block::Hash>) {
+        if self.stopped || !announcement.is_current(Instant::now()) {
+            return;
+        }
+        let still_wanted = match announcement.slot {
+            Slot::Tip => best_tip == Some(announcement.hash),
+            Slot::Mined => self.latest_mined == Some(announcement.hash),
+        };
+        if !still_wanted {
+            return;
+        }
+        let waiting = match announcement.slot {
+            Slot::Tip => &mut self.tip,
+            Slot::Mined => &mut self.mined,
+        };
+        if waiting.is_none() {
+            *waiting = Some(announcement);
+        }
+    }
+
+    /// Drops waiting announcements that are no longer worth sending.
+    fn prune(&mut self, now: Instant) {
+        let name = self.name;
+        for waiting in [&mut self.mined, &mut self.tip] {
+            let Some(announcement) = waiting.as_ref() else {
+                continue;
+            };
+            if !announcement.is_current(now) {
+                debug!(
+                    height = ?announcement.height,
+                    hash = ?announcement.hash,
+                    protocol = name,
+                    "dropping a block announcement that is no longer worth sending",
+                );
+                *waiting = None;
+            }
+        }
+    }
+
+    /// Starts or drops the wait for a peer, to match the waiting announcements.
+    ///
+    /// One wait covers every waiting announcement: a newer block replaces a waiting one without
+    /// restarting it.
+    fn match_readiness(&mut self) {
+        if self.stopped || !self.is_waiting() {
+            self.ready = None;
+        } else if self.ready.is_none() {
+            self.ready = Some(self.service.clone().ready_oneshot().boxed());
+        }
+    }
+
+    /// Ends this protocol's announcements after its service stopped answering.
+    fn stop(&mut self) {
+        self.stopped = true;
+        self.tip = None;
+        self.mined = None;
+        self.ready = None;
+    }
 }
 
 #[derive(Debug)]
-enum GossipEvent<T> {
-    MinedBlockBroadcastCompleted(MinedBlockBroadcastCompleted),
+enum GossipEvent<T, R> {
+    BroadcastCompleted(BroadcastCompleted),
     MinedBlock(MinedBlockEvent),
+    Expired,
+    ServiceReady(R),
     CommittedTip(T),
 }
 
-async fn next_gossip_event<T>(
+/// Returns the next event the gossip task acts on.
+///
+/// Prefers finished announcements, then this node's own blocks, then expiry, then a protocol that
+/// now has a peer, then a committed tip. The committed-tip path is a fallback, so selecting it
+/// before a mined block can duplicate a mined block's announcement, and a peer that is already
+/// waiting must not be used for an announcement that has just been replaced.
+async fn next_gossip_event<T, R>(
     mined_block_receiver: Option<&mut mpsc::UnboundedReceiver<MinedBlockEvent>>,
-    mined_block_completion_receiver: &mut mpsc::UnboundedReceiver<MinedBlockBroadcastCompleted>,
+    completion_receiver: &mut mpsc::UnboundedReceiver<BroadcastCompleted>,
+    expiry_fut: impl Future<Output = ()>,
+    ready_fut: impl Future<Output = R>,
     committed_tip_fut: impl Future<Output = T>,
-) -> GossipEvent<T> {
-    if let Some(mined_block_receiver) = mined_block_receiver {
-        tokio::select! {
-            biased;
+) -> GossipEvent<T, R> {
+    tokio::select! {
+        biased;
 
-            Some(completed) = mined_block_completion_receiver.recv() => {
-                GossipEvent::MinedBlockBroadcastCompleted(completed)
-            },
+        Some(completed) = completion_receiver.recv() => {
+            GossipEvent::BroadcastCompleted(completed)
+        },
 
-            Some(tip_change) = mined_block_receiver.recv() => {
-                GossipEvent::MinedBlock(tip_change)
-            },
+        Some(mined_block) = next_mined_block(mined_block_receiver) => {
+            GossipEvent::MinedBlock(mined_block)
+        },
 
-            committed_tip = committed_tip_fut => {
-                GossipEvent::CommittedTip(committed_tip)
-            },
-        }
-    } else {
-        tokio::select! {
-            biased;
+        () = expiry_fut => GossipEvent::Expired,
 
-            Some(completed) = mined_block_completion_receiver.recv() => {
-                GossipEvent::MinedBlockBroadcastCompleted(completed)
-            },
+        ready = ready_fut => GossipEvent::ServiceReady(ready),
 
-            committed_tip = committed_tip_fut => {
-                GossipEvent::CommittedTip(committed_tip)
-            },
-        }
+        committed_tip = committed_tip_fut => {
+            GossipEvent::CommittedTip(committed_tip)
+        },
     }
+}
+
+/// Returns this node's next mined-block lifecycle event, and never returns when this node does
+/// not mine.
+async fn next_mined_block(
+    receiver: Option<&mut mpsc::UnboundedReceiver<MinedBlockEvent>>,
+) -> Option<MinedBlockEvent> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Returns once one protocol has a peer that can receive an announcement.
+///
+/// A wait that is not selected keeps its progress: it is polled again on the next event.
+async fn next_ready<ZN>(protocols: &mut [Protocol<ZN>]) -> (usize, Result<ZN, BoxError>) {
+    futures::future::poll_fn(|cx| {
+        for (index, protocol) in protocols.iter_mut().enumerate() {
+            let Some(ready) = protocol.ready.as_mut() else {
+                continue;
+            };
+            if let std::task::Poll::Ready(result) = ready.poll_unpin(cx) {
+                protocol.ready = None;
+                return std::task::Poll::Ready((index, result));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// Waits until `deadline`, and never returns without one.
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Returns when the first waiting announcement stops being worth sending.
+fn next_deadline<ZN>(protocols: &[Protocol<ZN>]) -> Option<Instant> {
+    protocols
+        .iter()
+        .flat_map(|protocol| [protocol.tip.as_ref(), protocol.mined.as_ref()])
+        .flatten()
+        .map(|announcement| announcement.deadline)
+        .min()
 }
 
 /// Errors that can occur when gossiping committed blocks
@@ -89,23 +501,23 @@ pub enum BlockGossipError {
 
 /// Run continuously, gossiping newly verified [`block::Hash`]es to peers.
 ///
-/// Once the state has reached the chain tip, broadcast the [`block::Hash`]es
-/// of newly verified blocks to all ready peers.
+/// Once the state has reached the chain tip, announce the [`block::Hash`]es of newly verified
+/// blocks to the peers of each protocol that is enabled: `legacy_network` advertises over the
+/// legacy Zcash protocol, and `zakura_network` over the Zakura protocol. Each protocol waits for
+/// its own peers, so a protocol with none never delays the other.
 ///
-/// Blocks are only gossiped if they are:
-/// - on the best chain, and
-/// - the most recent block verified since the last gossip.
+/// Each protocol announces the latest committed best tip and the latest block this node mined.
+/// Blocks that are replaced while waiting for a peer are left to ordinary sync.
 ///
-/// In particular, if a lot of blocks are committed at the same time,
-/// gossips will be disabled or skipped until the state reaches the latest tip.
-///
-/// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
+/// Each announcement carries the block's serialized size, which sizes the legacy broadcast.
+/// Mined-block events carry the size; committed tips read it from `read_state`.
 ///
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN, RS>(
     sync_status: SyncStatus,
     mut chain_state: ChainTipChange,
-    broadcast_network: ZN,
+    legacy_network: Option<ZN>,
+    zakura_network: Option<ZN>,
     read_state: RS,
     mut mined_block_receiver: Option<mpsc::UnboundedReceiver<MinedBlockEvent>>,
 ) -> Result<(), BlockGossipError>
@@ -120,34 +532,39 @@ where
 {
     info!("initializing block gossip task");
 
-    let (mined_block_completion_sender, mut mined_block_completion_receiver) =
-        mpsc::unbounded_channel();
-    let mut mined_block_broadcasts = MinedBlockBroadcasts::default();
+    let (completion_sender, mut completion_receiver) = mpsc::unbounded_channel();
+    let mut protocols: Vec<Protocol<ZN>> = [("legacy", legacy_network), ("zakura", zakura_network)]
+        .into_iter()
+        .filter_map(|(name, service)| service.map(|service| Protocol::new(name, service)))
+        .collect();
+    let mut deliveries = MinedDeliveries::default();
+    // The submission whose latency has been recorded, so two protocols record one sample.
+    let mut recorded_submission = None;
 
     loop {
-        // Drain local completion notifications from spawned mined-block
-        // broadcasts before deciding whether the committed-tip fallback should
-        // run. These are not peer acknowledgements: a success appears here only
-        // after our mined-block broadcast future completed successfully.
-        //
-        // `try_recv()` keeps this non-blocking. `Empty` just means no spawned
-        // broadcast has reported back yet, so the gossip loop can keep making
-        // progress.
-        while let Ok(completed) = mined_block_completion_receiver.try_recv() {
-            finish_mined_block_broadcast(
+        // Record a finished announcement before deciding whether the committed-tip path should
+        // announce the same block. `try_recv()` keeps this non-blocking: `Empty` just means no
+        // announcement has reported back yet, so the loop can keep making progress.
+        while let Ok(completed) = completion_receiver.try_recv() {
+            finish_broadcast(
                 completed,
+                &mut protocols,
                 &mut chain_state,
-                &mut mined_block_broadcasts,
-                &broadcast_network,
+                &mut deliveries,
+                &mut recorded_submission,
             );
         }
 
-        // TODO: Refactor this into a struct and move the contents of this loop into its own method.
+        let now = Instant::now();
+        for protocol in &mut protocols {
+            protocol.prune(now);
+            protocol.match_readiness();
+        }
+
         let mut sync_status = sync_status.clone();
         let mut chain_tip = chain_state.clone_for_task();
 
-        // TODO: Move the contents of this async block to its own method
-        let tip_change_close_to_network_tip_fut = async move {
+        let committed_tip_fut = async move {
             /// A brief duration to wait after a tip change for a new message in the mined block channel.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
@@ -176,134 +593,181 @@ where
                 .unwrap_or(tip_action)
                 .best_tip_hash_and_height();
 
-            Ok((best_tip, "sending committed block broadcast", chain_tip))
+            Ok((best_tip, chain_tip))
         }
         .in_current_span();
 
-        // TODO: Move this logic for selecting the first ready future and updating `chain_state` to its own method.
-        //
-        // Prefer mined-block completions and submissions when multiple
-        // branches are ready. The committed-tip path is a fallback, so
-        // selecting it first can duplicate a mined-block broadcast.
-        let (((hash, height), log_msg, updated_chain_state), is_block_submission, early, size) =
-            match next_gossip_event(
-                mined_block_receiver.as_mut(),
-                &mut mined_block_completion_receiver,
-                tip_change_close_to_network_tip_fut,
-            )
-            .await
-            {
-                GossipEvent::MinedBlockBroadcastCompleted(completed) => {
-                    finish_mined_block_broadcast(
-                        completed,
-                        &mut chain_state,
-                        &mut mined_block_broadcasts,
-                        &broadcast_network,
-                    );
-                    continue;
-                }
-                GossipEvent::MinedBlock(MinedBlockEvent::Early {
-                    hash,
-                    height,
-                    size,
-                    submitted_at,
-                    submission,
-                    pending,
-                }) => (
-                    (
-                        (hash, height),
-                        "sending early mined block broadcast",
-                        chain_state,
+        let event = next_gossip_event(
+            mined_block_receiver.as_mut(),
+            &mut completion_receiver,
+            wait_until(next_deadline(&protocols)),
+            next_ready(&mut protocols),
+            committed_tip_fut,
+        )
+        .await;
+
+        match event {
+            GossipEvent::BroadcastCompleted(completed) => finish_broadcast(
+                completed,
+                &mut protocols,
+                &mut chain_state,
+                &mut deliveries,
+                &mut recorded_submission,
+            ),
+
+            GossipEvent::MinedBlock(mined_block) => {
+                let announcement = match mined_block {
+                    MinedBlockEvent::Early {
+                        hash,
+                        height,
+                        size,
+                        submitted_at,
+                        submission,
+                        pending,
+                    } => Announcement::mined(
+                        hash,
+                        height,
+                        size,
+                        Some(EarlyMined {
+                            pending,
+                            submitted_at,
+                            submission,
+                        }),
                     ),
-                    true,
-                    Some((pending, submitted_at, submission)),
-                    Some(size),
-                ),
-                GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, height, size }) => (
-                    (
-                        (hash, height),
-                        "sending committed mined block broadcast",
-                        chain_state,
-                    ),
-                    true,
-                    None,
-                    Some(size),
-                ),
-                GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false, None, None)
+                    MinedBlockEvent::Committed { hash, height, size } => {
+                        Announcement::mined(hash, height, size, None)
+                    }
+                };
+                announcement.log_accepted();
+                for protocol in &mut protocols {
+                    protocol.accept_mined(announcement.clone());
                 }
-            };
+            }
 
-        chain_state = updated_chain_state;
+            // The loop prunes expired announcements before it waits again.
+            GossipEvent::Expired => {}
 
-        // Without a delay between gossips, the committed-tip path sees a mined block's tip change
-        // before that block's own broadcast completes. If the broadcast fails,
-        // `finish_mined_block_broadcast` sends this fallback instead.
-        if !is_block_submission && mined_block_broadcasts.is_in_flight(&hash) {
-            debug!(
-                ?height,
-                ?hash,
-                "skipping committed block broadcast: mined block broadcast is in flight",
-            );
-            continue;
-        }
-
-        // TODO: Move logic for calling the peer set to its own method.
-
-        info!(?height, ?hash, ?size, is_block_submission, log_msg);
-        // Include readiness in the deadline. The event loop must keep consuming lifecycle and tip
-        // events when the peer set has no ready service.
-        let network = broadcast_network.clone();
-        let read_state = read_state.clone();
-        // Keep the committed-tip fallback until the committed broadcast succeeds. An admitted
-        // body can be served immediately, but contextual failure still cancels early inventory.
-        let completion_tx = (is_block_submission && early.is_none()).then(|| {
-            mined_block_broadcasts.start(hash);
-            mined_block_completion_sender.clone()
-        });
-        tokio::spawn(async move {
-            let block = match size {
-                Some(size) => zn::AdvertisedBlock::new(hash, size),
-                None => zn::AdvertisedBlock {
-                    size: committed_block_size(read_state, hash).await,
-                    ..hash.into()
-                },
-            };
-            // block broadcasts inform other nodes about new blocks,
-            // so our internal Grow or Reset state doesn't matter to them
-            let request = if is_block_submission {
-                zn::Request::AdvertiseMinedBlock(block)
-            } else {
-                zn::Request::AdvertiseBlock(block, None)
-            };
-            let broadcast = broadcast_with_timeout(network, request);
-            let succeeded = match early {
-                Some((mut pending, submitted_at, submission)) => {
-                    if !pending.is_valid() {
-                        false
-                    } else {
-                        let succeeded = tokio::select! {
-                            biased;
-                            _ = pending.wait_for_failure() => false,
-                            succeeded = broadcast => succeeded,
-                        };
-                        if succeeded {
-                            metrics::counter!("mining.optimistic_inventory.early_inventories")
-                                .increment(1);
-                            metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => submission.rpc_method())
-                                .record(submitted_at.elapsed().as_secs_f64());
+            GossipEvent::ServiceReady((index, ready)) => {
+                let protocol = &mut protocols[index];
+                match ready {
+                    Ok(service) => {
+                        protocol.prune(Instant::now());
+                        if let Some(announcement) = protocol.take_next() {
+                            if announcement.tracked {
+                                protocol.broadcasts.start(announcement.hash);
+                            }
+                            dispatch(
+                                index,
+                                protocol.name,
+                                service,
+                                announcement,
+                                read_state.clone(),
+                                completion_sender.clone(),
+                            );
                         }
-                        succeeded
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            protocol = protocol.name,
+                            "block advertisement service stopped; ending its announcements",
+                        );
+                        protocol.stop();
                     }
                 }
-                None => broadcast.await,
-            };
-
-            if let Some(completion_tx) = completion_tx {
-                let _ = completion_tx.send(MinedBlockBroadcastCompleted { block, succeeded });
             }
-        });
+
+            GossipEvent::CommittedTip(committed_tip) => {
+                let ((hash, height), updated_chain_state) = committed_tip?;
+                chain_state = updated_chain_state;
+                let announcement = Announcement::tip(hash, height);
+                announcement.log_accepted();
+                for protocol in &mut protocols {
+                    protocol.accept_tip(announcement.clone());
+                }
+            }
+        }
     }
+}
+
+/// Sends `announcement` to `protocol`'s peers through its ready `service`, and reports the
+/// outcome back to the gossip task.
+fn dispatch<ZN, RS>(
+    protocol: usize,
+    name: &'static str,
+    service: ZN,
+    announcement: Announcement,
+    read_state: RS,
+    completion_sender: mpsc::UnboundedSender<BroadcastCompleted>,
+) where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+    RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    RS::Future: Send,
+{
+    let Announcement {
+        hash,
+        height,
+        size,
+        mined,
+        deadline,
+        ref early,
+        ..
+    } = announcement;
+    let early = early.clone();
+
+    debug!(
+        ?height,
+        ?hash,
+        ?size,
+        mined,
+        early = early.is_some(),
+        protocol = name,
+        "sending a block announcement",
+    );
+
+    tokio::spawn(async move {
+        let block = match size {
+            Some(size) => zn::AdvertisedBlock::new(hash, size),
+            // Only read the size of a block that is being announced now.
+            None => zn::AdvertisedBlock {
+                size: committed_block_size(read_state, hash).await,
+                ..hash.into()
+            },
+        };
+        // block announcements inform other nodes about new blocks,
+        // so our internal Grow or Reset state doesn't matter to them
+        let request = if mined {
+            zn::Request::AdvertiseMinedBlock(block)
+        } else {
+            zn::Request::AdvertiseBlock(block, None)
+        };
+        let broadcast = broadcast_until(service, request, hash, deadline);
+
+        let outcome = match early {
+            Some(EarlyMined { mut pending, .. }) => {
+                if !pending.is_valid() {
+                    Outcome::Failed
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = pending.wait_for_failure() => Outcome::Failed,
+                        outcome = broadcast => outcome,
+                    }
+                }
+            }
+            None => broadcast.await,
+        };
+
+        let _ = completion_sender.send(BroadcastCompleted {
+            protocol,
+            outcome,
+            announcement,
+        });
+    });
 }
 
 /// Reads the serialized size of the committed block `hash` from the state.
@@ -330,60 +794,169 @@ where
     size
 }
 
-/// Sends a block broadcast, returning `true` if it succeeded within [`BLOCK_GOSSIP_TIMEOUT`].
-async fn broadcast_with_timeout<ZN>(network: ZN, request: zn::Request) -> bool
+/// Sends `request` for the block with `hash`, with `deadline` bounding the wait for a peer and
+/// the broadcast itself.
+async fn broadcast_until<ZN>(
+    mut service: ZN,
+    request: zn::Request,
+    hash: block::Hash,
+    deadline: Instant,
+) -> Outcome
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
 {
-    tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, network.oneshot(request))
-        .await
-        .is_ok_and(|result| result.is_ok())
+    // `service` is the ready service this announcement waited for, so it is called directly.
+    match tokio::time::timeout_at(deadline, service.call(request)).await {
+        Ok(Ok(_response)) => Outcome::Delivered,
+        Ok(Err(error)) if error.is::<zn::NoEligibleBlockPeers>() => Outcome::NoPeers,
+        Ok(Err(error)) => {
+            debug!(?error, ?hash, "block announcement failed");
+            Outcome::Failed
+        }
+        Err(_elapsed) => {
+            debug!(?hash, "block announcement ran out of time");
+            Outcome::Failed
+        }
+    }
 }
 
-/// Records a completed mined-block broadcast, and advertises the hash through the committed-tip
-/// fallback if the broadcast failed.
-fn finish_mined_block_broadcast<ZN>(
-    completed: MinedBlockBroadcastCompleted,
+/// Records a finished announcement, and keeps the block announced if it still needs to be.
+///
+/// An announcement that found no peer goes back to waiting for one. A committed mined block whose
+/// announcement failed is announced once more, while it is still the tip.
+fn finish_broadcast<ZN>(
+    completed: BroadcastCompleted,
+    protocols: &mut [Protocol<ZN>],
     chain_state: &mut ChainTipChange,
-    mined_block_broadcasts: &mut MinedBlockBroadcasts,
-    broadcast_network: &ZN,
+    deliveries: &mut MinedDeliveries,
+    recorded_submission: &mut Option<block::Hash>,
 ) where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
     ZN::Future: Send,
 {
-    let hash = completed.block.hash;
-    let needs_fallback = mined_block_broadcasts.finish(completed);
-
-    if completed.succeeded {
-        chain_state.mark_last_change_hash(hash);
-        return;
-    }
-
-    // A newer tip gets its own committed-tip broadcast.
-    if !needs_fallback || chain_state.latest_chain_tip().best_tip_hash() != Some(hash) {
-        return;
-    }
-
-    let request = zn::Request::AdvertiseMinedBlock(completed.block);
-    info!(
-        ?request,
-        "sending committed block broadcast after the mined block broadcast failed",
+    let protocol_count = protocols.len();
+    let best_tip = chain_state.latest_chain_tip().best_tip_hash();
+    let BroadcastCompleted {
+        protocol,
+        outcome,
+        announcement,
+    } = completed;
+    let (hash, height, size, tracked) = (
+        announcement.hash,
+        announcement.height,
+        announcement.size,
+        announcement.tracked,
     );
-    chain_state.mark_last_change_hash(hash);
-    spawn_erased(broadcast_with_timeout(broadcast_network.clone(), request));
+    let protocol = &mut protocols[protocol];
+
+    if outcome == Outcome::NoPeers {
+        // Nothing was sent, so this is not a failed delivery and does not use up the one retry.
+        if tracked {
+            protocol.broadcasts.finish(hash, false);
+        }
+        debug!(
+            ?height,
+            ?hash,
+            protocol = protocol.name,
+            "no peer could receive a block announcement; waiting for one",
+        );
+        protocol.restore(announcement, best_tip);
+        return;
+    }
+
+    let delivered = outcome == Outcome::Delivered;
+    if delivered {
+        if let Some(early) = &announcement.early {
+            // Two protocols announcing one submission is still one submission.
+            if *recorded_submission != Some(hash) {
+                *recorded_submission = Some(hash);
+                metrics::counter!("mining.optimistic_inventory.early_inventories").increment(1);
+                metrics::histogram!("mining.submit_to_inventory.duration_seconds", "method" => early.submission.rpc_method())
+                    .record(early.submitted_at.elapsed().as_secs_f64());
+            }
+        }
+    }
+
+    if !tracked {
+        return;
+    }
+
+    let needs_retry = protocol.broadcasts.finish(hash, delivered);
+
+    if delivered {
+        // Every protocol has the block, so its tip change needs no committed-tip announcement.
+        if deliveries.delivered(hash, protocol_count) {
+            chain_state.mark_last_change_hash(hash);
+        }
+        return;
+    }
+
+    // A newer tip gets its own committed-tip announcement.
+    if !needs_retry || best_tip != Some(hash) {
+        return;
+    }
+
+    info!(
+        ?height,
+        ?hash,
+        protocol = protocol.name,
+        "announcing a committed block again after its mined block announcement failed",
+    );
+    protocol.accept_tip(Announcement::retry(hash, height, size));
 }
 
-/// Committed mined-block broadcasts, tracked so the committed-tip path does not duplicate them.
+/// How many delivered mined blocks a delivery record remembers.
+///
+/// Announcements finish in any order, so one remembered block is not enough: a slower
+/// announcement of an older block would erase a newer block's record. Sixteen outlasts every
+/// announcement that can still be in flight, since the RPC admits at most that many submissions
+/// at once.
+const RECENT_DELIVERIES: usize = 16;
+
+/// Counts the protocols that have announced each recently committed mined block.
+///
+/// Every protocol shares one committed-tip path, so that path is only suppressed once every
+/// protocol has announced the block.
+#[derive(Debug, Default)]
+struct MinedDeliveries {
+    /// How many protocols have announced each block, oldest block first, at most
+    /// [`RECENT_DELIVERIES`] blocks.
+    recent: VecDeque<(block::Hash, usize)>,
+}
+
+impl MinedDeliveries {
+    /// Records one protocol's announcement of `hash`, returning whether all `protocols` have
+    /// announced it.
+    fn delivered(&mut self, hash: block::Hash, protocols: usize) -> bool {
+        let index = match self.recent.iter().position(|(recent, _)| *recent == hash) {
+            Some(index) => index,
+            None => {
+                if self.recent.len() >= RECENT_DELIVERIES {
+                    self.recent.pop_front();
+                }
+                self.recent.push_back((hash, 0));
+                self.recent.len() - 1
+            }
+        };
+        let (_, count) = &mut self.recent[index];
+        *count += 1;
+        *count >= protocols
+    }
+}
+
+/// Committed mined-block announcements, tracked so the committed-tip path does not duplicate
+/// them, per protocol.
 #[derive(Debug, Default)]
 struct MinedBlockBroadcasts {
-    /// Broadcasts that have not reported completion, counted per hash.
+    /// Announcements that have not reported completion, counted per hash.
     ///
-    /// Every spawned broadcast reports completion within [`BLOCK_GOSSIP_TIMEOUT`], so entries
-    /// do not accumulate.
+    /// Every dispatched announcement reports completion within its deadline, so entries do not
+    /// accumulate.
     in_flight: HashMap<block::Hash, usize>,
 
-    /// The most recent hash whose mined-block broadcast succeeded.
-    delivered: Option<block::Hash>,
+    /// The hashes whose mined-block announcement succeeded, oldest first, at most
+    /// [`RECENT_DELIVERIES`] of them.
+    delivered: VecDeque<block::Hash>,
 }
 
 impl MinedBlockBroadcasts {
@@ -395,14 +968,16 @@ impl MinedBlockBroadcasts {
         self.in_flight.contains_key(hash)
     }
 
-    /// Records a completed broadcast.
-    ///
-    /// Returns `true` if the hash now needs the committed-tip fallback: this broadcast failed, no
-    /// other broadcast of the hash is in flight, and none has succeeded.
-    fn finish(&mut self, completed: MinedBlockBroadcastCompleted) -> bool {
-        let MinedBlockBroadcastCompleted { block, succeeded } = completed;
-        let hash = block.hash;
+    /// Returns whether a mined-block announcement of `hash` succeeded recently.
+    fn was_delivered(&self, hash: &block::Hash) -> bool {
+        self.delivered.contains(hash)
+    }
 
+    /// Records a completed announcement.
+    ///
+    /// Returns `true` if the hash now needs announcing again: this announcement failed, no other
+    /// announcement of the hash is in flight, and none has succeeded.
+    fn finish(&mut self, hash: block::Hash, succeeded: bool) -> bool {
         if let Some(count) = self.in_flight.get_mut(&hash) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -411,29 +986,47 @@ impl MinedBlockBroadcasts {
         }
 
         if succeeded {
-            self.delivered = Some(hash);
+            if !self.was_delivered(&hash) {
+                if self.delivered.len() >= RECENT_DELIVERIES {
+                    self.delivered.pop_front();
+                }
+                self.delivered.push_back(hash);
+            }
             return false;
         }
 
-        !self.is_in_flight(&hash) && self.delivered != Some(hash)
+        !self.is_in_flight(&hash) && !self.was_delivered(&hash)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        next_gossip_event, GossipEvent, MinedBlockBroadcastCompleted, MinedBlockBroadcasts,
+        next_gossip_event, Announcement, BroadcastCompleted, EarlyMined, GossipEvent,
+        MinedBlockBroadcasts, MinedDeliveries, Outcome, Protocol, Slot, RECENT_DELIVERIES,
     };
 
     use std::future;
 
     use tokio::sync::mpsc;
+    use tower::util::BoxCloneService;
     use zakura_chain::block;
-    use zakura_rpc::MinedBlockEvent;
+    use zakura_rpc::{MinedBlockEvent, MinedBlockSubmission, PendingBlockSignal};
+
+    use crate::BoxError;
 
     // Repeat the vector so removing `biased;` reliably exposes randomized
     // selection among the ready events.
     const READY_EVENT_ATTEMPTS: usize = 64;
+
+    /// Returns a completed announcement of the committed mined block `hash`.
+    fn completed(hash: block::Hash, outcome: Outcome) -> BroadcastCompleted {
+        BroadcastCompleted {
+            protocol: 0,
+            outcome,
+            announcement: Announcement::mined(hash, block::Height(1), 1_000, None),
+        }
+    }
 
     #[tokio::test]
     async fn ready_gossip_events_are_selected_in_priority_order() {
@@ -441,7 +1034,7 @@ mod tests {
 
         for _ in 0..READY_EVENT_ATTEMPTS {
             let (mined_block_sender, mut mined_block_receiver) = mpsc::unbounded_channel();
-            let (mark_sender, mut mark_receiver) = mpsc::unbounded_channel();
+            let (completion_sender, mut completion_receiver) = mpsc::unbounded_channel();
 
             mined_block_sender
                 .send(MinedBlockEvent::Committed {
@@ -450,28 +1043,32 @@ mod tests {
                     size: 1_000,
                 })
                 .unwrap();
-            let completed = MinedBlockBroadcastCompleted {
-                block: submitted_hash.into(),
-                succeeded: true,
-            };
-            mark_sender.send(completed).unwrap();
+            completion_sender
+                .send(completed(submitted_hash, Outcome::Delivered))
+                .unwrap();
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),
-                &mut mark_receiver,
+                &mut completion_receiver,
                 future::ready(()),
+                future::ready("ready"),
+                future::ready("committed tip"),
             )
             .await;
 
             assert!(matches!(
                 event,
-                GossipEvent::MinedBlockBroadcastCompleted(event) if event == completed
+                GossipEvent::BroadcastCompleted(event)
+                    if event.announcement.hash == submitted_hash
+                        && event.outcome == Outcome::Delivered
             ));
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),
-                &mut mark_receiver,
+                &mut completion_receiver,
                 future::ready(()),
+                future::ready("ready"),
+                future::ready("committed tip"),
             )
             .await;
 
@@ -486,7 +1083,31 @@ mod tests {
 
             let event = next_gossip_event(
                 Some(&mut mined_block_receiver),
-                &mut mark_receiver,
+                &mut completion_receiver,
+                future::ready(()),
+                future::ready("ready"),
+                future::ready("committed tip"),
+            )
+            .await;
+
+            assert!(matches!(event, GossipEvent::Expired));
+
+            let event: GossipEvent<&str, &str> = next_gossip_event(
+                Some(&mut mined_block_receiver),
+                &mut completion_receiver,
+                future::pending(),
+                future::ready("ready"),
+                future::ready("committed tip"),
+            )
+            .await;
+
+            assert!(matches!(event, GossipEvent::ServiceReady("ready")));
+
+            let event: GossipEvent<&str, &str> = next_gossip_event(
+                Some(&mut mined_block_receiver),
+                &mut completion_receiver,
+                future::pending(),
+                future::pending(),
                 future::ready("committed tip"),
             )
             .await;
@@ -498,10 +1119,6 @@ mod tests {
     #[test]
     fn failed_mined_block_broadcast_needs_fallback_once_nothing_is_in_flight() {
         let hash = block::Hash([2; 32]);
-        let failed = MinedBlockBroadcastCompleted {
-            block: hash.into(),
-            succeeded: false,
-        };
         let mut broadcasts = MinedBlockBroadcasts::default();
 
         broadcasts.start(hash);
@@ -509,12 +1126,12 @@ mod tests {
         assert!(broadcasts.is_in_flight(&hash));
 
         assert!(
-            !broadcasts.finish(failed),
+            !broadcasts.finish(hash, false),
             "another broadcast of the hash can still succeed",
         );
         assert!(broadcasts.is_in_flight(&hash));
 
-        assert!(broadcasts.finish(failed));
+        assert!(broadcasts.finish(hash, false));
         assert!(!broadcasts.is_in_flight(&hash));
     }
 
@@ -526,14 +1143,235 @@ mod tests {
         broadcasts.start(hash);
         broadcasts.start(hash);
 
-        assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
-            block: hash.into(),
-            succeeded: true,
-        }));
-        assert!(!broadcasts.finish(MinedBlockBroadcastCompleted {
-            block: hash.into(),
-            succeeded: false,
-        }));
+        assert!(!broadcasts.finish(hash, true));
+        assert!(!broadcasts.finish(hash, false));
         assert!(!broadcasts.is_in_flight(&hash));
+        assert!(broadcasts.was_delivered(&hash));
+    }
+
+    #[test]
+    fn a_late_success_for_an_older_mined_block_keeps_the_newer_delivery() {
+        let older = block::Hash([7; 32]);
+        let newer = block::Hash([8; 32]);
+        let mut broadcasts = MinedBlockBroadcasts::default();
+
+        broadcasts.start(older);
+        broadcasts.start(newer);
+        assert!(!broadcasts.finish(newer, true));
+        assert!(!broadcasts.finish(older, true));
+
+        assert!(broadcasts.was_delivered(&newer));
+        assert!(broadcasts.was_delivered(&older));
+        assert!(
+            !broadcasts.finish(newer, false),
+            "a delivered block needs no retry",
+        );
+    }
+
+    #[test]
+    fn delivery_records_remember_a_bounded_number_of_blocks() {
+        let mut broadcasts = MinedBlockBroadcasts::default();
+        let mut deliveries = MinedDeliveries::default();
+        let hash = |index: usize| block::Hash([u8::try_from(index).expect("small index"); 32]);
+
+        for index in 0..=RECENT_DELIVERIES {
+            broadcasts.finish(hash(index), true);
+            assert!(!deliveries.delivered(hash(index), 2));
+        }
+
+        assert!(
+            !broadcasts.was_delivered(&hash(0)),
+            "the oldest is forgotten"
+        );
+        assert!(broadcasts.was_delivered(&hash(1)));
+        assert!(broadcasts.was_delivered(&hash(RECENT_DELIVERIES)));
+        assert!(
+            deliveries.delivered(hash(RECENT_DELIVERIES), 2),
+            "the newest count is kept"
+        );
+        assert!(
+            !deliveries.delivered(hash(0), 2),
+            "the oldest count starts again",
+        );
+    }
+
+    #[test]
+    fn the_committed_tip_is_suppressed_once_every_protocol_has_the_block() {
+        let hash = block::Hash([3; 32]);
+        let other = block::Hash([4; 32]);
+        let mut deliveries = MinedDeliveries::default();
+
+        assert!(
+            !deliveries.delivered(hash, 2),
+            "the second protocol has not announced the block yet",
+        );
+        assert!(deliveries.delivered(hash, 2));
+
+        assert!(
+            !deliveries.delivered(other, 2),
+            "a newer block starts its own count",
+        );
+    }
+
+    #[test]
+    fn a_late_delivery_of_an_older_mined_block_does_not_reset_the_count() {
+        let older = block::Hash([9; 32]);
+        let newer = block::Hash([10; 32]);
+        let mut deliveries = MinedDeliveries::default();
+
+        assert!(!deliveries.delivered(newer, 2));
+        assert!(!deliveries.delivered(older, 2));
+        assert!(
+            deliveries.delivered(newer, 2),
+            "the older block's late delivery kept the newer block's count",
+        );
+    }
+
+    /// A protocol whose service answers every advertisement.
+    fn protocol(
+    ) -> Protocol<BoxCloneService<zakura_network::Request, zakura_network::Response, BoxError>>
+    {
+        Protocol::new(
+            "legacy",
+            BoxCloneService::new(tower::service_fn(|_: zakura_network::Request| async {
+                Ok::<_, BoxError>(zakura_network::Response::Nil)
+            })),
+        )
+    }
+
+    /// A submission of a block that is not committed yet.
+    fn early(pending: PendingBlockSignal) -> EarlyMined {
+        EarlyMined {
+            pending,
+            submitted_at: std::time::Instant::now(),
+            submission: MinedBlockSubmission::FullBlock,
+        }
+    }
+
+    #[test]
+    fn a_waiting_submission_survives_an_older_block_committing() {
+        let waiting = block::Hash([5; 32]);
+        let older = block::Hash([6; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(
+            waiting,
+            block::Height(2),
+            1_000,
+            Some(early(PendingBlockSignal::valid_for_tests())),
+        ));
+        protocol.accept_mined(Announcement::mined(older, block::Height(1), 1_000, None));
+
+        let next = protocol.take_next().expect("a submission is waiting");
+        assert_eq!(next.hash, waiting);
+        assert_eq!(next.slot, Slot::Mined);
+        assert!(protocol.take_next().is_none(), "the older block is dropped");
+    }
+
+    #[test]
+    fn a_rejected_submission_does_not_block_a_committed_block() {
+        let submitted = block::Hash([11; 32]);
+        let committed = block::Hash([12; 32]);
+        let (pending, failure) = PendingBlockSignal::waiting_for_tests();
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(
+            submitted,
+            block::Height(3),
+            1_000,
+            Some(early(pending)),
+        ));
+        failure.fail();
+        protocol.accept_mined(Announcement::mined(
+            committed,
+            block::Height(2),
+            1_000,
+            None,
+        ));
+
+        let next = protocol
+            .take_next()
+            .expect("the committed block is waiting");
+        assert_eq!(next.hash, committed);
+        assert_eq!(next.slot, Slot::Mined);
+    }
+
+    #[test]
+    fn a_mined_block_replaced_while_it_was_being_sent_is_not_put_back() {
+        let older = block::Hash([13; 32]);
+        let newer = block::Hash([14; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_mined(Announcement::mined(older, block::Height(2), 1_000, None));
+        let older_sent = protocol.take_next().expect("the older block is waiting");
+        protocol.accept_mined(Announcement::mined(newer, block::Height(3), 1_000, None));
+        let newer_sent = protocol.take_next().expect("the newer block is waiting");
+
+        protocol.restore(older_sent, None);
+        assert!(
+            protocol.take_next().is_none(),
+            "the older block was replaced while it was being sent",
+        );
+
+        protocol.restore(newer_sent, None);
+        let next = protocol.take_next().expect("the newer block is put back");
+        assert_eq!(next.hash, newer);
+    }
+
+    #[test]
+    fn a_committed_tip_announced_as_a_mined_block_clears_the_waiting_tip() {
+        let older = block::Hash([15; 32]);
+        let mined = block::Hash([16; 32]);
+        let newest = block::Hash([17; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_tip(Announcement::tip(older, block::Height(2)));
+        protocol.broadcasts.start(mined);
+        protocol.accept_tip(Announcement::tip(mined, block::Height(3)));
+        assert!(
+            protocol.take_next().is_none(),
+            "the mined announcement in flight covers the tip",
+        );
+
+        protocol.broadcasts.finish(mined, true);
+        protocol.accept_tip(Announcement::tip(older, block::Height(2)));
+        protocol.accept_tip(Announcement::tip(mined, block::Height(3)));
+        assert!(
+            protocol.take_next().is_none(),
+            "the delivered mined announcement covers the tip",
+        );
+
+        protocol.accept_tip(Announcement::tip(newest, block::Height(4)));
+        let next = protocol.take_next().expect("a newer tip is announced");
+        assert_eq!(next.hash, newest);
+        assert!(!next.mined);
+    }
+
+    #[test]
+    fn a_committed_tip_keeps_the_waiting_retry_of_the_same_block() {
+        let hash = block::Hash([18; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_tip(Announcement::retry(hash, block::Height(3), Some(1_000)));
+        protocol.accept_tip(Announcement::tip(hash, block::Height(3)));
+
+        let next = protocol.take_next().expect("the retry is waiting");
+        assert_eq!(next.hash, hash);
+        assert!(next.mined, "the retry keeps its mined priority");
+        assert_eq!(next.size, Some(1_000));
+    }
+
+    #[test]
+    fn a_newer_tip_replaces_a_waiting_retry() {
+        let older = block::Hash([19; 32]);
+        let newer = block::Hash([20; 32]);
+
+        let mut protocol = protocol();
+        protocol.accept_tip(Announcement::retry(older, block::Height(3), Some(1_000)));
+        protocol.accept_tip(Announcement::tip(newer, block::Height(4)));
+
+        let next = protocol.take_next().expect("the newer tip is waiting");
+        assert_eq!(next.hash, newer);
+        assert!(!next.mined);
     }
 }

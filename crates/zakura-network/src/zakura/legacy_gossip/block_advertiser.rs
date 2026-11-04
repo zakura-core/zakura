@@ -90,11 +90,14 @@ impl ZakuraBlockAdvertiser {
         queue_wait: Duration,
     ) -> Result<Response, BoxError> {
         let frame = LegacyGossipFrame::AdvertiseBlock(hash);
+        let advertisement = broadcast.outbound.issue_advertisement();
         if broadcast.unseen(&frame).await.is_none() {
             // The block was already sent, as this node's submission or relayed from a peer. Now
             // that it has committed, it is still the block a later peer should be sent.
             if committed {
-                broadcast.outbound.remember_latest_block(&frame);
+                broadcast
+                    .outbound
+                    .remember_latest_block(advertisement, &frame);
             }
             return Ok(Response::Nil);
         }
@@ -106,7 +109,9 @@ impl ZakuraBlockAdvertiser {
         if reached.delivered > 0 {
             broadcast.mark_seen(&frame).await;
             if committed {
-                broadcast.outbound.remember_latest_block(&frame);
+                broadcast
+                    .outbound
+                    .remember_latest_block(advertisement, &frame);
             }
             // A session added while a full queue was making room was replayed the block before
             // this one, or nothing, and a later advertisement of this block is not sent again.
@@ -267,10 +272,11 @@ mod tests {
     }
 
     fn latest_block(outbound: &LegacyGossipOutbound) -> Option<block::Hash> {
-        *outbound
+        outbound
             .latest_block
             .lock()
             .expect("legacy gossip latest-block mutex is never poisoned")
+            .hash
     }
 
     async fn is_unseen(broadcast: &ZakuraGossipBroadcast, hash: block::Hash) -> bool {
@@ -632,7 +638,7 @@ mod tests {
                 .call(Request::AdvertiseBlockToAll(hash.into()))
                 .await
         };
-        let (((_joined, mut joined_receiver), drained), advertised) =
+        let (((joined, mut joined_receiver), drained), advertised) =
             tokio::join!(join_then_drain, advertise);
         assert_eq!(drained?, earlier);
         advertised?;
@@ -642,6 +648,16 @@ mod tests {
             recv_advert(&mut joined_receiver).await?,
             hash,
             "the session that joined while the block was waiting is sent it"
+        );
+
+        // The replay on joining runs after the block was remembered, and finds it queued.
+        broadcast
+            .outbound
+            .replay_latest_block_to_peer(joined)
+            .await?;
+        assert!(
+            joined_receiver.try_recv().is_err(),
+            "the joined session is not queued the block a second time"
         );
         Ok(())
     }
@@ -687,6 +703,53 @@ mod tests {
             .call(Request::AdvertiseBlockToAll(hash.into()))
             .await?;
         assert_eq!(recv_advert(&mut joined_receiver).await?, hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_keeps_the_later_block_for_replay_when_an_earlier_one_finishes_last(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_session, mut receiver) = insert_session(&broadcast.outbound, 18, 1);
+        let earlier = block_hash(180);
+        let older = block_hash(18);
+        let newer = block_hash(19);
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(earlier.into()))
+            .await?;
+
+        // While the older block waits for the full queue, the newer block, relayed from a peer
+        // already, takes the seen path at once; then the queue drains.
+        let mut later_advertiser = advertiser.clone();
+        let newer_then_drain = async {
+            tokio::time::sleep(TEST_QUEUE_WAIT / 4).await;
+            broadcast
+                .mark_seen(&LegacyGossipFrame::AdvertiseBlock(newer))
+                .await;
+            timeout(RECEIVE_TIMEOUT, later_advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(newer.into()))
+                .await?;
+            assert_eq!(latest_block(&broadcast.outbound), Some(newer));
+            recv_advert(&mut receiver).await
+        };
+        let advertise_older = async {
+            timeout(RECEIVE_TIMEOUT, advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(older.into()))
+                .await
+        };
+        let (drained, advertised) = tokio::join!(newer_then_drain, advertise_older);
+        assert_eq!(drained?, earlier);
+        advertised?;
+
+        assert_eq!(recv_advert(&mut receiver).await?, older);
+        assert_eq!(
+            latest_block(&broadcast.outbound),
+            Some(newer),
+            "the block advertised later stays the one replayed to later peers"
+        );
         Ok(())
     }
 }

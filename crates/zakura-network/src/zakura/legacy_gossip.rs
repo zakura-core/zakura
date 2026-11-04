@@ -1456,7 +1456,8 @@ impl ZakuraGossipBroadcast {
         frame: LegacyGossipFrame,
         exclude: Option<&ZakuraPeerId>,
     ) -> Result<(), BoxError> {
-        self.outbound.remember_latest_block(&frame);
+        let advertisement = self.outbound.issue_advertisement();
+        self.outbound.remember_latest_block(advertisement, &frame);
         self.outbound.send_to_peers(frame, exclude).await
     }
 
@@ -1531,7 +1532,18 @@ impl LegacyGossipOutboundState {
 #[derive(Clone, Debug, Default)]
 struct LegacyGossipOutbound {
     state: Arc<StdMutex<LegacyGossipOutboundState>>,
-    latest_block: Arc<StdMutex<Option<block::Hash>>>,
+    latest_block: Arc<StdMutex<LatestBlock>>,
+}
+
+/// The block replayed to a peer whose gossip session opens: the one of the most recently
+/// issued advertisement that was delivered, not the one whose delivery finished last.
+#[derive(Debug, Default)]
+struct LatestBlock {
+    /// How many advertisements have been issued, which orders them.
+    issued: u64,
+    /// The advertisement whose block is remembered.
+    remembered: u64,
+    hash: Option<block::Hash>,
 }
 
 impl LegacyGossipOutbound {
@@ -1703,12 +1715,30 @@ impl LegacyGossipOutbound {
             .contains_key(peer)
     }
 
-    fn remember_latest_block(&self, frame: &LegacyGossipFrame) {
+    /// Orders an advertisement that is about to be sent among the others, so that its block is
+    /// remembered for replay only while no later advertisement's block is.
+    fn issue_advertisement(&self) -> u64 {
+        let mut latest = self
+            .latest_block
+            .lock()
+            .expect("legacy gossip latest-block mutex is never poisoned");
+        latest.issued += 1;
+        latest.issued
+    }
+
+    /// Remembers `frame`'s block for replay to later peers, unless a later-issued
+    /// advertisement's block is remembered already: one held up by a full queue does not
+    /// replace the block that came after it.
+    fn remember_latest_block(&self, advertisement: u64, frame: &LegacyGossipFrame) {
         if let LegacyGossipFrame::AdvertiseBlock(hash) = frame {
-            *self
+            let mut latest = self
                 .latest_block
                 .lock()
-                .expect("legacy gossip latest-block mutex is never poisoned") = Some(*hash);
+                .expect("legacy gossip latest-block mutex is never poisoned");
+            if advertisement >= latest.remembered {
+                latest.remembered = advertisement;
+                latest.hash = Some(*hash);
+            }
         }
     }
 
@@ -1716,10 +1746,11 @@ impl LegacyGossipOutbound {
         &self,
         session: LegacyGossipPeerSession,
     ) -> Result<(), BoxError> {
-        let Some(hash) = *self
+        let Some(hash) = self
             .latest_block
             .lock()
             .expect("legacy gossip latest-block mutex is never poisoned")
+            .hash
         else {
             return Ok(());
         };
@@ -1859,6 +1890,9 @@ pub struct LegacyGossipPeerSession {
     conn_id: ZakuraConnId,
     session_id: u64,
     send: FramedSend,
+    /// The block this session was last queued, shared by every handle to the session, so the
+    /// replay on joining and a catch-up offer of the same block do not both queue it.
+    last_block: Arc<StdMutex<Option<block::Hash>>>,
 }
 
 impl LegacyGossipPeerSession {
@@ -1873,7 +1907,25 @@ impl LegacyGossipPeerSession {
             conn_id,
             session_id,
             send,
+            last_block: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Returns whether `hash` is the block this session was last queued.
+    fn was_last_queued(&self, hash: block::Hash) -> bool {
+        *self
+            .last_block
+            .lock()
+            .expect("legacy gossip session last-block mutex is never poisoned")
+            == Some(hash)
+    }
+
+    /// Records that `hash` was queued to this session.
+    fn queued_block(&self, hash: block::Hash) {
+        *self
+            .last_block
+            .lock()
+            .expect("legacy gossip session last-block mutex is never poisoned") = Some(hash);
     }
 
     /// Authenticated peer identity for this legacy gossip stream.
@@ -1897,9 +1949,15 @@ impl LegacyGossipPeerSession {
             && self.session_id == other.session_id
     }
 
-    /// Send an explicit block advertisement.
+    /// Send an explicit block advertisement. A block this session was queued last is not
+    /// queued again.
     pub fn try_send_advertise_block(&self, hash: block::Hash) -> Result<(), OrderedSendError> {
-        self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))
+        if self.was_last_queued(hash) {
+            return Ok(());
+        }
+        self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))?;
+        self.queued_block(hash);
+        Ok(())
     }
 
     /// Send an explicit block advertisement, giving a full queue up to `wait` to make room.
@@ -1911,16 +1969,25 @@ impl LegacyGossipPeerSession {
         hash: block::Hash,
         wait: Duration,
     ) -> Result<(), OrderedSendError> {
+        if self.was_last_queued(hash) {
+            return Ok(());
+        }
         let frame = LegacyGossipFrame::AdvertiseBlock(hash)
             .encode_frame()
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         let frame = match self.send.try_send(frame) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                self.queued_block(hash);
+                return Ok(());
+            }
             Err(mpsc::error::TrySendError::Closed(_frame)) => return Err(OrderedSendError::Closed),
             Err(mpsc::error::TrySendError::Full(frame)) => frame,
         };
         match timeout(wait, self.send.send(frame)).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                self.queued_block(hash);
+                Ok(())
+            }
             Ok(Err(_closed)) => Err(OrderedSendError::Closed),
             Err(_elapsed) => Err(OrderedSendError::Full),
         }

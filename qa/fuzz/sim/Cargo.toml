@@ -13,6 +13,7 @@ cargo-fuzz = true
 discovery_wait_complete = "discovery/wait-complete"
 header_sync_storage = "header-sync/storage"
 race_fixtures = "fixtures/all"
+header_reactor_policy = "header/reactor-policy"
 block_work_ownership = "block/work-ownership"
 block_work_funding = "block/work-funding"
 block_reactor_policy = "block/reactor-policy"
@@ -62,6 +63,13 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "header_reactor_policy"
+path = "fuzz_targets/header_reactor_policy.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "block_work_ownership"

@@ -9,6 +9,22 @@
 //! records the operation in the event. A `not-submitted` or
 //! `port-panicked` call pairs with nothing.
 //!
+//! Storage tags each operation with the reactor call whose poll submitted it
+//! (`Submitted`'s `call`), so a receipt pairs only with the call that submitted
+//! its operation. A `not-submitted` call submitted nothing.
+//!
+//! A call the reactor's teardown dropped is the one exception to the order above:
+//! its guard reports `dropped` before it drops the future, whose drop can reach
+//! scheduling points. So a `dropped` end names the operation its call submitted,
+//! if any, and that operation's `CallerDropped` or `ReplyDropped`, in its drain or
+//! a later one, pairs with it. A call that submitted nothing waits for nothing.
+//! Neither does a call whose operation storage's shutdown removed while the call
+//! still existed (`ShutDown`'s `callers_alive`), since that call's drop then finds
+//! no operation and leaves no receipt. A shutdown excuses no other call: one whose
+//! caller was already gone published its receipt or lost it. A call still waiting
+//! once the reactor's teardown is done fails the run (see
+//! [`Pairer::waiting_drop`]).
+//!
 //! Since the receipt and its `CallEnded` share a step, every receipt a
 //! reactor call must have taken pairs in its own drain: every locator's,
 //! and every VCT context's, prepare's or apply's whose work some dispatched
@@ -110,6 +126,17 @@ pub(crate) struct Pairer {
     paired: BTreeSet<u64>,
     /// The receipts the current drain's facts hold, by sequence number.
     fresh: Vec<u64>,
+    /// The call that submitted each operation a reactor call submitted.
+    submitter: BTreeMap<u64, u64>,
+    /// The operation each call submitted.
+    submitted: BTreeMap<u64, u64>,
+    /// Each operation's first receipt, by sequence number.
+    receipt_at: BTreeMap<u64, u64>,
+    /// Each operation whose call ended `dropped` before its receipt, with that
+    /// call.
+    awaiting: BTreeMap<u64, u64>,
+    /// The operations storage's shutdown removed while their call still existed.
+    removed: BTreeSet<u64>,
 }
 
 impl Pairer {
@@ -118,8 +145,21 @@ impl Pairer {
     pub(crate) fn facts<'f>(&mut self, facts: impl IntoIterator<Item = (u64, &'f StorageFact)>) {
         for (seq, fact) in facts {
             let (receipt, id) = match fact {
-                StorageFact::Submitted { id, request, .. } => {
+                StorageFact::Submitted {
+                    id, request, call, ..
+                } => {
                     self.ops.insert(*id, Work::of_request(request));
+                    if let Some(call) = call {
+                        self.submitter.insert(*id, *call);
+                        self.submitted.entry(*call).or_insert(*id);
+                    }
+                    continue;
+                }
+                StorageFact::ShutDown { callers_alive, .. } => {
+                    for id in callers_alive {
+                        self.removed.insert(*id);
+                        self.awaiting.remove(id);
+                    }
                     continue;
                 }
                 StorageFact::ReplyTaken { id } => (Receipt::ReplyTaken, *id),
@@ -128,6 +168,7 @@ impl Pairer {
                 _ => continue,
             };
             self.receipts.insert(seq, (receipt, id));
+            self.receipt_at.entry(id).or_insert(seq);
             self.fresh.push(seq);
         }
     }
@@ -164,7 +205,10 @@ impl Pairer {
         }
         let fresh = std::mem::take(&mut self.fresh);
         if failure.is_none() {
-            failure = fresh.into_iter().find_map(|seq| self.unpaired(seq));
+            failure = fresh.into_iter().find_map(|seq| {
+                let detail = self.unpaired(seq)?;
+                (!self.pair_dropped(seq)).then_some(detail)
+            });
         }
         match (panicked, failure) {
             (Some(call), _) => Err(PairError::PortPanicked { call }),
@@ -195,7 +239,39 @@ impl Pairer {
                     work.kind
                 ))
             }
-            "not-submitted" | "port-panicked" => return Ok(None),
+            "not-submitted" => {
+                return match self.submitted.get(&call) {
+                    Some(id) => Err(format!(
+                        "Mispaired: call {call} ended `not-submitted`, but submitted operation \
+                         {id}"
+                    )),
+                    None => Ok(None),
+                }
+            }
+            "port-panicked" => return Ok(None),
+            // Its receipt, if storage took the call, comes after it.
+            "dropped" => {
+                let Some(&id) = self.submitted.get(&call) else {
+                    return Ok(None);
+                };
+                if let Some(at) = self.receipt_at.get(&id).filter(|at| **at <= storage_seq) {
+                    return Err(format!(
+                        "Mispaired: call {call} ended `dropped` after operation {id}'s receipt \
+                         at storage fact {at}"
+                    ));
+                }
+                if self.ops.get(&id) != Some(work) {
+                    return Err(format!(
+                        "Mispaired: call {call}, a {:?} call, submitted operation {id}, whose \
+                         kind, owner or source differs",
+                        work.kind
+                    ));
+                }
+                if !self.removed.contains(&id) {
+                    self.awaiting.insert(id, call);
+                }
+                return Ok(Some(id));
+            }
             other => return Err(format!("Mispaired: call {call} ended `{other}`")),
         };
         let Some(&(receipt, id)) = self.receipts.get(&storage_seq) else {
@@ -217,12 +293,38 @@ impl Pairer {
                 work.kind
             ));
         }
+        if self.submitter.get(&id) != Some(&call) {
+            let by = self
+                .submitter
+                .get(&id)
+                .map_or("no reactor call".to_owned(), |by| format!("call {by}"));
+            return Err(format!(
+                "Mispaired: call {call} ended at operation {id}'s receipt, which {by} submitted"
+            ));
+        }
         if !self.paired.insert(id) {
             return Err(format!(
                 "PairedTwice: call {call} ended at operation {id}'s receipt, already paired"
             ));
         }
         Ok(Some(id))
+    }
+
+    /// The first `dropped` call still waiting for its operation's drop receipt, as
+    /// `(call, operation)`. No receipt came, and no shutdown removed the operation
+    /// while the call still existed.
+    pub(crate) fn waiting_drop(&self) -> Option<(u64, u64)> {
+        self.awaiting.iter().next().map(|(op, call)| (*call, *op))
+    }
+
+    /// Pairs the drop receipt at `seq` with the `dropped` call that submitted its
+    /// operation, if that call is waiting for it, and says whether it did.
+    fn pair_dropped(&mut self, seq: u64) -> bool {
+        let (receipt, id) = self.receipts[&seq];
+        if receipt == Receipt::ReplyTaken || self.awaiting.remove(&id).is_none() {
+            return false;
+        }
+        self.paired.insert(id)
     }
 
     /// The failure for the receipt at `seq`, if a call must have taken it
@@ -234,13 +336,14 @@ impl Pairer {
         }
         let work = self.ops.get(&id)?;
         // Scanned only for an unpaired receipt, which a healthy run never has.
-        let reactors = match work.kind {
-            OpKind::Locator => true,
-            OpKind::VctContext | OpKind::Prepare | OpKind::Apply => {
-                self.calls.values().any(|call| call == work)
-            }
-            _ => false,
-        };
+        let reactors = self.submitter.contains_key(&id)
+            || match work.kind {
+                OpKind::Locator => true,
+                OpKind::VctContext | OpKind::Prepare | OpKind::Apply => {
+                    self.calls.values().any(|call| call == work)
+                }
+                _ => false,
+            };
         reactors.then(|| {
             format!(
                 "Unpaired: operation {id}'s {receipt:?} at storage fact {seq} has no call ending \
@@ -273,7 +376,7 @@ mod tests {
         }
     }
 
-    /// Operation `id`, an apply by `session` from `source`.
+    /// Operation `id`, an apply by `session` from `source`, submitted by call `id`.
     fn apply_op(id: u64, session: u64, source: &str) -> StorageFact {
         StorageFact::Submitted {
             id,
@@ -284,15 +387,40 @@ mod tests {
                 target: "11".to_owned(),
             },
             digest: String::new(),
+            call: Some(id),
         }
     }
 
-    /// Operation `id`, a locator.
+    /// Operation `id`, a locator, submitted by call `id`.
     fn locator_op(id: u64) -> StorageFact {
+        submitted_by(id, id)
+    }
+
+    /// Operation `id`, a locator, submitted by call `call`.
+    fn submitted_by(id: u64, call: u64) -> StorageFact {
         StorageFact::Submitted {
             id,
             request: StorageRequest::ContinuationLocator,
             digest: String::new(),
+            call: Some(call),
+        }
+    }
+
+    /// `op` as submitted by no reactor call.
+    fn untagged(mut op: StorageFact) -> StorageFact {
+        if let StorageFact::Submitted { call, .. } = &mut op {
+            *call = None;
+        }
+        op
+    }
+
+    /// Storage's shutdown removing `dropped`, of which `callers_alive` still had
+    /// their call.
+    fn shut_down(dropped: &[u64], callers_alive: &[u64]) -> StorageFact {
+        StorageFact::ShutDown {
+            dropped: dropped.to_vec(),
+            deferred: Vec::new(),
+            callers_alive: callers_alive.to_vec(),
         }
     }
 
@@ -487,7 +615,9 @@ mod tests {
                 (2, ended(2, "replied")),
             ],
         );
-        assert!(evidence(result).starts_with("PairedTwice"));
+        assert!(evidence(result).starts_with(
+            "Mispaired: call 2 ended at operation 1's receipt, which call 1 submitted"
+        ));
         let mut pairer = Pairer::default();
         let (result, _) = drain(
             &mut pairer,
@@ -543,11 +673,225 @@ mod tests {
         let (result, _) = drain(
             &mut pairer,
             &[
-                (1, apply_op(1, 9, "aa")),
+                (1, untagged(apply_op(1, 9, "aa"))),
                 (2, StorageFact::ReplyTaken { id: 1 }),
             ],
             vec![(0, apply_call(1, 1, "aa"))],
         );
         assert_eq!(result, Ok(()));
+    }
+
+    /// A `dropped` end pairs with the later drop receipt of the operation its own
+    /// call submitted, and stops waiting there.
+    #[test]
+    fn a_dropped_end_pairs_with_its_own_later_receipt() {
+        for receipt in [
+            StorageFact::CallerDropped { id: 1 },
+            StorageFact::ReplyDropped { id: 1 },
+        ] {
+            let mut pairer = Pairer::default();
+            let (result, ops) = drain(
+                &mut pairer,
+                &[(1, locator_op(1))],
+                vec![(0, locator_call(1)), (1, ended(1, "dropped"))],
+            );
+            assert_eq!((result, ops), (Ok(()), vec![Some(1)]));
+            assert_eq!(pairer.waiting_drop(), Some((1, 1)));
+            let (result, _) = drain(&mut pairer, &[(2, receipt)], vec![]);
+            assert_eq!(result, Ok(()));
+            assert_eq!(pairer.waiting_drop(), None);
+        }
+    }
+
+    /// A drop receipt in the same drain as its `dropped` end, after it, pairs.
+    #[test]
+    fn a_dropped_end_pairs_with_its_receipt_in_the_same_drain() {
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[
+                (1, locator_op(1)),
+                (2, StorageFact::CallerDropped { id: 1 }),
+            ],
+            vec![(0, locator_call(1)), (1, ended(1, "dropped"))],
+        );
+        assert_eq!((result, ops), (Ok(()), vec![Some(1)]));
+        assert_eq!(pairer.waiting_drop(), None);
+    }
+
+    /// A receipt the store published before the `dropped` end isn't that end's: the
+    /// guard reports first.
+    #[test]
+    fn a_receipt_before_a_dropped_end_is_mispaired() {
+        let mut pairer = Pairer::default();
+        let (result, _) = drain(
+            &mut pairer,
+            &[
+                (1, locator_op(1)),
+                (2, StorageFact::CallerDropped { id: 1 }),
+            ],
+            vec![(0, locator_call(1)), (2, ended(1, "dropped"))],
+        );
+        assert!(evidence(result).starts_with("Mispaired: call 1 ended `dropped` after"));
+    }
+
+    /// A taken reply settles nothing for a waiting `dropped` end.
+    #[test]
+    fn a_reply_taken_is_no_drop_receipt() {
+        let mut pairer = Pairer::default();
+        let (result, _) = drain(
+            &mut pairer,
+            &[(1, locator_op(1))],
+            vec![(0, locator_call(1)), (1, ended(1, "dropped"))],
+        );
+        assert_eq!(result, Ok(()));
+        let (result, _) = drain(
+            &mut pairer,
+            &[(2, StorageFact::ReplyTaken { id: 1 })],
+            vec![],
+        );
+        assert!(evidence(result).starts_with("Unpaired"));
+        assert_eq!(pairer.waiting_drop(), Some((1, 1)));
+    }
+
+    /// Call 2 is dispatched after call 1 submitted operation 1, and ends dropped
+    /// before its first poll. Call 1's end never comes, so operation 1's
+    /// `CallerDropped` is unpaired. This fails if a dropped call takes any pending
+    /// operation of its work.
+    #[test]
+    fn a_dropped_call_never_takes_an_earlier_calls_operation() {
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[(1, locator_op(1))],
+            vec![
+                (0, locator_call(1)),
+                (1, locator_call(2)),
+                (1, ended(2, "dropped")),
+            ],
+        );
+        assert_eq!((result, ops), (Ok(()), vec![None]));
+        let (result, _) = drain(
+            &mut pairer,
+            &[(2, StorageFact::CallerDropped { id: 1 })],
+            vec![],
+        );
+        assert!(evidence(result).starts_with("Unpaired: operation 1's CallerDropped"));
+    }
+
+    /// Two locators overlap: call 1 is never polled, and call 2 submits operation 1.
+    /// Call 1 ends dropped after that submission, and call 2's end never comes. This
+    /// fails if a dropped call takes an operation of its work submitted after its
+    /// dispatch.
+    #[test]
+    fn an_unpolled_dropped_call_never_takes_an_overlapping_calls_operation() {
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[(1, submitted_by(1, 2))],
+            vec![
+                (0, locator_call(1)),
+                (0, locator_call(2)),
+                (1, ended(1, "dropped")),
+            ],
+        );
+        assert_eq!((result, ops), (Ok(()), vec![None]));
+        assert_eq!(pairer.waiting_drop(), None);
+        let (result, _) = drain(
+            &mut pairer,
+            &[(2, StorageFact::CallerDropped { id: 1 })],
+            vec![],
+        );
+        assert!(evidence(result).starts_with("Unpaired: operation 1's CallerDropped"));
+    }
+
+    /// A call storage never took submitted nothing, so its `dropped` end waits for
+    /// nothing, beside another call's operation.
+    #[test]
+    fn a_dropped_call_storage_never_took_waits_for_nothing() {
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[(1, submitted_by(2, 2))],
+            vec![
+                (0, locator_call(1)),
+                (0, locator_call(2)),
+                (1, ended(1, "dropped")),
+                (1, ended(2, "dropped")),
+            ],
+        );
+        assert_eq!((result, ops), (Ok(()), vec![None, Some(2)]));
+        assert_eq!(pairer.waiting_drop(), Some((2, 2)));
+        let (result, _) = drain(
+            &mut pairer,
+            &[(2, StorageFact::CallerDropped { id: 2 })],
+            vec![],
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(pairer.waiting_drop(), None);
+    }
+
+    /// A call that says `not-submitted` after submitting is mispaired.
+    #[test]
+    fn a_submitting_call_cannot_end_not_submitted() {
+        let mut pairer = Pairer::default();
+        let (result, _) = drain(
+            &mut pairer,
+            &[(1, locator_op(1))],
+            vec![(0, locator_call(1)), (1, ended(1, "not-submitted"))],
+        );
+        assert!(evidence(result).starts_with("Mispaired: call 1 ended `not-submitted`"));
+    }
+
+    /// #1842-a: storage removed the operation while the call still existed, so the
+    /// call's drop leaves no receipt, whichever came first.
+    #[test]
+    fn a_shutdown_excuses_a_drop_whose_caller_was_alive() {
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[(1, locator_op(1))],
+            vec![(0, locator_call(1)), (1, ended(1, "dropped"))],
+        );
+        assert_eq!((result, ops), (Ok(()), vec![Some(1)]));
+        let (result, _) = drain(&mut pairer, &[(2, shut_down(&[1], &[1]))], vec![]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(pairer.waiting_drop(), None);
+
+        let mut pairer = Pairer::default();
+        let (result, ops) = drain(
+            &mut pairer,
+            &[(1, locator_op(1)), (2, shut_down(&[1], &[1]))],
+            vec![(0, locator_call(1)), (2, ended(1, "dropped"))],
+        );
+        assert_eq!((result, ops), (Ok(()), vec![Some(1)]));
+        assert_eq!(pairer.waiting_drop(), None);
+    }
+
+    /// #1842-a: the call's future dropped and published no receipt, and storage
+    /// then shut down. The operation is in `dropped`, but its caller was gone, so
+    /// the shutdown can't be the reason no receipt came. This fails if any removal
+    /// excuses a missing receipt.
+    #[test]
+    fn a_shutdown_never_hides_a_lost_drop_receipt() {
+        let mut pairer = Pairer::default();
+        let (result, _) = drain(
+            &mut pairer,
+            &[(1, locator_op(1))],
+            vec![(0, locator_call(1)), (1, ended(1, "dropped"))],
+        );
+        assert_eq!(result, Ok(()));
+        let (result, _) = drain(&mut pairer, &[(2, shut_down(&[1], &[]))], vec![]);
+        assert_eq!(result, Ok(()));
+        assert_eq!(pairer.waiting_drop(), Some((1, 1)));
+
+        let mut pairer = Pairer::default();
+        let (result, _) = drain(
+            &mut pairer,
+            &[(1, locator_op(1)), (2, shut_down(&[1], &[]))],
+            vec![(0, locator_call(1)), (2, ended(1, "dropped"))],
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(pairer.waiting_drop(), Some((1, 1)));
     }
 }

@@ -124,6 +124,11 @@ pub struct Fact {
     pub at: Instant,
     /// What changed.
     pub kind: FactKind,
+    /// The header-sync reactor's port call whose poll published it, so a
+    /// `Submitted` fact names the call that submitted its operation. `None`
+    /// outside a call's poll. See `zakura_network`'s `observe::as_call`.
+    #[cfg(zakura_sim)]
+    pub call: Option<u64>,
 }
 
 /// What a [`Fact`] records. The head kinds name their transaction and come
@@ -174,6 +179,9 @@ pub enum FactKind {
     ShutDown {
         /// The operations it dropped, pending or with an untaken reply.
         dropped: Vec<OpId>,
+        /// Those of `dropped` whose call still existed. Only their callers can
+        /// find their operation gone and publish no drop receipt.
+        callers_alive: Vec<OpId>,
     },
 }
 
@@ -371,6 +379,8 @@ impl Ops {
                     txn,
                     at,
                     kind,
+                    #[cfg(zakura_sim)]
+                    call: zakura_network::zakura::observe::polling_call(),
                 }
             })
             .collect();
@@ -788,6 +798,11 @@ impl ControlledPort {
             (mem::take(&mut ops.slots), mem::take(&mut ops.permits))
         };
         let dropped = slots.keys().copied().collect();
+        let callers_alive = slots
+            .iter()
+            .filter(|(_, slot)| slot.presence.strong_count() > 0)
+            .map(|(id, _)| *id)
+            .collect();
         let mut kinds: Vec<FactKind> = permits
             .keys()
             .map(|id| FactKind::PermitDropped { id: *id })
@@ -802,7 +817,10 @@ impl ControlledPort {
                 .map(FactKind::Lease),
         );
         self.engine.close_selected_chain();
-        kinds.push(FactKind::ShutDown { dropped });
+        kinds.push(FactKind::ShutDown {
+            dropped,
+            callers_alive,
+        });
         self.ops().publish(now, kinds);
     }
 

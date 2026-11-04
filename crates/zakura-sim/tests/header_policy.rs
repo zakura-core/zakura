@@ -82,6 +82,7 @@ fn submitted(id: u64, kind: OpKind, session: u64) -> StorageFact {
         id,
         request: request(kind, session),
         digest: String::new(),
+        call: None,
     }
 }
 

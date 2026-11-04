@@ -879,7 +879,7 @@ fn shutdown_ends_everything_without_running_work() {
                 why: RetentionEnd::WithCapability,
                 ..
             }),
-            FactKind::ShutDown { dropped },
+            FactKind::ShutDown { dropped, .. },
         ] if dropped == &[OpId(1), OpId(2), OpId(3)]
     ));
 
@@ -891,6 +891,31 @@ fn shutdown_ends_everything_without_running_work() {
     port.shut_down();
     assert!(port.pending().is_empty());
     assert!(port.take_facts().is_empty());
+}
+
+/// Shutdown names the dropped operations whose call still exists. A call dropped
+/// first has left its receipt, so only a live call can later find its operation
+/// gone and leave none.
+#[test]
+fn shutdown_names_the_operations_whose_caller_is_alive() {
+    let (port, chain) = chain(1);
+    let mut gone = port.selected_chain_contains(chain[0].hash);
+    let mut alive = port.selected_chain_contains(chain[0].hash);
+    assert!(poll(&mut gone, Waker::noop()).is_pending());
+    assert!(poll(&mut alive, Waker::noop()).is_pending());
+    drop(gone);
+    port.shut_down();
+    let kinds = kinds(&port);
+    assert!(kinds.contains(&FactKind::CallerDropped { id: OpId(1) }));
+    assert_eq!(
+        kinds.last(),
+        Some(&FactKind::ShutDown {
+            dropped: vec![OpId(1), OpId(2)],
+            callers_alive: vec![OpId(2)],
+        })
+    );
+    drop(alive);
+    assert!(port.take_facts().is_empty(), "a late drop finds no slot");
 }
 
 /// Shutdown closes the selected-chain watch, so a receiver taken before it

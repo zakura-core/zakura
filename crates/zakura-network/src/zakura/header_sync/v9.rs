@@ -24,8 +24,8 @@ use crate::zakura::{
 };
 pub(crate) use wire::*;
 pub use wire::{
-    layout, rows, CommonMessage, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message,
-    Operation, RegtestMessage, Status, SubscribeHeaders,
+    budget, layout, rows, CommonMessage, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode,
+    Message, Operation, RegtestMessage, Status, SubscribeHeaders, HEADER_SYNC_BUDGET,
 };
 
 /// Page reads that may run at once across the node. Each read holds a
@@ -38,17 +38,19 @@ const NODE_EXECUTION: usize = 8;
 /// time.
 const PEER_EXECUTION: usize = 2;
 
-/// The production serving capacity for published pages: [`NODE_EXECUTION`]
-/// and [`PEER_EXECUTION`] page reads, and output sized for the largest page.
+/// The production serving limits for published pages: [`NODE_EXECUTION`] and
+/// [`PEER_EXECUTION`] page reads, and output sized for the largest page.
+pub(crate) const SERVE_LIMITS: ServeLimits = ServeLimits {
+    node_execution: NODE_EXECUTION,
+    peer_execution: PEER_EXECUTION,
+    // The largest page is about 2 MiB, so widening it to u64 is lossless.
+    ..sizing::serve_limits(largest_page(COMMON_HEADER_BYTES) as u64, sizing::TARGET_RTT)
+};
+
+/// The production serving capacity for published pages, under
+/// [`SERVE_LIMITS`].
 pub(crate) fn serving_capacity() -> ServeCapacity {
-    // The largest page is about 2 MiB, so it fits u64.
-    let largest = largest_page(COMMON_HEADER_BYTES) as u64;
-    let limits = ServeLimits {
-        node_execution: NODE_EXECUTION,
-        peer_execution: PEER_EXECUTION,
-        ..sizing::serve_limits(largest, sizing::TARGET_RTT)
-    };
-    ServeCapacity::new("header-sync", &SUBSCRIBE_HEADERS, limits)
+    ServeCapacity::new("header-sync", &SUBSCRIBE_HEADERS, SERVE_LIMITS)
         .expect("the header-sync serving limits are positive")
 }
 

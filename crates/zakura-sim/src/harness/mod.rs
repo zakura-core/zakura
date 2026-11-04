@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod header_work;
 pub mod machine;
 pub mod policy;
 mod record;
@@ -439,6 +440,7 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 
 /// Every harness, by name.
 pub static HARNESSES: &[HarnessEntry] = &[
+    header_work::REACTOR_ENTRY,
     block_work::ENTRY,
     block_work::FUNDING_ENTRY,
     block_work::REACTOR_ENTRY,

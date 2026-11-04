@@ -1030,22 +1030,18 @@ fn request(
         request_id,
     }
     .into();
-    ActiveHeaderRequest {
-        purpose: HeaderTargetPurpose::Normal,
-        peer: peer(peer_key),
-        source: source(peer_key),
-        target,
-        sent_locator: HeaderLocator::for_continuation(snapshot.frontiers.header_best),
-        request_id: HeaderSyncRequestId::new(request_value)
-            .expect("logical peer request identifiers are nonzero"),
+    ActiveHeaderRequest::new(
+        HeaderTargetPurpose::Normal,
+        peer(peer_key),
+        source(peer_key),
+        HeaderLocator::for_continuation(snapshot.frontiers.header_best),
         owner,
-        common_ancestor: None,
-        entries: Vec::new(),
-        phase: HeaderTargetPhase::Receiving,
-        cursor: None,
-        max_header_count: 1_000,
-        tree_aux_schema: AuxSchema::None,
-    }
+        target,
+        HeaderSyncRequestId::new(request_value)
+            .expect("logical peer request identifiers are nonzero"),
+        1_000,
+        AuxSchema::None,
+    )
 }
 
 #[cfg(test)]

@@ -64,6 +64,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         return value(plan.scenario());
     }
     match stem {
+        "header-reactor-policy" => value(zakura_sim::record::machine::MachineScenario {
+            input: include_bytes!("fixtures/header-reactor-policy.bin").to_vec(),
+        }),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
             input: vec![0, 0, 1, 200, 1, 0, 1, 0, 4, 0, 30, 0, 0, 9, 1, 200],
         }),

@@ -1,6 +1,6 @@
 //! Transaction checks.
 //!
-//! Code in this file can freely assume that no pre-V4 transactions are present.
+//! After [`version_has_a_verifier`], checks can assume that no pre-V4 transactions are present.
 
 use std::{
     borrow::Cow,
@@ -27,6 +27,17 @@ use zcash_script::{
 };
 
 use crate::error::TransactionError;
+
+/// Rejects v1 to v3 transactions, which have no verifier in this node.
+///
+/// This runs first among the quick checks so that the mempool's unconditional ban
+/// for the wrong version is never replaced by a tip-dependent chain error.
+pub fn version_has_a_verifier(tx: &Transaction) -> Result<(), TransactionError> {
+    if tx.version() < 4 {
+        return Err(TransactionError::WrongVersion);
+    }
+    Ok(())
+}
 
 /// Checks if the transaction's lock time allows this transaction to be included in a block.
 ///

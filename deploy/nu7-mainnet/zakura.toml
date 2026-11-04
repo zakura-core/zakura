@@ -1,0 +1,28 @@
+# zakurad configuration for the NU7 mainnet dashboard node (zakura-nu7-mainnet-1).
+# Installed at /etc/zakura/zakura.toml. RPC, metrics and health stay on loopback;
+# only the P2P port is reachable from outside.
+
+[network]
+network = "Mainnet"
+listen_addr = "[::]:8233"
+
+[state]
+cache_dir = "/var/lib/zakura"
+storage_mode = "pruned"
+
+[rpc]
+listen_addr = "127.0.0.1:8232"
+enable_cookie_auth = false
+
+[metrics]
+endpoint_addr = "127.0.0.1:9999"
+
+[health]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+checkpoint_sync = true
+
+[tracing]
+log_file = "/var/log/zakura/zakura.log"
+use_color = false

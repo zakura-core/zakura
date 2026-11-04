@@ -1,0 +1,26 @@
+# Caddyfile for zakura-nu7-mainnet-1. Source: deploy/nu7-mainnet/Caddyfile.
+# Caddy obtains the certificate itself; the hostname is a DNS-only A record.
+
+{
+	servers {
+		# Caddy defaults to no read timeouts; bound them so a client that
+		# stalls its headers or body cannot hold connections open forever.
+		timeouts {
+			read_header 10s
+			read_body 30s
+		}
+	}
+}
+
+nu7-mainnet.valargroup.dev {
+	encode zstd gzip
+	@public path / /v1/dashboard /healthz
+	handle @public {
+		reverse_proxy 127.0.0.1:8095 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+	handle {
+		respond "not found" 404
+	}
+}

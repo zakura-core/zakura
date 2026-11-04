@@ -1,0 +1,23 @@
+# Installed as /etc/systemd/system/zakurad.service on zakura-nu7-mainnet-1.
+[Unit]
+Description=Zakura full node (NU7 mainnet dashboard node)
+Documentation=https://github.com/zakura-core/zakura
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=/usr/local/bin/zakurad
+
+[Service]
+Type=simple
+User=zakura
+Group=zakura
+ExecStart=/usr/local/bin/zakurad -c /etc/zakura/zakura.toml start
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+# zakurad writes its own structured logs to /var/log/zakura/zakura.log (see [tracing] log_file).
+# Journal captures startup/panic output that precedes the log file opening.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

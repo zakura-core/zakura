@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NU7 Mainnet</title>
+<meta name="description" content="Developer dashboard for the NU7 upgrade on Zcash mainnet: block time, difficulty, fees and the NSM, observed from one Zakura node.">
+<meta name="robots" content="noindex">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous"></script>
+<style>
+:root {
+  --bg: #f7f6f2; --surface: #ffffff; --surface-2: #f0efe9; --text: #1b1b1f; --muted: #6b6b73;
+  --border: #e2e1da; --accent: #c45c26; --accent-2: #2b6cb0; --nsm: #1f8a5f; --miner: #c45c26;
+  --warn: #b7791f; --bad: #c53030; --grid: rgba(27,27,31,.08); --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121316; --surface: #1b1d22; --surface-2: #22252b; --text: #ebebe6; --muted: #9a9aa3;
+    --border: #2d3037; --accent: #e8824f; --accent-2: #6fa8f5; --nsm: #3fbf8a; --miner: #e8824f;
+    --warn: #e0a84a; --bad: #f06c6c; --grid: rgba(235,235,230,.08);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121316; --surface: #1b1d22; --surface-2: #22252b; --text: #ebebe6; --muted: #9a9aa3;
+  --border: #2d3037; --accent: #e8824f; --accent-2: #6fa8f5; --nsm: #3fbf8a; --miner: #e8824f;
+  --warn: #e0a84a; --bad: #f06c6c; --grid: rgba(235,235,230,.08);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.45; }
+a { color: var(--accent-2); }
+code { font-family: var(--mono); font-size: .92em; }
+.nu7-page { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 32px; max-width: 1400px; margin: 0 auto; padding: 32px 16px 64px; }
+@media (max-width: 960px) { .nu7-page { grid-template-columns: minmax(0, 1fr); } }
+.identity { position: sticky; top: 24px; align-self: start; }
+@media (max-width: 960px) { .identity { position: static; } }
+.kicker { text-transform: uppercase; letter-spacing: .12em; font-size: .72rem; color: var(--muted); margin: 0 0 8px; }
+.mark { font-size: 2.6rem; line-height: 1; margin: 0 0 12px; font-weight: 700; letter-spacing: -.02em; }
+.mark span { display: block; font-size: 1rem; font-weight: 500; color: var(--muted); letter-spacing: .02em; margin-top: 6px; }
+.lede { color: var(--muted); margin: 0 0 20px; }
+.changes { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.changes li { border-left: 3px solid var(--accent); padding-left: 12px; }
+.changes strong { display: block; }
+.changes span { color: var(--muted); font-size: .92rem; }
+.identity .footnote { margin-top: 24px; }
+.main { display: grid; gap: 28px; min-width: 0; }
+.nu7-pipeline { list-style: none; padding: 0; margin: 0; display: flex; gap: 12px; flex-wrap: wrap; }
+.nu7-pipeline li { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.nu7-pipeline .node { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--muted); }
+.nu7-pipeline li[data-state="live"] .node { background: var(--nsm); border-color: var(--nsm); }
+.nu7-pipeline li[data-state="estimate"] .node { border-color: var(--accent); }
+.stage-label { font-weight: 600; }
+.stage-status { color: var(--muted); font-size: .9rem; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.status-pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; background: var(--surface-2); }
+.status-pill--complete { background: color-mix(in srgb, var(--nsm) 18%, transparent); color: var(--nsm); }
+.status-pill--pending { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.status-pill--retired { color: var(--muted); }
+.nu7-notice { border: 1px solid var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); padding: 10px 14px; border-radius: 10px; font-size: .92rem; }
+.nu7-notice[hidden] { display: none; }
+.nu7-section > header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.nu7-section h2 { margin: 0; font-size: 1.1rem; }
+.nu7-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 0; }
+.nu7-stats > div { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+.nu7-stats dt { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 6px; }
+.nu7-stats dd { margin: 0; }
+.nu7-stats .value { font-size: 1.5rem; font-weight: 600; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.nu7-stats .hint { color: var(--muted); font-size: .82rem; margin-top: 4px; }
+.nu7-stats .hash code { font-size: .8rem; }
+.value.good { color: var(--nsm); } .value.warn { color: var(--warn); } .value.bad { color: var(--bad); }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+@media (max-width: 520px) { .charts { grid-template-columns: minmax(0, 1fr); } }
+.chart { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px 10px; min-width: 0; }
+.chart h3 { margin: 0 0 2px; font-size: .95rem; }
+.chart p { margin: 0 0 8px; color: var(--muted); font-size: .8rem; }
+.chart canvas { width: 100% !important; height: 220px !important; }
+.windows { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.windows button { background: var(--surface); color: var(--text); border: 0; padding: 6px 12px; cursor: pointer; font: inherit; font-size: .85rem; }
+.windows button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.nu7-blocks { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.nu7-blocks .head, .nu7-blocks li { display: grid; grid-template-columns: 110px minmax(0,1fr) 170px 80px 60px 110px 110px; gap: 12px; padding: 8px 14px; align-items: baseline; }
+.nu7-blocks .head { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); border-bottom: 1px solid var(--border); }
+.nu7-blocks ol { list-style: none; margin: 0; padding: 0; }
+.nu7-blocks li { border-bottom: 1px solid var(--border); font-size: .9rem; }
+.nu7-blocks li:last-child { border-bottom: 0; }
+.nu7-blocks code { overflow-wrap: anywhere; font-size: .78rem; color: var(--muted); }
+.nu7-blocks .num { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) { .nu7-blocks .head { display: none; } .nu7-blocks li { grid-template-columns: 1fr 1fr; } .nu7-blocks code { grid-column: 1 / -1; } }
+details { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 16px; }
+summary { cursor: pointer; font-weight: 600; }
+table.nu7-rules { width: 100%; border-collapse: collapse; font-size: .9rem; margin-top: 10px; }
+table.nu7-rules th, table.nu7-rules td { text-align: left; padding: 6px 8px; border-top: 1px solid var(--border); }
+table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; }
+.footnote { color: var(--muted); font-size: .82rem; }
+.events { font-size: .85rem; color: var(--muted); }
+.events li { margin: 2px 0; }
+</style>
+</head>
+<body>
+<div class="nu7-page" data-nu7-page>
+  <aside class="identity">
+    <p class="kicker">Zcash network upgrade</p>
+    <h1 class="mark">NU7 Mainnet <span>Developer dashboard</span></h1>
+    <p class="lede">Block time, difficulty, fees and the Network Sustainability Mechanism, observed from one Zakura mainnet node through activation.</p>
+    <ul class="changes">
+      <li><strong>25-second blocks</strong><span>Target spacing drops from 75 seconds to 25.</span></li>
+      <li><strong>Steadier difficulty</strong><span>The averaging window widens from 17 blocks to 102.</span></li>
+      <li><strong>Fees fund the NSM</strong><span>60% of transaction fees accrue to the Network Sustainability Mechanism.</span></li>
+      <li><strong>Sprout retirement</strong><span>The legacy Sprout shielded pool is suspended.</span></li>
+    </ul>
+    <p class="footnote">Data: <a href="/v1/dashboard" target="_blank" rel="noopener">/v1/dashboard</a> · node <span data-node-version>…</span> · <a href="https://zakura.com/nu7/" target="_blank" rel="noopener">public NU7 page</a></p>
+  </aside>
+
+  <div class="main">
+    <section class="rollout" aria-label="Rollout">
+      <ol class="nu7-pipeline">
+        <li data-state="live"><span class="node" aria-hidden="true"></span><span class="stage-label">Testnet</span><span class="stage-status"><span class="status-pill status-pill--complete">Active</span></span></li>
+        <li data-state="estimate" data-mainnet-stage><span class="node" aria-hidden="true"></span><span class="stage-label">Mainnet</span><span class="stage-status"><span class="status-pill status-pill--pending" data-mainnet-pill>Pending</span><span data-mainnet-detail>Block 3,543,405</span></span></li>
+      </ol>
+    </section>
+
+    <p class="nu7-notice" role="status" data-availability hidden>Live data unavailable. Showing the last fetched observation.</p>
+
+    <section class="nu7-section" aria-label="Network pulse">
+      <dl class="nu7-stats cards">
+        <div><dt>Best block</dt><dd class="value" data-height>…</dd><dd class="hint hash" data-hash></dd></div>
+        <div><dt>Header time age</dt><dd class="value" data-age>…</dd><dd class="hint" data-tip-time></dd></div>
+        <div><dt>Median interval</dt><dd class="value" data-median>…</dd><dd class="hint" data-median-hint></dd></div>
+        <div><dt>Difficulty</dt><dd class="value" data-difficulty>…</dd><dd class="hint" data-difficulty-hint></dd></div>
+        <div><dt>NSM fund balance</dt><dd class="value" data-nsm>…</dd><dd class="hint" data-nsm-hint></dd></div>
+        <div><dt>Observed reorgs · 24 h</dt><dd class="value" data-reorgs>…</dd><dd class="hint" data-reorgs-hint></dd></div>
+      </dl>
+    </section>
+
+    <section class="nu7-section" aria-label="Developer pulse">
+      <dl class="nu7-stats cards">
+        <div><dt>Activation</dt><dd class="value" data-activation>…</dd><dd class="hint" data-activation-hint></dd></div>
+        <div><dt>Network solution rate</dt><dd class="value" data-solps>…</dd><dd class="hint">getnetworksolps over 120 blocks</dd></div>
+        <div><dt>Fees · last 102 blocks</dt><dd class="value" data-fees102>…</dd><dd class="hint" data-fees102-hint></dd></div>
+        <div><dt>Mempool</dt><dd class="value" data-mempool>…</dd><dd class="hint" data-mempool-hint></dd></div>
+        <div><dt>Peers</dt><dd class="value" data-peers>…</dd><dd class="hint" data-peers-hint></dd></div>
+        <div><dt>Node</dt><dd class="value" data-node>…</dd><dd class="hint" data-node-hint></dd></div>
+      </dl>
+    </section>
+
+    <section class="nu7-section" aria-label="Charts">
+      <header><h2>Series</h2><div class="windows" role="group" aria-label="Window"><button type="button" data-window="1h">1 h</button><button type="button" data-window="6h" aria-pressed="true">6 h</button><button type="button" data-window="24h">24 h</button><button type="button" data-window="7d">7 d</button></div></header>
+      <div class="charts">
+        <div class="chart"><h3>Block interval</h3><p>Seconds between header times, with the rolling 102-block median and the target spacing.</p><canvas id="c-interval"></canvas></div>
+        <div class="chart"><h3>Difficulty</h3><p>Difficulty (log) and per-block change against the +16% / −32% adjustment limits.</p><canvas id="c-difficulty"></canvas></div>
+        <div class="chart"><h3>NSM balance</h3><p>Balance after each block and its per-block change next to the fee share plus reissuance the block should add.</p><canvas id="c-nsm"></canvas></div>
+        <div class="chart"><h3>Fee split</h3><p>Aggregate fees per block, split 40% miner / 60% NSM after activation. Wider bars merge blocks that landed between scrapes.</p><canvas id="c-fees"></canvas></div>
+        <div class="chart"><h3>Block fullness</h3><p>Orchard actions against the 330 per-block limit, transactions, and size.</p><canvas id="c-fullness"></canvas></div>
+        <div class="chart"><h3>Transaction fees</h3><p>Mempool fee quantiles and the node's per-transaction fee quantiles for mined transactions, in zatoshi.</p><canvas id="c-txfees"></canvas></div>
+        <div class="chart"><h3>Mempool and peers</h3><p>Mempool transactions and connected peers.</p><canvas id="c-mempool"></canvas></div>
+        <div class="chart"><h3>Node latency</h3><p>Block verification and state commit times (ms), one-minute quantiles.</p><canvas id="c-latency"></canvas></div>
+      </div>
+      <ul class="events" data-events></ul>
+    </section>
+
+    <section class="nu7-section" aria-label="Latest blocks">
+      <div class="nu7-blocks">
+        <p class="head"><span>Height</span><span>Hash</span><span>Header time · UTC</span><span class="num">Interval</span><span class="num">Tx</span><span class="num">Fees</span><span class="num">NSM share</span></p>
+        <ol data-blocks></ol>
+      </div>
+      <p class="footnote" data-updated></p>
+    </section>
+
+    <details>
+      <summary>Effective consensus parameters</summary>
+      <table class="nu7-rules"><thead><tr><th>Parameter</th><th>At tip</th><th>Next block</th></tr></thead><tbody data-rules></tbody></table>
+    </details>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var POLL_MS = 15000;
+  var ACTIVATION = 3543405;
+  var $ = function (selector) { return document.querySelector(selector); };
+  var state = { window: "6h", data: null, fetchedAt: 0, charts: {} };
+
+  function fmtInt(n) { return (n == null) ? "—" : Number(n).toLocaleString("en-US"); }
+  function fmtZec(zat, digits) {
+    if (zat == null) return "—";
+    return (zat / 1e8).toLocaleString("en-US", { minimumFractionDigits: digits == null ? 4 : digits, maximumFractionDigits: digits == null ? 4 : digits }) + " ZEC";
+  }
+  function fmtSeconds(s) { return (s == null) ? "—" : Number(s).toFixed(1) + " s"; }
+  function fmtAge(seconds) {
+    if (seconds == null) return "—";
+    var s = Math.max(0, Math.floor(seconds)), d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60), r = s % 60;
+    if (d > 0) return d + " d " + h + " h"; if (h > 0) return h + " h " + m + " m"; if (m > 0) return m + " m " + r + " s"; return r + " s";
+  }
+  function fmtUtc(unix, withSeconds) {
+    if (unix == null) return "—";
+    var iso = new Date(unix * 1000).toISOString();
+    return withSeconds ? iso.slice(0, 19).replace("T", " ") : iso.slice(0, 16).replace("T", " ") + " UTC";
+  }
+  function fmtSi(n, unit) {
+    if (n == null) return "—";
+    var units = ["", "k", "M", "G", "T", "P"], i = 0, v = Number(n);
+    while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+    return v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + " " + units[i] + unit;
+  }
+  function shortHash(hash) { return hash ? hash.slice(0, 8) + "…" + hash.slice(-8) : "—"; }
+  function setText(selector, text) { var el = $(selector); if (el) el.textContent = text; }
+  function setClass(selector, cls) { var el = $(selector); if (el) el.className = "value" + (cls ? " " + cls : ""); }
+
+  function render(d) {
+    var chain = d.chain, act = d.activation, nsm = d.nsm, node = d.node, mem = d.mempool;
+    setText("[data-node-version]", node.version || "unknown");
+    setText("[data-height]", fmtInt(chain.height));
+    var hash = $("[data-hash]"); if (hash) { hash.innerHTML = ""; var code = document.createElement("code"); code.textContent = shortHash(chain.hash); code.title = chain.hash || ""; hash.appendChild(code); }
+    setText("[data-tip-time]", chain.blockTime ? "Header time " + fmtUtc(chain.blockTime) : "");
+    var post = chain.intervals.postNu7, stats = post.count > 0 ? post : chain.intervals.last102;
+    setText("[data-median]", stats.median == null ? "Unavailable" : fmtSeconds(stats.median));
+    setText("[data-median-hint]", "Last " + stats.count + (post.count > 0 ? " post-NU7" : "") + " interval" + (stats.count === 1 ? "" : "s") + " · mean " + fmtSeconds(stats.mean) + " · " + chain.expectedMedianSeconds.toFixed(1) + " s median expected at the " + chain.targetSpacingSeconds + " s target");
+    setText("[data-difficulty]", chain.difficulty == null ? "—" : Number(chain.difficulty).toLocaleString("en-US", { maximumFractionDigits: 0 }));
+    setText("[data-difficulty-hint]", chain.daaWindow + "-block averaging window" + (chain.difficultyChangePct == null ? "" : " · last change " + (chain.difficultyChangePct >= 0 ? "+" : "") + chain.difficultyChangePct.toFixed(2) + "%"));
+    setText("[data-nsm]", nsm.available ? fmtZec(nsm.balanceZat, 2) : "Unavailable");
+    setText("[data-nsm-hint]", nsm.lastBlockFeeZat == null ? (nsm.lockboxZat != null ? "Lockbox " + fmtZec(nsm.lockboxZat, 2) : "") : "Last block fee share " + fmtZec(nsm.lastBlockFeeZat, 6));
+    setText("[data-reorgs]", fmtInt(d.observation.reorgs24h));
+    setText("[data-reorgs-hint]", fmtInt(d.observation.blocks24h) + " blocks observed · " + d.observation.scope);
+    setClass("[data-reorgs]", d.observation.reorgs24h > 0 ? "warn" : "");
+
+    var stage = $("[data-mainnet-stage]"), pill = $("[data-mainnet-pill]");
+    if (act.state === "active") {
+      setText("[data-activation]", "Active");
+      setText("[data-activation-hint]", "Since block " + fmtInt(act.height) + " · " + fmtInt(act.blocksSinceActivation) + " blocks ago" + (act.activatedAt ? " · " + fmtUtc(act.activatedAt) : ""));
+      setClass("[data-activation]", "good");
+      if (stage) stage.dataset.state = "live"; if (pill) { pill.textContent = "Active"; pill.className = "status-pill status-pill--complete"; }
+      setText("[data-mainnet-detail]", "Block " + fmtInt(act.height) + (act.activatedAt ? " · " + fmtUtc(act.activatedAt) : ""));
+    } else {
+      setText("[data-activation]", fmtInt(act.blocksRemaining) + " blocks");
+      setText("[data-activation-hint]", "≈ " + fmtUtc(act.etaUnix) + " at " + (act.etaBasisIntervalSeconds == null ? "—" : act.etaBasisIntervalSeconds.toFixed(1)) + " s per block · node reports " + (d.network.nu7Status || "unknown"));
+      setClass("[data-activation]", "");
+      setText("[data-mainnet-detail]", "Block " + fmtInt(act.height) + " · ≈ " + fmtUtc(act.etaUnix));
+    }
+    setText("[data-solps]", chain.solps == null ? "—" : fmtSi(chain.solps, "Sol/s"));
+    var f = nsm.fees102;
+    setText("[data-fees102]", f.feesZat == null ? "Unavailable" : fmtZec(f.feesZat));
+    setText("[data-fees102-hint]", f.feesZat == null ? "Needs the instrumented node build" : "NSM " + fmtZec(f.nsmZat) + " · miner " + fmtZec(f.minerZat) + " · split verified on " + fmtInt(f.splitOkBlocks) + "/" + fmtInt(f.blocks) + " blocks" + (f.reissuanceZat ? " · reissuance " + fmtZec(f.reissuanceZat) : ""));
+    setClass("[data-fees102]", f.blocks > 0 && f.splitOkBlocks != null && f.splitOkBlocks < f.blocks ? "bad" : "");
+    setText("[data-mempool]", fmtInt(mem.tx) + " tx");
+    setText("[data-mempool-hint]", fmtSi(mem.bytes, "B") + " · p50 fee " + (mem.feeZat.p50 == null ? "—" : fmtInt(mem.feeZat.p50) + " zat") + " · unpaid actions " + fmtInt(mem.actionsUnpaid));
+    setText("[data-peers]", fmtInt(node.peers));
+    setText("[data-peers-hint]", "obsolete-version peers " + fmtInt(node.peersObsolete) + " · chain tips " + fmtInt(chain.chainTips) + " · sync distance " + fmtInt(node.syncDistance));
+    setText("[data-node]", node.activeState || "—");
+    setClass("[data-node]", node.activeState === "active" ? "good" : "bad");
+    setText("[data-node-hint]", "v" + (node.version || "?") + " · RSS " + fmtSi(node.rssBytes, "B") + " · restarts " + fmtInt(node.restarts) + " · scrape " + (node.scrapeMs == null ? "—" : node.scrapeMs.toFixed(0) + " ms") + (node.metricsOptional.chainCounters ? "" : " · per-block counters absent"));
+
+    var list = $("[data-blocks]"); list.innerHTML = "";
+    d.recentBlocks.forEach(function (b) {
+      var li = document.createElement("li");
+      li.innerHTML = '<span class="height"></span><code></code><time></time><span class="num"></span><span class="num"></span><span class="num"></span><span class="num"></span>';
+      var c = li.children;
+      c[0].textContent = fmtInt(b.height); c[1].textContent = b.hash; c[2].textContent = fmtUtc(b.time, true); c[2].setAttribute("datetime", new Date(b.time * 1000).toISOString());
+      c[3].textContent = b.intervalSeconds == null ? "—" : b.intervalSeconds + " s"; c[4].textContent = fmtInt(b.nTx);
+      c[5].textContent = b.feesZat == null ? "—" : fmtZec(b.feesZat, 5) + (b.merged ? " *" : ""); c[6].textContent = b.nsmFeeZat == null ? "—" : fmtZec(b.nsmFeeZat, 5);
+      list.appendChild(li);
+    });
+    setText("[data-updated]", "Observed " + fmtUtc(d.generatedAt, true) + " UTC · status " + d.status + " · * fees merged from blocks that landed between scrapes");
+
+    var rules = $("[data-rules]"); rules.innerHTML = "";
+    var labels = { effectiveHeight: "Effective height", nu7Active: "NU7 active", branchId: "Consensus branch", targetSpacingSeconds: "Target spacing (s)", averagingWindowBlocks: "Averaging window (blocks)", averagingTimespanSeconds: "Averaging timespan (s)", dampingFactor: "Damping factor", maxAdjustUpPercent: "Max adjust up (%)", maxAdjustDownPercent: "Max adjust down (%)", medianTimeSpanBlocks: "Median time span (blocks)", minerPercent: "Miner fee share (%)", nsmPercent: "NSM fee share (%)", nsmRounding: "NSM rounding", coinbaseMaturityBlocks: "Coinbase maturity (blocks)", baseSubsidyZat: "Block subsidy (zat)", minimumProtocolVersion: "Minimum protocol version" };
+    Object.keys(labels).forEach(function (key) {
+      var tr = document.createElement("tr");
+      tr.innerHTML = "<th></th><td></td><td></td>";
+      tr.children[0].textContent = labels[key];
+      tr.children[1].textContent = cell(d.rules.atTip[key]); tr.children[2].textContent = cell(d.rules.nextBlock[key]);
+      rules.appendChild(tr);
+    });
+    var limits = d.rules.nextBlock.actionLimits;
+    ["orchardActionsPerPool", "saplingSpendsAndOutputs", "sproutJoinSplits"].forEach(function (key) {
+      var tr = document.createElement("tr"); tr.innerHTML = "<th></th><td></td><td></td>";
+      tr.children[0].textContent = "Limit: " + key; tr.children[1].textContent = cell(d.rules.atTip.actionLimits[key]); tr.children[2].textContent = cell(limits[key]);
+      rules.appendChild(tr);
+    });
+    var events = $("[data-events]"); events.innerHTML = "";
+    d.series.events.slice(-12).reverse().forEach(function (e) {
+      var li = document.createElement("li");
+      li.textContent = fmtUtc(e.t, true) + " · " + e.kind + (e.height ? " at " + fmtInt(e.height) : "") + (e.depth ? " · depth " + e.depth : "") + (e.detail ? " · " + e.detail : "");
+      events.appendChild(li);
+    });
+    renderCharts(d);
+  }
+  function cell(v) { return v == null ? "—" : (typeof v === "number" ? v.toLocaleString("en-US") : String(v)); }
+
+  // -- charts --------------------------------------------------------------
+  function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function chart(id, config) {
+    if (!window.Chart) return;
+    var existing = state.charts[id];
+    if (existing) { existing.data = config.data; existing.options = config.options; existing.update("none"); return; }
+    state.charts[id] = new Chart(document.getElementById(id).getContext("2d"), config);
+  }
+  function baseOptions(xTitle, scales) {
+    var text = css("--muted"), grid = css("--grid");
+    var base = { animation: false, responsive: true, maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+      plugins: { legend: { labels: { color: text, boxWidth: 10, font: { size: 11 } } } },
+      elements: { point: { radius: 0 }, line: { borderWidth: 1.5, tension: 0 } },
+      scales: { x: { ticks: { color: text, maxTicksLimit: 8, maxRotation: 0 }, grid: { color: grid }, title: { display: !!xTitle, text: xTitle, color: text } } } };
+    Object.keys(scales || {}).forEach(function (k) { var s = Object.assign({ ticks: { color: text }, grid: { color: grid } }, scales[k]); if (scales[k].ticks) s.ticks = Object.assign({ color: text }, scales[k].ticks); base.scales[k] = s; });
+    return base;
+  }
+  function rollingMedian(values, window) {
+    return values.map(function (_, i) {
+      var slice = values.slice(Math.max(0, i - window + 1), i + 1).filter(function (v) { return v != null; }).sort(function (a, b) { return a - b; });
+      if (!slice.length) return null; var mid = slice.length >> 1; return slice.length % 2 ? slice[mid] : (slice[mid - 1] + slice[mid]) / 2;
+    });
+  }
+  function timeLabels(ts) { return ts.map(function (t) { return fmtUtc(t, true).slice(11, 16); }); }
+  function zec(arr) { return arr.map(function (v) { return v == null ? null : v / 1e8; }); }
+  function activationMarker(heights) {
+    return { type: "line", label: "NU7 activation", data: heights.map(function (h) { return h === ACTIVATION ? 1 : null; }), yAxisID: "marker", borderColor: css("--accent-2"), borderWidth: 0, pointRadius: heights.map(function (h) { return h === ACTIVATION ? 5 : 0; }), pointBackgroundColor: css("--accent-2"), showLine: false };
+  }
+  function renderCharts(d) {
+    var b = d.series.blocks, s = d.series.samples, heights = b.height.map(fmtInt);
+    var accent = css("--accent"), accent2 = css("--accent-2"), nsmC = css("--nsm"), minerC = css("--miner"), muted = css("--muted"), warn = css("--warn"), bad = css("--bad");
+    var target = b.height.map(function (h) { return h >= ACTIVATION ? 25 : 75; });
+    chart("c-interval", { type: "bar", data: { labels: heights, datasets: [
+      { type: "bar", label: "interval (s)", data: b.intervalSeconds, backgroundColor: accent + "99" },
+      { type: "line", label: "rolling 102 median", data: rollingMedian(b.intervalSeconds, 102), borderColor: accent2 },
+      { type: "line", label: "target spacing", data: target, borderColor: muted, borderDash: [4, 4] },
+      activationMarker(b.height) ] },
+      options: baseOptions("height", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } }, marker: { display: false, min: 0, max: 1 } }) });
+    chart("c-difficulty", { type: "line", data: { labels: heights, datasets: [
+      { label: "difficulty", data: b.difficulty, borderColor: accent, yAxisID: "y" },
+      { type: "bar", label: "change %", data: b.difficultyChangePct, backgroundColor: accent2 + "88", yAxisID: "y2" },
+      { label: "+16% limit", data: b.height.map(function () { return 16; }), borderColor: warn, borderDash: [3, 3], yAxisID: "y2" },
+      { label: "−32% limit", data: b.height.map(function () { return -32; }), borderColor: bad, borderDash: [3, 3], yAxisID: "y2" } ] },
+      options: baseOptions("height", { y: { type: "logarithmic", position: "left" }, y2: { position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "%", color: muted } } }) });
+    var delta = b.nsmBalanceZat.map(function (v, i) { var p = i > 0 ? b.nsmBalanceZat[i - 1] : null; return (v == null || p == null) ? null : v - p; });
+    var expected = b.nsmFeeZat.map(function (v, i) { if (v == null) return null; return v + (b.reissuanceZat[i] || 0); });
+    chart("c-nsm", { type: "bar", data: { labels: heights, datasets: [
+      { type: "line", label: "NSM balance (ZEC)", data: zec(b.nsmBalanceZat), borderColor: nsmC, yAxisID: "y", spanGaps: true },
+      { type: "bar", label: "Δ per block (ZEC)", data: zec(delta), backgroundColor: nsmC + "88", yAxisID: "y2" },
+      { type: "bar", label: "fee share + reissuance (ZEC)", data: zec(expected), backgroundColor: accent2 + "88", yAxisID: "y2" } ] },
+      options: baseOptions("height", { y: { position: "left" }, y2: { position: "right", grid: { drawOnChartArea: false } } }) });
+    chart("c-fees", { type: "bar", data: { labels: heights, datasets: [
+      { label: "miner (ZEC)", data: zec(b.minerFeeZat), backgroundColor: minerC + "bb", stack: "fees" },
+      { label: "NSM (ZEC)", data: zec(b.nsmFeeZat), backgroundColor: nsmC + "bb", stack: "fees" } ] },
+      options: baseOptions("height", { x: { stacked: true }, y: { stacked: true, beginAtZero: true } }) });
+    chart("c-fullness", { type: "bar", data: { labels: heights, datasets: [
+      { label: "Orchard actions", data: b.orchardActions, backgroundColor: accent + "99", yAxisID: "y" },
+      { type: "line", label: "330 limit", data: b.height.map(function () { return 330; }), borderColor: bad, borderDash: [3, 3], yAxisID: "y" },
+      { type: "line", label: "transactions", data: b.nTx, borderColor: accent2, yAxisID: "y" },
+      { type: "line", label: "size (kB)", data: b.size.map(function (v) { return v == null ? null : v / 1000; }), borderColor: muted, yAxisID: "y2" } ] },
+      options: baseOptions("height", { y: { beginAtZero: true }, y2: { position: "right", grid: { drawOnChartArea: false }, beginAtZero: true } }) });
+    var tl = timeLabels(s.t);
+    chart("c-txfees", { type: "line", data: { labels: tl, datasets: [
+      { label: "mempool p10", data: s.mempoolFeeP10Zat, borderColor: muted, borderDash: [2, 2] },
+      { label: "mempool p50", data: s.mempoolFeeP50Zat, borderColor: accent2 },
+      { label: "mempool p90", data: s.mempoolFeeP90Zat, borderColor: muted, borderDash: [2, 2] },
+      { label: "mined p50", data: s.nodeFeeP50Zat, borderColor: accent },
+      { label: "mined p99", data: s.nodeFeeP99Zat, borderColor: warn } ] },
+      options: baseOptions("time (UTC)", { y: { type: "logarithmic", title: { display: true, text: "zat", color: muted } } }) });
+    chart("c-mempool", { type: "line", data: { labels: tl, datasets: [
+      { label: "mempool tx", data: s.mempoolTx, borderColor: accent, yAxisID: "y", fill: true, backgroundColor: accent + "22" },
+      { label: "peers", data: s.peers, borderColor: accent2, yAxisID: "y2" } ] },
+      options: baseOptions("time (UTC)", { y: { beginAtZero: true }, y2: { position: "right", grid: { drawOnChartArea: false }, beginAtZero: true } }) });
+    chart("c-latency", { type: "line", data: { labels: tl, datasets: [
+      { label: "verify p50", data: s.verifyP50Ms, borderColor: accent2 },
+      { label: "verify p99", data: s.verifyP99Ms, borderColor: accent2, borderDash: [3, 3] },
+      { label: "commit p50", data: s.commitP50Ms, borderColor: accent },
+      { label: "commit p99", data: s.commitP99Ms, borderColor: accent, borderDash: [3, 3] },
+      { label: "rocksdb p99", data: s.rocksdbP99Ms, borderColor: muted, borderDash: [3, 3] } ] },
+      options: baseOptions("time (UTC)", { y: { type: "logarithmic", title: { display: true, text: "ms", color: muted } } }) });
+  }
+
+  // -- polling -------------------------------------------------------------
+  function refresh() {
+    if (document.hidden) return;
+    var controller = typeof AbortSignal !== "undefined" && AbortSignal.timeout ? { signal: AbortSignal.timeout(10000) } : {};
+    fetch("/v1/dashboard?window=" + state.window, Object.assign({ cache: "no-store" }, controller)).then(function (r) {
+      if (!r.ok) throw new Error("status " + r.status); return r.json();
+    }).then(function (data) {
+      state.data = data; state.fetchedAt = Date.now() / 1000;
+      $("[data-availability]").hidden = data.status === "live";
+      render(data);
+    }).catch(function () { $("[data-availability]").hidden = false; });
+  }
+  function tick() {
+    if (!state.data || !state.data.chain.blockTime) return;
+    var age = state.data.chain.tipAgeSeconds + (Date.now() / 1000 - state.fetchedAt);
+    setText("[data-age]", fmtAge(age));
+    setClass("[data-age]", age > 600 ? "bad" : age > 180 ? "warn" : "");
+  }
+  document.querySelectorAll("[data-window]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      document.querySelectorAll("[data-window]").forEach(function (b) { b.setAttribute("aria-pressed", b === button ? "true" : "false"); });
+      state.window = button.dataset.window; refresh();
+    });
+  });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) refresh(); });
+  if (window.matchMedia) window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () { Object.keys(state.charts).forEach(function (k) { state.charts[k].destroy(); }); state.charts = {}; if (state.data) renderCharts(state.data); });
+  window.addEventListener("load", refresh);
+  setInterval(refresh, POLL_MS);
+  setInterval(tick, 1000);
+})();
+</script>
+</body>
+</html>

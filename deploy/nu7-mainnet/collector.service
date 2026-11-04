@@ -1,0 +1,28 @@
+# Installed as /etc/systemd/system/zakura-nu7-mainnet-dashboard.service.
+[Unit]
+Description=NU7 mainnet developer dashboard collector
+After=network-online.target zakurad.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# No root. The collector reads the node over loopback RPC and metrics, reads the
+# node's RSS from /proc and its unit state from systemctl, and keeps its SQLite
+# database in its state directory.
+DynamicUser=yes
+StateDirectory=zakura-nu7-mainnet
+WorkingDirectory=/opt/zakura-nu7-mainnet
+ExecStart=/usr/bin/python3 /opt/zakura-nu7-mainnet/collector.py --db /var/lib/zakura-nu7-mainnet/dashboard.sqlite --host 127.0.0.1 --port 8095
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -2276,6 +2276,58 @@ async fn getblocks_response_precedes_ready_block_advert() {
     .expect("the response and advert are both delivered");
 }
 
+/// A peer that always has a message ready cannot keep a queued block advert from being written:
+/// after a bounded run of its messages, the advert goes before the next one.
+#[tokio::test]
+async fn block_advert_is_written_during_a_run_of_peer_messages() {
+    let _init_guard = zakura_test::init();
+    tokio::time::pause();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let (
+            mut connection,
+            client_tx,
+            _inbound_service,
+            mut peer_outbound_messages,
+            shared_error_slot,
+        ) = new_test_connection();
+        let (block_advert_tx, block_advert_rx) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = block_advert_rx;
+        let advert_hash = block::Hash([5; 32]);
+        let (advert, delivery) = block_advert(advert_hash);
+        block_advert_tx.try_send(advert).unwrap();
+
+        // The peer always has a ping ready, which the connection answers by itself.
+        let pings = futures::stream::repeat_with(|| Ok(Message::Ping(Nonce::default())));
+        let connection_task = tokio::spawn(connection.run(pings));
+
+        let mut pongs_before_advert = 0;
+        loop {
+            match peer_outbound_messages.next().await {
+                Some(Message::Pong(_)) => pongs_before_advert += 1,
+                Some(Message::Inv(inv)) => {
+                    assert_eq!(inv, vec![InventoryHash::Block(advert_hash)]);
+                    break;
+                }
+                other => panic!("unexpected message to the peer: {other:?}"),
+            }
+            assert!(
+                pongs_before_advert
+                    <= usize::from(crate::peer::connection::PEER_MESSAGES_PER_WAITING_ADVERT),
+                "the advert is written after a bounded run of peer messages",
+            );
+        }
+        delivery.await.unwrap().unwrap();
+        assert!(shared_error_slot.try_get_error().is_none());
+
+        connection_task.abort();
+        drop(client_tx);
+    })
+    .await
+    .expect("the advert is written during the run of peer messages");
+}
+
 /// Sends a `FindBlocks` request on `client_tx` and waits for its `getblocks` to reach the wire.
 ///
 /// Returns the receiver for the request's response.

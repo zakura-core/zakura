@@ -567,6 +567,15 @@ impl From<Request> for InboundMessage {
     }
 }
 
+/// How many peer messages a connection handles in a row while a block advert waits, before the
+/// advert goes ahead of the next peer message.
+///
+/// Peer messages normally precede adverts, so a response to the peer's request goes out before an
+/// unsolicited `inv`. A peer that always has a message ready would otherwise keep an advert queued
+/// past the advertiser's wait, and only a flooding peer has one ready at every turn, so after this
+/// many messages the advert goes first.
+const PEER_MESSAGES_PER_WAITING_ADVERT: u8 = 4;
+
 /// Where a connection reads our requests from, and the authorization it rechecks before
 /// writing a block advert.
 pub(crate) struct ConnectionRequests<C> {
@@ -618,6 +627,9 @@ where
 
     /// Receives block adverts independently of the current request's response.
     pub(super) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
+
+    /// Peer messages handled in a row while a block advert waited in its queue.
+    peer_messages_while_advert_waited: u8,
 
     /// Live authorization, rechecked immediately before advert writes.
     minimum_peer_version: MinimumPeerVersion<C>,
@@ -765,6 +777,7 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             block_advert_rx,
+            peer_messages_while_advert_waited: 0,
             minimum_peer_version,
             bans,
             error_slot,
@@ -831,6 +844,8 @@ where
             self.request_slot
                 .set_busy(!matches!(self.state, State::AwaitingRequest));
 
+            // A block advert that a run of peer messages has held back goes before the next one.
+            let advert_due = self.block_advert_is_due();
             match self.state {
                 State::AwaitingRequest => {
                     trace!("awaiting client request or peer message");
@@ -873,9 +888,13 @@ where
                     // Zebra services might be temporarily delayed until the peer times out, if a
                     // request to that peer is sent by the service, and the service blocks until
                     // the request completes (or times out).
+                    //
+                    // The one exception is a block advert that a run of peer messages has held
+                    // back for [`PEER_MESSAGES_PER_WAITING_ADVERT`] messages: it goes before the
+                    // next peer message, so a flooding peer cannot keep it queued.
                     let incoming = tokio::select! {
                         biased;
-                        msg = peer_rx.next() => Either::Left(msg),
+                        msg = peer_rx.next(), if !advert_due => Either::Left(msg),
                         // A closed advert channel disables only this branch.
                         Some(advert) = self.block_advert_rx.recv() => {
                             self.send_block_advert(advert).await;
@@ -889,6 +908,7 @@ where
                         }
                         Either::Left(Some(Err(e))) => self.fail_with(e).await,
                         Either::Left(Some(Ok(msg))) => {
+                            self.note_peer_message();
                             let unhandled_msg = self.handle_message_as_request(msg).await;
 
                             if let Some(unhandled_msg) = unhandled_msg {
@@ -954,7 +974,8 @@ where
                     // This makes sure a peer can't block disconnection or timeouts by sending too
                     // many messages. It also avoids doing work to process messages after a
                     // connection has failed.
-                    // Peer messages precede adverts to preserve response ordering, as above.
+                    // Peer messages precede adverts to preserve response ordering, as above,
+                    // except an advert that a run of peer messages has held back.
                     let peer_msg = tokio::select! {
                         biased;
                         _ = tx.cancellation() => {
@@ -997,7 +1018,7 @@ where
                             };
                             continue;
                         }
-                        msg = peer_rx.next().instrument(span.clone()) => msg,
+                        msg = peer_rx.next().instrument(span.clone()), if !advert_due => msg,
                         Some(advert) = self.block_advert_rx.recv() => {
                             self.send_block_advert(advert).await;
                             continue;
@@ -1007,6 +1028,7 @@ where
                         None => self.fail_with(PeerError::ConnectionClosed).await,
                         Some(Err(e)) => self.fail_with(e).await,
                         Some(Ok(peer_msg)) => {
+                            self.note_peer_message();
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
                             let payload_bytes = decoded_payload_bytes(&peer_msg);
 
@@ -1112,7 +1134,24 @@ where
     /// acknowledges it once the local write completes.
     ///
     /// Does not change the state of any request that is awaiting its response.
+    /// Counts a peer message handled while a block advert waits in its queue.
+    fn note_peer_message(&mut self) {
+        self.peer_messages_while_advert_waited = if self.block_advert_rx.is_empty() {
+            0
+        } else {
+            self.peer_messages_while_advert_waited.saturating_add(1)
+        };
+    }
+
+    /// Returns whether a waiting block advert goes before the next peer message, because a run
+    /// of peer messages has held it back for [`PEER_MESSAGES_PER_WAITING_ADVERT`] of them.
+    fn block_advert_is_due(&self) -> bool {
+        self.peer_messages_while_advert_waited >= PEER_MESSAGES_PER_WAITING_ADVERT
+            && !self.block_advert_rx.is_empty()
+    }
+
     async fn send_block_advert(&mut self, advert: BlockAdvert) {
+        self.peer_messages_while_advert_waited = 0;
         if advert.result.is_closed() {
             metrics::counter!("peer.canceled").increment(1);
             metrics::counter!(

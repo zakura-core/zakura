@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{key, BlockFlush, Pending, Progress, Queueing, Verifier, BLOCKS};
+use super::{defers_to_blocks, key, BlockFlush, Pending, Progress, Queueing, Verifier, BLOCKS};
 
 /// Returns how many guards of `pending`'s block have not been released.
 fn outstanding(pending: &Pending) -> usize {
@@ -17,6 +17,7 @@ fn the_last_release_returns_the_queued_verifiers() {
     let mut progress = Progress {
         pending: 2,
         queued: Verifier::Sapling.bit() | Verifier::Halo2Nu6_3Onward.bit(),
+        standalone: false,
     };
 
     assert_eq!(progress.release(), None);
@@ -118,6 +119,16 @@ fn a_standalone_transaction_flushes_once_its_requests_are_queued() {
         request.enqueued(Verifier::Ed25519);
         assert_eq!(outstanding(&pending), 0);
     });
+}
+
+#[test]
+fn a_standalone_transaction_leaves_the_flush_to_a_queueing_block() {
+    let context = Arc::new(());
+    let _registration = BlockFlush::register(&context, 1);
+
+    // Other tests register blocks concurrently, so only a registered block's effect is asserted.
+    assert!(defers_to_blocks(true));
+    assert!(!defers_to_blocks(false), "a block's own flush never defers");
 }
 
 #[test]

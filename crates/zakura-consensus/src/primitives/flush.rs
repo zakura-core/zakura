@@ -1,6 +1,7 @@
 //! Block-level flushes of the shielded batch verifiers, once a block's shielded work is queued.
 //! A shielded transaction verified outside a block, such as a mempool transaction, is its own
-//! flush unit.
+//! flush unit, except while a block is queueing its checks: the batch workers are shared, and a
+//! flush has no block identity, so it leaves the batches for the block's own flush.
 //!
 //! The block verifier registers how many shielded transactions it is about to dispatch. Each
 //! shielded transaction holds a [`Queueing`] guard while it builds its checks, and each batch
@@ -84,6 +85,9 @@ struct Progress {
 
     /// The [`Verifier::bit`]s of the batch workers that received an item.
     queued: u8,
+
+    /// Whether this is a transaction verified outside any block, such as a mempool transaction.
+    standalone: bool,
 }
 
 impl Progress {
@@ -111,6 +115,7 @@ impl BlockFlush {
         let pending = Arc::new(Mutex::new(Progress {
             pending: shielded_transactions,
             queued: 0,
+            standalone: false,
         }));
 
         BLOCKS
@@ -162,11 +167,13 @@ impl Queueing {
     ///
     /// The transaction is its own flush unit: with no block boundary to wait for, the batch
     /// workers that received its items are flushed once its checks are built and every batch
-    /// request they made is queued, instead of waiting for the batch latency bound.
+    /// request they made is queued, instead of waiting for the batch latency bound. While a block
+    /// is queueing its checks, the flush is left to the block, see [`defers_to_blocks`].
     pub(crate) fn for_standalone_transaction() -> Self {
         Self(Arc::new(Mutex::new(Progress {
             pending: 1,
             queued: 0,
+            standalone: true,
         })))
     }
 
@@ -198,18 +205,39 @@ impl Queueing {
     }
 }
 
+/// Returns whether a finished transaction's flush is left to the blocks queueing their checks.
+///
+/// A flush sends the worker's whole pending batch, whoever queued it. A standalone transaction
+/// that flushed while a block was queueing would cut the block's batch short, so a stream of
+/// mempool transactions could split block verification into small batches. Its items wait for
+/// the block's flush, or for the batch latency bound in a worker the block does not use.
+fn defers_to_blocks(standalone: bool) -> bool {
+    standalone
+        && !BLOCKS
+            .lock()
+            .expect("block flush registry mutex should not be poisoned")
+            .is_empty()
+}
+
 impl Drop for Queueing {
     fn drop(&mut self) {
-        let Some(queued) = self
-            .0
-            .lock()
-            .expect("block flush progress mutex should not be poisoned")
-            .release()
-        else {
-            return;
+        let (queued, standalone) = {
+            let mut progress = self
+                .0
+                .lock()
+                .expect("block flush progress mutex should not be poisoned");
+            let Some(queued) = progress.release() else {
+                return;
+            };
+            (queued, progress.standalone)
         };
 
-        // The progress lock is released first: queueing a flush can wait on a batch service lock.
+        if defers_to_blocks(standalone) {
+            tracing::trace!("a block is queueing its checks, leaving the flush to it");
+            return;
+        }
+
+        // The progress lock is released: queueing a flush can wait on a batch service lock.
         for verifier in Verifier::ALL {
             if queued & verifier.bit() == 0 {
                 continue;

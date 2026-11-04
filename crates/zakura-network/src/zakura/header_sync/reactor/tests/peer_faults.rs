@@ -346,6 +346,50 @@ fn a_retired_rounds_invalid_header_still_cools_down_the_peer() {
     }
 }
 
+/// A peer that disconnects while the node prepares or applies its invalid
+/// headers is still reported when the failure settles, and its immediate
+/// reconnect is refused for the readmission cooldown.
+#[test]
+fn invalid_headers_penalize_a_peer_that_disconnected_first() {
+    for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+        let (mut reactor, mut actions, _snapshot, peer, source, owner) = peer_violation_fixture();
+        let _ = connect(&mut reactor, &peer, owner.session_id());
+        reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the fixture has active work")
+            .phase = phase;
+        reactor.handle_peer_disconnected(&peer, owner.session_id(), "test disconnect");
+        assert!(!reactor.sessions.contains_key(&peer), "phase {phase:?}");
+        while actions.try_recv().is_ok() {}
+
+        let failure = invalid_header_failure(source, owner);
+        if phase == HeaderTargetPhase::Preparing {
+            let failed = HeaderTargetPreparationResult::Failed(failure);
+            reactor.handle_header_target_prepared(peer.clone(), source, owner, failed);
+        } else {
+            let failed = HeaderTargetAdmissionResult::Failed(failure);
+            reactor.handle_header_target_admission_ready(peer.clone(), source, owner, failed);
+        }
+
+        assert_peer_violation(&mut actions, HeaderSyncMisbehavior::InvalidHeader);
+        assert!(
+            reactor
+                .state
+                .unproductive_peer_cooldowns
+                .contains_key(&peer),
+            "phase {phase:?}"
+        );
+        let (reconnect, _outbound, _connection, _) =
+            connect(&mut reactor, &peer, owner.session_id() + 1);
+        assert!(
+            reconnect.cancel_token().is_cancelled(),
+            "phase {phase:?}: the cooldown refuses the reconnect"
+        );
+        assert!(!reactor.sessions.contains_key(&peer), "phase {phase:?}");
+    }
+}
+
 /// A page or outcome for another subscription leaves the active request,
 /// the peer, and the scheduler untouched.
 #[test]

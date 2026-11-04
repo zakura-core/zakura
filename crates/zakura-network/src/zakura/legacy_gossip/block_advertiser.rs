@@ -25,7 +25,7 @@ use crate::{
     BoxError,
 };
 
-use super::{LegacyGossipFrame, ZakuraGossipBroadcast, ZakuraSupervisorHandle};
+use super::{BlockFanout, LegacyGossipFrame, ZakuraGossipBroadcast, ZakuraSupervisorHandle};
 
 /// How long a session whose queue is full gets to make room for a block advertisement, the
 /// same as a busy legacy peer's advert queue gets.
@@ -39,7 +39,9 @@ const QUEUE_WAIT: Duration = Duration::from_secs(3);
 /// only once a session queued it; a block already seen, sent earlier or relayed from a peer, is
 /// not sent again. A submitted block that the chain has not committed yet is never kept for
 /// replay, since the chain can still reject it; once it commits, its announcement keeps it for
-/// replay even though it is not sent again. Requests other than block advertisements fail.
+/// replay even though it is not sent again. A session added while a full queue was making room
+/// is offered the block once it is delivered, since its replay on joining came too early for
+/// it. Requests other than block advertisements fail.
 pub(crate) struct ZakuraBlockAdvertiser {
     broadcast: ZakuraGossipBroadcast,
     readiness: Readiness,
@@ -97,22 +99,31 @@ impl ZakuraBlockAdvertiser {
             return Ok(Response::Nil);
         }
 
-        let fanout = broadcast
+        let BlockFanout { reached, offered } = broadcast
             .outbound
             .fan_out_block_within(hash, queue_wait)
             .await;
-        if fanout.delivered > 0 {
+        if reached.delivered > 0 {
             broadcast.mark_seen(&frame).await;
             if committed {
                 broadcast.outbound.remember_latest_block(&frame);
             }
+            // A session added while a full queue was making room was replayed the block before
+            // this one, or nothing, and a later advertisement of this block is not sent again.
+            broadcast
+                .outbound
+                .send_block_to_sessions_added_since(&offered, hash);
             return Ok(Response::Nil);
         }
-        if fanout.attempted == 0 || !broadcast.outbound.has_open_session() {
-            // Nobody received it: the same as having had nobody to send to.
+        if reached.attempted == 0
+            || reached.reached_only_closed_sessions()
+            || !broadcast.outbound.has_open_session()
+        {
+            // Nobody received it: the same as having had nobody to send to. A session added
+            // meanwhile was not offered the block; it makes the next advertisement ready at once.
             return Err(Box::new(NoEligibleBlockPeers) as BoxError);
         }
-        let refusal = fanout
+        let refusal = reached
             .first_error
             .expect("a session that was attempted but did not deliver recorded its refusal");
         Err(refusal.into())
@@ -592,6 +603,90 @@ mod tests {
             hash,
             "a later peer is sent the committed block"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_offers_a_delivered_block_to_a_session_added_while_waiting(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_busy, mut busy_receiver) = insert_session(&broadcast.outbound, 14, 1);
+        let earlier = block_hash(140);
+        let hash = block_hash(14);
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(earlier.into()))
+            .await?;
+
+        // While the full queue is making room, another peer's session joins, then the queue
+        // drains.
+        let join_then_drain = async {
+            tokio::time::sleep(TEST_QUEUE_WAIT / 4).await;
+            let joined = insert_session(&broadcast.outbound, 15, 1);
+            let drained = recv_advert(&mut busy_receiver).await;
+            (joined, drained)
+        };
+        let advertise = async {
+            timeout(RECEIVE_TIMEOUT, advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(hash.into()))
+                .await
+        };
+        let (((_joined, mut joined_receiver), drained), advertised) =
+            tokio::join!(join_then_drain, advertise);
+        assert_eq!(drained?, earlier);
+        advertised?;
+
+        assert_eq!(recv_advert(&mut busy_receiver).await?, hash);
+        assert_eq!(
+            recv_advert(&mut joined_receiver).await?,
+            hash,
+            "the session that joined while the block was waiting is sent it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_advertiser_reports_no_eligible_peers_when_every_offered_session_closed(
+    ) -> Result<(), BoxError> {
+        let (mut advertiser, broadcast) = advertiser();
+        let (_gone, gone_receiver) = insert_session(&broadcast.outbound, 16, 1);
+        let earlier = block_hash(160);
+        let hash = block_hash(16);
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(earlier.into()))
+            .await?;
+
+        // While the full queue is making room, another peer's session joins and the full one's
+        // transport goes away.
+        let join_then_close = async {
+            tokio::time::sleep(TEST_QUEUE_WAIT / 4).await;
+            let joined = insert_session(&broadcast.outbound, 17, 1);
+            drop(gone_receiver);
+            joined
+        };
+        let advertise = async {
+            timeout(RECEIVE_TIMEOUT, advertiser.ready())
+                .await??
+                .call(Request::AdvertiseBlockToAll(hash.into()))
+                .await
+        };
+        let ((_joined, mut joined_receiver), advertised) = tokio::join!(join_then_close, advertise);
+        let error = advertised.expect_err("the block reached nobody");
+        assert!(
+            error.is::<NoEligibleBlockPeers>(),
+            "a session that joined after the offer is not a refusal, got {error}"
+        );
+        assert!(is_unseen(&broadcast, hash).await);
+        assert_eq!(latest_block(&broadcast.outbound), Some(earlier));
+
+        // The joined session makes the next advertisement ready, and is sent the block.
+        timeout(RECEIVE_TIMEOUT, advertiser.ready())
+            .await??
+            .call(Request::AdvertiseBlockToAll(hash.into()))
+            .await?;
+        assert_eq!(recv_advert(&mut joined_receiver).await?, hash);
         Ok(())
     }
 }

@@ -1776,24 +1776,39 @@ impl LegacyGossipOutbound {
     }
 
     /// Offer a block advertisement to every session at once, each full queue getting up to
-    /// `wait` to make room, and report what it reached.
-    async fn fan_out_block_within(&self, hash: block::Hash, wait: Duration) -> Fanout {
-        let sessions = self.sessions_except(None);
+    /// `wait` to make room, and report what it reached and which sessions it was offered to.
+    async fn fan_out_block_within(&self, hash: block::Hash, wait: Duration) -> BlockFanout {
+        let offered = self.sessions_except(None);
         let results = futures::future::join_all(
-            sessions
+            offered
                 .iter()
                 .map(|session| session.send_advertise_block_within(hash, wait)),
         )
         .await;
-        let mut fanout = Fanout {
-            attempted: 0,
-            delivered: 0,
-            first_error: None,
-        };
-        for (session, result) in sessions.iter().zip(results) {
-            fanout.record(session, result);
+        let mut reached = Fanout::default();
+        for (session, result) in offered.iter().zip(results) {
+            reached.record(session, result);
         }
-        fanout
+        BlockFanout { reached, offered }
+    }
+
+    /// Offer a block advertisement, without waiting, to every session that is not among
+    /// `offered`: the sessions added while an earlier offer was waiting for a full queue.
+    fn send_block_to_sessions_added_since(
+        &self,
+        offered: &[LegacyGossipPeerSession],
+        hash: block::Hash,
+    ) -> Fanout {
+        let added = self
+            .sessions_except(None)
+            .into_iter()
+            .filter(|session| {
+                !offered
+                    .iter()
+                    .any(|earlier| earlier.is_same_session(session))
+            })
+            .collect();
+        fan_out(added, &LegacyGossipFrame::AdvertiseBlock(hash))
     }
 
     /// The sessions to offer a frame to: every one but `exclude`'s.
@@ -1874,6 +1889,14 @@ impl LegacyGossipPeerSession {
         self.session_id
     }
 
+    /// Returns whether `other` is this same gossip session: the same stream on the same
+    /// connection to the same peer.
+    fn is_same_session(&self, other: &Self) -> bool {
+        self.peer_id == other.peer_id
+            && self.conn_id == other.conn_id
+            && self.session_id == other.session_id
+    }
+
     /// Send an explicit block advertisement.
     pub fn try_send_advertise_block(&self, hash: block::Hash) -> Result<(), OrderedSendError> {
         self.try_send_gossip_frame(LegacyGossipFrame::AdvertiseBlock(hash))
@@ -1947,12 +1970,14 @@ fn first_seen_for_supervisor(supervisor: &ZakuraSupervisorHandle) -> FirstSeenCa
 }
 
 /// What one fan-out of a gossip frame reached.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Fanout {
     /// Sessions the frame was offered to.
     attempted: usize,
     /// Sessions that queued the frame.
     delivered: usize,
+    /// Sessions whose transport writer had gone, so the offer reached nobody there.
+    closed: usize,
     /// The first refusal, when a session refused the frame.
     first_error: Option<OrderedSendError>,
 }
@@ -1969,11 +1994,19 @@ impl Fanout {
                     ?error,
                     "failed to queue Zakura legacy gossip frame"
                 );
+                if matches!(error, OrderedSendError::Closed) {
+                    self.closed += 1;
+                }
                 if self.first_error.is_none() {
                     self.first_error = Some(error);
                 }
             }
         }
+    }
+
+    /// Returns whether every session the frame was offered to had gone: nobody was asked.
+    fn reached_only_closed_sessions(&self) -> bool {
+        self.attempted > 0 && self.closed == self.attempted
     }
 
     /// The gossip result: an error when any session refused the frame, success
@@ -1986,13 +2019,15 @@ impl Fanout {
     }
 }
 
+/// A block advertisement's fan-out: what it reached, and the sessions it was offered to.
+struct BlockFanout {
+    reached: Fanout,
+    offered: Vec<LegacyGossipPeerSession>,
+}
+
 /// Offer `frame` to every session, continuing past the ones that refuse it.
 fn fan_out(sessions: Vec<LegacyGossipPeerSession>, frame: &LegacyGossipFrame) -> Fanout {
-    let mut fanout = Fanout {
-        attempted: 0,
-        delivered: 0,
-        first_error: None,
-    };
+    let mut fanout = Fanout::default();
     for session in sessions {
         let result = match frame {
             LegacyGossipFrame::AdvertiseBlock(hash) => session.try_send_advertise_block(*hash),

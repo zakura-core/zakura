@@ -1168,8 +1168,13 @@ mod submitblock_test {
 
     use super::*;
 
-    /// How long the test waits for the mined block broadcast log before failing.
+    /// How long the test waits for the mined block log before failing.
     const MINED_BLOCK_BROADCAST_DEADLINE: Duration = Duration::from_secs(7);
+
+    /// What the gossip task logs when it takes a mined block from the submit-block channel.
+    ///
+    /// The announcement itself waits for a peer that can receive it, which this test has none of.
+    const MINED_BLOCK_LOG: &str = "announcing this node's committed block";
 
     #[tokio::test]
     async fn submitblock_channel() -> Result<(), crate::BoxError> {

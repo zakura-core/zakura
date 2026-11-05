@@ -434,11 +434,13 @@ impl<S: HasView> Checker for RegistryChecker<S> {
         first
     }
 
-    /// Reports each property's outcome. An obligation still open now leaves
+    /// Tells the harness how the run ended, then reports each property's
+    /// outcome. An obligation still open now leaves
     /// the property `Inconclusive`, never `Held`. A violation that ended the
     /// run outside the registry, such as the step loop's `sim/no-livelock`,
     /// belongs to the registered property with its ID.
     fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        self.handle.ended(end);
         if let Some(violation) = &end.violation {
             self.step_loop_violation(violation);
         }

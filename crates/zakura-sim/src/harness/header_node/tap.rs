@@ -39,6 +39,11 @@
 //! [`SessionEvidence`], the reactor's session view. A rule that view
 //! breaks fails the run at the next drain, as a broken ownership rule does.
 //!
+//! The reactor's adopted state and what it publishes from it stay out of the
+//! log too. The tap keeps them, with the generations of its `Started` and
+//! locator `Dispatched` events, in an [`AdoptionEvidence`] that the harness's
+//! view reads.
+//!
 //! A tap made with a [`CapacityEvidence`] also reads the reactor's resource
 //! probe after each drain, and checks it against the ownership check's
 //! accounting, as [`super::capacity`] describes. The reactor hands the probe
@@ -70,6 +75,7 @@ use zakura_scheduler::{SimInstant, TaskId};
 use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
+    adoption::{AdoptionEvidence, AdoptionFact},
     capacity::{self, CapacityEvidence, CapacityReading, Expected},
     pair::{PairError, Pairer},
     policy::LinkEffect,
@@ -128,6 +134,8 @@ struct TapState {
     sessions: SessionEvidence,
     /// The reactor's capacity accounting facts.
     reservations: ReservationEvidence,
+    /// The reactor's adopted state and what it published, for the view.
+    adoption: AdoptionEvidence,
     /// The reactor's resource probe, once it hands it over.
     probe: Mutex<ProbeSlot>,
     /// Where the probe's reads go, if this tap reads it.
@@ -350,6 +358,18 @@ impl TapState {
         if in_run {
             state.sessions.reactor(&event);
         }
+        if let Some(fact) = AdoptionFact::of(&event) {
+            let unlogged = fact.is_unlogged();
+            // Only a live reactor adopts state or publishes, so none of it
+            // happens in the run's own shutdown.
+            match zakura_scheduler::hooks::now().filter(|_| in_run) {
+                Some(now) => state.adoption.record(now.since_start(), fact),
+                None => state.refused.store(true, Ordering::Relaxed),
+            }
+            if unlogged {
+                return;
+            }
+        }
         // Ownership, accounting, reservation and admission events stay out
         // of the observation log, whose format pinned Plans fix. The run's
         // own shutdown drops a live reactor's queue and calls after the log
@@ -471,7 +491,8 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
-    /// `sessions`, which this tap's run binds and freezes with its log.
+    /// `sessions`, which this tap's run binds and freezes with its log. Its
+    /// adoption evidence freezes with the log too.
     ///
     /// # Panics
     ///
@@ -507,6 +528,11 @@ impl ReactorTap {
             let sessions = sessions.clone();
             move || sessions.freeze()
         });
+        let adoption = AdoptionEvidence::default();
+        sim.on_frozen({
+            let adoption = adoption.clone();
+            move || adoption.freeze()
+        });
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -520,6 +546,7 @@ impl ReactorTap {
                 work: Mutex::default(),
                 sessions,
                 reservations,
+                adoption,
                 probe: Mutex::default(),
                 capacity,
                 off_reactor: Mutex::default(),
@@ -555,6 +582,11 @@ impl ReactorTap {
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
         self.pairer.facts(facts);
+    }
+
+    /// The reactor's adoption facts, which the tap fills as they happen.
+    pub fn adoption(&self) -> AdoptionEvidence {
+        self.state.adoption.clone()
     }
 
     /// The notice the harness gives this tap when it stops the reactor.
@@ -873,6 +905,9 @@ impl ActionSource for ReactorTap {
         // text names neither.
         if log.run() != self.id.run {
             return Err("ForeignRun: reactor tap registered with another run".to_owned());
+        }
+        if let Some(now) = zakura_scheduler::hooks::now() {
+            self.state.adoption.reach(now.since_start());
         }
         let events = mem::take(&mut self.state.buffer().events);
         let last = events.last().map_or(self.delivered, |(seq, _, _)| *seq);

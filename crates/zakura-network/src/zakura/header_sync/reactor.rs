@@ -822,8 +822,10 @@ impl HeaderSyncReactor {
                     VctRepairRetry::supplier(source, HeaderRequestTerminal::SessionReplaced),
                 );
             }
-            self.state.requeue_supplier(source_id_from_peer(&peer));
+            self.state.rotate_supplier(source_id_from_peer(&peer));
         }
+        // A reconnect resumes or ends the supplier's held repair history.
+        self.prune_vct_supplier_history();
         self.publish_peer_state();
         let admitted = self
             .sessions
@@ -923,7 +925,7 @@ impl HeaderSyncReactor {
         self.emit_status(hs_trace::HEADER_STATUS_RECEIVED, &peer, session_id, &status);
         self.state.record_status(&peer, status.clone());
         if let Some(task) = self.state.vct_repair.current_mut() {
-            task.observe_supplier_status(source_id_from_peer(&peer));
+            task.observe_supplier_status(source_id_from_peer(&peer), &status);
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
@@ -1687,7 +1689,9 @@ impl HeaderSyncReactor {
             .body_owner()
             .and_then(|repair_owner| self.state.vct_repair.get(repair_owner))
             .and_then(|task| match &task.state {
-                RepairPolicyState::Assigned { context } => Some(context.selected_header_count()),
+                RepairPolicyState::Assigned { context, .. } => {
+                    Some(context.selected_header_count())
+                }
                 _ => None,
             });
         match &result {
@@ -1768,7 +1772,7 @@ impl HeaderSyncReactor {
                             .map(|snapshot| snapshot.state_version)
                             .or_else(|| {
                                 self.state.vct_repair.get(repair_owner).and_then(|task| {
-                                    let RepairPolicyState::Assigned { context } = &task.state
+                                    let RepairPolicyState::Assigned { context, .. } = &task.state
                                     else {
                                         return None;
                                     };
@@ -1901,7 +1905,7 @@ impl HeaderSyncReactor {
                         .body_owner()
                         .expect("an auxiliary repair preparation has body authority");
                     let valid = self.state.vct_repair.get(repair_owner).is_some_and(|task| {
-                        let RepairPolicyState::Assigned { context } = &task.state else {
+                        let RepairPolicyState::Assigned { context, .. } = &task.state else {
                             return false;
                         };
                         target.target_tip_hash() == context.request_target().hash
@@ -2552,7 +2556,7 @@ impl HeaderSyncReactor {
                         );
                         if let Some(predecessor) = vct_repair_predecessor(&task) {
                             self.note_vct_repair_stall(
-                                &task,
+                                task.repair_generation,
                                 predecessor,
                                 VctSupplierRejections::default(),
                                 VctRepairStallOutcome::LocalOperationPending,

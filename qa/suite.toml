@@ -123,7 +123,7 @@ timeout-secs = 1800
 file = "crates/zakura-sim/tests/discovery.rs"
 test = "regenerate_wait_complete_input"
 run = false
-reason = "a tool, not a test: it rewrites the committed input, and needs the lost-wakeup patch applied"
+reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

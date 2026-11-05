@@ -233,8 +233,18 @@ fn build_header_sync_reactor(
         last_snapshot_refresh_trace_at: Cell::new(None),
     };
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
+        observe!(reactor, ReactorEvent::adopted(snapshot));
         reactor.emit_snapshot_observed(None, snapshot);
     }
+    // The returned handle holds the watch's only receiver, so it sees this value.
+    observe!(
+        reactor,
+        ReactorEvent::TipPublished {
+            height: initial_tip.0,
+            hash: initial_tip.1,
+            delivered: true,
+        }
+    );
     reactor.schedule_current_vct_repair();
     Ok((handle, actions_rx, reactor))
 }
@@ -782,6 +792,22 @@ impl HeaderSyncReactor {
             previous.is_some(),
             "sessions and schedules share their keys"
         );
+        observe!(self, {
+            let admitted = &self
+                .sessions
+                .get(&peer)
+                .expect("the admitted peer was just installed")
+                .session;
+            ReactorEvent::SessionAdmitted {
+                peer: peer.clone(),
+                session_id: admitted.session_id(),
+                direction,
+                replaced: previous
+                    .as_ref()
+                    .map(|previous| previous.session.session_id()),
+                origin: admitted.origin(),
+            }
+        });
         if let Some(previous) = previous {
             previous.session.cancel_token().cancel();
             if let Some((owner, source)) = replaced_repair.and_then(|(owner, source, phase)| {
@@ -796,8 +822,10 @@ impl HeaderSyncReactor {
                     VctRepairRetry::supplier(source, HeaderRequestTerminal::SessionReplaced),
                 );
             }
-            self.state.requeue_supplier(source_id_from_peer(&peer));
+            self.state.rotate_supplier(source_id_from_peer(&peer));
         }
+        // A reconnect resumes or ends the supplier's held repair history.
+        self.prune_vct_supplier_history();
         self.publish_peer_state();
         let admitted = self
             .sessions
@@ -850,6 +878,14 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
         self.sessions.remove(peer);
+        observe!(
+            self,
+            ReactorEvent::SessionEnded {
+                peer: peer.clone(),
+                session_id,
+                reason,
+            }
+        );
         let limits = self.startup.config.peer_limits;
         self.state.remove_session(
             peer,
@@ -889,7 +925,7 @@ impl HeaderSyncReactor {
         self.emit_status(hs_trace::HEADER_STATUS_RECEIVED, &peer, session_id, &status);
         self.state.record_status(&peer, status.clone());
         if let Some(task) = self.state.vct_repair.current_mut() {
-            task.observe_supplier_status(source_id_from_peer(&peer));
+            task.observe_supplier_status(source_id_from_peer(&peer), &status);
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
@@ -1481,6 +1517,7 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::StagingRefused);
             return;
         }
+        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let Some(session) = self
             .sessions
             .get(peer)
@@ -1652,7 +1689,9 @@ impl HeaderSyncReactor {
             .body_owner()
             .and_then(|repair_owner| self.state.vct_repair.get(repair_owner))
             .and_then(|task| match &task.state {
-                RepairPolicyState::Assigned { context } => Some(context.selected_header_count()),
+                RepairPolicyState::Assigned { context, .. } => {
+                    Some(context.selected_header_count())
+                }
                 _ => None,
             });
         match &result {
@@ -1733,7 +1772,7 @@ impl HeaderSyncReactor {
                             .map(|snapshot| snapshot.state_version)
                             .or_else(|| {
                                 self.state.vct_repair.get(repair_owner).and_then(|task| {
-                                    let RepairPolicyState::Assigned { context } = &task.state
+                                    let RepairPolicyState::Assigned { context, .. } = &task.state
                                     else {
                                         return None;
                                     };
@@ -1866,7 +1905,7 @@ impl HeaderSyncReactor {
                         .body_owner()
                         .expect("an auxiliary repair preparation has body authority");
                     let valid = self.state.vct_repair.get(repair_owner).is_some_and(|task| {
-                        let RepairPolicyState::Assigned { context } = &task.state else {
+                        let RepairPolicyState::Assigned { context, .. } = &task.state else {
                             return false;
                         };
                         target.target_tip_hash() == context.request_target().hash
@@ -2103,6 +2142,7 @@ impl HeaderSyncReactor {
             self.defer_ordinary_target(&peer);
             return;
         }
+        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let source = source_id_from_peer(&peer);
         let (sent, locator) = match resumed {
             Some((id, _, accepted, _)) => {
@@ -2269,6 +2309,7 @@ impl HeaderSyncReactor {
         if self.committed_snapshot.as_ref() == Some(&snapshot) {
             return;
         }
+        observe!(self, ReactorEvent::adopted(&snapshot));
 
         self.state.bump_scheduling_revision();
         let header_authority_changed = self.committed_snapshot.as_ref().is_some_and(|old| {
@@ -2305,7 +2346,16 @@ impl HeaderSyncReactor {
             }
         }
         if old_tip != Some(new_tip) {
-            let _ = self.tip.send((new_tip.height, new_tip.hash));
+            #[cfg_attr(not(any(test, zakura_sim)), allow(unused_variables))]
+            let delivered = self.tip.send((new_tip.height, new_tip.hash)).is_ok();
+            observe!(
+                self,
+                ReactorEvent::TipPublished {
+                    height: new_tip.height,
+                    hash: new_tip.hash,
+                    delivered,
+                }
+            );
             self.publish_peer_state();
         }
         self.refresh_statuses();
@@ -2353,6 +2403,14 @@ impl HeaderSyncReactor {
         };
         match session.try_send_status(status.clone()) {
             Ok(()) => {
+                observe!(
+                    self,
+                    ReactorEvent::StatusQueued {
+                        peer: peer.clone(),
+                        session_id: session.session_id(),
+                        status: status.clone(),
+                    }
+                );
                 self.emit_status(
                     hs_trace::HEADER_STATUS_SENT,
                     peer,
@@ -2376,6 +2434,13 @@ impl HeaderSyncReactor {
                     .and_then(|handles| handles.status_publisher.as_mut())
                 {
                     publisher.record_failed(now);
+                    observe!(
+                        self,
+                        ReactorEvent::StatusDeferred {
+                            peer: peer.clone(),
+                            session_id: session.session_id(),
+                        }
+                    );
                 }
                 tracing::debug!(?peer, ?error, "failed to queue header-sync Status");
                 self.emit_queue_send_failed(peer, &session, "Status", &error, None);
@@ -2491,7 +2556,7 @@ impl HeaderSyncReactor {
                         );
                         if let Some(predecessor) = vct_repair_predecessor(&task) {
                             self.note_vct_repair_stall(
-                                &task,
+                                task.repair_generation,
                                 predecessor,
                                 VctSupplierRejections::default(),
                                 VctRepairStallOutcome::LocalOperationPending,

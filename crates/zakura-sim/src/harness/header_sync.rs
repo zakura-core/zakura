@@ -27,8 +27,13 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        policy, preload, tap::ReactorTap, Chain, Control, ControlStep, DispatchFlag, Effects,
-        HeaderNode, Policy, PolicySource, Topology,
+        adoption::{AdoptionEvidence, SessionLife},
+        policy::{self, Allow, Hold, OpKind, Select, Trigger},
+        preload,
+        session::SessionEvidence,
+        tap::ReactorTap,
+        Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
+        Policy, PolicySource, Topology,
     },
     scenario::Rejection,
     wire_node::{TransportTap, WireNode},
@@ -39,7 +44,7 @@ use crate::{
     domain::session::{honest_never_punished, HonestPeers},
     observe::StorageFact,
     peer::{
-        adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, Dialer as PeerDialer,
+        adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
         PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
@@ -48,7 +53,7 @@ use crate::{
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
-    Observation, RunConfig, Sim,
+    Observation, RunConfig, RunEnd, Sim,
 };
 
 /// The smoke run's scenario. It has no knobs yet.
@@ -196,8 +201,269 @@ impl Default for StorageScenario {
     }
 }
 
+impl StorageScenario {
+    /// The node at A2 with `mirror-0` at A5, dialing, and `mirror-1` on a
+    /// fork of A3, dialed by the node. Each mirror's link closes and
+    /// relinks: `mirror-0`'s at once, `mirror-1`'s once `mirror-0` is
+    /// linked again.
+    pub fn close_relink() -> Self {
+        StorageScenario {
+            node: Chain::main(2),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(5),
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 3,
+                        fork: Some(Fork { branch: 1, len: 4 }),
+                    },
+                    dialer: Dialer::Node,
+                },
+            ],
+            controls: vec![
+                step("mirror-0", ControlAction::Close, None),
+                step(
+                    "mirror-0",
+                    ControlAction::Relink,
+                    Some(Trigger::Closed(mirror(0))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Close,
+                    Some(Trigger::Count(2, Box::new(Trigger::Linked(mirror(0))))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Relink,
+                    Some(Trigger::Closed(mirror(1))),
+                ),
+            ],
+            ..StorageScenario::default()
+        }
+    }
+
+    /// Three mirrors whose chains grow while the node syncs: `mirror-0`
+    /// once the node applies its first headers, `mirror-2`'s fork once
+    /// `mirror-0` has grown, then `mirror-0` again from A13, after which its
+    /// link closes and relinks.
+    pub fn grow() -> Self {
+        StorageScenario {
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(5),
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain::main(1),
+                    dialer: Dialer::Node,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 2,
+                        fork: Some(Fork { branch: 2, len: 3 }),
+                    },
+                    dialer: Dialer::Mirror,
+                },
+            ],
+            controls: vec![
+                step(
+                    "mirror-0",
+                    ControlAction::Grow { len: 8 },
+                    Some(Trigger::Handled(Select::nth(OpKind::Apply, 1))),
+                ),
+                step(
+                    "mirror-2",
+                    ControlAction::Grow { len: 3 },
+                    Some(Trigger::Grown(mirror(0))),
+                ),
+                step("mirror-0", ControlAction::Grow { len: 2 }, None),
+                step(
+                    "mirror-0",
+                    ControlAction::Close,
+                    Some(Trigger::Count(2, Box::new(Trigger::Grown(mirror(0))))),
+                ),
+                step("mirror-0", ControlAction::Relink, None),
+            ],
+            ..StorageScenario::default()
+        }
+    }
+
+    /// Four mirrors under [`Base::Any`] within 2 s, with holds that
+    /// together offer every outcome: the first read until a second read
+    /// completes, the first session's applies for 3 s, the second acquire
+    /// until its caller drops it, and every locator until the first VCT
+    /// context reply is taken.
+    pub fn holds() -> Self {
+        let read = Select {
+            kind: Some(OpKind::Read),
+            ..Select::default()
+        };
+        StorageScenario {
+            node: Chain::main(1),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(6),
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain::main(4),
+                    dialer: Dialer::Node,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 1,
+                        fork: Some(Fork { branch: 1, len: 5 }),
+                    },
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain::default(),
+                    dialer: Dialer::Node,
+                },
+            ],
+            policy: Policy {
+                base: Base::Any,
+                bound_ms: Some(2_000),
+                holds: vec![
+                    Hold {
+                        select: Select::nth(OpKind::Read, 1),
+                        until: Trigger::Count(2, Box::new(Trigger::Completed(read))),
+                        then: vec![Allow::Engine, Allow::Timeout],
+                        deadline_ms: None,
+                    },
+                    Hold {
+                        select: Select {
+                            kind: Some(OpKind::Apply),
+                            session: Some(1),
+                            ..Select::default()
+                        },
+                        until: Trigger::VirtualTime(3_000),
+                        then: vec![Allow::Unavailable, Allow::LocalResource, Allow::Rejected],
+                        deadline_ms: None,
+                    },
+                    Hold {
+                        select: Select::nth(OpKind::Acquire, 2),
+                        until: Trigger::CallerDropped(Select::held()),
+                        then: vec![Allow::Engine, Allow::Rejected],
+                        deadline_ms: None,
+                    },
+                    Hold {
+                        select: Select {
+                            kind: Some(OpKind::Locator),
+                            ..Select::default()
+                        },
+                        until: Trigger::ReplyTaken(Select::nth(OpKind::VctContext, 1)),
+                        then: vec![Allow::Engine],
+                        deadline_ms: None,
+                    },
+                ],
+            },
+            ..StorageScenario::default()
+        }
+    }
+
+    /// Two mirrors whose control steps wait for each trigger kind the
+    /// grammar has: a storage event of each kind, a link closing, a link
+    /// made, a growth and a virtual time. A hold of the first prepare waits
+    /// for the first membership submission.
+    pub fn triggers() -> Self {
+        StorageScenario {
+            node: Chain::main(3),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(9),
+                    dialer: Dialer::Node,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 3,
+                        fork: Some(Fork { branch: 2, len: 6 }),
+                    },
+                    dialer: Dialer::Mirror,
+                },
+            ],
+            policy: Policy {
+                holds: vec![Hold {
+                    select: Select::nth(OpKind::Prepare, 1),
+                    until: Trigger::Submitted(Select::nth(OpKind::Membership, 1)),
+                    then: vec![Allow::Engine, Allow::Timeout],
+                    deadline_ms: None,
+                }],
+                ..Policy::converging()
+            },
+            controls: vec![
+                step(
+                    "mirror-0",
+                    ControlAction::Close,
+                    Some(Trigger::Submitted(Select::nth(OpKind::Locator, 2))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Relink,
+                    Some(Trigger::Closed(mirror(0))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Grow { len: 4 },
+                    Some(Trigger::Completed(Select::nth(OpKind::Read, 1))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Close,
+                    Some(Trigger::Grown(mirror(1))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Relink,
+                    Some(Trigger::ReplyTaken(Select::nth(OpKind::Acquire, 1))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Grow { len: 2 },
+                    Some(Trigger::Count(2, Box::new(Trigger::Linked(mirror(1))))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Close,
+                    Some(Trigger::Handled(Select::nth(OpKind::Apply, 1))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Relink,
+                    Some(Trigger::VirtualTime(6_000)),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Close,
+                    Some(Trigger::CallerDropped(Select {
+                        kind: Some(OpKind::Read),
+                        ..Select::default()
+                    })),
+                ),
+            ],
+        }
+    }
+}
+
+/// `peer`'s control step `action`, offered once `when` holds.
+fn step(peer: &str, action: ControlAction, when: Option<Trigger>) -> ControlStep {
+    ControlStep {
+        peer: peer.to_owned(),
+        action,
+        when,
+    }
+}
+
+/// `mirror-<index>`, a [`StorageScenario`] mirror's name.
+fn mirror(index: usize) -> String {
+    format!("mirror-{index}")
+}
+
 /// The scenario's storage, with each actor's chain committed before the
-/// run. Cloning shares the ports, so a test can read them after a run.
+/// run, and the node's session view. Cloning shares both, so a test can read
+/// them after a run. One prepared `Ports` serves one run.
 #[derive(Clone)]
 pub struct Ports {
     /// The fixture every chain comes from.
@@ -206,6 +472,8 @@ pub struct Ports {
     pub node: Arc<ControlledPort>,
     /// Each mirror's engine port, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
+    /// The node's session view, which its tap and links fill during the run.
+    pub sessions: SessionEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -213,12 +481,15 @@ pub struct Ports {
 pub struct Storage {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
+    /// The node's adoption facts, from its tap.
+    adoption: AdoptionEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
-    _topology: Rc<Topology>,
+    topology: Rc<Topology>,
 }
 
 /// What [`Storage`]'s checks read between steps.
+#[derive(Clone)]
 pub struct StorageView {
     /// The node's port, for its pending operations and its engine's state.
     pub port: Arc<ControlledPort>,
@@ -227,6 +498,12 @@ pub struct StorageView {
     /// The peers the scenario marks `HonestPeer`, by index. Only
     /// `header-sync/wire` has peers to mark.
     pub honest_peers: Rc<BTreeSet<usize>>,
+    /// The node's adopted state and what it published from it.
+    pub adoption: AdoptionEvidence,
+    /// Each of the node's sessions and how long it lasted, which the status
+    /// rule ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
+    /// knows them, from its links.
+    pub sessions: Vec<SessionLife>,
 }
 
 impl HonestPeers for StorageView {
@@ -239,13 +516,22 @@ impl HonestPeers for StorageView {
 impl HasView for Storage {
     type View = StorageView;
 
-    /// The node's port and the dispatch guard's flag.
+    /// The node's port, the dispatch guard's flag, the node's adoption facts
+    /// and its sessions' lifetimes.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Rc::default(),
+            adoption: self.adoption.clone(),
+            sessions: self.topology.sessions(),
         }
+    }
+
+    /// Records the run's end in the node's adoption evidence, for its tip
+    /// rule.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
     }
 }
 
@@ -293,12 +579,15 @@ impl Subsystem for Storage {
             fixture,
             node,
             mirrors,
+            sessions: SessionEvidence::default(),
         }
     }
 
     /// Spawns the node on its controlled port under the scenario's policy,
     /// with its reactor tapped, then each mirror, links each mirror to the
-    /// node once, and adds the `Control` source. Only the node is tapped.
+    /// node once, and adds the `Control` source. Only the node is tapped,
+    /// and its tap learns of a `Shutdown` step before the node stops. The tap
+    /// and the links keep the node's session view in [`Ports::sessions`].
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
         let effects = Effects::default();
@@ -308,7 +597,10 @@ impl Subsystem for Storage {
             scenario.policy.clone(),
             effects.clone(),
         );
-        let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
+        let (observer, tap) =
+            ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
+        let adoption = tap.adoption();
+        let shutdown = tap.shutdown();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -340,7 +632,11 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let topology = Rc::new(Topology::new(nodes, effects));
+        let topology = Rc::new(
+            Topology::new(nodes, effects)
+                .with_tap(shutdown)
+                .with_sessions(ports.sessions),
+        );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),
@@ -358,7 +654,8 @@ impl Subsystem for Storage {
         Storage {
             port: ports.node,
             dispatch,
-            _topology: topology,
+            adoption,
+            topology,
         }
     }
 
@@ -443,6 +740,10 @@ pub struct WirePorts {
     pub chains: Vec<Option<Arc<HonestChain>>>,
     /// What the node's reactor was started with, once the run builds it.
     pub startup: Rc<RefCell<Option<StartupFacts>>>,
+    /// The node's session view, which its reactor and transport taps fill
+    /// during the run, joined to own-9's facts. One prepared `WirePorts`
+    /// serves one run.
+    pub sessions: SessionEvidence,
     /// The peers' records the identity map hasn't placed yet.
     records: PeerRecords,
 }
@@ -471,6 +772,8 @@ pub struct HeaderWire {
     dispatch: DispatchFlag,
     /// The peers the scenario marks `HonestPeer`.
     honest: Rc<BTreeSet<usize>>,
+    /// The node's adoption facts, from its tap.
+    adoption: AdoptionEvidence,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -479,13 +782,24 @@ pub struct HeaderWire {
 impl HasView for HeaderWire {
     type View = StorageView;
 
-    /// The node's port, the dispatch guard's flag and the honest peers.
+    /// The node's port, the dispatch guard's flag, the honest peers and the
+    /// node's adoption facts. Its sessions run over the network, so the view
+    /// gives no lifetimes, and the status rule judges only what each queued
+    /// status advertises.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: self.honest.clone(),
+            adoption: self.adoption.clone(),
+            sessions: Vec::new(),
         }
+    }
+
+    /// Records the run's end in the node's adoption evidence, for its tip
+    /// rule.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
     }
 }
 
@@ -497,13 +811,17 @@ impl Subsystem for HeaderWire {
     type Prepared = WirePorts;
 
     /// [`wire_config`], with twice its budget for a scenario with status
-    /// bursts: emptying a `Status` bucket takes about 600 frames, and the
-    /// node about 40 steps to read each.
+    /// bursts or an over-credit objects page. Emptying a `Status` bucket
+    /// takes about 600 frames, and the node about 40 steps to read each. The
+    /// node must read the whole 45 KB page before it can count objects, so
+    /// with every datagram delivered at once, that run spends up to about
+    /// 3,500 steps at 0 ns, past the livelock limit of a tenth of the
+    /// budget.
     fn config(scenario: &WireScenario) -> RunConfig {
         let burst = scenario.peers.iter().any(|peer| {
-            peer.script.contains(&PeerAction::Act {
-                act: Act::StatusBurst,
-            })
+            [Act::StatusBurst, Act::OverCreditObjects]
+                .into_iter()
+                .any(|act| peer.script.contains(&PeerAction::Act { act }))
         });
         let config = wire_config();
         RunConfig {
@@ -545,14 +863,17 @@ impl Subsystem for HeaderWire {
             node,
             chains,
             startup: Rc::default(),
+            sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
         }
     }
 
     /// Adds the network, then spawns the node as `header-sync/storage` does,
     /// with its reactor tapped, behind its transport, which its own tap
-    /// reports. Then spawns each peer, and a dial for each peer the node
-    /// dials, and adds the peers' action source.
+    /// reports. Both taps feed the node's session view in
+    /// [`WirePorts::sessions`], which joins the reactor's sessions to
+    /// own-9's facts. Then spawns each peer, and a dial for each peer the
+    /// node dials, and adds the peers' action source.
     fn build(sim: &mut Sim, scenario: &WireScenario, ports: WirePorts) -> Self {
         let net = scenario.net.net();
         sim.add_source(Box::new(net.clone()));
@@ -563,7 +884,18 @@ impl Subsystem for HeaderWire {
             scenario.policy.clone(),
             Effects::default(),
         );
-        let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
+        let names: Vec<String> = (0..scenario.peers.len())
+            .map(|index| format!("peer-{index}"))
+            .collect();
+        ports.sessions.expect_transport(
+            (0..)
+                .zip(&names)
+                .map(|(index, name)| (peer_id(scenario.net.seed, index), name.clone()))
+                .collect(),
+        );
+        let (observer, tap) =
+            ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
+        let adoption = tap.adoption();
         sim.add_source(Box::new(storage.with_tap(tap)));
         let header = HeaderNode::spawn(
             sim,
@@ -576,10 +908,13 @@ impl Subsystem for HeaderWire {
             Some(observer),
         );
         *ports.startup.borrow_mut() = Some(header.startup.clone());
-        let names: Vec<String> = (0..scenario.peers.len())
-            .map(|index| format!("peer-{index}"))
-            .collect();
-        let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
+        let (observer, tap) = TransportTap::with_sessions(
+            sim,
+            "node",
+            net.clone(),
+            names.clone(),
+            Some(ports.sessions.clone()),
+        );
         let dials = tap.dials();
         sim.add_source(Box::new(tap));
         let node = WireNode::spawn(
@@ -625,6 +960,7 @@ impl Subsystem for HeaderWire {
             port: ports.node,
             dispatch,
             honest: Rc::new(scenario.honest_peers()),
+            adoption,
             _keep: Box::new(node),
         }
     }

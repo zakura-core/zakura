@@ -32,25 +32,30 @@ use zakura_sim::{
     MemorySink, Observation, PlanInput, RunConfig, RunEnd, RunReport, Sim,
 };
 
+/// The last view a run's checks read, with how many adoption facts it held
+/// then.
+type LastView = Rc<RefCell<Option<(StorageView, usize)>>>;
+
 /// [`Storage`], keeping the last view its checks read, so a test can judge
 /// the evidence after the run.
 struct Adopting {
     storage: Storage,
-    last: Rc<RefCell<Option<StorageView>>>,
+    last: LastView,
 }
 
-/// A storage scenario and, if set, the run's step budget.
+/// A storage scenario and, if set, the run's step budget and drain bound.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Budgeted {
     storage: StorageScenario,
     budget: Option<u64>,
+    drain_bound: Option<u64>,
 }
 
 /// The ports, and where the harness leaves its last view.
 #[derive(Clone)]
 struct Ready {
     ports: Ports,
-    last: Rc<RefCell<Option<StorageView>>>,
+    last: LastView,
 }
 
 impl HasView for Adopting {
@@ -59,7 +64,7 @@ impl HasView for Adopting {
     /// The storage harness's view, also kept as the last one read.
     fn view(&self) -> StorageView {
         let view = self.storage.view();
-        *self.last.borrow_mut() = Some(view.clone());
+        *self.last.borrow_mut() = Some((view.clone(), view.adoption.facts().len()));
         view
     }
 
@@ -76,11 +81,13 @@ impl Subsystem for Adopting {
     type Scenario = Budgeted;
     type Prepared = Ready;
 
-    /// The storage harness's config, with the scenario's budget if set.
+    /// The storage harness's config, with the scenario's budget and drain
+    /// bound if set.
     fn config(scenario: &Budgeted) -> RunConfig {
         let config = storage_config();
         RunConfig {
             budget: scenario.budget.unwrap_or(config.budget),
+            drain_bound: scenario.drain_bound.unwrap_or(config.drain_bound),
             ..config
         }
     }
@@ -117,10 +124,12 @@ impl Subsystem for Adopting {
     }
 }
 
-/// A run's report and the last view its checks read.
+/// A run's report, the last view its checks read, and how many adoption facts
+/// that view held.
 struct Run {
     report: RunReport,
     view: StorageView,
+    seen: usize,
 }
 
 impl Run {
@@ -143,9 +152,20 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Run {
 
 /// [`run`] with `budget` steps, if set.
 fn run_for(scenario: &StorageScenario, budget: Option<u64>, input: PlanInput) -> Run {
+    run_limited(scenario, budget, None, input)
+}
+
+/// [`run_for`], with a drain of at most `drain_bound` steps, if set.
+fn run_limited(
+    scenario: &StorageScenario,
+    budget: Option<u64>,
+    drain_bound: Option<u64>,
+    input: PlanInput,
+) -> Run {
     let scenario = Budgeted {
         storage: scenario.clone(),
         budget,
+        drain_bound,
     };
     let ready = Adopting::prepare(&scenario);
     let report = run_prepared::<Adopting>(
@@ -157,12 +177,12 @@ fn run_for(scenario: &StorageScenario, budget: Option<u64>, input: PlanInput) ->
     )
     .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(report.end.violation, None, "{:?}", report.end);
-    let view = ready
+    let (view, seen) = ready
         .last
         .borrow_mut()
         .take()
         .expect("the checks read the view at every step");
-    Run { report, view }
+    Run { report, view, seen }
 }
 
 /// `action` on `peer`, offered once `when` holds.
@@ -440,6 +460,34 @@ fn a_run_that_ends_early_breaks_no_rule() {
             }
         }
     }
+}
+
+/// A run cut off with tasks still ready keeps the evidence it ended with.
+/// With no drain, many budgets stop the reactor partway through a poll, and
+/// the scheduler's cleanup then runs it on with the run's clock installed.
+/// Nothing it reports then reaches the evidence, so the rules judge what the
+/// run's last check saw.
+#[test]
+fn a_cut_off_run_keeps_the_evidence_it_ended_with() {
+    let scenario = grow_witness();
+    let mut cut = 0;
+    for budget in 1..=400 {
+        for input in inputs(2, 256) {
+            let run = run_limited(&scenario, Some(budget), Some(0), input);
+            cut += usize::from(run.report.end.drain.is_some_and(|drain| drain.exhausted));
+            assert_eq!(
+                run.adoption().facts().len(),
+                run.seen,
+                "budget {budget}: {:?}",
+                &run.adoption().facts()[run.seen..]
+            );
+            assert!(
+                !matches!(run.adoption().tip(), Acceptance::Violated(_)),
+                "budget {budget}"
+            );
+        }
+    }
+    assert!(cut > 0, "some run must be cut off");
 }
 
 /// The evidence and the run's log depend only on scenario and plan: plan A

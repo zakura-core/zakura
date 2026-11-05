@@ -310,6 +310,22 @@ version = "0.11.1"
 criteria = "safe-to-deploy"
 notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
+[[exemptions.sha2-asm]]
+version = "0.6.4"
+criteria = "safe-to-deploy"
+notes = """
+Scoped admission for the target-gated sha2 0.10.9 backend integration, not an
+unconditional package audit certification. An independent Codex AI reviewer
+inspected all 14 packaged files, including all six bundled assembly files,
+and verified the package checksum and source-file integrity. The dependency
+is enabled only on little-endian Linux/macOS AArch64. On those targets sha2
+0.10.9 executes its own CPU-guarded ARM modules with a Rust software fallback;
+it does not call sha2-asm's direct assembly wrappers. The upstream wrappers
+have implicit CPU preconditions, including ARM SHA instructions and SSSE3
+for 32-bit x86 SHA-512, so this admission must be reconsidered if the target
+condition, sha2 version, or direct callers change.
+"""
+
 [[exemptions.tar]]
 version = "0.4.45"
 criteria = "safe-to-deploy"

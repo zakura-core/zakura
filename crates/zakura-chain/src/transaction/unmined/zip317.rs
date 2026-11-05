@@ -1,6 +1,6 @@
 //! Fee calculations for [UnminedTx]s using [ZIP-317] action counts.
 //!
-//! Zakura uses a 400-zatoshi marginal fee for mempool and block production
+//! Zakura uses a 1,000-zatoshi marginal fee for mempool and block production
 //! policy, rather than ZIP-317's 5,000-zatoshi conventional fee.
 //!
 //! [ZIP-317]: https://zips.z.cash/zip-0317
@@ -22,7 +22,7 @@ mod tests;
 /// Zakura's marginal fee in zatoshis per logical action.
 //
 // TODO: allow Amount<NonNegative> in constants
-pub const MARGINAL_FEE: u64 = 400;
+pub const MARGINAL_FEE: u64 = 1_000;
 
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
 const GRACE_ACTIONS: u32 = 2;
@@ -44,7 +44,7 @@ const MIN_BLOCK_PRODUCTION_SUBSTITUTE_FEE: i64 = 1;
 
 /// Maximum unpaid actions in Zakura's mempool and block templates.
 ///
-/// Zero requires each transaction to pay the full 400-zatoshi fee per action.
+/// Zero requires each transaction to pay the full 1,000-zatoshi fee per action.
 pub const BLOCK_UNPAID_ACTION_LIMIT: u32 = 0;
 
 /// The legacy minimum fee per kilobyte for Zakura mempool transactions.
@@ -57,7 +57,7 @@ pub const MIN_MEMPOOL_TX_FEE_RATE: usize = 100;
 
 /// The cap for the legacy size-based relay fee.
 ///
-/// At two grace actions, the 400-zatoshi marginal fee already requires 800
+/// At two grace actions, the 1,000-zatoshi marginal fee requires 2,000
 /// zatoshis, so the legacy size-based fee cannot exceed the per-action fee.
 pub const MEMPOOL_TX_FEE_REQUIREMENT_CAP: usize = 800;
 

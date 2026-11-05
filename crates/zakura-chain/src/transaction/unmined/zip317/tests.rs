@@ -34,7 +34,7 @@ fn zip317_mempool_checks_ok() {
 }
 
 #[test]
-fn zakura_conventional_fee_is_400_per_action() {
+fn zakura_conventional_fee_is_1000_per_action() {
     let transaction = UnminedTx::from(Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
         lock_time: LockTime::unlocked(),
@@ -48,26 +48,26 @@ fn zakura_conventional_fee_is_400_per_action() {
     assert_eq!(conventional_actions(&transaction.transaction), 2);
     assert_eq!(
         conventional_fee(&transaction.transaction),
-        Amount::<NonNegative>::try_from(800).unwrap()
+        Amount::<NonNegative>::try_from(2_000).unwrap()
     );
     assert_eq!(
-        unpaid_actions(&transaction, Amount::try_from(799).unwrap()),
+        unpaid_actions(&transaction, Amount::try_from(1_999).unwrap()),
         1
     );
     assert_eq!(
-        unpaid_actions(&transaction, Amount::try_from(800).unwrap()),
+        unpaid_actions(&transaction, Amount::try_from(2_000).unwrap()),
         0
     );
     assert_eq!(
-        mempool_checks(1, Amount::try_from(799).unwrap(), transaction.size),
+        mempool_checks(1, Amount::try_from(1_999).unwrap(), transaction.size),
         Err(Error::UnpaidActions)
     );
-    assert!(mempool_checks(0, Amount::try_from(800).unwrap(), transaction.size).is_ok());
+    assert!(mempool_checks(0, Amount::try_from(2_000).unwrap(), transaction.size).is_ok());
 }
 
 #[test]
 fn legacy_relay_fee_cannot_exceed_two_action_fee() {
-    assert!(mempool_checks(0, Amount::try_from(800).unwrap(), 2_000_000).is_ok());
+    assert!(mempool_checks(0, Amount::try_from(2_000).unwrap(), 2_000_000).is_ok());
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn zip317_caps_weight_ratio_at_thirteen() {
     let legacy_conventional_fee = Amount::try_from(10_000).expect("fee is a valid amount");
     assert_eq!(
         conventional_fee_weight_ratio(&transaction, legacy_conventional_fee),
-        12.5
+        5.0
     );
 
     let miner_fee = Amount::try_from(200_000).expect("fee is a valid amount");
@@ -133,6 +133,6 @@ fn zip317_counts_ironwood_actions() {
     assert_eq!(conventional_actions(&transaction), 3);
     assert_eq!(
         conventional_fee(&transaction),
-        Amount::<NonNegative>::try_from(1_200).unwrap()
+        Amount::<NonNegative>::try_from(3_000).unwrap()
     );
 }

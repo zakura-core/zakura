@@ -73,7 +73,7 @@ pub fn owed(
     entries: &[Entry],
     attributions: &FaultAttributions,
 ) -> Result<Vec<OwedPenalty>, String> {
-    let judge = Judge::over(entries, attributions, &Cooldowns::Unchecked);
+    let judge = Judge::over(Mode::Scan, &[], entries, attributions);
     match judge.error {
         Some(why) => Err(why),
         None => Ok(judge.owed),
@@ -85,7 +85,7 @@ pub fn owed(
 /// the call, or the log ends first. Whether the node should have penalized
 /// them can't be judged from the reactor's side.
 pub fn untaken(entries: &[Entry], attributions: &FaultAttributions) -> Result<Vec<u64>, String> {
-    let judge = Judge::over(entries, attributions, &Cooldowns::Unchecked);
+    let judge = Judge::over(Mode::Scan, &[], entries, attributions);
     match judge.error {
         Some(why) => Err(why),
         None => Ok(judge.untaken()),
@@ -119,18 +119,28 @@ struct Window {
     handled: bool,
 }
 
-/// Whether the judge judges, and how it checks the cooldown after each
-/// matched `Misbehavior`.
-enum Cooldowns<'c> {
+/// Whether the judge judges.
+#[derive(Clone, Copy, Debug, Default)]
+enum Mode {
     /// It judges nothing and only collects what's owed and untaken, for
     /// [`owed`] and [`untaken`], so no earlier break cuts their lists short.
-    Unchecked,
-    /// Each matched `Misbehavior` must be followed by a `CooldownStarted` in
-    /// `facts` that installs `cooldown`, unless `cooldown` is zero.
-    Checked {
-        facts: &'c [CooldownFact],
+    #[default]
+    Scan,
+    /// It judges each penalty. Unless `cooldown` is zero, each matched
+    /// `Misbehavior` must be followed by a `CooldownStarted` that installs
+    /// `cooldown`.
+    Judge {
+        /// The node's configured readmission cooldown.
         cooldown: Duration,
     },
+}
+
+/// A `CooldownStarted`, keyed in [`Judge::started`] by the event before it.
+#[derive(Debug)]
+struct Started {
+    peer: String,
+    origin: u64,
+    cooldown: Duration,
 }
 
 /// The penalty rule's state after the log entries it has read. It reads each
@@ -138,8 +148,15 @@ enum Cooldowns<'c> {
 /// entries.
 #[derive(Debug, Default)]
 struct Judge {
+    mode: Mode,
     /// How many log entries it has read.
     read: usize,
+    /// How many cooldown facts it has read.
+    facts_read: usize,
+    /// Each started cooldown, by the number of the reactor event before it.
+    started: HashMap<u64, Vec<Started>>,
+    /// Each cooled peer's latest cooldown: when it started and when it ends.
+    cooled: HashMap<String, (Duration, Duration)>,
     requests: BTreeMap<u64, Request>,
     /// Each failed operation whose reply the reactor hasn't taken, with its
     /// request and category.
@@ -162,16 +179,79 @@ struct Judge {
 }
 
 impl Judge {
-    /// A judge that has read all of `entries`.
-    fn over(entries: &[Entry], attributions: &FaultAttributions, cooldowns: &Cooldowns) -> Self {
-        let mut judge = Judge::default();
-        judge.read(entries, attributions, cooldowns);
+    /// A judge in `mode` that has read all of `facts`, then all of
+    /// `entries`.
+    fn over(
+        mode: Mode,
+        facts: &[CooldownFact],
+        entries: &[Entry],
+        attributions: &FaultAttributions,
+    ) -> Self {
+        let mut judge = Judge {
+            mode,
+            ..Judge::default()
+        };
+        judge.cooldowns(facts);
+        judge.read(entries, attributions);
         judge
+    }
+
+    /// Reads `facts`, the cooldown facts after the ones it already read,
+    /// in the order the reactor reported them. An admission from a peer
+    /// inside a cooldown started for it breaks the rule. A scan reads none.
+    fn cooldowns(&mut self, facts: &[CooldownFact]) {
+        self.facts_read += facts.len();
+        if matches!(self.mode, Mode::Scan) {
+            return;
+        }
+        for fact in facts {
+            match fact {
+                CooldownFact::Started {
+                    peer,
+                    origin,
+                    cooldown,
+                    at,
+                    after,
+                } => {
+                    self.started.entry(*after).or_default().push(Started {
+                        peer: peer.clone(),
+                        origin: *origin,
+                        cooldown: *cooldown,
+                    });
+                    // Facts come in time order, so a later start never
+                    // begins before an earlier window ends unless the two
+                    // overlap. The later end covers both.
+                    let until = at.saturating_add(*cooldown);
+                    let window = self.cooled.entry(peer.clone()).or_insert((*at, until));
+                    if until >= window.1 {
+                        *window = (*at, until);
+                    }
+                }
+                CooldownFact::Admitted {
+                    peer,
+                    session_id,
+                    at,
+                } => {
+                    if let Some((from, until)) =
+                        self.cooled.get(peer).filter(|(_, until)| at < until)
+                    {
+                        self.broken.get_or_insert_with(|| {
+                            format!(
+                                "ReadmittedInCooldown: the reactor admitted session {session_id} \
+                                 from {peer} at {at:?}, inside the readmission cooldown it started \
+                                 at {from:?} until {until:?}"
+                            )
+                        });
+                    }
+                }
+                CooldownFact::Refused { .. } => {}
+            }
+        }
     }
 
     /// Reads the entries after the ones it already read, judging each owed
     /// penalty once its call's handling ends. Stops at the first break.
-    fn read(&mut self, entries: &[Entry], attributions: &FaultAttributions, cooldowns: &Cooldowns) {
+    fn read(&mut self, entries: &[Entry], attributions: &FaultAttributions) {
         let Some(new) = entries.get(self.read..) else {
             self.error
                 .get_or_insert_with(|| "the log the penalty rule reads got shorter".to_owned());
@@ -186,7 +266,7 @@ impl Judge {
                 self.error = Some(why);
                 return;
             }
-            self.judge(cooldowns);
+            self.judge();
         }
     }
 
@@ -316,10 +396,10 @@ impl Judge {
     /// Judges each pending penalty whose call's handling has ended. One
     /// that no reactor call submitted has no handling to penalize it, so it
     /// breaks at once.
-    fn judge(&mut self, cooldowns: &Cooldowns) {
-        if matches!(cooldowns, Cooldowns::Unchecked) {
+    fn judge(&mut self) {
+        let Mode::Judge { cooldown } = self.mode else {
             return;
-        }
+        };
         let mut pending = std::mem::take(&mut self.pending);
         pending.retain(|index| {
             let penalty = &self.owed[*index];
@@ -337,7 +417,7 @@ impl Judge {
             let Some(window) = self.windows.get(&call).filter(|window| window.handled) else {
                 return true;
             };
-            if let Err(why) = matched(penalty, window, cooldowns) {
+            if let Err(why) = matched(penalty, window, cooldown, &self.started) {
                 self.broken.get_or_insert(why);
             }
             false
@@ -374,9 +454,15 @@ impl Judge {
 
 /// Checks that `window`, the handling of `penalty`'s call, reported a
 /// `Misbehavior` naming the source's peer, the work's session as its origin
-/// and the reason the category calls for, then the cooldown `cooldowns`
-/// wants for it.
-fn matched(penalty: &OwedPenalty, window: &Window, cooldowns: &Cooldowns) -> Result<(), String> {
+/// and the reason the category calls for, then, unless `cooldown` is zero,
+/// a cooldown in `started` that installs `cooldown` for the same peer and
+/// session right after that `Misbehavior`.
+fn matched(
+    penalty: &OwedPenalty,
+    window: &Window,
+    cooldown: Duration,
+    started: &HashMap<u64, Vec<Started>>,
+) -> Result<(), String> {
     let what = format!(
         "{} operation {} failed with a header-peer fault of {} in session {}",
         penalty.stage, penalty.op, penalty.source, penalty.session_id
@@ -397,18 +483,17 @@ fn matched(penalty: &OwedPenalty, window: &Window, cooldowns: &Cooldowns) -> Res
             penalty.reason, penalty.call
         ));
     }
-    let Cooldowns::Checked { facts, cooldown } = cooldowns else {
-        return Ok(());
-    };
     if cooldown.is_zero() {
         return Ok(());
     }
-    let cooled = facts.iter().any(|fact| {
-        matches!(fact, CooldownFact::Started { peer, origin, cooldown: started, after, .. }
-            if *peer == penalty.source
-                && *origin == penalty.session_id
-                && started == cooldown
-                && reported.iter().any(|reported| reported.seq == *after))
+    let cooled = reported.iter().any(|reported| {
+        started.get(&reported.seq).is_some_and(|started| {
+            started.iter().any(|started| {
+                started.peer == penalty.source
+                    && started.origin == penalty.session_id
+                    && started.cooldown == cooldown
+            })
+        })
     });
     if cooled {
         Ok(())
@@ -418,38 +503,6 @@ fn matched(penalty: &OwedPenalty, window: &Window, cooldowns: &Cooldowns) -> Res
              cooldown for it after its Misbehavior"
         ))
     }
-}
-
-/// The first session the reactor admitted from a peer during that peer's
-/// readmission cooldown, as a break, reading `facts` in the order the
-/// reactor reported them.
-fn readmitted(facts: &[CooldownFact]) -> Option<String> {
-    let mut cooled: Vec<(&str, Duration, Duration)> = Vec::new();
-    for fact in facts {
-        match fact {
-            CooldownFact::Started {
-                peer, cooldown, at, ..
-            } => cooled.push((peer, *at, at.saturating_add(*cooldown))),
-            CooldownFact::Admitted {
-                peer,
-                session_id,
-                at,
-            } => {
-                if let Some((_, from, until)) = cooled
-                    .iter()
-                    .find(|(cooled, _, until)| *cooled == peer.as_str() && at < until)
-                {
-                    return Some(format!(
-                        "ReadmittedInCooldown: the reactor admitted session {session_id} from \
-                         {peer} at {at:?}, inside the readmission cooldown it started at \
-                         {from:?} until {until:?}"
-                    ));
-                }
-            }
-            CooldownFact::Refused { .. } => {}
-        }
-    }
-    None
 }
 
 /// The reason failed operation `id`, from `request`, with `category`, owes,
@@ -544,6 +597,11 @@ impl CooldownEvidence {
     pub fn facts(&self) -> Vec<CooldownFact> {
         self.store().facts.clone()
     }
+
+    /// The facts after the first `read`, in order.
+    fn facts_after(&self, read: usize) -> Vec<CooldownFact> {
+        self.store().facts.get(read..).unwrap_or_default().to_vec()
+    }
 }
 
 /// The node's fault evidence: whom its storage failures blamed, the
@@ -557,8 +615,9 @@ pub struct FaultEvidence {
     /// The node's configured readmission cooldown.
     cooldown: Duration,
     settled: Rc<std::cell::Cell<Option<bool>>>,
-    /// The property's judge, which reads each log entry once.
-    judge: Rc<RefCell<Judge>>,
+    /// The property's judge, which reads each log entry and cooldown fact
+    /// once, made at its first check.
+    judge: Rc<RefCell<Option<Judge>>>,
 }
 
 /// What [`FaultEvidence::check`] found after a step.
@@ -617,23 +676,22 @@ impl FaultEvidence {
     /// session that installs the configured cooldown. No session from a
     /// peer is admitted while a cooldown started for it lasts.
     pub fn check(&self, entries: &[Entry]) -> FaultCheck {
-        let facts = self.cooldowns.facts();
-        let cooldowns = Cooldowns::Checked {
-            facts: &facts,
-            cooldown: self.cooldown,
-        };
         let mut judge = self.judge.borrow_mut();
-        judge.read(entries, &self.attributions, &cooldowns);
-        if let Some(why) = judge.failure().or_else(|| readmitted(&facts)) {
+        let judge = judge.get_or_insert_with(|| Judge {
+            mode: Mode::Judge {
+                cooldown: self.cooldown,
+            },
+            ..Judge::default()
+        });
+        judge.cooldowns(&self.cooldowns.facts_after(judge.facts_read));
+        judge.read(entries, &self.attributions);
+        if let Some(why) = judge.failure() {
             return FaultCheck::Broken(why);
         }
         if let Some(why) = judge.open() {
             return FaultCheck::Open(why);
         }
-        let started = facts
-            .iter()
-            .any(|fact| matches!(fact, CooldownFact::Started { .. }));
-        if judge.owed.is_empty() && !started {
+        if judge.owed.is_empty() && judge.started.is_empty() {
             FaultCheck::Nothing
         } else {
             FaultCheck::Holds
@@ -647,13 +705,11 @@ impl FaultEvidence {
     /// ([`untaken`]) leaves the rule inconclusive too, so a node that
     /// abandons such work can't pass it.
     pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
-        let facts = self.cooldowns.facts();
-        let cooldowns = Cooldowns::Checked {
-            facts: &facts,
+        let mode = Mode::Judge {
             cooldown: self.cooldown,
         };
-        let judge = Judge::over(entries, &self.attributions, &cooldowns);
-        if let Some(why) = judge.failure().or_else(|| readmitted(&facts)) {
+        let judge = Judge::over(mode, &self.cooldowns.facts(), entries, &self.attributions);
+        if let Some(why) = judge.failure() {
             return Acceptance::Violated(why);
         }
         let Some(&index) = judge.pending.first() else {
@@ -1140,5 +1196,27 @@ mod tests {
             .collect();
         assert_eq!(owed, vec![1, 2]);
         assert_eq!(untaken(&log, evidence.attributions()).unwrap(), vec![3]);
+    }
+
+    /// The check reads each cooldown fact once, as it arrives: a cooldown
+    /// recorded after one check counts at the next, and an admission
+    /// recorded later still breaks the rule.
+    #[test]
+    fn the_check_reads_cooldown_facts_as_they_arrive() {
+        let evidence = cooled(Vec::new());
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, vec![misbehavior_at(7, "aa", 3)]));
+        let handled_at = log.len() - 1;
+        assert!(matches!(
+            evidence.check(&log[..handled_at]),
+            FaultCheck::Open(_)
+        ));
+        evidence.cooldowns().record(started("aa", 3, 60, 2, 7));
+        assert_eq!(evidence.check(&log), FaultCheck::Holds);
+        evidence.cooldowns().record(admitted("aa", 4, 30));
+        assert!(matches!(
+            evidence.check(&log),
+            FaultCheck::Broken(why) if why.starts_with("ReadmittedInCooldown")
+        ));
     }
 }

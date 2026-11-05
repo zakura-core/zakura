@@ -15,14 +15,14 @@
 
 mod support;
 
-use std::{process::Command, time::Duration};
+use std::{collections::BTreeMap, process::Command, time::Duration};
 
-use zakura_network::zakura::ZAKURA_STREAM_HEADER_SYNC;
+use zakura_network::zakura::{ZakuraHeaderSyncConfig, ZAKURA_STREAM_HEADER_SYNC};
 
 use support::{
     inputs,
     prepare_fault::{redial_after_disconnect, scenario, LastView, Watched},
-    steer::steer,
+    steer::{steer, Pair},
 };
 use zakura_sim::{
     harness::{
@@ -36,7 +36,8 @@ use zakura_sim::{
     },
     observe::{ReactorFact, SessionStepFact, StorageFact, StorageRequest, TransportFact},
     peer::PeerAction,
-    Checker, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    Checker, MemorySink, Observation, ObservationLog, Plan, PlanInput, PropertyOutcome,
+    PropertyReport, RunEnd, RunReport, StepCtx, Violation,
 };
 
 /// The readmission cooldown the node's default config sets.
@@ -48,7 +49,33 @@ struct Steered {
     report: RunReport,
     view: StorageView,
     sessions: SessionEvidence,
+    times: StepTimes,
     plan: PlanInput,
+}
+
+/// The virtual time after each step since the run's start, which the log
+/// itself doesn't carry.
+#[derive(Default)]
+struct StepTimes(BTreeMap<u64, Duration>);
+
+impl StepTimes {
+    /// The time after `step`.
+    fn at(&self, step: u64) -> Duration {
+        *self.0.get(&step).expect("every step's time is recorded")
+    }
+}
+
+impl Checker for StepTimes {
+    /// Records the step's time.
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        self.0.insert(cx.step, cx.now.since_start());
+        None
+    }
+
+    /// Nothing.
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
 }
 
 /// Runs `scenario` under `plan` with `extra` beside the registered
@@ -83,15 +110,17 @@ fn steered(plan: PlanInput) -> Steered {
     let scenario = scenario(vec![PeerAction::Disconnect, PeerAction::Redial], true);
     let mut last = None;
     let (report, plan, _) = steer(plan, &redial_after_disconnect, &mut |plan, checker| {
-        let (run, view, sessions) = run(&scenario, plan, checker);
-        last = Some((view, sessions));
+        let mut times = StepTimes::default();
+        let (run, view, sessions) = run(&scenario, plan, &mut Pair(checker, &mut times));
+        last = Some((view, sessions, times));
         run
     });
-    let (view, sessions) = last.expect("the steered run's view");
+    let (view, sessions, times) = last.expect("the steered run's view");
     Steered {
         report,
         view,
         sessions,
+        times,
         plan,
     }
 }
@@ -165,6 +194,7 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
             report,
             view,
             sessions,
+            times,
             ..
         } = steered(plan);
         assert!(
@@ -204,44 +234,107 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
             "plan {index}: nothing from the peer is admitted: {facts:?}"
         );
 
-        // The redial reaches own-9 as a new header session, which the
-        // service parks for the published back-off, so the reactor never
-        // admits it.
+        // The redial reaches own-9 as a new header session inside the
+        // cooldown, and the service parks it, so the reactor never admits
+        // it. The back-off is what parks it: the peer's first connection
+        // was torn down first, so no live session collides with it, and
+        // the reactor held no session, so a peer slot was free.
+        let CooldownFact::Started { at: from, .. } = facts[started] else {
+            unreachable!("matched above");
+        };
         let redial = redialed(&report);
+        let parked = times.at(redial.parked);
         assert!(
-            !sessions.facts().iter().any(|fact| matches!(
+            from <= parked && parked < from + COOLDOWN,
+            "plan {index}: parked at {parked:?}, cooldown from {from:?}"
+        );
+        assert!(
+            redial.first_torn_down < redial.row,
+            "plan {index}: {redial:?}"
+        );
+        let session_facts = sessions.facts();
+        assert!(
+            matches!(
+                session_facts
+                    .iter()
+                    .filter(|fact| matches!(
+                        fact,
+                        SessionFact::SessionAdmitted { .. } | SessionFact::SessionEnded { .. }
+                    ))
+                    .collect::<Vec<_>>()[..],
+                [
+                    SessionFact::SessionAdmitted { session_id: admitted, .. },
+                    SessionFact::SessionEnded { session_id: ended, .. },
+                ] if admitted == ended && *admitted == session
+            ),
+            "plan {index}: {session_facts:?}"
+        );
+        assert!(
+            ZakuraHeaderSyncConfig::default()
+                .peer_limits
+                .max_inbound_peers
+                > 0
+        );
+        assert!(
+            !session_facts.iter().any(|fact| matches!(
                 fact,
-                SessionFact::SessionAdmitted { session_id, .. } if *session_id == redial
+                SessionFact::SessionAdmitted { session_id, .. } if *session_id == redial.session_id
             )),
-            "plan {index}: {:?}",
-            sessions.facts()
+            "plan {index}: {session_facts:?}"
         );
         assert_eq!(sessions.end_check(), EndCheck::Complete, "plan {index}");
     }
 }
 
-/// The session ID of the redial's header stream: own-9's header `Session`
-/// row on the peer's second connection, whose generation own-9 parked,
-/// never installed, and then let exit.
-fn redialed(report: &RunReport) -> u64 {
+/// Where the redial's header session shows in a run's log.
+#[derive(Debug)]
+struct Redial {
+    /// Its session ID, which own-9 also gave its generation.
+    session_id: u64,
+    /// The step that logged own-9 parking its generation.
+    parked: u64,
+    /// Where its `Session` row is in the log.
+    row: usize,
+    /// Where the peer's first connection's `torn-down` is in the log.
+    first_torn_down: usize,
+}
+
+/// The redial's header session: own-9's header `Session` row on the peer's
+/// second connection, whose generation own-9 parked, never installed, and
+/// then let exit.
+fn redialed(report: &RunReport) -> Redial {
     let entries = report.log.entries();
-    let rows: Vec<(u64, u64)> = entries
+    let rows: Vec<(usize, u64, u64)> = entries
         .iter()
-        .filter_map(|entry| match &entry.obs {
+        .enumerate()
+        .filter_map(|(at, entry)| match &entry.obs {
             Observation::Session {
                 connection,
                 peer,
                 kind: ZAKURA_STREAM_HEADER_SYNC,
                 session_id,
                 ..
-            } if peer == "peer-0" => Some((*connection, *session_id)),
+            } if peer == "peer-0" => Some((at, *connection, *session_id)),
             _ => None,
         })
         .collect();
-    let [_, (connection, session_id)] = rows[..] else {
+    let [(_, first, _), (row, connection, session_id)] = rows[..] else {
         panic!("the peer opens one header session per connection: {rows:?}");
     };
-    let steps: Vec<&SessionStepFact> = entries
+    let first_torn_down = entries
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.obs,
+                Observation::Transport {
+                    connection: Some(on),
+                    event: TransportFact::TornDown,
+                    ..
+                } if *on == first
+            )
+        })
+        .expect("the peer's first connection is torn down");
+    let steps: Vec<(u64, &SessionStepFact)> = entries
         .iter()
         .filter_map(|entry| match &entry.obs {
             Observation::Transport {
@@ -252,27 +345,29 @@ fn redialed(report: &RunReport) -> u64 {
                         step,
                     },
                 ..
-            } if *on == connection => Some(step),
+            } if *on == connection => Some((entry.step, step)),
             _ => None,
         })
-        .filter(|step| match step {
+        .filter(|(_, step)| match step {
             SessionStepFact::GenerationInstalled { generation, .. }
             | SessionStepFact::GenerationParked { generation }
             | SessionStepFact::GenerationExited { generation, .. } => *generation == session_id,
             _ => false,
         })
         .collect();
-    assert!(
-        matches!(
-            steps[..],
-            [
-                SessionStepFact::GenerationParked { .. },
-                SessionStepFact::GenerationExited { current: false, .. }
-            ]
-        ),
-        "own-9 parks the redial's generation, never installs it, and lets it exit: {steps:?}"
-    );
-    session_id
+    let [(parked, SessionStepFact::GenerationParked { .. }), (_, SessionStepFact::GenerationExited { current: false, .. })] =
+        steps[..]
+    else {
+        panic!(
+            "own-9 parks the redial's generation, never installs it, and lets it exit: {steps:?}"
+        );
+    };
+    Redial {
+        session_id,
+        parked,
+        row,
+        first_torn_down,
+    }
 }
 
 /// The witness's evidence under the steered `plan`: the cooldown facts, the

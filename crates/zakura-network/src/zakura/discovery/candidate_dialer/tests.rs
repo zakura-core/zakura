@@ -1186,8 +1186,9 @@ async fn a_candidate_larger_than_the_free_slots_yields_to_one_that_fits() {
 // V12 F-510, through the dialer loop: candidates whose dials fail at once
 // complete before the next round. One round dials the four concurrent dial
 // slots' worth. The completions must not start the next round early, and the
-// next round must still come one interval after the first.
-#[tokio::test]
+// next round must still come one interval after the first. Paused time keeps
+// the interval checks independent of the machine's speed.
+#[tokio::test(start_paused = true)]
 async fn the_dialer_loop_dials_once_per_interval_through_completions() {
     let node = crate::zakura::testkit::ZakuraTestNode::builder(9216)
         .spawn()

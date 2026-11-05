@@ -1625,6 +1625,268 @@ mod tests {
         assert_eq!(alive.load(counter::Ordering::Relaxed), 0);
     }
 
+    /// Records every event, in order.
+    #[derive(Debug, Default)]
+    struct Recorded(Mutex<Vec<ReactorEvent>>);
+
+    impl HeaderSyncObserver for Recorded {
+        fn observe(&self, event: ReactorEvent) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    impl Recorded {
+        /// The events recorded since the last call.
+        fn take(&self) -> Vec<ReactorEvent> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    /// A queue reporting to a new recorder, with `peer(1)`'s target staged,
+    /// and the observer slot that recorder sits in.
+    fn observed_queue() -> (PeerWorkQueue, Arc<Recorded>, ObserverSlot) {
+        let recorder = Arc::new(Recorded::default());
+        let observer = ObserverSlot(Some(recorder.clone()));
+        let mut queue = PeerWorkQueue::default();
+        queue.observed_by(&observer);
+        assert_eq!(
+            queue.stage(peer(1), advertisement(1), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        (queue, recorder, observer)
+    }
+
+    /// A page entry whose header `version` sets its hash apart.
+    fn versioned_entry(version: u32) -> HeaderEntry {
+        let mut header = *regtest_genesis_block().header;
+        header.version = version;
+        HeaderEntry {
+            header: Arc::new(header),
+            body_size: 0,
+            tree_aux: None,
+        }
+    }
+
+    /// Stages `entries` on `peer(1)`'s round as a page that frame `frame` of
+    /// subscription 3 brought on session 7.
+    fn stage_arrival(queue: &mut PeerWorkQueue, entries: Vec<HeaderEntry>, frame: u64) -> bool {
+        queue.stage_page(
+            &peer(1),
+            snapshot().frontiers.finalized,
+            entries,
+            Cursor {
+                height: block::Height(0),
+                hash: hash(0),
+                headers: 0,
+                bytes: 0,
+            },
+            PageArrival {
+                from_peer: peer(1),
+                from_session: 7,
+                subscription: 3,
+                frame: Some(frame),
+            },
+        )
+    }
+
+    /// An observed round reports its reservation's opening, binding and end,
+    /// each page it stages with that page's values, a continuation's
+    /// reservation and cancellation, the rounds of the leases a call holds,
+    /// the round's release, and each lease's return once its last holder
+    /// drops, in that order.
+    #[test]
+    fn an_observed_round_reports_its_capacity_in_order() {
+        let (mut queue, recorder, observer) = observed_queue();
+        let entries = [11, 12, 13].map(versioned_entry);
+        let [first, second, third] = entries.each_ref().map(|entry| entry.header.hash());
+
+        assert!(queue.reserve_request(&peer(1), 3));
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::ReservationOpened {
+                reservation: 1,
+                peer: peer(1),
+                purpose: ReservationPurpose::Ordinary,
+                headers: 3,
+                request: None,
+            }]
+        );
+
+        assert!(queue.start(active_request(1, advertisement(1), &snapshot(), Vec::new())));
+        let round = RequestRef::of(queue.active(&peer(1)).expect("the round started"));
+        let incarnation = round.incarnation;
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::ReservationBound {
+                reservation: 1,
+                request: round.clone(),
+                max_headers: 1_000,
+            }]
+        );
+
+        let staged = |hashes: Vec<block::Hash>, reserved_left, staged_total, frame| {
+            ReactorEvent::PageStaged {
+                from_peer: peer(1),
+                from_session: 7,
+                request: round.clone(),
+                reservation: 1,
+                subscription: 3,
+                frame: Some(frame),
+                headers: hashes.len(),
+                reserved_left,
+                stored: hashes.clone(),
+                hashes,
+                staged_total,
+            }
+        };
+        assert!(stage_arrival(
+            &mut queue,
+            vec![entries[0].clone(), entries[1].clone()],
+            9
+        ));
+        assert_eq!(recorder.take(), [staged(vec![first, second], 1, 2, 9)]);
+
+        // The page that spends the reservation reports before its end.
+        assert!(stage_arrival(&mut queue, vec![entries[2].clone()], 10));
+        assert_eq!(
+            recorder.take(),
+            [
+                staged(vec![third], 0, 3, 10),
+                ReactorEvent::ReservationEnded {
+                    reservation: 1,
+                    released: 0,
+                    cause: ReservationEnd::Staged,
+                },
+            ]
+        );
+
+        // A continuation names the running round, and its cancellation
+        // returns every header it held.
+        assert!(queue.reserve_request(&peer(1), 2));
+        queue.cancel_request_reservation(&peer(1));
+        assert_eq!(
+            recorder.take(),
+            [
+                ReactorEvent::ReservationOpened {
+                    reservation: 2,
+                    peer: peer(1),
+                    purpose: ReservationPurpose::Ordinary,
+                    headers: 2,
+                    request: Some(round.clone()),
+                },
+                ReactorEvent::ReservationEnded {
+                    reservation: 2,
+                    released: 2,
+                    cause: ReservationEnd::Cancelled,
+                },
+            ]
+        );
+
+        let call = StorageCall {
+            number: 1,
+            kind: StorageCallKind::Prepare,
+        };
+        let mut held = queue
+            .retain_headers(&peer(1), call)
+            .expect("the round started");
+        held.observed_by(&observer);
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::HeadersHeld {
+                call: 1,
+                kind: StorageCallKind::Prepare,
+                peer: peer(1),
+                incarnation,
+                headers: 3,
+                leases: vec![incarnation, incarnation],
+            }]
+        );
+
+        // The call still holds both leases, so the release returns neither.
+        assert!(queue.remove(&peer(1)).is_some());
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::RoundReleased {
+                peer: peer(1),
+                incarnation,
+                queue_owned: 0,
+            }]
+        );
+
+        drop(held);
+        let returned = |headers| ReactorEvent::LeaseReturned {
+            peer: peer(1),
+            incarnation,
+            headers,
+        };
+        assert_eq!(
+            recorder.take(),
+            [
+                ReactorEvent::HeadersEnded {
+                    call: 1,
+                    incarnation,
+                    headers: 3,
+                    end: HeaderWorkEnd::Dropped,
+                },
+                returned(2),
+                returned(1),
+            ]
+        );
+    }
+
+    /// Removing a round ends its reservation as released and returns the
+    /// leases only the queue held before it reports the release, and the
+    /// queue's own drop ends a reservation it still holds.
+    #[test]
+    fn a_removed_round_returns_its_capacity_before_its_release_reports() {
+        let (mut queue, recorder, _observer) = observed_queue();
+        assert!(queue.reserve_request(&peer(1), 2));
+        assert!(queue.start(active_request(1, advertisement(1), &snapshot(), Vec::new())));
+        let incarnation = queue
+            .active(&peer(1))
+            .expect("the round started")
+            .incarnation()
+            .get();
+        assert!(stage_arrival(&mut queue, vec![versioned_entry(11)], 9));
+        assert!(queue.reserve_request(&peer(2), 4));
+        recorder.take();
+
+        assert!(queue.remove(&peer(1)).is_some());
+        assert_eq!(
+            recorder.take(),
+            [
+                ReactorEvent::ReservationEnded {
+                    reservation: 1,
+                    released: 1,
+                    cause: ReservationEnd::Released,
+                },
+                ReactorEvent::LeaseReturned {
+                    peer: peer(1),
+                    incarnation,
+                    headers: 1,
+                },
+                ReactorEvent::RoundReleased {
+                    peer: peer(1),
+                    incarnation,
+                    queue_owned: 0,
+                },
+            ]
+        );
+
+        drop(queue);
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::ReservationEnded {
+                reservation: 2,
+                released: 4,
+                cause: ReservationEnd::Dropped,
+            }]
+        );
+    }
+
     #[test]
     fn malformed_overreturn_preserves_reservation_until_terminal_cleanup() {
         let budget = HeaderChunkBudget::default();

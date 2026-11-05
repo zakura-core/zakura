@@ -603,6 +603,7 @@ mod tests {
         tokio::io::AsyncWriteExt::write_all(&mut writer, b"second\n")
             .await
             .unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut writer).await.unwrap();
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
             b"first\n"[..]
@@ -610,9 +611,17 @@ mod tests {
         tokio::io::AsyncWriteExt::write_all(&mut writer, &vec![b'x'; 256 * 1024])
             .await
             .unwrap();
+        // Tokio write_all can return before its blocking write reaches the OS.
+        // Flush before capturing a prefix larger than the worker's two chunks
+        // of bounded prefetch, so truncation must interrupt an unfinished read.
+        tokio::io::AsyncWriteExt::flush(&mut writer).await.unwrap();
         let response = export(dir.path(), "conn", &hyper::HeaderMap::new())
             .await
             .unwrap();
+        assert_eq!(
+            response.headers()[hyper::header::CONTENT_LENGTH],
+            (b"first\nsecond\n".len() + 256 * 1024).to_string()
+        );
         writer.set_len(0).await.unwrap();
         assert!(response.into_body().collect().await.is_err());
     }
@@ -643,6 +652,7 @@ mod tests {
             .into_data()
             .unwrap();
         writer.write_all(b"new rows\n").await.unwrap();
+        writer.flush().await.unwrap();
         let tail = first_body.collect().await.unwrap().to_bytes();
         let first_bytes = [head.as_ref(), tail.as_ref()].concat();
         assert_eq!(first_bytes.len(), 1024 * 1024);
@@ -654,6 +664,7 @@ mod tests {
             "bytes 1048576-2097151/2097152"
         );
         writer.write_all(b"more rows\n").await.unwrap();
+        writer.flush().await.unwrap();
         let second_bytes = second.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
             [first_bytes.as_slice(), second_bytes.as_ref()].concat(),

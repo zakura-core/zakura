@@ -304,7 +304,7 @@ jobs:
       # keep pulling anonymously.
       - name: Login to DockerHub for pulls
         if: ${{ github.repository == 'zakura-core/zakura' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
@@ -608,7 +608,7 @@ jobs:
       # keep pulling anonymously.
       - name: Login to DockerHub for pulls
         if: ${{ github.repository == 'zakura-core/zakura' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
@@ -636,7 +636,7 @@ jobs:
           ${{ !inputs.dry_run
             && github.repository == 'zakura-core/zakura'
             && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
@@ -702,7 +702,7 @@ jobs:
     needs: [resolve-release, build]
     steps:
       - name: Login to DockerHub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
@@ -764,7 +764,7 @@ jobs:
       # keep pulling anonymously.
       - name: Login to DockerHub for pulls
         if: ${{ github.repository == 'zakura-core/zakura' }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
@@ -792,7 +792,7 @@ jobs:
           ${{ !inputs.dry_run
             && github.repository == 'zakura-core/zakura'
             && (startsWith(github.ref, 'refs/tags/v') || inputs.publish_docker_to_dockerhub) }}
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}
@@ -869,7 +869,7 @@ jobs:
     needs: [resolve-release, resolve-zcashd-compat-manifest, build-zcashd-compat]
     steps:
       - name: Login to DockerHub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 #v4.7.0
         with:
           username: valaroman
           password: ${{ secrets.DOCKERHUB_TOKEN_ZAKURA }}

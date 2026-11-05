@@ -131,6 +131,12 @@ test = "regenerate_saved_plans"
 run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
+[[ignored]]
+file = "crates/zakura-sim/tests/header_storage_seeds.rs"
+test = "regenerate_storage_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed seeds"
+
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
 # `zakura_sim release` and `zakura_sim asan` jobs make. The ASan lane needs
@@ -167,12 +173,14 @@ smoke-secs = 60
 timeout-secs = 1800
 
 # The action grammar is built for 4,096-byte inputs, as qa/fuzz/sim's README
-# says.
+# says. Each run takes tens to hundreds of milliseconds, so libFuzzer's
+# default length control would keep mutations under the 344-byte scenario
+# prefix for hours. `-len_control=0` lets them reach the whole input at once.
 [[target]]
 package = "sim"
 name = "header_sync_storage"
 smoke-secs = 60
-args = ["-max_len=4096"]
+args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800
 
 # `fixtures/all` picks any race fixture in any variant, so the target's runs

@@ -260,6 +260,9 @@ pub(crate) struct ServiceStream {
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
     pub(crate) cancel_token: CancellationToken,
+    /// Where the stream's session came from, if its builder said.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) origin: Option<SessionOrigin>,
 }
 
 impl ServiceStream {
@@ -276,6 +279,8 @@ impl ServiceStream {
             recv,
             send,
             cancel_token,
+            #[cfg(any(test, zakura_sim))]
+            origin: None,
         }
     }
 }
@@ -325,9 +330,6 @@ pub struct Peer {
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
     close_cause: CloseCause,
-    /// Where the session came from, if whoever built the peer said.
-    #[cfg(any(test, zakura_sim))]
-    origin: Option<SessionOrigin>,
 }
 
 impl Peer {
@@ -521,24 +523,25 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
-            #[cfg(any(test, zakura_sim))]
-            origin: None,
         }
     }
 
-    /// This peer, carrying `origin` to the service that admits its session.
+    /// This peer, with every stream it carries reporting `origin` as where
+    /// its session came from. An in-memory peer from [`Peer::new_versioned`]
+    /// carries one stream, so its one session takes `origin`.
     #[cfg(any(test, zakura_sim))]
-    pub fn with_origin(self, origin: SessionOrigin) -> Self {
-        Self {
-            origin: Some(origin),
-            ..self
+    pub fn with_origin(mut self, origin: SessionOrigin) -> Self {
+        for stream in self.streams.values_mut() {
+            stream.origin = Some(origin);
         }
+        self
     }
 
-    /// Where this peer's session came from, if its builder said.
+    /// Where the session of this peer's `kind` stream came from, if its
+    /// builder said.
     #[cfg(any(test, zakura_sim))]
-    pub fn origin(&self) -> Option<SessionOrigin> {
-        self.origin
+    pub fn origin(&self, kind: u16) -> Option<SessionOrigin> {
+        self.streams.get(&kind).and_then(|stream| stream.origin)
     }
 
     /// Take ownership of a stream's receive and send handles for `kind`.

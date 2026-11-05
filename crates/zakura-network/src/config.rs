@@ -836,6 +836,9 @@ impl Config {
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to
     /// `p2p_stack`, so the stack is never re-derived from the network's binary defaults.
     ///
+    /// [`identity_dir`](Self::identity_dir) is a fresh [`test_identity_dir`], so a test
+    /// endpoint never reads or overwrites a real node's identity files.
+    ///
     /// Override other fields with struct-update syntax, e.g.
     /// `Config { network, ..Config::for_test(P2pStack::Dual) }`.
     ///
@@ -853,6 +856,7 @@ impl Config {
 
         Config {
             p2p_stack,
+            identity_dir: test_identity_dir(),
             zakura: ZakuraConfig {
                 listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
                 ..ZakuraConfig::default()
@@ -860,6 +864,19 @@ impl Config {
             ..Config::default()
         }
     }
+}
+
+/// Returns a new directory path under [`std::env::temp_dir`] for a test node's
+/// identity files. The default `~/.zakura` holds a real node's identity key and
+/// discovery sequence, which a test endpoint would otherwise read and overwrite.
+///
+/// The path is not created: the first write creates it, and it outlives the test.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub(crate) fn test_identity_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "zakura-test-identity-{:016x}",
+        rand_10::random::<u64>()
+    ))
 }
 
 /// Loads a persisted Zakura secret key from `key_file`, or generates, persists, and

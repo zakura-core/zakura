@@ -398,6 +398,25 @@ mod tests {
     /// break. The same log blaming the request's source owes one.
     #[test]
     fn a_fault_blaming_another_source_owes_nothing() {
+        // Through the storage source's projection: a typed failure of a
+        // request naming source A that blames source B keeps B's digest, and
+        // owes nothing.
+        use zakura_header_chain::{Attribution, ErrorCategory, SourceId};
+        use zakura_storage::header::evidence::ResultIdentity;
+
+        let digest = |byte: u8| -> String { format!("{byte:02x}").repeat(32) };
+        let failed = |blamed: u8| ResultIdentity::PrepareFailed {
+            category: ErrorCategory::InvalidHeader,
+            attribution: Attribution::HeaderPeer(SourceId::from_digest([blamed; 32])),
+        };
+        let log = failed_prepare(1, &digest(0xaa), 3, "invalid_header");
+        let projected = FaultAttributions::default();
+        projected.record_result(NODE, 1, &failed(0xbb));
+        assert_eq!(projected.get(NODE, 1), Some(blame(&digest(0xbb))));
+        assert_eq!(owed(&log, &projected).unwrap(), Vec::new());
+        projected.record_result(NODE, 1, &failed(0xaa));
+        assert_eq!(owed(&log, &projected).unwrap().len(), 1);
+
         let log = failed_prepare(1, "aa", 3, "invalid_header");
         assert_eq!(
             evidence(&[(1, blame("bb"))]).penalized(&log),

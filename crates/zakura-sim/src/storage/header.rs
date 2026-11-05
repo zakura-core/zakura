@@ -135,15 +135,19 @@ impl FaultAttributions {
     /// Records whom `fact` blamed, if it completes a failed prepare or apply
     /// of storage `instance`.
     fn record(&self, instance: u64, fact: &Fact) {
-        let FactKind::Completed(completion) = &fact.kind else {
-            return;
-        };
-        let (ResultIdentity::PrepareFailed { attribution, .. }
-        | ResultIdentity::ApplyFailed { attribution, .. }) = &completion.result
-        else {
-            return;
-        };
-        self.insert(instance, completion.id.0, Blame::of(*attribution));
+        if let FactKind::Completed(completion) = &fact.kind {
+            self.record_result(instance, completion.id.0, &completion.result);
+        }
+    }
+
+    /// Records whom `result` blamed, if it's a failed prepare or apply, as
+    /// operation `id` of storage `instance`.
+    pub(crate) fn record_result(&self, instance: u64, id: u64, result: &ResultIdentity) {
+        if let ResultIdentity::PrepareFailed { attribution, .. }
+        | ResultIdentity::ApplyFailed { attribution, .. } = result
+        {
+            self.insert(instance, id, Blame::of(*attribution));
+        }
     }
 
     /// Records that operation `id` of storage `instance` blamed `blame`.

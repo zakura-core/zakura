@@ -17,7 +17,11 @@ use zakura_node_services::block_memory::BlockHandle;
 use tower::{BoxError, Service, ServiceExt};
 use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
-    block::{self, merkle::AuthDataRoot, Block, HeightDiff},
+    block::{
+        self,
+        merkle::{AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
+        Block, HeightDiff,
+    },
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
     ironwood, orchard,
@@ -906,10 +910,28 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
 }
 
 /// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
+///
+/// Unlike the semantic verifier, which checks the transaction Merkle root before it hashes any
+/// authorizing data, these constructors run for a body that is already bound to its header: a
+/// block another verifier committed, a block read back from disk, or the tip loaded at start-up.
+/// They need both the IDs and the root, so each transaction's shared ZIP-244 decomposition is
+/// walked once, in parallel across the block.
 fn transaction_hashes_and_auth_data_root(
     block: &block::BlockRef,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
-    (block.transaction_hashes(), block.auth_data_digests().root)
+    use rayon::prelude::*;
+
+    let (transaction_hashes, auth_digests): (Vec<_>, Vec<_>) = block
+        .parallel_transactions()
+        .map(|transaction| transaction.txid_and_auth_digest())
+        .unzip();
+
+    let auth_data_root = auth_digests
+        .into_iter()
+        .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+        .collect();
+
+    (transaction_hashes.into(), auth_data_root)
 }
 
 #[cfg(test)]

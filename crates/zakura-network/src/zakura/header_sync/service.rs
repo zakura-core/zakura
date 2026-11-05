@@ -683,6 +683,8 @@ impl Service for HeaderSyncService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
+        #[cfg(any(test, zakura_sim))]
+        let origin = peer.origin(ZAKURA_STREAM_HEADER_SYNC);
         let Some((session_id, stream_version, recv, send)) =
             peer.take_versioned_stream_with_session_id(ZAKURA_STREAM_HEADER_SYNC)
         else {
@@ -758,7 +760,7 @@ impl Service for HeaderSyncService {
             status,
         );
         #[cfg(any(test, zakura_sim))]
-        let session = session.with_origin(peer.origin());
+        let session = session.with_origin(origin);
         let (publisher, publishing) = sim_arg!(spawn_publisher(
             &self.header_sync,
             header_bytes,

@@ -18,7 +18,9 @@
 //! the address. That's also when the tap opens loss on the session's links,
 //! through [`Net::admitted`]. A dial of the node's that fails before any
 //! connection registers is reported through the tap too, as `dial-failed`
-//! keyed by the dialed address (M5-F).
+//! keyed by the dialed address (M5-F). A tap with a session view also feeds
+//! it every transport event as the transport reports it, for hdr-5's join of
+//! the reactor's sessions to own-9's facts.
 
 use std::{
     collections::BTreeMap,
@@ -47,7 +49,7 @@ use zakura_quic::{
 use zakura_rt::{sim::RunId, sync::watch};
 use zakura_scheduler::SimInstant;
 
-use super::header_node::HeaderNode;
+use super::header_node::{session::SessionEvidence, HeaderNode};
 use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
@@ -201,6 +203,8 @@ struct TapState {
     /// Set when something reported an event outside `run`.
     refused: AtomicBool,
     buffer: Mutex<Buffer>,
+    /// The node's session view, fed each transport event as it's reported.
+    sessions: Option<SessionEvidence>,
 }
 
 /// Events reported and not yet drained.
@@ -227,13 +231,16 @@ impl TapState {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Numbers and buffers `event`, or refuses it outside the tap's run.
-    /// Neither step yields, and the buffer's std lock is never held across
-    /// another call.
+    /// Numbers and buffers `event`, or refuses it outside the tap's run. A
+    /// transport event reaches the session view first. No step yields, and
+    /// no std lock is held across another call.
     fn push(&self, event: Reported) {
         if zakura_rt::sim::run_id() != Some(self.run) {
             self.refused.store(true, Ordering::Relaxed);
             return;
+        }
+        if let (Some(sessions), Reported::Event(event)) = (&self.sessions, &event) {
+            sessions.transport(event);
         }
         let mut buffer = self.buffer();
         buffer.last = buffer
@@ -296,6 +303,22 @@ impl TransportTap {
         net: Net,
         peers: Vec<String>,
     ) -> (Arc<dyn TransportObserver>, TransportTap) {
+        TransportTap::with_sessions(sim, node, net, peers, None)
+    }
+
+    /// [`TransportTap::new`], also feeding every transport event to
+    /// `sessions`, the node's session view, if given.
+    ///
+    /// # Panics
+    ///
+    /// As [`TransportTap::new`] does.
+    pub fn with_sessions(
+        sim: &mut Sim,
+        node: &str,
+        net: Net,
+        peers: Vec<String>,
+        sessions: Option<SessionEvidence>,
+    ) -> (Arc<dyn TransportObserver>, TransportTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
@@ -303,6 +326,7 @@ impl TransportTap {
                 observer: observer.clone(),
                 refused: AtomicBool::new(false),
                 buffer: Mutex::default(),
+                sessions,
             }))
         });
         let state = observer.0.clone();

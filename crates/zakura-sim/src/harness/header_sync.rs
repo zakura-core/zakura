@@ -44,7 +44,7 @@ use crate::{
     domain::session::{honest_never_punished, HonestPeers},
     observe::StorageFact,
     peer::{
-        adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, Dialer as PeerDialer,
+        adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
         PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
@@ -740,6 +740,10 @@ pub struct WirePorts {
     pub chains: Vec<Option<Arc<HonestChain>>>,
     /// What the node's reactor was started with, once the run builds it.
     pub startup: Rc<RefCell<Option<StartupFacts>>>,
+    /// The node's session view, which its reactor and transport taps fill
+    /// during the run, joined to own-9's facts. One prepared `WirePorts`
+    /// serves one run.
+    pub sessions: SessionEvidence,
     /// The peers' records the identity map hasn't placed yet.
     records: PeerRecords,
 }
@@ -859,14 +863,17 @@ impl Subsystem for HeaderWire {
             node,
             chains,
             startup: Rc::default(),
+            sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
         }
     }
 
     /// Adds the network, then spawns the node as `header-sync/storage` does,
     /// with its reactor tapped, behind its transport, which its own tap
-    /// reports. Then spawns each peer, and a dial for each peer the node
-    /// dials, and adds the peers' action source.
+    /// reports. Both taps feed the node's session view in
+    /// [`WirePorts::sessions`], which joins the reactor's sessions to
+    /// own-9's facts. Then spawns each peer, and a dial for each peer the
+    /// node dials, and adds the peers' action source.
     fn build(sim: &mut Sim, scenario: &WireScenario, ports: WirePorts) -> Self {
         let net = scenario.net.net();
         sim.add_source(Box::new(net.clone()));
@@ -877,7 +884,17 @@ impl Subsystem for HeaderWire {
             scenario.policy.clone(),
             Effects::default(),
         );
-        let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
+        let names: Vec<String> = (0..scenario.peers.len())
+            .map(|index| format!("peer-{index}"))
+            .collect();
+        ports.sessions.expect_transport(
+            (0..)
+                .zip(&names)
+                .map(|(index, name)| (peer_id(scenario.net.seed, index), name.clone()))
+                .collect(),
+        );
+        let (observer, tap) =
+            ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
         let adoption = tap.adoption();
         sim.add_source(Box::new(storage.with_tap(tap)));
         let header = HeaderNode::spawn(
@@ -891,10 +908,13 @@ impl Subsystem for HeaderWire {
             Some(observer),
         );
         *ports.startup.borrow_mut() = Some(header.startup.clone());
-        let names: Vec<String> = (0..scenario.peers.len())
-            .map(|index| format!("peer-{index}"))
-            .collect();
-        let (observer, tap) = TransportTap::new(sim, "node", net.clone(), names.clone());
+        let (observer, tap) = TransportTap::with_sessions(
+            sim,
+            "node",
+            net.clone(),
+            names.clone(),
+            Some(ports.sessions.clone()),
+        );
         let dials = tap.dials();
         sim.add_source(Box::new(tap));
         let node = WireNode::spawn(

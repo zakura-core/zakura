@@ -264,6 +264,10 @@ pub(super) fn spawn_service_session(
         session_id: primary.context.stream_id,
         cancel_token: cancel.clone(),
         streams: Vec::with_capacity(streams.len()),
+        #[cfg(any(test, zakura_sim))]
+        quic_stream: primary.io.0.as_ref().map(|(send, _)| send.id()),
+        #[cfg(any(test, zakura_sim))]
+        origin: None,
     };
     let exit = SessionExit {
         stream: primary.stream,

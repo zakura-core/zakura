@@ -133,6 +133,8 @@ pub struct Sim {
     config: RunConfig,
     /// The harness's task holds.
     holds: Vec<Box<dyn TaskHold>>,
+    /// Run once the log freezes, before the scheduler shuts down.
+    on_frozen: Vec<Box<dyn FnOnce()>>,
 }
 
 impl Sim {
@@ -158,7 +160,16 @@ impl Sim {
             run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             config,
             holds: Vec::new(),
+            on_frozen: Vec::new(),
         }
+    }
+
+    /// Runs `hook` once the run's log freezes, before the scheduler shuts
+    /// down. Shutdown still resumes the run's suspended tasks, so evidence a
+    /// harness keeps beside the log freezes here too, and what cleanup
+    /// reports can't change what the run ended with.
+    pub(crate) fn on_frozen(&mut self, hook: impl FnOnce() + 'static) {
+        self.on_frozen.push(Box::new(hook));
     }
 
     /// Keeps the ready tasks `hold` names out of each step's enabled set,
@@ -280,6 +291,9 @@ impl Sim {
             _ => properties,
         };
         state.log.freeze();
+        for hook in std::mem::take(&mut self.on_frozen) {
+            hook();
+        }
         let cleanup = self.shut_down();
         sink.record(Record::End(end_record(
             &end,
@@ -591,13 +605,32 @@ impl Sim {
 
     /// The evidence failure that ends a run which `end` didn't already end
     /// at a harness failure, if any of its evidence sources was dropped, or skipped
-    /// a boundary, after its last observation. Checked before the log
-    /// freezes, so the run's own shutdown, after it, never fails here.
+    /// a boundary, after its last observation. A run that ended idle or at its
+    /// budget also fails if a source's evidence is unfinished, such as a stop the
+    /// harness began that hasn't ended. A violation ends a run early on purpose,
+    /// so it skips that check. Checked before the log freezes, so the run's own
+    /// shutdown, after it, never fails here.
     fn end_evidence(&self, end: &RunEnd, st: &State) -> Option<HarnessFailure> {
         match end.outcome {
             Outcome::Harness => None,
-            _ => self.check_evidence(st).err(),
+            Outcome::Violation => self.check_evidence(st).err(),
+            Outcome::Budget | Outcome::Idle { .. } => self
+                .check_evidence(st)
+                .err()
+                .or_else(|| self.unfinished_evidence()),
         }
+    }
+
+    /// The first evidence source whose evidence is unfinished
+    /// ([`LiveEvidence::unfinished`]), as a failure.
+    fn unfinished_evidence(&self) -> Option<HarnessFailure> {
+        self.evidence.iter().find_map(|(instance, checkpoint)| {
+            let detail = checkpoint.live()?.unfinished()?;
+            Some(HarnessFailure::SourceEvidence {
+                source: checkpoint.kind().source(*instance),
+                detail: detail.to_owned(),
+            })
+        })
     }
 
     /// Requires every evidence checkpoint to name the current step, with

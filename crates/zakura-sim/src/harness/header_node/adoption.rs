@@ -217,6 +217,8 @@ struct Store {
     horizon: Duration,
     /// Whether the run settled, once it has ended.
     settled: Option<bool>,
+    /// Set when the run's log froze. Facts after it are dropped.
+    frozen: bool,
 }
 
 /// One reactor's adoption facts, shared by its tap and the harness's view.
@@ -231,15 +233,21 @@ impl AdoptionEvidence {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records `fact`, reported at `at`, unless the run has ended. The
-    /// scheduler's cleanup still runs a task stopped partway through a poll
-    /// to its end, with the run's clock installed, so a fact it reports then
-    /// would rewrite what the run showed when it ended.
+    /// Records `fact`, reported at `at`, unless the evidence is frozen.
     pub(super) fn record(&self, at: Duration, fact: AdoptionFact) {
         let mut store = self.store();
-        if store.settled.is_none() {
+        if !store.frozen {
             store.facts.push(Stamped { at, fact });
         }
+    }
+
+    /// Stops recording facts. The tap calls it when the run's log freezes,
+    /// as the session view does: the scheduler's shutdown still runs a task
+    /// stopped partway through a poll to its end, with the run's clock
+    /// installed, and a fact it reports then would rewrite what the run ended
+    /// with.
+    pub(super) fn freeze(&self) {
+        self.store().frozen = true;
     }
 
     /// Records that the run reached `at`.
@@ -248,8 +256,7 @@ impl AdoptionEvidence {
         store.horizon = store.horizon.max(at);
     }
 
-    /// Records how the run ended, and freezes the facts (see
-    /// [`AdoptionEvidence::record`]). It settled if it ended with no task
+    /// Records how the run ended. It settled if it ended with no task
     /// ready: idle with every task finished or waiting outside the scheduler,
     /// or after a drain that ran out of ready tasks. Any other end, such as a
     /// drain cut off at its bound, a violation or a harness failure, can stop
@@ -723,6 +730,7 @@ mod tests {
         // nothing.
         let frozen = evidence(vec![(0, adopted(&first))], 0);
         frozen.end(&run_end(Outcome::Budget, drained(true)));
+        frozen.freeze();
         frozen.record(Duration::ZERO, published(first.header_best));
         assert!(matches!(frozen.tip(), Acceptance::Inconclusive(_)));
         let skipped = evidence(vec![(0, adopted(&first)), (0, adopted(&second))], 0);

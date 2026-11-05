@@ -355,7 +355,8 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
-    /// `sessions`, which this tap's run binds and freezes with its log.
+    /// `sessions`, which this tap's run binds and freezes with its log. Its
+    /// adoption evidence freezes with the log too.
     ///
     /// # Panics
     ///
@@ -372,6 +373,11 @@ impl ReactorTap {
             let sessions = sessions.clone();
             move || sessions.freeze()
         });
+        let adoption = AdoptionEvidence::default();
+        sim.on_frozen({
+            let adoption = adoption.clone();
+            move || adoption.freeze()
+        });
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -384,7 +390,7 @@ impl ReactorTap {
                 buffer: Mutex::default(),
                 work: Mutex::default(),
                 sessions,
-                adoption: AdoptionEvidence::default(),
+                adoption,
             }))
         });
         let state = observer.0.clone();

@@ -111,7 +111,7 @@ impl ReactorState {
     /// so neither replacing nor reconnecting a session resets them.
     ///
     /// A new peer joins the back of the repair supplier order. A replacement
-    /// keeps its position until [`Self::requeue_supplier`] moves it.
+    /// keeps its position until [`Self::rotate_supplier`] moves it.
     ///
     /// The replaced session's pending `Close` dies with it. The peer's pending
     /// locator read stays pending until its storage operation settles.
@@ -563,26 +563,19 @@ impl ReactorState {
         self.vct_supplier_order.push_back(peer);
     }
 
-    /// Forget a replaced session's repair history and move it to the back of the supplier order.
-    pub(super) fn requeue_supplier(&mut self, source: zakura_header_chain::SourceId) {
-        if let Some(task) = self.vct_repair.current_mut() {
-            task.forget_source(source);
-        }
-        self.rotate_supplier(source);
-    }
-
     /// Apply `retry`'s attribution to `owner`'s repair and report whether a retry is scheduled.
     ///
     /// Supplier and excluded-input failures charge the supplier and rotate it to the back
-    /// of the supplier order. A local failure backs the repair off until
-    /// [`VCT_REPAIR_RETRY_INTERVAL`] after `now`. A stale episode schedules nothing.
-    /// When the supplier's session is no longer current, the departed session's failure
-    /// history leaves the task.
+    /// of the supplier order. A charge stays with the supplier's identity across session
+    /// replacement and disconnect, until the episode ends or
+    /// [`RepairRequirement::retain_connected_sources`] releases it. A session that ended before its
+    /// supplier answered charges nothing. A `TargetNotSelected` answer waits for a status
+    /// other than the one the request was built from. A local failure backs the repair off
+    /// until [`VCT_REPAIR_RETRY_INTERVAL`] after `now`. A stale episode schedules nothing.
     pub(super) fn schedule_repair_retry(
         &mut self,
         owner: zakura_header_chain::BodyWorkOwner,
         retry: VctRepairRetry,
-        session_is_current: bool,
         now: Instant,
     ) -> bool {
         let source = retry.source;
@@ -590,13 +583,14 @@ impl ReactorState {
             self.vct_repair
                 .get_mut(owner)
                 .is_some_and(|task| match retry.attribution {
-                    VctRepairRetryAttribution::Supplier => {
-                        if retry.terminal == HeaderRequestTerminal::TargetNotSelected {
+                    VctRepairRetryAttribution::Supplier => match retry.terminal {
+                        HeaderRequestTerminal::SessionReplaced
+                        | HeaderRequestTerminal::Disconnected => task.requeue(source).is_ok(),
+                        HeaderRequestTerminal::TargetNotSelected => {
                             task.wait_for_supplier_status(source).is_ok()
-                        } else {
-                            task.retry(source).is_ok()
                         }
-                    }
+                        _ => task.retry(source).is_ok(),
+                    },
                     VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
                     VctRepairRetryAttribution::Stale => false,
                     VctRepairRetryAttribution::Local => task
@@ -605,13 +599,6 @@ impl ReactorState {
                 });
         if !scheduled {
             return false;
-        }
-        if !session_is_current {
-            // Retained local work can finish after its supplier reconnects.
-            // Its failure history belongs to the departed session.
-            if let Some(task) = self.vct_repair.get_mut(owner) {
-                task.forget_source(source);
-            }
         }
         if retry.attribution.charges_supplier() {
             self.rotate_supplier(source);
@@ -660,7 +647,6 @@ impl ReactorState {
             .vct_repair
             .current()
             .filter(|task| task.repair_generation == record.generation)
-            .cloned()
         else {
             self.vct_repair_stall = None;
             return None;
@@ -673,6 +659,8 @@ impl ReactorState {
         if !trace && !report {
             return None;
         }
+        // Copy the task, with its supplier history, only when output is due.
+        let task = task.clone();
         let best_peer_tip = self
             .peers
             .values()

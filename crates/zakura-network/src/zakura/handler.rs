@@ -2225,6 +2225,13 @@ struct AdmittedSession {
     session_id: u64,
     cancel_token: CancellationToken,
     streams: Vec<ServiceStreamRole>,
+    /// The primary stream's QUIC stream ID, if it has one.
+    #[cfg(any(test, zakura_sim))]
+    quic_stream: Option<u64>,
+    /// Where the session came from, once [`ServiceSessionIO::with_origin`]
+    /// says. Every member stream reports it.
+    #[cfg(any(test, zakura_sim))]
+    origin: Option<crate::zakura::SessionOrigin>,
 }
 
 struct ServiceStreamRole {
@@ -2239,16 +2246,19 @@ impl AdmittedSession {
         self.streams
             .into_iter()
             .map(|role| {
-                (
-                    role.kind,
-                    ServiceStream::new(
-                        self.session_id,
-                        role.version,
-                        role.recv,
-                        role.send,
-                        self.cancel_token.clone(),
-                    ),
-                )
+                let stream = ServiceStream::new(
+                    self.session_id,
+                    role.version,
+                    role.recv,
+                    role.send,
+                    self.cancel_token.clone(),
+                );
+                #[cfg(any(test, zakura_sim))]
+                let stream = ServiceStream {
+                    origin: self.origin,
+                    ..stream
+                };
+                (role.kind, stream)
             })
             .collect()
     }
@@ -2283,6 +2293,33 @@ impl ServiceSessionIO {
             conn,
             close_cause,
         }
+    }
+
+    /// `admitted`, reporting where its session came from: connection
+    /// `conn_id`, its primary QUIC stream, and the generation this state
+    /// installed for it, which is kept apart from the session ID the
+    /// service is handed. A session with no QUIC stream or no installed
+    /// generation reports none.
+    #[cfg(any(test, zakura_sim))]
+    fn with_origin(
+        &self,
+        conn_id: ZakuraConnId,
+        mut admitted: AdmittedSession,
+        opened_locally: bool,
+    ) -> AdmittedSession {
+        let generation = self
+            .sessions
+            .get(&admitted.kind)
+            .and_then(|session| session.installed(opened_locally));
+        admitted.origin = admitted
+            .quic_stream
+            .zip(generation)
+            .map(|(quic_stream, generation)| crate::zakura::SessionOrigin {
+                connection: conn_id,
+                quic_stream: Some(quic_stream),
+                generation,
+            });
+        admitted
     }
 
     fn session(&mut self, kind: u16) -> &mut ServiceSessionState {
@@ -3328,6 +3365,8 @@ impl ZakuraProtocolHandler {
                     }
                 };
                 opened_capabilities |= stream.capability;
+                #[cfg(any(test, zakura_sim))]
+                let admitted = session_io.with_origin(conn_id, admitted, true);
                 service_streams.extend(admitted.into_service_streams());
             }
             if !connection_token.is_cancelled() {
@@ -3423,6 +3462,8 @@ impl ZakuraProtocolHandler {
                         .await
                     {
                         Ok(admitted) => {
+                            #[cfg(any(test, zakura_sim))]
+                            let admitted = session_io.with_origin(conn_id, admitted, true);
                             let service_streams = admitted.into_service_streams();
                             let admitted_capabilities = self.registry.add_escalated_peer(
                                 Peer::new_with_service_streams(
@@ -3537,6 +3578,8 @@ impl ZakuraProtocolHandler {
                             continue;
                         }
 
+                        #[cfg(any(test, zakura_sim))]
+                        let admitted = session_io.with_origin(conn_id, admitted, false);
                         let service_streams = admitted.into_service_streams();
                         // We keep the full accepted capability context so
                         // discovery can make cross-service ownership

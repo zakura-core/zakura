@@ -274,6 +274,31 @@ fn zakura_node_secret_key_is_redacted_from_debug_and_serialization() {
 }
 
 #[test]
+fn test_configs_keep_identity_files_out_of_the_real_identity_dir() {
+    let _init_guard = zakura_test::init();
+
+    let config = Config::for_test(P2pStack::Dual);
+    let other = Config::for_test(P2pStack::Dual);
+    let node_id = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]).public();
+
+    for path in [
+        config.identity_dir.clone(),
+        crate::config::zakura_secret_key_file_path(&config.identity_dir, &config.network),
+        config.zakura_discovery_sequence_file(&node_id),
+    ] {
+        assert!(
+            !path.starts_with(crate::config::default_network_identity_dir()),
+            "test identity files must not land in the real identity dir: {path:?}",
+        );
+        assert!(path.starts_with(std::env::temp_dir()), "{path:?}");
+    }
+    assert_ne!(
+        config.identity_dir, other.identity_dir,
+        "parallel test nodes must not share identity files",
+    );
+}
+
+#[test]
 fn identity_dir_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 

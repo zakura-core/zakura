@@ -23,6 +23,7 @@ use zakura_rt::{
     time::utc_now,
 };
 
+use super::sequence_file::AuthoredSequenceFile;
 use super::state::{DiscoverySessionKey, DiscoveryState, LocalRecordState, SessionRecordError};
 use super::verified::VerifiedRecord;
 use super::wire::{record_len, write_record_body, NODE_ID_BYTES, SIGNATURE_BYTES};
@@ -1278,9 +1279,9 @@ pub struct ZakuraDiscoveryLocalConfig {
     pub chain_id: [u8; 32],
     /// Last locally authored self-record sequence loaded from durable storage.
     ///
-    /// Until cache persistence wires this seed at startup, self-record sequences are derived from
-    /// wall-clock nanoseconds. They strictly increase across a same-key restart only while the
-    /// system clock is monotonic; a backward clock step can still produce a non-increasing sequence.
+    /// The first sequence is the later of this sequence plus one and the wall clock in
+    /// nanoseconds. Without a stored sequence, a backward clock step across a restart can
+    /// author a lower sequence, and peers keep the older record until it expires.
     pub last_authored_sequence: Option<u64>,
 }
 
@@ -1323,6 +1324,8 @@ pub struct ZakuraDiscoveryHandle {
     /// Node-wide slots for verification workers and their pending results.
     /// Each session reader holds at most one slot until it installs or drops its result.
     verify_slots: SlotBudget,
+    /// Durable storage for each authored self-record sequence, if the node has one.
+    sequence_file: Option<Arc<AuthoredSequenceFile>>,
 }
 
 /// Signature verification slots: a quarter of the cores, and at least one.
@@ -1443,7 +1446,20 @@ impl ZakuraDiscoveryHandle {
             signing_key,
             verification_context,
             verify_slots: record_verify_slots(),
+            sequence_file: None,
         })
+    }
+
+    /// Store each self-record sequence this handle authors in `file` before
+    /// publishing it, starting with the startup record's sequence.
+    ///
+    /// Seed [`ZakuraDiscoveryLocalConfig::last_authored_sequence`] from
+    /// [`AuthoredSequenceFile::load`], so a restart authors a newer sequence
+    /// even after a backward clock step.
+    pub(crate) fn with_sequence_file(mut self, file: AuthoredSequenceFile) -> Self {
+        file.store_or_warn(self.current_self_record().body.sequence);
+        self.sequence_file = Some(Arc::new(file));
+        self
     }
 
     /// Returns the current signed local self-record without taking the state lock.
@@ -1475,6 +1491,22 @@ impl ZakuraDiscoveryHandle {
         }
         let body = state.next_self_record_body(now_unix_secs, wall_clock_sequence);
         let record = Arc::new(ZakuraNodeRecord::sign(body, &self.signing_key)?);
+        // Store the sequence before any peer can see it, so a restart never reuses it.
+        if let Some(file) = &self.sequence_file {
+            let file = Arc::clone(file);
+            let sequence = record.body.sequence;
+            if let Err(error) =
+                zakura_rt::task::spawn_blocking_named("discovery_sequence_store", move || {
+                    file.store_or_warn(sequence)
+                })
+                .await
+            {
+                tracing::warn!(
+                    ?error,
+                    "the discovery self-record sequence store task failed"
+                );
+            }
+        }
         // Publish before releasing the state lock so concurrent refreshers cannot publish a lower
         // sequence after a newer record.
         self.self_record_tx.send_replace(record.clone());
@@ -3178,11 +3210,10 @@ fn current_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Interim wall-clock-nanosecond self-record sequence seed.
+/// Wall-clock-nanosecond self-record sequence seed.
 ///
-/// This strictly increases across a same-key restart only while the system clock is monotonic. A
-/// backward clock step can still produce a non-increasing sequence; the durable fix is to persist
-/// and reload `last_authored_sequence` in the cache-persistence task.
+/// This alone strictly increases across a same-key restart only while the system clock is
+/// monotonic. [`AuthoredSequenceFile`] covers a backward clock step.
 fn current_sequence_tick() -> u64 {
     utc_now()
         .duration_since(UNIX_EPOCH)
@@ -6656,6 +6687,45 @@ mod tests {
             restarted.current_self_record().body.node_id,
             first.current_self_record().body.node_id
         );
+    }
+
+    /// A restart after a backward clock step still authors a newer record,
+    /// because the handle stores every sequence it authors, including refreshes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_restart_after_a_clock_rollback_authors_a_newer_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = || AuthoredSequenceFile::new(dir.path().join("sequence"));
+        let secret = secret_key();
+        let config = ZakuraDiscoveryConfig {
+            record_ttl: Duration::from_secs(60),
+            refresh_interval: Duration::from_secs(10),
+            ..ZakuraDiscoveryConfig::default()
+        };
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let mut local = local_config_with(secret.clone(), vec![test_addr(44)], vec![service(1)]);
+        local.last_authored_sequence = file().load();
+        let first =
+            discovery_handle_at_with_sequence(local, config.clone(), connected_rx, NOW, 1_000)
+                .with_sequence_file(file());
+        assert_eq!(file().load(), Some(1_000), "the startup record is stored");
+        let refreshed = first
+            .current_self_record_for_gossip_at(NOW + 50, 2_000)
+            .await
+            .expect("self-record refresh signs");
+        assert_eq!(file().load(), Some(refreshed.body.sequence));
+
+        // The clock went back past both records, and the node now advertises
+        // a new address.
+        let mut local = local_config_with(secret, vec![test_addr(45)], vec![service(1)]);
+        local.last_authored_sequence = file().load();
+        let (_connected_tx, connected_rx) = watch::channel(Vec::new());
+        let restarted =
+            discovery_handle_at_with_sequence(local, config, connected_rx, NOW - 3_600, 500)
+                .with_sequence_file(file());
+        let restarted_record = restarted.current_self_record();
+        assert!(restarted_record.body.sequence > refreshed.body.sequence);
+        assert_eq!(restarted_record.body.direct_addrs, vec![test_addr(45)]);
+        assert_eq!(file().load(), Some(restarted_record.body.sequence));
     }
 
     #[test]

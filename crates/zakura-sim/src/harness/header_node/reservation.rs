@@ -61,7 +61,9 @@ mod tests {
     use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
     use super::ReservationEvidence;
-    use crate::harness::header_node::{session::SessionEvidence, tap::ReactorTap};
+    use crate::harness::header_node::{
+        capacity::CapacityEvidence, session::SessionEvidence, tap::ReactorTap,
+    };
 
     /// A tap keeps every accounting fact it's handed, through its capacity
     /// handle or its own, in order, and nothing else.
@@ -79,6 +81,7 @@ mod tests {
             "node",
             SessionEvidence::default(),
             evidence.clone(),
+            CapacityEvidence::default(),
         );
         let capacity = observer
             .capacity_observer()

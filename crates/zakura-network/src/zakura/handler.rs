@@ -3374,8 +3374,9 @@ impl ZakuraProtocolHandler {
             }
         }
 
-        // Local reopens whose transport IO is in flight.
-        let mut local_opens = FuturesUnordered::new();
+        // Local reopens whose transport IO is in flight, created on the first
+        // reopen.
+        let mut local_opens: Option<FuturesUnordered<BoxFuture<'_, _>>> = None;
         loop {
             let session_deadline = pending_sessions.deadline();
             zakura_rt::select! {
@@ -3431,12 +3432,14 @@ impl ZakuraProtocolHandler {
                     // is reserved only once the streams are ready.
                     let attempt = session_io.begin_attempt(stream.kind);
                     let open = &open_context;
-                    local_opens.push(
+                    local_opens.get_or_insert_with(FuturesUnordered::new).push(
                         async move { (stream, attempt, self.open_session_streams(open, stream).await) }
                             .boxed(),
                     );
                 }
-                Some((stream, attempt, opened)) = local_opens.next(), if !local_opens.is_empty() => {
+                Some((stream, attempt, opened)) = async { local_opens.as_mut()?.next().await },
+                    if local_opens.as_ref().is_some_and(|opens| !opens.is_empty()) =>
+                {
                     let opened = match opened {
                         Ok(members)
                             if !session_io
@@ -3790,23 +3793,20 @@ impl ZakuraProtocolHandler {
             .expect("a selected stream has an owning service")
             .reserve_session(open.direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
-        let prepared = members
-            .into_iter()
-            .map(|member| {
-                let mut member = self.prepare_opened_stream(
-                    member,
-                    message_buckets,
-                    open.limits,
-                    open.connection_token.clone(),
-                    open.close_cause.clone(),
-                    open.freshness_tx.clone(),
-                    open.conn.clone(),
-                    open.peer_id.clone(),
-                );
-                member.set_session_resources(reservation.clone());
-                member
-            })
-            .collect();
+        let prepared = members.into_iter().map(|member| {
+            let mut member = self.prepare_opened_stream(
+                member,
+                message_buckets,
+                open.limits,
+                open.connection_token.clone(),
+                open.close_cause.clone(),
+                open.freshness_tx.clone(),
+                open.conn.clone(),
+                open.peer_id.clone(),
+            );
+            member.set_session_resources(reservation.clone());
+            member
+        });
         Ok(spawn_service_session(
             workers,
             prepared,

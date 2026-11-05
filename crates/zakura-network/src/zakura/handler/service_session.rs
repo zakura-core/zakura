@@ -246,13 +246,15 @@ pub(super) fn trace_session_step(
 /// Run all members independently and report exit only after every worker finishes.
 pub(super) fn spawn_service_session(
     workers: &mut JoinSet<()>,
-    streams: Vec<PreparedStream>,
+    streams: impl IntoIterator<Item = PreparedStream, IntoIter: ExactSizeIterator>,
     queue_depth: usize,
     opened_locally: bool,
     exits: mpsc::UnboundedSender<SessionExit>,
 ) -> AdmittedSession {
+    let mut streams = streams.into_iter().peekable();
+    let members = streams.len();
     let primary = streams
-        .first()
+        .peek()
         .expect("a validated session has at least one stream");
     if let Some(resources) = &primary.context.session_resources {
         resources.admitted();
@@ -263,7 +265,7 @@ pub(super) fn spawn_service_session(
         kind: primary.stream.kind,
         session_id: primary.context.stream_id,
         cancel_token: cancel.clone(),
-        streams: Vec::with_capacity(streams.len()),
+        streams: Vec::with_capacity(members),
     };
     let exit = SessionExit {
         stream: primary.stream,
@@ -271,7 +273,7 @@ pub(super) fn spawn_service_session(
         opened_locally,
     };
     let mut running = futures::stream::FuturesUnordered::new();
-    let application_drain = Arc::new(Barrier::new(streams.len()));
+    let application_drain = Arc::new(Barrier::new(members));
     for mut prepared in streams {
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =

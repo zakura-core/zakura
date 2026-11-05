@@ -111,6 +111,100 @@ fn each_send_through_a_reserved_permit_is_a_point() {
 }
 
 #[test]
+fn reserve_many_waits_for_the_whole_batch_in_fifo_order() {
+    run(async {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(1).await.unwrap();
+        let mut batch = pin!(tx.reserve_many(2));
+        let mut later = pin!(tx.reserve());
+        poll_fn(|cx| {
+            assert!(batch.as_mut().poll(cx).is_pending());
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(rx.recv().await, Some(1));
+        assert!(tx.try_reserve().is_err(), "the queued batch owns the slots");
+        let mut permits = batch.await.unwrap();
+        assert_eq!(permits.len(), 2);
+        permits.next().unwrap().send(2);
+        poll_fn(|cx| {
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(permits);
+        later.await.unwrap().send(3);
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(tx.capacity(), 2);
+    });
+}
+
+#[test]
+fn cancelling_reserve_many_returns_partial_capacity_to_the_next_waiter() {
+    run(async {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(1).await.unwrap();
+        let mut batch = Box::pin(tx.reserve_many(2));
+        let mut later = pin!(tx.reserve());
+        poll_fn(|cx| {
+            assert!(batch.as_mut().poll(cx).is_pending());
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(batch);
+        later.await.unwrap().send(2);
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(tx.capacity(), 2);
+    });
+}
+
+#[test]
+fn reserve_many_handles_zero_oversized_and_closed_requests() {
+    run(async {
+        let (tx, mut rx) = mpsc::channel::<u8>(2);
+        assert_eq!(tx.reserve_many(0).await.unwrap().len(), 0);
+        assert!(tx.reserve_many(3).await.is_err());
+        assert_eq!(tx.capacity(), 2);
+        tx.send(1).await.unwrap();
+        let mut batch = pin!(tx.reserve_many(2));
+        poll_fn(|cx| {
+            assert!(batch.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        rx.close();
+        assert!(batch.await.is_err());
+        assert!(tx.reserve_many(1).await.is_err());
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, None);
+    });
+}
+
+#[test]
+fn reserve_many_instruments_sends_and_unused_permit_releases() {
+    let (_channels, report) = run(async {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut permits = tx.reserve_many(4).await.unwrap();
+        permits.next().unwrap().send(1);
+        drop(permits.next().unwrap());
+        drop(permits);
+        assert_eq!(rx.recv().await, Some(1));
+        // Returning the channel lets the report exclude closing-handle releases.
+        (tx, rx)
+    });
+    assert_eq!(report.count(Op::Send), 2, "one reservation and one send");
+    assert_eq!(
+        report.count(Op::Release),
+        2,
+        "one permit and the remaining batch"
+    );
+}
+
+#[test]
 fn watch_reads_and_writes_are_points() {
     let (seen, report) = run(async {
         let (tx, mut rx) = watch::channel(0);

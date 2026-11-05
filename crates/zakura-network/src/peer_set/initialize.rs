@@ -1064,6 +1064,7 @@ where
     let connected_addr = peer::ConnectedAddr::new_inbound_direct(addr);
 
     debug!("got incoming connection");
+    peer::disable_nagle(&tcp_stream);
 
     // # Correctness
     //

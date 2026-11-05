@@ -16,13 +16,15 @@
 //! zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...
 //! zakura-sim verify-archive <dir>
 //! zakura-sim campaign (build|start|resume|close|status|verify) --store <dir> ...
+//! zakura-sim targets --out <dir> [--target <name>]...
 //! ```
 //!
 //! It works only in the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 //! `cargo xtask record`, `cargo xtask replay`, `cargo xtask shrink`,
 //! `cargo xtask sim-versions`, `cargo xtask sim-seeds`, `cargo xtask sim-suite`,
-//! `cargo xtask sim-triage`, `cargo xtask sim-verify-archive` and
-//! `cargo xtask sim-campaign` build and run it with that flag.
+//! `cargo xtask sim-triage`, `cargo xtask sim-verify-archive`,
+//! `cargo xtask sim-campaign` and `cargo xtask sim-targets` build and run it
+//! with that flag.
 
 /// Prints that this build has no simulator, and exits with code 2.
 #[cfg(not(zakura_sim))]
@@ -190,6 +192,7 @@ mod cli {
             Some("triage") => triage(args.collect()),
             Some("verify-archive") => verify_archive(args.collect()),
             Some("campaign") => super::campaign::run(args.collect()),
+            Some("targets") => super::campaign::targets(args.collect()),
             Some("-h" | "--help") => {
                 print!("{}", usage());
                 Ok(())

@@ -36,7 +36,7 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations or session admissions.
+    /// reservations or session admissions and ends.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -47,6 +47,7 @@ impl Recorder {
                         | ReactorEvent::HeadersEnded { .. }
                         | ReactorEvent::ReservationOpened { .. }
                         | ReactorEvent::SessionAdmitted { .. }
+                        | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::CallEnded {
                             end: CallEnd::Dropped,
                             ..
@@ -1379,10 +1380,12 @@ fn no_observer_evaluates_nothing() {
     );
 }
 
-/// Each installed session reports its admission once, a replacement included,
-/// and a refused one reports none.
+/// Each installed session reports its admission once, with its ID, its
+/// direction, the session it replaced and the origin its peer carried, and a
+/// refused one reports none. Only the current session's disconnect reports
+/// its end.
 #[test]
-fn admitted_sessions_are_observed() {
+fn admitted_and_ended_sessions_are_observed() {
     let recorder = Arc::new(Recorder::default());
     let (mut reactor, _) = observed_reactor(
         Arc::new(ScriptedPort::default()),
@@ -1390,25 +1393,69 @@ fn admitted_sessions_are_observed() {
         crate::zakura::ZakuraTrace::noop(),
     );
     let peer = ZakuraPeerId::new(vec![0x51; 32]).expect("the test peer ID has the required length");
-    let admitted = || {
+    let sessions = || {
         recorder
             .take_all()
             .into_iter()
-            .filter(|event| matches!(event, ReactorEvent::SessionAdmitted { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    ReactorEvent::SessionAdmitted { .. } | ReactorEvent::SessionEnded { .. }
+                )
+            })
             .collect::<Vec<_>>()
     };
-    let one = [ReactorEvent::SessionAdmitted { peer: peer.clone() }];
+    let origin = |id: u64| crate::zakura::SessionOrigin {
+        connection: id + 10,
+        quic_stream: Some(id + 20),
+        generation: id + 30,
+    };
+    let admitted = |session_id, replaced, origin| ReactorEvent::SessionAdmitted {
+        peer: peer.clone(),
+        session_id,
+        direction: ServicePeerDirection::Inbound,
+        replaced,
+        origin,
+    };
 
     let _first = connect(&mut reactor, &peer, 1);
-    assert_eq!(admitted(), one, "the first session is admitted");
-    let _second = connect(&mut reactor, &peer, 2);
-    assert_eq!(admitted(), one, "its replacement is admitted");
+    assert_eq!(
+        sessions(),
+        [admitted(1, None, None)],
+        "the first session is admitted"
+    );
+    let (send, _second) = framed_channel(8);
+    reactor.handle_peer_connected(
+        PeerSession::from_parts_with_session_id(peer.clone(), 2, send, CancellationToken::new())
+            .with_origin(Some(origin(2))),
+    );
+    assert_eq!(
+        sessions(),
+        [admitted(2, Some(1), Some(origin(2)))],
+        "its replacement is admitted, naming the session it replaced and its own origin"
+    );
+    reactor.handle_peer_disconnected(&peer, 1, "test");
+    assert_eq!(
+        sessions(),
+        [],
+        "the replaced session's disconnect is a no-op"
+    );
+    reactor.handle_peer_disconnected(&peer, 2, "test");
+    assert_eq!(
+        sessions(),
+        [ReactorEvent::SessionEnded {
+            peer: peer.clone(),
+            session_id: 2,
+            reason: "test",
+        }],
+        "the current session's disconnect ends it"
+    );
     reactor.state.unproductive_peer_cooldowns.insert(
         peer.clone(),
         Instant::now() + std::time::Duration::from_secs(60),
     );
     let _refused = connect(&mut reactor, &peer, 3);
-    assert_eq!(admitted(), [], "a refused readmission isn't");
+    assert_eq!(sessions(), [], "a refused readmission isn't");
 }
 
 /// The `Misbehavior` events in `events`.

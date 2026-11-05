@@ -29,6 +29,7 @@ use super::{
     header_node::{
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
+        session::SessionEvidence,
         tap::ReactorTap,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
         Policy, PolicySource, Topology,
@@ -460,7 +461,8 @@ fn mirror(index: usize) -> String {
 }
 
 /// The scenario's storage, with each actor's chain committed before the
-/// run. Cloning shares the ports, so a test can read them after a run.
+/// run, and the node's session view. Cloning shares both, so a test can read
+/// them after a run. One prepared `Ports` serves one run.
 #[derive(Clone)]
 pub struct Ports {
     /// The fixture every chain comes from.
@@ -469,6 +471,8 @@ pub struct Ports {
     pub node: Arc<ControlledPort>,
     /// Each mirror's engine port, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
+    /// The node's session view, which its tap and links fill during the run.
+    pub sessions: SessionEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -556,13 +560,15 @@ impl Subsystem for Storage {
             fixture,
             node,
             mirrors,
+            sessions: SessionEvidence::default(),
         }
     }
 
     /// Spawns the node on its controlled port under the scenario's policy,
     /// with its reactor tapped, then each mirror, links each mirror to the
     /// node once, and adds the `Control` source. Only the node is tapped,
-    /// and its tap learns of a `Shutdown` step before the node stops.
+    /// and its tap learns of a `Shutdown` step before the node stops. The tap
+    /// and the links keep the node's session view in [`Ports::sessions`].
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
         let effects = Effects::default();
@@ -572,7 +578,8 @@ impl Subsystem for Storage {
             scenario.policy.clone(),
             effects.clone(),
         );
-        let (observer, tap) = ReactorTap::new(sim, &ports.node, "node");
+        let (observer, tap) =
+            ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
         let shutdown = tap.shutdown();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
@@ -605,7 +612,11 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let topology = Rc::new(Topology::new(nodes, effects).with_tap(shutdown));
+        let topology = Rc::new(
+            Topology::new(nodes, effects)
+                .with_tap(shutdown)
+                .with_sessions(ports.sessions),
+        );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
                 Dialer::Mirror => topology.link(index, 0),

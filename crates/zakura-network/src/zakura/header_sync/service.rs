@@ -24,8 +24,6 @@ use super::{
 };
 #[cfg(test)]
 use crate::zakura::framed_channel;
-#[cfg(any(test, zakura_sim))]
-use crate::zakura::RegulationTap;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
@@ -41,6 +39,8 @@ use crate::zakura::{
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
     ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::{RegulationTap, SessionOrigin};
 
 /// Conservative re-offer delay when header sync publishes no peer backoff deadline.
 const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
@@ -140,6 +140,9 @@ pub struct PeerSession {
     session_id: u64,
     direction: ServicePeerDirection,
     inner: Arc<PeerSessionInner>,
+    /// Where the transport got this session, from its [`Peer`].
+    #[cfg(any(test, zakura_sim))]
+    origin: Option<SessionOrigin>,
 }
 
 #[derive(Debug)]
@@ -192,7 +195,21 @@ impl PeerSession {
                 open_writer: StdMutex::new(None),
                 status,
             }),
+            #[cfg(any(test, zakura_sim))]
+            origin: None,
         }
+    }
+
+    /// This session, reporting `origin` as where the transport got it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn with_origin(self, origin: Option<SessionOrigin>) -> Self {
+        Self { origin, ..self }
+    }
+
+    /// Where the transport got this session, if its [`Peer`] said.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn origin(&self) -> Option<SessionOrigin> {
+        self.origin
     }
 
     #[cfg(test)]
@@ -740,6 +757,8 @@ impl Service for HeaderSyncService {
             subscriber,
             status,
         );
+        #[cfg(any(test, zakura_sim))]
+        let session = session.with_origin(peer.origin());
         let (publisher, publishing) = sim_arg!(spawn_publisher(
             &self.header_sync,
             header_bytes,

@@ -33,6 +33,10 @@
 //! them to its [`PolicySource`](super::PolicySource), whose triggers count
 //! them.
 //!
+//! Every event the reactor reports in the run also feeds the tap's
+//! [`SessionEvidence`], the reactor's session view. A rule that view
+//! breaks fails the run at the next drain, as a broken ownership rule does.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -58,6 +62,7 @@ use zakura_storage::header::controlled::ControlledPort;
 use super::{
     pair::{PairError, Pairer},
     policy::LinkEffect,
+    session::SessionEvidence,
 };
 use crate::{
     draws::Failure,
@@ -104,6 +109,8 @@ struct TapState {
     buffer: Mutex<Buffer>,
     /// Checks each call's identity and retained headers as events arrive.
     work: Mutex<WorkCheck>,
+    /// The reactor's session view.
+    sessions: SessionEvidence,
 }
 
 /// The tap's ownership check, and the first rule a history broke.
@@ -231,6 +238,11 @@ impl HeaderSyncObserver for TapObserver {
     fn observe(&self, event: ReactorEvent) {
         let state = &self.0;
         let in_run = zakura_rt::sim::run_id() == Some(state.run);
+        // The session view sees every event and picks what its rules read,
+        // so no second list here can drift from them.
+        if in_run {
+            state.sessions.reactor(&event);
+        }
         // Ownership, reservation and admission events stay out of the
         // observation log, whose format pinned Plans fix.
         if matches!(
@@ -257,6 +269,14 @@ impl HeaderSyncObserver for TapObserver {
             if in_run {
                 state.buffer().effects.push(effect);
             } else {
+                state.refused.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        // Only a live reactor handles a disconnect, so this doesn't happen
+        // in the run's own shutdown either.
+        if matches!(event, ReactorEvent::SessionEnded { .. }) {
+            if !in_run {
                 state.refused.store(true, Ordering::Relaxed);
             }
             return;
@@ -311,7 +331,23 @@ impl ReactorTap {
         port: &Arc<ControlledPort>,
         node: &str,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
+        ReactorTap::with_sessions(sim, port, node, SessionEvidence::default())
+    }
+
+    /// [`ReactorTap::new`], with the reactor's session view kept in
+    /// `sessions`, which this tap's run binds.
+    ///
+    /// # Panics
+    ///
+    /// Outside a run, or if another tap already bound `sessions`.
+    pub fn with_sessions(
+        sim: &mut Sim,
+        port: &Arc<ControlledPort>,
+        node: &str,
+        sessions: SessionEvidence,
+    ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
+        sessions.bind(run);
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -323,6 +359,7 @@ impl ReactorTap {
                 shutdown: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 work: Mutex::default(),
+                sessions,
             }))
         });
         let state = observer.0.clone();
@@ -361,6 +398,12 @@ impl ReactorTap {
         TapShutdown(self.state.clone())
     }
 
+    /// The reactor's session view, which the topology's links also report
+    /// to.
+    pub fn sessions(&self) -> SessionEvidence {
+        self.state.sessions.clone()
+    }
+
     /// Takes the reservations and admissions recorded since the last call,
     /// by peer, in order.
     pub(crate) fn take_effects(&mut self) -> Vec<(LinkEffect, ZakuraPeerId)> {
@@ -369,7 +412,7 @@ impl ReactorTap {
 }
 
 /// `peer` as hex, by the digest storage attributes it with.
-fn peer(peer: &ZakuraPeerId) -> String {
+pub(super) fn peer(peer: &ZakuraPeerId) -> String {
     hex(&peer.digest())
 }
 
@@ -574,7 +617,8 @@ impl ActionSource for ReactorTap {
     }
 
     /// Pairs and logs every event recorded since the last observation, in
-    /// order, and records what it delivered in the checkpoint. A drain that
+    /// order, and records what it delivered in the checkpoint. A drain after
+    /// a broken ownership or session rule fails. A drain that
     /// doesn't pair is still logged, then fails, unless the tap is unhealthy,
     /// which the run reports instead, or records a port panic as the run's
     /// harness failure. Once the reactor's teardown is done, a dropped call still
@@ -616,7 +660,11 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        if let Some(rule) = self.state.broken_work_rule() {
+        if let Some(rule) = self
+            .state
+            .broken_work_rule()
+            .or_else(|| self.state.sessions.broken())
+        {
             return Err(rule);
         }
         match paired {

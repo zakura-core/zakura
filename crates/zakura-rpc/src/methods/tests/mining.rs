@@ -1424,3 +1424,35 @@ async fn shielded_template_rewards() {
     );
     assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }
+
+/// A same-tip long poll answer is labelled by the first thing that changed: no ID, an expired
+/// time range, a new rejection revision, and otherwise the mempool.
+#[test]
+fn same_tip_template_answer_reasons() {
+    let id =
+        LongPollInput::new(Height(1), Hash([1; 32]), DateTime32::from(100), vec![]).generate_id();
+    let mut new_revision = id;
+    new_revision.revision += 1;
+
+    assert_eq!(
+        TemplateAnswer::for_same_tip(None, &id, false),
+        TemplateAnswer::NoLongPoll
+    );
+    assert_eq!(
+        TemplateAnswer::for_same_tip(None, &id, true),
+        TemplateAnswer::NoLongPoll,
+        "a request without an ID never waited, so it can't have reached the max time"
+    );
+    assert_eq!(
+        TemplateAnswer::for_same_tip(Some(&id), &new_revision, true),
+        TemplateAnswer::MaxTime
+    );
+    assert_eq!(
+        TemplateAnswer::for_same_tip(Some(&id), &new_revision, false),
+        TemplateAnswer::Rejection
+    );
+    assert_eq!(
+        TemplateAnswer::for_same_tip(Some(&id), &id, false),
+        TemplateAnswer::Mempool
+    );
+}

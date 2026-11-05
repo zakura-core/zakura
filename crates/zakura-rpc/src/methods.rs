@@ -1086,6 +1086,95 @@ where
 /// the point past which a parent's templates cost more than they are worth.
 const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Why a `getblocktemplate` request returned the template it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateAnswer {
+    /// The request had no long poll ID, so it returned current work right away.
+    NoLongPoll,
+    /// The client's long poll ID names a different chain tip than the current one.
+    OldTip,
+    /// The chain tip changed while the long poll was waiting.
+    NewTip,
+    /// The template rejection revision changed since the client's long poll ID.
+    Rejection,
+    /// The mempool transactions changed since the client's long poll ID.
+    Mempool,
+    /// The template's time range expired while the long poll was waiting.
+    MaxTime,
+}
+
+impl TemplateAnswer {
+    /// Returns why a request on the current tip returned work: it had no long poll ID, its
+    /// time range expired, the rejection revision moved, or else the mempool changed.
+    ///
+    /// A long poll ID on another tip returns before this point, so it is never classified here.
+    fn for_same_tip(
+        client_long_poll_id: Option<&types::long_poll::LongPollId>,
+        server_long_poll_id: &types::long_poll::LongPollId,
+        max_time_reached: bool,
+    ) -> Self {
+        match client_long_poll_id {
+            None => Self::NoLongPoll,
+            Some(_) if max_time_reached => Self::MaxTime,
+            Some(client) if client.revision != server_long_poll_id.revision => Self::Rejection,
+            Some(_) => Self::Mempool,
+        }
+    }
+
+    /// Returns the reason as it appears in logs.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoLongPoll => "no_long_poll",
+            Self::OldTip => "old_tip",
+            Self::NewTip => "new_tip",
+            Self::Rejection => "rejection",
+            Self::Mempool => "mempool",
+            Self::MaxTime => "max_time",
+        }
+    }
+}
+
+/// Logs one `getblocktemplate` answer with why it returned, how long the request waited before
+/// building (`wait`), and how long building and validating the template took (`build`).
+///
+/// Answers for a new chain tip log at info, so a pool can join them against its own timings at
+/// the default log level. Other answers are frequent and log at debug.
+fn log_template_answer(
+    reason: TemplateAnswer,
+    template: &GetBlockTemplateResponse,
+    request_started: tokio::time::Instant,
+    build_started: tokio::time::Instant,
+    rebuilds: usize,
+) {
+    let GetBlockTemplateResponse::TemplateMode(template) = template else {
+        return;
+    };
+    let wait = build_started.saturating_duration_since(request_started);
+    let build = build_started.elapsed();
+
+    macro_rules! log_answer {
+        ($level:ident) => {
+            tracing::$level!(
+                reason = reason.as_str(),
+                height = template.height,
+                previous_block_hash = %template.previous_block_hash,
+                transactions = template.transactions.len(),
+                submit_old = ?template.submit_old,
+                ?wait,
+                ?build,
+                rebuilds,
+                "answered getblocktemplate"
+            )
+        };
+    }
+
+    if matches!(reason, TemplateAnswer::OldTip | TemplateAnswer::NewTip) {
+        log_answer!(info);
+    } else {
+        log_answer!(debug);
+    }
+}
+
 /// The outcome of validating one server mining template.
 enum Preparation {
     /// The template passed proposal validation.
@@ -3479,6 +3568,8 @@ where
             .await;
         }
 
+        let request_started = tokio::time::Instant::now();
+
         // To implement long polling correctly, we split this RPC into multiple phases.
         check_parameters(&parameters)?;
 
@@ -3510,7 +3601,7 @@ where
             //
             // Set up the loop.
             // The loop returns the server long poll ID, which should be different to the client one.
-            let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
+            let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old, reason) = loop {
                 // Check if we are synced to the tip.
                 // The result of this check can change during long polling.
                 //
@@ -3561,6 +3652,7 @@ where
                             .same_tip(client_long_poll_id)
                     })
                 {
+                    let build_started = tokio::time::Instant::now();
                     if let Some(template) = self
                         .new_tip_template(
                             None,
@@ -3571,6 +3663,13 @@ where
                         )
                         .await?
                     {
+                        log_template_answer(
+                            TemplateAnswer::OldTip,
+                            &template,
+                            request_started,
+                            build_started,
+                            rebuild,
+                        );
                         return Ok(template);
                     }
                     continue 'rebuild;
@@ -3623,6 +3722,11 @@ where
                             server_long_poll_id.submit_old(old_long_poll_id)
                         })
                     };
+                    let reason = TemplateAnswer::for_same_tip(
+                        client_long_poll_id.as_ref(),
+                        &server_long_poll_id,
+                        max_time_reached,
+                    );
 
                     break (
                         server_long_poll_id,
@@ -3630,6 +3734,7 @@ where
                         mempool_txs,
                         mempool_tx_deps,
                         submit_old,
+                        reason,
                     );
                 }
 
@@ -3753,6 +3858,7 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
+                        let build_started = tokio::time::Instant::now();
                         let precomputed_coinbase = precomputed_coinbase?;
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
                         let Some(rejection_state) =
@@ -3779,6 +3885,13 @@ where
                             )
                             .await?
                         {
+                            log_template_answer(
+                                TemplateAnswer::NewTip,
+                                &template,
+                                request_started,
+                                build_started,
+                                rebuild,
+                            );
                             return Ok(template);
                         }
                         continue 'rebuild;
@@ -3806,6 +3919,7 @@ where
             // Apart from random weighted transaction selection,
             // the template only depends on the previously fetched data.
             // This processing fails only if the coinbase transaction cannot be built.
+            let build_started = tokio::time::Instant::now();
 
             tracing::debug!(
                 mempool_tx_hashes = ?mempool_txs
@@ -3859,6 +3973,7 @@ where
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?
             {
+                log_template_answer(reason, &template, request_started, build_started, rebuild);
                 return Ok(template);
             }
         }

@@ -11,6 +11,7 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -167,9 +168,49 @@ class EndpointTest(EndpointCase):
         tunnel = trace_query.Endpoint(self.server.url.replace("127.0.0.1", "localhost"),
                                       host_header=f"127.0.0.1:{self.server.server_address[1]}",
                                       range_bytes=16)
-        self.assertEqual(tunnel.dump("commit_state"), self.path.read_bytes())
+        self.assertEqual(b"".join(tunnel.dump("commit_state")), self.path.read_bytes())
         with self.assertRaises(ValueError):
-            tunnel.dump("../etc/passwd")
+            list(tunnel.dump("../etc/passwd"))
+
+    def test_replacement_mid_poll_preserves_row_identity(self):
+        self.append(row("old") * 3)
+        original = self.endpoint.read_range
+        old_id = self.endpoint.probe("commit_state").file_id
+
+        def replace_after_first_row(table, token, start, end):
+            if start >= len(row("old")):
+                raise trace_query.FileReplaced(table)
+            return original(table, token, start, end)
+
+        with patch.object(self.endpoint, "read_range", side_effect=replace_after_first_row):
+            poll = self.endpoint.poll("commit_state", trace_query.Cursor())
+        self.assertEqual(self.events(poll), ["old"])
+        self.assertEqual(poll.cursor.file_id, old_id)
+        self.assertEqual(poll.cursor.offset, 0)
+
+    def test_oversized_unfinished_line_fails_without_advancing(self):
+        self.append(b"x" * 100)
+        cursor = trace_query.Cursor()
+        with patch.object(trace_query, "MAX_LINE_BYTES", 32):
+            with self.assertRaises(trace_query.EndpointError):
+                self.endpoint.poll("commit_state", cursor, budget_bytes=16)
+        self.assertEqual(cursor, trace_query.Cursor())
+
+    def test_wrong_range_or_token_is_rejected(self):
+        self.append(row("a"))
+        token = self.endpoint.probe("commit_state").token
+        for headers in ({"content-range": "bytes 0-1/99", "x-trace-file-id": token},
+                        {"content-range": f"bytes 0-1/{self.path.stat().st_size}",
+                         "x-trace-file-id": "1:2:99"}):
+            with self.subTest(headers=headers), patch.object(
+                    self.endpoint, "_request", return_value=(206, headers, b"xx")):
+                with self.assertRaises(trace_query.EndpointError):
+                    self.endpoint.read_range("commit_state", token, 0, 2)
+
+    def test_invalid_metadata_does_not_poison_sqlite_batch(self):
+        self.append(row([], ts=2**100) + row("a"))
+        poll = self.endpoint.poll("commit_state", trace_query.Cursor())
+        self.assertEqual((self.events(poll), poll.malformed), (["a"], 1))
 
 
 class MirrorTest(EndpointCase):
@@ -202,8 +243,28 @@ class MirrorTest(EndpointCase):
 
     def test_queries_are_read_only(self):
         mirror = self.mirror()
-        with self.assertRaises(sqlite3.OperationalError):
+        with self.assertRaises(sqlite3.DatabaseError):
             trace_query.run_query(mirror_path(mirror), "DELETE FROM trace_rows")
+        for query in ("PRAGMA query_only=OFF", "ATTACH ':memory:' AS other",
+                      "CREATE TEMP TABLE temp_table (x)"):
+            with self.subTest(query=query), self.assertRaises(sqlite3.DatabaseError):
+                trace_query.run_query(mirror_path(mirror), query)
+
+    def test_follow_yields_to_other_tables_before_catching_up(self):
+        self.append(row("a") * 10)
+        (Path(self.dir.name) / "block_sync.jsonl").write_bytes(row("b"))
+        mirror = self.mirror()
+        trace_query.follow({"local": self.endpoint}, ["commit_state", "block_sync"],
+                           mirror, budget_bytes=16)
+        self.assertLess(mirror.cursor("local", "commit_state").offset, self.path.stat().st_size)
+        self.assertGreater(mirror.cursor("local", "block_sync").offset, 0)
+
+    def test_replayed_rows_report_zero_inserts(self):
+        self.append(row("a"))
+        poll = self.endpoint.poll("commit_state", trace_query.Cursor())
+        mirror = self.mirror()
+        self.assertEqual(mirror.store("local", "commit_state", poll), 1)
+        self.assertEqual(mirror.store("local", "commit_state", poll), 0)
 
     def test_cli_pull_then_sql(self):
         self.server.range_limit = trace_query.MAX_RANGE_BYTES

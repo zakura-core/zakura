@@ -27,6 +27,7 @@ Stdlib only, so it runs on any host with Python 3.9+.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import sqlite3
@@ -35,6 +36,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 LOG = logging.getLogger("trace_query")
@@ -63,6 +65,7 @@ REQUEST_TIMEOUT_SECS = 35.0
 # One poll reads at most this much, so a first catch-up of a large file
 # commits in bounded steps.
 DEFAULT_POLL_BUDGET_BYTES = 64 * MAX_RANGE_BYTES
+MAX_LINE_BYTES = 8 * MAX_RANGE_BYTES
 
 
 class EndpointError(Exception):
@@ -113,6 +116,8 @@ class Capture:
             device, inode, length = (int(part) for part in token.split(":"))
         except ValueError:
             raise EndpointError(f"malformed X-Trace-File-Id {token!r}") from None
+        if min(device, inode, length) < 0:
+            raise EndpointError(f"negative X-Trace-File-Id field {token!r}")
         return cls(token=token, file_id=f"{device}:{inode}", length=length)
 
 
@@ -126,6 +131,8 @@ class Endpoint:
         # literal bound address as Host, so callers pass that through here.
         self.host_header = host_header
         self.timeout = timeout
+        if not 0 < range_bytes <= MAX_RANGE_BYTES:
+            raise ValueError("range_bytes must be between 1 and 1 MiB")
         self.range_bytes = range_bytes
 
     def _request(self, table: str, headers: dict) -> tuple[int, dict, bytes]:
@@ -136,17 +143,22 @@ class Endpoint:
             request.add_header("Host", self.host_header)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read()
+                body = response.read(self.range_bytes + 1)
+                if len(body) > self.range_bytes:
+                    raise EndpointError(f"{table}: response exceeds range limit")
                 expected = response.headers.get("Content-Length")
-                if expected is not None and len(body) != int(expected):
+                if expected is None or not expected.isdecimal() or len(body) != int(expected):
                     raise EndpointError(f"{table}: short body {len(body)} of {expected} bytes")
-                return response.status, dict(response.headers), body
+                return response.status, {k.lower(): v for k, v in response.headers.items()}, body
         except urllib.error.HTTPError as error:
-            return error.code, dict(error.headers or {}), b""
+            with error:
+                return error.code, {}, b""
+        except http.client.HTTPException as error:
+            raise EndpointError(f"{table}: interrupted HTTP response: {error}") from error
 
     def probe(self, table: str) -> Optional["Capture"]:
         """Capture a fresh prefix. Returns None when the table file is missing."""
-        status, headers, _ = self._request(table, {"Range": "bytes=0-0"})
+        status, headers, body = self._request(table, {"Range": "bytes=0-0"})
         if status == 404:
             return None
         if status == 416:
@@ -154,41 +166,48 @@ class Endpoint:
             return Capture(token=None, file_id=None, length=0)
         if status != 206:
             raise EndpointError(f"{table}: probe returned HTTP {status}")
-        token = headers.get("X-Trace-File-Id") or headers.get("x-trace-file-id")
+        token = headers.get("x-trace-file-id")
         if not token:
             raise EndpointError(f"{table}: probe response has no X-Trace-File-Id")
-        return Capture.parse(token)
+        capture = Capture.parse(token)
+        if len(body) != 1 or headers.get("content-range") != f"bytes 0-0/{capture.length}":
+            raise EndpointError(f"{table}: invalid probe range")
+        return capture
 
     def read_range(self, table: str, token: str, start: int, end: int) -> bytes:
         """Read bytes `start..end` (exclusive) of the prefix that `token` captured."""
-        status, _, body = self._request(
+        status, headers, body = self._request(
             table, {"Range": f"bytes={start}-{end - 1}", "X-Trace-File-Id": token})
         if status == 409:
             raise FileReplaced(table)
         if status != 206:
             raise EndpointError(f"{table}: range {start}-{end - 1} returned HTTP {status}")
+        length = Capture.parse(token).length
+        if (len(body) != end - start or headers.get("x-trace-file-id") != token
+                or headers.get("content-range") != f"bytes {start}-{end - 1}/{length}"):
+            raise EndpointError(f"{table}: response does not match requested range")
         return body
 
-    def dump(self, table: str) -> bytes:
-        """Return a fresh, complete prefix of one table."""
+    def dump(self, table: str) -> Iterator[bytes]:
+        """Stream a fresh prefix in bounded chunks; the last line may be incomplete."""
         capture = self.probe(table)
         if capture is None:
             raise EndpointError(f"{table}: no such trace file")
         token, length = capture.token, capture.length
-        chunks = []
         offset = 0
         while offset < length:
             end = min(offset + self.range_bytes, length)
             chunk = self.read_range(table, token, offset, end)
             if not chunk:
                 raise EndpointError(f"{table}: empty range at {offset}")
-            chunks.append(chunk)
+            yield chunk
             offset += len(chunk)
-        return b"".join(chunks)
 
     def poll(self, table: str, cursor: Cursor,
              budget_bytes: int = DEFAULT_POLL_BUDGET_BYTES) -> Poll:
         """Read the rows appended after `cursor`, up to `budget_bytes`."""
+        if budget_bytes <= 0:
+            raise ValueError("budget_bytes must be positive")
         capture = self.probe(table)
         if capture is None:
             return Poll(cursor=cursor)
@@ -222,7 +241,9 @@ class Endpoint:
         except FileReplaced:
             # Keep the complete lines already parsed; the next poll restarts.
             LOG.warning("%s: file replaced during a poll; restarting next poll", table)
-            result.cursor = Cursor(None, 0)
+            # Rows still belong to the captured file. Rewind its cursor so a
+            # subsequent probe can detect replacement without relabelling rows.
+            result.cursor.offset = 0
             return result
         result.cursor.offset = line_start
         result.more = read_to < length
@@ -234,6 +255,9 @@ class Endpoint:
         position = 0
         while True:
             newline = pending.find(b"\n", position)
+            end = len(pending) if newline < 0 else newline
+            if end - position > MAX_LINE_BYTES:
+                raise EndpointError(f"line exceeds {MAX_LINE_BYTES} bytes at {line_start + position}")
             if newline < 0:
                 return line_start + position
             line = bytes(pending[position:newline])
@@ -243,10 +267,14 @@ class Endpoint:
                 continue
             try:
                 row = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 result.malformed += 1
                 continue
-            if isinstance(row, dict):
+            if (isinstance(row, dict)
+                    and (row.get("event") is None or isinstance(row["event"], str))
+                    and (row.get("process_trace_id") is None or isinstance(row["process_trace_id"], str))
+                    and (row.get("ts") is None or
+                         (type(row["ts"]) is int and -(2**63) <= row["ts"] < 2**63))):
                 result.rows.append((offset, row))
             else:
                 result.malformed += 1
@@ -312,11 +340,11 @@ class Mirror:
                 event = row.get("event")
                 if events and event not in events:
                     continue
-                self.db.execute(
+                inserted = self.db.execute(
                     "INSERT OR IGNORE INTO trace_rows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (node, table, poll.cursor.file_id or "", offset, event, row.get("ts"),
                      row.get("process_trace_id"), now, json.dumps(row, separators=(",", ":"))))
-                stored += 1
+                stored += inserted.rowcount
             self.db.execute(
                 "INSERT INTO trace_cursors VALUES (?, ?, ?, ?, ?) ON CONFLICT (node, tbl) "
                 "DO UPDATE SET file_id = excluded.file_id, offset = excluded.offset, "
@@ -335,32 +363,33 @@ def follow(endpoints: dict, tables: Iterable[str], mirror: Mirror,
            events: Optional[set] = None, budget_bytes: int = DEFAULT_POLL_BUDGET_BYTES) -> int:
     """Poll every (node, table) once into `mirror`; return rows stored.
 
-    A table that stops at its byte budget is polled again until it catches up.
+    Each table gets one bounded poll so a busy table cannot starve another.
     One failing node or table is logged and skipped.
     """
     stored = 0
     for node, endpoint in endpoints.items():
         for table in tables:
-            while True:
-                try:
-                    poll = endpoint.poll(table, mirror.cursor(node, table), budget_bytes)
-                except (EndpointError, OSError) as error:
-                    LOG.warning("%s/%s: %s", node, table, error)
-                    break
-                if poll.reset:
-                    LOG.info("%s/%s: trace file replaced; reading the new file", node, table)
-                if poll.malformed:
-                    LOG.warning("%s/%s: skipped %d malformed lines", node, table, poll.malformed)
-                stored += mirror.store(node, table, poll, events)
-                if not poll.more:
-                    break
+            try:
+                poll = endpoint.poll(table, mirror.cursor(node, table), budget_bytes)
+            except (EndpointError, OSError) as error:
+                LOG.warning("%s/%s: %s", node, table, error)
+                continue
+            if poll.reset:
+                LOG.info("%s/%s: trace file replaced; reading the new file", node, table)
+            if poll.malformed:
+                LOG.warning("%s/%s: skipped %d malformed lines", node, table, poll.malformed)
+            stored += mirror.store(node, table, poll, events)
     return stored
 
 
 def run_query(path: str, query: str, params: Iterable = ()) -> tuple[list, list]:
     """Run one read-only query; return the column names and rows."""
-    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    db = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
     try:
+        db.execute("PRAGMA query_only = ON")
+        allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+                   sqlite3.SQLITE_RECURSIVE}
+        db.set_authorizer(lambda action, *_: sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY)
         cursor = db.execute(query, tuple(params))
         columns = [column[0] for column in cursor.description or ()]
         return columns, cursor.fetchall()
@@ -412,7 +441,8 @@ def main(argv: Optional[list] = None) -> int:
                         format="%(asctime)s %(levelname)s %(message)s")
 
     if args.command == "dump":
-        sys.stdout.buffer.write(Endpoint(args.url, args.host_header).dump(args.table))
+        for chunk in Endpoint(args.url, args.host_header).dump(args.table):
+            sys.stdout.buffer.write(chunk)
         return 0
 
     if args.command == "sql":

@@ -43,7 +43,7 @@ python3 trace_query.py sql --db traces.sqlite "
 
 `--format json` prints one JSON object per row. Queries open the mirror read-only.
 
-Print a fresh prefix of one table for `jq`:
+Stream a fresh prefix of one table for `jq` (the final line may be incomplete):
 
 ```sh
 python3 trace_query.py dump --url http://127.0.0.1:9009 --table commit_state | jq .
@@ -78,4 +78,12 @@ The client inherits the endpoint's consistency model: it assumes append-only
 files. External copytruncate or in-place edits can mix bytes without an error.
 A row the writer dropped or buffered is not in the mirror. The cursor only
 advances past complete lines, so the last unfinished line is read on the next
-poll. Each poll reads at most 64 MiB per table and continues until it catches up.
+poll. Each pass reads up to 64 MiB per table, plus enough bytes to complete its
+first line. Lines above 8 MiB fail the poll without advancing the cursor.
+`pull` without `--follow` performs one pass. Use `--follow` to drain a backlog;
+each pass gives every node and table a turn. `dump` streams bounded chunks.
+SQL results are materialized in memory; use `LIMIT` for large result sets.
+
+Changing `--event` does not replay rows before a saved cursor. Use a new mirror
+to collect events that a previous filter excluded. Retention deletes rows but
+does not shrink the database file; SQLite reuses those pages for later rows.

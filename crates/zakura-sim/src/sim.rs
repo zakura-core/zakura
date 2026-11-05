@@ -133,6 +133,8 @@ pub struct Sim {
     config: RunConfig,
     /// The harness's task holds.
     holds: Vec<Box<dyn TaskHold>>,
+    /// Run once the log freezes, before the scheduler shuts down.
+    on_frozen: Vec<Box<dyn FnOnce()>>,
 }
 
 impl Sim {
@@ -158,7 +160,16 @@ impl Sim {
             run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             config,
             holds: Vec::new(),
+            on_frozen: Vec::new(),
         }
+    }
+
+    /// Runs `hook` once the run's log freezes, before the scheduler shuts
+    /// down. Shutdown still resumes the run's suspended tasks, so evidence a
+    /// harness keeps beside the log freezes here too, and what cleanup
+    /// reports can't change what the run ended with.
+    pub(crate) fn on_frozen(&mut self, hook: impl FnOnce() + 'static) {
+        self.on_frozen.push(Box::new(hook));
     }
 
     /// Keeps the ready tasks `hold` names out of each step's enabled set,
@@ -280,6 +291,9 @@ impl Sim {
             _ => properties,
         };
         state.log.freeze();
+        for hook in std::mem::take(&mut self.on_frozen) {
+            hook();
+        }
         let cleanup = self.shut_down();
         sink.record(Record::End(end_record(
             &end,

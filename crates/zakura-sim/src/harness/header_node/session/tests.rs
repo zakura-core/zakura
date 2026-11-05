@@ -524,3 +524,48 @@ fn every_own9_mismatch_breaks() {
     late.ledger().generation_installed(1, 6);
     assert_eq!(late.broken(), Some(rule), "a later row joins nothing");
 }
+
+/// Feeds a teardown of connection 1 to its view when it drops.
+struct TearDownOnDrop(SessionEvidence);
+
+impl Drop for TearDownOnDrop {
+    /// Reports connection 1's teardown, as a handler's cleanup would.
+    fn drop(&mut self) {
+        self.0.transport(&TransportEvent::TornDown { conn_id: 1 });
+    }
+}
+
+/// A session still unretired when the run ends stays inconclusive, though the
+/// run's shutdown then resumes a task whose cleanup reports its connection's
+/// teardown: the view froze with the log.
+#[test]
+fn shutdown_cleanup_cannot_retire_a_session() {
+    let mut sim = crate::Sim::new(
+        crate::harness::header_sync::storage_config(),
+        crate::PlanInput::Bytes(Vec::new()),
+    );
+    let port = Arc::new(zakura_storage::header::controlled::ControlledPort::new(
+        &zakura_storage::header::fixture::HeaderFixture::regtest(),
+    ));
+    let view = own9();
+    let (observer, tap) =
+        super::super::tap::ReactorTap::with_sessions(&mut sim, &port, "node", view.clone());
+    observer.observe(admitted(5, None, wire(1, 8, 5)));
+    observer.observe(ReactorEvent::SessionEnded {
+        peer: mirror(),
+        session_id: 5,
+        reason: "test",
+    });
+    sim.add_source(Box::new(tap));
+    let guard = TearDownOnDrop(view.clone());
+    sim.scheduler().spawn_root("cleanup", async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    let report = sim.run(&mut crate::NoChecks, &mut crate::MemorySink::default());
+    assert_eq!(report.cleanup.leaked, 0, "{report:?}");
+    assert_eq!(
+        view.end_check(),
+        EndCheck::Inconclusive(vec![("peer-0".to_owned(), 5)])
+    );
+}

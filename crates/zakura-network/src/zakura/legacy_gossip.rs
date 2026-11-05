@@ -621,6 +621,25 @@ impl LegacyRequestKind {
 
 pub(super) struct LegacyResponseCodec;
 
+/// One response item, with completed inventory payloads decoded by the reader.
+///
+/// Raw frames also let the codec decode responses independently of the transport.
+#[derive(Debug)]
+pub(super) enum LegacyResponseItem {
+    /// A control/list frame, or raw inventory chunks for standalone decoding.
+    Frame(Frame),
+    /// A complete block, including the reader's trailing-byte check.
+    Block(Arc<Block>),
+    /// A complete transaction, including the reader's trailing-byte check.
+    Transaction(UnminedTx),
+}
+
+impl From<Frame> for LegacyResponseItem {
+    fn from(frame: Frame) -> Self {
+        Self::Frame(frame)
+    }
+}
+
 impl LegacyResponseCodec {
     pub(super) fn encode_response(
         request_id: u64,
@@ -733,7 +752,7 @@ impl LegacyResponseCodec {
     pub(super) fn decode_response(
         request_id: u64,
         request_kind: LegacyRequestKind,
-        frames: Vec<Frame>,
+        items: impl IntoIterator<Item = impl Into<LegacyResponseItem>>,
         requested: Option<&RequestedInventory>,
     ) -> Result<Response, LegacyGossipError> {
         let (requested_block_hashes, requested_transaction_ids) = match requested {
@@ -750,145 +769,175 @@ impl LegacyResponseCodec {
         let mut saw_nil = false;
         let mut reassembler = ResponseReassembler::new(request_id);
 
-        for frame in frames {
-            if frame.flags != 0 {
-                return Err(LegacyGossipError::UnsupportedFlags(frame.flags));
-            }
+        for item in items {
+            let item = match item.into() {
+                LegacyResponseItem::Frame(frame) => {
+                    if frame.flags != 0 {
+                        return Err(LegacyGossipError::UnsupportedFlags(frame.flags));
+                    }
+                    match frame.message_type {
+                        MSG_RESPONSE_BLOCK => {
+                            if request_kind != LegacyRequestKind::Blocks {
+                                return Err(LegacyGossipError::UnexpectedResponse("Blocks"));
+                            }
+                            let Some(bytes) = reassembler.accept(&frame.payload)? else {
+                                continue;
+                            };
+                            let mut remaining = bytes.as_slice();
+                            let block = Block::zcash_deserialize_from_slice(&mut remaining)?;
+                            if !remaining.is_empty() {
+                                return Err(LegacyGossipError::TrailingBytes);
+                            }
+                            LegacyResponseItem::Block(Arc::new(block))
+                        }
+                        MSG_RESPONSE_TRANSACTION => {
+                            if request_kind != LegacyRequestKind::Transactions {
+                                return Err(LegacyGossipError::UnexpectedResponse("Transactions"));
+                            }
+                            let Some(bytes) = reassembler.accept(&frame.payload)? else {
+                                continue;
+                            };
+                            let mut remaining = bytes.as_slice();
+                            let transaction =
+                                Transaction::zcash_deserialize_from_slice(&mut remaining)?;
+                            if !remaining.is_empty() {
+                                return Err(LegacyGossipError::TrailingBytes);
+                            }
+                            LegacyResponseItem::Transaction(transaction.into())
+                        }
+                        _ => LegacyResponseItem::Frame(frame),
+                    }
+                }
+                decoded => {
+                    reassembler.reject_if_active()?;
+                    decoded
+                }
+            };
 
-            match frame.message_type {
-                MSG_RESPONSE_BLOCK => {
+            match item {
+                LegacyResponseItem::Block(block) => {
                     if request_kind != LegacyRequestKind::Blocks {
                         return Err(LegacyGossipError::UnexpectedResponse("Blocks"));
                     }
-                    if let Some(bytes) = reassembler.accept(&frame.payload)? {
-                        let mut remaining = bytes.as_slice();
-                        let block = Arc::new(Block::zcash_deserialize_from_slice(&mut remaining)?);
-                        if !remaining.is_empty() {
-                            return Err(LegacyGossipError::TrailingBytes);
+                    // Bind the delivered block to a hash we actually requested.
+                    // Without this, a peer can substitute any other valid block
+                    // for the one requested, corrupting downstream hash/source
+                    // accounting (the response is correlated only by request id
+                    // and kind, not by hash).
+                    if let Some(requested) = requested_block_hashes {
+                        let hash = block.hash();
+                        if !requested.contains(&hash) {
+                            return Err(LegacyGossipError::UnsolicitedBlock(hash));
                         }
-                        // Bind the delivered block to a hash we actually requested.
-                        // Without this, a peer can substitute any other valid block
-                        // for the one requested, corrupting downstream hash/source
-                        // accounting (the response is correlated only by request id
-                        // and kind, not by hash).
-                        if let Some(requested) = requested_block_hashes {
-                            let hash = block.hash();
-                            if !requested.contains(&hash) {
-                                return Err(LegacyGossipError::UnsolicitedBlock(hash));
-                            }
-                        }
-                        blocks.push(InventoryResponse::Available((block.into(), None)));
                     }
+                    blocks.push(InventoryResponse::Available((block.into(), None)));
                 }
-                MSG_RESPONSE_TRANSACTION => {
+                LegacyResponseItem::Transaction(transaction) => {
                     if request_kind != LegacyRequestKind::Transactions {
                         return Err(LegacyGossipError::UnexpectedResponse("Transactions"));
                     }
-                    if let Some(bytes) = reassembler.accept(&frame.payload)? {
-                        let mut remaining = bytes.as_slice();
-                        let transaction =
-                            Transaction::zcash_deserialize_from_slice(&mut remaining)?;
-                        if !remaining.is_empty() {
-                            return Err(LegacyGossipError::TrailingBytes);
+                    // Bind the delivered transaction to an ID we requested, as
+                    // for blocks above.
+                    if let Some(requested) = requested_transaction_ids {
+                        if !requested.contains(&transaction.id()) {
+                            return Err(LegacyGossipError::UnsolicitedTransaction(
+                                transaction.id(),
+                            ));
                         }
-                        let transaction = UnminedTx::from(transaction);
-                        // Bind the delivered transaction to an ID we requested, as
-                        // for blocks above.
-                        if let Some(requested) = requested_transaction_ids {
-                            if !requested.contains(&transaction.id()) {
-                                return Err(LegacyGossipError::UnsolicitedTransaction(
-                                    transaction.id(),
-                                ));
+                    }
+                    transactions.push(InventoryResponse::Available((transaction, None)));
+                }
+                LegacyResponseItem::Frame(frame) => match frame.message_type {
+                    MSG_RESPONSE_MISSING_BLOCKS => {
+                        if request_kind != LegacyRequestKind::Blocks {
+                            return Err(LegacyGossipError::UnexpectedResponse("MissingBlocks"));
+                        }
+                        reassembler.reject_if_active()?;
+                        for hash in decode_hashes_response(request_id, frame.payload)? {
+                            // A peer may only report blocks we requested as missing.
+                            if let Some(requested) = requested_block_hashes {
+                                if !requested.contains(&hash) {
+                                    return Err(LegacyGossipError::UnsolicitedBlock(hash));
+                                }
+                            }
+                            blocks.push(InventoryResponse::Missing(hash));
+                        }
+                    }
+                    MSG_RESPONSE_MISSING_TRANSACTIONS => {
+                        if request_kind != LegacyRequestKind::Transactions {
+                            return Err(LegacyGossipError::UnexpectedResponse(
+                                "MissingTransactions",
+                            ));
+                        }
+                        reassembler.reject_if_active()?;
+                        for id in decode_tx_ids_response(request_id, frame.payload)? {
+                            if let Some(requested) = requested_transaction_ids {
+                                if !requested.contains(&id) {
+                                    return Err(LegacyGossipError::UnsolicitedTransaction(id));
+                                }
+                            }
+                            transactions.push(InventoryResponse::Missing(id));
+                        }
+                    }
+                    MSG_RESPONSE_BLOCK_HASHES => {
+                        if request_kind != LegacyRequestKind::FindBlocks {
+                            return Err(LegacyGossipError::UnexpectedResponse("BlockHashes"));
+                        }
+                        reassembler.reject_if_active()?;
+                        block_hashes.extend(decode_hashes_response(request_id, frame.payload)?);
+                    }
+                    MSG_RESPONSE_BLOCK_HEADERS => {
+                        if request_kind != LegacyRequestKind::FindHeaders {
+                            return Err(LegacyGossipError::UnexpectedResponse("BlockHeaders"));
+                        }
+                        reassembler.reject_if_active()?;
+                        block_headers.extend(decode_block_headers(request_id, frame.payload)?);
+                    }
+                    MSG_RESPONSE_TRANSACTION_IDS => {
+                        if request_kind != LegacyRequestKind::MempoolTransactionIds {
+                            return Err(LegacyGossipError::UnexpectedResponse("TransactionIds"));
+                        }
+                        reassembler.reject_if_active()?;
+                        transaction_ids.extend(decode_tx_ids_response(request_id, frame.payload)?);
+                    }
+                    MSG_RESPONSE_PONG => {
+                        if request_kind != LegacyRequestKind::Ping {
+                            return Err(LegacyGossipError::UnexpectedResponse("Pong"));
+                        }
+                        reassembler.reject_if_active()?;
+                        decode_id_only_response(request_id, frame.payload)?;
+                        saw_pong = true;
+                    }
+                    MSG_RESPONSE_NIL => {
+                        // NIL is the empty-result sentinel for chain discovery and
+                        // mempool queries: the inbound service answers an empty
+                        // FindBlocks/FindHeaders/MempoolTransactionIds (and a queued
+                        // PushTransaction) with Response::Nil, so accept it for those
+                        // kinds and let the final match below turn it into that
+                        // kind's empty response. Inventory fetches and Ping must not
+                        // receive a bare NIL — for BlocksByHash/TransactionsById it
+                        // means the peer has none of the requested items, so reject
+                        // it as unexpected and let the caller fall back to another
+                        // peer (rather than silently returning an empty fetch).
+                        match request_kind {
+                            LegacyRequestKind::FindBlocks
+                            | LegacyRequestKind::FindHeaders
+                            | LegacyRequestKind::MempoolTransactionIds
+                            | LegacyRequestKind::PushTransaction => {}
+                            LegacyRequestKind::Blocks
+                            | LegacyRequestKind::Transactions
+                            | LegacyRequestKind::Ping => {
+                                return Err(LegacyGossipError::UnexpectedResponse("Nil"));
                             }
                         }
-                        transactions.push(InventoryResponse::Available((transaction, None)));
+                        reassembler.reject_if_active()?;
+                        decode_id_only_response(request_id, frame.payload)?;
+                        saw_nil = true;
                     }
-                }
-                MSG_RESPONSE_MISSING_BLOCKS => {
-                    if request_kind != LegacyRequestKind::Blocks {
-                        return Err(LegacyGossipError::UnexpectedResponse("MissingBlocks"));
+                    message_type => {
+                        return Err(LegacyGossipError::UnknownMessageType(message_type))
                     }
-                    reassembler.reject_if_active()?;
-                    for hash in decode_hashes_response(request_id, frame.payload)? {
-                        // A peer may only report blocks we requested as missing.
-                        if let Some(requested) = requested_block_hashes {
-                            if !requested.contains(&hash) {
-                                return Err(LegacyGossipError::UnsolicitedBlock(hash));
-                            }
-                        }
-                        blocks.push(InventoryResponse::Missing(hash));
-                    }
-                }
-                MSG_RESPONSE_MISSING_TRANSACTIONS => {
-                    if request_kind != LegacyRequestKind::Transactions {
-                        return Err(LegacyGossipError::UnexpectedResponse("MissingTransactions"));
-                    }
-                    reassembler.reject_if_active()?;
-                    for id in decode_tx_ids_response(request_id, frame.payload)? {
-                        if let Some(requested) = requested_transaction_ids {
-                            if !requested.contains(&id) {
-                                return Err(LegacyGossipError::UnsolicitedTransaction(id));
-                            }
-                        }
-                        transactions.push(InventoryResponse::Missing(id));
-                    }
-                }
-                MSG_RESPONSE_BLOCK_HASHES => {
-                    if request_kind != LegacyRequestKind::FindBlocks {
-                        return Err(LegacyGossipError::UnexpectedResponse("BlockHashes"));
-                    }
-                    reassembler.reject_if_active()?;
-                    block_hashes.extend(decode_hashes_response(request_id, frame.payload)?);
-                }
-                MSG_RESPONSE_BLOCK_HEADERS => {
-                    if request_kind != LegacyRequestKind::FindHeaders {
-                        return Err(LegacyGossipError::UnexpectedResponse("BlockHeaders"));
-                    }
-                    reassembler.reject_if_active()?;
-                    block_headers.extend(decode_block_headers(request_id, frame.payload)?);
-                }
-                MSG_RESPONSE_TRANSACTION_IDS => {
-                    if request_kind != LegacyRequestKind::MempoolTransactionIds {
-                        return Err(LegacyGossipError::UnexpectedResponse("TransactionIds"));
-                    }
-                    reassembler.reject_if_active()?;
-                    transaction_ids.extend(decode_tx_ids_response(request_id, frame.payload)?);
-                }
-                MSG_RESPONSE_PONG => {
-                    if request_kind != LegacyRequestKind::Ping {
-                        return Err(LegacyGossipError::UnexpectedResponse("Pong"));
-                    }
-                    reassembler.reject_if_active()?;
-                    decode_id_only_response(request_id, frame.payload)?;
-                    saw_pong = true;
-                }
-                MSG_RESPONSE_NIL => {
-                    // NIL is the empty-result sentinel for chain discovery and
-                    // mempool queries: the inbound service answers an empty
-                    // FindBlocks/FindHeaders/MempoolTransactionIds (and a queued
-                    // PushTransaction) with Response::Nil, so accept it for those
-                    // kinds and let the final match below turn it into that
-                    // kind's empty response. Inventory fetches and Ping must not
-                    // receive a bare NIL — for BlocksByHash/TransactionsById it
-                    // means the peer has none of the requested items, so reject
-                    // it as unexpected and let the caller fall back to another
-                    // peer (rather than silently returning an empty fetch).
-                    match request_kind {
-                        LegacyRequestKind::FindBlocks
-                        | LegacyRequestKind::FindHeaders
-                        | LegacyRequestKind::MempoolTransactionIds
-                        | LegacyRequestKind::PushTransaction => {}
-                        LegacyRequestKind::Blocks
-                        | LegacyRequestKind::Transactions
-                        | LegacyRequestKind::Ping => {
-                            return Err(LegacyGossipError::UnexpectedResponse("Nil"));
-                        }
-                    }
-                    reassembler.reject_if_active()?;
-                    decode_id_only_response(request_id, frame.payload)?;
-                    saw_nil = true;
-                }
-                message_type => return Err(LegacyGossipError::UnknownMessageType(message_type)),
+                },
             }
         }
 
@@ -2479,14 +2528,14 @@ impl ZakuraRequestClient {
                 return Err(error);
             }
         };
-        // The grant funds the frames and the decoder's reassembly copy. It ends when
-        // the raw response does, within this request's client slot, even if its
-        // connection has closed. The caller's pipeline owns the decoded payloads.
-        let (frames, _grant) = response.into_parts();
+        // Keep the serialized-byte grant through response assembly, within this
+        // request's client slot, even if its connection has closed. Completed
+        // blocks and transactions already own their decoded payloads.
+        let (items, _grant) = response.into_parts();
         let mut response = match LegacyResponseCodec::decode_response(
             request_id,
             request_kind,
-            frames,
+            items,
             requested.as_ref(),
         ) {
             Ok(response) => response,
@@ -6676,7 +6725,7 @@ mod tests {
     fn response_codec_rejects_empty_inventory_frame_sets() {
         for kind in [LegacyRequestKind::Blocks, LegacyRequestKind::Transactions] {
             assert!(matches!(
-                LegacyResponseCodec::decode_response(1, kind, Vec::new(), None),
+                LegacyResponseCodec::decode_response(1, kind, Vec::<Frame>::new(), None),
                 Err(LegacyGossipError::MissingResponse(_))
             ));
         }

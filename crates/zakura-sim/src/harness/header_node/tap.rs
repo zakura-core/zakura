@@ -42,6 +42,10 @@
 //! locator `Dispatched` events, in an [`AdoptionEvidence`] that the harness's
 //! view reads.
 //!
+//! So do the readmission cooldowns the reactor starts and the sessions it
+//! refuses. The tap keeps them, with the time of each and of each admission,
+//! in a [`CooldownEvidence`] that the harness's view reads.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -51,6 +55,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, PoisonError, Weak,
     },
+    time::Duration,
 };
 
 use zakura_network::zakura::{
@@ -66,6 +71,7 @@ use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
+    fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
     policy::LinkEffect,
     session::SessionEvidence,
@@ -119,6 +125,8 @@ struct TapState {
     sessions: SessionEvidence,
     /// The reactor's adopted state and what it published, for the view.
     adoption: AdoptionEvidence,
+    /// The reactor's cooldowns, refusals and admissions, for the view.
+    cooldowns: CooldownEvidence,
 }
 
 /// The tap's ownership check, and the first rule a history broke.
@@ -251,6 +259,21 @@ impl HeaderSyncObserver for TapObserver {
         if in_run {
             state.sessions.reactor(&event);
         }
+        let at = zakura_scheduler::hooks::now()
+            .filter(|_| in_run)
+            .map(|now| now.since_start());
+        let after = state.buffer().last;
+        if let Some(fact) = cooldown_fact(&event, at.unwrap_or_default(), after) {
+            // Only a live reactor admits, refuses or cools a peer, so none of
+            // it happens in the run's own shutdown.
+            match at {
+                Some(_) => state.cooldowns.record(fact),
+                None => state.refused.store(true, Ordering::Relaxed),
+            }
+            if !matches!(event, ReactorEvent::SessionAdmitted { .. }) {
+                return;
+            }
+        }
         if let Some(fact) = AdoptionFact::of(&event) {
             let unlogged = fact.is_unlogged();
             // Only a live reactor adopts state or publishes, so none of it
@@ -378,6 +401,11 @@ impl ReactorTap {
             let adoption = adoption.clone();
             move || adoption.freeze()
         });
+        let cooldowns = CooldownEvidence::default();
+        sim.on_frozen({
+            let cooldowns = cooldowns.clone();
+            move || cooldowns.freeze()
+        });
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -391,6 +419,7 @@ impl ReactorTap {
                 work: Mutex::default(),
                 sessions,
                 adoption,
+                cooldowns,
             }))
         });
         let state = observer.0.clone();
@@ -429,6 +458,12 @@ impl ReactorTap {
         self.state.adoption.clone()
     }
 
+    /// The reactor's cooldowns, refusals and admissions, which the tap fills
+    /// as they happen.
+    pub fn cooldowns(&self) -> CooldownEvidence {
+        self.state.cooldowns.clone()
+    }
+
     /// The notice the harness gives this tap when it stops the reactor.
     pub fn shutdown(&self) -> TapShutdown {
         TapShutdown(self.state.clone())
@@ -450,6 +485,42 @@ impl ReactorTap {
 /// `peer` as hex, by the digest storage attributes it with.
 pub(super) fn peer(peer: &ZakuraPeerId) -> String {
     hex(&peer.digest())
+}
+
+/// The cooldown fact `event` gives, if any, reported at `at`, after the
+/// tap logged event number `after`.
+fn cooldown_fact(event: &ReactorEvent, at: Duration, after: u64) -> Option<CooldownFact> {
+    Some(match event {
+        ReactorEvent::CooldownStarted {
+            peer: cooled,
+            origin,
+            cooldown,
+        } => CooldownFact::Started {
+            peer: peer(cooled),
+            origin: *origin,
+            cooldown: *cooldown,
+            at,
+            after,
+        },
+        ReactorEvent::SessionRefused {
+            peer: refused,
+            session_id,
+        } => CooldownFact::Refused {
+            peer: peer(refused),
+            session_id: *session_id,
+            at,
+        },
+        ReactorEvent::SessionAdmitted {
+            peer: admitted,
+            session_id,
+            ..
+        } => CooldownFact::Admitted {
+            peer: peer(admitted),
+            session_id: *session_id,
+            at,
+        },
+        _ => return None,
+    })
 }
 
 /// `request` in plain fields.

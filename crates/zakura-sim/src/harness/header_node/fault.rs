@@ -1,17 +1,28 @@
 //! Whether the node penalizes the peer behind each header fault its storage
-//! reports, judged from the log and the storage source's view-side
-//! [`FaultAttributions`].
+//! reports, and keeps that peer out for its readmission cooldown, judged from
+//! the log, the storage source's view-side [`FaultAttributions`] and the
+//! tap's view-side [`CooldownEvidence`]. This is
+//! `header-sync/header-fault-penalized`. hdr-3's
+//! `fault-penalized-after-teardown` is its disconnect case: a disconnect
+//! before the failure settles changes nothing it owes.
 //!
 //! [`owed`] applies production's rule for an automatic header-peer fault on
 //! its own: the failure blames the header peer, that peer is the source the
 //! request named, and the category is `malformed_protocol` or
-//! `invalid_header`. [`FaultEvidence::penalized`] then wants a matching
-//! `Misbehavior` for each one, reported while the reactor handled the call
-//! that took the failed reply. This is the first rule of
-//! `header-sync/header-fault-penalized`. A disconnect before the failure
-//! settles changes nothing it owes.
+//! `invalid_header`. Each such failure whose reply the reactor took owes, while
+//! the reactor handles the call that took it, a matching `Misbehavior` and,
+//! unless the node's configured cooldown is zero, the `CooldownStarted` that
+//! follows it. Until that cooldown ends, the reactor admits no session from
+//! the peer. [`FaultEvidence::check`] judges this as the run goes, and
+//! [`FaultEvidence::penalized`] judges a finished run.
 
-use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use super::adoption::{settled, Acceptance};
 use crate::{
@@ -62,7 +73,11 @@ pub fn owed(
     entries: &[Entry],
     attributions: &FaultAttributions,
 ) -> Result<Vec<OwedPenalty>, String> {
-    scan(entries, attributions).map(|(owed, _)| owed)
+    let judge = Judge::over(entries, attributions, &Cooldowns::Unchecked);
+    match judge.error {
+        Some(why) => Err(why),
+        None => Ok(judge.owed),
+    }
 }
 
 /// The operations in `entries` that failed with a fault that would owe a
@@ -70,51 +85,155 @@ pub fn owed(
 /// the call, or the log ends first. Whether the node should have penalized
 /// them can't be judged from the reactor's side.
 pub fn untaken(entries: &[Entry], attributions: &FaultAttributions) -> Result<Vec<u64>, String> {
-    scan(entries, attributions).map(|(_, untaken)| untaken)
+    let judge = Judge::over(entries, attributions, &Cooldowns::Unchecked);
+    match judge.error {
+        Some(why) => Err(why),
+        None => Ok(judge.untaken()),
+    }
 }
 
-/// [`owed`] and [`untaken`] in one pass over `entries`.
-fn scan(
-    entries: &[Entry],
-    attributions: &FaultAttributions,
-) -> Result<(Vec<OwedPenalty>, Vec<u64>), String> {
-    let mut requests: BTreeMap<u64, Request<'_>> = BTreeMap::new();
-    let mut failed: BTreeMap<u64, (Request<'_>, &str)> = BTreeMap::new();
-    let mut owed = Vec::new();
-    for entry in entries {
-        let Observation::Storage {
-            service,
-            instance: NODE,
-            fact,
-            ..
-        } = &entry.obs
-        else {
-            continue;
+/// A logged prepare or apply request, as [`owed`] reads it.
+#[derive(Clone, Debug)]
+struct Request {
+    stage: &'static str,
+    source: String,
+    session_id: u64,
+    call: Option<u64>,
+}
+
+/// A `Misbehavior` the reactor reported while it handled one call: its
+/// peer, reason and origin, and its event number.
+#[derive(Clone, Debug)]
+struct Reported {
+    peer: String,
+    reason: String,
+    origin: Option<u64>,
+    seq: u64,
+}
+
+/// What the reactor reported while it handled one call's completion.
+#[derive(Debug, Default)]
+struct Window {
+    reported: Vec<Reported>,
+    /// Set at the call's `Handled`, after which nothing joins it.
+    handled: bool,
+}
+
+/// How the judge checks the cooldown after each matched `Misbehavior`.
+enum Cooldowns<'c> {
+    /// It doesn't, as [`owed`] and [`untaken`] read only the penalties.
+    Unchecked,
+    /// Each matched `Misbehavior` must be followed by a `CooldownStarted` in
+    /// `facts` that installs `cooldown`, unless `cooldown` is zero.
+    Checked {
+        facts: &'c [CooldownFact],
+        cooldown: Duration,
+    },
+}
+
+/// The penalty rule's state after the log entries it has read. It reads each
+/// entry once, so the property's check costs nothing per step beyond the new
+/// entries.
+#[derive(Debug, Default)]
+struct Judge {
+    /// How many log entries it has read.
+    read: usize,
+    requests: BTreeMap<u64, Request>,
+    /// Each failed operation whose reply the reactor hasn't taken, with its
+    /// request and category.
+    failed: BTreeMap<u64, (Request, String)>,
+    /// Every penalty owed so far, in the order the replies were taken.
+    owed: Vec<OwedPenalty>,
+    /// The penalties in [`Judge::owed`] whose call's handling hasn't ended,
+    /// by index.
+    pending: Vec<usize>,
+    /// What each call's handling reported, from its `CallEnded` on.
+    windows: HashMap<u64, Window>,
+    /// The call whose handling is running: its `CallEnded` came, and its
+    /// `Handled` hasn't.
+    handling: Option<u64>,
+    /// Why the evidence can't be read, such as a failure with no
+    /// attribution.
+    error: Option<String>,
+    /// The first break of the rule.
+    broken: Option<String>,
+}
+
+impl Judge {
+    /// A judge that has read all of `entries`.
+    fn over(entries: &[Entry], attributions: &FaultAttributions, cooldowns: &Cooldowns) -> Self {
+        let mut judge = Judge::default();
+        judge.read(entries, attributions, cooldowns);
+        judge
+    }
+
+    /// Reads the entries after the ones it already read, judging each owed
+    /// penalty once its call's handling ends. Stops at the first break.
+    fn read(&mut self, entries: &[Entry], attributions: &FaultAttributions, cooldowns: &Cooldowns) {
+        let Some(new) = entries.get(self.read..) else {
+            self.error
+                .get_or_insert_with(|| "the log the penalty rule reads got shorter".to_owned());
+            return;
         };
-        if service != HEADER_SERVICE {
-            continue;
+        self.read = entries.len();
+        for entry in new {
+            if self.failure().is_some() {
+                return;
+            }
+            if let Err(why) = self.entry(entry, attributions) {
+                self.error = Some(why);
+                return;
+            }
+            self.judge(cooldowns);
         }
+    }
+
+    /// The evidence error or rule break that stopped it, if one did.
+    fn failure(&self) -> Option<String> {
+        self.error.clone().or_else(|| self.broken.clone())
+    }
+
+    /// Reads one log entry.
+    fn entry(&mut self, entry: &Entry, attributions: &FaultAttributions) -> Result<(), String> {
+        match &entry.obs {
+            Observation::Storage {
+                service,
+                instance: NODE,
+                fact,
+                ..
+            } if service == HEADER_SERVICE => self.storage(fact, attributions),
+            Observation::Reactor { seq, event, .. } => {
+                self.reactor(*seq, event);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Reads one of the node's header storage facts.
+    fn storage(
+        &mut self,
+        fact: &StorageFact,
+        attributions: &FaultAttributions,
+    ) -> Result<(), String> {
         match fact {
             StorageFact::Submitted {
                 id,
                 request:
-                    StorageRequest::PrepareHeaderTarget { owner, source, .. }
-                    | StorageRequest::ApplyHeaderTarget { owner, source, .. },
+                    request @ (StorageRequest::PrepareHeaderTarget { owner, source, .. }
+                    | StorageRequest::ApplyHeaderTarget { owner, source, .. }),
                 call,
                 ..
             } => {
-                let stage = match fact {
-                    StorageFact::Submitted {
-                        request: StorageRequest::PrepareHeaderTarget { .. },
-                        ..
-                    } => "prepare",
+                let stage = match request {
+                    StorageRequest::PrepareHeaderTarget { .. } => "prepare",
                     _ => "apply",
                 };
-                requests.insert(
+                self.requests.insert(
                     *id,
                     Request {
                         stage,
-                        source,
+                        source: source.clone(),
                         session_id: owner.session_id,
                         call: *call,
                     },
@@ -126,20 +245,22 @@ fn scan(
                     StorageResult::PrepareFailed { category } | StorageResult::ApplyFailed { category },
                 ..
             } => {
-                let request = *requests.get(id).ok_or_else(|| {
+                let request = self.requests.get(id).cloned().ok_or_else(|| {
                     format!("UnknownOperation: operation {id} failed with no logged request")
                 })?;
-                failed.insert(*id, (request, category));
+                if owes(attributions, *id, &request, category)?.is_some() {
+                    self.failed.insert(*id, (request, category.clone()));
+                }
             }
             StorageFact::ReplyTaken { id } => {
-                let Some((request, category)) = failed.remove(id) else {
-                    continue;
-                };
-                if let Some(reason) = owes(attributions, *id, request, category)? {
-                    owed.push(OwedPenalty {
+                if let Some((request, category)) = self.failed.remove(id) {
+                    let reason = owes(attributions, *id, &request, &category)?
+                        .expect("only a failure that owes a penalty is kept");
+                    self.pending.push(self.owed.len());
+                    self.owed.push(OwedPenalty {
                         op: *id,
                         stage: request.stage,
-                        source: request.source.to_owned(),
+                        source: request.source,
                         session_id: request.session_id,
                         reason,
                         call: request.call,
@@ -148,14 +269,182 @@ fn scan(
             }
             _ => {}
         }
+        Ok(())
     }
-    let mut untaken = Vec::new();
-    for (id, (request, category)) in failed {
-        if owes(attributions, id, request, category)?.is_some() {
-            untaken.push(id);
+
+    /// Reads one reactor fact, numbered `seq`, into its call's window.
+    fn reactor(&mut self, seq: u64, event: &ReactorFact) {
+        match event {
+            // A dropped call is never handled.
+            ReactorFact::CallEnded { call, end, .. } if end != "dropped" => {
+                self.windows.entry(*call).or_default();
+                self.handling = Some(*call);
+            }
+            ReactorFact::Handled { call, .. } => {
+                if let Some(window) = self.windows.get_mut(call) {
+                    window.handled = true;
+                }
+                if self.handling == Some(*call) {
+                    self.handling = None;
+                }
+            }
+            ReactorFact::Misbehavior {
+                peer,
+                reason,
+                origin,
+                ..
+            } => {
+                // The reactor handles one completion at a time, and the
+                // tap's order puts each of its events between that call's
+                // `CallEnded` and `Handled`.
+                let window = self.handling.and_then(|call| self.windows.get_mut(&call));
+                if let Some(window) = window {
+                    window.reported.push(Reported {
+                        peer: peer.clone(),
+                        reason: reason.clone(),
+                        origin: *origin,
+                        seq,
+                    });
+                }
+            }
+            _ => {}
         }
     }
-    Ok((owed, untaken))
+
+    /// Judges each pending penalty whose call's handling has ended. One
+    /// that no reactor call submitted has no handling to penalize it, so it
+    /// breaks at once.
+    fn judge(&mut self, cooldowns: &Cooldowns) {
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.retain(|index| {
+            let penalty = &self.owed[*index];
+            let Some(call) = penalty.call else {
+                self.broken.get_or_insert_with(|| {
+                    format!(
+                        "UnpenalizedFault: {} operation {} failed with a header-peer fault of {} \
+                         in session {}, and no reactor call submitted it, so no handling can \
+                         penalize it",
+                        penalty.stage, penalty.op, penalty.source, penalty.session_id
+                    )
+                });
+                return false;
+            };
+            let Some(window) = self.windows.get(&call).filter(|window| window.handled) else {
+                return true;
+            };
+            if let Err(why) = matched(penalty, window, cooldowns) {
+                self.broken.get_or_insert(why);
+            }
+            false
+        });
+        self.pending = pending;
+    }
+
+    /// The failed operations that owe a penalty and whose reply the reactor
+    /// hasn't taken, in order.
+    fn untaken(&self) -> Vec<u64> {
+        self.failed.keys().copied().collect()
+    }
+
+    /// Why the rule can't judge everything it read yet, if it can't: a
+    /// penalty whose call's handling hasn't ended, or a failure whose reply
+    /// the reactor hasn't taken.
+    fn open(&self) -> Option<String> {
+        if let Some(index) = self.pending.first() {
+            let penalty = &self.owed[*index];
+            return Some(format!(
+                "{} operation {} failed with a header-peer fault of {} in session {}, and the \
+                 reactor hasn't finished handling call {:?}",
+                penalty.stage, penalty.op, penalty.source, penalty.session_id, penalty.call
+            ));
+        }
+        self.failed.keys().next().map(|op| {
+            format!(
+                "UntakenFault: operation {op} failed with a header-peer fault whose reply the \
+                 reactor never took"
+            )
+        })
+    }
+}
+
+/// Checks that `window`, the handling of `penalty`'s call, reported a
+/// `Misbehavior` naming the source's peer, the work's session as its origin
+/// and the reason the category calls for, then the cooldown `cooldowns`
+/// wants for it.
+fn matched(penalty: &OwedPenalty, window: &Window, cooldowns: &Cooldowns) -> Result<(), String> {
+    let what = format!(
+        "{} operation {} failed with a header-peer fault of {} in session {}",
+        penalty.stage, penalty.op, penalty.source, penalty.session_id
+    );
+    let reported: Vec<&Reported> = window
+        .reported
+        .iter()
+        .filter(|reported| {
+            reported.peer == penalty.source
+                && reported.reason == penalty.reason
+                && reported.origin == Some(penalty.session_id)
+        })
+        .collect();
+    if reported.is_empty() {
+        return Err(format!(
+            "UnpenalizedFault: {what}, and the reactor reported no {} Misbehavior from that \
+             session while it handled call {:?}",
+            penalty.reason, penalty.call
+        ));
+    }
+    let Cooldowns::Checked { facts, cooldown } = cooldowns else {
+        return Ok(());
+    };
+    if cooldown.is_zero() {
+        return Ok(());
+    }
+    let cooled = facts.iter().any(|fact| {
+        matches!(fact, CooldownFact::Started { peer, origin, cooldown: started, after, .. }
+            if *peer == penalty.source
+                && *origin == penalty.session_id
+                && started == cooldown
+                && reported.iter().any(|reported| reported.seq == *after))
+    });
+    if cooled {
+        Ok(())
+    } else {
+        Err(format!(
+            "UncooledFault: {what}, and the reactor installed no {cooldown:?} readmission \
+             cooldown for it after its Misbehavior"
+        ))
+    }
+}
+
+/// The first session the reactor admitted from a peer during that peer's
+/// readmission cooldown, as a break, reading `facts` in the order the
+/// reactor reported them.
+fn readmitted(facts: &[CooldownFact]) -> Option<String> {
+    let mut cooled: Vec<(&str, Duration, Duration)> = Vec::new();
+    for fact in facts {
+        match fact {
+            CooldownFact::Started {
+                peer, cooldown, at, ..
+            } => cooled.push((peer, *at, at.saturating_add(*cooldown))),
+            CooldownFact::Admitted {
+                peer,
+                session_id,
+                at,
+            } => {
+                if let Some((_, from, until)) = cooled
+                    .iter()
+                    .find(|(cooled, _, until)| *cooled == peer.as_str() && at < until)
+                {
+                    return Some(format!(
+                        "ReadmittedInCooldown: the reactor admitted session {session_id} from \
+                         {peer} at {at:?}, inside the readmission cooldown it started at \
+                         {from:?} until {until:?}"
+                    ));
+                }
+            }
+            CooldownFact::Refused { .. } => {}
+        }
+    }
+    None
 }
 
 /// The reason failed operation `id`, from `request`, with `category`, owes,
@@ -163,38 +452,136 @@ fn scan(
 fn owes(
     attributions: &FaultAttributions,
     id: u64,
-    request: Request<'_>,
+    request: &Request,
     category: &str,
 ) -> Result<Option<&'static str>, String> {
     let blame = attributions
         .get(NODE, id)
         .ok_or_else(|| format!("MissingAttribution: failed operation {id} has no attribution"))?;
-    Ok(owes_penalty(request.source, category, &blame))
+    Ok(owes_penalty(&request.source, category, &blame))
 }
 
-/// A logged prepare or apply request, as [`owed`] reads it.
-#[derive(Clone, Copy)]
-struct Request<'a> {
-    stage: &'static str,
-    source: &'a str,
-    session_id: u64,
-    call: Option<u64>,
+/// One fact about the node's readmission cooldowns, kept out of the log.
+/// Peers are written as the log writes them: the hex of their digest. `at`
+/// is the virtual time since the run's start that the reactor reported it
+/// at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CooldownFact {
+    /// `CooldownStarted`, reported right after reactor event `after`, the
+    /// `Misbehavior` it follows.
+    Started {
+        /// The cooled peer.
+        peer: String,
+        /// The session whose work showed the fault.
+        origin: u64,
+        /// How long the cooldown lasts.
+        cooldown: Duration,
+        /// When it started.
+        at: Duration,
+        /// The number of the last logged reactor event before it.
+        after: u64,
+    },
+    /// `SessionRefused`.
+    Refused {
+        /// The refused peer.
+        peer: String,
+        /// The refused session.
+        session_id: u64,
+        /// When.
+        at: Duration,
+    },
+    /// `SessionAdmitted`, which the refusal rule reads.
+    Admitted {
+        /// The admitted peer.
+        peer: String,
+        /// The admitted session.
+        session_id: u64,
+        /// When.
+        at: Duration,
+    },
 }
 
-/// The node's fault evidence: whom its storage failures blamed, and, once
-/// the run ends, whether it settled. Cloning shares both.
+/// What [`CooldownEvidence`] holds.
+#[derive(Debug, Default)]
+struct CooldownStore {
+    facts: Vec<CooldownFact>,
+    /// Set when the run's log froze. Facts after it are dropped.
+    frozen: bool,
+}
+
+/// The reactor's cooldown facts, shared by its tap and the harness's view.
+/// Cloning shares the store.
+#[derive(Clone, Debug, Default)]
+pub struct CooldownEvidence(Arc<Mutex<CooldownStore>>);
+
+impl CooldownEvidence {
+    /// Locks the store. Every change completes under the lock, and nothing
+    /// else is called while it's held.
+    fn store(&self) -> std::sync::MutexGuard<'_, CooldownStore> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records `fact`, unless the evidence is frozen.
+    pub(super) fn record(&self, fact: CooldownFact) {
+        let mut store = self.store();
+        if !store.frozen {
+            store.facts.push(fact);
+        }
+    }
+
+    /// Stops recording facts, when the run's log freezes, as the adoption
+    /// evidence does.
+    pub(super) fn freeze(&self) {
+        self.store().frozen = true;
+    }
+
+    /// Every fact so far, in the order the reactor reported them.
+    pub fn facts(&self) -> Vec<CooldownFact> {
+        self.store().facts.clone()
+    }
+}
+
+/// The node's fault evidence: whom its storage failures blamed, the
+/// cooldowns its reactor started and the sessions it admitted or refused,
+/// the cooldown its config sets, and, once the run ends, whether it
+/// settled. Cloning shares all of it.
 #[derive(Clone, Debug, Default)]
 pub struct FaultEvidence {
     attributions: FaultAttributions,
-    settled: Rc<Cell<Option<bool>>>,
+    cooldowns: CooldownEvidence,
+    /// The node's configured readmission cooldown.
+    cooldown: Duration,
+    settled: Rc<std::cell::Cell<Option<bool>>>,
+    /// The property's judge, which reads each log entry once.
+    judge: Rc<RefCell<Judge>>,
+}
+
+/// What [`FaultEvidence::check`] found after a step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaultCheck {
+    /// No fault owes anything, and the reactor started no cooldown.
+    Nothing,
+    /// Everything judged so far holds, and nothing is open.
+    Holds,
+    /// Everything judged so far holds, but this is still open.
+    Open(String),
+    /// The rule broke.
+    Broken(String),
 }
 
 impl FaultEvidence {
-    /// Evidence that reads `attributions`.
-    pub fn new(attributions: FaultAttributions) -> Self {
+    /// Evidence that reads `attributions` and `cooldowns`, for a node whose
+    /// config sets a readmission cooldown of `cooldown`.
+    pub fn new(
+        attributions: FaultAttributions,
+        cooldowns: CooldownEvidence,
+        cooldown: Duration,
+    ) -> Self {
         FaultEvidence {
             attributions,
-            settled: Rc::default(),
+            cooldowns,
+            cooldown,
+            ..FaultEvidence::default()
         }
     }
 
@@ -203,68 +590,83 @@ impl FaultEvidence {
         &self.attributions
     }
 
+    /// The cooldowns the reactor started and the sessions it admitted or
+    /// refused.
+    pub fn cooldowns(&self) -> &CooldownEvidence {
+        &self.cooldowns
+    }
+
     /// Records how the run ended, and whether it [`settled`].
     pub fn end(&self, end: &RunEnd) {
         self.settled.set(Some(settled(end)));
     }
 
-    /// The penalty rule over `entries`, the run's log: each penalty
-    /// [`owed`] is matched by a `Misbehavior` naming the source's peer, the
-    /// work's session as its origin and the reason the category calls for,
-    /// which the reactor reported while it handled the call that submitted
-    /// the operation: strictly between that call's `CallEnded` and `Handled`,
-    /// in the tap's order. A `Misbehavior` from another completion, even
-    /// against the same session, matches nothing. A penalty still unmatched
-    /// when a settled run ends is a break. Unmatched at any other end, or
-    /// before the run has ended, it's inconclusive. With nothing unmatched,
-    /// a fault the reactor never took ([`untaken`]) leaves the rule
-    /// inconclusive too, so a node that abandons such work can't pass it.
-    pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
-        let (owed, untaken) = match scan(entries, &self.attributions) {
-            Ok(scanned) => scanned,
-            Err(why) => return Acceptance::Violated(why),
+    /// `header-sync/header-fault-penalized` after a step, over `entries`,
+    /// the run's log so far, which only ever grows: each penalty [`owed`],
+    /// once the reactor has handled the call that took its failed reply,
+    /// was matched by a `Misbehavior` naming the source's peer, the work's
+    /// session as its origin and the reason the category calls for,
+    /// reported strictly between that call's `CallEnded` and `Handled` in
+    /// the tap's order. Unless the configured cooldown is zero, that
+    /// `Misbehavior` is followed by a `CooldownStarted` for the same peer and
+    /// session that installs the configured cooldown. No session from a
+    /// peer is admitted while a cooldown started for it lasts.
+    pub fn check(&self, entries: &[Entry]) -> FaultCheck {
+        let facts = self.cooldowns.facts();
+        let cooldowns = Cooldowns::Checked {
+            facts: &facts,
+            cooldown: self.cooldown,
         };
-        let events: Vec<&ReactorFact> = entries
+        let mut judge = self.judge.borrow_mut();
+        judge.read(entries, &self.attributions, &cooldowns);
+        if let Some(why) = judge.failure().or_else(|| readmitted(&facts)) {
+            return FaultCheck::Broken(why);
+        }
+        if let Some(why) = judge.open() {
+            return FaultCheck::Open(why);
+        }
+        let started = facts
             .iter()
-            .filter_map(|entry| match &entry.obs {
-                Observation::Reactor { event, .. } => Some(event),
-                _ => None,
-            })
-            .collect();
-        let penalized = |penalty: &OwedPenalty| {
-            let Some(call) = penalty.call else {
-                return false;
-            };
-            let Some(start) = events.iter().position(
-                |event| matches!(event, ReactorFact::CallEnded { call: ended, .. } if *ended == call),
-            ) else {
-                return false;
-            };
-            events[start + 1..]
-                .iter()
-                .take_while(
-                    |event| !matches!(event, ReactorFact::Handled { call: handled, .. } if *handled == call),
-                )
-                .any(|event| {
-                    matches!(event, ReactorFact::Misbehavior { peer, reason, origin, .. }
-                        if *peer == penalty.source
-                            && reason == penalty.reason
-                            && *origin == Some(penalty.session_id))
-                })
+            .any(|fact| matches!(fact, CooldownFact::Started { .. }));
+        if judge.owed.is_empty() && !started {
+            FaultCheck::Nothing
+        } else {
+            FaultCheck::Holds
+        }
+    }
+
+    /// The same rule as [`FaultEvidence::check`] over a finished run's
+    /// `entries`. A penalty still open when a settled run ends is a break.
+    /// Open at any other end, or before the run has ended, it's
+    /// inconclusive. With nothing else open, a fault the reactor never took
+    /// ([`untaken`]) leaves the rule inconclusive too, so a node that
+    /// abandons such work can't pass it.
+    pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
+        let facts = self.cooldowns.facts();
+        let cooldowns = Cooldowns::Checked {
+            facts: &facts,
+            cooldown: self.cooldown,
         };
-        let Some(first) = owed.iter().find(|penalty| !penalized(penalty)) else {
-            return match untaken.first() {
+        let judge = Judge::over(entries, &self.attributions, &cooldowns);
+        if let Some(why) = judge.failure().or_else(|| readmitted(&facts)) {
+            return Acceptance::Violated(why);
+        }
+        let Some(&index) = judge.pending.first() else {
+            return match judge.open() {
                 None => Acceptance::Holds,
-                Some(op) => Acceptance::Inconclusive(format!(
-                    "UntakenFault: operation {op} failed with a header-peer fault whose reply \
-                     the reactor never took"
-                )),
+                Some(why) => Acceptance::Inconclusive(why),
             };
         };
+        let penalty = &judge.owed[index];
         let what = format!(
             "{} operation {} failed with a header-peer fault of {} in session {}, and the \
              reactor reported no {} Misbehavior from that session while it handled call {:?}",
-            first.stage, first.op, first.source, first.session_id, first.reason, first.call
+            penalty.stage,
+            penalty.op,
+            penalty.source,
+            penalty.session_id,
+            penalty.reason,
+            penalty.call
         );
         match self.settled.get() {
             Some(true) => Acceptance::Violated(format!("UnpenalizedFault: {what}")),
@@ -406,7 +808,8 @@ mod tests {
         for (id, blame) in blamed {
             attributions.insert(NODE, *id, blame.clone());
         }
-        let evidence = FaultEvidence::new(attributions);
+        let evidence =
+            FaultEvidence::new(attributions, CooldownEvidence::default(), Duration::ZERO);
         evidence.settled.set(Some(true));
         evidence
     }
@@ -563,6 +966,145 @@ mod tests {
         assert!(matches!(
             evidence(&[]).penalized(&log),
             Acceptance::Violated(why) if why.starts_with("MissingAttribution")
+        ));
+    }
+
+    /// The reactor's `Misbehavior` against `peer` from session `origin`, as
+    /// its event `seq`.
+    fn misbehavior_at(seq: u64, peer: &str, origin: u64) -> Entry {
+        let mut entry = misbehavior(peer, origin);
+        if let Observation::Reactor { seq: at, .. } = &mut entry.obs {
+            *at = seq;
+        }
+        entry
+    }
+
+    /// A cooldown of `peer` for session `origin`'s fault, started at `at`
+    /// seconds right after reactor event `after`.
+    fn started(peer: &str, origin: u64, cooldown: u64, at: u64, after: u64) -> CooldownFact {
+        CooldownFact::Started {
+            peer: peer.to_owned(),
+            origin,
+            cooldown: Duration::from_secs(cooldown),
+            at: Duration::from_secs(at),
+            after,
+        }
+    }
+
+    /// A session `session_id` from `peer` admitted at `at` seconds.
+    fn admitted(peer: &str, session_id: u64, at: u64) -> CooldownFact {
+        CooldownFact::Admitted {
+            peer: peer.to_owned(),
+            session_id,
+            at: Duration::from_secs(at),
+        }
+    }
+
+    /// Fault evidence for a settled run of a node with a 60 s cooldown,
+    /// where operation 1 blamed `aa` and the reactor reported `facts`.
+    fn cooled(facts: Vec<CooldownFact>) -> FaultEvidence {
+        let attributions = FaultAttributions::default();
+        attributions.insert(NODE, 1, blame("aa"));
+        let cooldowns = CooldownEvidence::default();
+        for fact in facts {
+            cooldowns.record(fact);
+        }
+        let evidence = FaultEvidence::new(attributions, cooldowns, Duration::from_secs(60));
+        evidence.settled.set(Some(true));
+        evidence
+    }
+
+    /// With a cooldown configured, the matched `Misbehavior` must be
+    /// followed by the `CooldownStarted` it installs: same peer and session,
+    /// the configured length, and right after that `Misbehavior`.
+    #[test]
+    fn a_penalty_starts_the_configured_cooldown_after_its_misbehavior() {
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, vec![misbehavior_at(7, "aa", 3)]));
+        let judged = |facts| cooled(facts).penalized(&log);
+        assert_eq!(judged(vec![started("aa", 3, 60, 2, 7)]), Acceptance::Holds);
+        for facts in [
+            Vec::new(),
+            vec![started("bb", 3, 60, 2, 7)],
+            vec![started("aa", 4, 60, 2, 7)],
+            vec![started("aa", 3, 30, 2, 7)],
+            vec![started("aa", 3, 60, 2, 6)],
+        ] {
+            assert!(
+                matches!(judged(facts.clone()),
+                    Acceptance::Violated(why) if why.starts_with("UncooledFault")),
+                "{facts:?}"
+            );
+        }
+        // A zero cooldown installs nothing, so none is owed.
+        let unconfigured = cooled(Vec::new());
+        let unconfigured = FaultEvidence {
+            cooldown: Duration::ZERO,
+            ..unconfigured
+        };
+        assert_eq!(unconfigured.penalized(&log), Acceptance::Holds);
+    }
+
+    /// No session from a cooled peer is admitted until its cooldown ends.
+    /// Another peer, or an admission from before the cooldown or from its
+    /// end on, is fine.
+    #[test]
+    fn a_cooled_peer_is_not_readmitted_until_its_cooldown_ends() {
+        let cooldown = || started("aa", 3, 60, 2, 7);
+        for (facts, broken) in [
+            (vec![cooldown(), admitted("aa", 4, 30)], true),
+            (vec![cooldown(), admitted("aa", 4, 2)], true),
+            (vec![cooldown(), admitted("aa", 4, 62)], false),
+            (vec![cooldown(), admitted("bb", 4, 30)], false),
+            (vec![admitted("aa", 4, 2), cooldown()], false),
+        ] {
+            let evidence = cooled(facts.clone());
+            assert_eq!(
+                matches!(evidence.penalized(&[]),
+                    Acceptance::Violated(why) if why.starts_with("ReadmittedInCooldown")),
+                broken,
+                "{facts:?}"
+            );
+            assert_eq!(
+                matches!(evidence.check(&[]), FaultCheck::Broken(_)),
+                broken,
+                "{facts:?}"
+            );
+        }
+    }
+
+    /// The property's check reads the log as it grows: a penalty is open
+    /// until its call's handling ends, then holds or breaks for good.
+    #[test]
+    fn the_check_judges_each_penalty_once_its_handling_ends() {
+        assert_eq!(cooled(Vec::new()).check(&[]), FaultCheck::Nothing);
+        let evidence = cooled(vec![started("aa", 3, 60, 2, 7)]);
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, vec![misbehavior_at(7, "aa", 3)]));
+        let handled_at = log.len() - 1;
+        assert!(matches!(
+            evidence.check(&log[..handled_at]),
+            FaultCheck::Open(_)
+        ));
+        assert_eq!(evidence.check(&log), FaultCheck::Holds);
+
+        let evidence = cooled(Vec::new());
+        assert!(matches!(
+            evidence.check(&log[..handled_at]),
+            FaultCheck::Open(_)
+        ));
+        assert!(matches!(
+            evidence.check(&log),
+            FaultCheck::Broken(why) if why.starts_with("UncooledFault")
+        ));
+
+        // A fault whose reply the reactor hasn't taken stays open.
+        let evidence = cooled(Vec::new());
+        let mut untaken = failed_prepare(1, "aa", 3, "invalid_header");
+        untaken.pop();
+        assert!(matches!(
+            evidence.check(&untaken),
+            FaultCheck::Open(why) if why.starts_with("UntakenFault")
         ));
     }
 }

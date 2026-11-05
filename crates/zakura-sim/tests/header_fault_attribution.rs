@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use support::{config, inputs, run};
 use zakura_chain::{block, work::difficulty::CompactDifficulty};
@@ -16,7 +16,7 @@ use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{
     harness::header_node::{
         adoption::Acceptance,
-        fault::{owed, FaultEvidence, OwedPenalty},
+        fault::{owed, CooldownEvidence, FaultEvidence, OwedPenalty},
     },
     observe::{StorageFact, StorageResult},
     storage::{Blame, HeaderStorage},
@@ -87,7 +87,12 @@ fn attempt(
                 }
             });
             let storage = HeaderStorage::new(sim, port.clone());
-            faults = Some(FaultEvidence::new(storage.attributions()));
+            // No reactor runs, so nothing starts a cooldown.
+            faults = Some(FaultEvidence::new(
+                storage.attributions(),
+                CooldownEvidence::default(),
+                Duration::ZERO,
+            ));
             sim.add_source(Box::new(storage));
         },
         &mut NoChecks,

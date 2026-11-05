@@ -28,7 +28,7 @@ use super::{
     header_node::StartupFacts,
     header_node::{
         adoption::{AdoptionEvidence, SessionLife},
-        fault::FaultEvidence,
+        fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         session::SessionEvidence,
@@ -49,8 +49,8 @@ use crate::{
         PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Source,
-        Sources, Status, Verdict,
+        Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Inconclusive, Kind, Property,
+        PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
@@ -149,6 +149,12 @@ pub const DIRECT_DISPATCH: &str = "harness/direct-dispatch";
 /// The node's storage operations get rising IDs, each completes at most
 /// once, and only after its submission (M4.1).
 pub const OPERATION_IDS: &str = "header-sync/storage-operation-ids";
+
+/// Each header-peer fault the reactor took is penalized against its work's
+/// session and starts its peer's readmission cooldown, and no session from
+/// that peer is admitted while the cooldown lasts ([`FaultEvidence::check`]).
+/// hdr-3's `fault-penalized-after-teardown` is its disconnect case.
+pub const HEADER_FAULT_PENALIZED: &str = "header-sync/header-fault-penalized";
 
 /// Which end of a mirror's link dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,7 +615,8 @@ impl Subsystem for Storage {
             ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
         let adoption = tap.adoption();
         let shutdown = tap.shutdown();
-        let faults = FaultEvidence::new(storage.attributions());
+        let attributions = storage.attributions();
+        let cooldowns = tap.cooldowns();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -641,6 +648,11 @@ impl Subsystem for Storage {
                 None,
             ));
         }
+        let faults = FaultEvidence::new(
+            attributions,
+            cooldowns,
+            nodes[0].startup.config.unproductive_peer_cooldown,
+        );
         let topology = Rc::new(
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
@@ -786,6 +798,8 @@ pub struct HeaderWire {
     adoption: AdoptionEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
+    /// The node's session view, joined to own-9's facts.
+    sessions: SessionEvidence,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -809,11 +823,13 @@ impl HasView for HeaderWire {
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence, for
-    /// the tip and penalty rules.
+    /// Records the run's end in the node's adoption and fault evidence and
+    /// its session view, for the tip and penalty rules and the own-9 end
+    /// check.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
+        self.sessions.end(end);
     }
 }
 
@@ -918,7 +934,8 @@ impl Subsystem for HeaderWire {
         let (observer, tap) =
             ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
         let adoption = tap.adoption();
-        let faults = FaultEvidence::new(storage.attributions());
+        let attributions = storage.attributions();
+        let cooldowns = tap.cooldowns();
         sim.add_source(Box::new(storage.with_tap(tap)));
         let header = HeaderNode::spawn(
             sim,
@@ -931,6 +948,11 @@ impl Subsystem for HeaderWire {
             Some(observer),
         );
         *ports.startup.borrow_mut() = Some(header.startup.clone());
+        let faults = FaultEvidence::new(
+            attributions,
+            cooldowns,
+            header.startup.config.unproductive_peer_cooldown,
+        );
         let (observer, tap) = TransportTap::with_sessions(
             sim,
             "node",
@@ -985,6 +1007,7 @@ impl Subsystem for HeaderWire {
             honest: Rc::new(scenario.honest_peers()),
             adoption,
             faults,
+            sessions: ports.sessions,
             _keep: Box::new(node),
         }
     }
@@ -1079,9 +1102,9 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     properties
 }
 
-/// The storage harness's properties, [`OPERATION_IDS`] then
-/// [`DIRECT_DISPATCH`], both active. A test harness that wraps
-/// [`Storage`] with its view registers them too.
+/// The storage harness's properties, [`OPERATION_IDS`],
+/// [`DIRECT_DISPATCH`] and [`HEADER_FAULT_PENALIZED`], all active. A test
+/// harness that wraps [`Storage`] with its view registers them too.
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1103,6 +1126,18 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             needs: &[Source::View],
             status: Status::Active,
             check: check_direct_dispatch::<S>,
+            witness: None,
+        },
+        Property {
+            id: PropertyId::new(HEADER_FAULT_PENALIZED),
+            claim: "every prepare or apply failure that is an automatic header-peer fault gets a \
+                    Misbehavior against that work's session and starts its peer's readmission \
+                    cooldown, and a reconnect within the cooldown is refused",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Storage, Source::View],
+            status: Status::Active,
+            check: check_header_fault_penalized::<S>,
             witness: None,
         },
     ]
@@ -1175,6 +1210,27 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
         )
     } else {
         Verdict::Holds
+    }
+}
+
+/// Checks [`HEADER_FAULT_PENALIZED`] after each step, from the node's fault
+/// evidence ([`FaultEvidence::check`]). Something still open is unsettled,
+/// so a run that ends with it is inconclusive.
+fn check_header_fault_penalized<S: HasView<View = StorageView>>(
+    cx: &mut CheckCtx<'_, S>,
+) -> Verdict {
+    match cx.view().faults.check(cx.log.entries()) {
+        FaultCheck::Nothing => Verdict::NotApplicable,
+        FaultCheck::Holds => Verdict::Holds,
+        FaultCheck::Open(_) => {
+            cx.unsettled(Inconclusive::ObligationOpen);
+            Verdict::Holds
+        }
+        FaultCheck::Broken(why) => cx.violated(
+            "each header-peer fault the reactor took is penalized against its session and \
+             cools its peer down, which no session from it skips",
+            why,
+        ),
     }
 }
 

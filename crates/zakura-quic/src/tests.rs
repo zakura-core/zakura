@@ -1536,6 +1536,38 @@ async fn blocked_write_fails_when_the_peer_stops() {
     .unwrap();
 }
 
+/// API-5, DRV-9: `stopped` resolves with the peer's code while the writer
+/// writes nothing, a stop before accept resolves it at once, and a closed
+/// connection resolves it with the close reason.
+#[tokio::test]
+async fn stopped_resolves_on_the_peer_stop_and_on_close() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(64).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let (_peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        let mut stopped = Box::pin(send.stopped());
+        assert!(futures::poll!(&mut stopped).is_pending());
+        peer_recv.stop(VarInt::from_u32(9)).unwrap();
+        assert_eq!(stopped.await, Ok(VarInt::from_u32(9)));
+
+        // The peer stops a stream this node hasn't accepted yet.
+        let (mut peer_send, mut peer_recv) = inbound.open_bi().await.unwrap();
+        peer_send.write_all(b"x").await.unwrap();
+        peer_recv.stop(VarInt::from_u32(11)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (accepted, _accepted_recv) = conn.accept_bi().await.unwrap();
+        assert_eq!(accepted.stopped().await, Ok(VarInt::from_u32(11)));
+
+        let (live, _live_recv) = conn.open_bi().await.unwrap();
+        let stopped = live.stopped();
+        conn.close(VarInt::from_u32(0), b"done");
+        assert_eq!(stopped.await, Err(crate::ConnectionError::LocallyClosed));
+    })
+    .await
+    .unwrap();
+}
+
 /// `finish` after writes that wait on flow control finishes after them.
 #[tokio::test]
 async fn finish_waits_for_writes_queued_behind_flow_control() {

@@ -5762,14 +5762,23 @@ async fn request_stream_worker(
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
         return;
     };
+    // A requester that gives up stops the response stream. The stop ends the
+    // output wait and the service's call, so the abandoned request releases
+    // its funding and no longer runs its backend work. The connection task
+    // already answered the stop with RESET_STREAM. Each select polls its work
+    // before the stop, so a request the service rejects at once still meets
+    // its protocol close.
+    let stopped = send.stopped();
+    zakura_rt::pin!(stopped);
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         output = context.resources.output.admit(bound.bytes) => output,
+        _ = &mut stopped => return,
     };
 
     // The raw frame's grant ends with the service's call, which cancelling the
-    // connection also ends.
+    // connection or stopping the stream also ends.
     let response = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
@@ -5781,6 +5790,7 @@ async fn request_stream_worker(
             context.limits.max_message_bytes,
             frame,
         ) => response,
+        _ = &mut stopped => return,
     };
     drop(raw_grant);
     let response_frames = match response {

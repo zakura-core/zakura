@@ -156,11 +156,6 @@ struct ConnTask<S: UdpIo> {
     acceptors: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
     accepted_spare: VecDeque<StreamId>,
     sends: HashMap<StreamId, SendState>,
-    /// The peer's STOP_SENDING code for each stream this node reset in
-    /// answer, or will reset once it is accepted, until the handle finishes,
-    /// resets or drops it. A later write gets `Stopped(code)` instead of the
-    /// reset stream's `ClosedStream`.
-    stopped: HashMap<StreamId, VarInt>,
     /// Streams whose send handles can still issue writes.
     writable_handles: HashSet<StreamId>,
     /// How many remote bidirectional streams quinn-proto has handed out. A
@@ -234,7 +229,6 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         acceptors: VecDeque::new(),
         accepted_spare: VecDeque::new(),
         sends: HashMap::new(),
-        stopped: HashMap::new(),
         writable_handles: HashSet::new(),
         accepted_bidi: 0,
         reads: HashMap::new(),
@@ -736,7 +730,7 @@ impl<S: UdpIo> ConnTask<S> {
                 self.serve_acceptors();
             }
             ConnCmd::Write { id, data, reply } => {
-                if let Some(&code) = self.stopped.get(&id) {
+                if let Some(code) = self.stop_code(id) {
                     let _ = reply.send(Err(WriteError::Stopped(code)));
                     return;
                 }
@@ -752,7 +746,7 @@ impl<S: UdpIo> ConnTask<S> {
             }
             ConnCmd::Finish { id } | ConnCmd::DropSend { id } => {
                 self.writable_handles.remove(&id);
-                if self.stopped.remove(&id).is_none() {
+                if self.forget_stop(id).is_none() {
                     match self.sends.get_mut(&id) {
                         Some(state) if !state.writes.is_empty() => state.finish_after = true,
                         _ => {
@@ -763,7 +757,7 @@ impl<S: UdpIo> ConnTask<S> {
             }
             ConnCmd::Reset { id, code } => {
                 self.writable_handles.remove(&id);
-                self.stopped.remove(&id);
+                self.forget_stop(id);
                 self.fail_writes(id, WriteError::ClosedStream);
                 self.send_payload.remove(&id);
                 let _ = self.conn.send_stream(id).reset(code);
@@ -903,7 +897,7 @@ impl<S: UdpIo> ConnTask<S> {
                     self.accepted_bidi = id.index() + 1;
                     self.recv_payload.insert(id);
                     // The reset `on_stopped` deferred until this accept.
-                    if let Some(&code) = self.stopped.get(&id) {
+                    if let Some(code) = self.stop_code(id) {
                         let _ = self.conn.send_stream(id).reset(code);
                     } else {
                         self.send_payload.insert(id);
@@ -974,11 +968,11 @@ impl<S: UdpIo> ConnTask<S> {
             // quinn-proto counts a remote send stream only once it is
             // accepted, so a reset acked before then underflows that count.
             // `serve_acceptors` sends the reset on accept.
-            self.stopped.insert(id, error_code);
+            self.record_stop(id, error_code);
             return;
         }
         if self.writable_handles.contains(&id) {
-            self.stopped.insert(id, error_code);
+            self.record_stop(id, error_code);
         }
         // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM. quinn-proto
         // leaves this to the application, and without it the peer never
@@ -986,6 +980,30 @@ impl<S: UdpIo> ConnTask<S> {
         // stream credit.
         self.send_payload.remove(&id);
         let _ = self.conn.send_stream(id).reset(error_code);
+    }
+
+    /// The peer's STOP_SENDING code for `id`, while its handle can write.
+    fn stop_code(&self, id: StreamId) -> Option<VarInt> {
+        self.shared.stopped.borrow().get(&id).copied()
+    }
+
+    /// Keeps the peer's STOP_SENDING code for `id` and wakes the handle's
+    /// [`SendStream::stopped`](crate::SendStream::stopped).
+    fn record_stop(&self, id: StreamId, code: VarInt) {
+        self.shared.stopped.send_modify(|stopped| {
+            stopped.insert(id, code);
+        });
+    }
+
+    /// Drops the code for `id` once its handle can't write. Wakes no one,
+    /// since no waiter resolves on a removal.
+    fn forget_stop(&self, id: StreamId) -> Option<VarInt> {
+        let mut code = None;
+        self.shared.stopped.send_if_modified(|stopped| {
+            code = stopped.remove(&id);
+            false
+        });
+        code
     }
 
     fn fail_writes(&mut self, id: StreamId, error: WriteError) {
@@ -1285,7 +1303,6 @@ mod tests {
             acceptors: VecDeque::new(),
             accepted_spare: VecDeque::new(),
             sends: HashMap::new(),
-            stopped: HashMap::new(),
             writable_handles: HashSet::new(),
             accepted_bidi: 0,
             reads: HashMap::new(),
@@ -1768,10 +1785,10 @@ mod tests {
             };
             task.handle_cmd(close);
             assert!(!task.writable_handles.contains(&id));
-            assert!(task.stopped.is_empty());
+            assert!(task.shared.stopped.borrow().is_empty());
             task.on_stopped(id, code);
             assert!(
-                task.stopped.is_empty(),
+                task.shared.stopped.borrow().is_empty(),
                 "late STOP_SENDING must not retain a code"
             );
         }

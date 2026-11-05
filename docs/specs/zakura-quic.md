@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-02. Version 0.15.
+Status: draft for review, 2026-11-05. Version 0.16.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -32,7 +32,8 @@ each change. Version 0.13 adds `zakura-rt` to DEP-2, so the driver's clocks
 come from the runtime a simulation controls; §17k explains it. Version 0.14
 adds the §16 row for byte-identical replay; §17l explains it. Version 0.15
 adds API-10, credit holds, and lets CTRL-6 sit below CTRL-5; §17m lists each
-change.
+change. Version 0.16 adds `SendStream::stopped` to API-5 and DRV-9; §17n
+explains it.
 
 ## 0. Conventions
 
@@ -354,7 +355,9 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   For a peer-opened stream this node hasn't accepted yet, the task MUST keep
   the code and send the reset on accept, because `quinn-proto` counts a
   remote send stream only from acceptance. A later write on the accepted
-  stream gets `Stopped(code)`.
+  stream gets `Stopped(code)`, and `SendStream::stopped` resolves with the
+  code. The task keeps the code only while the stream's handle can still
+  write, so the codes it holds are bounded by the open streams.
 - **DRV-10.** `open_bi` and `accept_bi` are cancel safe. If the caller drops
   the call after the connection task replied, the stream goes to the next
   caller. A lost stream ID would hold its stream open, and its credit, for the
@@ -809,8 +812,12 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
   (DRV-4, DRV-5). A `SendStream` write may return before `quinn-proto` accepts
   its data, so a write error can belong to an earlier write (DRV-4):
   - `SendStream`: `write_all`, `write_chunk` (no copy), `set_priority`,
-    `finish` and `reset`. `set_priority` maps to `quinn-proto`'s stream
-    priority (higher first) and is ordered with the stream's writes;
+    `finish`, `reset` and `stopped`. `set_priority` maps to `quinn-proto`'s
+    stream priority (higher first) and is ordered with the stream's writes.
+    `stopped` returns a future that doesn't borrow the handle. It resolves
+    with the peer's STOP_SENDING code (DRV-9), or with the close reason once
+    the connection closes. It costs no task and no allocation, so an
+    application can race it against per-request work;
   - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end`, `stop`
     and `hold_credit` (API-10).
   The crate defines `WriteError`, `ReadError`, `ReadExactError`,
@@ -1001,6 +1008,7 @@ this release tolerates, and keep each hard change explicit.
 | Dropping the last `Conn` closes the connection | DRV-7 |
 | GRO segments don't share an allocation | DRV-3 |
 | A stopped stream returns its credit; a cancelled `accept_bi` hands its stream to the next call | DRV-9, DRV-10 |
+| `SendStream::stopped` resolves with the peer's code when the peer stops the stream, and with the close reason when the connection closes | API-5, DRV-9 |
 | Raising the stream limit admits a blocked opener; the load snapshot reports delivered bytes, open streams and the path; the final sample names the local close cause | API-9, OBS-3 |
 | A shrink below granted credit becomes debt that reads repay before a new grant (pins `quinn-proto`); a greedy sender's delivered minus released bytes never exceed the window under random holds, reads and releases; releasing a hold unblocks a sender stuck on `DATA_BLOCKED` | API-10 |
 | Admission ordering, refuse, ignore, retry, timeout | ADM-1–ADM-7, SEC-3, SEC-4 |
@@ -1344,3 +1352,16 @@ Changed:
   the handshake window plus its negotiated streams' receive shares, and a
   connection in its handshake only the handshake and send windows. The
   default budget is 15 GiB.
+
+## 17n. Changes in version 0.16
+
+A peer that abandons a request stops its response stream with STOP_SENDING.
+Before this version the application learned of the stop only at its next
+write, so it kept doing the request's work and encoding its response (V12
+F-499).
+
+Changed:
+
+- **API-5.** Adds `SendStream::stopped`.
+- **DRV-9.** `SendStream::stopped` resolves with the code the task keeps.
+- **§16.** Adds the `stopped` test.

@@ -771,6 +771,14 @@ impl LegacyRequests {
         self.started.load(Ordering::Relaxed)
     }
 
+    /// Stop the response stream of the last request, as a requester that gives
+    /// up does.
+    fn stop_last_response(&mut self) -> Result<(), BoxError> {
+        let (_, peer_recv) = self.held.last_mut().ok_or("the test opened a request")?;
+        peer_recv.stop(0u32.into())?;
+        Ok(())
+    }
+
     async fn until_calls(&self, calls: usize) -> Result<(), BoxError> {
         timeout(TEST_TIMEOUT, async {
             while self.calls() != calls {
@@ -948,6 +956,53 @@ async fn cancelling_a_request_returns_its_reservation() -> Result<(), BoxError> 
 
     drop(saturating);
     assert_eq!(requests.output.granted(), 0);
+    requests.link.close().await;
+    Ok(())
+}
+
+/// A requester that stops its response stream mid-call ends the call and
+/// returns its reservation and raw frame. A stop during the wait for a
+/// reservation keeps the call from running. Neither stop closes the
+/// connection.
+#[tokio::test]
+async fn a_stopped_response_stream_cancels_its_request() -> Result<(), BoxError> {
+    const OUTPUT: u64 = 8 << 20;
+    let mut requests = LegacyRequests::connect(OUTPUT, Vec::new()).await?;
+
+    let (running, connection) = requests
+        .start(LEGACY_REQUEST_BLOCKS_BY_HASH, one_block_request())
+        .await?;
+    requests.until_calls(1).await?;
+    assert_eq!(requests.output.granted(), one_block_bound().bytes);
+    requests.stop_last_response()?;
+    timeout(TEST_TIMEOUT, running)
+        .await
+        .map_err(|_| "the stop ends the running call")??;
+    assert_eq!(requests.output.granted(), 0);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    assert!(!connection.is_cancelled());
+
+    let saturating = requests
+        .output_gate()
+        .admit(OUTPUT)
+        .now_or_never()
+        .ok_or("the stop returned the budget")?;
+    let (waiting, connection) = requests
+        .start(LEGACY_REQUEST_BLOCKS_BY_HASH, one_block_request())
+        .await?;
+    requests
+        .until_raw(8 + one_block_request().len() as u64)
+        .await?;
+    requests.stop_last_response()?;
+    timeout(TEST_TIMEOUT, waiting)
+        .await
+        .map_err(|_| "the stop ends the wait for a reservation")??;
+    assert_eq!(requests.calls(), 1, "the stopped wait never ran its call");
+    assert_eq!(requests.output.granted(), OUTPUT);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    assert!(!connection.is_cancelled());
+
+    drop(saturating);
     requests.link.close().await;
     Ok(())
 }

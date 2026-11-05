@@ -20,9 +20,12 @@ use std::{net::SocketAddr, sync::Arc};
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, StreamId, VarInt};
-use zakura_rt::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
-    counter, mpsc, oneshot, watch, Notify,
+use zakura_rt::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        counter, mpsc, oneshot, watch, Notify,
+    },
 };
 
 use crate::{
@@ -127,6 +130,16 @@ pub(crate) type ReadReply = Result<Option<Vec<Bytes>>, ReadError>;
 pub(crate) struct ConnShared {
     /// Set once, when the connection closes.
     pub(crate) closed: watch::Sender<Option<ConnectionError>>,
+    /// The peer's STOP_SENDING code for each stream this node reset in
+    /// answer, or will reset once it is accepted, until the handle finishes,
+    /// resets or drops it. A later write gets `Stopped(code)` instead of the
+    /// reset stream's `ClosedStream`, and [`SendStream::stopped`] resolves.
+    ///
+    /// Only the connection task changes it. It notifies receivers only when
+    /// it adds a code, because only an added code resolves a waiter.
+    ///
+    /// [`SendStream::stopped`]: crate::SendStream::stopped
+    pub(crate) stopped: watch::Sender<HashMap<StreamId, VarInt>>,
     pub(crate) stable_id: usize,
     /// The connection task's latest load snapshot (API-9).
     pub(crate) load: watch::Sender<crate::conn::ConnLoad>,
@@ -150,6 +163,7 @@ impl ConnShared {
         static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
+            stopped: watch::Sender::new(HashMap::new()),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),

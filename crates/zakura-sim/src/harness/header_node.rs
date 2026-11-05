@@ -8,12 +8,14 @@
 //! `Sim::new` by [`preload`], since a run's scenario clock would otherwise
 //! decide whether the fixture headers validate. [`policy`] holds individual
 //! operations, and gates `Control` steps, until chosen events happen. A
-//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
+//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts,
+//! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
 //! A `Shutdown` step stops the node under test on purpose, which its tap
 //! expects. The tap and the topology's links keep the node's
 //! [`session`] view, and the tap keeps its header capacity accounting in a
 //! [`reservation::ReservationEvidence`].
 
+pub mod adoption;
 mod pair;
 pub mod policy;
 pub mod reservation;
@@ -22,11 +24,11 @@ pub mod tap;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::pin,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -49,6 +51,7 @@ use zakura_storage::header::{
 };
 
 use self::{
+    adoption::SessionLife,
     policy::{Hold, LinkEffect, Predicates, Trigger},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
@@ -217,6 +220,11 @@ pub struct Effects {
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
+    /// When the node under test's header-sync session on each link ended,
+    /// since the run's start, by connection ID. Each link's cancellation
+    /// hooks record it, inside the `cancel` that ends the session, so no
+    /// harness read touches a token.
+    pub ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -497,6 +505,8 @@ pub struct Link {
     pub conn_id: u64,
     /// The header-sync session's ID, the same on both sides.
     pub session_id: u64,
+    /// When it was made, since the run's start.
+    pub linked_at: Duration,
     /// Each side's connection token, dialer first.
     tokens: [CancellationToken; 2],
     /// The node under test's session view, which learns of the close.
@@ -707,21 +717,44 @@ impl Topology {
                 (from_dialer, to_dialer),
             ),
         ];
+        // The node's side of the session ends when either connection token is
+        // cancelled, or when the node cancels its own session token alone, as
+        // it does to refuse or retire the session. A hook runs inside that
+        // `cancel` and is no scheduling point, so it records the instant.
+        let ended = |token: &CancellationToken| {
+            let ended = self.effects.ended.clone();
+            token.on_cancel(move || {
+                // The run's own teardown cancels after its evidence froze.
+                let Some(now) = zakura_scheduler::hooks::now() else {
+                    return;
+                };
+                ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(id)
+                    .or_insert(now.since_start());
+            });
+        };
+        for token in &tokens {
+            ended(token);
+        }
         for ((local, remote, direction, streams), token) in sides.into_iter().zip(&tokens) {
-            self.nodes[local].service.add_peer(
-                Peer::new_versioned(
-                    id,
-                    self.nodes[remote].id.clone(),
-                    ZAKURA_CAP_HEADER_SYNC,
-                    direction,
-                    ZAKURA_STREAM_HEADER_SYNC,
-                    ZAKURA_HEADER_SYNC_STREAM_VERSION,
-                    id,
-                    streams,
-                    token.clone(),
-                )
-                .with_origin(origin),
-            );
+            let peer = Peer::new_versioned(
+                id,
+                self.nodes[remote].id.clone(),
+                ZAKURA_CAP_HEADER_SYNC,
+                direction,
+                ZAKURA_STREAM_HEADER_SYNC,
+                ZAKURA_HEADER_SYNC_STREAM_VERSION,
+                id,
+                streams,
+                token.clone(),
+            )
+            .with_origin(origin);
+            if local == 0 {
+                ended(&peer.service_cancel_token());
+            }
+            self.nodes[local].service.add_peer(peer);
         }
         let link = Link {
             peer: self.nodes[peer].name.clone(),
@@ -729,11 +762,47 @@ impl Topology {
             listener,
             conn_id: id,
             session_id: id,
+            linked_at: zakura_scheduler::hooks::now()
+                .expect("links are made inside a run")
+                .since_start(),
             tokens,
             sessions: self.sessions.clone(),
         };
         self.effects.links.borrow_mut().push(link.clone());
         link
+    }
+
+    /// Each link's session and how long it lasted, in link order. A session
+    /// ends when [`Effects::ended`] records it, or when a later link to the
+    /// same peer replaces it, whichever comes first. The node refuses a
+    /// session only by cancelling it, so a session still open here was
+    /// admitted.
+    pub fn sessions(&self) -> Vec<SessionLife> {
+        let links = self.effects.links.borrow();
+        let ended = self
+            .effects
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        links
+            .iter()
+            .enumerate()
+            .map(|(index, link)| {
+                let replaced = links[index + 1..]
+                    .iter()
+                    .find(|later| later.peer == link.peer)
+                    .map(|later| later.linked_at);
+                let until = match (ended.get(&link.conn_id).copied(), replaced) {
+                    (Some(ended), Some(replaced)) => Some(ended.min(replaced)),
+                    (ended, replaced) => ended.or(replaced),
+                };
+                SessionLife {
+                    session_id: link.session_id,
+                    from: link.linked_at,
+                    until,
+                }
+            })
+            .collect()
     }
 
     /// The newest link between the node under test and the node named

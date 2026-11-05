@@ -230,6 +230,15 @@ impl<T> JoinHandle<T> {
         self.abort_handle().is_finished_at(Location::caller())
     }
 
+    /// The spawned task's id in its run, or `None` for a task tokio runs
+    /// outside one.
+    pub fn task_id(&self) -> Option<TaskId> {
+        match &self.inner {
+            Inner::Tokio(_) => None,
+            Inner::Sim { task, .. } => Some(*task),
+        }
+    }
+
     /// A handle that can abort the task without joining it.
     pub fn abort_handle(&self) -> AbortHandle {
         match &self.inner {

@@ -192,6 +192,13 @@ fn task_from_rt(task: rt::TaskId) -> TaskId {
     TaskId(u32::try_from(task.get()).expect("zakura-rt only holds ids this scheduler handed out"))
 }
 
+impl From<rt::TaskId> for TaskId {
+    /// The scheduler task behind `task`, an id this scheduler handed out.
+    fn from(task: rt::TaskId) -> Self {
+        task_from_rt(task)
+    }
+}
+
 /// A scheduler object id as `zakura-rt` sees it.
 fn object_to_rt(object: ObjectId) -> rt::ObjectId {
     rt::ObjectId {

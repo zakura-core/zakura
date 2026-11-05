@@ -34,6 +34,8 @@ pub use policy::{
 };
 use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
 #[cfg(zakura_sim)]
+pub(in crate::zakura::header_sync) use probe::ProbeTargets;
+#[cfg(zakura_sim)]
 pub use probe::{HeaderResourceProbe, HeaderResources};
 
 #[cfg(any(test, zakura_sim))]

@@ -11,15 +11,16 @@
 //! - `ReservedMismatch` and `OwnedMismatch`: at a quiet boundary, with the
 //!   reactor alive, the budget holds exactly what the tap's
 //!   [`HeaderWorkLedger`] says the queue holds. A boundary is quiet when the
-//!   task the queue's accounting reports from isn't stopped mid-poll. Only
+//!   reactor's task, which the probe names, isn't stopped mid-poll. Only
 //!   that task changes the budget, and the event reporting each change
 //!   follows it in the same poll, so elsewhere the read isn't compared.
-//!   Accounting reported from a second task fails as
-//!   `AccountingOffReactor`, since then no boundary is known quiet.
+//!   Accounting reported from another task fails as `AccountingOffReactor`,
+//!   since then no boundary is known quiet.
 //! - `TeardownReserved`, `TeardownOwned` and `TeardownLocatorPermits`: once
 //!   a reactor the harness stopped is gone, nothing stays reserved or owned,
 //!   and every locator permit is free except one for each locator read
-//!   storage still holds pending.
+//!   storage still holds pending. The probe holds the locator semaphore, so
+//!   a permit forgotten without returning still counts.
 //!
 //! These read counters that no owner event reports, so they catch a stray
 //! reservation, lease or permit that every event leaves clean. A read that

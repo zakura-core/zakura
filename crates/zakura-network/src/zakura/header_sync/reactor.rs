@@ -115,11 +115,23 @@ pub fn spawn_header_sync_reactor(
     HeaderSyncStartError,
 > {
     let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
-    Ok((
-        handle,
-        actions,
-        spawn_erased_named("header_sync_reactor", reactor.run()),
-    ))
+    #[cfg(zakura_sim)]
+    let probe = reactor.startup.observer.0.clone().map(|observer| {
+        let targets = super::scheduler::peer_work::ProbeTargets::of(
+            &reactor.peer_work_queue,
+            &reactor.locator_capacity,
+            zakura_header_chain::MAX_STAGED_TARGETS_V1,
+        );
+        (observer, targets)
+    });
+    let task = spawn_erased_named("header_sync_reactor", reactor.run());
+    // The observer takes the probe once the reactor's task exists, which
+    // only a simulated run schedules.
+    #[cfg(zakura_sim)]
+    if let (Some((observer, targets)), Some(id)) = (probe, task.task_id()) {
+        observer.resource_probe(targets.on(id));
+    }
+    Ok((handle, actions, task))
 }
 
 fn build_header_sync_reactor(
@@ -236,14 +248,6 @@ fn build_header_sync_reactor(
     reactor
         .peer_work_queue
         .observed_by(&reactor.startup.observer);
-    #[cfg(zakura_sim)]
-    if let Some(observer) = &reactor.startup.observer.0 {
-        observer.resource_probe(observe::HeaderResourceProbe::new(
-            &reactor.peer_work_queue,
-            &reactor.locator_capacity,
-            zakura_header_chain::MAX_STAGED_TARGETS_V1,
-        ));
-    }
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
     }

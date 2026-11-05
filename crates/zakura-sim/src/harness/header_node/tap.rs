@@ -132,26 +132,9 @@ struct TapState {
     probe: Mutex<ProbeSlot>,
     /// Where the probe's reads go, if this tap reads it.
     capacity: Option<CapacityEvidence>,
-    /// The task the reactor's accounting reports from, once it first does.
-    accounting_task: Mutex<AccountingTask>,
-}
-
-/// Which task the reactor's accounting reports from. Only that task changes
-/// the budget, so a boundary that finds it at a poll boundary is quiet.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum AccountingTask {
-    /// No accounting fact came from a task yet.
-    #[default]
-    Unknown,
-    /// Every one so far came from this task.
-    Only(TaskId),
-    /// Facts came from two tasks, `first` and then `second`.
-    Two {
-        /// The task the first came from.
-        first: TaskId,
-        /// The other task.
-        second: TaskId,
-    },
+    /// The first task other than the probe's reactor task that reported
+    /// accounting, if any.
+    off_reactor: Mutex<Option<TaskId>>,
 }
 
 /// The resource probe a tap was handed.
@@ -206,23 +189,22 @@ impl TapState {
         work.broken.clone()
     }
 
-    /// Notes the task reporting an accounting fact now, if any.
+    /// Notes the task reporting an accounting fact now, if it isn't the
+    /// reactor task the probe names.
     fn note_accounting_task(&self) {
         let Some(task) = zakura_scheduler::hooks::current_task() else {
             return;
         };
-        let mut known = self
-            .accounting_task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *known = match *known {
-            AccountingTask::Unknown => AccountingTask::Only(task),
-            AccountingTask::Only(first) if first != task => AccountingTask::Two {
-                first,
-                second: task,
-            },
-            unchanged => unchanged,
+        let reactor = match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
+            ProbeSlot::Held(probe) => TaskId::from(probe.task()),
+            ProbeSlot::Missing | ProbeSlot::Replaced => return,
         };
+        if task != reactor {
+            self.off_reactor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(task);
+        }
     }
 
     /// The headers the ownership check's accounting holds reserved and
@@ -540,7 +522,7 @@ impl ReactorTap {
                 reservations,
                 probe: Mutex::default(),
                 capacity,
-                accounting_task: Mutex::default(),
+                off_reactor: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -621,14 +603,22 @@ impl ReactorTap {
         if self.state.unwound.load(Ordering::Relaxed) || (gone && !self.state.stopped()) {
             return Ok(());
         }
+        if let Some(task) = *self
+            .state
+            .off_reactor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Err(format!(
+                "AccountingOffReactor: task {} reported capacity accounting, not the reactor's \
+                 task {}, so no boundary is known quiet",
+                task.index(),
+                TaskId::from(probe.task()).index()
+            ));
+        }
         let Some(read) = zakura_rt::sim::boundary_read(|| probe.read()) else {
             return Ok(());
         };
-        let task = *self
-            .state
-            .accounting_task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
         let expected = if gone {
             Expected::Teardown {
                 storage_permits: self
@@ -638,18 +628,7 @@ impl ReactorTap {
                     .map_or(0, |port| port.owner_state().permits.len()),
             }
         } else {
-            let quiet = match task {
-                AccountingTask::Unknown => false,
-                AccountingTask::Only(task) => !self.mid_poll.contains(task),
-                AccountingTask::Two { first, second } => {
-                    return Err(format!(
-                        "AccountingOffReactor: the reactor's capacity accounting reported \
-                         from task {} and then task {}, so no boundary is known quiet",
-                        first.index(),
-                        second.index()
-                    ))
-                }
-            };
+            let quiet = !self.mid_poll.contains(TaskId::from(probe.task()));
             Expected::Live {
                 accounted: quiet.then(|| self.state.accounted()),
             }

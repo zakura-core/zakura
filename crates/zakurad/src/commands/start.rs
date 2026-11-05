@@ -538,7 +538,7 @@ impl StartCmd {
         // Cancel detached tasks before dropping the state services, whose teardown blocks.
         let _shutdown_on_drop = shutdown.clone().drop_guard();
 
-        if let Some(task) = crate::components::tracing::raw_endpoint::init(
+        if let Some((task, _)) = crate::components::tracing::raw_endpoint::init(
             config.tracing.raw_endpoint_addr,
             config.network.zakura.trace_dir.clone(),
             shutdown.clone(),

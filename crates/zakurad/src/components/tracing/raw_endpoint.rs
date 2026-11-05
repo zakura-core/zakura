@@ -25,7 +25,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const MAX_BYTES: usize = 1024 * 1024;
+const MAX_RANGE_BYTES: u64 = 1024 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 // Explicit export allowlist, independent of other files in the trace directory.
 const TABLES: &[&str] = &[
@@ -51,7 +51,7 @@ pub(crate) async fn init(
     address: Option<SocketAddr>,
     directory: Option<PathBuf>,
     shutdown: CancellationToken,
-) -> io::Result<Option<JoinHandle<()>>> {
+) -> io::Result<Option<(JoinHandle<()>, SocketAddr)>> {
     let Some(address) = address else {
         return Ok(None);
     };
@@ -74,15 +74,22 @@ pub(crate) async fn init(
         )
     })?;
     let listener = TcpListener::bind(address).await?;
-    let authority = listener.local_addr()?.to_string();
+    let bound_address = listener.local_addr()?;
+    let authority = bound_address.to_string();
     info!(%authority, "raw trace endpoint enabled; local users can read sensitive trace data");
-    Ok(Some(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // One active request bounds disk work, memory and slow-client resources.
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { break };
+                    let (stream, _) = match accepted {
+                        Ok(connection) => connection,
+                        Err(error) => {
+                            warn!(?error, "raw trace endpoint failed to accept a connection");
+                            break;
+                        }
+                    };
                     let service = service_fn(|request| handle(request, &directory, &authority));
                     let connection = async {
                         let _ = http1::Builder::new()
@@ -98,7 +105,8 @@ pub(crate) async fn init(
                 }
             }
         }
-    })))
+    });
+    Ok(Some((task, bound_address)))
 }
 
 /// Reject browser access and nonliteral authorities before resolving a table.
@@ -174,7 +182,7 @@ fn byte_range(value: &str, length: u64) -> Result<(u64, u64), StatusCode> {
     if start >= length {
         return Err(invalid);
     }
-    let limit = u64::try_from(MAX_BYTES).expect("one MiB fits u64");
+    let limit = MAX_RANGE_BYTES;
     let end = if end.is_empty() {
         start.saturating_add(limit - 1).min(length - 1)
     } else {
@@ -184,6 +192,33 @@ fn byte_range(value: &str, length: u64) -> Result<(u64, u64), StatusCode> {
         return Err(invalid);
     }
     Ok((start, end + 1))
+}
+
+/// A conservative snapshot validator, not a persistent capture identifier.
+/// Even append changes it: safe resume requires an unchanged file.
+fn file_identity(metadata: &std::fs::Metadata) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "raw trace export requires Unix",
+        ))
+    }
 }
 
 /// Open a fixed table and stream only the file length observed at open time.
@@ -212,13 +247,7 @@ async fn export(
     if !metadata.is_file() {
         return Err(unavailable);
     }
-    #[cfg(unix)]
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-        format!("{}:{}", metadata.dev(), metadata.ino())
-    };
-    #[cfg(not(unix))]
-    let identity = String::new(); // init rejects this platform before opening a listener.
+    let identity = file_identity(&metadata).map_err(|_| unavailable)?;
     if let Some(expected) = headers.get("x-trace-file-id") {
         if expected.to_str().ok() != Some(identity.as_str()) {
             return Err(StatusCode::CONFLICT);
@@ -240,26 +269,37 @@ async fn export(
         .await
         .map_err(|_| unavailable)?;
     let count = end - start;
-    let chunks = stream::try_unfold((file, count), |(mut file, remaining)| async move {
-        if remaining == 0 {
-            return Ok::<_, io::Error>(None);
-        }
-        let size = usize::try_from(remaining.min(64 * 1024)).expect("64 KiB fits usize");
-        let mut buffer = vec![0; size];
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "trace truncated during export",
-            ));
-        }
-        buffer.truncate(read);
-        let remaining = remaining - u64::try_from(read).expect("read size fits u64");
-        Ok(Some((
-            hyper::body::Frame::data(Bytes::from(buffer)),
-            (file, remaining),
-        )))
-    });
+    let stream_identity = identity.clone();
+    let chunks = stream::try_unfold(
+        (file, count, stream_identity),
+        |(mut file, remaining, identity)| async move {
+            if remaining == 0 {
+                return Ok::<_, io::Error>(None);
+            }
+            let size = usize::try_from(remaining.min(64 * 1024)).expect("64 KiB fits usize");
+            let mut buffer = vec![0; size];
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "trace truncated during export",
+                ));
+            }
+            // Check after reading and before exposing bytes: a changing file cannot
+            // silently become a different snapshot under a resume token.
+            if file_identity(&file.metadata().await?)? != identity {
+                return Err(io::Error::other(
+                    "trace changed during export; restart the snapshot",
+                ));
+            }
+            buffer.truncate(read);
+            let remaining = remaining - u64::try_from(read).expect("read size fits u64");
+            Ok(Some((
+                hyper::body::Frame::data(Bytes::from(buffer)),
+                (file, remaining, identity),
+            )))
+        },
+    );
     let mut response = Response::new(StreamBody::new(chunks).boxed_unsync());
     *response.status_mut() = status;
     let response_headers = response.headers_mut();
@@ -340,6 +380,13 @@ mod tests {
         ] {
             assert!(requested_table(&request(path), authority).is_err());
         }
+        assert_eq!(
+            requested_table(
+                &request("http://127.0.0.1:9000/traces/block_sync"),
+                authority
+            ),
+            Err(StatusCode::FORBIDDEN)
+        );
         let mut req = request("/traces/block_sync");
         req.headers_mut()
             .insert(ORIGIN, "http://example.com".parse().unwrap());
@@ -384,6 +431,25 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             &data[4..9]
         );
+        tokio::fs::write(&path, b"changed and longer data\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            export(dir.path(), "block_sync", &headers).await.err(),
+            Some(StatusCode::CONFLICT)
+        );
+        tokio::fs::write(&path, b"short\n").await.unwrap();
+        assert_eq!(
+            export(dir.path(), "block_sync", &headers).await.err(),
+            Some(StatusCode::CONFLICT)
+        );
+        let current = export(dir.path(), "block_sync", &hyper::HeaderMap::new())
+            .await
+            .unwrap();
+        headers.insert(
+            "x-trace-file-id",
+            current.headers()["x-trace-file-id"].clone(),
+        );
         tokio::fs::rename(&path, dir.path().join("old.jsonl"))
             .await
             .unwrap();
@@ -392,6 +458,82 @@ mod tests {
             export(dir.path(), "block_sync", &headers).await.err(),
             Some(StatusCode::CONFLICT)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_reports_appends_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conn.jsonl");
+        tokio::fs::write(&path, b"first\n").await.unwrap();
+        let response = export(dir.path(), "conn", &hyper::HeaderMap::new())
+            .await
+            .unwrap();
+        let mut writer = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"second\n")
+            .await
+            .unwrap();
+        assert!(response.into_body().collect().await.is_err());
+        let response = export(dir.path(), "conn", &hyper::HeaderMap::new())
+            .await
+            .unwrap();
+        writer.set_len(0).await.unwrap();
+        assert!(response.into_body().collect().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_server_serializes_clients_and_stops_on_shutdown() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("conn.jsonl"), b"row\n")
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let (task, address) = init(
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some(dir.path().to_owned()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+        slow.write_all(b"GET /traces/conn HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        let mut next = tokio::net::TcpStream::connect(address).await.unwrap();
+        next.write_all(format!("GET /traces/conn HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut probe = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), next.read(&mut probe))
+                .await
+                .is_err()
+        );
+        tokio::time::pause();
+        tokio::time::advance(CONNECTION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), next.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("cache-control: no-store"));
+        assert!(response.ends_with("row\n"));
+        let _idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -420,6 +562,15 @@ mod tests {
         assert!(export(dir.path(), "block_sync", &hyper::HeaderMap::new())
             .await
             .is_err());
+        let _socket =
+            std::os::unix::net::UnixListener::bind(dir.path().join("stream.jsonl")).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            export(dir.path(), "stream", &hyper::HeaderMap::new())
+        )
+        .await
+        .unwrap()
+        .is_err());
         std::fs::create_dir(dir.path().join("conn.jsonl")).unwrap();
         assert!(export(dir.path(), "conn", &hyper::HeaderMap::new())
             .await

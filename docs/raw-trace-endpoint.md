@@ -27,7 +27,7 @@ curl --fail http://127.0.0.1:9009/traces/block_sync
 or unsafe files return 503. Other paths, methods and query parameters are rejected.
 
 A request without `Range` streams the whole current file, stopping at the length
-observed when it was opened. Appends after that point are excluded. Memory is
+observed when it was opened. A detected file change aborts the stream. Memory is
 bounded to 64 KiB chunks; the connection has a 30-second deadline, so large or
 slow transfers may end early. Empty files return an empty 200 response.
 
@@ -57,12 +57,20 @@ After an interrupted transfer, resume after the last byte actually received.
 Responses preserve exact bytes, including partial JSONL lines; collectors must
 join byte portions before parsing lines. No record boundary is silently dropped.
 
-The identity uses the opened file's device and inode. It detects rename-based
-rotation but is not a content hash or durable cursor: inode reuse and same-inode
-copy-truncate/refill cannot reliably be detected. An observed premature EOF
-aborts the body. For resumable collection, use an operator-controlled directory
-without copy-truncate or in-place edits, and a fresh directory per node run.
-Do not assume consistency across tables or across concurrent file modification.
+The identity includes the opened file's device, inode, length, modification time
+and change time (including nanoseconds). This is deliberately conservative:
+**even append invalidates resume**. Growth, truncation, same-inode rewrites and
+replacement between requests return 409 when the old identity is supplied.
+During streaming, metadata is checked after each read and before releasing that
+chunk. A detected change or premature EOF aborts the body. Discard an interrupted
+snapshot if its identity no longer matches; do not splice it into a new one.
+
+Reliable multipart resume therefore needs a quiescent file. Active tables may
+need a new request starting at zero after each write. This is an initial snapshot
+export API, not a lossless live-follow protocol. Metadata is not a content hash;
+coarse filesystem timestamp resolution or privileged timestamp manipulation can
+hide same-size rewrites. Use a trusted local filesystem and operator-controlled
+directory without in-place edits. Do not assume consistency across tables.
 
 Reading does not flush writers or wait for future rows. Existing buffering,
 dropped rows and rotation still apply. There is no acknowledgement, retention

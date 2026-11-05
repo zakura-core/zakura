@@ -1090,21 +1090,25 @@ pub fn storage_config() -> RunConfig {
 /// The family header sync's generated property IDs name.
 pub const FAMILY: &str = "header-sync";
 
-/// `header-sync/wire`'s properties: [`storage_properties`], then header
-/// sync's generated receiver and sender properties (M5-Q13), then
-/// `session/honest-never-punished`. Header sync's adapter observes none of
-/// the downstream templates' effects, so it registers none of them.
+/// `header-sync/wire`'s properties: [`storage_properties`], then
+/// [`HEADER_FAULT_PENALIZED`], then header sync's generated receiver and
+/// sender properties (M5-Q13), then `session/honest-never-punished`. Header
+/// sync's adapter observes none of the downstream templates' effects, so it
+/// registers none of them. `header-sync/storage` doesn't register
+/// [`HEADER_FAULT_PENALIZED`]: none of its mirrors can send a header that
+/// fails preparation, so no run or fuzz seed there could apply it.
 pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     let mut properties = storage_properties();
+    properties.push(header_fault_penalized());
     properties.extend(table_properties(FAMILY, &RegtestMessage::LAYOUT));
     properties.extend(sender_properties(FAMILY, &RegtestMessage::LAYOUT));
     properties.push(honest_never_punished());
     properties
 }
 
-/// The storage harness's properties, [`OPERATION_IDS`],
-/// [`DIRECT_DISPATCH`] and [`HEADER_FAULT_PENALIZED`], all active. A test
-/// harness that wraps [`Storage`] with its view registers them too.
+/// The storage harness's properties, [`OPERATION_IDS`] then
+/// [`DIRECT_DISPATCH`], both active. A test harness that wraps
+/// [`Storage`] with its view registers them too.
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1126,18 +1130,6 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             needs: &[Source::View],
             status: Status::Active,
             check: check_direct_dispatch::<S>,
-            witness: None,
-        },
-        Property {
-            id: PropertyId::new(HEADER_FAULT_PENALIZED),
-            claim: "every prepare or apply failure that is an automatic header-peer fault gets a \
-                    Misbehavior against that work's session and starts its peer's readmission \
-                    cooldown, and a reconnect within the cooldown is refused",
-            kind: Kind::Safety,
-            assumes: &[],
-            needs: &[Source::Storage, Source::View],
-            status: Status::Active,
-            check: check_header_fault_penalized::<S>,
             witness: None,
         },
     ]
@@ -1210,6 +1202,22 @@ fn check_direct_dispatch<S: HasView<View = StorageView>>(cx: &mut CheckCtx<'_, S
         )
     } else {
         Verdict::Holds
+    }
+}
+
+/// [`HEADER_FAULT_PENALIZED`], active.
+fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
+    Property {
+        id: PropertyId::new(HEADER_FAULT_PENALIZED),
+        claim: "every prepare or apply failure that is an automatic header-peer fault gets a \
+                    Misbehavior against that work's session and starts its peer's readmission \
+                    cooldown, and a reconnect within the cooldown is refused",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Storage, Source::View],
+        status: Status::Active,
+        check: check_header_fault_penalized::<S>,
+        witness: None,
     }
 }
 

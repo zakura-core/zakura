@@ -22,7 +22,9 @@ use zakura_chain::{
     fmt::humantime_seconds,
     parameters::Network,
     serialization::ZcashDeserializeInto,
-    transaction::{self, Transaction, VerifiedUnminedTx},
+    transaction::{
+        Hash, LockTime, Transaction, VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD,
+    },
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
@@ -1835,11 +1837,11 @@ fn expiry_fixture_transaction(
     let input = input.unwrap_or_else(|| {
         let mut hash = [0; 32];
         hash[..8].copy_from_slice(&index.to_le_bytes());
-        OutPoint::from_usize(transaction::Hash(hash), 0)
+        OutPoint::from_usize(Hash(hash), 0)
     });
     let transaction = Transaction::V5 {
         network_upgrade: NetworkUpgrade::Nu5,
-        lock_time: transaction::LockTime::unlocked(),
+        lock_time: LockTime::unlocked(),
         expiry_height,
         inputs: vec![transparent::Input::PrevOut {
             outpoint: input,
@@ -1960,8 +1962,7 @@ async fn benchmark_mempool_idle_poll() -> Result<(), Report> {
 
     const POLLS: u32 = 2_000;
     const SAMPLES: usize = 21;
-    let default_count =
-        Config::default().tx_cost_limit / transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
+    let default_count = Config::default().tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD;
     for count in [0, default_count / 8, default_count] {
         let (
             mut mempool,

@@ -131,3 +131,87 @@ Other retained witnesses and planted cases remain unverified at this commit.
 mut-1.2 owns the native mutation inventory. mut-1.3 owns missing witnesses
 and fuzz adapters. mut-2 owns the case catalogue and frozen discovery inputs.
 sim-9 stays deferred.
+
+## mut-1.2: patch and test bindings
+
+Pinned source: `870678be1739ea799e59b4e0bdfe6cf512792710`, with the
+metadata from this PR.
+This section adds binding metadata and one fuzz-target declaration fix.
+It does not complete mut-1.2's compilation and sensitivity gate.
+
+### What stays in the repository
+
+- `qa/native-mutations/cases.json` gives all 22 native patches a package,
+  an exact test selector, a source file and an intended assertion.
+  The handoff-floor case uses a `zakura-sim` integration test and needs
+  `RUSTFLAGS='--cfg zakura_sim'`. Its new README names that test.
+  These mappings name native assertions, not registered simulator IDs.
+- `scripts/mutation_inventory.py` inventories all 34 planted and 22 native
+  patches without applying them. It runs `git apply --check` on each patch.
+  For planted cases it checks the input hash, the sidecar's `holds` witness
+  for the intended property and the simulator target binaries.
+  For native cases it checks the package and the selector. A library
+  selector must start with its file's module path, and an integration
+  selector's file must be `tests/<test_target>.rs`. Otherwise `--exact`
+  would select zero tests.
+- `qa/fuzz/p2p/Cargo.toml` now lists `discovery/answer-settlement` for
+  `discovery_query`. That target already replays every input through
+  `replay_discovery_settlement_bytes`; only the metadata omitted the ID.
+
+### Reproduce
+
+```sh
+python3 scripts/mutation_inventory.py --output "$TMPDIR/mutations.json"
+python3 -m unittest discover -s scripts/tests -p test_mutation_inventory.py -v
+python3 scripts/check-fuzz-campaign.py
+```
+
+For one native case, run the command that the inventory emits with the
+recorded flags. First append `--list` and confirm the exact selector.
+Then require one executed test on the unchanged source, the intended
+assertion on the patched source, and a pass after restoring the source.
+
+### Expected outcome
+
+| Check | Expected outcome |
+| --- | --- |
+| Inventory | 56 patches; 0 metadata or application failures. 22 planted cases map to simulator fuzz targets. 12 use `block-sync/storage`, which has no fuzz target. |
+| Inventory tests | 8 pass |
+| `check-fuzz-campaign.py` | Passes |
+| `decode_admission_precedes_materialization_and_survives_final_holders` | 1 passed |
+| `standalone_transaction_reservation_precedes_decode_and_outlives_clones`, unchanged | 1 passed |
+| Same test with `state/transaction-results/early-transaction-release.patch` | Fails with `a live standalone allocation retains its charge`: 0 against 435 |
+| Same test after restoring the source | 1 passed |
+
+The native run used Rust 1.99.0 on Linux, `--cfg zakura_sim`, the locked
+dependencies and the test profile without debug information. It applied
+only `early-transaction-release.patch`. The other 21 native selectors are
+checked statically only. No discovery campaign ran.
+
+### Slot reconciliation
+
+| Slot | Evidence at the pinned source | Remaining gap |
+| --- | --- | --- |
+| own-1, header reactor | The `header/reactor-policy` planted case passed mut-1.1 sensitivity. | H2 wrong-owner release, retention bypass, missed wakeup and stale-completion mutations are absent. Reuse the adopted-state work in #2032/#2033 where its checks apply. |
+| own-4, block reactor | Three `block/reactor-policy` patches and their coverage row exist. | The `block-sync/reactor-query-lifecycle` row still marks the bypass pending: no committed input reaches action-channel refusal. |
+| own-5, block fill and peers | The handoff-floor patch maps to an integration test. The p2p machine table maps block fill, request lifecycle and peer-registry properties. | The handoff mapping has no registered replay property. Broader B3/B4 mutations and integrated observations remain open. |
+| own-8, discovery | The planted discovery cases have simulator mappings. Four discovery machine targets exist. | The two `qa/mutations/discovery/worker-lifetime/` patches are outside both retained runners and have no case sidecars. |
+| own-9, sessions and credit | `held_credit_bounds_a_greedy_peer`, `releasing_a_credit_hold_unblocks_the_sender` and `grants_match_an_independent_ledger` are candidate checks. | No retained held-credit mutation exists. |
+| own-10, backend reads | All five read-worker patches apply. Both private-pool patches already use `ReadWorkerPool`. | Compilation, intended assertion failure and deterministic replay remain open. |
+| own-11, backend results | Disk-result and transaction-result patches have exact selectors. `early-transaction-release` has baseline, mutant and restored results. | The other backend cases need executable selection and sensitivity runs. |
+
+### Evidence bundle
+
+`2039-mut-1.2-2026-11-05.tar.zst`, SHA-256
+`ba5edbd8b776c64d9a94eb91c8659a9277af1d5f2888c025962768ae711d020f`.
+It holds the original run README, the static inventory output, the native
+run record and its logs. That inventory output was generated from an
+uncommitted worktree, so its `revision` field names the parent commit.
+
+```text
+2039-mut-1.2-2026-11-05/README.md
+2039-mut-1.2-2026-11-05/SHA256SUMS
+2039-mut-1.2-2026-11-05/inventory.json
+2039-mut-1.2-2026-11-05/logs/{decode-baseline,native-baseline,native-mutant,native-restored,node-tests}.log
+2039-mut-1.2-2026-11-05/native-result.json
+```

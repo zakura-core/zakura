@@ -9,6 +9,8 @@ import re
 import subprocess
 import tomllib
 
+WITNESSES = "qa/mutation-readiness/witnesses.json"
+
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -105,6 +107,22 @@ def native_binding(root, case):
     }
 
 
+def witness_errors(root):
+    """Check every native selector in the witness inventory, if one exists."""
+    path = root / WITNESSES
+    if not path.is_file():
+        return []
+    errors = []
+    for row in json.loads(path.read_text())["rows"]:
+        for test in row.get("tests", []):
+            try:
+                _, found = selector_errors(root, test["source"], test["selector"])
+            except (OSError, KeyError, ValueError, StopIteration) as error:
+                found = [f"binding metadata: {error!r}"]
+            errors.extend(f"{WITNESSES} {row['id']}: {error}" for error in found)
+    return errors
+
+
 def inventory(root):
     """Return one row per retained patch and every static validation failure."""
     native = json.loads((root / "qa/native-mutations/cases.json").read_text())
@@ -138,6 +156,7 @@ def inventory(root):
             row["errors"] = [f"binding metadata: {error!r}"]
         rows.append(row)
     errors.extend(f"mapping has no patch: {path}" for path in sorted(mappings))
+    errors.extend(witness_errors(root))
     return {
         "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "worktree_status": subprocess.check_output(

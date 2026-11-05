@@ -143,13 +143,6 @@ class MinerTests(unittest.TestCase):
         self.assertEqual(miners.coinbase_tag("03fd0a3604f09fa693"), None)
         self.assertEqual(miners.coinbase_tag("bad"), None)
 
-    def test_status_flags_only_statistically_missing_miners(self):
-        self.assertEqual(miners.miner_status(0.30, 0, 20), "absent", "(0.7)^20 is well under 1%")
-        self.assertEqual(miners.miner_status(0.05, 0, 20), "ok", "a 5% pool can easily miss 20 blocks")
-        self.assertEqual(miners.miner_status(0.30, 20, 300), "low", "90 expected, 20 seen")
-        self.assertEqual(miners.miner_status(0.30, 80, 300), "ok")
-        self.assertEqual(miners.miner_status(None, 0, 300), "ok")
-
     def test_shares_table_and_buckets(self):
         rows = [{"height": h, "time": 1000 + 25 * h, "miner_id": "Luxor" if h % 3 else "2Miners"} for h in range(1, 31)]
         baseline = miners.miner_shares(rows[:20])
@@ -159,13 +152,14 @@ class MinerTests(unittest.TestCase):
         week = miners.miner_shares(rows + [{"height": 31, "time": 1800, "miner_id": "Newcomer"},
                                            {"height": 0, "time": 900, "miner_id": "Oldtimer"}])
         table = miners.miner_table(baseline, recent, week, now=2000)
-        self.assertEqual([row["miner"] for row in table], ["Luxor", "2Miners", "Newcomer", "Oldtimer"])
-        self.assertEqual(table[2]["status"], "new")
+        self.assertEqual([row["miner"] for row in table], ["Luxor", "2Miners", "Newcomer", "Oldtimer"],
+                         "baseline miners by share, then the rest by blocks this week")
+        self.assertEqual((table[2]["baselineShare"], table[2]["recentBlocks"]), (None, 1))
         self.assertEqual(table[0]["lastHeight"], 29)
-        self.assertEqual(table[0]["weekBlocks"], 20)
         self.assertEqual([row["activity"] for row in table], ["active", "active", "active", "active"],
                          "every block here is under an hour old")
-        self.assertEqual(table[3]["status"], "new", "a miner seen this week but not in the baseline or recent window")
+        self.assertEqual((table[3]["baselineShare"], table[3]["recentBlocks"], table[3]["lastHeight"]), (None, 0, 0),
+                         "a miner seen this week but not in the baseline or recent window")
         buckets = miners.miner_buckets(rows, 250, top=1)
         self.assertEqual(buckets["miners"], ["Luxor", "other"])
         self.assertEqual(sum(buckets["counts"]["Luxor"]) + sum(buckets["counts"]["other"]), 30)
@@ -191,7 +185,7 @@ class MinerTests(unittest.TestCase):
         self.assertEqual([row["miner"] for row in table], ["Luxor", "KuPool", "other"],
                          "KuPool keeps a row by its tag at 0.5%; three solo miners at 0.5% each are combined")
         other = table[2]
-        self.assertEqual((other["miners"], other["weekBlocks"], other["lastHeight"]), (3, 3, 203))
+        self.assertEqual((other["miners"], other["recentBlocks"], other["lastHeight"]), (3, 3, 203))
         self.assertEqual(other["activity"], "inactive", "the newest solo block is 3725 s old")
         self.assertAlmostEqual(other["baselineShare"], 3 / 204)
         self.assertTrue(miners.is_major("addr:t1MKn3…hVn7", shares, {"miners": {"addr:t1MKn3…hVn7": {"share": 0.2}}}))

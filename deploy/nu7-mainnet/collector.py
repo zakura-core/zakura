@@ -661,6 +661,13 @@ class Collector:
         baseline = miners.miner_shares(baseline_rows)
         recent = miners.miner_shares(recent_rows)
         week = miners.miner_shares(week_rows)
+        rolling_curve = timed(model.get("rolling") or [], tip["time"] if tip else now)
+        before_activation = store.block(self.activation_height - 1)
+        if before_activation:
+            fixed_start = before_activation["time"]
+        else:
+            # `eta` estimates the activation block itself; its predecessor lands one spacing earlier.
+            fixed_start = (eta - spacing) if eta else (tip["time"] if tip else now)
         return {
             "schemaVersion": 1,
             "generatedAt": now,
@@ -707,11 +714,11 @@ class Collector:
                 "expected": model.get("expected"),
             },
             "projections": {
-                "fixed": thin_projection(fixed),
+                "fixed": thin_projection(timed_fixed(fixed, rolling_curve, fixed_start)),
                 "rolling": {
                     "fromHeight": model.get("rollingFrom"),
                     "hashrateSolps": model.get("rollingHashrateSolps"),
-                    "curve": thin_curve(model.get("rolling") or []),
+                    "curve": thin_curve(rolling_curve),
                 },
             },
             "miners": {
@@ -822,6 +829,36 @@ def bucket_seconds(window_seconds):
     if window_seconds <= 24 * 3600:
         return 3600
     return 6 * 3600
+
+
+def timed(curve, start_time):
+    """The projection points with a `time`: `start_time` plus the expected intervals up to and including each block."""
+    out = []
+    clock = start_time
+    for point in curve:
+        clock += point["expectedIntervalSeconds"]
+        out.append({**point, "time": clock})
+    return out
+
+
+def timed_fixed(fixed, rolling_curve, fallback_start):
+    """The frozen projection with a `time` on its curve and band points.
+
+    Its first block is the activation block, so the times start from the
+    block before activation: its header time once stored (`fallback_start`
+    then), else the rolling projection's time at that height, else the
+    activation estimate. The meta dict itself is left as stored.
+    """
+    if not fixed:
+        return None
+    from_height = fixed["fromHeight"]
+    start = next((p["time"] for p in rolling_curve if p["height"] == from_height - 1), None)
+    if start is None:
+        start = fallback_start
+    curve = timed(fixed.get("curve") or [], start)
+    by_height = {p["height"]: p["time"] for p in curve}
+    band = [{**p, "time": by_height.get(p["height"])} for p in fixed["band"]] if fixed.get("band") else None
+    return {**fixed, "curve": curve, "band": band}
 
 
 def thin_curve(curve):

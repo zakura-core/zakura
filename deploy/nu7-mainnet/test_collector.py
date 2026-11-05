@@ -262,7 +262,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(payload["chain"]["expected"]["modelChecked"], 100)
         self.assertEqual(payload["chain"]["expected"]["nextBits"], f"{self.node.consensus_bits(tampered + 1):08x}")
         table = {row["miner"]: row for row in payload["miners"]["table"]}
-        self.assertEqual(table["Luxor"]["status"], "new", "no blocks stored before the recent 300-block window yet")
+        self.assertIsNone(table["Luxor"]["baselineShare"], "no blocks stored before the recent 300-block window yet")
         self.assertGreater(table["Luxor"]["recentBlocks"], 40)
         collector.monte_carlo_thread.join(timeout=30)
         store.close()
@@ -292,8 +292,24 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual((rolling["fromHeight"], len(rolling["curve"])), (next_height, 40 + (FAKE_ACTIVATION - next_height)),
                          "before activation the projection reaches 40 blocks past it")
         self.assertEqual(payload["projections"]["fixed"]["band"][0]["height"], FAKE_ACTIVATION)
+        tip_time = store.tip()["time"]
+        times = [p["time"] for p in rolling["curve"]]
+        self.assertGreater(times[0], tip_time, "the rolling projection's first block lands after the tip")
+        self.assertEqual(times, sorted(times))
+        fixed_curve = payload["projections"]["fixed"]["curve"]
+        at_activation = next(p["time"] for p in rolling["curve"] if p["height"] == FAKE_ACTIVATION - 1)
+        self.assertAlmostEqual(fixed_curve[0]["time"], at_activation + fixed_curve[0]["expectedIntervalSeconds"],
+                               msg="the frozen curve starts from the rolling projection's time before activation")
+        self.assertEqual(payload["projections"]["fixed"]["band"][0]["time"], fixed_curve[0]["time"])
         json.dumps(payload, allow_nan=False)
         store.close()
+
+    def test_projection_times_survive_thinning(self):
+        curve = [{"height": h, "expectedIntervalSeconds": 25.0} for h in range(1000, 1320)]
+        thinned = collector_module.thin_curve(collector_module.timed(curve, 5000.0))
+        self.assertEqual((thinned[-1]["height"], thinned[-1]["time"]), (1310, 5000.0 + 25.0 * 311),
+                         "the last kept point (every tenth after 300) carries its full-curve time")
+        self.assertEqual(thinned[0]["time"], 5025.0)
 
     def test_model_is_ready_after_a_restart_without_new_blocks(self):
         self.collector.ingest_once(self.store)

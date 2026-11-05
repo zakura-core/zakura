@@ -7,6 +7,8 @@
 <meta name="description" content="Developer dashboard for the NU7 upgrade on Zcash mainnet: block time, difficulty, fees and the NSM, observed from one Zakura node.">
 <meta name="robots" content="noindex">
 <script defer src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js" crossorigin="anonymous"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js" crossorigin="anonymous"></script>
 <style>
 :root {
   --bg: #f7f6f2; --surface: #ffffff; --surface-2: #f0efe9; --text: #1b1b1f; --muted: #6b6b73;
@@ -59,9 +61,9 @@ code { font-family: var(--mono); font-size: .92em; }
 .nu7-notice[hidden] { display: none; }
 .nu7-miners .num { text-align: right; font-variant-numeric: tabular-nums; }
 .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; background: var(--surface-2); color: var(--muted); }
-.chip--absent { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
-.chip--low { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
-.chip--new { background: color-mix(in srgb, var(--accent-2) 18%, transparent); color: var(--accent-2); }
+.zoom-note { margin: 4px 0 0; color: var(--warn); font-size: .78rem; }
+.zoom-note[hidden] { display: none; }
+.zoom-help { color: var(--muted); font-size: .82rem; margin: 0 0 12px; }
 .chip--active { background: color-mix(in srgb, var(--nsm) 18%, transparent); color: var(--nsm); }
 .chip--inactive { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
 .chip--gone { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
@@ -135,7 +137,7 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
     <section class="nu7-section" aria-label="Network pulse">
       <dl class="nu7-stats cards">
         <div><dt>Best block</dt><dd class="value" data-height>…</dd><dd class="hint hash" data-hash></dd></div>
-        <div><dt>Header time age</dt><dd class="value" data-age>…</dd><dd class="hint" data-tip-time></dd></div>
+        <div><dt>Live block time</dt><dd class="value" data-age>…</dd><dd class="hint" data-tip-time></dd></div>
         <div><dt>Median interval</dt><dd class="value" data-median>…</dd><dd class="hint" data-median-hint></dd></div>
         <div><dt>Difficulty</dt><dd class="value" data-difficulty>…</dd><dd class="hint" data-difficulty-hint></dd></div>
         <div><dt>NSM fund balance</dt><dd class="value" data-nsm>…</dd><dd class="hint" data-nsm-hint></dd></div>
@@ -158,11 +160,12 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
 
     <section class="nu7-section" aria-label="Charts">
       <header><h2>Series</h2><div class="windows" role="group" aria-label="Window"><button type="button" data-window="1h">1 h</button><button type="button" data-window="6h" aria-pressed="true">6 h</button><button type="button" data-window="24h">24 h</button><button type="button" data-window="7d">7 d</button></div></header>
+      <p class="zoom-help">Drag across a chart to zoom its time axis, ctrl + wheel or pinch to zoom, shift + drag to pan, double-click to reset. A zoomed chart pauses its updates until reset.</p>
       <div class="charts">
-        <div class="chart"><h3>Block interval</h3><p>Seconds between header times, with the rolling 102-block median and the target spacing.</p><canvas id="c-interval"></canvas></div>
+        <div class="chart"><h3>Block interval</h3><p>Seconds between header times, with the rolling 10-block median and the target spacing.</p><canvas id="c-interval"></canvas></div>
         <div class="chart"><h3>Difficulty</h3><p>Difficulty (log) and its per-block change. The rule clamps the timespan it adjusts by, not the step itself, so single steps stay within about −24% / +19%.</p><canvas id="c-difficulty"></canvas></div>
         <div class="chart"><h3>Difficulty: live vs expected</h3><p>Live difficulty against what the rule requires from the stored headers (should overlay exactly), the projection frozen before activation at a constant hashrate (expected = Monte Carlo median, with its 10–90% band) and the projection re-run from the current chain and hashrate. The dashed level is where difficulty settles at today's hashrate.</p><canvas id="c-expected"></canvas></div>
-        <div class="chart"><h3>Block time: observed vs expected</h3><p>Rolling 102-block mean and median of the observed intervals, the time each block was expected to take at its difficulty and the hashrate of the previous 120 blocks, and the projections' expected block time ahead of the tip.</p><canvas id="c-blocktime"></canvas></div>
+        <div class="chart"><h3>Block time: observed vs expected</h3><p>Rolling 10-block mean and median of the observed intervals, the time each block was expected to take at its difficulty and the hashrate of the previous 120 blocks, and the projections' expected block time ahead of the tip.</p><canvas id="c-blocktime"></canvas></div>
         <div class="chart"><h3>Recent block times</h3><p>Each block's interval at its header time, with the block time the model expected for it.</p><canvas id="c-recent"></canvas></div>
         <div class="chart"><h3>Miners</h3><p>Blocks per miner per bucket, from coinbase tags and payout addresses. Shielded payouts without a tag share one bucket.</p><canvas id="c-miners"></canvas></div>
         <div class="chart"><h3>NSM balance</h3><p>Balance after each block and its per-block change next to the fee share plus reissuance the block should add.</p><canvas id="c-nsm"></canvas></div>
@@ -177,15 +180,11 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
 
     <section class="nu7-section" aria-label="Miners">
       <header><h2>Miners</h2><p class="footnote" data-miners-hint></p></header>
-      <table class="nu7-rules nu7-miners"><thead><tr><th>Miner</th><th class="num">Baseline share</th><th class="num">Recent share</th><th class="num">Recent blocks</th><th class="num">Blocks (7 d)</th><th class="num">Last block</th><th>Activity</th><th>Share check</th></tr></thead><tbody data-miners></tbody></table>
+      <table class="nu7-rules nu7-miners"><thead><tr><th>Miner</th><th class="num">Baseline share</th><th class="num">Recent share</th><th class="num">Recent blocks</th><th class="num">Last block</th><th>Activity</th></tr></thead><tbody data-miners></tbody></table>
       <ul class="legend" aria-label="Legend">
         <li><span class="chip chip--active">active</span><span>Mined a block within the last hour.</span></li>
-        <li><span class="chip chip--inactive">inactive</span><span>Mined a block within the last 7 days, but none for over an hour. A small miner can go an hour without a block by chance; the share check says whether the gap is unusual.</span></li>
+        <li><span class="chip chip--inactive">inactive</span><span>Mined a block within the last 7 days, but none for over an hour. A small miner can go an hour without a block by chance.</span></li>
         <li><span class="chip chip--gone">gone</span><span>No block in the last 7 days.</span></li>
-        <li><span class="chip">ok</span><span>Share check: recent blocks are consistent with the baseline share.</span></li>
-        <li><span class="chip chip--low">low</span><span>Share check: more than 3σ below the block count the baseline share predicts (at least 9 expected).</span></li>
-        <li><span class="chip chip--absent">absent</span><span>Share check: no recent block, where the baseline share makes that under 1% likely.</span></li>
-        <li><span class="chip chip--new">new</span><span>Not in the baseline; first seen after it.</span></li>
         <li><span class="chip">other</span><span>Every miner without a known pool tag and under 1% of the blocks (this week and in the baseline), added up: mostly solo miners.</span></li>
       </ul>
     </section>
@@ -244,7 +243,8 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
     setText("[data-node-version]", node.version || "unknown");
     setText("[data-height]", fmtInt(chain.height));
     var hash = $("[data-hash]"); if (hash) { hash.innerHTML = ""; var code = document.createElement("code"); code.textContent = shortHash(chain.hash); code.title = chain.hash || ""; hash.appendChild(code); }
-    setText("[data-tip-time]", chain.blockTime ? "Header time " + fmtUtc(chain.blockTime) : "");
+    var lastInterval = d.series.blocks.intervalSeconds.length ? d.series.blocks.intervalSeconds[d.series.blocks.intervalSeconds.length - 1] : null;
+    setText("[data-tip-time]", "since block " + fmtInt(chain.height) + " was seen · header time " + (chain.blockTime ? fmtUtc(chain.blockTime, true) + " UTC" : "—") + " · last interval " + fmtSeconds(lastInterval) + " · expected " + fmtSeconds((chain.expected || {}).expectedIntervalSeconds) + " · target " + chain.targetSpacingSeconds + " s");
     var post = chain.intervals.postNu7, stats = post.count > 0 ? post : chain.intervals.last102;
     setText("[data-median]", stats.median == null ? "Unavailable" : fmtSeconds(stats.median));
     setText("[data-median-hint]", "Last " + stats.count + (post.count > 0 ? " post-NU7" : "") + " interval" + (stats.count === 1 ? "" : "s") + " · mean " + fmtSeconds(stats.mean) + " · " + chain.expectedMedianSeconds.toFixed(1) + " s median expected at the " + chain.targetSpacingSeconds + " s target");
@@ -327,14 +327,13 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
     var mi = d.miners || { table: [], baseline: {}, recent: {} };
     (mi.table || []).forEach(function (row) {
       var tr = document.createElement("tr");
-      tr.innerHTML = '<th></th><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td><span class="chip"></span></td><td><span class="chip"></span></td>';
+      tr.innerHTML = '<th></th><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td><span class="chip"></span></td>';
       var c = tr.children;
       if (row.miner === "other") { tr.className = "other"; }
       c[0].textContent = row.miner === "other" ? "other (" + fmtInt(row.miners) + " miners)" : row.miner; c[1].textContent = pct(row.baselineShare); c[2].textContent = pct(row.recentShare);
-      c[3].textContent = fmtInt(row.recentBlocks); c[4].textContent = fmtInt(row.weekBlocks || 0);
-      c[5].textContent = row.lastHeight ? fmtInt(row.lastHeight) + " · " + fmtAge(row.lastSeenSeconds) + " ago" : "—";
-      c[6].firstChild.textContent = row.activity || "gone"; c[6].firstChild.className = "chip chip--" + (row.activity || "gone");
-      c[7].firstChild.textContent = row.status; c[7].firstChild.className = "chip chip--" + row.status;
+      c[3].textContent = fmtInt(row.recentBlocks);
+      c[4].textContent = row.lastHeight ? fmtInt(row.lastHeight) + " · " + fmtAge(row.lastSeenSeconds) + " ago" : "—";
+      c[5].firstChild.textContent = row.activity || "gone"; c[5].firstChild.className = "chip chip--" + (row.activity || "gone");
       minersBody.appendChild(tr);
     });
     setText("[data-miners-hint]", "Baseline: " + fmtInt(mi.baseline.blocks) + " blocks " + fmtInt(mi.baseline.fromHeight) + "–" + fmtInt(mi.baseline.untilHeight) + " · recent: last " + fmtInt(mi.recent.lastBlocks) + " blocks (" + fmtInt(mi.recent.blocks) + " attributed) · week: " + fmtInt((mi.week || {}).blocks || 0) + " attributed blocks · rows: known pools and miners with at least " + pct(mi.majorShare || 0.01) + " of the blocks");
@@ -347,19 +346,42 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
   function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
   function chart(id, config) {
     if (!window.Chart) return;
+    if (window.ChartZoom && !state.zoomRegistered) { Chart.register(window.ChartZoom); state.zoomRegistered = true; }
     var existing = state.charts[id];
-    if (existing) { existing.data = config.data; existing.options = config.options; existing.update("none"); return; }
-    state.charts[id] = new Chart(document.getElementById(id).getContext("2d"), config);
+    if (existing) {
+      // A zoomed chart keeps its data until the viewer resets it, so the region does not move under them.
+      if (existing.isZoomedOrPanned && existing.isZoomedOrPanned()) return;
+      existing.data = config.data; existing.options = config.options; existing.update("none"); return;
+    }
+    var canvas = document.getElementById(id);
+    var created = new Chart(canvas.getContext("2d"), config);
+    state.charts[id] = created;
+    var note = document.createElement("p"); note.className = "zoom-note"; note.hidden = true; note.textContent = "zoomed · double-click to reset";
+    canvas.parentNode.appendChild(note);
+    canvas.addEventListener("dblclick", function () { if (created.resetZoom) created.resetZoom(); noteZoom(created); if (state.data) renderCharts(state.data); });
   }
-  function baseOptions(xTitle, scales) {
-    var text = css("--muted"), grid = css("--grid");
-    var base = { animation: false, responsive: true, maintainAspectRatio: false, interaction: { mode: "index", intersect: false },
+  function noteZoom(c) { var note = c.canvas.parentNode.querySelector(".zoom-note"); if (note) note.hidden = !(c.isZoomedOrPanned && c.isZoomedOrPanned()); }
+  function tickTime(unix, span) { var iso = new Date(unix * 1000).toISOString(); return span < 2 * 86400 ? iso.slice(11, 16) : iso.slice(5, 16).replace("T", " "); }
+  // `axis`: "category" (labels), "time" (linear seconds, every dataset shares the block times, tooltip by index) or
+  // "time-nearest" (linear seconds, datasets with their own points, tooltip for the nearest point).
+  function baseOptions(xTitle, scales, axis) {
+    var text = css("--muted"), grid = css("--grid"), accent = css("--accent");
+    var timed = axis === "time" || axis === "time-nearest";
+    var x = { ticks: { color: text, maxTicksLimit: 8, maxRotation: 0 }, grid: { color: grid }, title: { display: !!xTitle, text: xTitle, color: text } };
+    if (timed) { x.type = "linear"; x.bounds = "data"; x.ticks.callback = function (v) { return tickTime(v, this.max - this.min); }; }
+    var base = { animation: false, responsive: true, maintainAspectRatio: false,
+      interaction: axis === "time-nearest" ? { mode: "nearest", axis: "x", intersect: false } : { mode: "index", intersect: false },
       plugins: { legend: { labels: { color: text, boxWidth: 10, font: { size: 11 } } },
-        // Chart.js rounds tooltip values to 3 decimals; per-block fees are ~0.0003 ZEC.
-        tooltip: { callbacks: { label: function (item) { var v = item.parsed.y; return item.dataset.label + ": " + (v == null ? "—" : Number(v).toLocaleString("en-US", { maximumFractionDigits: 8 })); } } } },
+        tooltip: { callbacks: {
+          title: function (items) { if (!items.length) return ""; var it = items[0]; if (!timed) return it.label; var raw = it.raw || {}; return fmtUtc(it.parsed.x, true) + " UTC" + (raw.h != null ? " · block " + fmtInt(raw.h) : ""); },
+          // Chart.js rounds tooltip values to 3 decimals; per-block fees are ~0.0003 ZEC.
+          label: function (item) { var v = item.parsed.y; return item.dataset.label + ": " + (v == null ? "—" : Number(v).toLocaleString("en-US", { maximumFractionDigits: 8 })); } } },
+        zoom: { zoom: { drag: { enabled: true, backgroundColor: accent + "22" }, wheel: { enabled: true, modifierKey: "ctrl" }, pinch: { enabled: true }, mode: "x", onZoomComplete: function (e) { noteZoom(e.chart); } },
+          pan: { enabled: true, mode: "x", modifierKey: "shift", onPanComplete: function (e) { noteZoom(e.chart); } },
+          limits: { x: { min: "original", max: "original" } } } },
       elements: { point: { radius: 0 }, line: { borderWidth: 1.5, tension: 0 } },
-      scales: { x: { ticks: { color: text, maxTicksLimit: 8, maxRotation: 0 }, grid: { color: grid }, title: { display: !!xTitle, text: xTitle, color: text } } } };
-    Object.keys(scales || {}).forEach(function (k) { var s = Object.assign({ ticks: { color: text }, grid: { color: grid } }, scales[k]); if (scales[k].ticks) s.ticks = Object.assign({ color: text }, scales[k].ticks); base.scales[k] = s; });
+      scales: { x: x } };
+    Object.keys(scales || {}).forEach(function (k) { var s = Object.assign({ ticks: { color: text }, grid: { color: grid } }, scales[k]); if (scales[k].ticks) s.ticks = Object.assign({ color: text }, scales[k].ticks); base.scales[k] = k === "x" ? Object.assign(x, scales[k]) : s; });
     return base;
   }
   function rollingMedian(values, window) {
@@ -368,43 +390,62 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
       if (!slice.length) return null; var mid = slice.length >> 1; return slice.length % 2 ? slice[mid] : (slice[mid - 1] + slice[mid]) / 2;
     });
   }
+  function rollingMean(values, window) {
+    return values.map(function (_, i) {
+      var slice = values.slice(Math.max(0, i - window + 1), i + 1).filter(function (v) { return v != null; });
+      if (!slice.length) return null; return slice.reduce(function (a, v) { return a + v; }, 0) / slice.length;
+    });
+  }
   function timeLabels(ts) { return ts.map(function (t) { return fmtUtc(t, true).slice(11, 16); }); }
   function zec(arr) { return arr.map(function (v) { return v == null ? null : v / 1e8; }); }
-  function activationMarker(heights) {
-    return { type: "line", label: "NU7 activation", data: heights.map(function (h) { return h === ACTIVATION ? 1 : null; }), yAxisID: "marker", borderColor: css("--accent-2"), borderWidth: 0, pointRadius: heights.map(function (h) { return h === ACTIVATION ? 5 : 0; }), pointBackgroundColor: css("--accent-2"), showLine: false };
+  // Points on a time axis: one per block, carrying its height for the tooltip.
+  function pts(times, values, heights) { return times.map(function (t, i) { return { x: t, y: values[i] == null ? null : values[i], h: heights ? heights[i] : undefined }; }); }
+  function curvePts(curve, key) { return (curve || []).map(function (p) { return { x: p.time, y: p[key], h: p.height }; }); }
+  function bar(dataset) { return Object.assign({ type: "bar", barThickness: "flex", maxBarThickness: 24 }, dataset); }
+  function activationTime(d, b) {
+    if (d.activation.activatedAt) return d.activation.activatedAt;
+    var at = ((d.projections || {}).rolling || {}).curve || [];
+    for (var i = 0; i < at.length; i++) if (at[i].height === ACTIVATION) return at[i].time;
+    return d.activation.etaUnix || null;
   }
+  // The activation block as a dot on the "marker" axis: aligned with the block times for index tooltips, or alone.
+  function activationMarker(times, heights, at) {
+    var data = times ? pts(times, heights.map(function (h) { return h === ACTIVATION ? 1 : null; }), heights) : (at == null ? [] : [{ x: at, y: 1, h: ACTIVATION }]);
+    return { type: "line", label: "NU7 activation", data: data, yAxisID: "marker", borderColor: css("--accent-2"), borderWidth: 0, pointRadius: 5, pointBackgroundColor: css("--accent-2"), showLine: false };
+  }
+  function markerAxis() { return { display: false, min: 0, max: 1 }; }
   function renderCharts(d) {
-    var b = d.series.blocks, s = d.series.samples, heights = b.height.map(fmtInt);
+    var b = d.series.blocks, s = d.series.samples, bt = b.time, bh = b.height;
     var accent = css("--accent"), accent2 = css("--accent-2"), nsmC = css("--nsm"), minerC = css("--miner"), muted = css("--muted"), warn = css("--warn"), bad = css("--bad");
-    var target = b.height.map(function (h) { return h >= ACTIVATION ? 25 : 75; });
-    chart("c-interval", { type: "bar", data: { labels: heights, datasets: [
-      { type: "bar", label: "interval (s)", data: b.intervalSeconds, backgroundColor: accent + "99" },
-      { type: "line", label: "rolling 102 median", data: rollingMedian(b.intervalSeconds, 102), borderColor: accent2 },
-      { type: "line", label: "target spacing", data: target, borderColor: muted, borderDash: [4, 4] },
-      activationMarker(b.height) ] },
-      options: baseOptions("height", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } }, marker: { display: false, min: 0, max: 1 } }) });
-    chart("c-difficulty", { type: "line", data: { labels: heights, datasets: [
-      { label: "difficulty", data: b.difficulty, borderColor: accent, yAxisID: "y" },
-      { type: "bar", label: "change %", data: b.difficultyChangePct, backgroundColor: accent2 + "88", yAxisID: "y2" } ] },
-      options: baseOptions("height", { y: { type: "logarithmic", position: "left" }, y2: { position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "%", color: muted } } }) });
+    var target = bh.map(function (h) { return h >= ACTIVATION ? 25 : 75; });
+    chart("c-interval", { type: "bar", data: { datasets: [
+      bar({ label: "interval (s)", data: pts(bt, b.intervalSeconds, bh), backgroundColor: accent + "99" }),
+      { type: "line", label: "rolling 10 median", data: pts(bt, rollingMedian(b.intervalSeconds, 10), bh), borderColor: accent2 },
+      { type: "line", label: "target spacing", data: pts(bt, target, bh), borderColor: muted, borderDash: [4, 4] },
+      activationMarker(bt, bh) ] },
+      options: baseOptions("header time (UTC)", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } }, marker: markerAxis() }, "time") });
+    chart("c-difficulty", { type: "line", data: { datasets: [
+      { label: "difficulty", data: pts(bt, b.difficulty, bh), borderColor: accent, yAxisID: "y" },
+      bar({ label: "change %", data: pts(bt, b.difficultyChangePct, bh), backgroundColor: accent2 + "88", yAxisID: "y2" }) ] },
+      options: baseOptions("header time (UTC)", { y: { type: "logarithmic", position: "left" }, y2: { position: "right", grid: { drawOnChartArea: false }, title: { display: true, text: "%", color: muted } } }, "time") });
     renderModelCharts(d, b, accent, accent2, nsmC, muted, warn, bad);
     var delta = b.nsmBalanceZat.map(function (v, i) { var p = i > 0 ? b.nsmBalanceZat[i - 1] : null; return (v == null || p == null) ? null : v - p; });
     var expected = b.nsmFeeZat.map(function (v, i) { if (v == null) return null; return v + (b.reissuanceZat[i] || 0); });
-    chart("c-nsm", { type: "bar", data: { labels: heights, datasets: [
-      { type: "line", label: "NSM balance (ZEC)", data: zec(b.nsmBalanceZat), borderColor: nsmC, yAxisID: "y", spanGaps: true },
-      { type: "bar", label: "Δ per block (ZEC)", data: zec(delta), backgroundColor: nsmC + "88", yAxisID: "y2" },
-      { type: "bar", label: "fee share + reissuance (ZEC)", data: zec(expected), backgroundColor: accent2 + "88", yAxisID: "y2" } ] },
-      options: baseOptions("height", { y: { position: "left" }, y2: { position: "right", grid: { drawOnChartArea: false } } }) });
-    chart("c-fees", { type: "bar", data: { labels: heights, datasets: [
-      { label: "miner (ZEC)", data: zec(b.minerFeeZat), backgroundColor: minerC + "bb", stack: "fees" },
-      { label: "NSM (ZEC)", data: zec(b.nsmFeeZat), backgroundColor: nsmC + "bb", stack: "fees" } ] },
-      options: baseOptions("height", { x: { stacked: true }, y: { stacked: true, beginAtZero: true } }) });
-    chart("c-fullness", { type: "bar", data: { labels: heights, datasets: [
-      { label: "Orchard actions", data: b.orchardActions, backgroundColor: accent + "99", yAxisID: "y" },
-      { type: "line", label: "330 limit", data: b.height.map(function () { return 330; }), borderColor: bad, borderDash: [3, 3], yAxisID: "y" },
-      { type: "line", label: "transactions", data: b.nTx, borderColor: accent2, yAxisID: "y" },
-      { type: "line", label: "size (kB)", data: b.size.map(function (v) { return v == null ? null : v / 1000; }), borderColor: muted, yAxisID: "y2" } ] },
-      options: baseOptions("height", { y: { beginAtZero: true }, y2: { position: "right", grid: { drawOnChartArea: false }, beginAtZero: true } }) });
+    chart("c-nsm", { type: "bar", data: { datasets: [
+      { type: "line", label: "NSM balance (ZEC)", data: pts(bt, zec(b.nsmBalanceZat), bh), borderColor: nsmC, yAxisID: "y", spanGaps: true },
+      bar({ label: "Δ per block (ZEC)", data: pts(bt, zec(delta), bh), backgroundColor: nsmC + "88", yAxisID: "y2" }),
+      bar({ label: "fee share + reissuance (ZEC)", data: pts(bt, zec(expected), bh), backgroundColor: accent2 + "88", yAxisID: "y2" }) ] },
+      options: baseOptions("header time (UTC)", { y: { position: "left" }, y2: { position: "right", grid: { drawOnChartArea: false } } }, "time") });
+    chart("c-fees", { type: "bar", data: { datasets: [
+      bar({ label: "miner (ZEC)", data: pts(bt, zec(b.minerFeeZat), bh), backgroundColor: minerC + "bb", stack: "fees" }),
+      bar({ label: "NSM (ZEC)", data: pts(bt, zec(b.nsmFeeZat), bh), backgroundColor: nsmC + "bb", stack: "fees" }) ] },
+      options: baseOptions("header time (UTC)", { x: { stacked: true }, y: { stacked: true, beginAtZero: true } }, "time") });
+    chart("c-fullness", { type: "bar", data: { datasets: [
+      bar({ label: "Orchard actions", data: pts(bt, b.orchardActions, bh), backgroundColor: accent + "99", yAxisID: "y" }),
+      { type: "line", label: "330 limit", data: pts(bt, bh.map(function () { return 330; }), bh), borderColor: bad, borderDash: [3, 3], yAxisID: "y" },
+      { type: "line", label: "transactions", data: pts(bt, b.nTx, bh), borderColor: accent2, yAxisID: "y" },
+      { type: "line", label: "size (kB)", data: pts(bt, b.size.map(function (v) { return v == null ? null : v / 1000; }), bh), borderColor: muted, yAxisID: "y2" } ] },
+      options: baseOptions("header time (UTC)", { y: { beginAtZero: true }, y2: { position: "right", grid: { drawOnChartArea: false }, beginAtZero: true } }, "time") });
     var tl = timeLabels(s.t);
     chart("c-txfees", { type: "line", data: { labels: tl, datasets: [
       { label: "mempool p10", data: s.mempoolFeeP10Zat, borderColor: muted, borderDash: [2, 2] },
@@ -433,60 +474,51 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
     // The node's GetDifficulty: both compact mantissas shifted a byte in u32 space, then 256 per exponent step.
     return (0x7ffff00 / ((bits << 8) >>> 0)) * Math.pow(256, 31 - (bits >>> 24));
   }
-  function rollingMean(values, window) {
-    return values.map(function (_, i) {
-      var slice = values.slice(Math.max(0, i - window + 1), i + 1).filter(function (v) { return v != null; });
-      if (!slice.length) return null; return slice.reduce(function (a, v) { return a + v; }, 0) / slice.length;
-    });
-  }
-  function aligned(labels, points, key, value) {
-    var map = {}; (points || []).forEach(function (p) { map[p[key]] = p[value]; });
-    return labels.map(function (h) { return map[h] == null ? null : map[h]; });
+  function lastTime(curve) { return curve && curve.length ? curve[curve.length - 1].time : null; }
+  // The target spacing as a step from 75 s to 25 s at activation, over the chart's span.
+  function targetLine(xMin, xMax, at) {
+    if (at == null || at >= xMax) return [{ x: xMin, y: 75 }, { x: xMax, y: 75 }];
+    if (at <= xMin) return [{ x: xMin, y: 25 }, { x: xMax, y: 25 }];
+    return [{ x: xMin, y: 75 }, { x: at, y: 75 }, { x: at, y: 25 }, { x: xMax, y: 25 }];
   }
   function renderModelCharts(d, b, accent, accent2, nsmC, muted, warn, bad) {
     var proj = d.projections || {}, fixed = proj.fixed, rolling = proj.rolling || {}, ex = d.chain.expected || {};
-    var set = {}; b.height.forEach(function (h) { set[h] = true; });
-    (rolling.curve || []).forEach(function (p) { set[p.height] = true; });
-    if (fixed) { (fixed.curve || []).forEach(function (p) { set[p.height] = true; }); }
-    var heights = Object.keys(set).map(Number).sort(function (x, y) { return x - y; });
-    var labels = heights.map(fmtInt);
-    var live = aligned(heights, b.height.map(function (h, i) { return { h: h, v: b.difficulty[i] }; }), "h", "v");
-    var ruled = aligned(heights, b.height.map(function (h, i) { return { h: h, v: difficultyFromBits(b.expectedBits[i]) }; }), "h", "v");
+    var bt = b.time, bh = b.height, at = activationTime(d, b);
+    var xMin = bt.length ? bt[0] : null;
+    var xMax = Math.max.apply(null, [bt.length ? bt[bt.length - 1] : 0, lastTime(rolling.curve) || 0, fixed ? (lastTime(fixed.curve) || 0) : 0]);
     var datasets = [
-      { label: "live", data: live, borderColor: accent, borderWidth: 2, spanGaps: true },
-      { label: "rule-implied", data: ruled, borderColor: bad, borderDash: [2, 2], spanGaps: true } ];
+      { label: "live", data: pts(bt, b.difficulty, bh), borderColor: accent, borderWidth: 2, spanGaps: true },
+      { label: "rule-implied", data: pts(bt, b.expectedBits.map(difficultyFromBits), bh), borderColor: bad, borderDash: [2, 2], spanGaps: true } ];
     if (fixed) {
       if (fixed.band) {
-        datasets.push({ label: "frozen 10–90% band", data: aligned(heights, fixed.band, "height", "p90"), borderColor: accent2 + "00", backgroundColor: accent2 + "22", fill: "+1", spanGaps: true });
-        datasets.push({ label: "frozen p10", data: aligned(heights, fixed.band, "height", "p10"), borderColor: accent2 + "00", spanGaps: true });
-        datasets.push({ label: "frozen expected (median)", data: aligned(heights, fixed.band, "height", "p50"), borderColor: accent2, spanGaps: true });
+        datasets.push({ label: "frozen 10–90% band", data: curvePts(fixed.band, "p90"), borderColor: accent2 + "00", backgroundColor: accent2 + "22", fill: "+1" });
+        datasets.push({ label: "frozen p10", data: curvePts(fixed.band, "p10"), borderColor: accent2 + "00" });
+        datasets.push({ label: "frozen expected (median)", data: curvePts(fixed.band, "p50"), borderColor: accent2 });
       }
-      datasets.push({ label: "frozen noise-free", data: aligned(heights, fixed.curve, "height", "difficulty"), borderColor: accent2, borderDash: [6, 3], spanGaps: true });
+      datasets.push({ label: "frozen noise-free", data: curvePts(fixed.curve, "difficulty"), borderColor: accent2, borderDash: [6, 3] });
     }
-    datasets.push({ label: "from current data", data: aligned(heights, rolling.curve, "height", "difficulty"), borderColor: nsmC, spanGaps: true });
-    if (ex.equilibriumDifficulty != null) datasets.push({ label: "settles at (current hashrate)", data: heights.map(function () { return ex.equilibriumDifficulty; }), borderColor: muted, borderDash: [3, 3] });
-    datasets.push(activationMarker(heights));
-    chart("c-expected", { type: "line", data: { labels: labels, datasets: datasets },
-      options: baseOptions("height", { y: { type: "logarithmic" }, marker: { display: false, min: 0, max: 1 } }) });
+    datasets.push({ label: "from current data", data: curvePts(rolling.curve, "difficulty"), borderColor: nsmC });
+    if (ex.equilibriumDifficulty != null && xMin != null) datasets.push({ label: "settles at (current hashrate)", data: [{ x: xMin, y: ex.equilibriumDifficulty }, { x: xMax, y: ex.equilibriumDifficulty }], borderColor: muted, borderDash: [3, 3] });
+    datasets.push(activationMarker(null, null, at));
+    chart("c-expected", { type: "line", data: { datasets: datasets },
+      options: baseOptions("time (UTC)", { y: { type: "logarithmic" }, marker: markerAxis() }, "time-nearest") });
 
-    var observedMean = aligned(heights, b.height.map(function (h, i) { return { h: h, v: null }; }), "h", "v");
-    var mean102 = rollingMean(b.intervalSeconds, 102), median102 = rollingMedian(b.intervalSeconds, 102);
     var blockDatasets = [
-      { label: "observed mean (102)", data: aligned(heights, b.height.map(function (h, i) { return { h: h, v: mean102[i] }; }), "h", "v"), borderColor: accent, borderWidth: 2, spanGaps: true },
-      { label: "observed median (102)", data: aligned(heights, b.height.map(function (h, i) { return { h: h, v: median102[i] }; }), "h", "v"), borderColor: accent, borderDash: [2, 2], spanGaps: true },
-      { label: "expected per block", data: aligned(heights, b.height.map(function (h, i) { return { h: h, v: b.expectedIntervalSeconds[i] }; }), "h", "v"), borderColor: warn, spanGaps: true } ];
-    if (fixed) blockDatasets.push({ label: "frozen projection", data: aligned(heights, fixed.curve, "height", "expectedIntervalSeconds"), borderColor: accent2, borderDash: [6, 3], spanGaps: true });
-    blockDatasets.push({ label: "from current data", data: aligned(heights, rolling.curve, "height", "expectedIntervalSeconds"), borderColor: nsmC, spanGaps: true });
-    blockDatasets.push({ label: "target spacing", data: heights.map(function (h) { return h >= ACTIVATION ? 25 : 75; }), borderColor: muted, borderDash: [3, 3] });
-    blockDatasets.push(activationMarker(heights));
-    chart("c-blocktime", { type: "line", data: { labels: labels, datasets: blockDatasets },
-      options: baseOptions("height", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } }, marker: { display: false, min: 0, max: 1 } }) });
+      { label: "observed mean (10)", data: pts(bt, rollingMean(b.intervalSeconds, 10), bh), borderColor: accent, borderWidth: 2, spanGaps: true },
+      { label: "observed median (10)", data: pts(bt, rollingMedian(b.intervalSeconds, 10), bh), borderColor: accent, borderDash: [2, 2], spanGaps: true },
+      { label: "expected per block", data: pts(bt, b.expectedIntervalSeconds, bh), borderColor: warn, spanGaps: true } ];
+    if (fixed) blockDatasets.push({ label: "frozen projection", data: curvePts(fixed.curve, "expectedIntervalSeconds"), borderColor: accent2, borderDash: [6, 3] });
+    blockDatasets.push({ label: "from current data", data: curvePts(rolling.curve, "expectedIntervalSeconds"), borderColor: nsmC });
+    if (xMin != null) blockDatasets.push({ label: "target spacing", data: targetLine(xMin, xMax, at), borderColor: muted, borderDash: [3, 3] });
+    blockDatasets.push(activationMarker(null, null, at));
+    chart("c-blocktime", { type: "line", data: { datasets: blockDatasets },
+      options: baseOptions("time (UTC)", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } }, marker: markerAxis() }, "time-nearest") });
 
-    var tl = timeLabels(b.time);
+    var tl = timeLabels(bt);
     chart("c-recent", { type: "bar", data: { labels: tl, datasets: [
       { type: "bar", label: "interval (s)", data: b.intervalSeconds, backgroundColor: accent + "99" },
       { type: "line", label: "expected (s)", data: b.expectedIntervalSeconds, borderColor: warn, spanGaps: true },
-      { type: "line", label: "target", data: b.height.map(function (h) { return h >= ACTIVATION ? 25 : 75; }), borderColor: muted, borderDash: [3, 3] } ] },
+      { type: "line", label: "target", data: bh.map(function (h) { return h >= ACTIVATION ? 25 : 75; }), borderColor: muted, borderDash: [3, 3] } ] },
       options: baseOptions("header time (UTC)", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } } }) });
 
     var mb = d.series.minerBuckets || { starts: [], miners: [], counts: {} };
@@ -505,15 +537,19 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
       if (!r.ok) throw new Error("status " + r.status); return r.json();
     }).then(function (data) {
       state.data = data; state.fetchedAt = Date.now() / 1000;
+      var seen = data.series.blocks.observedAt, lastSeen = seen.length ? seen[seen.length - 1] : null;
+      state.sinceSeen = lastSeen != null && data.generatedAt != null ? Math.max(0, data.generatedAt - lastSeen) : null;
       $("[data-availability]").hidden = data.status === "live";
       render(data);
     }).catch(function () { $("[data-availability]").hidden = false; });
   }
   function tick() {
     if (!state.data || !state.data.chain.blockTime) return;
-    var age = state.data.chain.tipAgeSeconds + (Date.now() / 1000 - state.fetchedAt);
-    setText("[data-age]", fmtAge(age));
-    setClass("[data-age]", age > 600 ? "bad" : age > 180 ? "warn" : "");
+    var elapsed = Date.now() / 1000 - state.fetchedAt;
+    var since = state.sinceSeen != null ? state.sinceSeen + elapsed : state.data.chain.tipAgeSeconds + elapsed;
+    setText("[data-age]", fmtAge(since));
+    var expected = (state.data.chain.expected || {}).expectedIntervalSeconds;
+    setClass("[data-age]", since > 600 ? "bad" : (expected && since > 2 * expected) ? "warn" : "");
   }
   document.querySelectorAll("[data-window]").forEach(function (button) {
     button.addEventListener("click", function () {

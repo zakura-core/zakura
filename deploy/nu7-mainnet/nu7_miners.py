@@ -11,7 +11,6 @@ counted as one anonymous shielded miner.
 
 from __future__ import annotations
 
-import math
 import re
 
 # A miner is active while its newest block is at most this old, and inactive
@@ -45,8 +44,6 @@ POOL_TAGS = [
     ("zergpool", "Zergpool"),
     ("solopool", "SoloPool"),
 ]
-ABSENT_PROBABILITY = 0.01
-LOW_MIN_EXPECTED = 9.0
 
 
 def coinbase_tag(scriptsig_hex):
@@ -117,30 +114,12 @@ def miner_shares(rows):
     return {"blocks": total, "miners": counts}
 
 
-def miner_status(baseline_share, recent_blocks, recent_total):
-    """ok, low or absent: whether a miner's recent block count is consistent with its baseline share.
-
-    `absent` needs the chance of mining nothing at the baseline share to be
-    under 1%; `low` needs at least 9 expected blocks and an observed count more
-    than three standard deviations below it. Small pools are never flagged.
-    """
-    if not baseline_share or recent_total <= 0:
-        return "ok"
-    expected = baseline_share * recent_total
-    if recent_blocks == 0 and (1.0 - baseline_share) ** recent_total < ABSENT_PROBABILITY:
-        return "absent"
-    if expected >= LOW_MIN_EXPECTED and recent_blocks < expected - 3.0 * math.sqrt(expected):
-        return "low"
-    return "ok"
-
-
 def miner_activity(last_seen_seconds):
     """active, inactive or gone from the age of a miner's newest block.
 
     `active`: a block within the last hour. `inactive`: a block within the
     last week but none for over an hour. `gone`: nothing in a week, or never
-    seen. A small miner can go an hour without a block by chance; the share
-    check (`miner_status`) says whether a gap is statistically unusual.
+    seen. A small miner can go an hour without a block by chance.
     """
     if last_seen_seconds is None or last_seen_seconds > SEEN_WITHIN_SECONDS:
         return "gone"
@@ -189,11 +168,9 @@ def combine_rows(rows, now):
         "baselineBlocks": sum(row["baselineBlocks"] for row in rows),
         "recentShare": sum(row["recentShare"] for row in rows),
         "recentBlocks": sum(row["recentBlocks"] for row in rows),
-        "weekBlocks": sum(row["weekBlocks"] for row in rows),
         "lastHeight": last_height,
         "lastSeenSeconds": last_seen,
         "activity": miner_activity(last_seen),
-        "status": OTHER,
     }
 
 
@@ -216,7 +193,7 @@ def all_miner_rows(baseline, recent, week, now):
     rows = []
     seen = set()
 
-    def row(miner, base, current, weekly, status):
+    def row(miner, base, current, weekly):
         last_height, last_time = _latest(weekly, current, base)
         last_seen = (now - last_time) if last_time else None
         return {
@@ -225,24 +202,19 @@ def all_miner_rows(baseline, recent, week, now):
             "baselineBlocks": base["blocks"] if base else 0,
             "recentShare": current.get("share") or 0.0,
             "recentBlocks": current["blocks"],
-            "weekBlocks": weekly["blocks"],
             "lastHeight": last_height,
             "lastSeenSeconds": last_seen,
             "activity": miner_activity(last_seen),
-            "status": status,
         }
 
     for miner, entry in sorted(baseline["miners"].items(), key=lambda item: -item[1]["blocks"]):
         seen.add(miner)
-        current = recent["miners"].get(miner, empty)
-        rows.append(row(miner, entry, current, week["miners"].get(miner, empty),
-                        miner_status(entry["share"], current["blocks"], recent["blocks"])))
+        rows.append(row(miner, entry, recent["miners"].get(miner, empty), week["miners"].get(miner, empty)))
     others = {**week["miners"], **{m: e for m, e in recent["miners"].items() if m not in week["miners"]}}
     for miner, weekly in sorted(others.items(), key=lambda item: -item[1]["blocks"]):
         if miner in seen:
             continue
-        current = recent["miners"].get(miner, empty)
-        rows.append(row(miner, None, current, week["miners"].get(miner, empty), "new"))
+        rows.append(row(miner, None, recent["miners"].get(miner, empty), week["miners"].get(miner, empty)))
     return rows
 
 

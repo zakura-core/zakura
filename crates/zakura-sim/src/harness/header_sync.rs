@@ -27,6 +27,7 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
+        adoption::{AdoptionEvidence, SessionLife},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         session::SessionEvidence,
@@ -52,7 +53,7 @@ use crate::{
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
-    Observation, RunConfig, Sim,
+    Observation, RunConfig, RunEnd, Sim,
 };
 
 /// The smoke run's scenario. It has no knobs yet.
@@ -480,12 +481,15 @@ pub struct Ports {
 pub struct Storage {
     port: Arc<ControlledPort>,
     dispatch: DispatchFlag,
+    /// The node's adoption facts, from its tap.
+    adoption: AdoptionEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
-    _topology: Rc<Topology>,
+    topology: Rc<Topology>,
 }
 
 /// What [`Storage`]'s checks read between steps.
+#[derive(Clone)]
 pub struct StorageView {
     /// The node's port, for its pending operations and its engine's state.
     pub port: Arc<ControlledPort>,
@@ -494,6 +498,12 @@ pub struct StorageView {
     /// The peers the scenario marks `HonestPeer`, by index. Only
     /// `header-sync/wire` has peers to mark.
     pub honest_peers: Rc<BTreeSet<usize>>,
+    /// The node's adopted state and what it published from it.
+    pub adoption: AdoptionEvidence,
+    /// Each of the node's sessions and how long it lasted, which the status
+    /// rule ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
+    /// knows them, from its links.
+    pub sessions: Vec<SessionLife>,
 }
 
 impl HonestPeers for StorageView {
@@ -506,13 +516,22 @@ impl HonestPeers for StorageView {
 impl HasView for Storage {
     type View = StorageView;
 
-    /// The node's port and the dispatch guard's flag.
+    /// The node's port, the dispatch guard's flag, the node's adoption facts
+    /// and its sessions' lifetimes.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Rc::default(),
+            adoption: self.adoption.clone(),
+            sessions: self.topology.sessions(),
         }
+    }
+
+    /// Records the run's end in the node's adoption evidence, for its tip
+    /// rule.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
     }
 }
 
@@ -580,6 +599,7 @@ impl Subsystem for Storage {
         );
         let (observer, tap) =
             ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
+        let adoption = tap.adoption();
         let shutdown = tap.shutdown();
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
@@ -634,7 +654,8 @@ impl Subsystem for Storage {
         Storage {
             port: ports.node,
             dispatch,
-            _topology: topology,
+            adoption,
+            topology,
         }
     }
 
@@ -751,6 +772,8 @@ pub struct HeaderWire {
     dispatch: DispatchFlag,
     /// The peers the scenario marks `HonestPeer`.
     honest: Rc<BTreeSet<usize>>,
+    /// The node's adoption facts, from its tap.
+    adoption: AdoptionEvidence,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -759,13 +782,24 @@ pub struct HeaderWire {
 impl HasView for HeaderWire {
     type View = StorageView;
 
-    /// The node's port, the dispatch guard's flag and the honest peers.
+    /// The node's port, the dispatch guard's flag, the honest peers and the
+    /// node's adoption facts. Its sessions run over the network, so the view
+    /// gives no lifetimes, and the status rule judges only what each queued
+    /// status advertises.
     fn view(&self) -> StorageView {
         StorageView {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: self.honest.clone(),
+            adoption: self.adoption.clone(),
+            sessions: Vec::new(),
         }
+    }
+
+    /// Records the run's end in the node's adoption evidence, for its tip
+    /// rule.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
     }
 }
 
@@ -861,6 +895,7 @@ impl Subsystem for HeaderWire {
         );
         let (observer, tap) =
             ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
+        let adoption = tap.adoption();
         sim.add_source(Box::new(storage.with_tap(tap)));
         let header = HeaderNode::spawn(
             sim,
@@ -925,6 +960,7 @@ impl Subsystem for HeaderWire {
             port: ports.node,
             dispatch,
             honest: Rc::new(scenario.honest_peers()),
+            adoption,
             _keep: Box::new(node),
         }
     }

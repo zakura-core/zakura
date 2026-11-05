@@ -1,0 +1,8 @@
+   Compiling zakura-node-services v5.1.0 (/home/evan/src/valar/zakura.mut-1-bindings/crates/zakura-node-services)
+    Finished `test` profile [unoptimized] target(s) in 1.04s
+     Running unittests src/lib.rs (/home/evan/.tmp/mut-1-baseline/build/debug/deps/zakura_node_services-83d24be2ae2ec6e1)
+
+running 1 test
+test block_memory::tests::standalone_transaction_reservation_precedes_decode_and_outlives_clones ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 35 filtered out; finished in 0.00s

@@ -1,0 +1,18 @@
+{
+  "revision": "aa98e054eac239817fa54a4b2687cbe71fb07612",
+  "patch": "qa/native-mutations/state/transaction-results/early-transaction-release.patch",
+  "patch_sha256": "0e3bbf1a45d64c962e5a621c30d9f2f2625192bb430c8d51812099b51c13fe40",
+  "toolchain": "1.99.0",
+  "rustflags": "--cfg zakura_sim",
+  "profile": "test",
+  "debug": 0,
+  "incremental": false,
+  "test": "block_memory::tests::standalone_transaction_reservation_precedes_decode_and_outlives_clones",
+  "baseline_exit": 0,
+  "mutant_exit": 101,
+  "restored_exit": 0,
+  "intended_assertion": "a live standalone allocation retains its charge",
+  "actual_charge": 0,
+  "expected_charge": 435,
+  "discovery": "not-run"
+}

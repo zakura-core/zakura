@@ -285,11 +285,11 @@ It runs no discovery campaign and proves no mutation sensitivity.
 
 ```sh
 CARGO_BUILD_JOBS=8 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL=0 \
-  "$SIM" targets --out "$TMPDIR/readiness" \
+  "$SIM" targets --out "${TMPDIR:-/tmp}/readiness" \
   --target header_reactor_policy --target header_publisher_policy \
   --target block_reactor_policy --target block_decoded_retention \
   --target discovery_record_book --sanitizer none --child-secs 15 \
-  --target-dir "$TMPDIR/readiness-build"
+  --target-dir "${TMPDIR:-/tmp}/readiness-build"
 ```
 
 Readiness uses the pinned `nightly-2026-07-15`, cargo-fuzz 0.13.2 and

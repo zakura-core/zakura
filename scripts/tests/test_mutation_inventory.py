@@ -1,12 +1,16 @@
 """Regression checks for false readiness claims in the static inventory."""
 
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
 
-import mutation_inventory as inventory
+SCRIPT = Path(__file__).resolve().parents[1] / "mutation_inventory.py"
+SPEC = importlib.util.spec_from_file_location("mutation_inventory", SCRIPT)
+inventory = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(inventory)
 
 
 class InventoryTests(unittest.TestCase):
@@ -36,13 +40,25 @@ class InventoryTests(unittest.TestCase):
     def write_cases(self, cases):
         self.write("qa/native-mutations/cases.json", json.dumps(cases))
 
-    def test_source_symbol_never_claims_executable_selection(self):
+    def test_intact_mapping_passes(self):
         row = inventory.inventory(self.root)["cases"][0]
         self.assertEqual(row["errors"], [])
         self.assertEqual(row["apply"], "passed")
-        self.assertEqual(row["compilation"], "not-run")
-        self.assertEqual(row["sensitivity"], "not-run")
-        self.assertEqual(row["executable_selection"], "not-run; source symbol check only")
+
+    def test_selector_outside_the_source_module_fails(self):
+        # `--exact` selects zero tests when the module path is wrong.
+        self.write("src/service/tests.rs", "#[test]\nfn selected() {}\n")
+        self.case.update(source="src/service/tests.rs", test="other::tests::selected")
+        self.write_cases([self.case])
+        errors = inventory.inventory(self.root)["cases"][0]["errors"]
+        self.assertEqual(errors, ["selector other::tests::selected lies outside module service::tests"])
+
+    def test_integration_selector_needs_its_target_file(self):
+        self.write("tests/props.rs", "#[test]\nfn selected() {}\n")
+        self.case.update(source="tests/props.rs", test_target="other")
+        self.write_cases([self.case])
+        errors = inventory.inventory(self.root)["cases"][0]["errors"]
+        self.assertEqual(errors, ["tests/props.rs is not the integration test file for other"])
 
     def test_missing_mapping_keeps_the_patch_and_reports_failure(self):
         self.write_cases([])

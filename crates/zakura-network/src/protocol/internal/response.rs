@@ -96,6 +96,20 @@ pub enum Response {
         Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>,
     ),
 
+    /// A [`Response::Blocks`] from a legacy connection that negotiated early block relay.
+    ///
+    /// The peer may send a block before its own full validation finishes, so the block
+    /// verifier must not score the peer for a later transaction or contextual failure.
+    /// Only the connection creates this variant; the inbound service always answers with
+    /// [`Response::Blocks`].
+    EarlyBlocks(
+        #[cfg_attr(
+            any(test, feature = "proptest-impl"),
+            proptest(strategy = "block_responses()")
+        )]
+        Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>>,
+    ),
+
     /// A list of found unmined transactions, and missing unmined transaction IDs.
     ///
     /// Each list contains zero or more entries.
@@ -121,7 +135,7 @@ impl fmt::Display for Response {
             Response::TransactionIds(ids) => format!("TransactionIds {{ ids: {} }}", ids.len()),
 
             // Display heights for single-block responses (which Zebra requests and expects)
-            Response::Blocks(blocks) if blocks.len() == 1 => {
+            Response::Blocks(blocks) | Response::EarlyBlocks(blocks) if blocks.len() == 1 => {
                 match blocks.first().expect("len is 1") {
                     Available((block, _)) => format!(
                         "Block {{ height: {}, hash: {} }}",
@@ -135,7 +149,7 @@ impl fmt::Display for Response {
                     Missing(hash) => format!("Block {{ missing: {hash} }}"),
                 }
             }
-            Response::Blocks(blocks) => format!(
+            Response::Blocks(blocks) | Response::EarlyBlocks(blocks) => format!(
                 "Blocks {{ blocks: {}, missing: {} }}",
                 blocks.iter().filter(|r| r.is_available()).count(),
                 blocks.iter().filter(|r| r.is_missing()).count()
@@ -165,13 +179,35 @@ impl Response {
             Response::TransactionIds(_) => "TransactionIds",
 
             Response::Blocks(_) => "Blocks",
+            Response::EarlyBlocks(_) => "EarlyBlocks",
             Response::Transactions(_) => "Transactions",
         }
     }
 
     /// Returns true if the response is a block or transaction inventory download.
     pub fn is_inventory_download(&self) -> bool {
-        matches!(self, Response::Blocks(_) | Response::Transactions(_))
+        matches!(
+            self,
+            Response::Blocks(_) | Response::EarlyBlocks(_) | Response::Transactions(_)
+        )
+    }
+
+    /// Returns the block statuses of a [`Response::Blocks`] or [`Response::EarlyBlocks`].
+    pub fn block_statuses(
+        &self,
+    ) -> Option<&[InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>]> {
+        match self {
+            Response::Blocks(blocks) | Response::EarlyBlocks(blocks) => Some(blocks),
+            _ => None,
+        }
+    }
+
+    /// Returns this response with [`Response::Blocks`] tagged as an early-relay delivery.
+    pub(crate) fn into_early_relay_delivery(self) -> Self {
+        match self {
+            Response::Blocks(blocks) => Response::EarlyBlocks(blocks),
+            response => response,
+        }
     }
 }
 

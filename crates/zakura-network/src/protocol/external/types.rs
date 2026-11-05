@@ -145,6 +145,14 @@ bitflags! {
         ///
         /// This bit is in the temporary experiment range until a permanent service bit is assigned.
         const NODE_P2P_V2 = 1 << 24;
+
+        /// NODE_EARLY_BLOCK_RELAY means that the node relays and accepts tip blocks before their
+        /// full validation finishes, on connections where both ends set this bit.
+        ///
+        /// Zebra's Ándale release uses the same bit, so negotiated Zakura and Zebra peers
+        /// interoperate. This bit is in the temporary experiment range until a permanent
+        /// service bit is assigned.
+        const NODE_EARLY_BLOCK_RELAY = 1 << 25;
     }
 }
 
@@ -352,9 +360,10 @@ mod test {
         let _init_guard = zakura_test::init();
 
         assert_eq!(PeerServices::NODE_P2P_V2.bits(), 1 << 24);
+        assert_eq!(PeerServices::NODE_EARLY_BLOCK_RELAY.bits(), 1 << 25);
 
         let decoded =
-            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 25));
+            PeerServices::from_bits_truncate(PeerServices::NODE_NETWORK.bits() | (1 << 26));
         assert_eq!(decoded, PeerServices::NODE_NETWORK);
     }
 }

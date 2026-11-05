@@ -684,7 +684,10 @@ where
                     None,
                 );
 
-                let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
+                let early_relay_delivery = matches!(rsp, zn::Response::EarlyBlocks(_));
+                let (block, advertiser_addr) = if let zn::Response::Blocks(blocks)
+                | zn::Response::EarlyBlocks(blocks) = rsp
+                {
                     // A cooperating peer returns exactly one available block for a
                     // single-hash request. A response with a different count, or a
                     // `Missing` status, means the peer is misbehaving or raced us
@@ -915,9 +918,14 @@ where
 
                     // Verify the block.
                     verify_start = std::time::Instant::now();
+                    let request = if early_relay_delivery {
+                        zakura_consensus::Request::CommitEarlyRelay(block.clone())
+                    } else {
+                        zakura_consensus::Request::Commit(block.clone())
+                    };
                     let mut rsp = verifier
                         .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
-                        .call(zakura_consensus::Request::Commit(block.clone())).boxed();
+                        .call(request).boxed();
 
                     // Add a shorter timeout to workaround a known bug (#5125)
                     let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);

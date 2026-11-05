@@ -197,6 +197,12 @@ pub struct ConnectionInfo {
     /// requests are still shed for backpressure, but the connection is not
     /// severed). See [`Connection::handle_inbound_overload`].
     pub is_protected_peer: bool,
+
+    /// Whether both ends advertised [`PeerServices::NODE_EARLY_BLOCK_RELAY`].
+    ///
+    /// On these connections, inbound `getdata` may be served early bodies, and blocks this
+    /// node downloads are verified as early-relay deliveries.
+    pub early_block_relay: bool,
 }
 
 /// The peer address that we are handshaking with.
@@ -715,13 +721,28 @@ where
 
 /// Return the services Zakura should advertise for this handshake.
 fn configured_advertised_services(config: &Config, mut services: PeerServices) -> PeerServices {
-    services.remove(PeerServices::NODE_P2P_V2);
+    services.remove(PeerServices::NODE_P2P_V2 | PeerServices::NODE_EARLY_BLOCK_RELAY);
 
     if config.v2_p2p() {
         services |= PeerServices::NODE_P2P_V2;
     }
+    if config.experimental_early_block_relay {
+        services |= PeerServices::NODE_EARLY_BLOCK_RELAY;
+    }
 
     services
+}
+
+/// Returns true when both version messages advertise early block relay.
+///
+/// Isolated connections advertise no services, so they never negotiate it.
+fn negotiated_early_block_relay(local: &VersionMessage, remote: &VersionMessage) -> bool {
+    local
+        .services
+        .contains(PeerServices::NODE_EARLY_BLOCK_RELAY)
+        && remote
+            .services
+            .contains(PeerServices::NODE_EARLY_BLOCK_RELAY)
 }
 
 fn inbound_error_address_change(
@@ -979,12 +1000,17 @@ where
     let negotiated_version = min(constants::CURRENT_NETWORK_PROTOCOL_VERSION, remote.version);
 
     // Limit containing struct size, and avoid multiple duplicates of 300+ bytes of data.
+    let early_block_relay = negotiated_early_block_relay(&our_version, &remote);
+    if early_block_relay {
+        metrics::counter!("zakura.p2p.handshake.early_block_relay.negotiated").increment(1);
+    }
     let connection_info = Arc::new(ConnectionInfo {
         connected_addr: *connected_addr,
         remote,
         local: our_version,
         negotiated_version,
         is_protected_peer,
+        early_block_relay,
     });
 
     debug!(

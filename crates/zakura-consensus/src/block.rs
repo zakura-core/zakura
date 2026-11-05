@@ -35,11 +35,13 @@ use zakura_state as zs;
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
+pub mod early_relay;
 mod prepared;
 mod receipt;
 pub mod request;
 pub mod subsidy;
 
+pub use early_relay::{EarlyRelay, EarlyRelayGuard};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
@@ -63,6 +65,8 @@ pub struct SemanticBlockVerifier<S, V> {
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
     receipt_orders: receipt::ReceiptRegistry,
+    /// Publishes verified tip children before their commit, when early block relay is enabled.
+    early_relay: Option<EarlyRelay>,
 }
 
 /// Block verification errors.
@@ -130,6 +134,31 @@ pub enum VerifyBlockError {
     /// This is for errors that are not specifically related to block depth or commit failures.
     #[error("state service error for block {hash}: {source}")]
     StateService { source: BoxError, hash: block::Hash },
+
+    /// A block from a negotiated early-relay peer failed after its header and commitments
+    /// checked out against a committed parent.
+    ///
+    /// The peer may have relayed the block before its own validation finished, so the failure
+    /// is not scored. The block itself is still invalid.
+    #[error("early-relay block failed validation: {0}")]
+    EarlyRelay(Box<VerifyBlockError>),
+
+    /// A block from a negotiated early-relay peer failed, and the parent context needed to
+    /// check its header and commitments was unavailable.
+    #[error("early-relay block failed, and its parent context is unavailable: {0}")]
+    EarlyRelayUnavailable(Box<VerifyBlockError>),
+
+    /// A block from a negotiated early-relay peer failed, and its header or commitments do not
+    /// check out against its committed parent.
+    #[error("early-relay block failed header authentication: {source}; it also failed: {failure}")]
+    EarlyRelayAdmission {
+        source: Box<zs::ValidateContextError>,
+        failure: Box<VerifyBlockError>,
+    },
+
+    /// A block from a negotiated early-relay peer was recently rejected after authentication.
+    #[error("early-relay block {0} was recently rejected")]
+    EarlyRelayRejected(block::Hash),
 }
 
 impl VerifyBlockError {
@@ -217,13 +246,28 @@ impl VerifyBlockError {
             }
             Self::Transaction(error) => error.body_verification_class(),
             Self::Subsidy(_) => consensus("block.subsidy"),
+            Self::EarlyRelay(failure)
+            | Self::EarlyRelayUnavailable(failure)
+            | Self::EarlyRelayAdmission { failure, .. } => failure.body_verification_class(),
+            // Only deterministic failures of authenticated blocks enter the rejection set.
+            Self::EarlyRelayRejected(_) => consensus("early_relay.recently_rejected"),
+        }
+    }
+
+    /// Returns the failure that an early-relay wrapper exempts from scoring, or this error.
+    fn unwrap_early_relay(&self) -> &Self {
+        match self {
+            Self::EarlyRelay(failure)
+            | Self::EarlyRelayUnavailable(failure)
+            | Self::EarlyRelayAdmission { failure, .. } => failure,
+            error => error,
         }
     }
 
     /// Returns `true` if this is definitely a duplicate request.
     /// Some duplicate requests might not be detected, and therefore return `false`.
     pub fn is_duplicate_request(&self) -> bool {
-        match self {
+        match self.unwrap_early_relay() {
             VerifyBlockError::Block { source, .. } => source.is_duplicate_request(),
             VerifyBlockError::Commit(commit_err) => commit_err.is_duplicate_request(),
             _ => false,
@@ -232,18 +276,19 @@ impl VerifyBlockError {
 
     /// See [`zs::ValidateContextError::is_auth_commitment_mismatch`].
     pub fn is_auth_commitment_mismatch(&self) -> bool {
-        matches!(self, VerifyBlockError::Commit(error) if error.is_auth_commitment_mismatch())
+        matches!(self.unwrap_early_relay(), VerifyBlockError::Commit(error)
+            if error.is_auth_commitment_mismatch())
     }
 
     /// See [`zs::ValidateContextError::is_descendant_of_auth_commitment_mismatch`].
     pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
-        matches!(self, VerifyBlockError::Commit(error)
+        matches!(self.unwrap_early_relay(), VerifyBlockError::Commit(error)
             if error.is_descendant_of_auth_commitment_mismatch())
     }
 
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
-        match self {
+        match self.unwrap_early_relay() {
             VerifyBlockError::Block {
                 source: BlockError::AlreadyInChain(_, location),
             } => Some(location),
@@ -260,6 +305,16 @@ impl VerifyBlockError {
             Equihash { .. } | Subsidy(_) | MissingTransparentInput { .. } => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
+            // Matches Zebra's Ándale: clock-dependent and operator-invalidation failures stay
+            // unscored, so negotiated peers never ban each other over local state.
+            EarlyRelayAdmission { source, .. } => match source.as_ref() {
+                zs::ValidateContextError::TimeTooEarly { .. }
+                | zs::ValidateContextError::TimeTooLate { .. }
+                | zs::ValidateContextError::BlockPreviouslyInvalidated { .. } => 0,
+                _ => zs::CommitBlockError::ValidateContextError(source.clone()).misbehavior_score(),
+            },
+            // The negotiated peer may have relayed the block before its own validation finished.
+            EarlyRelay(_) | EarlyRelayUnavailable(_) | EarlyRelayRejected(_) => 0,
             _other => 0,
         }
     }
@@ -409,7 +464,14 @@ where
             transaction_verifier,
             prepared_candidates: Default::default(),
             receipt_orders: Default::default(),
+            early_relay: None,
         }
+    }
+
+    /// Publishes verified tip children to `early_relay` before their commit finishes.
+    pub fn with_early_relay(mut self, early_relay: Option<EarlyRelay>) -> Self {
+        self.early_relay = early_relay;
+        self
     }
 }
 
@@ -443,6 +505,17 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
+        let early_relay = self.early_relay.clone();
+
+        // A negotiated peer cannot be scored for an authenticated block that failed later, so a
+        // recently rejected one is not verified again.
+        if matches!(request, Request::CommitEarlyRelay(_))
+            && early_relay
+                .as_ref()
+                .is_some_and(|relay| relay.is_rejected(hash))
+        {
+            return async move { Err(VerifyBlockError::EarlyRelayRejected(hash)) }.boxed();
+        }
 
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
@@ -450,6 +523,9 @@ where
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
             let mut auth_data_root = None;
+            // Set once the header-level checks pass. Only later failures of a negotiated
+            // early-relay delivery can be exempt from scoring.
+            let mut header_checks_passed = false;
             let result: Result<block::Hash, VerifyBlockError> = async {
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let _receipt = receipt;
@@ -460,7 +536,9 @@ where
                 let (mined, prepared_source) = match &request {
                     Request::CommitMined { admission, .. } => (Some(admission.clone()), None),
                     Request::Prepare { source, .. } => (None, Some(*source)),
-                    Request::Commit(_) | Request::CheckProposal(_) => (None, None),
+                    Request::Commit(_)
+                    | Request::CommitEarlyRelay(_)
+                    | Request::CheckProposal(_) => (None, None),
                 };
                 // Check that this block is actually a new block.
                 tracing::trace!("checking that block is not already in state");
@@ -648,6 +726,7 @@ where
                 // See [ZIP-1015](https://zips.z.cash/zip-1015).
                 let deferred_pool_balance_change =
                     check::subsidy_is_valid(&block, &network, expected_block_subsidy)?;
+                header_checks_passed = true;
 
                 // Now do the slower checks
 
@@ -876,20 +955,49 @@ where
                     .await;
                 }
 
-                commit_prepared_block(&mut state_service, prepared_block, mined).await
+                let early_relay_guard = match (&early_relay, &request) {
+                    (Some(relay), Request::Commit(_) | Request::CommitEarlyRelay(_)) => {
+                        publish_early_relay(relay, &mut state_service, &network, &prepared_block)
+                            .await
+                    }
+                    _ => None,
+                };
+
+                let result = commit_prepared_block(&mut state_service, prepared_block, mined).await;
+                if let (Some(guard), Err(error)) = (early_relay_guard, &result) {
+                    if is_deterministic_failure(error) {
+                        guard.reject();
+                    }
+                }
+                result
             }
             .await;
 
             match result {
                 // Proposals never become body evidence, so they keep the first failure.
-                Err(error) if !request.is_proposal() => Err(confirm_auth_data_binding(
-                    state_service,
-                    &network,
-                    request.block(),
-                    auth_data_root,
-                    error,
-                )
-                .await),
+                Err(error) if !request.is_proposal() => {
+                    let error = confirm_auth_data_binding(
+                        state_service.clone(),
+                        &network,
+                        request.block(),
+                        auth_data_root,
+                        error,
+                    )
+                    .await;
+                    if matches!(request, Request::CommitEarlyRelay(_)) && header_checks_passed {
+                        Err(early_relay_failure(
+                            state_service,
+                            &network,
+                            request.block(),
+                            auth_data_root,
+                            early_relay.as_ref(),
+                            error,
+                        )
+                        .await)
+                    } else {
+                        Err(error)
+                    }
+                }
                 result => result,
             }
         }
@@ -1021,6 +1129,134 @@ where
     match response? {
         zs::Response::PreparedMinedRelayEligibility(eligibility) => Ok(eligibility),
         _ => unreachable!("wrong response for prepared mined-block relay eligibility"),
+    }
+}
+
+/// Asks state whether a semantically verified block extends the selected tip with the expected
+/// work and a body that matches its header commitments.
+async fn relay_eligibility<S>(
+    state_service: S,
+    commitment: zs::BlockCommitmentData,
+) -> Result<zs::PreparedMinedRelayEligibility, BoxError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+{
+    let response = tokio::time::timeout(
+        AUTH_DATA_CHECK_TIMEOUT,
+        state_service.oneshot(zs::Request::CheckPreparedMinedRelayEligibility(commitment)),
+    )
+    .await
+    .map_err(|_| "early-relay eligibility check timed out")??;
+    match response {
+        zs::Response::PreparedMinedRelayEligibility(eligibility) => Ok(eligibility),
+        _ => unreachable!("wrong response for relay eligibility"),
+    }
+}
+
+/// Publishes a fully semantically verified block for early relay, if state authorizes it.
+///
+/// Only an NU5-or-later child of the selected tip with the expected work is published. Every
+/// other block, and every failed or slow check, keeps commit-first relay.
+async fn publish_early_relay<S>(
+    relay: &EarlyRelay,
+    state_service: &mut S,
+    network: &Network,
+    prepared_block: &zs::SemanticallyVerifiedBlock,
+) -> Option<EarlyRelayGuard>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    if zakura_chain::parameters::NetworkUpgrade::current(network, prepared_block.height)
+        < zakura_chain::parameters::NetworkUpgrade::Nu5
+    {
+        return None;
+    }
+    let eligibility = relay_eligibility(state_service.clone(), prepared_block.into()).await;
+    match eligibility {
+        Ok(zs::PreparedMinedRelayEligibility::Authorized) => {
+            relay.publish(prepared_block.block.clone(), prepared_block.hash)
+        }
+        _ => None,
+    }
+}
+
+/// Exempts a negotiated early-relay delivery from scoring for a failure after its header checks.
+///
+/// The exemption needs the header to prove the expected work against a committed parent, and
+/// the body to match the header's commitments, the same checks a sender makes before it relays
+/// early. A header or commitment failure keeps a score. Missing parent context is not scored,
+/// because an honest peer can relay a child of a tip this node has not committed yet. A
+/// deterministic failure of an authenticated block enters `relay`'s rejection set.
+async fn early_relay_failure<S>(
+    state_service: S,
+    network: &Network,
+    block: BlockHandle,
+    auth_data_root: Option<block::merkle::AuthDataRoot>,
+    relay: Option<&EarlyRelay>,
+    error: VerifyBlockError,
+) -> VerifyBlockError
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+{
+    if error.misbehavior_score() == 0 || error.is_auth_commitment_mismatch() {
+        return error;
+    }
+    // Before NU5, the header commits to the final Sapling root, which needs tree updates to
+    // check, so early relay never authenticates those blocks.
+    let Some(height) = block.coinbase_height() else {
+        return error;
+    };
+    if zakura_chain::parameters::NetworkUpgrade::current(network, height)
+        < zakura_chain::parameters::NetworkUpgrade::Nu5
+    {
+        return error;
+    }
+
+    let hash = block.hash();
+    let commitment = zs::BlockCommitmentData {
+        block,
+        auth_data_root,
+    };
+    match relay_eligibility(state_service, commitment).await {
+        Ok(
+            zs::PreparedMinedRelayEligibility::Authorized
+            | zs::PreparedMinedRelayEligibility::CommitFirst,
+        ) => {
+            if let Some(relay) = relay.filter(|_| is_deterministic_failure(&error)) {
+                relay.reject(hash);
+            }
+            VerifyBlockError::EarlyRelay(Box::new(error))
+        }
+        Ok(zs::PreparedMinedRelayEligibility::Unavailable) => {
+            VerifyBlockError::EarlyRelayUnavailable(Box::new(error))
+        }
+        Err(source) => match early_relay_admission_error(source) {
+            Some(source) => VerifyBlockError::EarlyRelayAdmission {
+                source,
+                failure: Box::new(error),
+            },
+            None => VerifyBlockError::EarlyRelayUnavailable(Box::new(error)),
+        },
+    }
+}
+
+/// Returns true if every body that matches this block's header commitments fails the same rule.
+fn is_deterministic_failure(error: &VerifyBlockError) -> bool {
+    matches!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+    )
+}
+
+/// Returns the header or commitment rule that an eligibility check failed, if it failed one.
+fn early_relay_admission_error(source: BoxError) -> Option<Box<zs::ValidateContextError>> {
+    match source.downcast::<zs::ValidateContextError>() {
+        Ok(source) => Some(source),
+        Err(source) => source
+            .downcast::<Box<zs::ValidateContextError>>()
+            .ok()
+            .map(|source| *source),
     }
 }
 

@@ -387,6 +387,21 @@ pub struct Config {
     ///
     /// Experimental.
     pub advert_window_full_size_bytes: u64,
+
+    /// Experimental: negotiate early block relay with legacy peers that also enable it.
+    ///
+    /// Both ends advertise service bit 25 ([`PeerServices::NODE_EARLY_BLOCK_RELAY`]), which
+    /// Zebra's Ándale release uses for the same capability. On a negotiated connection, this node
+    /// advertises and serves a tip child after full semantic verification, before its contextual
+    /// commit finishes. It also stops scoring a negotiated peer for a block that later fails
+    /// transaction or contextual validation, once the block's header and commitments check out
+    /// against a committed parent.
+    ///
+    /// Connections without the bit, and the Zakura P2P v2 stack, keep committed-block relay.
+    /// The bit is in the temporary experiment range: enable it only among coordinated peers.
+    ///
+    /// [`PeerServices::NODE_EARLY_BLOCK_RELAY`]: crate::PeerServices::NODE_EARLY_BLOCK_RELAY
+    pub experimental_early_block_relay: bool,
 }
 
 impl Config {
@@ -975,6 +990,7 @@ impl Default for Config {
             advert_window_max: DEFAULT_ADVERT_WINDOW_MAX,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
+            experimental_early_block_relay: false,
         }
     }
 }
@@ -1177,6 +1193,7 @@ struct DConfig {
     advert_window_max: usize,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
+    experimental_early_block_relay: bool,
 }
 
 impl Default for DConfig {
@@ -1204,6 +1221,7 @@ impl Default for DConfig {
             advert_window_max: config.advert_window_max,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
+            experimental_early_block_relay: config.experimental_early_block_relay,
         }
     }
 }
@@ -1277,6 +1295,7 @@ impl From<Config> for DConfig {
             advert_window_max,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            experimental_early_block_relay,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1322,6 +1341,7 @@ impl From<Config> for DConfig {
             advert_window_max,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            experimental_early_block_relay,
         }
     }
 }
@@ -1353,6 +1373,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_max,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            experimental_early_block_relay,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
@@ -1508,6 +1529,7 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_max,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            experimental_early_block_relay,
         })
     }
 }

@@ -17,6 +17,12 @@ pub enum PreparedCandidateSource {
 pub enum Request {
     /// Performs semantic validation, then asks the state to perform contextual validation and commit the block
     Commit(BlockHandle),
+    /// Commits a block delivered by a legacy peer that negotiated early block relay.
+    ///
+    /// Verification is the same as [`Request::Commit`]. The peer may have sent the block before
+    /// its own validation finished, so a transaction or contextual failure is not scored once
+    /// the header and commitments check out against a committed parent.
+    CommitEarlyRelay(BlockHandle),
     /// Reuses prepared mining work when possible, then commits the solved block.
     CommitMined {
         /// The solved block.
@@ -41,7 +47,7 @@ impl Request {
     /// Returns inner block
     pub fn block(&self) -> BlockHandle {
         match self {
-            Request::Commit(block) => block,
+            Request::Commit(block) | Request::CommitEarlyRelay(block) => block,
             Request::CommitMined { block, .. } => block,
             Request::CheckProposal(block) => block,
             Request::Prepare { block, .. } => block,
@@ -52,7 +58,9 @@ impl Request {
     /// Returns `true` if the request is a proposal
     pub fn is_proposal(&self) -> bool {
         match self {
-            Request::Commit(_) | Request::CommitMined { .. } => false,
+            Request::Commit(_) | Request::CommitEarlyRelay(_) | Request::CommitMined { .. } => {
+                false
+            }
             Request::CheckProposal(_) | Request::Prepare { .. } => true,
         }
     }

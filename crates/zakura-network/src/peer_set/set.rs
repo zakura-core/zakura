@@ -1437,22 +1437,26 @@ where
 
     /// Pace legacy inventory through the corresponding uploads, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (block, mined) = match req {
+        let (block, mined, early) = match req {
             Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
-                (block, false)
+                (block, false, false)
             }
-            Request::AdvertiseMinedBlock(block) => (block, true),
+            Request::AdvertiseMinedBlock(block) => (block, true, false),
+            Request::AdvertiseEarlyBlock(block) => (block, false, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
         self.prune_block_gossip_peers();
         // A minimum version increase cancels busy outdated peers only after their current work.
         let minimum_version = self.minimum_peer_version.current();
-        let peers = self
+        let peers: Vec<_> = self
             .block_gossip_peers
             .values()
-            .filter(|peer| peer.version >= minimum_version)
+            .filter(|peer| peer.version >= minimum_version && (!early || peer.early_block_relay))
             .cloned()
             .collect();
+        if early && peers.is_empty() {
+            return async { Ok(Response::Nil) }.boxed();
+        }
         crate::peer::block_gossip::broadcast_block(
             peers,
             block.hash,
@@ -1777,7 +1781,13 @@ where
             Request::AdvertiseTransactionIds(_, _) => self.route_broadcast(req),
             Request::AdvertiseBlock(_, _)
             | Request::AdvertiseBlockToAll(_)
-            | Request::AdvertiseMinedBlock(_) => self.route_block_broadcast(req),
+            | Request::AdvertiseMinedBlock(_)
+            | Request::AdvertiseEarlyBlock(_) => self.route_block_broadcast(req),
+
+            // Only an inbound connection creates this request.
+            Request::EarlyBlocksByHash(_) => {
+                async { Err(SharedPeerError::from(PeerError::InboundOnlyRequest).into()) }.boxed()
+            }
 
             // Choose a random less-loaded peer for all other requests
             _ => self.route_p2c(req),

@@ -134,6 +134,10 @@ pub enum PeerError {
     #[error("block adverts require the dedicated block advert service")]
     AdvertRequiresDedicatedService,
 
+    /// An outbound caller sent a request that only an inbound connection creates.
+    #[error("only inbound connections create this request")]
+    InboundOnlyRequest,
+
     /// This peer request's caused an internal service timeout, so the connection was dropped
     /// to shed load or prevent attacks.
     #[error("Internal services timed out")]
@@ -201,6 +205,7 @@ impl PeerError {
             PeerError::Overloaded => "Overloaded".into(),
             PeerError::NoReadyPeers => "NoReadyPeers".into(),
             PeerError::AdvertRequiresDedicatedService => "AdvertRequiresDedicatedService".into(),
+            PeerError::InboundOnlyRequest => "InboundOnlyRequest".into(),
             PeerError::InboundTimeout => "InboundTimeout".into(),
             PeerError::ServiceShutdown => "ServiceShutdown".into(),
             PeerError::NotFoundResponse(_) => "NotFoundResponse".into(),

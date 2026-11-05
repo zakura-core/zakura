@@ -10,7 +10,10 @@ use tokio::sync::{mpsc, watch};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
-use zakura_chain::{block, chain_tip::ChainTip};
+use zakura_chain::{
+    block, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip, serialization::ZcashSerialize,
+};
+use zakura_consensus::{EarlyRelay, EARLY_RELAY_LIFETIME};
 use zakura_network as zn;
 use zakura_node_services::task::spawn_erased;
 use zakura_rpc::MinedBlockEvent;
@@ -304,6 +307,54 @@ where
             }
         });
     }
+}
+
+/// Run continuously, advertising each block published for early relay to legacy peers that
+/// negotiated early block relay.
+///
+/// The verifier publishes a block after full semantic verification, before its contextual
+/// commit finishes. Committed-tip gossip still advertises the block to every peer afterward.
+/// Nothing is advertised while the node is far from the tip, because its peers already have
+/// those blocks.
+pub async fn gossip_early_relay_blocks<ZN>(
+    sync_status: SyncStatus,
+    early_relay: EarlyRelay,
+    broadcast_network: ZN,
+) -> Result<(), BlockGossipError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
+    ZN::Future: Send,
+{
+    info!("initializing early-relay block gossip task");
+    let mut published = early_relay.subscribe();
+
+    // This task owns a clone of the sender, so the channel never closes.
+    while published.changed().await.is_ok() {
+        let Some(hash) = *published.borrow_and_update() else {
+            continue;
+        };
+        if !sync_status.is_close_to_tip() {
+            continue;
+        }
+        // The commit may already have withdrawn the block, and committed-tip gossip covers it.
+        let Some(block) = early_relay.get(hash) else {
+            continue;
+        };
+        let advert = zn::AdvertisedBlock::new(hash, block.zcash_serialized_size());
+        debug!(?hash, "sending early-relay block broadcast");
+        let network = broadcast_network.clone();
+        tokio::spawn(async move {
+            let request = zn::Request::AdvertiseEarlyBlock(advert);
+            let sent = tokio::time::timeout(EARLY_RELAY_LIFETIME, network.oneshot(request))
+                .await
+                .is_ok_and(|result| result.is_ok());
+            if sent {
+                metrics::counter!("sync.gossip.early_relay.broadcasts").increment(1);
+            }
+        });
+    }
+
+    Ok(())
 }
 
 /// Reads the serialized size of the committed block `hash` from the state.

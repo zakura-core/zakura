@@ -328,6 +328,7 @@ where
             remote,
             negotiated_version,
             is_protected_peer: false,
+            early_block_relay: false,
         });
 
         let client = Client {

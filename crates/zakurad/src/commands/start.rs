@@ -557,6 +557,10 @@ impl StartCmd {
             .flatten()
             .map(|pruning| pruning.tx_retention);
         let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
+        let early_relay = config
+            .network
+            .experimental_early_block_relay
+            .then(zakura_consensus::EarlyRelay::default);
         let inbound = LoadShed::new(spawn_buffer(
             Timeout::new(
                 Inbound::new(
@@ -566,7 +570,8 @@ impl StartCmd {
                     zcashd_compat_block_gossip_peer_ips.clone(),
                     setup_rx,
                 )
-                .with_pending_blocks(pending_blocks.clone()),
+                .with_pending_blocks(pending_blocks.clone())
+                .with_early_relay(early_relay.clone()),
                 MAX_INBOUND_RESPONSE_TIME,
             ),
             inbound::downloads::MAX_INBOUND_CONCURRENCY,
@@ -619,6 +624,7 @@ impl StartCmd {
                 state.clone(),
                 read_only_state_service.clone(),
                 tx_verifier_setup_rx,
+                early_relay.clone(),
             )
             .boxed()
             .await;
@@ -843,13 +849,22 @@ impl StartCmd {
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
                 chain_tip_change.clone(),
-                block_adverts,
+                block_adverts.clone(),
                 read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
             )
             .in_current_span(),
         );
         node_tasks.track(&block_gossip_task_handle);
+
+        if let Some(early_relay) = early_relay {
+            info!("spawning early-relay block gossip task");
+            let early_gossip_task_handle = spawn_erased(
+                sync::gossip_early_relay_blocks(sync_status.clone(), early_relay, block_adverts)
+                    .in_current_span(),
+            );
+            node_tasks.track(&early_gossip_task_handle);
+        }
 
         info!("spawning mempool queue checker task");
         let mempool_queue_checker_task_handle =

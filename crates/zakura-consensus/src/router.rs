@@ -36,7 +36,7 @@ use zakura_node_services::task::{spawn_buffer, spawn_erased};
 use zakura_state as zs;
 
 use crate::{
-    block::{Request, SemanticBlockVerifier, VerifyBlockError},
+    block::{EarlyRelay, Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
     error::{BlockError, TransactionError},
     transaction, BoxError, Config,
@@ -478,6 +478,7 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     mut state_service: S,
     transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
+    early_relay: Option<EarlyRelay>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -613,7 +614,8 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone())
+        .with_early_relay(early_relay);
     let checkpoint = CheckpointVerifier::from_checkpoint_list(
         list,
         network,
@@ -663,16 +665,28 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = state_service.clone();
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        mempool,
+        None,
+    )
+    .await
 }
 
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
+///
+/// With `early_relay`, the block verifier publishes verified tip children to it before their
+/// commit finishes.
 pub async fn init_with_read_state<S, R, Mempool>(
     config: Config,
     network: &Network,
     state_service: S,
     read_state_service: R,
     mempool: oneshot::Receiver<Mempool>,
+    early_relay: Option<EarlyRelay>,
 ) -> (
     Buffer<Request, futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>>,
     Buffer<
@@ -697,7 +711,15 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = TransactionStateRouter::new(state_service.clone(), read_state_service);
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        mempool,
+        early_relay,
+    )
+    .await
 }
 
 /// Parses the checkpoint list for `network` and `config`.

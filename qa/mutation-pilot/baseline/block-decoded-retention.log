@@ -1,0 +1,3 @@
+trace 1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652 in qa/mutation-pilot/baseline/block-decoded-retention: idle after 21 steps
+witness test of block/decoded-retention, expecting holds: passed
+replayed trace 1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652: idle after 21 steps; every pick, draw and observation matched

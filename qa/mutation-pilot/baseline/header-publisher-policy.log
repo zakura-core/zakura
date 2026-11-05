@@ -1,0 +1,3 @@
+trace 84faa324d25e12321863d69737409cb414918cbc978f348b38bcb3d0c72ec246 in qa/mutation-pilot/baseline/header-publisher-policy: idle after 8 steps
+witness test of header/publisher-policy, expecting holds: passed
+replayed trace 84faa324d25e12321863d69737409cb414918cbc978f348b38bcb3d0c72ec246: idle after 8 steps; every pick, draw and observation matched

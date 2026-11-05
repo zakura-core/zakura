@@ -1154,9 +1154,10 @@ const GET_BLOCK_TEMPLATE_LOG_TARGET: &str = "zakura_rpc::getblocktemplate";
 /// `wake` is when and why the request first saw a change to return for: the start of the loop
 /// pass that found it, or the moment the tip wait finished.
 ///
-/// Answers on a new tip log at info, once per block for each long poller, because release
-/// builds compile out debug logs and pools need these to join their timings with ours. Other
-/// answers can come every few seconds, so they log at debug.
+/// Every answer logs at info, because release builds compile out debug logs and pools need
+/// each answer to join their timings with ours. Only nodes serving `getblocktemplate` log
+/// these: about one line per block and one per mempool change (at most every
+/// `MEMPOOL_LONG_POLL_INTERVAL`) for each long poller, plus one per plain request.
 fn log_template_answer(
     wake: (tokio::time::Instant, TemplateAnswer),
     answer: TemplateAnswer,
@@ -1171,29 +1172,19 @@ fn log_template_answer(
     let wait = woke.saturating_duration_since(request_started);
     let build = woke.elapsed();
 
-    macro_rules! log_answer {
-        ($level:ident) => {
-            tracing::$level!(
-                target: GET_BLOCK_TEMPLATE_LOG_TARGET,
-                reason = reason.as_str(),
-                answer = answer.as_str(),
-                height = template.height,
-                previous_block_hash = %template.previous_block_hash,
-                transactions = template.transactions.len(),
-                submit_old = ?template.submit_old,
-                ?wait,
-                ?build,
-                rebuilds,
-                "answered getblocktemplate"
-            )
-        };
-    }
-
-    if matches!(answer, TemplateAnswer::OldTip | TemplateAnswer::NewTip) {
-        log_answer!(info);
-    } else {
-        log_answer!(debug);
-    }
+    tracing::info!(
+        target: GET_BLOCK_TEMPLATE_LOG_TARGET,
+        reason = reason.as_str(),
+        answer = answer.as_str(),
+        height = template.height,
+        previous_block_hash = %template.previous_block_hash,
+        transactions = template.transactions.len(),
+        submit_old = ?template.submit_old,
+        ?wait,
+        ?build,
+        rebuilds,
+        "answered getblocktemplate"
+    );
 }
 
 /// The outcome of validating one server mining template.

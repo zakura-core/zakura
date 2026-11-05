@@ -1,7 +1,8 @@
 //! Synchronous header-sync reactor events for simulator tests.
 //!
 //! The reactor reports its port calls, active-request starts and
-//! retirements, and refused offers to an installed [`HeaderSyncObserver`].
+//! retirements, refused offers, header reservations and session admissions to
+//! an installed [`HeaderSyncObserver`].
 //! This module exists only in test and `zakura_sim` builds. Production builds
 //! compile none of it, and the reactor's `observe!` macro drops its tokens.
 
@@ -148,6 +149,21 @@ pub enum ReactorEvent {
         target_tip_hash: block::Hash,
         /// Which capacity refused it.
         cause: WaitCause,
+    },
+    /// The reactor reserved header capacity for one wire request to `peer`:
+    /// a round's first request, a continuation, or a VCT repair request.
+    /// Reported once the reservation succeeds, before the request is sent, so
+    /// it doesn't show that the request went out: a failed send or grant
+    /// cancels the reservation, and a scheduling point can come in between.
+    ReservationOpened {
+        /// The peer the request goes to.
+        peer: ZakuraPeerId,
+    },
+    /// The reactor admitted a session from `peer`, replacing any session it
+    /// held for that peer.
+    SessionAdmitted {
+        /// The admitted peer.
+        peer: ZakuraPeerId,
     },
     /// The reactor dispatched a violation by `peer` to storage.
     Misbehavior {

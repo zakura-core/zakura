@@ -340,11 +340,15 @@ fn open_work(byte: u8) -> [ReactorEvent; 3] {
 }
 
 /// Runs a tapped reactor that reports `events`, then ends, or panics if
-/// `unwinds`, and so drops its observer.
-fn teardown_after(events: Vec<ReactorEvent>, unwinds: bool) -> RunReport {
+/// `unwinds`, and so drops its observer. If `noticed`, the harness tells the
+/// tap it's stopping the reactor before the reactor reports anything.
+fn teardown_after(events: Vec<ReactorEvent>, unwinds: bool, noticed: bool) -> RunReport {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    if noticed {
+        tap.shutdown().begin();
+    }
     let source =
         PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
     sim.add_source(Box::new(source));
@@ -369,7 +373,7 @@ fn evidence_failure(report: &RunReport) -> &str {
 /// done, though it never reached a drop for the pairer to wait on.
 #[test]
 fn a_call_left_unended_fails_at_teardown() {
-    let report = teardown_after(open_work(1).into(), false);
+    let report = teardown_after(open_work(1).into(), false, false);
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
 }
@@ -383,7 +387,7 @@ fn headers_left_held_fail_at_teardown() {
         call: 1,
         end: CallEnd::NotSubmitted,
     });
-    let report = teardown_after(events, false);
+    let report = teardown_after(events, false, false);
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("OpenOwnership: call 1"), "{detail}");
 }
@@ -392,13 +396,66 @@ fn headers_left_held_fail_at_teardown() {
 /// stays quiet, so the crash isn't read as an ownership bug.
 #[test]
 fn an_unwound_reactor_is_not_reported_as_open_work() {
-    let report = teardown_after(open_work(3).into(), true);
+    let report = teardown_after(open_work(3).into(), true, false);
     if let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness {
         assert!(
             !detail.starts_with("UnendedCall") && !detail.starts_with("OpenOwnership"),
             "{detail}"
         );
     }
+}
+
+/// A reactor that goes away unannounced fails the run as `ReactorGone`, and
+/// one the harness stopped on purpose, with nothing left open, doesn't.
+#[test]
+fn only_an_announced_stop_may_drop_the_reactor() {
+    let unannounced = teardown_after(Vec::new(), false, false);
+    let detail = evidence_failure(&unannounced);
+    assert!(detail.starts_with("ReactorGone"), "{detail}");
+
+    let announced = teardown_after(Vec::new(), false, true);
+    assert_eq!(announced.end.harness, None, "{:?}", announced.end);
+}
+
+/// An announced stop still runs the teardown checks: work it leaves open
+/// fails the run as the ledger names it.
+#[test]
+fn an_announced_stop_still_fails_open_work() {
+    let report = teardown_after(open_work(4).into(), false, true);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
+}
+
+/// A run that ends at its budget while an announced stop is still under way
+/// fails as `ShutdownIncomplete`, since the reactor's last events and the
+/// teardown checks never came.
+#[test]
+fn a_run_that_ends_mid_stop_fails() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
+/// A reactor that unwinds during an announced stop crashed rather than
+/// stopped, so the run still fails as `ReactorGone`.
+#[test]
+fn an_unwound_reactor_fails_an_announced_stop() {
+    let report = teardown_after(open_work(5).into(), true, true);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ReactorGone"), "{detail}");
 }
 
 /// With the node's first locator held until 30 s after its submission, the

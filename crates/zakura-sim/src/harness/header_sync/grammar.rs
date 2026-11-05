@@ -60,7 +60,9 @@
 //! actions. The grammar has no
 //! `reply-queued` or `prepared` trigger, since a header node never records
 //! them, and no hold deadline, since a deadline before the hold opens
-//! stops time with nothing to offer. Bytes no field reads are ignored, and
+//! stops time with nothing to offer. It has no `shutdown` step and no
+//! `reservation-opened` or `session-admitted` trigger yet, since adding
+//! them would change what existing inputs mean. Bytes no field reads are ignored, and
 //! the canonical prefix sets them to 0.
 //!
 //! Changing any of this changes what an input's bytes mean, so it bumps
@@ -329,6 +331,11 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
                 // The limit fits a byte, as the assertion on it checks.
                 slot[2] = units::<u8>(len.into(), 1, 1, MAX_GROWTH as u8, "a growth")? - 1;
                 GROW
+            }
+            ControlAction::Shutdown => {
+                return Err(Unencodable(
+                    "the grammar has no shutdown control step".to_owned(),
+                ))
             }
         };
         slot[1] = mirror_index(&step.peer, mirrors)?;

@@ -45,6 +45,14 @@ pub(crate) trait LiveEvidence {
     /// Why the publisher's evidence is incomplete, if it is, as a failure
     /// detail.
     fn health(&self) -> Option<&'static str>;
+
+    /// Why the publisher's evidence would be incomplete if the run ended now,
+    /// as a failure detail, beyond [`health`](LiveEvidence::health). A run
+    /// that ends idle or at its budget checks it once, before it reports its
+    /// properties. None by default.
+    fn unfinished(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A controlled port publishes storage facts.

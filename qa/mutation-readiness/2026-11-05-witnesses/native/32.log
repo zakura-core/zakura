@@ -1,6 +1,0 @@
-
-running 1 test
-test zakura::block_sync::tests::query_lifecycle::full_action_channel_keeps_the_accepted_query_and_its_next_id ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2637 filtered out; finished in 0.25s
-

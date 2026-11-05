@@ -176,7 +176,7 @@ assertion on the patched source, and a pass after restoring the source.
 | Check | Expected outcome |
 | --- | --- |
 | Inventory | 56 patches; 0 metadata or application failures. 22 planted cases map to simulator fuzz targets. 12 use `block-sync/storage`, which has no fuzz target. |
-| Inventory tests | 8 pass |
+| Inventory tests | All pass |
 | `check-fuzz-campaign.py` | Passes |
 | `decode_admission_precedes_materialization_and_survives_final_holders` | 1 passed |
 | `standalone_transaction_reservation_precedes_decode_and_outlives_clones`, unchanged | 1 passed |
@@ -214,4 +214,125 @@ uncommitted worktree, so its `revision` field names the parent commit.
 2039-mut-1.2-2026-11-05/inventory.json
 2039-mut-1.2-2026-11-05/logs/{decode-baseline,native-baseline,native-mutant,native-restored,node-tests}.log
 2039-mut-1.2-2026-11-05/native-result.json
+```
+
+## mut-1.3: witness inventory and selected target readiness
+
+Pinned sources: native tests at `8c63fa3ec2348b036e1a24bd9fa6c677eca49c57`;
+target readiness at `b2e0456474e47e6264c912b2f6b50d09c8603115`.
+Both commits keep the production source of
+`870678be1739ea799e59b4e0bdfe6cf512792710`.
+This section prepares five simulator targets for the bounded pilot.
+It does not close the full-stack witness inventory or score mutations.
+
+### Witness inventory
+
+`witnesses.json` maps all 31 requirements from the superseded own-15
+inventory. Each row names exact native test selectors, their source files,
+the remaining work and related open PRs. `scripts/mutation_inventory.py`
+checks each selector against its file's module path.
+
+| Disposition | Rows |
+| --- | ---: |
+| Existing native test | 23 |
+| Partial native coverage | 4 |
+| New work | 3 |
+| Deferred multi-service integration | 1 |
+
+A passing native test does not establish a simulator witness, an intended
+mutation failure or fresh-process replay. Those layers stay open.
+The new-work rows need shared-work rejection after the block reactor's
+observation, writer start during full request publication, and bounded
+discovery dial progress. The partial rows keep their missing interleavings:
+a composed block peer-task panic, session-guard cleanup under contention,
+capacity release during waiter setup, and cancellation during an executing
+decode. Multi-service composition stays deferred with sim-9.3/xsync-3.
+
+#2027, #2030, #2032 and #2033 supply pending header hooks. Their reported
+tests are not evidence at this pinned head.
+
+### Fuzz lockfile refresh
+
+At the parent commit, `qa/fuzz/sim/Cargo.lock` no longer matched its
+manifests. `cargo metadata --locked` refuses it. The readiness guard rejects
+any build that rewrites the lock. This PR commits the lock that Cargo
+produced, SHA-256
+`c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc`.
+`cargo metadata --locked` accepts it. Only the fuzz lock changed; no Rust
+source changed.
+
+### Reproduce
+
+Native tests: build with Rust 1.99.0, the locked workspace, empty `RUSTFLAGS`
+and the test profile without debug information or incremental compilation.
+
+```sh
+cargo +1.99.0 test --locked -p zakura-network --lib --no-run
+python3 -c 'import json; [print(t["selector"]) for r in json.load(open("qa/mutation-readiness/witnesses.json"))["rows"] for t in r.get("tests", [])]' \
+  | sort -u | while IFS= read -r selector; do
+  timeout 10 "$NETWORK_TEST" "$selector" --exact --test-threads=1
+done
+```
+
+Set `NETWORK_TEST` to the test executable that the build prints.
+Require one passed test per invocation. A timeout, an ignored test or a zero
+selection is unresolved evidence, not a pass.
+
+Target readiness: build the simulator with Rust 1.99.0 and
+`RUSTFLAGS='--cfg zakura_sim'`, then run the `targets` subcommand that
+`cargo xtask sim-targets` uses. It runs curated seeds only.
+It runs no discovery campaign and proves no mutation sensitivity.
+
+```sh
+CARGO_BUILD_JOBS=8 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_INCREMENTAL=0 \
+  "$SIM" targets --out "$TMPDIR/readiness" \
+  --target header_reactor_policy --target header_publisher_policy \
+  --target block_reactor_policy --target block_decoded_retention \
+  --target discovery_record_book --sanitizer none --child-secs 15 \
+  --target-dir "$TMPDIR/readiness-build"
+```
+
+Readiness uses the pinned `nightly-2026-07-15`, cargo-fuzz 0.13.2 and
+`--sanitizer none`.
+
+### Expected outcome
+
+| Check | Expected outcome |
+| --- | --- |
+| Native selectors | 35 unique selectors; each runs one test and passes. The compiled library lists 2,638 tests. |
+| Inventory | 0 errors, including the 35 witness selectors |
+| `header_reactor_policy` | Ready; 1 curated seed applies `header/reactor-policy` |
+| `header_publisher_policy` | Ready; 1 curated seed applies `header/publisher-policy` |
+| `block_reactor_policy` | Ready; 2 curated seeds apply `block/reactor-policy` |
+| `block_decoded_retention` | Ready; 1 curated seed applies `block/decoded-retention` |
+| `discovery_record_book` | Ready; 1 curated seed applies `discovery/record-book` |
+
+Every ready row has build identity `b2e0456`, clean, with the fuzz lock hash
+above. No seed was quarantined. The first readiness command rejected
+`discovery_record_book` and `block_decoded_retention` because the lock changed
+during the build. A retry from the clean commit made both ready.
+
+Block-storage and header-wire targets remain outside this selection.
+The lost-trigger and header-wire failures from mut-1.1 remain open.
+
+### Evidence bundle
+
+`2040-mut-1.3-2026-11-05.tar.zst`, SHA-256
+`a0633fe5777bc9129c2691edf5d0f2135e9a145994b2a1e677c0a464b7cfa470`.
+It holds the original run README, one log per native test with their
+results, both readiness reports with their logs, and each ready target's
+execution log and statistics.
+
+```text
+2040-mut-1.3-2026-11-05/README.md
+2040-mut-1.3-2026-11-05/SHA256SUMS
+2040-mut-1.3-2026-11-05/native/{00..35}.log
+2040-mut-1.3-2026-11-05/native/{results.json,selectors.txt}
+2040-mut-1.3-2026-11-05/readiness-initial.{json,log}
+2040-mut-1.3-2026-11-05/readiness-retry.{json,log}
+2040-mut-1.3-2026-11-05/targets/block_decoded_retention/{run.log,stats/stats-4122096.json}
+2040-mut-1.3-2026-11-05/targets/block_reactor_policy/{run.log,stats/stats-4113023.json}
+2040-mut-1.3-2026-11-05/targets/discovery_record_book/{run.log,stats/stats-4120590.json}
+2040-mut-1.3-2026-11-05/targets/header_publisher_policy/{run.log,stats/stats-4117815.json}
+2040-mut-1.3-2026-11-05/targets/header_reactor_policy/{run.log,stats/stats-4104248.json}
 ```

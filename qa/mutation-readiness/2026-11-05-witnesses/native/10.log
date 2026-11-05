@@ -1,6 +1,0 @@
-
-running 1 test
-test zakura::block_sync::work_queue::request_write::tests::reset_cannot_interleave_outstanding_publication_and_enqueue ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2637 filtered out; finished in 0.02s
-

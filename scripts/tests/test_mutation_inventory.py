@@ -84,6 +84,17 @@ class InventoryTests(unittest.TestCase):
         errors = inventory.inventory(self.root)["errors"]
         self.assertEqual(len(errors), 2)
 
+    def test_witness_inventory_selector_outside_its_module_fails(self):
+        self.write("src/service/tests.rs", "#[test]\nfn selected() {}\n")
+        rows = [{"id": "own-1.example", "tests": [
+            {"source": "src/service/tests.rs", "selector": "service::tests::selected"},
+            {"source": "src/service/tests.rs", "selector": "service::selected"},
+        ]}]
+        self.write(inventory.WITNESSES, json.dumps({"rows": rows}))
+        self.assertEqual(inventory.inventory(self.root)["errors"], [
+            f"{inventory.WITNESSES} own-1.example: selector service::selected lies outside module service::tests",
+        ])
+
     def test_wrong_property_witness_fails(self):
         self.write("qa/planted/right/example.patch", "unused")
         self.write("qa/planted/right/example.toml", 'input = "input.bin"\n')

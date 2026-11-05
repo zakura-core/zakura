@@ -2,23 +2,36 @@
 
 `catalogue.json` selects ten existing production mutations across six fault
 classes and five transport-free simulator targets. It pins patches, source
-files, checker/generator files, sensitivity inputs and the initial discovery
-corpus. Each case names its causal trigger and the observations that expose
-the changed behavior. The catalogue changes no production code, property,
-generator, witness input or mutation patch.
+files, checker and generator files, sensitivity inputs and the initial
+discovery corpus. Each case names its causal trigger and the observations
+that expose the changed behavior. The catalogue changes no production code,
+property, generator, witness input or mutation patch.
 
-This package prepares the pilot. It records baseline calibration and no
-mutant or scored discovery campaign. The full retained-suite readiness gate
-remains open.
+This package prepares the pilot. No mutant and no scored discovery campaign
+has run. The full retained-suite readiness gate remains open.
 The [mutation plan](https://valargroup.getoutline.com/doc/6af54d3b-7ca5-4f05-975d-77893109e7ad)
 defines the broader acceptance criteria.
 
+## Pinned build inputs
+
+| Build | Revision | Toolchain |
+| --- | --- | --- |
+| Dev/test witness simulator | `870678be1739ea799e59b4e0bdfe6cf512792710` | Rust 1.99.0, `--cfg zakura_sim`, no debug information or incremental compilation |
+| Fuzz targets | `b2e0456474e47e6264c912b2f6b50d09c8603115` | `nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, `--sanitizer none` |
+
+The fuzz revision keeps the production source of the witness revision.
+It adds only the refreshed `qa/fuzz/sim/Cargo.lock` from mut-1.3.
+`scripts/check_mutation_pilot.py` passes only on a tree whose build inputs
+equal both revisions. This PR's head is such a tree; later commits on `main`
+are not. Run the pilot from a tree where the checker passes, or re-pin the
+catalogue first.
+
 ## Case matrix
 
-Paths below are relative to `qa/planted/`. The JSON file contains their hashes
-and complete trigger descriptions. The step identifies the causal operation
-in the corresponding baseline trace. Reviewers must inspect that operation;
-the checker only verifies that the step exists.
+Paths are relative to `qa/planted/`. The JSON file holds their hashes and
+complete trigger descriptions. The step identifies the causal operation in
+the baseline trace. Reviewers must inspect that operation; the checker only
+verifies that the step exists.
 
 | Mutation | Fault class | Trigger step | Intended check |
 | --- | --- | ---: | --- |
@@ -38,17 +51,87 @@ retention model owns a separate handle graph. The record-book model computes
 entry selection and relay attribution. The header models compute locator and
 publisher state. Each driver compares production observations with its model.
 The JSON file names and hashes the driver, harness and shared checker sources.
-The mutations change production behavior rather than these observations or
-models. Compilation and intended mutant failure remain separate checks.
+Each mutation changes production behavior, not these observations or models.
 
-## Baseline evidence
+## Discovery inputs and bounds
 
-Six distinct retained inputs cover the ten cases. Every input passed its
-`holds` witness and Exact replay in separate processes. All traces ended
-quiescent with zero cleanup failures. These runs used the saved unmodified
-simulator from mut-1.1, built at
-`870678be1739ea799e59b4e0bdfe6cf512792710` with Rust 1.99.0 on Linux x86_64.
-The catalogue records that executable's build provenance and SHA-256.
+Discovery starts from an empty corpus. This measures cold-start discovery,
+not discovery from the existing regression corpus. `discovery-empty/`
+contains no `.bin` inputs or `.toml` sidecars, which are the only files the
+seed loader reads. Every discovery invocation must pass
+`--fixtures qa/mutation-pilot/discovery-empty`; omitting it loads the curated
+sensitivity witnesses. Start every original, mutant and seed run in a fresh
+store. Never pass `--parent`, carry a corpus, reuse a calibration corpus, or
+import a witness or derived input. The paired runner must also verify the
+campaign's saved initial snapshot.
+
+The allocation is five seeds (`11`, `23`, `47`, `89`, `179`) and 600
+seconds per seed for each original and mutant. Each run uses one worker,
+512-byte inputs, a 10-second input limit, 2048 MiB RSS, no restarts,
+semantic feedback and no sanitizer. Each machine decoder bounds its
+operations to the 512-byte scenario prefix. Its harness bounds simulator
+work to 128 steps, or 129 for decoded retention including drain.
+Confirmation gets 60 seconds per child. Shrinking gets 600 seconds and 2000
+candidates. The scored campaign runs on a remote droplet, never locally or
+in CI.
+
+`STORE` names a fresh disk-backed directory for one case, lane and seed.
+`BUILD` names the store's verified build digest for that case's target.
+
+```sh
+"$SIM" campaign start --store "$STORE" --campaign "$CASE-$LANE-$SEED" \
+  --sim "$HARNESS" --build "$BUILD" --seconds 600 --workers 1 --seed "$SEED" \
+  --fixtures qa/mutation-pilot/discovery-empty --max-len 512 --timeout 10 \
+  --rss-limit-mb 2048 --max-restarts 0 --abandon-limit 1 --feedback on
+```
+
+## Verify
+
+```sh
+python3 scripts/check_mutation_pilot.py
+python3 scripts/check_mutation_pilot.py --evidence "$BUNDLE_DIR"
+python3 -m unittest discover -s scripts/tests -p test_check_mutation_pilot.py -v
+```
+
+Without `--evidence`, the checker verifies the repository inputs. It checks
+the case count and fault classes, patch, sidecar, witness, production and
+checker hashes, patch bindings, target bindings and the `holds` witness for
+each intended property. It checks the empty discovery corpus. It rejects a
+tree whose build inputs differ from either pinned revision.
+With `--evidence`, it also checks the extracted bundle against the
+catalogue. Each baseline must have nonzero intended applicability, a passing
+witness, no other property outcome than held or not applicable, a quiescent
+end and zero cleanup failures. Each calibration run must be complete and
+clean, with matching build identity and applicability label.
+The checker reruns no replay, proves no causal trigger semantics and runs no
+mutation. The tests build a small synthetic checkout and bundle.
+
+## Reproduce the baselines and calibration
+
+Build the witness simulator as in `qa/mutation-readiness/README.md`
+(mut-1.1). Set `SIM` to that executable, `INPUT` and `HARNESS` from a
+catalogue case, and `OUT` to a fresh disk-backed directory.
+
+```sh
+timeout 60 "$SIM" record --sim "$HARNESS" --input "$INPUT" --out "$OUT" \
+  --witness "$HARNESS" --expect holds
+timeout 60 "$SIM" replay "$OUT"
+"$SIM" seeds --sim "$HARNESS" \
+  --fixtures qa/mutation-pilot/discovery-empty --report "$OUT/empty-seeds.json"
+```
+
+Calibration builds each target with the fuzz toolchain above and starts a
+new empty corpus with seed 11. Each run record in the bundle holds its exact
+command and environment. Remove `ZAKURA_SIM_EXPECT` and the sanitizer
+option variables, as the record lists. Never reuse a calibration corpus for
+scoring.
+
+## Expected outcome
+
+Six retained inputs cover the ten cases. Each passes its `holds` witness and
+Exact replay, ends quiescent and has zero cleanup failures. The `seeds`
+command admits zero inputs from `discovery-empty/` for each of the five
+harnesses.
 
 | Input stem | Steps | Intended applicability |
 | --- | ---: | ---: |
@@ -59,50 +142,9 @@ The catalogue records that executable's build provenance and SHA-256.
 | `header-publisher-policy` | 8 | 8 |
 | `header-reactor-policy` | 26 | 23 |
 
-`baseline/` retains inputs, full traces, witness results, replay logs and
-process outcomes. `catalogue_base_revision` identifies the metadata starting
-point. It does not replace the executable's source revision. The source paths
-used by the simulator provenance were unchanged between those revisions.
-
-The dev/test simulator used `RUSTFLAGS='--cfg zakura_sim'`, no debug information
-and no incremental compilation. It retained debug assertions and overflow
-checks. A nightly fuzz executable has a different build contract. Before
-scoring, the paired runner must run the original and mutant with identical
-fuzz toolchain, dependency lockfile, profile, flags and bounds. These dev/test
-witness results cannot substitute for that paired fuzz baseline.
-
-## Discovery inputs and bounds
-
-The selected experiment starts from an empty corpus. This measures cold-start
-discovery. It does not measure discovery from the existing regression corpus.
-`discovery-empty/` contains no `.bin` inputs or `.toml` sidecars. The canonical
-corpus is the sorted input-digest list encoded as UTF-8 `[]` plus LF. The JSON
-file records its SHA-256. The `seeds` command admitted zero inputs for each of
-the five harnesses when given this explicit fixture directory.
-
-Every discovery invocation must pass `--fixtures qa/mutation-pilot/discovery-empty`.
-Omitting that flag loads the repository's curated sensitivity witnesses.
-Start every original/mutant/seed run in a fresh store. Do not pass `--parent`,
-carry a corpus, reuse a calibration corpus, or import a witness or derived
-input. A fresh empty corpus prevents those inputs from entering by accident.
-The shared `seeds` loader currently accepts an explicit empty fixture directory.
-The paired runner must also verify the campaign's saved initial snapshot.
-
-The allocation is five seeds (`11`, `23`, `47`, `89`, `179`) and 600
-seconds per seed for each original/mutant pair. Each run uses one worker,
-512-byte inputs, a 10-second input limit, 2048 MiB RSS, no restarts, semantic
-feedback and no sanitizer. Each machine decoder bounds its operations to the
-512-byte scenario prefix. Its harness bounds simulator work to 128 steps, or
-129 steps for decoded retention including drain. Confirmation gets 60 seconds
-per child. Shrinking gets 600 seconds and 2000 candidates.
-
-## Baseline calibration
-
-Six unmodified fuzz runs calibrated the bounds above. Each run started a
-fresh empty corpus with seed 11. The first five requested five seconds each.
-The record-book target observed no applicable input, so a separate run used
-the same seed, bounds and generator for 30 seconds. Both results remain below.
-No generator or input repair followed either run.
+Six unmodified calibration runs exited zero with complete stats, no
+violations, no abandoned runs and no cleanup failures. Peak RSS was 32–33 MiB.
+Other builds ran concurrently, so throughput is host-specific.
 
 | Target | Requested seconds | Elapsed seconds | Inputs | Applicable inputs |
 | --- | ---: | ---: | ---: | ---: |
@@ -113,105 +155,63 @@ No generator or input repair followed either run.
 | `header_publisher_policy` | 5 | 6.026 | 87,963 | 66,117 |
 | `header_reactor_policy` | 5 | 6.027 | 85,923 | 8,057 |
 
-Every process exited zero with complete stats, no violations, no abandoned
-runs and no cleanup failures. Peak RSS ranged from 32 to 33 MiB. The runs
-support the selected resource limits. They do not establish a discovery rate.
-Other builds ran during calibration, so throughput is host-specific. The
-600-second allocation retains the plan's initial proposal; it does not promise
-that any target will reach its trigger within that budget.
+**Record-book applicability remains open.** `discovery_record_book` applied
+to zero of 27,183 cold-start inputs. Its `Holds` gate requires an
+installation, replacement, eviction and sample within one input. Zero
+applicability is not a pass and not coverage. No generator or input repair
+followed. Both record-book cases stay in the discovery denominator. A scored
+run with zero applicability must report `NotApplicable`, not intended
+detection. Their committed sensitivity fixture still applies 13 times, and
+their curated target readiness passed in mut-1.3.
 
-**Record-book applicability remains open.** Its `Holds` gate requires an
-installation, replacement, eviction and sample within the same input. Neither
-calibration run satisfied that whole-history gate. Zero applicability does
-not mean that the driver executed no operations. The two record-book cases
-remain in the future discovery denominator. A scored run with zero
-applicability must report that outcome, not coverage or intended detection.
-Their committed sensitivity fixture still passes, and their curated target
-readiness result remains separate from cold-start discovery.
+The 600-second allocation keeps the plan's initial proposal. It does not
+promise that any target reaches its trigger within that budget.
 
-The clean fuzz binaries came from mut-1.3 at
-`b2e0456474e47e6264c912b2f6b50d09c8603115`. Their build identities pin
-`nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, and the refreshed
-simulator fuzz lockfile. `fuzz_build_inputs` records these separately from the
-dev/test witness build. Each `calibration/*/run.json` records its binary hash,
-build identity, command, environment, elapsed time and initial empty corpus.
-The catalogue hashes the run records, stats and log copies. Log copies omit
-trailing whitespace; each run record also retains the raw log's hash.
-Generated calibration corpora remain outside this catalogue and all scored
-inputs. Their counts and manifest hashes provide an audit record.
+## Evidence bundle
 
-This command shape supplies the explicit discovery configuration after the
-paired runner has prepared and verified the selected build. `STORE` names a
-fresh disk-backed directory for exactly one case, lane and seed. `BUILD` names
-the store's verified build digest. The build must match that case's target.
+`2043-mut-2-2026-11-05.tar.zst`, SHA-256
+`fbf6210f4be815c2e47cfb43859c41f89335b9149eb1ee65495fc753f2255df2`.
+The mutation plan in Outline holds it as an attachment. Extract it and pass
+`2043-mut-2-2026-11-05/` as `--evidence`. `baseline.directory` and
+`calibration.runs[].directory` in the catalogue resolve inside that
+directory. `SHA256SUMS` inside the bundle covers every other file.
 
-```sh
-"$SIM" campaign start --store "$STORE" --campaign "$CASE-$LANE-$SEED" \
-  --sim "$HARNESS" --build "$BUILD" --seconds 600 --workers 1 --seed "$SEED" \
-  --fixtures qa/mutation-pilot/discovery-empty --max-len 512 --timeout 10 \
-  --rss-limit-mb 2048 --max-restarts 0 --abandon-limit 1 --feedback on
+```text
+2043-mut-2-2026-11-05/SHA256SUMS
+2043-mut-2-2026-11-05/baseline/results.json
+2043-mut-2-2026-11-05/baseline/{block-decoded-retention,block-reactor-identity,block-reactor-policy}/{input.bin,trace.jsonl,witness.json}
+2043-mut-2-2026-11-05/baseline/{discovery-record-book,header-publisher-policy,header-reactor-policy}/{input.bin,trace.jsonl,witness.json}
+2043-mut-2-2026-11-05/baseline/<stem>.log, one per input stem above
+2043-mut-2-2026-11-05/baseline/<stem>-discovery-seeds.json for block-decoded-retention, block-reactor-policy, discovery-record-book, header-publisher-policy, header-reactor-policy
+2043-mut-2-2026-11-05/calibration/{block_decoded_retention,block_reactor_policy,discovery_record_book,header_publisher_policy,header_reactor_policy}/{run.json,run.log,stats/stats-3.json}
+2043-mut-2-2026-11-05/calibration/discovery_record_book-30s/{run.json,run.log,stats/stats-4121690.json}
 ```
 
 ## Exclusions and remaining work
 
 The full inventory keeps all 56 retained patches visible in mut-1.2. This
 pilot selects ten of them. It excludes the other 46, including all 22 native
-cases, because this first discovery experiment uses registered simulator
-machine targets. Their exclusion does not establish equivalence or coverage.
+cases, because this discovery experiment uses registered simulator machine
+targets. Exclusion establishes neither equivalence nor coverage.
 
 The pilot also excludes integrated block storage, header wire, discovery
 worker lifetime, held-credit runtime coverage and all-reactor composition.
-mut-1.1 retained the discovery lost-trigger failures, header-wire end-record
-mismatch and unresolved capacity-release timeout. None of those failures
-counts as a passing baseline here. mut-1.3 records the missing-witness and
-readiness dispositions. sim-9 remains deferred.
+The discovery lost-trigger failures, the header-wire end-record mismatch and
+the unresolved capacity-release timeout from mut-1.1 do not count as passing
+baselines. sim-9 stays deferred.
 
-The catalogue uses existing regression mutations and known sensitivity
+The catalogue reuses existing regression mutations and their sensitivity
 fixtures. Discovery receives none of those inputs, but this remains a
 regression catalogue rather than unseen-mutant evaluation. Later generator
 repairs need fresh mutants to measure generalization.
 
-Before scoring, mut-3 must verify patch application, compilation, the reviewed
-behavior change, passing paired baselines and required observations. It must
-enforce paired build identity. Sensitivity then records the intended violation
-or a valid survivor. A catch is not an entry requirement. The runner must
-preserve an initial miss before any test or generator repair. It must keep
-wrong-ID failures, zero applicability, baseline failures and incomplete
-observations separate from intended detection. A timeout, compiler failure
-or unrelated panic never counts as intended detection.
-
-## Verify or reproduce
-
-```sh
-python3 scripts/check_mutation_pilot.py
-python3 -m unittest discover -s scripts -p test_check_mutation_pilot.py -v
-```
-
-The checker verifies hashes and bindings, nonzero sensitivity applicability,
-passing witnesses, clean outcomes, recorded replay exits and empty discovery
-inputs. It checks calibration build identities, complete input counts and
-applicability labels. It rejects drift in source and fuzz build inputs. It
-does not rerun replay, prove causal trigger semantics or execute a mutation.
-The ten tests reject wrong-ID witnesses, zero sensitivity applicability,
-another property's failure, copied sensitivity inputs, missing corpus
-directories, source/checker drift, misreported calibration applicability and
-calibration cleanup failures.
-
-To repeat one baseline, build the pinned source using the mut-1.1 instructions.
-Set `SIM` to that executable, `INPUT` and `HARNESS` from a catalogue case, and
-`OUT` to a fresh disk-backed directory. Each process has a 60-second limit.
-
-```sh
-timeout 60 "$SIM" record --sim "$HARNESS" --input "$INPUT" --out "$OUT" \
-  --witness "$HARNESS" --expect holds
-timeout 60 "$SIM" replay "$OUT"
-"$SIM" seeds --sim "$HARNESS" \
-  --fixtures qa/mutation-pilot/discovery-empty --report "$OUT/empty-seeds.json"
-```
-
-To repeat calibration, build the selected target with mut-1.3's toolchain and
-flags. Start a new empty directory for each run and use its recorded command
-and environment. `-max_total_time` requests five seconds, or 30 for the second
-record-book run. An outer watchdog allows 15 extra seconds. Remove
-`ZAKURA_SIM_EXPECT` and sanitizer-option variables as the run record specifies.
-Preserve raw process stats and never reuse the generated corpus for scoring.
+Before scoring, mut-3 must verify patch application, compilation, the
+reviewed behavior change, passing paired baselines and required
+observations. It must enforce paired build identity. The dev/test witness
+results above cannot substitute for a paired fuzz baseline. Sensitivity then
+records the intended violation or a valid survivor; a catch is not an entry
+requirement. The runner must preserve an initial miss before any test or
+generator repair. It must keep wrong-ID failures, zero applicability,
+baseline failures and incomplete observations separate from intended
+detection. A timeout, compiler failure or unrelated panic never counts as
+intended detection.

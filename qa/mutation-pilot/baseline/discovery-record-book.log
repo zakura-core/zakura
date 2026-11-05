@@ -1,3 +1,0 @@
-trace 3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac in qa/mutation-pilot/baseline/discovery-record-book: idle after 20 steps
-witness test of discovery/record-book, expecting holds: passed
-replayed trace 3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac: idle after 20 steps; every pick, draw and observation matched

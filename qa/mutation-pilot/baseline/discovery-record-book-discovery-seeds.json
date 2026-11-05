@@ -1,8 +1,0 @@
-{
-  "harness": "discovery/record-book",
-  "fixtures": [
-    "qa/mutation-pilot/discovery-empty"
-  ],
-  "seeds": [],
-  "other_harnesses": 0
-}

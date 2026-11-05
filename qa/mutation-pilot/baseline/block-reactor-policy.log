@@ -1,3 +1,0 @@
-trace c68402875cae13a2c7113ca9ad3590fbe62b3479a10a1b04c20171daedab9124 in qa/mutation-pilot/baseline/block-reactor-policy: idle after 15 steps
-witness test of block/reactor-policy, expecting holds: passed
-replayed trace c68402875cae13a2c7113ca9ad3590fbe62b3479a10a1b04c20171daedab9124: idle after 15 steps; every pick, draw and observation matched

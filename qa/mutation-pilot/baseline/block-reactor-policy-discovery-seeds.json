@@ -1,8 +1,0 @@
-{
-  "harness": "block/reactor-policy",
-  "fixtures": [
-    "qa/mutation-pilot/discovery-empty"
-  ],
-  "seeds": [],
-  "other_harnesses": 0
-}

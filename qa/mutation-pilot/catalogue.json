@@ -53,8 +53,6 @@
   "discovery": {
     "corpus": "qa/mutation-pilot/discovery-empty",
     "corpus_inputs": [],
-    "canonical_corpus_encoding": "UTF-8 JSON [] followed by LF; sorted input digest list",
-    "corpus_sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
     "provenance": "Deliberate cold start. No curated, regression, witness, derived, or carried inputs. libFuzzer generates initial inputs.",
     "seeds": [
       11,
@@ -72,7 +70,7 @@
     "abandon_limit": 1,
     "feedback": "on",
     "sanitizer": "none",
-    "calibration": "Six baseline-only cold-start runs retained in calibration; discovery record-book did not satisfy its whole-history applicability gate in either 5s or 30s. No generator, witness or corpus repair followed.",
+    "calibration": "Six baseline-only cold-start runs, kept in the evidence bundle under calibration/; discovery record-book did not satisfy its whole-history applicability gate in either 5s or 30s. No generator, witness or corpus repair followed.",
     "paired_runs": "Use identical seed, bounds and initial empty corpus for original and mutant. Start each seed in a fresh store; never carry a previous corpus."
   },
   "confirmation": {
@@ -108,7 +106,7 @@
         "crates/zakura-network/src/zakura/block_sync/reactor"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/block-reactor-identity",
+        "directory": "baseline/block-reactor-identity",
         "trace_sha256": "3d898c93f3a4cec2a396420f79d8e0be86286d03406e33044436dbaa7370ac8e",
         "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
         "applicable": 4,
@@ -156,7 +154,7 @@
         "crates/zakura-network/src/zakura/block_sync/reactor"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/block-reactor-policy",
+        "directory": "baseline/block-reactor-policy",
         "trace_sha256": "c68402875cae13a2c7113ca9ad3590fbe62b3479a10a1b04c20171daedab9124",
         "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
         "applicable": 15,
@@ -204,7 +202,7 @@
         "crates/zakura-network/src/zakura/block_sync/reactor"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/block-reactor-identity",
+        "directory": "baseline/block-reactor-identity",
         "trace_sha256": "3d898c93f3a4cec2a396420f79d8e0be86286d03406e33044436dbaa7370ac8e",
         "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
         "applicable": 4,
@@ -252,7 +250,7 @@
         "crates/zakura-node-services/src/block_memory/model.rs"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/block-decoded-retention",
+        "directory": "baseline/block-decoded-retention",
         "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
         "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
         "applicable": 1,
@@ -300,7 +298,7 @@
         "crates/zakura-node-services/src/block_memory/model.rs"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/block-decoded-retention",
+        "directory": "baseline/block-decoded-retention",
         "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
         "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
         "applicable": 1,
@@ -348,7 +346,7 @@
         "crates/zakura-node-services/src/block_memory/model.rs"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/block-decoded-retention",
+        "directory": "baseline/block-decoded-retention",
         "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
         "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
         "applicable": 1,
@@ -396,7 +394,7 @@
         "crates/zakura-network/src/zakura"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/discovery-record-book",
+        "directory": "baseline/discovery-record-book",
         "trace_sha256": "3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac",
         "witness_result_sha256": "6db3effcb6b0fc35e0e98543c04fc1537e586cc0f17be99f1cb59a798e9d2cb9",
         "applicable": 13,
@@ -444,7 +442,7 @@
         "crates/zakura-network/src/zakura"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/discovery-record-book",
+        "directory": "baseline/discovery-record-book",
         "trace_sha256": "3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac",
         "witness_result_sha256": "6db3effcb6b0fc35e0e98543c04fc1537e586cc0f17be99f1cb59a798e9d2cb9",
         "applicable": 13,
@@ -492,7 +490,7 @@
         "crates/zakura-network/src/zakura/header_sync/reactor"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/header-reactor-policy",
+        "directory": "baseline/header-reactor-policy",
         "trace_sha256": "03cfee761e1f08c5c395444363a0e5c9a496e58fe222e7d052dc260594c32f93",
         "witness_result_sha256": "103c74a73707c06ac6d9dbf271305aca6d7344d7dd343f3ff06fbdfcae552340",
         "applicable": 23,
@@ -542,7 +540,7 @@
         "crates/zakura-network/src/zakura/regulation/subscription"
       ],
       "baseline": {
-        "directory": "qa/mutation-pilot/baseline/header-publisher-policy",
+        "directory": "baseline/header-publisher-policy",
         "trace_sha256": "84faa324d25e12321863d69737409cb414918cbc978f348b38bcb3d0c72ec246",
         "witness_result_sha256": "2dca7c92732dc4da60cc17c43eda2511b9e315d30f93d07f02cf9d72b6239e48",
         "applicable": 8,
@@ -584,7 +582,7 @@
   "calibration": {
     "runs": [
       {
-        "directory": "qa/mutation-pilot/calibration/block_decoded_retention",
+        "directory": "calibration/block_decoded_retention",
         "target": "block_decoded_retention",
         "harness": "block/decoded-retention",
         "run_sha256": "7db04d1b2bbff886f4638f26f3921804d54c9a8077cb4e50caeaf39af16ef1a6",
@@ -594,7 +592,7 @@
         "applicability": "observed"
       },
       {
-        "directory": "qa/mutation-pilot/calibration/block_reactor_policy",
+        "directory": "calibration/block_reactor_policy",
         "target": "block_reactor_policy",
         "harness": "block/reactor-policy",
         "run_sha256": "083604ee05448c090628adc1bb4d198d7be6e45ab9c35f163961a66006dfb4db",
@@ -604,7 +602,7 @@
         "applicability": "observed"
       },
       {
-        "directory": "qa/mutation-pilot/calibration/discovery_record_book",
+        "directory": "calibration/discovery_record_book",
         "target": "discovery_record_book",
         "harness": "discovery/record-book",
         "run_sha256": "7608ce9a0e0fc3579473c9c7e8514998843cfb6cb1f2b8a99fdf26ed631b05c9",
@@ -614,7 +612,7 @@
         "applicability": "not-observed"
       },
       {
-        "directory": "qa/mutation-pilot/calibration/discovery_record_book-30s",
+        "directory": "calibration/discovery_record_book-30s",
         "target": "discovery_record_book",
         "harness": "discovery/record-book",
         "run_sha256": "061a5cd0b6d0189653a982e8a0818b0ef62143fc4657c270e56760c273f15da3",
@@ -624,7 +622,7 @@
         "applicability": "not-observed"
       },
       {
-        "directory": "qa/mutation-pilot/calibration/header_publisher_policy",
+        "directory": "calibration/header_publisher_policy",
         "target": "header_publisher_policy",
         "harness": "header/publisher-policy",
         "run_sha256": "1c44ba9a811bc030ef63c9d74b4e792bb1ad99f2659f84365ad2d7b0205218e2",
@@ -634,7 +632,7 @@
         "applicability": "observed"
       },
       {
-        "directory": "qa/mutation-pilot/calibration/header_reactor_policy",
+        "directory": "calibration/header_reactor_policy",
         "target": "header_reactor_policy",
         "harness": "header/reactor-policy",
         "run_sha256": "cc58dc5ecd649dc9a867cd2d39086fc96b1fc85a8af3e09854203bbe3c33dcf5",
@@ -647,5 +645,8 @@
     "decision": "Freeze 512-byte inputs at the existing decoder limit, 10s input timeout and 2048MiB RSS. Retain the planned 600s allocation per seed. Calibration completed without resource failures; it does not prove discovery reachability or bound its probability.",
     "open_gap": "discovery/record-book requires installed, replaced, evicted and sampled in one input for Holds. Neither calibration attempt reached that full gate. Keep both selected cases in the discovery denominator; report not-applicable if the scored run also never applies.",
     "restrictions": "Calibration used only original builds and seed 11. Its generated corpora are excluded from every scored initial corpus. Build work ran concurrently; throughput is host-specific."
+  },
+  "evidence": {
+    "bundle": "2043-mut-2-2026-11-05.tar.zst"
   }
 }

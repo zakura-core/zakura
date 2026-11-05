@@ -1990,6 +1990,97 @@ async fn mempool_cancel_mined() -> Result<(), Report> {
     Ok(())
 }
 
+/// Check that two blocks committed between mempool polls remove their mined transactions
+/// without dropping and re-verifying the rest of the mempool.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_keeps_unmined_transactions_when_a_poll_misses_a_block() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let block_bytes = |height: u32| {
+        zakura_test::vectors::MAINNET_BLOCKS
+            .get(&height)
+            .expect("mainnet test vector block exists")
+    };
+    let block = |height: u32| -> Arc<Block> {
+        block_bytes(height)
+            .zcash_deserialize_into()
+            .expect("mainnet test vector block deserializes")
+    };
+
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block(1)).await;
+    // Let the mempool see block 1, so it is the mempool's last seen tip.
+    mempool.dummy_call().await;
+
+    // Block 2's coinbase is mined by the block the mempool will miss, block 3's by the new
+    // tip, and block 5's stays unmined.
+    let mut mined_in_skipped_block = network.unmined_transactions_in_blocks(2..=2);
+    let mined_in_skipped_block = mined_in_skipped_block
+        .next()
+        .expect("block 2 has a coinbase");
+    let mut mined_in_new_tip = network.unmined_transactions_in_blocks(3..=3);
+    let mined_in_new_tip = mined_in_new_tip.next().expect("block 3 has a coinbase");
+    let mut still_unmined = network.unmined_transactions_in_blocks(5..=5);
+    let still_unmined = still_unmined.next().expect("block 5 has a coinbase");
+
+    for tx in [&mined_in_skipped_block, &mined_in_new_tip, &still_unmined] {
+        mempool.storage().insert(tx.clone(), Vec::new(), None)?;
+    }
+    assert_eq!(mempool.storage().transaction_count(), 3);
+
+    // Commit blocks 2 and 3 without polling the mempool in between.
+    for height in [2, 3] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block(height),
+        )
+        .await;
+    }
+    mempool.dummy_call().await;
+
+    let remaining: HashSet<_> = mempool.storage().tx_ids().collect();
+    assert_eq!(
+        remaining,
+        [still_unmined.transaction.id()].into_iter().collect(),
+        "only the transaction that neither block mined should stay in the mempool",
+    );
+    assert_eq!(
+        mempool.tx_downloads().in_flight(),
+        0,
+        "the mempool should not re-verify transactions it already holds",
+    );
+
+    let mempool_change = timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+        .await
+        .expect("should not timeout")
+        .expect("recv should return Ok");
+    assert_eq!(
+        mempool_change,
+        MempoolChange::mined(
+            [
+                mined_in_skipped_block.transaction.id(),
+                mined_in_new_tip.transaction.id(),
+            ]
+            .into_iter()
+            .collect()
+        ),
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> {
     // Use a configured Testnet that activates NU5 at `NU5_ACTIVATION_TEST_HEIGHT`, so a real

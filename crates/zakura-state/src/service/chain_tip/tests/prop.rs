@@ -7,13 +7,15 @@ use proptest::prelude::*;
 use proptest_derive::Arbitrary;
 
 use zakura_chain::{
-    block::Block,
+    block::{self, Block},
     chain_tip::ChainTip,
     fmt::{DisplayToDebug, SummaryDebug},
     parameters::{Network, NetworkUpgrade},
 };
 
-use crate::service::chain_tip::{ChainTipBlock, ChainTipSender, TipAction};
+use crate::service::chain_tip::{
+    ChainTipBlock, ChainTipSender, TipAction, MAX_RECENT_TIP_ANCESTORS,
+};
 
 use TipChangeCheck::*;
 
@@ -44,7 +46,7 @@ proptest! {
         let mut latest_non_finalized_tip = None;
         let mut seen_non_finalized_tip = false;
 
-        let mut pending_action = None;
+        let mut published_run: Vec<ChainTipBlock> = Vec::new();
         let mut last_block_hash = None;
         let mut chain_hashes = HashSet::new();
 
@@ -125,38 +127,19 @@ proptest! {
                 expected_transaction_ids
             );
 
-            let old_last_change_hash = chain_tip_change.last_change_hash;
-
-            let new_action = expected_tip.and_then(|(chain_tip, block)| {
-                // Mirror `ChainTipChange::action`: the mempool verifies against the *next*
-                // height, so a reset happens at `activation_height - 1`, and also at the
-                // temporary-Orchard-disabling soft fork's activation height (see commit
-                // 548672c5e). `next` always succeeds because the tip is far below `Height::MAX`.
-                let next_height = chain_tip
-                    .height
-                    .next()
-                    .expect("chain tip height is far below Height::MAX");
-
-                if Some(chain_tip.hash) == old_last_change_hash {
-                    // some updates don't do anything, so there's no new action
-                    None
-                } else if Some(chain_tip.previous_block_hash) != old_last_change_hash
-                    || NetworkUpgrade::is_activation_height(&network, next_height)
-                    || network
-                        .is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
-                {
-                    Some(TipAction::reset_with(block.0.into()))
-                } else {
-                    Some(TipAction::grow_with(block.0.into()))
+            // Track the trailing run of published tips that are each a child of the previous one,
+            // which is the history the sender keeps for skipped blocks.
+            if let Some((chain_tip, _block)) = expected_tip.as_ref() {
+                if published_run.last().map(|tip: &ChainTipBlock| tip.hash) != Some(chain_tip.hash) {
+                    if published_run.last().map(|tip| tip.hash) != Some(chain_tip.previous_block_hash) {
+                        published_run.clear();
+                    }
+                    published_run.push(chain_tip.clone());
                 }
-            });
+            }
 
-            let expected_action = match (pending_action.clone(), new_action.clone()) {
-                (Some(pending_action), Some(new_action)) if pending_action == new_action => Some(new_action),
-                (Some(_pending_action), Some(new_action)) => Some(new_action.into_reset()),
-                (None, new_action) => new_action,
-                (pending_action, None) => pending_action,
-            };
+            let old_last_change_hash = chain_tip_change.last_change_hash;
+            let expected_action = expected_tip_action(&network, old_last_change_hash, &published_run);
 
             match tip_change_check {
                 WaitFor => {
@@ -175,16 +158,11 @@ proptest! {
                         expected_action,
                         "\n\
                          unexpected wait_for_tip_change TipAction\n\
-                         new_action: {:?}\n\
-                         pending_action: {:?}\n\
                          old last_change_hash: {:?}\n\
                          new last_change_hash: {:?}",
-                        new_action,
-                        pending_action,
                         old_last_change_hash,
                         chain_tip_change.last_change_hash
                     );
-                    pending_action = None;
                 }
 
                 Last => {
@@ -193,23 +171,71 @@ proptest! {
                         expected_action,
                         "\n\
                          unexpected last_tip_change TipAction\n\
-                         new_action: {:?}\n\
-                         pending_action: {:?}\n\
                          old last_change_hash: {:?}\n\
                          new last_change_hash: {:?}",
-                        new_action,
-                        pending_action,
                         old_last_change_hash,
                         chain_tip_change.last_change_hash
                     );
-                    pending_action = None;
                 }
 
-                Skip => {
-                    pending_action = expected_action;
-                }
+                Skip => {}
             }
         }
+    }
+}
+
+/// Returns the action a [`ChainTipChange`] whose last change was `last_change_hash` should
+/// report, given the trailing run of published tips that each extend the previous one.
+///
+/// The change grows through skipped blocks when the last change is one of the
+/// `MAX_RECENT_TIP_ANCESTORS` tips before the current tip, every skipped block has transactions,
+/// and no added block is just below an activation height. Otherwise it resets.
+fn expected_tip_action(
+    network: &Network,
+    last_change_hash: Option<block::Hash>,
+    published_run: &[ChainTipBlock],
+) -> Option<TipAction> {
+    let (new_tip, earlier) = published_run.split_last()?;
+
+    if Some(new_tip.hash) == last_change_hash {
+        // some updates don't do anything, so there's no new action
+        return None;
+    }
+
+    let skipped_blocks = if Some(new_tip.previous_block_hash) == last_change_hash {
+        Some(Vec::new())
+    } else {
+        let kept_start = earlier.len().saturating_sub(MAX_RECENT_TIP_ANCESTORS);
+        earlier[kept_start..]
+            .iter()
+            .rposition(|tip| Some(tip.hash) == last_change_hash)
+            .map(|index| earlier[kept_start + index + 1..].to_vec())
+            .filter(|skipped| skipped.iter().all(|tip| !tip.transactions.is_empty()))
+    };
+
+    // Mirror `ChainTipChange::action`: the mempool verifies against the *next*
+    // height, so a reset happens at `activation_height - 1`, and also at the
+    // temporary-Orchard-disabling soft fork's activation height (see commit
+    // 548672c5e). `next` always succeeds because the tip is far below `Height::MAX`.
+    let reaches_activation = |tip: &ChainTipBlock| {
+        let next_height = tip
+            .height
+            .next()
+            .expect("chain tip height is far below Height::MAX");
+        NetworkUpgrade::is_activation_height(network, next_height)
+            || network.is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
+    };
+
+    match skipped_blocks {
+        Some(skipped)
+            if !skipped
+                .iter()
+                .chain(std::iter::once(new_tip))
+                .any(reaches_activation) =>
+        {
+            Some(TipAction::grow_through(skipped, new_tip.clone()))
+        }
+        _ => Some(TipAction::reset_with(new_tip.clone())),
     }
 }
 
@@ -266,6 +292,6 @@ enum TipChangeCheck {
     /// Check that `last_tip_change` returns the correct result
     Last,
 
-    /// Don't check this case (causes a `TipAction::Reset` in the next check)
+    /// Don't check this case (the next check combines it with later changes)
     Skip,
 }

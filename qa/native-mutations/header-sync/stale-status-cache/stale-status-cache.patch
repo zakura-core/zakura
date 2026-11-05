@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index c353aa0405..5c3a4ae651 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2305,7 +2305,7 @@ impl HeaderSyncReactor {
+         self.request_vct_repair_context();
+         for handles in self.sessions.values_mut() {
+             match handles.status_publisher.as_mut() {
+-                Some(publisher) => publisher.observe(status.clone(), now),
++                Some(_) => {}
+                 None => {
+                     handles.status_publisher = Some(StatusPublisher::new(
+                         status.clone(),

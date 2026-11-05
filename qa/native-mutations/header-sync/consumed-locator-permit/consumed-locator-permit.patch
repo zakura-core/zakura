@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+index cafdee5a52..ed7a977a0b 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+@@ -429,6 +429,12 @@ impl HeaderSyncReactor {
+                 self.peer_work_queue.remove_unstarted(peer);
+                 return StorageDispatch::Deferred(key.call);
+             };
++            // Mutation: a second permit taken outside dispatch and consumed
++            // with `forget`, which never returns it and lets go of the
++            // semaphore.
++            if let Ok(extra) = self.locator_capacity.clone().try_acquire_owned() {
++                extra.forget();
++            }
+             (Some(key), Some(port::LocatorReadPermit::new(permit)))
+         } else {
+             (None, None)

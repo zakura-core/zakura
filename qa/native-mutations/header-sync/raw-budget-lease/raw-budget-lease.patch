@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-index caec1c3ec2..7b0696e983 100644
+index 6aa2ce91e9..212a66a82e 100644
 --- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-@@ -777,6 +777,16 @@ impl PeerWorkQueue {
+@@ -779,6 +779,16 @@ impl PeerWorkQueue {
          let Ok(lease) = reservation.consume(returned) else {
              return false;
          };

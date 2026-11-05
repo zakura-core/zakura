@@ -1,19 +1,31 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-index caec1c3ec2..6748e9cd32 100644
+index 6aa2ce91e9..e6d2c2f93e 100644
 --- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-@@ -750,6 +750,14 @@ impl PeerWorkQueue {
+@@ -437,6 +437,8 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
+     staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
+     #[cfg(any(test, zakura_sim))]
+     observing: QueueObservation,
++    /// Mutation: a raw reservation held until the queue drops.
++    raw: Option<HeaderCountReservation>,
+ }
+ 
+ /// What the queue needs to report its reservations, pages and leases.
+@@ -748,6 +750,17 @@ impl PeerWorkQueue {
+         if self.request_reservations.contains_key(peer) {
+             return false;
+         }
++        // Mutation: one raw header, reserved before the queue's first
++        // reservation and held until the queue drops, which releases it.
++        // Nothing reports it.
++        if self.raw.is_none() {
++            self.raw = sim_arg!(self.budget.reserve(1); Opening {
++                observer: &ObserverSlot(None),
++                peer,
++                purpose,
++                request: None,
++            });
++        }
+         let Some(reservation) = sim_arg!(self.budget.reserve(count); self.opening(peer, purpose))
          else {
              return false;
-         };
-+        // Mutation: a raw one-header reservation that nothing reports or
-+        // ends.
-+        std::mem::forget(sim_arg!(self.budget.reserve(1); Opening {
-+            observer: &ObserverSlot(None),
-+            peer,
-+            purpose,
-+            request: None,
-+        }));
-         self.request_reservations.insert(peer.clone(), reservation);
-         true
-     }

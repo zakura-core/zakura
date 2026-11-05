@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-index caec1c3ec2..f3225eeed7 100644
+index 6aa2ce91e9..e77a35eac6 100644
 --- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
-@@ -146,7 +146,6 @@ impl HeaderChunkBudget {
+@@ -148,7 +148,6 @@ impl HeaderChunkBudget {
      }
  
      fn publish(&self, usage: HeaderChunkUsage) {
@@ -10,7 +10,7 @@ index caec1c3ec2..f3225eeed7 100644
          // The conversion is exact because the count is at most 4,000.
          metrics::gauge!("sync.header.chunk_budget.capacity").set(self.0.capacity as f64);
          metrics::gauge!("sync.header.chunk_budget.reserved").set(usage.reserved as f64);
-@@ -750,6 +749,14 @@ impl PeerWorkQueue {
+@@ -752,6 +751,14 @@ impl PeerWorkQueue {
          else {
              return false;
          };

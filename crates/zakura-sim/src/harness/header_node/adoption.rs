@@ -231,9 +231,15 @@ impl AdoptionEvidence {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records `fact`, reported at `at`.
+    /// Records `fact`, reported at `at`, unless the run has ended. The
+    /// scheduler's cleanup still runs a task stopped partway through a poll
+    /// to its end, with the run's clock installed, so a fact it reports then
+    /// would rewrite what the run showed when it ended.
     pub(super) fn record(&self, at: Duration, fact: AdoptionFact) {
-        self.store().facts.push(Stamped { at, fact });
+        let mut store = self.store();
+        if store.settled.is_none() {
+            store.facts.push(Stamped { at, fact });
+        }
     }
 
     /// Records that the run reached `at`.
@@ -242,11 +248,12 @@ impl AdoptionEvidence {
         store.horizon = store.horizon.max(at);
     }
 
-    /// Records how the run ended. It settled if it ended with no task ready
-    /// or parked: idle with every task finished or waiting outside the
-    /// scheduler, or after a drain that ran out of ready tasks. Any other end,
-    /// such as a drain cut off at its bound, a violation or a harness failure,
-    /// can stop a task partway through a synchronous call.
+    /// Records how the run ended, and freezes the facts (see
+    /// [`AdoptionEvidence::record`]). It settled if it ended with no task
+    /// ready: idle with every task finished or waiting outside the scheduler,
+    /// or after a drain that ran out of ready tasks. Any other end, such as a
+    /// drain cut off at its bound, a violation or a harness failure, can stop
+    /// a task partway through a synchronous call.
     pub fn end(&self, end: &RunEnd) {
         let settled = match end.outcome {
             Outcome::Idle { status } => matches!(
@@ -639,8 +646,9 @@ mod tests {
 
     /// A changed tip is owed before the next adoption, or by the end of a
     /// settled run: published by then it holds, and otherwise it breaks. Owed
-    /// while the run goes on, or when it stops unsettled, is inconclusive. A
-    /// stale or lost publication breaks.
+    /// while the run goes on, or when it stops unsettled, is inconclusive, and
+    /// a publication after the end doesn't count. A stale or lost publication
+    /// breaks.
     #[test]
     fn a_changed_tip_is_owed_before_the_next_adoption() {
         let (first, second) = (adoption(1, 1), adoption(2, 2));
@@ -711,6 +719,12 @@ mod tests {
         assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
         held.end(&run_end(Outcome::Budget, drained(false)));
         assert_eq!(held.tip(), Acceptance::Holds);
+        // Cleanup can finish the publication after the end, which changes
+        // nothing.
+        let frozen = evidence(vec![(0, adopted(&first))], 0);
+        frozen.end(&run_end(Outcome::Budget, drained(true)));
+        frozen.record(Duration::ZERO, published(first.header_best));
+        assert!(matches!(frozen.tip(), Acceptance::Inconclusive(_)));
         let skipped = evidence(vec![(0, adopted(&first)), (0, adopted(&second))], 0);
         assert!(violates(&skipped.tip(), "UnpublishedTip"));
         let stale = evidence(

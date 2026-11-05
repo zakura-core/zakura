@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index f86287d775..eb06cd6d3c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -671,6 +671,9 @@ impl PeerWorkQueue {
+             }
+             return false;
+         }
++        // Mutation: the round stores the page's headers in reverse order.
++        let mut entries = entries;
++        entries.reverse();
+         self.policy.stage_page(peer, ancestor, entries, cursor);
+         #[cfg(any(test, zakura_sim))]
+         self.report_staged(peer, hashes);

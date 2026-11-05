@@ -1,0 +1,20 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index f9ceaf3034..cb1c9917a5 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -1180,7 +1180,14 @@ impl WorkPolicy {
+             common_ancestor,
+             target,
+             completion,
+-            entries: std::mem::take(&mut request.entries),
++            // Mutation: the prepare sends the round's headers with its first
++            // and last swapped, so the count holds and the last header differs.
++            entries: {
++                let mut entries = std::mem::take(&mut request.entries);
++                let last = entries.len().saturating_sub(1);
++                entries.swap(0, last);
++                entries
++            },
+         })
+     }
+ 

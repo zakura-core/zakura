@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index af4ee6a563..28e21a524e 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2761,7 +2761,8 @@ impl HeaderSyncReactor {
+         self.state.clear_request_deadline(peer);
+         let reserved = self.peer_work_queue.reserved_header_count(peer);
+         let owned = self.peer_work_queue.owned_header_count(peer);
+-        if let Some(active) = self.peer_work_queue.remove(peer) {
++        // Mutation: the round retires, and the queue keeps it.
++        if let Some(active) = self.peer_work_queue.active(peer).cloned() {
+             observe!(self, ReactorEvent::retired(&active, terminal_outcome));
+             self.emit_request_terminal(&active, terminal_outcome);
+             self.cancel_active_request(&active);

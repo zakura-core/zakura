@@ -1,0 +1,18 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index dbc6882afc..fee349a80f 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -716,6 +716,13 @@ impl PeerWorkQueue {
+         else {
+             return false;
+         };
++        // Mutation: a second reservation for `peer`, outside the queue's
++        // accounting, so nothing ever ends it.
++        if let Some(secondary) =
++            sim_arg!(self.budget.reserve(count); self.opening(peer, purpose))
++        {
++            std::mem::forget(secondary);
++        }
+         self.request_reservations.insert(peer.clone(), reservation);
+         true
+     }

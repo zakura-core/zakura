@@ -1,0 +1,346 @@
+{
+  "source_revision": "870678be1739ea799e59b4e0bdfe6cf512792710",
+  "scope": "Retained planted cases; native mutations remain for mut-1.2. Result evidence is recorded separately.",
+  "cases": [
+    {
+      "case": "qa/planted/block/decoded-retention/double-release.toml",
+      "property": "block/decoded-retention",
+      "patch_sha256": "358db37c7fe10785f6efda7ca3829ec9e73789e547f10409e33f8cf1cdc4a0f8",
+      "input": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "input_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "harness": "block/decoded-retention",
+      "generator": 1,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/decoded-retention/missing-admission.toml",
+      "property": "block/decoded-retention",
+      "patch_sha256": "c4519caeb671bb7e139952e44692a72e75e2cc2845dd71f7187dfd66bbafe57e",
+      "input": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "input_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "harness": "block/decoded-retention",
+      "generator": 1,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/decoded-retention/raw-header-escape.toml",
+      "property": "block/decoded-retention",
+      "patch_sha256": "8b4581bf658f3f8b3b27881a2f50cf9c8d86a7a391aa2b977036c2f8e2cf2985",
+      "input": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "input_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "harness": "block/decoded-retention",
+      "generator": 1,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/decoded-retention/raw-transaction-escape.toml",
+      "property": "block/decoded-retention",
+      "patch_sha256": "f00177a8fa55c6d8b3a2905388e825f4690b31d466923495418a3ddad196eefc",
+      "input": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "input_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "harness": "block/decoded-retention",
+      "generator": 1,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/reactor-policy/lost-forced-retry.toml",
+      "property": "block/reactor-policy",
+      "patch_sha256": "992317db3707e06dd27486b300b868056e14e9cf021096c80dfdf5b074d488b1",
+      "input": "crates/zakura-sim/tests/fixtures/block-reactor-identity.bin",
+      "input_sha256": "be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a",
+      "harness": "block/reactor-policy",
+      "generator": 3,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/reactor-policy/refusal-consumes-query-id.toml",
+      "property": "block/reactor-policy",
+      "patch_sha256": "68ea6dfc5ad5974380b99a5a4e03031a65f276fa647c29ac03ce8c81830ae2e6",
+      "input": "crates/zakura-sim/tests/fixtures/block-reactor-policy.bin",
+      "input_sha256": "866eab29ee4b80c036ede067022d9d7cd8906370f6065b9e322e2a9e3c8da9a8",
+      "harness": "block/reactor-policy",
+      "generator": 3,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/reactor-policy/stale-scope-completes-query.toml",
+      "property": "block/reactor-policy",
+      "patch_sha256": "ae002e957c5eb66a358e811e2d9ed27273ea23999506afa80188e8d1d27e4897",
+      "input": "crates/zakura-sim/tests/fixtures/block-reactor-identity.bin",
+      "input_sha256": "be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a",
+      "harness": "block/reactor-policy",
+      "generator": 3,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/work-funding/floor-bypass-beyond-cap.toml",
+      "property": "block/work-funding",
+      "patch_sha256": "1583ffecff83c79075d010674b7c80f98c8ef01547b5e04f2652f18911990a08",
+      "input": "crates/zakura-sim/tests/fixtures/block-work-owner-cap.bin",
+      "input_sha256": "69629f4507b04e4411d8c8ef96be02f3ce28320a2d7a5b37de6cfc5d16f0c252",
+      "harness": "block/work-funding",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/work-funding/lost-reservation-release.toml",
+      "property": "block/work-funding",
+      "patch_sha256": "63b7e6c4ec9601be8dbe66d4541b9f7ffec5207b6ce27409abbba3ccc3d01165",
+      "input": "crates/zakura-sim/tests/fixtures/block-work-funding.bin",
+      "input_sha256": "44f34297f8e8c3f67b002320dd48ac4fb3f3b3528ef1857ffce603e4db04fce4",
+      "harness": "block/work-funding",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block/work-ownership/missing-published-charge.toml",
+      "property": "block/work-ownership",
+      "patch_sha256": "b5b7df94bb893e77ca941cee71c2027792e8c07b0c13f607f62e1a40bcf3ab01",
+      "input": "crates/zakura-sim/tests/fixtures/block-work-ownership.bin",
+      "input_sha256": "13b38bbe78bc8741d9714e06982824cce8e4bc35e049c2d1e5ce4fcaeac22602",
+      "harness": "block/work-ownership",
+      "generator": 1,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/budget-ledgers-agree/handoff-keeps-charge.toml",
+      "property": "block-sync/budget-ledgers-agree",
+      "patch_sha256": "5c00b25fe892097173ba1e0bc828e0bcb94146038862df2d574d42a9fa50a338",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-handoff.bin",
+      "input_sha256": "a97337bfc72d0b50d601701e5981dc6d0b80053e7ed50f74393c2aa4e9a9ccde",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/capacity-release-wakes/stale-completion-no-wake.toml",
+      "property": "block-sync/capacity-release-wakes",
+      "patch_sha256": "560d4f2a9f3f0f2850ff97e15b55078700b42d0db591c5325eacd0d70e9d05c0",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-capacity-frontier-first.bin",
+      "input_sha256": "b8af915b8272e2b7ac2d09f798279287d89d085065aa91b0163f648f115eb987",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "timeout: logs/capacity.log; frontier-first reached 60-second process limit; reply-first did not run"
+    },
+    {
+      "case": "qa/planted/block-sync/detached-submission-bounded/forget-on-reset.toml",
+      "property": "block-sync/detached-submission-bounded",
+      "patch_sha256": "a70c26e6fcf1d541798765decda23e5af3e1862fbe0140def0f75fb85d58d58c",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-stalled-reset.bin",
+      "input_sha256": "ec74e6608369dfa70231f388ed39813d3e5804c884de8d8891f6d95712ca2967",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/detached-submission-bounded/keep-detached-after-verdict.toml",
+      "property": "block-sync/detached-submission-bounded",
+      "patch_sha256": "9191875d5888cc61430d4703d418062b185b604a662fc9a2e8a0db63739e6a32",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin",
+      "input_sha256": "94cad5c4fe37df07236237fb82de191d3d64f0fe995b3ad1e2d9e1008c440d2e",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/input-decoded-bound/no-room-check.toml",
+      "property": "block-sync/input-decoded-bound",
+      "patch_sha256": "fec3948e8e0431013b550557e52de9b91edc9aafc3bb794955607ed784ab84b0",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-decoded-input-stall.bin",
+      "input_sha256": "601fc60f651d775ac102ae8c9a478978c08b042a5be541fa1b84ad0b7f61d174",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/lookahead-overshoot-bound/omit-outstanding-estimates.toml",
+      "property": "block-sync/lookahead-overshoot-bound",
+      "patch_sha256": "27c8b4e02eed1c0f6670a6762490f39c6872f6c61177bd3719ee7f7043c4d89f",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-above-window.bin",
+      "input_sha256": "e66b81be1c76b815b0d2ef0c9b60e702d09219cf7d689b1f1100c6a11d0599cd",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/payload-inventory-agrees/lost-payload-release.toml",
+      "property": "block-sync/payload-inventory-agrees",
+      "patch_sha256": "607f30bcbd1444696740ff7405ae608a1e56a804512087877b3b2cfc3fee2fe5",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-handoff.bin",
+      "input_sha256": "a97337bfc72d0b50d601701e5981dc6d0b80053e7ed50f74393c2aa4e9a9ccde",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/reserved-byte-bound/above-floor-charge.toml",
+      "property": "block-sync/reserved-byte-bound",
+      "patch_sha256": "9399a3c61888f66571bf237ff8fb1ba385295253791952982eda80278d6bf81f",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-paused-handoffs.bin",
+      "input_sha256": "5b9f13720f7a45875e7095b41e43a15ec699bb298bc7b811495911d683a1b1f0",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/retained-byte-bound/wide-commit-window.toml",
+      "property": "block-sync/retained-byte-bound",
+      "patch_sha256": "540871127202c519b0a5937f004ba9f3b732e79d79e5b95a7a7d15c55d2dd9a8",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-stuck-floor.bin",
+      "input_sha256": "4fa5ce72c2dcba356e9db4a472497944eb6720eac3db88e18f4b37cd57d8916d",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/stale-completion-inert/release-by-height.toml",
+      "property": "block-sync/stale-completion-inert",
+      "patch_sha256": "5c1d484358154b6a419f397569c55dd1c6be87635d73afd43d6b45d889a255f7",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-stale-beside-current.bin",
+      "input_sha256": "94cad5c4fe37df07236237fb82de191d3d64f0fe995b3ad1e2d9e1008c440d2e",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/submit-only-requested/height-only.toml",
+      "property": "block-sync/submit-only-requested",
+      "patch_sha256": "df9e0ea776dc7ec5ec1a1e6d5e4f29e0c3f17f9d81048b45f1d090316cdea59f",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-reset-mid-flight.bin",
+      "input_sha256": "e00e3c03597aa347c7c5e41b0bf27524df695f085192c43d866c5e0591a3709d",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/block-sync/teardown-returns-baseline/skip-return-on-drop.toml",
+      "property": "block-sync/teardown-returns-baseline",
+      "patch_sha256": "5d1658cc3b61bde41d77b252dd6f295a51fa5fd633af9e7dbce850926a78e9f2",
+      "input": "crates/zakura-sim/tests/fixtures/block-sync-peers-leave.bin",
+      "input_sha256": "b9fe6c9d03eb685a1a234b4782234e455cce35f78467858e21a59ca9ab6cc3c0",
+      "harness": "block-sync/storage",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/record-book/keep-old-relay-attribution.toml",
+      "property": "discovery/record-book",
+      "patch_sha256": "9e92b04ffcb610da734fb98bcc9ed785ad25894f0231b6b32bdc26c87941fa10",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+      "input_sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+      "harness": "discovery/record-book",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/record-book/skip-book-eviction.toml",
+      "property": "discovery/record-book",
+      "patch_sha256": "a46839ea714abfbc6691b952e48823caf43da06959df1eaf898515f92b106159",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+      "input_sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+      "harness": "discovery/record-book",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/record-book/widen-disclosure-window.toml",
+      "property": "discovery/record-book",
+      "patch_sha256": "dc508f34ed84dcac82c4900f7a5f958bccd160418e4cf26d62edc4d7b24df928",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+      "input_sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+      "harness": "discovery/record-book",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/record-book/wrong-eviction-victim.toml",
+      "property": "discovery/record-book",
+      "patch_sha256": "95adfe32b70de60d2f39af6a2d3bc06a2627cf0c492f8fb51cc511747f4008a7",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+      "input_sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+      "harness": "discovery/record-book",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/session-installation/install-superseded-result.toml",
+      "property": "discovery/session-installation",
+      "patch_sha256": "cc9383833db606501a8ff61e40f833a2646252ea32d49d68cf0a6c91277b1544",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-session-installation.bin",
+      "input_sha256": "d96653a697e5e59373da80db04a6c6cc082dd3e853da38b137f209f543608b12",
+      "harness": "discovery/session-installation",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/session-installation/unbounded-service-hints.toml",
+      "property": "discovery/session-installation",
+      "patch_sha256": "8ec0655d30e4211df5d33e78f07b3d382ca24a82983ebdfe9fe4cadc134cc477",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-session-installation.bin",
+      "input_sha256": "d96653a697e5e59373da80db04a6c6cc082dd3e853da38b137f209f543608b12",
+      "harness": "discovery/session-installation",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/verification-capacity/release-before-install.toml",
+      "property": "discovery/verification-capacity",
+      "patch_sha256": "4da56a1f0e3acdba86ac040aeaf4c6f3832a3f7229c8c4f575efc1ee12b91ca7",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-verification-capacity.bin",
+      "input_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "harness": "discovery/verification-capacity",
+      "generator": 1,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/discovery/wait-complete-wakes/lost-wakeup.toml",
+      "property": "discovery/wait-complete-wakes",
+      "patch_sha256": "8c38130d62969d31dbb01658b92a2666a1413ff3a2457cd05c2a698626b7d2f2",
+      "input": "crates/zakura-sim/tests/fixtures/discovery-wait-complete.bin",
+      "input_sha256": "1993c08e29c3d65d67d52856bbd0b5531918a2b66edf71a00eb73a6e5e58cba2",
+      "harness": "discovery/wait-complete",
+      "generator": 1,
+      "baseline": "failed: logs/check-0.log; lost trigger history"
+    },
+    {
+      "case": "qa/planted/header/publisher-policy/lost-credit.toml",
+      "property": "header/publisher-policy",
+      "patch_sha256": "79e4cba41b2e259063c326a034fdfe5bc1f0e1ebc9e42f935c3e078a4f18cef7",
+      "input": "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin",
+      "input_sha256": "d873835827624015735be3ddf3be8fef8a25af2e62ffe5532d1297aa7887525b",
+      "harness": "header/publisher-policy",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/header/publisher-policy/lost-job.toml",
+      "property": "header/publisher-policy",
+      "patch_sha256": "092fa42cbe784820a31155f02f5ebcd596889fa0bf9b95b68b4890daa300cf6d",
+      "input": "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin",
+      "input_sha256": "d873835827624015735be3ddf3be8fef8a25af2e62ffe5532d1297aa7887525b",
+      "harness": "header/publisher-policy",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/header/publisher-policy/lost-terminal.toml",
+      "property": "header/publisher-policy",
+      "patch_sha256": "a242e7e48b8f80c11b08851eae99acec2709137e730b86a3c1e2128c23e8b163",
+      "input": "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin",
+      "input_sha256": "d873835827624015735be3ddf3be8fef8a25af2e62ffe5532d1297aa7887525b",
+      "harness": "header/publisher-policy",
+      "generator": 2,
+      "baseline": "not-run"
+    },
+    {
+      "case": "qa/planted/header/reactor-policy/locator-call-settles-without-removal.toml",
+      "property": "header/reactor-policy",
+      "patch_sha256": "34d1a97cac84ad918c6bb7a1fdd918d280b71d7706691a7ef1575ca20d2199a7",
+      "input": "crates/zakura-sim/tests/fixtures/header-reactor-policy.bin",
+      "input_sha256": "1bb8d5f2c6f679f5a1dab02b0cfcd6472b955f7b408a14bc9e703cb68f664511",
+      "harness": "header/reactor-policy",
+      "generator": 1,
+      "baseline": "passed: header-baseline/witness.json; 23 applicable checks"
+    }
+  ]
+}

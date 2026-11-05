@@ -1,0 +1,47 @@
+{
+  "source_revision": "870678be1739ea799e59b4e0bdfe6cf512792710",
+  "build_seconds": {
+    "baseline": 57.25,
+    "mutant": 41.95
+  },
+  "tests": [
+    {
+      "name": "witness",
+      "exit_code": 101,
+      "passed": 9,
+      "failed": 2,
+      "ignored": 0
+    },
+    {
+      "name": "header_wire_lifecycle::saved_plans_replay_their_end_records",
+      "exit_code": 101,
+      "passed": 0,
+      "failed": 1
+    },
+    {
+      "name": "capacity_release_wakes without --include-ignored",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 2,
+      "classification": "not-run"
+    },
+    {
+      "name": "capacity_release_wakes with --include-ignored",
+      "exit_code": 124,
+      "completed": 0,
+      "classification": "timeout"
+    }
+  ],
+  "pilot": {
+    "cases": 1,
+    "baseline_applicable": 23,
+    "baseline_steps": 26,
+    "mutant_violation": "header/reactor-policy",
+    "mutant_step": 7,
+    "confirmation": "confirmed",
+    "baseline_replay": "exact",
+    "mutant_replay": "exact",
+    "baseline_after": "passed",
+    "discovery": "not-run"
+  }
+}

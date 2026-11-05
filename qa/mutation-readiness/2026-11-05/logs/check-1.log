@@ -1,0 +1,6 @@
+
+running 2 tests
+test the_frontier_first_input_holds_capacity_release_wakes ... ignored, a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`
+test the_reply_first_input_holds_capacity_release_wakes ... ignored, a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 9 filtered out; finished in 0.00s

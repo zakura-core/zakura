@@ -137,14 +137,16 @@ pub(crate) fn zakura_node_secret_key_file_path(identity_dir: &Path, network: &Ne
 }
 
 /// Returns the file under `identity_dir` that holds the last discovery
-/// self-record sequence this node authored on `network`. It sits beside the
-/// identity key because the sequence belongs to that identity.
+/// self-record sequence that `node_id` authored on `network`. The name
+/// carries the node ID because the sequence belongs to that identity: nodes
+/// with configured keys can share one `identity_dir`.
 pub(crate) fn zakura_discovery_sequence_file_path(
     identity_dir: &Path,
     network: &Network,
+    node_id: &zakura_quic::NodeId,
 ) -> PathBuf {
     identity_dir.join(format!(
-        "{}.zakura-discovery-sequence",
+        "{}.{node_id}.zakura-discovery-sequence",
         network.lowercase_name()
     ))
 }

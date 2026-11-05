@@ -814,10 +814,10 @@ impl Config {
         Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 
-    /// The file that holds the last discovery self-record sequence this node
-    /// authored, under [`identity_dir`](Self::identity_dir).
-    pub(crate) fn zakura_discovery_sequence_file(&self) -> PathBuf {
-        zakura_discovery_sequence_file_path(&self.identity_dir, &self.network)
+    /// The file that holds the last discovery self-record sequence that
+    /// `node_id` authored, under [`identity_dir`](Self::identity_dir).
+    pub(crate) fn zakura_discovery_sequence_file(&self, node_id: &zakura_quic::NodeId) -> PathBuf {
+        zakura_discovery_sequence_file_path(&self.identity_dir, &self.network, node_id)
     }
 
     /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer

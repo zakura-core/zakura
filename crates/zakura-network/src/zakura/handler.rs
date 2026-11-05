@@ -4645,7 +4645,7 @@ async fn spawn_zakura_endpoint_inner(
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
         Some(discovery::AuthoredSequenceFile::new(
-            config.zakura_discovery_sequence_file(),
+            config.zakura_discovery_sequence_file(&local_node_id),
         )),
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),

@@ -6,6 +6,8 @@ use std::{
 };
 
 use zakura_chain::{
+    block::{Block, MAX_BLOCK_BYTES},
+    serialization::{CompactSizeMessage, ZcashDeserializeInto, ZcashSerialize},
     transaction::{VerifiedUnminedTx, MEMPOOL_TRANSACTION_COST_THRESHOLD},
     transparent::OutPoint,
 };
@@ -13,6 +15,8 @@ use zakura_chain::{
 use super::super::{
     config::Config, fixtures::TxFactory, verified_set::MAX_MEMPOOL_ANCESTORS, Storage,
 };
+
+const SAMPLES: usize = 21;
 
 struct Fixture {
     storage: Storage,
@@ -112,7 +116,6 @@ impl Fixture {
 #[allow(clippy::print_stdout, reason = "manual benchmark results")]
 fn benchmark_mempool_mining_index_mutations() {
     const ITERATIONS: u32 = 128;
-    const SAMPLES: usize = 21;
     let default_count =
         usize::try_from(Config::default().tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD)
             .unwrap();
@@ -156,5 +159,120 @@ fn benchmark_mempool_mining_index_mutations() {
                 assert_eq!(fixture.storage.transaction_count(), count);
             }
         }
+    }
+}
+
+/// A block-shaped payload exactly at the serialized block size limit. The
+/// genesis header/coinbase and placeholder proofs are only fixture data;
+/// contextual and cryptographic block validation are outside these timings.
+fn full_block(factory: &mut TxFactory) -> (Block, Vec<VerifiedUnminedTx>) {
+    let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let limit = usize::try_from(MAX_BLOCK_BYTES).unwrap();
+    let header_bytes = block.header.zcash_serialized_size();
+    let mut transaction_bytes = block.transactions[0].zcash_serialized_size();
+    let block_size = |count: usize, bytes: usize| {
+        header_bytes
+            + CompactSizeMessage::try_from(count)
+                .unwrap()
+                .zcash_serialized_size()
+            + bytes
+    };
+    let mut members: Vec<VerifiedUnminedTx> = Vec::new();
+    loop {
+        let tx = factory.tx(20_000);
+        if block_size(members.len() + 2, transaction_bytes + tx.transaction.size()) > limit {
+            break;
+        }
+        transaction_bytes += tx.transaction.size();
+        members.push(tx);
+    }
+    let padding = limit - block_size(members.len() + 1, transaction_bytes);
+    let last = members.last_mut().unwrap();
+    let padded = factory.tx_with(20_000, 0, padding);
+    assert_eq!(padded.transaction.size(), last.transaction.size() + padding);
+    *last = padded;
+    block.transactions.extend(
+        members
+            .iter()
+            .map(|tx| tx.transaction.transaction().clone()),
+    );
+    assert_eq!(block.zcash_serialized_size(), limit);
+    (block, members)
+}
+
+/// Measures the full mined-transaction cleanup path for a serialized 2 MB
+/// block, including the coinbase TXID that is absent from the mempool.
+#[test]
+#[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
+#[allow(clippy::print_stdout, reason = "manual benchmark results")]
+fn benchmark_mempool_full_block_deletion() {
+    const BLOCK_ITERATIONS: u32 = 16;
+    let default_count =
+        usize::try_from(Config::default().tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD)
+            .unwrap();
+    let mut factory = TxFactory::new();
+    for count in [default_count / 8, default_count] {
+        let (block, members) = full_block(&mut factory);
+        assert!(members.len() <= count);
+        let block_cost: u64 = members.iter().map(VerifiedUnminedTx::cost).sum();
+        let background_count = count - members.len();
+        let mut storage = Storage::new(&Config {
+            tx_cost_limit: u64::try_from(background_count).unwrap()
+                * MEMPOOL_TRANSACTION_COST_THRESHOLD
+                + block_cost,
+            ..Default::default()
+        });
+        for _ in 0..background_count {
+            storage
+                .insert(factory.tx(10_000), Vec::new(), None)
+                .unwrap();
+        }
+        for tx in &members {
+            storage.insert(tx.clone(), Vec::new(), None).unwrap();
+        }
+        let mined = block
+            .transactions
+            .iter()
+            .map(|tx| tx.unmined_id().mined_id())
+            .collect();
+        let mut sample = || {
+            let transactions = block.transactions.clone();
+            let start = Instant::now();
+            storage.clear_mined_dependencies(black_box(&mined));
+            let removed = black_box(
+                storage.reject_and_remove_same_effects(black_box(&mined), black_box(transactions)),
+            );
+            let elapsed = start.elapsed();
+            assert_eq!(removed.mined.len(), members.len());
+            assert!(removed.invalidated.is_empty());
+            assert_eq!(storage.transaction_count(), background_count);
+            storage.chain_rejected_same_effects.clear();
+            for tx in &members {
+                storage.insert(tx.clone(), Vec::new(), None).unwrap();
+            }
+            assert_eq!(storage.transaction_count(), count);
+            elapsed
+        };
+        for _ in 0..BLOCK_ITERATIONS {
+            let _ = sample();
+        }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let duration: Duration = (0..BLOCK_ITERATIONS).map(|_| sample()).sum();
+            samples.push(duration / BLOCK_ITERATIONS);
+        }
+        samples.sort();
+        println!(
+            "full_block transactions={count} block_bytes={} block_transactions={} removed={} \
+             median_ns={} min_ns={} max_ns={}",
+            block.zcash_serialized_size(),
+            block.transactions.len(),
+            members.len(),
+            samples[SAMPLES / 2].as_nanos(),
+            samples[0].as_nanos(),
+            samples[SAMPLES - 1].as_nanos(),
+        );
     }
 }

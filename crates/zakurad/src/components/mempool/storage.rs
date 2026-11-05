@@ -870,11 +870,9 @@ impl Storage {
         &self,
         tx_ids: HashSet<Hash>,
     ) -> impl Iterator<Item = &UnminedTx> {
-        self.verified
-            .transactions()
-            .iter()
-            .filter(move |(tx_id, _)| tx_ids.contains(tx_id))
-            .map(|(_, tx)| &tx.transaction)
+        tx_ids
+            .into_iter()
+            .filter_map(|tx_id| self.transactions().get(&tx_id).map(|tx| &tx.transaction))
     }
 
     /// Returns a transaction and the transaction ids of its dependencies, if it is in the verified set.

@@ -1,8 +1,9 @@
 # Raw trace endpoint
 
-The optional endpoint serves structured JSONL traces for diagnostics and
-future collection tools. It reuses existing capture; it does not enable more
-trace events, aggregate nodes, or export application logs or OpenTelemetry spans.
+The optional endpoint serves the node's structured JSONL trace files over local
+HTTP, so that collectors can copy and follow them while the node appends. It
+serves the existing files only. It does not enable more trace events, and it
+does not export application logs or OpenTelemetry spans.
 
 ```toml
 [network.zakura]
@@ -12,132 +13,133 @@ trace_dir = "/var/lib/zakura/traces"
 raw_endpoint_addr = "127.0.0.1:9009"
 ```
 
-Both settings are required. Without `raw_endpoint_addr` no listener is opened.
-Invalid addresses, missing `trace_dir`, and bind errors fail node startup.
-The endpoint currently requires Unix for no-follow file opens.
+Both settings are required. Without `raw_endpoint_addr`, the node opens no
+listener. A non-loopback address, a missing `trace_dir` or a bind error fails
+node startup. The endpoint requires Unix.
 
-```sh
-curl --fail http://127.0.0.1:9009/traces/block_sync
+## Requests
+
+| Request | Response |
+| --- | --- |
+| `GET /traces` | `application/json` index of the tables. |
+| `GET /traces/<table>` | `application/x-ndjson`: the table's file, `<trace_dir>/<table>.jsonl`. |
+| `HEAD` on either path | The same headers, with no body. |
+
+A table name is 1 to 64 characters from `a-z`, `0-9` and `_`. The endpoint
+serves every regular file in `trace_dir` whose name is a table name followed by
+`.jsonl`. It never follows a symlink.
+
+The index lists each table's name, its length in bytes and its `ETag`:
+
+```json
+{"tables":[{"name":"block_sync","bytes":1048576,"etag":"\"803-1a2b-17f0c0ffee\""}]}
 ```
 
-`GET /traces/<table>` returns `application/x-ndjson`. Allowed table names are
-`handshake`, `conn`, `stream`, `discovery`, `ratelimit`, `header_sync`,
-`legacy_request`, `block_sync`, `commit_state`, `quic_conn`, `queue_send`,
-`legacy_peer_request`, and `legacy_sync`. Missing files return 404; unavailable
-or unsafe files return 503. Other paths, methods and query parameters are rejected.
-
-A request without `Range` streams a fixed prefix of the current file, stopping at
-the length observed when it was opened. Appends beyond that length are excluded.
-Memory is bounded to 64 KiB chunks; the connection has a 30-second deadline,
-so large or slow transfers may end early. Empty files return an empty 200 response.
-
-Use a single inclusive byte range to select a portion:
-
 ```sh
-curl --fail -D headers.txt -H 'Range: bytes=0-1048575' \
-  http://127.0.0.1:9009/traces/block_sync -o part.jsonl
+curl --fail http://127.0.0.1:9009/traces
+curl --fail http://127.0.0.1:9009/traces/block_sync -o block_sync.jsonl
 ```
 
-A range returns 206 with `Content-Range`, `Content-Length`, and `X-Trace-File-Id`.
-Each range is limited to 1 MiB. `bytes=0-` selects up to that bound; explicit ends
-are clipped to the observed file length. Suffix and multiple ranges are rejected.
-Invalid, oversized and beyond-EOF ranges return 416. Query parameters are rejected.
+A response ends at the file's length when the node opened it. Rows appended
+after that point go to later requests. Responses are exact bytes, so the last
+line can be incomplete; collectors should hold back a partial line until a
+later request completes it.
 
-Resume at the byte after the previous response's end, passing its file identity:
+### Byte ranges
+
+The endpoint implements HTTP range requests from RFC 9110 for one range:
+`bytes=<first>-`, `bytes=<first>-<last>` or `bytes=-<suffix>`. A satisfiable
+range returns 206 with `Content-Range: bytes <first>-<last>/<length>`. A range
+that starts at or past the end returns 416 with `Content-Range: bytes */<length>`.
+A malformed range or a multi-range request returns 416. A `Range` header with
+another unit is ignored. Ranges have no size limit.
+
+### File identity
+
+Every response for a table carries a strong `ETag` that names the file, not
+its contents: the device, the inode and, where the filesystem records it, the
+birth time. The trace writer only appends, so bytes already read under one
+`ETag` never change. A replaced file has a new `ETag`.
+
+- `If-Range: <etag>` with a range sends the range when the `ETag` matches, and
+  the whole current file with 200 when it does not.
+- `If-Match: <etag>` returns 412 when the `ETag` does not match.
+
+### Following a table
+
+Store the `ETag` and the number of bytes read, then poll:
 
 ```sh
-curl --fail -H 'Range: bytes=1048576-' \
-  -H 'X-Trace-File-Id: <value from previous response>' \
-  http://127.0.0.1:9009/traces/block_sync -o next-part.jsonl
+curl -H 'Range: bytes=<bytes read>-' -H 'If-Range: <etag>' \
+  http://127.0.0.1:9009/traces/block_sync
 ```
 
-Nonzero offsets require this header (428 otherwise); malformed tokens return 400.
-The token contains the file's device, inode and captured length. Every resumed
-range is interpreted against that original length, including `Content-Range`'s
-total. Appends do not change the token or extend the response. Replacement or an
-observed length below the captured bound returns 409. During streaming an observed
-shrink or premature EOF aborts the body. Start a new collection on 409; never
-concatenate portions from different tokens.
+| Status | Meaning | Next step |
+| --- | --- | --- |
+| 206 | New bytes after the cursor. | Append them and advance the cursor. |
+| 416, length equals the cursor | Nothing new. | Poll again later. |
+| 416, length below the cursor | The file was truncated. | Restart from byte 0. |
+| 200 | The file was replaced. | Discard the old rows and store the new `ETag`. |
 
-After an interrupted transfer, resume after the last byte actually received with
-the same token. Responses preserve exact bytes, including partial JSONL lines;
-join portions before parsing lines. At the original end, further ranges return
-416 even if the source has grown. Omit the token to capture a fresh prefix and
-see newer rows. There is no wait for future rows or live-tail subscription.
+One request per poll is enough. A collector that follows many tables can poll
+`GET /traces` and request only the tables whose length grew.
 
-## Consistency model: append-only source
+## Status codes
 
-This is a fixed-prefix view of an **append-only** file, not an immutable filesystem
-snapshot or content-hash validator. The current `zakura-jsonl-trace` writer opens
-files with `create(true).append(true)`, retains its handles, and appends buffered
-rows; it has no built-in truncate or rotation path. That producer can keep writing
-while an earlier prefix is streamed or resumed. Tests exercise the actual writer
-and appends before/between body reads and range requests.
+| Status | Cause |
+| --- | --- |
+| 400 | A query string, or a non-ASCII `Range`, `If-Range` or `If-Match`. |
+| 403 | `Host` differs from the bound address, the request has an `Origin` header or an absolute URI, or the table's path is not a regular file. |
+| 404 | An unknown path, an invalid table name, or a missing file. |
+| 405 | A method other than `GET` and `HEAD`. |
+| 412 | `If-Match` failed. |
+| 416 | The range is unsatisfiable, malformed or multiple. |
+| 503 | Every filesystem thread is busy or stalled, or the file cannot be read. |
 
-**Disable external copytruncate and in-place editing for files being collected.**
-The continuous-sync controller in `deploy/continuous-sync/continuous-sync.py`
-and its logrotate template currently use copytruncate; their default rotation
-setup is incompatible with this endpoint's resume contract. This PR does not
-change that controller or silently disable its retention policy.
+Refusals carry a one-line `text/plain` reason.
 
-Device/inode and a minimum length detect replacement and observed truncation.
-They cannot detect truncate-and-regrow above the captured length between checks,
-same-inode overwrites, or inode reuse. These unsupported mutations can mix bytes
-without an error; the token must not be treated as proof against them. There is
-no retained file history, copy, content hashing or per-client cursor state.
-Use a trusted local filesystem and an operator-controlled append-only directory,
-and start a new capture after node restarts or operator file changes.
-Rename/replacement between requests returns 409. An already-open stream remains
-on the old descriptor; it never switches to the replacement pathname. However,
-the current writer also keeps its old descriptor, so renaming files is not a
-supported way to redirect its future output. Do not assume consistency across
-tables or that a captured last line is complete.
+## Consistency
 
-Reading does not flush writers or wait for future rows. Existing buffering,
-dropped rows and rotation still apply. There is no acknowledgement, retention
-guarantee, backpressure on capture, or historical segment export. Collectors must
-not interpret exports as complete evidence. CSV export and table selection in
-PRs #965 and #1549 remain separate work; this endpoint exports main's current
-JSONL format only.
+The endpoint is correct for append-only files, which is how the node's trace
+writer works: it opens each file with `create(true).append(true)`, keeps the
+handle and never truncates or rotates it. An external tool that rewrites a file
+in place, truncates it and lets it regrow past a collector's cursor, or reuses
+its inode can mix old and new bytes without an error. **Do not run
+copytruncate log rotation on collected files.** The continuous-sync
+controller's logrotate template uses copytruncate today.
 
-## Access and resource limits
+The trace writer buffers rows and can drop them under load, so an export is
+not complete evidence. There is no ordering across tables.
 
-Only literal loopback bind addresses are accepted. The request Host must match
-the bound address and port exactly. Requests with an Origin header or an absolute
-URI are rejected, and responses disable caching and MIME sniffing. No CORS
-permission is supplied. These controls limit browser and DNS-rebinding access;
-they do not authenticate local processes.
+## Access
 
-Every local user able to reach the listener can read traces. Traces may contain
-peer addresses, block timing, node identity, and other sensitive operational data.
-Use only on hosts with trusted local users. For remote collection, use an
-operator-managed authenticated SSH tunnel or a TLS proxy with authentication and
-access controls. Preserve the endpoint's literal Host header. Do not forward the
-port publicly or treat a loopback bind inside a container as remote authentication.
+The listener accepts only loopback addresses. A request must send the literal
+bound address and port as `Host`, and must not send `Origin` or an absolute URI.
+Responses set `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`
+and grant no CORS access. These checks stop browsers and DNS rebinding. They do
+not authenticate local processes: **every local user that can reach the port
+can read the traces**, which include peer addresses, block timing and node
+identity.
 
-Keep the trace directory and its parent directories writable only by the node
-operator. The endpoint rejects symlinked files and nonregular files, but assumes
-trusted directory ownership; it does not sandbox an attacker who can replace
-parent directories or plant hard links. It never accepts a filesystem path from
-a request and exports only the fixed table allowlist.
+For remote collection, use an authenticated SSH tunnel or an authenticating TLS
+proxy that forwards the bound address as `Host`. Do not forward the port
+publicly, and do not treat a loopback bind inside a container as access control.
 
-The server processes one connection at a time, disables keep-alive, bounds HTTP
-headers, limits range responses to 1 MiB, and closes connections after 30 seconds.
-Slow local clients can delay other readers but cannot create unbounded concurrent
-request tasks. Accept errors retry after a one-second, shutdown-cancellable backoff.
+Keep `trace_dir` and its parent directories writable only by the node operator.
+The endpoint refuses symlinks and non-regular files but trusts the directory.
 
-One dedicated thread performs all trace filesystem operations, including open,
-metadata, seek and read. It does not use the node's shared Tokio blocking pool.
-Admission belongs to the filesystem job until it exits, not to the HTTP request:
-a timeout or disconnect cannot release the slot while a syscall is still running.
-Further exports return 503 while the worker is occupied. A one-slot response
-channel applies backpressure, allowing at most one queued and one worker-owned
-64 KiB chunk, plus the chunk being sent by HTTP and the fixed worker thread stack.
-There is no unbounded job queue or per-request worker thread.
+## Resource limits
 
-Shutdown closes the listener and response channel. The worker exits after its
-current job returns. An operating-system filesystem syscall cannot be forcibly
-cancelled; permanently stalled storage can strand this single dedicated thread
-and its file handle until process exit, but cannot accumulate workers or occupy
-the node's shared blocking pool. These limits do not remove the existing disk
-and CPU cost of enabling trace capture.
+- At most 4 connections are served at once; further clients wait in the listen
+  backlog. Each connection serves one request.
+- A connection is dropped when request headers, the client's reading or the
+  file read stall for 30 seconds. A transfer that keeps making progress has no
+  deadline.
+- Each response reads the file in 256 KiB chunks and holds at most three.
+- Each request runs its file reads on its own thread, at most 4 at once. A
+  read that stalls keeps its thread until the read returns, and further
+  requests get 503 while every thread is taken. The threads are not Tokio's
+  blocking pool, so a stalled disk cannot block the node's other blocking work
+  or its shutdown.
+- On shutdown the endpoint closes its listener and connections. Each file
+  thread exits when its current read returns.

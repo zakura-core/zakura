@@ -22,7 +22,7 @@ The simulator keeps the dev/test profile's debug assertions and overflow
 checks. Rust 1.94.0 refuses this commit, which requires Rust 1.97 or later.
 
 ```sh
-export CARGO_TARGET_DIR="$TMPDIR/mut-1-baseline/build"
+export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/mut-1-baseline/build"
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 export RUSTFLAGS='--cfg zakura_sim'
 cargo +1.99.0 test --locked -j 8 -p zakura-sim \
@@ -161,7 +161,7 @@ It does not complete mut-1.2's compilation and sensitivity gate.
 ### Reproduce
 
 ```sh
-python3 scripts/mutation_inventory.py --output "$TMPDIR/mutations.json"
+python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"
 python3 -m unittest discover -s scripts/tests -p test_mutation_inventory.py -v
 python3 scripts/check-fuzz-campaign.py
 ```

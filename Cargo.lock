@@ -2845,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "14.0.0"
+version = "15.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "14.1.1"
+version = "15.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

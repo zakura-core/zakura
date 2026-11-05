@@ -121,6 +121,7 @@ impl HeaderWorkLedger {
                 peer,
                 incarnation,
                 headers,
+                ..
             } => {
                 let current = self.rounds.get(peer).copied();
                 let record = self.record_mut(*call)?;
@@ -222,6 +223,7 @@ impl HeaderWorkLedger {
                     peer,
                     source,
                     owner,
+                    ..
                 }),
                 Some(PortCall::Apply {
                     peer: apply_peer,
@@ -311,6 +313,8 @@ mod tests {
             peer: peer(byte),
             source: SourceId::from_digest([byte; 32]),
             owner: owner(),
+            target: zakura_header_chain::Frontier::new(block::Height(5), block::Hash([9; 32])),
+            hashes: Vec::new(),
         }
     }
 
@@ -343,6 +347,7 @@ mod tests {
             peer: peer(byte),
             incarnation,
             headers: 5,
+            leases: Vec::new(),
         }
     }
 
@@ -468,6 +473,7 @@ mod tests {
             peer: peer(1),
             incarnation: 1,
             headers: 4,
+            leases: Vec::new(),
         });
         refused_as(wrong_count, "BadHandoff");
 

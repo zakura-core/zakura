@@ -421,7 +421,6 @@ impl HeaderSyncReactor {
         active: &ActiveHeaderRequest,
         terminal_outcome: HeaderRequestTerminal,
     ) {
-        observe!(self, ReactorEvent::retired(active, terminal_outcome));
         if !terminal_outcome.needs_terminal_trace() {
             return;
         }

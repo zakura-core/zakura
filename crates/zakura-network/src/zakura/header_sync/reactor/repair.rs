@@ -62,11 +62,18 @@ impl HeaderSyncReactor {
         retry: VctRepairRetry,
     ) {
         let source = retry.source;
+        // The retirement is reported once the queue has released the round.
+        #[cfg(any(test, zakura_sim))]
+        let retiring = self.peer_work_queue.active_owner(owner.into()).cloned();
         if let Some(active) = self.peer_work_queue.active_owner(owner.into()).cloned() {
             self.emit_request_terminal(&active, retry.terminal);
         }
         self.cancel_owned_request(source, owner.into());
         self.peer_work_queue.remove_owner(owner.into());
+        #[cfg(any(test, zakura_sim))]
+        if let Some(active) = retiring {
+            observe!(self, ReactorEvent::retired(&active, retry.terminal));
+        }
         let peer = self
             .sessions
             .iter()
@@ -454,7 +461,6 @@ impl HeaderSyncReactor {
         {
             return RepairAttempt::NoLocalCapacity;
         }
-        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let session = self
             .sessions
             .get(&peer)

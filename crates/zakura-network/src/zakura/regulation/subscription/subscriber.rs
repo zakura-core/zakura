@@ -129,6 +129,13 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         self
     }
 
+    /// The frame the tapped stream's service handles now, which a
+    /// `PageClaimed` names, or `None` without a tap.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn serving_frame(&self) -> Option<u64> {
+        self.tap.as_ref().and_then(|tap| tap.stream().serving())
+    }
+
     /// Report `transition` if a tap is attached. `transition` is built only
     /// then.
     #[cfg(any(test, zakura_sim))]

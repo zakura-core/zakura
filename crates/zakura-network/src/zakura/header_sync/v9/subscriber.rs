@@ -217,6 +217,10 @@ pub struct Admitted {
     pub(crate) reaches_target: bool,
     /// Whether this node sent `Close` before the page arrived.
     pub(crate) after_close: bool,
+    /// The page's position among its stream's reads, as the transport's
+    /// `PageClaimed` reports it, when a transport reader admitted it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) frame: Option<u64>,
     seal: Seal,
 }
 

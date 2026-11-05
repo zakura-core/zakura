@@ -232,6 +232,10 @@ fn build_header_sync_reactor(
         peer_work_queue: PeerWorkQueue::default(),
         last_snapshot_refresh_trace_at: Cell::new(None),
     };
+    #[cfg(any(test, zakura_sim))]
+    reactor
+        .peer_work_queue
+        .observed_by(&reactor.startup.observer);
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
     }
@@ -1283,12 +1287,17 @@ impl HeaderSyncReactor {
             active.matches_response_page(response.initial_target_tip_hash, returned_ancestor)
         });
         if !page_matches
-            || !self.peer_work_queue.stage_page(
+            || !sim_arg!(self.peer_work_queue.stage_page(
                 &peer,
                 returned_ancestor,
                 response.entries,
                 admitted.cursor,
-            )
+            ); observe::PageArrival {
+                from_peer: peer.clone(),
+                from_session: session_id,
+                subscription: admitted.id,
+                frame: admitted.frame,
+            })
         {
             self.reject_page(peer, session_id);
             return;
@@ -1505,7 +1514,6 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::StagingRefused);
             return;
         }
-        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let Some(session) = self
             .sessions
             .get(peer)
@@ -2128,7 +2136,6 @@ impl HeaderSyncReactor {
             self.defer_ordinary_target(&peer);
             return;
         }
-        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let source = source_id_from_peer(&peer);
         let (sent, locator) = match resumed {
             Some((id, _, accepted, _)) => {
@@ -2361,6 +2368,10 @@ impl HeaderSyncReactor {
             .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
         for active in self.peer_work_queue.retire_obsolete_active(snapshot) {
             self.state.clear_request_deadline(&active.peer);
+            observe!(
+                self,
+                ReactorEvent::retired(&active, HeaderRequestTerminal::SnapshotObsolete)
+            );
             self.emit_request_terminal(&active, HeaderRequestTerminal::SnapshotObsolete);
             self.cancel_active_request(&active);
         }
@@ -2750,6 +2761,7 @@ impl HeaderSyncReactor {
         let reserved = self.peer_work_queue.reserved_header_count(peer);
         let owned = self.peer_work_queue.owned_header_count(peer);
         if let Some(active) = self.peer_work_queue.remove(peer) {
+            observe!(self, ReactorEvent::retired(&active, terminal_outcome));
             self.emit_request_terminal(&active, terminal_outcome);
             self.cancel_active_request(&active);
         }

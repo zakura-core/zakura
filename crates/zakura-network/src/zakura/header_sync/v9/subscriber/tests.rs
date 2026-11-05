@@ -46,6 +46,7 @@ impl Admitted {
             },
             reaches_target: page.reaches_initial_target,
             after_close: false,
+            frame: None,
             seal: Seal,
         }
     }

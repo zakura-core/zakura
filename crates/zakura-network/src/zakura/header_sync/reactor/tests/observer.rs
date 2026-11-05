@@ -36,7 +36,7 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations or session admissions and ends.
+    /// capacity accounting or session admissions and ends.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -46,6 +46,11 @@ impl Recorder {
                     ReactorEvent::HeadersHeld { .. }
                         | ReactorEvent::HeadersEnded { .. }
                         | ReactorEvent::ReservationOpened { .. }
+                        | ReactorEvent::ReservationBound { .. }
+                        | ReactorEvent::ReservationEnded { .. }
+                        | ReactorEvent::PageStaged { .. }
+                        | ReactorEvent::LeaseReturned { .. }
+                        | ReactorEvent::RoundReleased { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::CallEnded {
@@ -719,17 +724,28 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
             },
         )
     } else {
+        let operation = prepare_operation(
+            &reactor,
+            &peer,
+            HeaderTargetPurpose::Normal,
+            old.entries.clone(),
+        );
+        let HeaderPortOperation::PrepareHeaderTarget { target, .. } = &operation else {
+            unreachable!("`prepare_operation` always builds a prepare")
+        };
+        let target = *target;
         (
-            prepare_operation(
-                &reactor,
-                &peer,
-                HeaderTargetPurpose::Normal,
-                old.entries.clone(),
-            ),
+            operation,
             PortCall::Prepare {
                 peer: peer.clone(),
                 source,
                 owner,
+                target,
+                hashes: old
+                    .entries
+                    .iter()
+                    .map(|entry| entry.header.hash())
+                    .collect(),
             },
         )
     };
@@ -878,6 +894,19 @@ async fn synthetic_prepare_ends_not_submitted() {
     recorder.take();
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
+        let HeaderPortOperation::PrepareHeaderTarget {
+            target, entries, ..
+        } = &operation
+        else {
+            unreachable!("`prepare_operation` always builds a prepare")
+        };
+        let (target, hashes) = (
+            *target,
+            entries
+                .iter()
+                .map(|entry| entry.header.hash())
+                .collect::<Vec<_>>(),
+        );
         assert!(matches!(
             reactor.dispatch_action(operation),
             StorageDispatch::Started(_)
@@ -890,6 +919,8 @@ async fn synthetic_prepare_ends_not_submitted() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    target,
+                    hashes,
                 },
             },
             ReactorEvent::CallEnded {

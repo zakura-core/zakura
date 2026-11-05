@@ -31,7 +31,9 @@
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands
 //! them to its [`PolicySource`](super::PolicySource), whose triggers count
-//! them.
+//! them. Its header capacity accounting, the reservations with their
+//! bindings and ends, staged pages and returned leases, stays out too: the
+//! ownership check folds it, and a [`ReservationEvidence`] keeps it.
 //!
 //! Every event the reactor reports in the run also feeds the tap's
 //! [`SessionEvidence`], the reactor's session view. A rule that view
@@ -62,6 +64,7 @@ use zakura_storage::header::controlled::ControlledPort;
 use super::{
     pair::{PairError, Pairer},
     policy::LinkEffect,
+    reservation::ReservationEvidence,
     session::SessionEvidence,
 };
 use crate::{
@@ -111,6 +114,8 @@ struct TapState {
     work: Mutex<WorkCheck>,
     /// The reactor's session view.
     sessions: SessionEvidence,
+    /// The reactor's capacity accounting facts.
+    reservations: ReservationEvidence,
 }
 
 /// The tap's ownership check, and the first rule a history broke.
@@ -233,29 +238,71 @@ impl Drop for TapObserver {
 }
 
 impl HeaderSyncObserver for TapObserver {
+    /// [`TapState::record`].
+    fn observe(&self, event: ReactorEvent) {
+        self.0.record(event);
+    }
+
+    /// A [`TapAccounting`] handle, so a reservation or lease that outlives
+    /// the reactor doesn't keep the tap reading it as alive. The teardown
+    /// check then finds it open.
+    fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+        Some(Arc::new(TapAccounting(self.0.clone())))
+    }
+}
+
+/// The handle the reactor's work queue reports its accounting through. It
+/// shares the tap's state but isn't the observer whose lifetime marks the
+/// reactor's.
+struct TapAccounting(Arc<TapState>);
+
+impl std::fmt::Debug for TapAccounting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TapAccounting")
+    }
+}
+
+impl HeaderSyncObserver for TapAccounting {
+    /// [`TapState::record`].
+    fn observe(&self, event: ReactorEvent) {
+        self.0.record(event);
+    }
+}
+
+impl TapState {
     /// Buffers `event` with the port's last fact, or refuses it outside the
     /// tap's run. Neither step yields.
-    fn observe(&self, event: ReactorEvent) {
-        let state = &self.0;
+    fn record(self: &Arc<Self>, event: ReactorEvent) {
+        let state = self;
         let in_run = zakura_rt::sim::run_id() == Some(state.run);
         // The session view sees every event and picks what its rules read,
         // so no second list here can drift from them.
         if in_run {
             state.sessions.reactor(&event);
         }
-        // Ownership, reservation and admission events stay out of the
-        // observation log, whose format pinned Plans fix.
-        if matches!(
-            event,
-            ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
-        ) {
+        // Ownership, accounting, reservation and admission events stay out
+        // of the observation log, whose format pinned Plans fix. The run's
+        // own shutdown drops a live reactor's queue and calls after the log
+        // froze, which ends their reservations, leases and ownership.
+        let accounted = ReservationEvidence::keeps(&event);
+        if in_run && accounted {
+            state.reservations.record(&event);
+        }
+        if accounted
+            || matches!(
+                event,
+                ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
+            )
+        {
             if in_run {
                 state.check_work(&event);
             }
-            return;
+            if !matches!(event, ReactorEvent::ReservationOpened { .. }) {
+                return;
+            }
         }
         let effect = match &event {
-            ReactorEvent::ReservationOpened { peer } => {
+            ReactorEvent::ReservationOpened { peer, .. } => {
                 Some((LinkEffect::ReservationOpened, peer.clone()))
             }
             ReactorEvent::SessionAdmitted { peer, .. } => {
@@ -334,6 +381,22 @@ impl ReactorTap {
         ReactorTap::with_sessions(sim, port, node, SessionEvidence::default())
     }
 
+    /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
+    /// also kept in `reservations`.
+    ///
+    /// # Panics
+    ///
+    /// As [`ReactorTap::with_sessions`] does.
+    pub fn with_evidence(
+        sim: &mut Sim,
+        port: &Arc<ControlledPort>,
+        node: &str,
+        sessions: SessionEvidence,
+        reservations: ReservationEvidence,
+    ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
+        ReactorTap::tapped(sim, port, node, sessions, reservations)
+    }
+
     /// [`ReactorTap::new`], with the reactor's session view kept in
     /// `sessions`, which this tap's run binds and freezes with its log.
     ///
@@ -345,6 +408,17 @@ impl ReactorTap {
         port: &Arc<ControlledPort>,
         node: &str,
         sessions: SessionEvidence,
+    ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
+        ReactorTap::tapped(sim, port, node, sessions, ReservationEvidence::default())
+    }
+
+    /// The tap [`ReactorTap::with_evidence`] makes.
+    fn tapped(
+        sim: &mut Sim,
+        port: &Arc<ControlledPort>,
+        node: &str,
+        sessions: SessionEvidence,
+        reservations: ReservationEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
@@ -364,6 +438,7 @@ impl ReactorTap {
                 buffer: Mutex::default(),
                 work: Mutex::default(),
                 sessions,
+                reservations,
             }))
         });
         let state = observer.0.clone();
@@ -476,6 +551,7 @@ fn call(call: PortCall) -> ReactorCall {
             peer: supplier,
             source,
             owner,
+            ..
         } => ReactorCall::Prepare {
             peer: peer(&supplier),
             source: hex(&source.digest()),

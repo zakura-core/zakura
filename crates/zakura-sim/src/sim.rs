@@ -135,6 +135,23 @@ pub struct Sim {
     holds: Vec<Box<dyn TaskHold>>,
     /// Run once the log freezes, before the scheduler shuts down.
     on_frozen: Vec<Box<dyn FnOnce()>>,
+    /// The tasks stopped mid-poll at the boundary the sources observe now.
+    mid_poll: MidPoll,
+}
+
+/// The tasks stopped mid-poll at the boundary a run's sources are
+/// observing: each is partway through synchronous code that yielded at a
+/// preemption point. A task that isn't can't be between a change it makes
+/// and a report that follows it in the same poll. Cloning shares it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MidPoll(Rc<RefCell<BTreeSet<TaskId>>>);
+
+impl MidPoll {
+    /// Whether `task` is stopped mid-poll at the boundary being observed.
+    /// Read it only while observing.
+    pub(crate) fn contains(&self, task: TaskId) -> bool {
+        self.0.borrow().contains(&task)
+    }
 }
 
 impl Sim {
@@ -161,7 +178,14 @@ impl Sim {
             config,
             holds: Vec::new(),
             on_frozen: Vec::new(),
+            mid_poll: MidPoll::default(),
         }
+    }
+
+    /// The tasks stopped mid-poll at each boundary the sources observe, as
+    /// [`MidPoll`] says.
+    pub(crate) fn mid_poll(&self) -> MidPoll {
+        self.mid_poll.clone()
     }
 
     /// Runs `hook` once the run's log freezes, before the scheduler shuts
@@ -588,6 +612,7 @@ impl Sim {
     /// failure one of them records in the run's failure cell, such as a
     /// reactor port panic, still outranks it. The first failure is returned.
     fn observe_sources(&mut self, st: &mut State) -> Result<(), HarnessFailure> {
+        *self.mid_poll.0.borrow_mut() = self.sched().mid_poll();
         let mut failed = None;
         for (index, source) in self.sources.iter_mut().enumerate() {
             if let Err(detail) = source.observe(&mut st.log) {

@@ -15,6 +15,8 @@ use zakura_header_chain::{
 };
 use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
+#[cfg(zakura_sim)]
+pub use super::scheduler::peer_work::{HeaderResourceProbe, HeaderResources};
 use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
 };
@@ -44,6 +46,13 @@ pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     /// from its own handles can return one that doesn't count.
     fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
         None
+    }
+
+    /// Takes the reactor's [`HeaderResourceProbe`], which the reactor hands
+    /// over once, as it's built. The default drops it.
+    #[cfg(zakura_sim)]
+    fn resource_probe(&self, probe: HeaderResourceProbe) {
+        drop(probe);
     }
 }
 

@@ -236,6 +236,14 @@ fn build_header_sync_reactor(
     reactor
         .peer_work_queue
         .observed_by(&reactor.startup.observer);
+    #[cfg(zakura_sim)]
+    if let Some(observer) = &reactor.startup.observer.0 {
+        observer.resource_probe(observe::HeaderResourceProbe::new(
+            &reactor.peer_work_queue,
+            &reactor.locator_capacity,
+            zakura_header_chain::MAX_STAGED_TARGETS_V1,
+        ));
+    }
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         reactor.emit_snapshot_observed(None, snapshot);
     }

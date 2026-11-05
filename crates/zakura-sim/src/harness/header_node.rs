@@ -12,8 +12,10 @@
 //! A `Shutdown` step stops the node under test on purpose, which its tap
 //! expects. The tap and the topology's links keep the node's
 //! [`session`] view, and the tap keeps its header capacity accounting in a
-//! [`reservation::ReservationEvidence`].
+//! [`reservation::ReservationEvidence`], and its resource probe's reads in a
+//! [`capacity::CapacityEvidence`].
 
+pub mod capacity;
 mod pair;
 pub mod policy;
 pub mod reservation;

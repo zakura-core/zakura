@@ -722,6 +722,13 @@ impl Scheduler {
         ids
     }
 
+    /// The tasks stopped mid-poll, at a preemption point or parked on a
+    /// lock, rather than at a poll boundary. Each is partway through
+    /// synchronous code that yielded at a point.
+    pub fn mid_poll(&self) -> BTreeSet<TaskId> {
+        self.state(|s| s.mid_poll.clone())
+    }
+
     /// What the run can do next.
     pub fn status(&self) -> Status {
         self.state(|s| {

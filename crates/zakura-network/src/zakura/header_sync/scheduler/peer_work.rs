@@ -20,6 +20,8 @@ use zakura_rt::{
 };
 
 mod policy;
+#[cfg(zakura_sim)]
+mod probe;
 
 pub(in crate::zakura::header_sync) use policy::{
     decide_offer, page_next, repair_page, OfferDecision, OfferFacts, OfferedPeerWork, PageFacts,
@@ -31,6 +33,8 @@ pub use policy::{
     HeaderWorkEnd, StorageCallKind, WorkIncarnation,
 };
 use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
+#[cfg(zakura_sim)]
+pub use probe::{HeaderResourceProbe, HeaderResources};
 
 #[cfg(any(test, zakura_sim))]
 use super::super::observe::{

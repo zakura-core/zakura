@@ -1,4 +1,4 @@
-//! Opt-in, local-only access to bounded snapshots of structured trace files.
+//! Opt-in, local-only streams and bounded byte ranges of structured trace files.
 
 use std::{
     convert::Infallible,
@@ -356,6 +356,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stream_and_resume_preserve_exact_bytes() {
         let dir = tempfile::tempdir().unwrap();

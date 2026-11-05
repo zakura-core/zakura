@@ -33,6 +33,8 @@ use crate::methods::types::get_block_template::{
 };
 
 const PACKING_THRESHOLD_BYTES: usize = 50_000;
+const MAX_PACKING_SCAN_ENTRIES: usize = 100;
+const SELECTION_STOP_BYTES: usize = 3_000;
 const SAMPLES: usize = 12;
 
 #[derive(Clone, Copy, Debug)]
@@ -260,7 +262,10 @@ impl IndexedSelector {
     }
 
     fn finish(mut self, pack: bool) -> Selection {
-        while let Some(id) = self.best() {
+        while self.limits.remaining_bytes > SELECTION_STOP_BYTES {
+            let Some(id) = self.best() else {
+                break;
+            };
             if !self.add_package(id) {
                 break;
             }
@@ -269,8 +274,16 @@ impl IndexedSelector {
         let mut packing_elapsed = Duration::ZERO;
         if pack && self.limits.remaining_bytes > PACKING_THRESHOLD_BYTES {
             let start = Instant::now();
-            for offset in 0..self.order.len() {
-                if self.limits.remaining_bytes < self.minimum_size {
+            let scan_end = self
+                .cursor
+                .saturating_add(MAX_PACKING_SCAN_ENTRIES)
+                .min(self.order.len());
+            // Continue from the main pass without revisiting its prefix. Every
+            // visited entry counts, including selected or ineligible entries.
+            for offset in self.cursor..scan_end {
+                if self.limits.remaining_bytes <= SELECTION_STOP_BYTES
+                    || self.limits.remaining_bytes < self.minimum_size
+                {
                     break;
                 }
                 scanned += 1;
@@ -317,6 +330,9 @@ impl Factory {
         spent: Vec<OutPoint>,
         outputs: usize,
     ) -> VerifiedUnminedTx {
+        if actions == 0 {
+            self.serial += 1;
+        }
         let mut authorized = Vec::new();
         for _ in 0..actions {
             self.serial += 1;
@@ -356,7 +372,7 @@ impl Factory {
                 .collect(),
             sapling_shielded_data: None,
             orchard_shielded_data: None,
-            ironwood_shielded_data: Some(ironwood::ShieldedData {
+            ironwood_shielded_data: (actions > 0).then(|| ironwood::ShieldedData {
                 flags: ironwood::Flags::ENABLE_SPENDS,
                 value_balance: Amount::zero(),
                 shared_anchor: Default::default(),
@@ -365,10 +381,9 @@ impl Factory {
                 binding_sig: [0; 64].into(),
             }),
         };
-        assert!(tx
-            .ironwood_shielded_data()
-            .unwrap()
-            .proof_size_is_canonical());
+        if let Some(shielded) = tx.ironwood_shielded_data() {
+            assert!(shielded.proof_size_is_canonical());
+        }
         let unmined: transaction::UnminedTx = tx.into();
         let conventional: u64 = unmined.conventional_fee().into();
         let mut verified = VerifiedUnminedTx::new(
@@ -524,6 +539,7 @@ fn validate(
     height: Height,
     miner: &MinerParams,
 ) -> Stats {
+    assert!(selection.scanned <= MAX_PACKING_SCAN_ENTRIES);
     let mut limits = limits(network, height, miner);
     let mut selected = HashSet::new();
     let mut bytes = 0;
@@ -604,7 +620,104 @@ fn indexed_prototype_packing_preserves_priority_prefix_and_fills_the_gap() {
     let packed_stats = validate(&packed, &fixture, &network, height, &miner);
     assert!(packed.txs.starts_with(&plain.txs));
     assert!(packed_stats.remaining < plain_stats.remaining);
-    assert!(packed.scanned <= fixture.pool.len());
+    assert!(packed.scanned <= MAX_PACKING_SCAN_ENTRIES);
+}
+
+#[test]
+fn indexed_prototype_packing_stops_after_one_hundred_entries() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let mut txs: Vec<_> = (0..=MAX_PACKING_SCAN_ENTRIES)
+        .map(|_| factory.tx(64, 10, Vec::new(), 1))
+        .collect();
+    let small = factory.tx(1, 1, Vec::new(), 1);
+    let small_id = small.transaction.id().mined_id();
+    txs.push(small);
+    let fixture = Fixture::from_transactions(txs);
+    let run = |mut txs: Vec<VerifiedUnminedTx>, deps, remove_first| {
+        if remove_first {
+            txs.remove(0);
+        }
+        let mut limits = limits(&network, height, &miner);
+        limits.remaining_bytes = PACKING_THRESHOLD_BYTES + 1;
+        IndexedSelector::new(txs, deps, limits).finish(true)
+    };
+
+    // The small transaction follows 100 oversized entries after the blocked
+    // priority candidate. It must not be visited as entry 101.
+    let (txs, deps) = fixture.snapshot();
+    let bounded = run(txs, deps, false);
+    assert_eq!(bounded.scanned, MAX_PACKING_SCAN_ENTRIES);
+    assert!(bounded.txs.is_empty());
+
+    // Removing one oversized transaction puts the fitting candidate exactly at
+    // the scan boundary, proving entry 100 is still considered.
+    let (txs, deps) = fixture.snapshot();
+    let boundary = run(txs, deps, true);
+    validate(&boundary, &fixture, &network, height, &miner);
+    assert_eq!(boundary.scanned, MAX_PACKING_SCAN_ENTRIES);
+    assert_eq!(boundary.txs.len(), 1);
+    assert_eq!(boundary.txs[0].1.transaction.id().mined_id(), small_id);
+}
+
+#[test]
+fn indexed_prototype_primary_stops_at_three_kilobytes() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let first = factory.tx(0, 10, Vec::new(), 1);
+    let first_size = first.transaction.size();
+    let first_id = first.transaction.id().mined_id();
+    let tail = factory.tx(0, 1, Vec::new(), 2);
+    assert!(tail.transaction.size() < SELECTION_STOP_BYTES);
+    let fixture = Fixture::from_transactions(vec![first, tail]);
+    for pack in [false, true] {
+        for remaining in [SELECTION_STOP_BYTES - 1, SELECTION_STOP_BYTES] {
+            let (txs, deps) = fixture.snapshot();
+            let mut limits = limits(&network, height, &miner);
+            limits.remaining_bytes = remaining;
+            let selection = IndexedSelector::new(txs, deps, limits).finish(pack);
+            assert!(selection.txs.is_empty());
+            assert_eq!(selection.scanned, 0);
+        }
+        let (txs, deps) = fixture.snapshot();
+        let mut limits = limits(&network, height, &miner);
+        limits.remaining_bytes = first_size + SELECTION_STOP_BYTES;
+        let selection = IndexedSelector::new(txs, deps, limits).finish(pack);
+        validate(&selection, &fixture, &network, height, &miner);
+        assert_eq!(selection.txs.len(), 1);
+        assert_eq!(selection.txs[0].1.transaction.id().mined_id(), first_id);
+    }
+}
+
+#[test]
+fn indexed_prototype_packing_stops_at_three_kilobytes() {
+    let (network, height, miner, _) = context();
+    let mut factory = Factory::new();
+    let mut txs = vec![factory.tx(64, 10, Vec::new(), 1)];
+    txs.extend((0..8).map(|_| factory.tx(1, 2, Vec::new(), 1)));
+    let remaining = txs[1..]
+        .iter()
+        .map(|tx| tx.transaction.size())
+        .sum::<usize>()
+        + SELECTION_STOP_BYTES;
+    assert!(remaining > PACKING_THRESHOLD_BYTES);
+    let tail = factory.tx(0, 1, Vec::new(), 1);
+    let tail_id = tail.transaction.id().mined_id();
+    assert!(tail.transaction.size() < SELECTION_STOP_BYTES);
+    txs.push(tail);
+    let fixture = Fixture::from_transactions(txs);
+    let (txs, deps) = fixture.snapshot();
+    let mut limits = limits(&network, height, &miner);
+    limits.remaining_bytes = remaining;
+    let selection = IndexedSelector::new(txs, deps, limits).finish(true);
+    let stats = validate(&selection, &fixture, &network, height, &miner);
+    assert_eq!(remaining - stats.bytes, SELECTION_STOP_BYTES);
+    assert_eq!(selection.scanned, 8);
+    assert_eq!(selection.txs.len(), 8);
+    assert!(selection
+        .txs
+        .iter()
+        .all(|(_, tx)| tx.transaction.id().mined_id() != tail_id));
 }
 
 /// The env gate keeps all-ignored CI runs from executing this performance job.

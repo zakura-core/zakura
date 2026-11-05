@@ -636,3 +636,734 @@ impl MiningRpcMethods for RpcRequestClient {
         .map_err(|err| eyre!(err))
     }
 }
+
+/// Exercises actual RPC admission, template selection, and mining across local PQ activation.
+#[cfg(feature = "pq")]
+pub(crate) async fn pq_mempool_test() -> Result<()> {
+    pq_spend_test(PqSpendScenario::Mempool).await
+}
+
+/// Sends PQ authorizations over legacy P2P, then verifies the peer's mined block and RPC bytes.
+#[cfg(feature = "pq")]
+pub(crate) async fn pq_p2p_test() -> Result<()> {
+    pq_spend_test(PqSpendScenario::Peer).await
+}
+
+/// Revalidates PQ spending after a rollback below activation and an alternate chain.
+#[cfg(feature = "pq")]
+pub(crate) async fn pq_activation_reorg_test() -> Result<()> {
+    pq_spend_test(PqSpendScenario::Reorg).await
+}
+
+#[cfg(feature = "pq")]
+enum PqSpendScenario {
+    Mempool,
+    Peer,
+    Reorg,
+}
+
+#[cfg(feature = "pq")]
+enum PqTestKey {
+    Fast(zcash_transparent::pq::sha2_128f::SigningKey),
+    Small(zcash_transparent::pq::sha2_192s::SigningKey),
+}
+#[cfg(feature = "pq")]
+impl PqTestKey {
+    fn new(parameters: zcash_transparent::pq::ParameterSet, seed: u8) -> Self {
+        use zcash_transparent::pq::{self, ParameterSet};
+        match parameters {
+            ParameterSet::Sha2_128f => Self::Fast(pq::sha2_128f::SigningKey::from_seed(
+                &[seed; pq::sha2_128f::SEED_BYTES],
+            )),
+            ParameterSet::Sha2_192s => Self::Small(pq::sha2_192s::SigningKey::from_seed(
+                &[seed; pq::sha2_192s::SEED_BYTES],
+            )),
+        }
+    }
+    fn public_key(&self) -> Vec<u8> {
+        match self {
+            Self::Fast(key) => key.public_key().to_vec(),
+            Self::Small(key) => key.public_key().to_vec(),
+        }
+    }
+    fn sign(&self, message: &[u8], context: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Fast(key) => key.sign(message, context).unwrap(),
+            Self::Small(key) => key.sign(message, context).unwrap(),
+        }
+    }
+}
+
+/// Shares real signed fixtures across admission, propagation, and activation reorganization.
+#[cfg(feature = "pq")]
+async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
+    use zakura_chain::{parameters::testnet::RegtestParameters, transaction::HashType};
+    use zcash_script::script::Code;
+    use zcash_transparent::{
+        pq::{p2sh, ParameterSet},
+        util::hash160,
+    };
+
+    fn push(bytes: &[u8]) -> Vec<u8> {
+        let mut encoded = vec![0x4d];
+        encoded.extend(u16::try_from(bytes.len()).unwrap().to_le_bytes());
+        encoded.extend(bytes);
+        encoded
+    }
+    fn transaction(outpoint: OutPoint, value: Amount<NonNegative>, output: Script) -> Transaction {
+        Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(0),
+            inputs: vec![Input::PrevOut {
+                outpoint,
+                unlock_script: Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![Output::new(value, output)],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        }
+    }
+    fn install(tx: &mut Transaction, index: usize, arguments: &[Vec<u8>], redeem: &Code) {
+        let mut script = Vec::new();
+        for argument in arguments {
+            script.extend(push(argument));
+        }
+        script.extend(push(&redeem.0));
+        if let Transaction::V5 { inputs, .. } = tx {
+            if let Input::PrevOut { unlock_script, .. } = &mut inputs[index] {
+                *unlock_script = Script::new(&script);
+            }
+        }
+    }
+
+    let _guard = zakura_test::init();
+    let maturity = transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
+    let activation = Height(maturity + 3);
+    let net = Network::new_regtest(RegtestParameters {
+        pq_p2sh_activation_height: Some(activation),
+        activation_heights: ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let miner = Address::from_script_hash(NetworkKind::Regtest, OP_TRUE_SCRIPT_HASH);
+    let parameters = [ParameterSet::Sha2_128f, ParameterSet::Sha2_192s];
+    let keys: Vec<Vec<PqTestKey>> = parameters
+        .iter()
+        .map(|&set| (1..=3).map(|seed| PqTestKey::new(set, seed)).collect())
+        .collect();
+    let mut singles = Vec::new();
+    let mut multiples = Vec::new();
+    for (set, keys) in parameters.iter().zip(&keys) {
+        let mut single = push(&keys[0].public_key());
+        single.push(0xac);
+        singles.push(p2sh::redeem_script(*set, &Code(single))?);
+        let mut multi = vec![0x52];
+        for key in keys {
+            multi.extend(push(&key.public_key()));
+        }
+        multi.extend([0x53, 0xae]);
+        multiples.push(p2sh::redeem_script(*set, &Code(multi))?);
+    }
+    let mut unknown = singles[0].clone();
+    unknown.0[5] = 3;
+    let secret = secp256k1::SecretKey::from_secret_bytes([4; 32])?;
+    let public = secp256k1::PublicKey::from_secret_key(&secret).serialize();
+    let mut legacy = push(&public);
+    legacy.push(0xac);
+    let mut fifteen = vec![0x5f];
+    for _ in 0..15 {
+        fifteen.extend(push(&keys[0][0].public_key()));
+    }
+    fifteen.extend([0x5f, 0xae]);
+    let large_redeem = p2sh::redeem_script(parameters[0], &Code(fifteen))?;
+    let redeems = [
+        singles[0].clone(),
+        multiples[0].clone(),
+        unknown,
+        Code(legacy),
+        singles[1].clone(),
+        multiples[1].clone(),
+        singles[0].clone(),
+        singles[1].clone(),
+        large_redeem.clone(),
+    ];
+    let mut config = os_assigned_rpc_port_config(false, &net)?;
+    config.mempool.debug_enable_at_height = Some(0);
+    config.mining.miner_address = Some(miner.to_string().parse()?);
+    config.consensus.checkpoint_sync = false;
+    config.network.initial_testnet_peers.clear();
+    config.network.cache_dir = false.into();
+    // Writing and reading TOML is part of starting this real node.
+    let mut node = testdir()?
+        .with_config(&mut config)?
+        .spawn_child(args!["start"])?
+        .with_timeout(EXTENDED_LAUNCH_DELAY);
+    let peer_address = read_listen_addr_from_logs(&mut node, "Opened Zcash protocol endpoint at")?;
+    let rpc = read_listen_addr_from_logs(&mut node, OPENED_RPC_ENDPOINT_MSG)?;
+    node.expect_stdout_line_matches("activating mempool")?;
+    // Keep child pipes drained while RPC/P2P work runs; a full log pipe can stall a node.
+    let mut log_readers = Vec::new();
+    for output in [node.stdout.take(), node.stderr.take()]
+        .into_iter()
+        .flatten()
+    {
+        log_readers.push(std::thread::spawn(move || {
+            for line in output {
+                println!("node A: {}", line.expect("read node log"));
+            }
+        }));
+    }
+    let client = RpcRequestClient::new(rpc);
+    let first = client.mine_proposed_block(&net).await?;
+    for _ in 1..maturity {
+        client.mine_proposed_block(&net).await?;
+    }
+    let (outpoint, value) = op_true_coinbase_output(&first, &miner)?;
+    let mut funding = spend_op_true_output(outpoint, value, &miner)?;
+    let funded_value: Amount<NonNegative> = 10_000_000u64.try_into()?;
+    if let Transaction::V5 { outputs, .. } = &mut funding {
+        let mut change = outputs[0].value();
+        outputs.clear();
+        for redeem in &redeems {
+            let address = Address::from_script_hash(NetworkKind::Regtest, hash160::hash(&redeem.0));
+            outputs.push(Output::new(funded_value, address.script()));
+            change = (change - funded_value)?.constrain()?;
+        }
+        outputs.push(Output::new(change, miner.script()));
+    }
+    client.send_raw_transaction(&funding).await?;
+    let block = client.mine_proposed_block(&net).await?;
+    assert!(block
+        .transactions
+        .iter()
+        .any(|tx| tx.hash() == funding.hash()));
+    let mut spends = Vec::new();
+    for index in 0..7 {
+        let mut previous = vec![Output::new(
+            funded_value,
+            Address::from_script_hash(NetworkKind::Regtest, hash160::hash(&redeems[index].0))
+                .script(),
+        )];
+        let mut tx = transaction(
+            OutPoint {
+                hash: funding.hash(),
+                index: u32::try_from(index)?,
+            },
+            funded_value,
+            miner.script(),
+        );
+        if index == 6 {
+            previous.push(Output::new(
+                funded_value,
+                Address::from_script_hash(NetworkKind::Regtest, hash160::hash(&redeems[7].0))
+                    .script(),
+            ));
+            if let Transaction::V5 {
+                inputs, outputs, ..
+            } = &mut tx
+            {
+                inputs.push(Input::PrevOut {
+                    outpoint: OutPoint {
+                        hash: funding.hash(),
+                        index: 7,
+                    },
+                    unlock_script: Script::new(&[]),
+                    sequence: u32::MAX,
+                });
+                outputs[0] = Output::new((funded_value + funded_value)?, miner.script());
+            }
+        }
+        // Exact-length placeholders establish serialized size before fee calculation/signing.
+        for input_index in 0..previous.len() {
+            let output_index = if input_index == 0 { index } else { 7 };
+            let set = if output_index <= 2 || output_index == 6 {
+                parameters[0]
+            } else {
+                parameters[1]
+            };
+            let signature = vec![
+                0;
+                if index == 3 {
+                    73
+                } else {
+                    set.signature_bytes() + 1
+                }
+            ];
+            let arguments = if index == 1 || index == 5 {
+                vec![vec![], signature.clone(), signature]
+            } else {
+                vec![signature]
+            };
+            install(&mut tx, input_index, &arguments, &redeems[output_index]);
+        }
+        let fee = zakura_chain::transaction::zip317::conventional_fee(&tx);
+        if let Transaction::V5 { outputs, .. } = &mut tx {
+            outputs[0] = Output::new((outputs[0].value() - fee)?.constrain()?, miner.script());
+        }
+        let hasher = tx.sighasher(NetworkUpgrade::Nu5, Arc::new(previous.clone()))?;
+        for input_index in 0..previous.len() {
+            let output_index = if input_index == 0 { index } else { 7 };
+            let set_index = usize::from(output_index >= 4 && output_index != 6);
+            let digest = hasher.sighash(
+                HashType::ALL,
+                Some((input_index, redeems[output_index].0.clone())),
+            );
+            let arguments = if index == 3 {
+                let mut signature = secret
+                    .sign_ecdsa(secp256k1::Message::from_digest(digest.0))
+                    .serialize_der()
+                    .to_vec();
+                signature.push(1);
+                vec![signature]
+            } else {
+                let sign = |key: &PqTestKey| {
+                    let mut signature =
+                        key.sign(&digest.0, p2sh::signing_context(parameters[set_index]));
+                    signature.push(1);
+                    signature
+                };
+                if index == 1 || index == 5 {
+                    vec![vec![], sign(&keys[set_index][0]), sign(&keys[set_index][2])]
+                } else {
+                    vec![sign(&keys[set_index][0])]
+                }
+            };
+            install(&mut tx, input_index, &arguments, &redeems[output_index]);
+        }
+        assert_eq!(
+            zakura_chain::transaction::zip317::conventional_fee(&tx),
+            fee,
+            "final encoding retains the fee estimate"
+        );
+        spends.push(tx);
+    }
+    for index in [0, 1, 4, 5, 6] {
+        assert!(
+            client.send_raw_transaction(&spends[index]).await.is_err(),
+            "both PQ versions reject before activation"
+        );
+    }
+    client.mine_proposed_block(&net).await?;
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        Height(activation.0 - 1),
+        "admission checks the next block height"
+    );
+    let mut oversized = transaction(
+        OutPoint {
+            hash: funding.hash(),
+            index: 8,
+        },
+        funded_value,
+        miner.script(),
+    );
+    let mut placeholders = vec![vec![]];
+    placeholders.extend(vec![vec![0; parameters[0].signature_bytes() + 1]; 15]);
+    install(&mut oversized, 0, &placeholders, &large_redeem);
+    let large_fee = zakura_chain::transaction::zip317::conventional_fee(&oversized);
+    if let Transaction::V5 { outputs, .. } = &mut oversized {
+        outputs[0] = Output::new((funded_value - large_fee)?.constrain()?, miner.script());
+    }
+    let prev = Output::new(
+        funded_value,
+        Address::from_script_hash(NetworkKind::Regtest, hash160::hash(&large_redeem.0)).script(),
+    );
+    let digest = oversized
+        .sighasher(NetworkUpgrade::Nu5, Arc::new(vec![prev.clone()]))?
+        .sighash(HashType::ALL, Some((0, large_redeem.0.clone())));
+    let mut signature = keys[0][0].sign(&digest.0, p2sh::signing_context(parameters[0]));
+    signature.push(1);
+    let mut arguments = vec![vec![]];
+    arguments.extend(vec![signature; 15]);
+    install(&mut oversized, 0, &arguments, &large_redeem);
+    assert!(oversized.zcash_serialize_to_vec()?.len() > 250_000);
+    zakura_script::CachedFfiTransaction::new_for_network(
+        Arc::new(oversized.clone()),
+        Arc::new(vec![prev]),
+        &net,
+        activation,
+    )?
+    .is_valid(0)?;
+    let error = client
+        .send_raw_transaction(&oversized)
+        .await
+        .expect_err("valid fifteen-signature 128f spend exceeds default relay size");
+    assert!(
+        error.to_string().contains("configured mempool maximum"),
+        "relay rejects the size, not the valid signatures: {error}"
+    );
+    let mut forged = spends[0].clone();
+    if let Transaction::V5 { inputs, .. } = &mut forged {
+        if let Input::PrevOut { unlock_script, .. } = &mut inputs[0] {
+            let mut bytes = unlock_script.as_raw_bytes().to_vec();
+            bytes[10] ^= 1;
+            *unlock_script = Script::new(&bytes);
+        }
+    }
+    assert!(
+        client.send_raw_transaction(&forged).await.is_err(),
+        "forged signature is rejected"
+    );
+    assert!(
+        client.send_raw_transaction(&spends[2]).await.is_err(),
+        "unsupported execution identifier is rejected"
+    );
+    // Node B starts with an empty database and learns the funding chain only from A.
+    // No funding block or spending transaction is submitted to B through RPC.
+    let mut peer = if matches!(scenario, PqSpendScenario::Peer) {
+        let mut peer_config = config.clone();
+        peer_config.network.initial_testnet_peers = [peer_address.to_string()].into();
+        let mut peer_node = testdir()?
+            .with_config(&mut peer_config)?
+            .spawn_child(args!["start"])?
+            .with_timeout(EXTENDED_LAUNCH_DELAY);
+        let peer_rpc = read_listen_addr_from_logs(&mut peer_node, OPENED_RPC_ENDPOINT_MSG)?;
+        peer_node.expect_stdout_line_matches("activating mempool")?;
+        for output in [peer_node.stdout.take(), peer_node.stderr.take()]
+            .into_iter()
+            .flatten()
+        {
+            log_readers.push(std::thread::spawn(move || {
+                for line in output {
+                    println!("node B: {}", line.expect("read peer log"));
+                }
+            }));
+        }
+        let peer_client = RpcRequestClient::new_with_timeout(peer_rpc, Duration::from_secs(10));
+        let tip: String = client
+            .json_result_from_call("getbestblockhash", "[]")
+            .await
+            .map_err(|e| eyre!(e))?;
+        wait_for_pq_tip(&peer_client, tip.parse()?).await?;
+        let mempool: Vec<String> = peer_client
+            .json_result_from_call("getrawmempool", "[]")
+            .await
+            .map_err(|e| eyre!(e))?;
+        assert!(mempool.is_empty(), "the peer starts without the PQ spends");
+        Some((peer_node, peer_client))
+    } else {
+        None
+    };
+
+    for index in [0, 1, 3, 4, 5, 6] {
+        let mempool: Vec<String> = client
+            .json_result_from_call("getrawmempool", "[]")
+            .await
+            .map_err(|e| eyre!(e))?;
+        if mempool.contains(&spends[index].hash().to_string()) {
+            // The RPC retry queue can resubmit pre-activation transactions after the tip changes.
+            assert_pq_rpc_bytes(&client, &spends[index]).await?;
+        } else {
+            client.send_raw_transaction(&spends[index]).await?;
+        }
+        if let Some((_, peer_client)) = &peer {
+            // The node caps concurrent downloads from one peer at five. Await each
+            // admission so this fixture tests relay rather than overflowing that queue.
+            let expected = spends[index].hash().to_string();
+            let mut last_mempool = Vec::new();
+            // Allow a complete 73-second periodic mempool crawl in this two-node fixture.
+            tokio::time::timeout(Duration::from_secs(90), async {
+                loop {
+                    let mempool: Vec<String> = peer_client
+                        .json_result_from_call("getrawmempool", "[]")
+                        .await
+                        .map_err(|e| eyre!(e))?;
+                    if mempool.contains(&expected) {
+                        break Ok::<_, eyre::Report>(());
+                    }
+                    last_mempool = mempool;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .wrap_err_with(|| format!("node B did not receive spend {index} ({expected}) through P2P; mempool: {last_mempool:?}"))??;
+        }
+    }
+    let mempool: Vec<String> = client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    let (template, _) = client.block_from_template(&net).await?;
+    for index in [0, 1, 3, 4, 5, 6] {
+        let tx = &spends[index];
+        assert!(mempool.contains(&tx.hash().to_string()));
+        assert!(template
+            .transactions
+            .iter()
+            .any(|candidate| candidate.hash() == tx.hash()));
+    }
+    let mined = if let Some((_, peer_client)) = &peer {
+        let (template, _) = peer_client.block_from_template(&net).await?;
+        for index in [0, 1, 3, 4, 5, 6] {
+            assert!(
+                template
+                    .transactions
+                    .iter()
+                    .any(|tx| tx.hash() == spends[index].hash()),
+                "the peer selects the relayed spend for mining"
+            );
+            assert_pq_rpc_bytes(peer_client, &spends[index]).await?;
+        }
+        let mined = peer_client.mine_proposed_block(&net).await?;
+        wait_for_pq_tip(&client, mined.hash()).await?;
+        let received = client
+            .get_block(i32::try_from(activation.0)?)
+            .await
+            .map_err(|e| eyre!(e))?
+            .expect("node A accepted the peer's block");
+        assert_eq!(
+            received.zcash_serialize_to_vec()?,
+            mined.zcash_serialize_to_vec()?,
+            "block propagation preserves authorization bytes"
+        );
+        for index in [0, 1, 3, 4, 5, 6] {
+            assert_pq_rpc_bytes(&client, &spends[index]).await?;
+            assert_pq_rpc_bytes(peer_client, &spends[index]).await?;
+        }
+        for rpc in [&client, peer_client] {
+            // State commitment and the mempool's tip notification run independently.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let mempool: Vec<String> = rpc
+                        .json_result_from_call("getrawmempool", "[]")
+                        .await
+                        .map_err(|e| eyre!(e))?;
+                    if mempool.is_empty() {
+                        return Ok::<_, eyre::Report>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .wrap_err("mined spends did not leave a node's mempool")??;
+        }
+        mined
+    } else if matches!(scenario, PqSpendScenario::Reorg) {
+        pq_reorg_spends(&client, &net, &spends, activation, block.hash()).await?
+    } else {
+        client.mine_proposed_block(&net).await?
+    };
+    let expected_mined: &[usize] = if matches!(scenario, PqSpendScenario::Reorg) {
+        &[0, 1, 4, 5, 6]
+    } else {
+        &[0, 1, 3, 4, 5, 6]
+    };
+    for &index in expected_mined {
+        assert!(mined
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == spends[index].hash()));
+    }
+    if let Some((peer_node, _)) = peer.take() {
+        let mut peer_node = peer_node;
+        peer_node.kill(false)?;
+        peer_node
+            .wait_with_output()?
+            .assert_failure()?
+            .assert_was_killed()?;
+    }
+    node.kill(false)?;
+    node.wait_with_output()?
+        .assert_failure()?
+        .assert_was_killed()?;
+    for reader in log_readers {
+        reader.join().expect("node log reader finished");
+    }
+    Ok(())
+}
+
+/// Waits for an exact peer tip, including semantic block verification and state commitment.
+#[cfg(feature = "pq")]
+async fn wait_for_pq_tip(client: &RpcRequestClient, expected: block::Hash) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let tip: String = client
+                .json_result_from_call("getbestblockhash", "[]")
+                .await
+                .map_err(|e| eyre!(e))?;
+            if tip == expected.to_string() {
+                return Ok::<_, eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .wrap_err("peer did not accept the expected chain tip")?
+}
+
+/// Checks the full serialized transaction, because its v5 transaction ID excludes authorization.
+#[cfg(feature = "pq")]
+async fn assert_pq_rpc_bytes(client: &RpcRequestClient, transaction: &Transaction) -> Result<()> {
+    let raw: HexData = client
+        .json_result_from_call(
+            "getrawtransaction",
+            format!(r#"["{}", 0]"#, transaction.hash()),
+        )
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert_eq!(
+        raw.0,
+        transaction.zcash_serialize_to_vec()?,
+        "RPC preserves complete authorization bytes"
+    );
+    let decoded: Transaction = raw.0.as_slice().zcash_deserialize_into()?;
+    assert_eq!(decoded, *transaction);
+    Ok(())
+}
+
+/// Rolls back mined authorizations, rejects them below activation, then mines an alternate chain.
+#[cfg(feature = "pq")]
+async fn pq_reorg_spends(
+    client: &RpcRequestClient,
+    network: &Network,
+    spends: &[Transaction],
+    activation: Height,
+    funding_tip: block::Hash,
+) -> Result<Block> {
+    use zakura_chain::{
+        block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash},
+        serialization::BytesInDisplayOrder,
+    };
+
+    let old_block = client.mine_proposed_block(network).await?;
+    assert_eq!(old_block.coinbase_height(), Some(activation));
+    for index in [0, 1, 3, 4, 5, 6] {
+        assert!(old_block
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == spends[index].hash()));
+    }
+    let fork_parent_height = i32::try_from(activation.0 - 1)?;
+    let old_parent = client
+        .get_block(fork_parent_height)
+        .await
+        .map_err(|e| eyre!(e))?
+        .expect("activation block has a parent");
+    let params = serde_json::to_string(&vec![old_parent.hash().to_string()])?;
+    let _: () = client
+        .json_result_from_call("invalidateblock", params)
+        .await
+        .map_err(|e| eyre!(e))?;
+    wait_for_pq_tip(client, funding_tip).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let pool: Vec<String> = client
+                .json_result_from_call("getrawmempool", "[]")
+                .await
+                .map_err(|e| eyre!(e))?;
+            if pool == vec![spends[3].hash().to_string()] {
+                return Ok::<_, eyre::Report>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .wrap_err("rollback did not remove PQ spends while preserving the legacy spend")??;
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        Height(activation.0 - 2)
+    );
+    for index in [0, 1, 4, 5, 6] {
+        assert!(
+            client.send_raw_transaction(&spends[index]).await.is_err(),
+            "PQ spends are ineligible below activation after rollback"
+        );
+    }
+
+    let template: BlockTemplateResponse = client
+        .json_result_from_call("getblocktemplate", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert_eq!(template.height(), activation.0 - 1);
+    let mut candidate =
+        proposal_block_from_template(&template, BlockTemplateTimeSource::default(), network)?;
+    assert_eq!(
+        candidate.transactions.len(),
+        2,
+        "only the legacy spend remains eligible below activation"
+    );
+    assert_eq!(candidate.transactions[1].hash(), spends[3].hash());
+    // A different nonce avoids reusing the explicitly invalidated parent's hash.
+    Arc::make_mut(&mut candidate.header).nonce = [7; 32].into();
+    let proposal = |block: &Block| -> Result<String> {
+        Ok(serde_json::json!([{"mode": "proposal", "data": hex::encode(block.zcash_serialize_to_vec()?)}]).to_string())
+    };
+    let valid: BlockProposalResponse = client
+        .json_result_from_call("getblocktemplate", proposal(&candidate)?)
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert!(
+        valid.is_valid(),
+        "the pre-activation control block is valid: {valid:?}"
+    );
+    let mut forbidden = candidate.clone();
+    let pq_indices = [0, 1, 4, 5, 6];
+    let mut fees = Amount::<NonNegative>::zero();
+    for index in pq_indices {
+        fees = (fees + zakura_chain::transaction::zip317::conventional_fee(&spends[index]))?;
+        forbidden.transactions.push(Arc::new(spends[index].clone()));
+    }
+    // Preserve the exact reward and both commitments so rejection reaches script validation.
+    if let Transaction::V5 { outputs, .. } = Arc::make_mut(&mut forbidden.transactions[0]) {
+        outputs[0] = Output::new((outputs[0].value() + fees)?, outputs[0].lock_script.clone());
+    }
+    let auth_root: AuthDataRoot = forbidden.transactions.iter().collect();
+    let header = Arc::make_mut(&mut forbidden.header);
+    header.merkle_root = forbidden.transactions.iter().collect();
+    header.commitment_bytes = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &template.default_roots().chain_history_root(),
+        &auth_root,
+    )
+    .bytes_in_serialized_order()
+    .into();
+    let rejected: BlockProposalResponse = client
+        .json_result_from_call("getblocktemplate", proposal(&forbidden)?)
+        .await
+        .map_err(|e| eyre!(e))?;
+    match rejected {
+        BlockProposalResponse::Rejected(reason) => assert!(
+            reason.contains("script"),
+            "the otherwise valid block must fail script validation: {reason}"
+        ),
+        BlockProposalResponse::Valid => panic!("PQ spending block was accepted before activation"),
+    }
+    assert!(
+        client.submit_block(forbidden).await.is_err(),
+        "block submission also rejects pre-activation PQ authorizations"
+    );
+    assert_eq!(
+        client.blockchain_info().await?.blocks(),
+        Height(activation.0 - 2)
+    );
+    client.submit_block(candidate.clone()).await?;
+    wait_for_pq_tip(client, candidate.hash()).await?;
+    assert_ne!(
+        candidate.hash(),
+        old_parent.hash(),
+        "the node follows an alternate branch"
+    );
+    for index in [0, 1, 4, 5, 6] {
+        client.send_raw_transaction(&spends[index]).await?;
+    }
+    let (restored, height) = client.block_from_template(network).await?;
+    assert_eq!(height, activation);
+    for index in [0, 1, 4, 5, 6] {
+        assert!(
+            restored
+                .transactions
+                .iter()
+                .any(|tx| tx.hash() == spends[index].hash()),
+            "spends become eligible again on the alternate branch"
+        );
+    }
+    let mined = client.mine_proposed_block(network).await?;
+    assert_ne!(mined.hash(), old_block.hash());
+    for index in [0, 1, 3, 4, 5, 6] {
+        assert_pq_rpc_bytes(client, &spends[index]).await?;
+    }
+    Ok(mined)
+}

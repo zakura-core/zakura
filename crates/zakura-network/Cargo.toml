@@ -39,6 +39,9 @@ exclude = [
 [features]
 default = []
 
+# Permit explicit local regtest PQ activation in node configuration.
+pq = []
+
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin"]
 howudoin = []

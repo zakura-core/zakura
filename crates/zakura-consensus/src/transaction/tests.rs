@@ -152,6 +152,22 @@ async fn cancelled_owned_transaction_verification_keeps_queued_script_charge() {
 
 mod mempool_precheck;
 
+#[cfg(feature = "pq")]
+mod pq {
+    mod sha2_128f {
+        use zcash_transparent::pq::sha2_128f as crypto;
+        const PARAMETERS: zcash_transparent::pq::ParameterSet =
+            zcash_transparent::pq::ParameterSet::Sha2_128f;
+        include!("tests/pq.rs");
+    }
+    mod sha2_192s {
+        use zcash_transparent::pq::sha2_192s as crypto;
+        const PARAMETERS: zcash_transparent::pq::ParameterSet =
+            zcash_transparent::pq::ParameterSet::Sha2_192s;
+        include!("tests/pq.rs");
+    }
+}
+
 /// Returns the timeout duration for tests, extended when running under coverage
 /// instrumentation to account for the performance overhead.
 fn test_timeout() -> std::time::Duration {

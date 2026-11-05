@@ -171,6 +171,12 @@ pub struct PeerSpec {
     /// second.
     #[serde(default)]
     pub adversary: Option<AdversarySpec>,
+    /// Whether the honest script serves a chain whose tip header is
+    /// invalid ([`HonestChain::with_invalid_tip`]): a page carrying it
+    /// passes the node's wire checks and fails preparation. Left out of a
+    /// serialized scenario when false, so saved ones keep their form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub invalid_tip: bool,
 }
 
 impl PeerSpec {
@@ -183,6 +189,7 @@ impl PeerSpec {
             script: Vec::new(),
             honest: None,
             adversary: None,
+            invalid_tip: false,
         }
     }
 
@@ -194,12 +201,13 @@ impl PeerSpec {
         }
     }
 
-    /// True if the peer is `HonestPeer`: it runs the honest script, takes
-    /// no adversarial act, echoes the node's nonce rightly, and opens no
+    /// True if the peer is `HonestPeer`: it runs the honest script on a
+    /// valid chain, takes no adversarial act, echoes the node's nonce rightly, and opens no
     /// stream outside the honest script.
     pub fn is_honest(&self) -> bool {
         self.honest.is_some()
             && self.adversary.is_none()
+            && !self.invalid_tip
             && !self.bad_nonce_echo
             && !self
                 .script
@@ -723,7 +731,17 @@ impl StreamModels {
     /// as its sending does.
     pub(crate) fn send_crafted(&mut self, frame: Crafted) -> Outgoing {
         let header = frame.header;
-        let label = self.labels(&frame).first();
+        let mut label = self.labels(&frame).first();
+        // A page carrying the header the fixture made invalid breaks no wire
+        // rule, so the node judges its content only when it prepares that
+        // header (hdr-4 ask 4, option (b)). Its sending changed the models
+        // as a conformant page's does.
+        let prepares = (label == Label::Conformant)
+            .then(|| self.content.invalid_header(&frame.message))
+            .flatten();
+        if prepares.is_some() {
+            label = Label::BadContent;
+        }
         let stream = &RegtestMessage::LAYOUT[0];
         let id = |stream: &zakura_network::zakura::Stream| StreamId {
             kind: stream.kind,
@@ -753,6 +771,7 @@ impl StreamModels {
                 exchange: exchange(&frame.message),
                 // A frame's declared length is under 4 GiB.
                 payload: header.payload_len as u64,
+                prepares,
             }],
         }
     }

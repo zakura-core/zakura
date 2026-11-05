@@ -76,7 +76,7 @@ fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
 
 #[tokio::test]
 async fn replacement_requests_from_cached_status_without_waiting_for_an_announcement() {
-    let (mut routine, mut outbound, _events) = super::tests::status_test_routine();
+    let (mut routine, mut outbound, mut events) = super::tests::status_test_routine();
     let connection = Arc::new(StatusSender::new(u32::MAX, Duration::ZERO));
     connection.record_received(
         0,
@@ -119,6 +119,15 @@ async fn replacement_requests_from_cached_status_without_waiting_for_an_announce
             start_height: block::Height(1),
             ..
         }
+    ));
+    // The stored Status was paced when it arrived, so the replacement
+    // publishes it without a fresh reply.
+    assert!(matches!(
+        events.try_recv(),
+        Ok(RoutineToReactor::StatusReceived {
+            send_reply: false,
+            ..
+        })
     ));
 }
 

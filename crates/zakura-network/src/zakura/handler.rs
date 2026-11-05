@@ -2158,7 +2158,7 @@ struct ConnectionServeContext {
     conn: ZakuraConnTrace,
     /// Counts an inbound connection against its IP until registration.
     control_handshake: Option<ControlHandshakeGuard>,
-    /// Tells a discovery dial how registration ended. See [`DialReport`].
+    /// Tells a reported dial how registration ended. See [`DialReport`].
     registration_report: Option<oneshot::Sender<DialRegistration>>,
 }
 
@@ -5003,7 +5003,7 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 }
 
 /// How a dialed connection's registration ended, as the dial reports it to
-/// its discovery attempt.
+/// its discovery attempt or maintained redial.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DialRegistration {
     /// The supervisor registered the peer on this connection.
@@ -5012,7 +5012,7 @@ pub(crate) enum DialRegistration {
     LocalLimit,
 }
 
-/// The channels on which a discovery dial reports its progress.
+/// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
     /// Receives the IP whose handshake TLS authenticated, before the control
     /// handshake starts.

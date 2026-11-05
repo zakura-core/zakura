@@ -33,6 +33,9 @@ pub(super) enum RedialNext {
     /// Sleep this long, waking early if the peer registers from another
     /// connection, then start the next attempt.
     RetryAfter(Duration),
+    /// Sleep this long, ignoring registrations from other connections, then
+    /// start the next attempt. An ALPN mismatch waits out its floor this way.
+    WaitOut(Duration),
 }
 
 impl DialResult {
@@ -49,11 +52,14 @@ impl DialResult {
     /// Rescores this attempt after the peer's registration outlived it.
     ///
     /// A registration that lasted `lasted` long enough to be healthy upgrades
-    /// the attempt to healthy; a shorter one leaves the attempt's result.
+    /// the attempt to healthy; a shorter one leaves the attempt's result. An
+    /// ALPN mismatch keeps its result, because another connection's
+    /// registration says nothing about the protocol at the dialed address.
     pub(super) fn with_lagging_registration(self, lasted: Duration) -> Self {
-        match Self::lasting(lasted) {
-            Self::Healthy => Self::Healthy,
-            _ => self,
+        if self != Self::AlpnMismatch && Self::lasting(lasted) == Self::Healthy {
+            Self::Healthy
+        } else {
+            self
         }
     }
 }
@@ -116,7 +122,8 @@ impl RedialState {
     /// without counting an attempt or growing the backoff. A failure or an
     /// ALPN mismatch counts an attempt, stops at the policy's maximum, and
     /// otherwise waits out the backoff, which then doubles up to its maximum.
-    /// An ALPN mismatch waits at least [`ZAKURA_ALPN_MISMATCH_BACKOFF`].
+    /// An ALPN mismatch waits at least [`ZAKURA_ALPN_MISMATCH_BACKOFF`], and a
+    /// registration from another connection doesn't cut that wait short.
     pub(super) fn record(&mut self, attempt: DialResult) -> RedialNext {
         match attempt {
             DialResult::Healthy => {
@@ -139,13 +146,13 @@ impl RedialState {
             return RedialNext::Stop;
         }
 
-        let wait = if attempt == DialResult::AlpnMismatch {
-            self.backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
+        let next = if attempt == DialResult::AlpnMismatch {
+            RedialNext::WaitOut(self.backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF))
         } else {
-            self.backoff
+            RedialNext::RetryAfter(self.backoff)
         };
         self.backoff = self.backoff.saturating_mul(2).min(self.policy.max_backoff);
-        RedialNext::RetryAfter(wait)
+        next
     }
 
     fn reset(&mut self) {

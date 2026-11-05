@@ -7,10 +7,16 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use zakura_quic::NodeAddr;
-use zakura_rt::{sync::watch, time::Instant};
+use zakura_rt::{
+    sync::{oneshot, watch},
+    time::Instant,
+};
 
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent};
-use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId, ZakuraTrace};
+use crate::zakura::{
+    handler::DialRegistration, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
+    ZakuraTrace,
+};
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod model;
@@ -146,25 +152,12 @@ pub(crate) async fn native_dial_supervised(
         let node_addr = node_addr.clone();
         let limits = limits.clone();
         Box::pin(async move {
-            let started = Instant::now();
-            match super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits).await {
-                Ok(()) => DialResult::lasting(started.elapsed()),
-                Err(error) if error.is_alpn_mismatch() => {
-                    tracing::debug!(
-                        ?error,
-                        "Zakura peer speaks another protocol version; backing off"
-                    );
-                    DialResult::AlpnMismatch
-                }
-                Err(error) if error.is_pre_dial_limit() => {
-                    tracing::debug!(?error, "Zakura native dial hit a local limit; will retry");
-                    DialResult::LocalLimit
-                }
-                Err(error) => {
-                    tracing::debug!(?error, "Zakura native dial failed; will retry");
-                    DialResult::Failed
-                }
-            }
+            let (registration, registered) = oneshot::channel();
+            score_dial(
+                super::dialer::native_bootstrap_dial(&endpoint, node_addr, &limits, registration),
+                registered,
+            )
+            .await
         }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
     });
 
@@ -177,6 +170,49 @@ pub(crate) async fn native_dial_supervised(
         biased;
         _ = shutdown.cancelled() => {}
         _ = supervised => {}
+    }
+}
+
+/// Scores one dial. `serve` dials the peer, serves the connection until it
+/// ends, and reports on `registration` how the connection's registration ended.
+///
+/// Health counts from the `Registered` report, not from the dial's start, so
+/// transport and control-handshake setup earn no healthy-connection credit.
+async fn score_dial(
+    serve: impl Future<Output = Result<(), ZakuraHandlerError>>,
+    registration: oneshot::Receiver<DialRegistration>,
+) -> DialResult {
+    let registered =
+        async { matches!(registration.await, Ok(DialRegistration::Registered)).then(Instant::now) };
+    zakura_rt::pin!(serve, registered);
+    let mut registered_at = None;
+    let mut reported = false;
+    let served = loop {
+        zakura_rt::select! {
+            served = &mut serve => break served,
+            at = &mut registered, if !reported => {
+                reported = true;
+                registered_at = at;
+            }
+        }
+    };
+    match served {
+        Ok(()) => registered_at.map_or(DialResult::Failed, |at| DialResult::lasting(at.elapsed())),
+        Err(error) if error.is_alpn_mismatch() => {
+            tracing::debug!(
+                ?error,
+                "Zakura peer speaks another protocol version; backing off"
+            );
+            DialResult::AlpnMismatch
+        }
+        Err(error) if error.is_pre_dial_limit() => {
+            tracing::debug!(?error, "Zakura native dial hit a local limit; will retry");
+            DialResult::LocalLimit
+        }
+        Err(error) => {
+            tracing::debug!(?error, "Zakura native dial failed; will retry");
+            DialResult::Failed
+        }
     }
 }
 
@@ -293,7 +329,14 @@ where
                 // including the deregistration from the failed attempt we just
                 // observed.
                 RedialNext::RetryAfter(wait) => {
-                    if !sleep_unless_registered(&mut self.registered, &self.peer_id, wait).await {
+                    if !sleep_unless_registered(&mut self.registered, Some(&self.peer_id), wait)
+                        .await
+                    {
+                        return;
+                    }
+                }
+                RedialNext::WaitOut(wait) => {
+                    if !sleep_unless_registered(&mut self.registered, None, wait).await {
                         return;
                     }
                 }
@@ -414,12 +457,13 @@ impl Drop for TracedAttempt {
     }
 }
 
-/// Sleeps for `wait`, waking early if `peer_id` registers from another
-/// connection. Ignores unrelated peer-set changes. Returns `false` when the
-/// registration watch closes (node shutdown).
+/// Sleeps for `wait`, waking early if `wake_for` registers from another
+/// connection. Ignores every registration when `wake_for` is `None`, and
+/// unrelated peer-set changes always. Returns `false` when the registration
+/// watch closes (node shutdown).
 async fn sleep_unless_registered(
     registered: &mut watch::Receiver<Vec<ZakuraPeerId>>,
-    peer_id: &ZakuraPeerId,
+    wake_for: Option<&ZakuraPeerId>,
     wait: Duration,
 ) -> bool {
     let sleep = zakura_rt::time::sleep(wait);
@@ -430,7 +474,7 @@ async fn sleep_unless_registered(
                 if changed.is_err() {
                     return false;
                 }
-                if registered.borrow().contains(peer_id) {
+                if wake_for.is_some_and(|peer_id| registered.borrow().contains(peer_id)) {
                     return true;
                 }
             }

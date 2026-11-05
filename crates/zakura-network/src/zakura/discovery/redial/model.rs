@@ -115,12 +115,11 @@ impl RedialModel {
                         .saturating_mul(factor)
                         .min(self.policy.max)
                 };
-                let wait = if attempt == DialResult::AlpnMismatch {
-                    backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF)
+                if attempt == DialResult::AlpnMismatch {
+                    RedialNext::WaitOut(backoff.max(ZAKURA_ALPN_MISMATCH_BACKOFF))
                 } else {
-                    backoff
-                };
-                RedialNext::RetryAfter(wait)
+                    RedialNext::RetryAfter(backoff)
+                }
             }
         }
     }
@@ -246,7 +245,9 @@ pub(super) fn run(
         let attempt = match lagging {
             Some(lasted) if start == RedialStart::Dial && policy.maintains() => {
                 let rescored = attempt.with_lagging_registration(Duration::from_secs(lasted));
-                let expected = if RedialModel::score(lasted) == DialResult::Healthy {
+                let expected = if attempt != DialResult::AlpnMismatch
+                    && RedialModel::score(lasted) == DialResult::Healthy
+                {
                     DialResult::Healthy
                 } else {
                     attempt
@@ -275,6 +276,10 @@ pub(super) fn run(
             RedialNext::RetryAfter(wait) => assert!(
                 wait >= policy.initial.min(policy.max),
                 "{PROPERTY}: backoff floor"
+            ),
+            RedialNext::WaitOut(wait) => assert!(
+                wait >= ZAKURA_ALPN_MISMATCH_BACKOFF,
+                "{PROPERTY}: ALPN backoff floor"
             ),
         }
     }

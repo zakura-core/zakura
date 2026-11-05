@@ -47,7 +47,7 @@ pub mod service_trait;
 #[cfg(test)]
 mod tests;
 
-/// The bound for the chain verifier and transaction verifier buffers.
+/// The bound for the chain verifier buffer.
 ///
 /// We choose the verifier buffer bound based on the maximum number of
 /// concurrent verifier users, to avoid contention:
@@ -60,6 +60,19 @@ mod tests;
 /// We deliberately add extra slots, because they only cost a small amount of
 /// memory, but missing slots can significantly slow down Zebra.
 const VERIFIER_BUFFER_BOUND: usize = 5;
+
+/// The bound for the transaction verifier buffer.
+///
+/// The block verifier sends every transaction in a block through this buffer, so a large block
+/// queues thousands of requests at once. With a few slots, the block verifier and the buffer's
+/// worker take turns for each transaction instead of overlapping.
+///
+/// Queued requests share their transaction and output data with the block that holds them, so a
+/// slot adds only its own bookkeeping. The queue is first in, first out, so a mempool request that
+/// arrives behind a block's requests waits for their verifier setup, about a microsecond each.
+/// Mempool verification has its own concurrency limit, so it doesn't rely on this bound for
+/// backpressure.
+const TRANSACTION_VERIFIER_BUFFER_BOUND: usize = 4096;
 
 /// The block verifier router routes requests to either the checkpoint verifier or the
 /// semantic block verifier, depending on the maximum checkpoint height.
@@ -575,7 +588,10 @@ where
     // transaction verification
 
     let transaction = transaction::Verifier::new(network, transaction_state, mempool);
-    let transaction = spawn_buffer(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
+    let transaction = spawn_buffer(
+        BoxService::new(transaction),
+        TRANSACTION_VERIFIER_BUFFER_BOUND,
+    );
 
     // block verification
     let (list, max_checkpoint_height) = init_checkpoint_list(config, network);

@@ -512,13 +512,13 @@ fn validate(
             tower::service_fn(|_| async { unreachable!("State service should not be called") });
         let verifier = transaction::Verifier::new_for_tests(&network, state_service);
         let verifier = Buffer::new(verifier, 10);
-        let transaction_hash = transaction.hash();
+        let transaction_id = transaction.unmined_id();
 
         // Test the transaction verifier
         verifier
             .clone()
             .oneshot(transaction::Request::Block {
-                transaction_hash,
+                transaction_id,
                 transaction: Arc::new(transaction).into(),
                 known_utxos: Arc::new(known_utxos),
                 parent_utxos: Arc::new(HashMap::new()),

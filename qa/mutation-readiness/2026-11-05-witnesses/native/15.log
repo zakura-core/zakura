@@ -1,6 +1,0 @@
-
-running 1 test
-test zakura::discovery::candidate_dialer::tests::panicked_worker_returns_metadata_needed_to_release_reservations ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2637 filtered out; finished in 0.00s
-

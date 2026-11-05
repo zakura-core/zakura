@@ -1,6 +1,0 @@
-
-running 1 test
-test zakura::discovery::service::tests::a_service_admitted_during_the_answer_wait_keeps_the_connection ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2637 filtered out; finished in 0.00s
-

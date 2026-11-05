@@ -9,6 +9,8 @@ import re
 import subprocess
 import tomllib
 
+WITNESSES = "qa/mutation-readiness/witnesses.json"
+
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -51,17 +53,43 @@ def planted_binding(root, patch):
     }
 
 
+def selector_errors(root, source, test, test_target=None):
+    """Check that `--exact test` can name a function in `source`.
+
+    A library test's name starts with the module path of its file, and an
+    integration test's file is `tests/<test_target>.rs`. Cargo selects zero
+    tests when either part is wrong, so a function-name match alone is not
+    enough. This does not prove that Cargo compiles or selects the test.
+    """
+    path = root / source
+    crate = next(parent for parent in path.parents if (parent / "Cargo.toml").is_file())
+    parts = path.relative_to(crate).with_suffix("").parts
+    errors = []
+    if test_target is not None:
+        if parts != ("tests", test_target):
+            errors.append(f"{source} is not the integration test file for {test_target}")
+        module = []
+    elif parts[0] != "src":
+        errors.append(f"{source} is outside the library source tree")
+        module = []
+    else:
+        module = list(parts[1:])
+        if module[-1] in ("lib", "mod"):
+            module.pop()
+    *test_module, symbol = test.split("::")
+    if test_module[: len(module)] != module:
+        errors.append(f"selector {test} lies outside module {'::'.join(module)}")
+    if not re.search(r"\bfn\s+" + re.escape(symbol) + r"\s*\(", path.read_text()):
+        errors.append(f"test function not found in {source}")
+    return crate, errors
+
+
 def native_binding(root, case):
-    """Check a declared source symbol; this does not prove executable selection."""
+    """Check a native case's package, test selector and intended assertion."""
     if "gap" in case:
         return {"errors": [case["gap"]]}
-    source = root / case["source"]
     test = case["test"]
-    symbol = test.split("::")[-1]
-    errors = []
-    if not re.search(r"\bfn\s+" + re.escape(symbol) + r"\s*\(", source.read_text()):
-        errors.append(f"test function not found in {case['source']}")
-    crate = next(parent for parent in source.parents if (parent / "Cargo.toml").is_file())
+    crate, errors = selector_errors(root, case["source"], test, case.get("test_target"))
     manifest = tomllib.loads((crate / "Cargo.toml").read_text())
     if manifest["package"]["name"] != case["package"]:
         errors.append("declared package differs from the source crate")
@@ -75,9 +103,24 @@ def native_binding(root, case):
         "required_failure": case["required_failure"],
         "command": ["cargo", "test", "--locked", "-p", case["package"], *target, "--", test, "--exact"],
         "rustflags": case.get("rustflags", ""),
-        "executable_selection": "not-run; source symbol check only",
         "errors": errors,
     }
+
+
+def witness_errors(root):
+    """Check every native selector in the witness inventory, if one exists."""
+    path = root / WITNESSES
+    if not path.is_file():
+        return []
+    errors = []
+    for row in json.loads(path.read_text())["rows"]:
+        for test in row.get("tests", []):
+            try:
+                _, found = selector_errors(root, test["source"], test["selector"])
+            except (OSError, KeyError, ValueError, StopIteration) as error:
+                found = [f"binding metadata: {error!r}"]
+            errors.extend(f"{WITNESSES} {row['id']}: {error}" for error in found)
+    return errors
 
 
 def inventory(root):
@@ -110,17 +153,16 @@ def inventory(root):
             else:
                 row.update(native_binding(root, mappings.pop(path)))
         except (OSError, KeyError, ValueError, StopIteration) as error:
-            row["errors"] = [f"binding metadata: {error}"]
-        row["compilation"] = "not-run"
-        row["sensitivity"] = "not-run"
+            row["errors"] = [f"binding metadata: {error!r}"]
         rows.append(row)
     errors.extend(f"mapping has no patch: {path}" for path in sorted(mappings))
+    errors.extend(witness_errors(root))
     return {
         "revision": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
         "worktree_status": subprocess.check_output(
             ["git", "status", "--porcelain", "--untracked-files=all"], cwd=root, text=True,
         ).splitlines(),
-        "scope": "Static inventory only. Apply success and source symbols do not prove compilation, executable selection, trigger reachability, or detection.",
+        "scope": "Static inventory only. No row has been compiled or run. Apply success and selector checks do not prove compilation, executable selection, trigger reachability, or detection.",
         "errors": errors,
         "cases": rows,
     }

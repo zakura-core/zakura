@@ -248,7 +248,7 @@ a composed block peer-task panic, session-guard cleanup under contention,
 capacity release during waiter setup, and cancellation during an executing
 decode. Multi-service composition stays deferred with sim-9.3/xsync-3.
 
-#2027, #2030, #2032 and #2033 supply pending header hooks. Their reported
+PRs #2027, #2030, #2032 and #2033 supply pending header hooks. Their reported
 tests are not evidence at this pinned head.
 
 ### Fuzz lockfile refresh

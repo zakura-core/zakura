@@ -3049,21 +3049,31 @@ impl HeaderSyncReactor {
             );
         });
         if owner.is_some() {
+            let now = Instant::now();
             #[cfg(any(test, zakura_sim))]
             let installed = self.state.cooldowns_installed;
             self.state.start_readmission_cooldown(
                 &peer,
-                Instant::now(),
+                now,
                 self.startup.config.unproductive_peer_cooldown,
             );
             #[cfg(any(test, zakura_sim))]
             if let Some(owner) = owner.filter(|_| self.state.cooldowns_installed != installed) {
+                // The entry actually installed for `peer`, not the configured
+                // length, so a wrong deadline shows.
+                let cooldown = self
+                    .state
+                    .unproductive_peer_cooldowns
+                    .get(&peer)
+                    .map_or(std::time::Duration::ZERO, |until| {
+                        until.saturating_duration_since(now)
+                    });
                 observe!(
                     self,
                     ReactorEvent::CooldownStarted {
                         peer: peer.clone(),
                         origin: owner.session_id(),
-                        cooldown: self.startup.config.unproductive_peer_cooldown,
+                        cooldown,
                     }
                 );
             }

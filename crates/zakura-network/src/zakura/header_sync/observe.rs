@@ -218,7 +218,8 @@ pub enum ReactorEvent {
         peer: ZakuraPeerId,
         /// The session whose work showed the fault.
         origin: u64,
-        /// How long the reactor refuses `peer`'s sessions from now.
+        /// How long the installed entry refuses `peer`'s sessions from now:
+        /// its deadline less the time it was installed at.
         cooldown: std::time::Duration,
     },
     /// The reactor adopted a committed snapshot as the state it schedules and

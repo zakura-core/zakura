@@ -106,6 +106,41 @@ clean, with matching build identity and applicability label.
 The checker reruns no replay, proves no causal trigger semantics and runs no
 mutation. The tests build a small synthetic checkout and bundle.
 
+## Paired runner
+
+`cargo xtask planted pilot` runs the paired experiments from this
+catalogue (mut-3). It checks out each pinned revision in fresh worktrees,
+so it runs from a later tree such as `main`. The Python checker's tree pin
+then fails, but the runner checks the same pins itself: each patch, witness
+input and production file must match its catalogue hash, and each trace or
+fuzz build must pair with the catalogue's build identity. The runner builds
+the original and every mutant in separate worktrees and target directories
+under `--work`. `--out` must be missing or empty, so a run never replaces an
+earlier result.
+
+```sh
+cargo xtask planted pilot sensitivity --out "$OUT" [--only <case-id>]...
+cargo xtask planted pilot discovery --out "$OUT" [--only <case-id>]... [--seed <n>]...
+```
+
+`sensitivity` builds the witness revision with Rust 1.99.0 and the dev
+profile without debug information or incremental compilation. It writes
+`sensitivity.json`. `discovery` builds the fuzz revision and runs each
+original and mutant campaign with the bounds above. It writes
+`discovery.json`. Run `discovery` only on the remote campaign host. It runs
+one 600-second original campaign per target and seed, and one 600-second
+mutant campaign per case and seed. `--only` and `--seed` split the work
+across hosts.
+
+Each result is exactly one class of the plan's table: intended violation,
+other violation, survived budget, not applicable, baseline failure, invalid
+mutant, harness failure or equivalent. Only review metadata marks a case
+equivalent, through an `equivalent` argument on its catalogue entry. An
+intended violation also needs a fresh `zakura-sim confirm` and an Exact
+replay of the confirmed trace. Each report counts results by class and fault
+class. The rate's denominator leaves out baseline failures, invalid mutants
+and equivalent mutants, and keeps not-applicable results.
+
 ## Reproduce the baselines and calibration
 
 Build the witness simulator as in `qa/mutation-readiness/README.md`

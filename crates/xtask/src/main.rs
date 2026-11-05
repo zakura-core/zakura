@@ -99,6 +99,11 @@ fn try_main() -> Result<(), BoxError> {
             rt_imports::check(&repo_root()?)
         }
         Some("planted") => {
+            let mut args = args.peekable();
+            if args.peek().map(String::as_str) == Some("pilot") {
+                args.next();
+                return planted::pilot(&repo_root()?, args);
+            }
             let mut changed_since = None;
             let mut property = None;
             let mut targets = false;
@@ -362,6 +367,11 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
+        "  cargo xtask planted pilot (sensitivity|discovery) --out <dir> [--work <dir>]"
+    )?;
+    writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
+    writeln!(
+        output,
         "  cargo xtask record --sim <name> (--input <file> | --scenario <json> --plan <file>) --out <dir>"
     )?;
     writeln!(
@@ -460,6 +470,19 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "also confirms each patched input through that target in fresh processes."
     )?;
+    writeln!(
+        output,
+        "`planted pilot` runs the mutation pilot's paired experiments on the cases of"
+    )?;
+    writeln!(
+        output,
+        "qa/mutation-pilot/catalogue.json, each mutant in its own worktree and build, and"
+    )?;
+    writeln!(
+        output,
+        "writes sensitivity.json or discovery.json to --out. Discovery runs only on a"
+    )?;
+    writeln!(output, "remote campaign host.")?;
     writeln!(output)?;
     writeln!(
         output,

@@ -35,7 +35,9 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call, without retained-header ownership.
+    /// The events recorded since the last call, without retained-header ownership,
+    /// reservations, session admissions and ends, or the adopted state and its
+    /// publications.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -44,10 +46,33 @@ impl Recorder {
                     event,
                     ReactorEvent::HeadersHeld { .. }
                         | ReactorEvent::HeadersEnded { .. }
+                        | ReactorEvent::ReservationOpened { .. }
+                        | ReactorEvent::SessionAdmitted { .. }
+                        | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::CallEnded {
                             end: CallEnd::Dropped,
                             ..
                         }
+                        | ReactorEvent::SnapshotAdopted { .. }
+                        | ReactorEvent::StatusQueued { .. }
+                        | ReactorEvent::StatusDeferred { .. }
+                        | ReactorEvent::TipPublished { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The adopted state and publications recorded since the last call.
+    fn take_adoption(&self) -> Vec<ReactorEvent> {
+        self.take_all()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ReactorEvent::SnapshotAdopted { .. }
+                        | ReactorEvent::StatusQueued { .. }
+                        | ReactorEvent::StatusDeferred { .. }
+                        | ReactorEvent::TipPublished { .. }
                 )
             })
             .collect()
@@ -1376,6 +1401,84 @@ fn no_observer_evaluates_nothing() {
     );
 }
 
+/// Each installed session reports its admission once, with its ID, its
+/// direction, the session it replaced and the origin its peer carried, and a
+/// refused one reports none. Only the current session's disconnect reports
+/// its end.
+#[test]
+fn admitted_and_ended_sessions_are_observed() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = ZakuraPeerId::new(vec![0x51; 32]).expect("the test peer ID has the required length");
+    let sessions = || {
+        recorder
+            .take_all()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ReactorEvent::SessionAdmitted { .. } | ReactorEvent::SessionEnded { .. }
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let origin = |id: u64| crate::zakura::SessionOrigin {
+        connection: id + 10,
+        quic_stream: Some(id + 20),
+        generation: id + 30,
+    };
+    let admitted = |session_id, replaced, origin| ReactorEvent::SessionAdmitted {
+        peer: peer.clone(),
+        session_id,
+        direction: ServicePeerDirection::Inbound,
+        replaced,
+        origin,
+    };
+
+    let _first = connect(&mut reactor, &peer, 1);
+    assert_eq!(
+        sessions(),
+        [admitted(1, None, None)],
+        "the first session is admitted"
+    );
+    let (send, _second) = framed_channel(8);
+    reactor.handle_peer_connected(
+        PeerSession::from_parts_with_session_id(peer.clone(), 2, send, CancellationToken::new())
+            .with_origin(Some(origin(2))),
+    );
+    assert_eq!(
+        sessions(),
+        [admitted(2, Some(1), Some(origin(2)))],
+        "its replacement is admitted, naming the session it replaced and its own origin"
+    );
+    reactor.handle_peer_disconnected(&peer, 1, "test");
+    assert_eq!(
+        sessions(),
+        [],
+        "the replaced session's disconnect is a no-op"
+    );
+    reactor.handle_peer_disconnected(&peer, 2, "test");
+    assert_eq!(
+        sessions(),
+        [ReactorEvent::SessionEnded {
+            peer: peer.clone(),
+            session_id: 2,
+            reason: "test",
+        }],
+        "the current session's disconnect ends it"
+    );
+    reactor.state.unproductive_peer_cooldowns.insert(
+        peer.clone(),
+        Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let _refused = connect(&mut reactor, &peer, 3);
+    assert_eq!(sessions(), [], "a refused readmission isn't");
+}
+
 /// The `Misbehavior` events in `events`.
 fn misbehaviors(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
     events
@@ -1561,5 +1664,109 @@ fn dispatch_reports_distinct_origin_and_current() {
             origin: Some(1),
             current: Some(2),
         }]
+    );
+}
+
+/// The reactor reports the snapshot it adopts at construction and each newer one
+/// it observes, the tip watch's initial value and each send with whether a
+/// receiver saw it, and each `Status` it queues or defers with its session.
+#[tokio::test(start_paused = true)]
+async fn adopted_state_and_its_publications_are_observed() {
+    let recorder = Arc::new(Recorder::default());
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.observer = ObserverSlot(Some(recorder.clone()));
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the observed reactor builds");
+    let adopted = |snapshot: &zakura_header_chain::EngineSnapshot| ReactorEvent::SnapshotAdopted {
+        state_version: snapshot.state_version,
+        header_generation: snapshot.header_generation,
+        finalized: snapshot.frontiers.finalized,
+        header_best: snapshot.frontiers.header_best,
+        suffix_work: snapshot.header_best_score.suffix_work.as_u256(),
+        oldest_retained: snapshot.oldest_retained_height,
+    };
+    let published = |tip: zakura_header_chain::Frontier, delivered| ReactorEvent::TipPublished {
+        height: tip.height,
+        hash: tip.hash,
+        delivered,
+    };
+    let queued =
+        |snapshot: &zakura_header_chain::EngineSnapshot, limits| ReactorEvent::StatusQueued {
+            peer: peer(),
+            session_id: 7,
+            status: Status::from_snapshot(snapshot, limits),
+        };
+    assert_eq!(
+        recorder.take_adoption(),
+        [adopted(&snapshot), published(anchor, true)],
+        "construction adopts the snapshot and publishes the initial tip"
+    );
+
+    // The session's queue holds one frame, so its first status fills it.
+    let (send, mut outbound) = framed_channel(1);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        peer(),
+        7,
+        send,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        CloseCause::new(),
+    ));
+    let limits = reactor.page_limits;
+    assert_eq!(recorder.take_adoption(), [queued(&snapshot, limits)]);
+
+    // A new tip moves the tip watch. Its status waits for the one-second floor,
+    // then the full queue defers it.
+    let mut newer = snapshot.clone();
+    newer.state_version = newer.state_version.checked_next().unwrap();
+    newer.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x51; 32]));
+    reactor.observe_latest_committed_snapshot(newer.clone());
+    assert_eq!(
+        recorder.take_adoption(),
+        [
+            adopted(&newer),
+            published(newer.frontiers.header_best, true)
+        ]
+    );
+    reactor.observe_latest_committed_snapshot(newer.clone());
+    assert_eq!(
+        recorder.take_adoption(),
+        [],
+        "the same snapshot adopts nothing"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    reactor.refresh_statuses();
+    assert_eq!(
+        recorder.take_adoption(),
+        [ReactorEvent::StatusDeferred {
+            peer: peer(),
+            session_id: 7,
+        }]
+    );
+
+    // Once the queue drains, the retry queues the latest status.
+    outbound.try_recv().expect("the first status is queued");
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    reactor.refresh_statuses();
+    assert_eq!(recorder.take_adoption(), [queued(&newer, limits)]);
+
+    // With the handle gone, no receiver sees the next tip.
+    drop(handle);
+    let mut newest = newer;
+    newest.state_version = newest.state_version.checked_next().unwrap();
+    newest.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x52; 32]));
+    reactor.observe_latest_committed_snapshot(newest.clone());
+    assert_eq!(
+        recorder.take_adoption()[..2],
+        [
+            adopted(&newest),
+            published(newest.frontiers.header_best, false)
+        ]
     );
 }

@@ -172,14 +172,14 @@ impl BlockSyncPeerSession {
         &self.peer_id
     }
 
+    /// Give this session `sender` as its connection's Status state, as
+    /// admission does for a regulated connection.
     #[cfg(test)]
-    pub(super) fn with_status_for_test(mut self, status: BlockSyncStatus) -> Self {
-        let state = Arc::new(super::regulated::status_sender::StatusSender::new(
-            u32::MAX,
-            Duration::ZERO,
-        ));
-        state.record_received(status);
-        self.status_sender = Some(state);
+    pub(super) fn with_status_sender_for_test(
+        mut self,
+        sender: Arc<super::regulated::status_sender::StatusSender>,
+    ) -> Self {
+        self.status_sender = Some(sender);
         self
     }
 
@@ -260,15 +260,29 @@ impl BlockSyncPeerSession {
         }
     }
 
-    pub(super) fn received_status(&self) -> Option<BlockSyncStatus> {
+    /// The inbound Status state an earlier stream-6 session of this
+    /// connection left behind.
+    /// Reading claims the state for `generation`, so an older routine of
+    /// this connection can no longer write it.
+    pub(super) fn received_status(
+        &self,
+        generation: u64,
+    ) -> Option<super::regulated::status_sender::ReceivedStatus> {
         self.status_sender
             .as_ref()
-            .and_then(|state| state.received())
+            .and_then(|state| state.received(generation))
     }
 
-    pub(super) fn record_received_status(&self, status: BlockSyncStatus) {
+    /// Keep this session's inbound Status pacing with the connection, with
+    /// the Status just applied, if any.
+    pub(super) fn record_received_status(
+        &self,
+        generation: u64,
+        applied: Option<BlockSyncStatus>,
+        pacing: super::regulated::status_sender::InboundStatusPacing,
+    ) {
         if let Some(state) = &self.status_sender {
-            state.record_received(status);
+            state.record_received(generation, applied, pacing);
         }
     }
 
@@ -1526,9 +1540,18 @@ mod regulated_frame_tests {
             servable_high: block::Height(20),
             ..Default::default()
         };
-        first.record_received(received);
+        let pacing = super::super::regulated::status_sender::InboundStatusPacing {
+            apply_meter: super::super::state::RateMeter::new(Duration::from_secs(1)),
+            reply_meter: super::super::state::RateMeter::new(Duration::from_secs(1)),
+            range_bypass_available: false,
+            pending: None,
+        };
+        first.record_received(1, Some(received), pacing);
         let replacement = attach(1);
-        assert_eq!(replacement.received(), Some(received));
+        assert_eq!(
+            replacement.received(2).map(|received| received.applied),
+            Some(received)
+        );
         assert!(Arc::ptr_eq(&first, &replacement));
         // Regulated connections advertise the budgeted serving limit, not the local one.
         let local = ZakuraBlockSyncConfig::default().initial_status();
@@ -1541,7 +1564,7 @@ mod regulated_frame_tests {
         assert!(replacement.advertised(local).max_inflight_requests < local.max_inflight_requests);
         let new_connection = attach(2);
         assert!(!Arc::ptr_eq(&first, &new_connection));
-        assert_eq!(new_connection.received(), None);
+        assert!(new_connection.received(3).is_none());
         service.remove_peer(&peer, 1);
         assert!(!service
             .inner

@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-grow.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its 344-byte
+# prefix is the scenario's canonical encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 2
+sha256 = "13a6f50ed23fbeabd2398d65f6da2ec0807869b1b64f185031c14b5ead5e7ee5"
+scenario_sha256 = "764686f33a7babcf73bd6eac0eb25feb5dca036b3a210ca6967533cedbf2bfe4"
+source = "crates/zakura-sim/tests/header_storage_seeds.rs"

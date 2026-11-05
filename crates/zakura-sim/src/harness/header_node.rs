@@ -8,19 +8,25 @@
 //! `Sim::new` by [`preload`], since a run's scenario clock would otherwise
 //! decide whether the fixture headers validate. [`policy`] holds individual
 //! operations, and gates `Control` steps, until chosen events happen. A
-//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts.
+//! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts,
+//! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
+//! A `Shutdown` step stops the node under test on purpose, which its tap
+//! expects. The tap and the topology's links keep the node's
+//! [`session`] view.
 
+pub mod adoption;
 mod pair;
 pub mod policy;
+pub mod session;
 pub mod tap;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::pin,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -31,8 +37,8 @@ use zakura_header_chain::{Frontier, VctRootRepairStatus};
 use zakura_network::zakura::{
     framed_channel, observe::HeaderSyncObserver, spawn_header_sync_reactor, FullStateFrontiers,
     HeaderSyncHandle, HeaderSyncService, HeaderSyncStartup, Peer, Service, ServicePeerDirection,
-    ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
-    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    SessionOrigin, ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
+    ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_quic::NodeSecretKey;
@@ -43,8 +49,10 @@ use zakura_storage::header::{
 };
 
 use self::{
+    adoption::SessionLife,
     policy::{Hold, LinkEffect, Predicates, Trigger},
-    tap::ReactorTap,
+    session::SessionEvidence,
+    tap::{ReactorTap, TapShutdown},
 };
 use crate::{
     storage::{HeaderStorage, HEADER_SERVICE},
@@ -195,9 +203,14 @@ impl Policy {
 
 /// What tasks did to a [`Topology`], shared with the [`PolicySource`] that
 /// counts it for [`Trigger::Linked`], [`Trigger::Closed`] and
-/// [`Trigger::Grown`].
+/// [`Trigger::Grown`], and the names it counts tapped reactor facts under.
 #[derive(Clone, Default)]
 pub struct Effects {
+    /// Each node's peer identity and name, which [`Topology::new`] fills,
+    /// so [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`]
+    /// name the peer as the scenario does. A fact about a peer with no name
+    /// here counts for no trigger.
+    pub names: Rc<RefCell<Vec<(ZakuraPeerId, String)>>>,
     /// Every link made, in order.
     pub links: Rc<RefCell<Vec<Link>>>,
     /// Each peer whose chain grew, once per committed growth, in order.
@@ -205,6 +218,11 @@ pub struct Effects {
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
+    /// When the node under test's header-sync session on each link ended,
+    /// since the run's start, by connection ID. Each link's cancellation
+    /// hooks record it, inside the `cancel` that ends the session, so no
+    /// harness read touches a token.
+    pub ended: Arc<Mutex<BTreeMap<u64, Duration>>>,
 }
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
@@ -291,6 +309,7 @@ impl ActionSource for PolicySource {
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         let before = log.entries().len();
         let stored = self.storage.observe(log);
+        let mut tapped_effects = Vec::new();
         // Drained even when storage failed, so a port panic the tap holds
         // still reaches the run's failure cell and outranks that failure.
         let tapped = match &mut self.tap {
@@ -305,6 +324,7 @@ impl ActionSource for PolicySource {
                         _ => None,
                     },
                 ));
+                tapped_effects = tap.take_effects();
                 tap.observe(log)
             }
             None => Ok(()),
@@ -322,15 +342,23 @@ impl ActionSource for PolicySource {
                 _ => {}
             }
         }
+        let names = self.effects.names.borrow();
+        for (effect, peer) in tapped_effects {
+            if let Some((_, name)) = names.iter().find(|(id, _)| *id == peer) {
+                predicates.record_link(effect, name);
+            }
+        }
         let links = self.effects.links.borrow();
         for link in &links[self.linked..] {
             predicates.record_link(LinkEffect::Linked, &link.peer);
         }
         self.linked = links.len();
-        // A connection closes once, whoever cancels it and however often.
+        // A connection closes once, whoever cancels it and however often. A
+        // service's own cancellation reaches the session view here.
         for link in links.iter() {
             if link.is_closed() && self.closed.insert(link.conn_id) {
                 predicates.record_link(LinkEffect::Closed, &link.peer);
+                link.record_closed();
             }
         }
         let grown = self.effects.grown.borrow();
@@ -381,6 +409,8 @@ pub struct HeaderNode {
     pub vct_repairs: watch::Sender<VctRootRepairStatus>,
     /// What the reactor was started with.
     pub startup: StartupFacts,
+    /// The reactor's shutdown token, which a `Shutdown` step cancels.
+    shutdown: CancellationToken,
 }
 
 /// The settings a [`HeaderNode`]'s reactor was started with, read from the
@@ -433,6 +463,7 @@ impl HeaderNode {
         startup.vct_root_repairs = Some(repairs);
         startup.header_chain_port = port.clone();
         startup.observer.0 = observer;
+        let shutdown = startup.shutdown.clone();
         let facts = StartupFacts {
             config: startup.config.clone(),
             request_timeout: startup.request_timeout,
@@ -454,6 +485,7 @@ impl HeaderNode {
             port,
             vct_repairs,
             startup: facts,
+            shutdown,
         }
     }
 }
@@ -471,16 +503,29 @@ pub struct Link {
     pub conn_id: u64,
     /// The header-sync session's ID, the same on both sides.
     pub session_id: u64,
+    /// When it was made, since the run's start.
+    pub linked_at: Duration,
     /// Each side's connection token, dialer first.
     tokens: [CancellationToken; 2],
+    /// The node under test's session view, which learns of the close.
+    sessions: Option<SessionEvidence>,
 }
 
 impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
+        self.record_closed();
         for token in &self.tokens {
             token.cancel();
+        }
+    }
+
+    /// Tells the node under test's session view that this link closed. It
+    /// keeps only the first notice.
+    fn record_closed(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.link_closed(self.conn_id);
         }
     }
 
@@ -502,17 +547,76 @@ pub struct Topology {
     /// The last connection and session ID handed out. A replacement needs
     /// both to be new, so one counter serves both.
     last_id: Cell<u64>,
+    /// The node under test's tap, told of its shutdown.
+    tap: Option<TapShutdown>,
+    /// The node under test's session view, told of each link.
+    sessions: Option<SessionEvidence>,
 }
 
 impl Topology {
     /// `nodes`, with no links yet. Each link it makes, and each growth,
-    /// goes in `effects`.
+    /// goes in `effects`, which learns each node's name.
     pub fn new(nodes: Vec<HeaderNode>, effects: Effects) -> Self {
+        effects.names.borrow_mut().extend(
+            nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.name.clone())),
+        );
         Topology {
             nodes,
             effects,
             last_id: Cell::new(0),
+            tap: None,
+            sessions: None,
         }
+    }
+
+    /// This topology, telling `tap` before it stops the node under test.
+    pub fn with_tap(self, tap: TapShutdown) -> Self {
+        Topology {
+            tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// This topology, reporting each link it opens and closes to
+    /// `sessions`, the node under test's session view, which then joins
+    /// each admission to its link.
+    pub fn with_sessions(self, sessions: SessionEvidence) -> Self {
+        sessions.expect_links();
+        Topology {
+            sessions: Some(sessions),
+            ..self
+        }
+    }
+
+    /// Records why a `Control` step couldn't take effect, which ends the
+    /// run as a harness failure.
+    fn fail(&self, why: String) {
+        self.effects.failure.borrow_mut().get_or_insert(why);
+    }
+
+    /// Tells the node under test's tap that a `Shutdown` step was picked, so
+    /// a run that ends before the step takes effect fails as an unfinished
+    /// stop.
+    fn expect_shutdown(&self) {
+        if let Some(tap) = &self.tap {
+            tap.begin();
+        }
+    }
+
+    /// Stops the node under test, as zakurad's shutdown ends header sync:
+    /// closes every link to it, so its sessions end, and cancels its
+    /// reactor, which retires its work and drops its pending calls. Its tap
+    /// was told at the step's pick.
+    fn shutdown(&self) {
+        // Cancelling can be a scheduling point, so the links are copied
+        // first. Every link has the node under test at one end.
+        let links = self.effects.links.borrow().clone();
+        for link in &links {
+            link.close();
+        }
+        self.nodes[0].shutdown.cancel();
     }
 
     /// Extends the selected chain of the node named `peer` by `len` fixture
@@ -569,12 +673,34 @@ impl Topology {
 
     /// Connects `dialer` to `listener` with a new connection and session,
     /// each side's stream 5 at version 9 over a pair of in-memory channels.
+    /// Each side's peer carries the link's counter as its origin's
+    /// connection and generation. The session view hears of the link first.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
+        let peer = if dialer == 0 { listener } else { dialer };
+        let origin = SessionOrigin {
+            connection: id,
+            quic_stream: None,
+            generation: id,
+        };
+        if let Some(sessions) = &self.sessions {
+            sessions.link_opened(
+                &self.nodes[peer].id,
+                &self.nodes[peer].name,
+                origin,
+                id,
+                &self.nodes[dialer].name,
+                if dialer == 0 {
+                    ServicePeerDirection::Outbound
+                } else {
+                    ServicePeerDirection::Inbound
+                },
+            );
+        }
         let sides = [
             (
                 dialer,
@@ -589,8 +715,29 @@ impl Topology {
                 (from_dialer, to_dialer),
             ),
         ];
+        // The node's side of the session ends when either connection token is
+        // cancelled, or when the node cancels its own session token alone, as
+        // it does to refuse or retire the session. A hook runs inside that
+        // `cancel` and is no scheduling point, so it records the instant.
+        let ended = |token: &CancellationToken| {
+            let ended = self.effects.ended.clone();
+            token.on_cancel(move || {
+                // The run's own teardown cancels after its evidence froze.
+                let Some(now) = zakura_scheduler::hooks::now() else {
+                    return;
+                };
+                ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(id)
+                    .or_insert(now.since_start());
+            });
+        };
+        for token in &tokens {
+            ended(token);
+        }
         for ((local, remote, direction, streams), token) in sides.into_iter().zip(&tokens) {
-            self.nodes[local].service.add_peer(Peer::new_versioned(
+            let peer = Peer::new_versioned(
                 id,
                 self.nodes[remote].id.clone(),
                 ZAKURA_CAP_HEADER_SYNC,
@@ -600,19 +747,60 @@ impl Topology {
                 id,
                 streams,
                 token.clone(),
-            ));
+            )
+            .with_origin(origin);
+            if local == 0 {
+                ended(&peer.service_cancel_token());
+            }
+            self.nodes[local].service.add_peer(peer);
         }
-        let peer = if dialer == 0 { listener } else { dialer };
         let link = Link {
             peer: self.nodes[peer].name.clone(),
             dialer,
             listener,
             conn_id: id,
             session_id: id,
+            linked_at: zakura_scheduler::hooks::now()
+                .expect("links are made inside a run")
+                .since_start(),
             tokens,
+            sessions: self.sessions.clone(),
         };
         self.effects.links.borrow_mut().push(link.clone());
         link
+    }
+
+    /// Each link's session and how long it lasted, in link order. A session
+    /// ends when [`Effects::ended`] records it, or when a later link to the
+    /// same peer replaces it, whichever comes first. The node refuses a
+    /// session only by cancelling it, so a session still open here was
+    /// admitted.
+    pub fn sessions(&self) -> Vec<SessionLife> {
+        let links = self.effects.links.borrow();
+        let ended = self
+            .effects
+            .ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        links
+            .iter()
+            .enumerate()
+            .map(|(index, link)| {
+                let replaced = links[index + 1..]
+                    .iter()
+                    .find(|later| later.peer == link.peer)
+                    .map(|later| later.linked_at);
+                let until = match (ended.get(&link.conn_id).copied(), replaced) {
+                    (Some(ended), Some(replaced)) => Some(ended.min(replaced)),
+                    (ended, replaced) => ended.or(replaced),
+                };
+                SessionLife {
+                    session_id: link.session_id,
+                    from: link.linked_at,
+                    until,
+                }
+            })
+            .collect()
     }
 
     /// The newest link between the node under test and the node named
@@ -647,6 +835,12 @@ pub enum ControlAction {
         /// The new headers.
         len: u32,
     },
+    /// Stop the node under test, which the step must name: close every link
+    /// to it and cancel its reactor. Its tap expects the reactor to go, and
+    /// checks it left no call or ownership open. A later relink, a second
+    /// shutdown, or a run that ends idle or at its budget before the reactor
+    /// is gone fails the run.
+    Shutdown,
 }
 
 impl ControlAction {
@@ -656,6 +850,7 @@ impl ControlAction {
             ControlAction::Close => "close",
             ControlAction::Relink => "relink",
             ControlAction::Grow { .. } => "grow",
+            ControlAction::Shutdown => "shutdown",
         }
     }
 }
@@ -679,12 +874,16 @@ pub struct ControlStep {
 /// its trigger holds. A harness task carries each one out on its next step,
 /// since linking takes locks that tasks hold across scheduling points, where
 /// only a task can wait. So a pick only queues the action, and triggers
-/// count the effect.
+/// count the effect. Every check on a step runs at its pick, so a run cut
+/// off before the task takes the step still fails an invalid one.
 pub struct Control {
     script: Vec<ControlStep>,
+    topology: Rc<Topology>,
     predicates: Rc<RefCell<Predicates>>,
     /// The next step to offer.
     next: usize,
+    /// Set once a `Shutdown` step was picked.
+    shut_down: bool,
     to_task: mpsc::Sender<ControlStep>,
 }
 
@@ -699,7 +898,9 @@ impl Control {
         predicates: Rc<RefCell<Predicates>>,
     ) -> Self {
         let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
+        let task_topology = topology.clone();
         sim.scheduler().spawn_root("control", async move {
+            let topology = task_topology;
             while let Some(step) = steps.recv().await {
                 let link = || {
                     topology
@@ -713,13 +914,16 @@ impl Control {
                         topology.link(link.dialer, link.listener);
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
+                    ControlAction::Shutdown => topology.shutdown(),
                 }
             }
         });
         Control {
             script,
+            topology,
             predicates,
             next: 0,
+            shut_down: false,
             to_task,
         }
     }
@@ -753,10 +957,36 @@ impl ActionSource for Control {
         }
     }
 
+    /// Checks the next step and queues it for the control task. A shutdown
+    /// that doesn't name the node under test, a second shutdown, and a
+    /// relink after one fail the run here instead. A shutdown counts as
+    /// begun from its pick, before the task takes it.
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
-        self.to_task
-            .try_send(self.script[self.next].clone())
-            .expect("the channel holds the whole script, and the task outlives the run");
+        let step = self.script[self.next].clone();
         self.next += 1;
+        let invalid = match step.action {
+            ControlAction::Shutdown if step.peer != self.topology.nodes[0].name => Some(format!(
+                "a shutdown names the node under test, not {}",
+                step.peer
+            )),
+            ControlAction::Shutdown if self.shut_down => {
+                Some("the node is already shut down".to_owned())
+            }
+            ControlAction::Relink if self.shut_down => {
+                Some(format!("relinking {} after the shutdown", step.peer))
+            }
+            _ => None,
+        };
+        if let Some(why) = invalid {
+            self.topology.fail(why);
+            return;
+        }
+        if step.action == ControlAction::Shutdown {
+            self.shut_down = true;
+            self.topology.expect_shutdown();
+        }
+        self.to_task
+            .try_send(step)
+            .expect("the channel holds the whole script, and the task outlives the run");
     }
 }

@@ -438,7 +438,7 @@ def watch(helper, thread, state_path):
                             diagnostic = {key: record[key] for key in ("result", "cause", "step", "execution", "status", "precondition") if key in record}
                         except ValueError:
                             pass
-                if diagnostic.get("result") == "unreachable" and diagnostic.get("cause") == "network" and diagnostic.get("execution") == "not_started":
+                if diagnostic.get("result") == "unreachable" and diagnostic.get("execution") == "not_started":
                     transport_failures += 1
                     if transport_failures <= 3:
                         print(json.dumps({"event": "transport_retry", "attempt": transport_failures, "classification": diagnostic}), flush=True)

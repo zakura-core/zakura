@@ -16,11 +16,23 @@ class ComparisonTests(unittest.TestCase):
         failure = SimpleNamespace(returncode=4, stdout="", stderr='ssh-check: {"result":"unreachable","cause":"network","execution":"not_started"}')
         status = SimpleNamespace(returncode=0, stdout=json.dumps({"state":"stopped","at":0}), stderr="")
         queued = SimpleNamespace(returncode=0, stdout="Queued message", stderr="")
+        for cause in ("network", "ssh"):
+            with self.subTest(cause=cause), tempfile.TemporaryDirectory() as directory:
+                failure.stderr = 'ssh-check: ' + json.dumps({"result": "unreachable", "cause": cause, "execution": "not_started"})
+                with patch.object(comparison.subprocess, "run", side_effect=[failure, failure, status, queued]) as run, patch.object(comparison.time, "sleep") as sleep:
+                    comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30])
+                self.assertEqual(run.call_count, 4)
+
+    def test_watcher_stops_after_transport_retry_budget_is_exhausted(self):
+        failure = SimpleNamespace(returncode=4, stdout="", stderr='ssh-check: {"result":"unreachable","cause":"ssh","execution":"not_started"}')
+        queued = SimpleNamespace(returncode=0, stdout="Queued message", stderr="")
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(comparison.subprocess, "run", side_effect=[failure, failure, status, queued]) as run, patch.object(comparison.time, "sleep") as sleep:
-                comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30])
-        self.assertEqual(run.call_count, 4)
+            with patch.object(comparison.subprocess, "run", side_effect=[failure] * 4 + [queued]) as run, patch.object(comparison.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "unreachable"):
+                    comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
+        self.assertEqual(run.call_count, 5)
+        self.assertEqual(sleep.call_count, 3)
 
     def test_watcher_does_not_retry_authentication_failure(self):
         failure = SimpleNamespace(returncode=5, stdout="", stderr='ssh-check: {"result":"auth_refused"}')

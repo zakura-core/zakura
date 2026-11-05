@@ -27,8 +27,12 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        policy, preload, session::SessionEvidence, tap::ReactorTap, Chain, Control, ControlStep,
-        DispatchFlag, Effects, HeaderNode, Policy, PolicySource, Topology,
+        policy::{self, Allow, Hold, OpKind, Select, Trigger},
+        preload,
+        session::SessionEvidence,
+        tap::ReactorTap,
+        Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
+        Policy, PolicySource, Topology,
     },
     scenario::Rejection,
     wire_node::{TransportTap, WireNode},
@@ -194,6 +198,266 @@ impl Default for StorageScenario {
             controls: Vec::new(),
         }
     }
+}
+
+impl StorageScenario {
+    /// The node at A2 with `mirror-0` at A5, dialing, and `mirror-1` on a
+    /// fork of A3, dialed by the node. Each mirror's link closes and
+    /// relinks: `mirror-0`'s at once, `mirror-1`'s once `mirror-0` is
+    /// linked again.
+    pub fn close_relink() -> Self {
+        StorageScenario {
+            node: Chain::main(2),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(5),
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 3,
+                        fork: Some(Fork { branch: 1, len: 4 }),
+                    },
+                    dialer: Dialer::Node,
+                },
+            ],
+            controls: vec![
+                step("mirror-0", ControlAction::Close, None),
+                step(
+                    "mirror-0",
+                    ControlAction::Relink,
+                    Some(Trigger::Closed(mirror(0))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Close,
+                    Some(Trigger::Count(2, Box::new(Trigger::Linked(mirror(0))))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Relink,
+                    Some(Trigger::Closed(mirror(1))),
+                ),
+            ],
+            ..StorageScenario::default()
+        }
+    }
+
+    /// Three mirrors whose chains grow while the node syncs: `mirror-0`
+    /// once the node applies its first headers, `mirror-2`'s fork once
+    /// `mirror-0` has grown, then `mirror-0` again from A13, after which its
+    /// link closes and relinks.
+    pub fn grow() -> Self {
+        StorageScenario {
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(5),
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain::main(1),
+                    dialer: Dialer::Node,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 2,
+                        fork: Some(Fork { branch: 2, len: 3 }),
+                    },
+                    dialer: Dialer::Mirror,
+                },
+            ],
+            controls: vec![
+                step(
+                    "mirror-0",
+                    ControlAction::Grow { len: 8 },
+                    Some(Trigger::Handled(Select::nth(OpKind::Apply, 1))),
+                ),
+                step(
+                    "mirror-2",
+                    ControlAction::Grow { len: 3 },
+                    Some(Trigger::Grown(mirror(0))),
+                ),
+                step("mirror-0", ControlAction::Grow { len: 2 }, None),
+                step(
+                    "mirror-0",
+                    ControlAction::Close,
+                    Some(Trigger::Count(2, Box::new(Trigger::Grown(mirror(0))))),
+                ),
+                step("mirror-0", ControlAction::Relink, None),
+            ],
+            ..StorageScenario::default()
+        }
+    }
+
+    /// Four mirrors under [`Base::Any`] within 2 s, with holds that
+    /// together offer every outcome: the first read until a second read
+    /// completes, the first session's applies for 3 s, the second acquire
+    /// until its caller drops it, and every locator until the first VCT
+    /// context reply is taken.
+    pub fn holds() -> Self {
+        let read = Select {
+            kind: Some(OpKind::Read),
+            ..Select::default()
+        };
+        StorageScenario {
+            node: Chain::main(1),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(6),
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain::main(4),
+                    dialer: Dialer::Node,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 1,
+                        fork: Some(Fork { branch: 1, len: 5 }),
+                    },
+                    dialer: Dialer::Mirror,
+                },
+                MirrorSpec {
+                    chain: Chain::default(),
+                    dialer: Dialer::Node,
+                },
+            ],
+            policy: Policy {
+                base: Base::Any,
+                bound_ms: Some(2_000),
+                holds: vec![
+                    Hold {
+                        select: Select::nth(OpKind::Read, 1),
+                        until: Trigger::Count(2, Box::new(Trigger::Completed(read))),
+                        then: vec![Allow::Engine, Allow::Timeout],
+                        deadline_ms: None,
+                    },
+                    Hold {
+                        select: Select {
+                            kind: Some(OpKind::Apply),
+                            session: Some(1),
+                            ..Select::default()
+                        },
+                        until: Trigger::VirtualTime(3_000),
+                        then: vec![Allow::Unavailable, Allow::LocalResource, Allow::Rejected],
+                        deadline_ms: None,
+                    },
+                    Hold {
+                        select: Select::nth(OpKind::Acquire, 2),
+                        until: Trigger::CallerDropped(Select::held()),
+                        then: vec![Allow::Engine, Allow::Rejected],
+                        deadline_ms: None,
+                    },
+                    Hold {
+                        select: Select {
+                            kind: Some(OpKind::Locator),
+                            ..Select::default()
+                        },
+                        until: Trigger::ReplyTaken(Select::nth(OpKind::VctContext, 1)),
+                        then: vec![Allow::Engine],
+                        deadline_ms: None,
+                    },
+                ],
+            },
+            ..StorageScenario::default()
+        }
+    }
+
+    /// Two mirrors whose control steps wait for each trigger kind the
+    /// grammar has: a storage event of each kind, a link closing, a link
+    /// made, a growth and a virtual time. A hold of the first prepare waits
+    /// for the first membership submission.
+    pub fn triggers() -> Self {
+        StorageScenario {
+            node: Chain::main(3),
+            mirrors: vec![
+                MirrorSpec {
+                    chain: Chain::main(9),
+                    dialer: Dialer::Node,
+                },
+                MirrorSpec {
+                    chain: Chain {
+                        main: 3,
+                        fork: Some(Fork { branch: 2, len: 6 }),
+                    },
+                    dialer: Dialer::Mirror,
+                },
+            ],
+            policy: Policy {
+                holds: vec![Hold {
+                    select: Select::nth(OpKind::Prepare, 1),
+                    until: Trigger::Submitted(Select::nth(OpKind::Membership, 1)),
+                    then: vec![Allow::Engine, Allow::Timeout],
+                    deadline_ms: None,
+                }],
+                ..Policy::converging()
+            },
+            controls: vec![
+                step(
+                    "mirror-0",
+                    ControlAction::Close,
+                    Some(Trigger::Submitted(Select::nth(OpKind::Locator, 2))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Relink,
+                    Some(Trigger::Closed(mirror(0))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Grow { len: 4 },
+                    Some(Trigger::Completed(Select::nth(OpKind::Read, 1))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Close,
+                    Some(Trigger::Grown(mirror(1))),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Relink,
+                    Some(Trigger::ReplyTaken(Select::nth(OpKind::Acquire, 1))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Grow { len: 2 },
+                    Some(Trigger::Count(2, Box::new(Trigger::Linked(mirror(1))))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Close,
+                    Some(Trigger::Handled(Select::nth(OpKind::Apply, 1))),
+                ),
+                step(
+                    "mirror-0",
+                    ControlAction::Relink,
+                    Some(Trigger::VirtualTime(6_000)),
+                ),
+                step(
+                    "mirror-1",
+                    ControlAction::Close,
+                    Some(Trigger::CallerDropped(Select {
+                        kind: Some(OpKind::Read),
+                        ..Select::default()
+                    })),
+                ),
+            ],
+        }
+    }
+}
+
+/// `peer`'s control step `action`, offered once `when` holds.
+fn step(peer: &str, action: ControlAction, when: Option<Trigger>) -> ControlStep {
+    ControlStep {
+        peer: peer.to_owned(),
+        action,
+        when,
+    }
+}
+
+/// `mirror-<index>`, a [`StorageScenario`] mirror's name.
+fn mirror(index: usize) -> String {
+    format!("mirror-{index}")
 }
 
 /// The scenario's storage, with each actor's chain committed before the
@@ -509,13 +773,17 @@ impl Subsystem for HeaderWire {
     type Prepared = WirePorts;
 
     /// [`wire_config`], with twice its budget for a scenario with status
-    /// bursts: emptying a `Status` bucket takes about 600 frames, and the
-    /// node about 40 steps to read each.
+    /// bursts or an over-credit objects page. Emptying a `Status` bucket
+    /// takes about 600 frames, and the node about 40 steps to read each. The
+    /// node must read the whole 45 KB page before it can count objects, so
+    /// with every datagram delivered at once, that run spends up to about
+    /// 3,500 steps at 0 ns, past the livelock limit of a tenth of the
+    /// budget.
     fn config(scenario: &WireScenario) -> RunConfig {
         let burst = scenario.peers.iter().any(|peer| {
-            peer.script.contains(&PeerAction::Act {
-                act: Act::StatusBurst,
-            })
+            [Act::StatusBurst, Act::OverCreditObjects]
+                .into_iter()
+                .any(|act| peer.script.contains(&PeerAction::Act { act }))
         });
         let config = wire_config();
         RunConfig {

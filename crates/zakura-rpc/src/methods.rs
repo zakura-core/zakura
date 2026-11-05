@@ -1613,6 +1613,46 @@ where
             .await
     }
 
+    /// Builds the coinbase-only template a long poll returns once it sees a new tip.
+    ///
+    /// Miners want work on the new tip before the mempool has caught up with it, so this
+    /// template has no mempool transactions and an ID that names none. The client's next long
+    /// poll then returns the full template as soon as the mempool has any. Returns `Ok(None)`
+    /// when the template was superseded, like [`Self::finish_mining_template`].
+    async fn new_tip_template(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        rejection_state: &types::get_block_template::TemplateRejections,
+        client_long_poll_id: Option<&types::long_poll::LongPollId>,
+    ) -> Result<Option<GetBlockTemplateResponse>> {
+        let mut long_poll_id = LongPollInput::new(
+            chain_info.tip_height,
+            chain_info.tip_hash,
+            chain_info.max_time,
+            vec![],
+        )
+        .generate_id();
+        long_poll_id.revision = rejection_state.revision;
+        let submit_old = client_long_poll_id.map(|old| long_poll_id.submit_old(old));
+
+        // After ZIP 234 activation the coinbase proof must wait for the new parent's pools, so
+        // the build runs off the async worker to let other RPC requests continue.
+        let template = self
+            .build_mining_template(
+                precomputed_coinbase,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                vec![],
+                submit_old,
+            )
+            .await?;
+        self.finish_mining_template(template, chain_info, miner_params)
+            .await
+    }
+
     /// Validates an empty replacement template in the foreground and publishes it.
     ///
     /// A recovered template is the only work this parent may still hand out, so it is validated
@@ -3509,6 +3549,33 @@ where
                     continue;
                 };
 
+                // A long poll whose ID names an older tip has missed the tip change it waits for:
+                // the client sent it after the change, or this loop came back around after it.
+                // Answer the way the tip arm below does, instead of waiting for the mempool to
+                // process the new block and then building a full template.
+                if client_long_poll_id
+                    .as_ref()
+                    .is_some_and(|client_long_poll_id| {
+                        !LongPollInput::new(tip_height, tip_hash, max_time, vec![])
+                            .generate_id()
+                            .same_tip(client_long_poll_id)
+                    })
+                {
+                    if let Some(template) = self
+                        .new_tip_template(
+                            None,
+                            miner_params,
+                            &chain_info,
+                            &rejection_state,
+                            client_long_poll_id.as_ref(),
+                        )
+                        .await?
+                    {
+                        return Ok(template);
+                    }
+                    continue 'rebuild;
+                }
+
                 // Fetch the mempool data for the block template:
                 // - if the mempool transactions change, we might return from long polling.
                 //
@@ -3693,18 +3760,6 @@ where
                         else {
                             continue;
                         };
-                        let mut server_long_poll_id = LongPollInput::new(
-                            chain_info.tip_height,
-                            chain_info.tip_hash,
-                            chain_info.max_time,
-                            vec![]
-                        )
-                        .generate_id();
-                        server_long_poll_id.revision = rejection_state.revision;
-
-                        let submit_old = client_long_poll_id
-                            .as_ref()
-                            .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
 
                         // Discard the precomputed coinbase if our `+2` guess was wrong
                         // (multi-block advance, reorg, or spurious notification) — its
@@ -3714,19 +3769,16 @@ where
                             .then_some(precomputed_coinbase)
                             .flatten();
 
-                        // Build an empty block on the new tip. After ZIP 234 activation,
-                        // its proof must wait for the new parent's pools; build it off the
-                        // async worker so other RPC requests can continue.
-                        let template = self.build_mining_template(
-                            precomputed_coinbase,
-                            miner_params,
-                            &chain_info,
-                            server_long_poll_id,
-                            vec![],
-                            submit_old,
-                        )
-                        .await?;
-                        if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
+                        if let Some(template) = self
+                            .new_tip_template(
+                                precomputed_coinbase,
+                                miner_params,
+                                &chain_info,
+                                &rejection_state,
+                                client_long_poll_id.as_ref(),
+                            )
+                            .await?
+                        {
                             return Ok(template);
                         }
                         continue 'rebuild;

@@ -14,7 +14,7 @@ use std::{
 use indexmap::IndexMap;
 use tokio::sync::watch;
 use zakura_chain::{
-    block::{self, Hash, Height},
+    block::{self, merkle::AuthDataRoot, Hash, Height},
     parameters::Network,
     sprout::{self},
     transparent,
@@ -934,6 +934,7 @@ impl NonFinalizedState {
         let contextual_block_start = Instant::now();
         let height = prepared.height;
         let block_hash = prepared.hash;
+        let auth_data_root = prepared.auth_data_root;
         let transaction_count = prepared.block.view().transactions().len();
         let spent_utxo_count = spent_utxos.len();
         let contextual = ContextuallyVerifiedBlock::with_block_and_shared_spent_utxos(
@@ -961,6 +962,7 @@ impl NonFinalizedState {
         let result = Self::validate_and_update_parallel(
             new_chain,
             contextual,
+            auth_data_root,
             sprout_final_treestates,
             contextual_metrics,
         );
@@ -1099,14 +1101,18 @@ impl NonFinalizedState {
     }
 
     /// Validate `contextual` and update `new_chain`, doing CPU-intensive work in parallel batches.
+    ///
+    /// `auth_data_root` is the block's authorizing-data root if its verifier already computed it
+    /// from this block's transactions. `None` recomputes it.
     #[allow(clippy::unwrap_in_result)]
     #[tracing::instrument(
-        skip(new_chain, contextual, sprout_final_treestates),
+        skip(new_chain, contextual, auth_data_root, sprout_final_treestates),
         fields(height = ?contextual.height, hash = %contextual.hash)
     )]
     fn validate_and_update_parallel(
         new_chain: Arc<Chain>,
         contextual: ContextuallyVerifiedBlock,
+        auth_data_root: Option<AuthDataRoot>,
         sprout_final_treestates: HashMap<sprout::tree::Root, Arc<sprout::tree::NoteCommitmentTree>>,
         contextual_metrics: ContextualMetrics,
     ) -> Result<Arc<Chain>, ValidateContextError> {
@@ -1130,7 +1136,7 @@ impl NonFinalizedState {
                     block,
                     &network,
                     &history_tree,
-                    None,
+                    auth_data_root,
                 );
                 block_commitment_result = Some((result, start.elapsed()));
             });

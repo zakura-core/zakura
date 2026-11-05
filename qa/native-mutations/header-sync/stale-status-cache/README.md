@@ -20,5 +20,5 @@ Required failure: the status rule breaks with `StatusOverdue` or
 `StaleStatus`, so `every_live_session_gets_the_adopted_status` fails. The
 generation and tip tests still pass. The mirrors run the same patched reactor,
 so the witness no longer has the shape
-`the_grow_witness_holds_a_read_across_the_growth` checks, and that test fails
+`the_grow_witness_holds_a_locator_across_the_growth` checks, and that test fails
 too. It checks no rule.

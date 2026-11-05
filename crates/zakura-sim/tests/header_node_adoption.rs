@@ -3,10 +3,10 @@
 //! tip it publishes, kept in the tap's view-side evidence store and judged by
 //! the generation, status and tip rules.
 //!
-//! The witness grows `mirror-0` twice while the node's first publisher read,
-//! taken under the node's starting generation, is held until the first growth
-//! is applied. Each growth changes the node's selected chain, so its header
-//! generation and tip advance twice.
+//! The witness holds the node's first locator read, taken under its starting
+//! generation for `mirror-1`'s target, while `mirror-0` grows and the node
+//! applies the growth under a new generation. Released after that, the read
+//! settles a target the adoption made obsolete, which must not start a round.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -169,36 +169,41 @@ fn step(peer: &str, action: ControlAction, when: Trigger) -> ControlStep {
     }
 }
 
-/// The witness: the node at A3, `mirror-0` at A5 dialing in, and the node
-/// dialing `mirror-1` at genesis, which it serves. The node syncs A5 from
-/// `mirror-0`, which then grows to A7, so the node adopts two new generations
-/// after its starting one. Its first publisher read, for `mirror-1`, is held
-/// until the growth's apply completes, so a call from an older generation is
-/// in flight while the growth changes the selected chain.
+/// The witness: the node at A3, `mirror-0` at A3 dialing in, and the node
+/// dialing `mirror-1` at A9. Only `mirror-1` offers more work at first, so the
+/// node's first locator read is for its target, under the starting
+/// generation. That read is held while `mirror-0` grows to A5 and the node
+/// syncs and applies the growth, which adopts a new generation. Released then,
+/// it settles a target the adoption made obsolete. The node then syncs A9 from
+/// `mirror-1` under a third generation.
 fn grow_witness() -> StorageScenario {
-    let apply = |nth| Trigger::Completed(Select::nth(OpKind::Apply, nth));
+    let locator = || Select::nth(OpKind::Locator, 1);
     StorageScenario {
         node: Chain::main(3),
         mirrors: vec![
             MirrorSpec {
-                chain: Chain::main(5),
+                chain: Chain::main(3),
                 dialer: Dialer::Mirror,
             },
             MirrorSpec {
-                chain: Chain::default(),
+                chain: Chain::main(9),
                 dialer: Dialer::Node,
             },
         ],
         policy: Policy {
             holds: vec![Hold {
-                select: Select::nth(OpKind::Read, 1),
-                until: apply(2),
+                select: locator(),
+                until: Trigger::Completed(Select::nth(OpKind::Apply, 1)),
                 then: vec![Allow::Engine],
                 deadline_ms: None,
             }],
             ..Policy::converging()
         },
-        controls: vec![step("mirror-0", ControlAction::Grow { len: 2 }, apply(1))],
+        controls: vec![step(
+            "mirror-0",
+            ControlAction::Grow { len: 2 },
+            Trigger::Submitted(locator()),
+        )],
     }
 }
 
@@ -265,45 +270,28 @@ fn sweep(rule: &str, check: impl Fn(&Run) -> Acceptance) -> Tally {
     tally
 }
 
-/// The witness runs as designed. The held read was submitted before the
-/// growth's apply completed, and completed after it, under a generation the
-/// node held before the growth. The node adopted A3, then A5 and A7 under
-/// two newer generations, queued a status for each tip on both sessions, published each tip, and dispatched a locator after the first
-/// new adoption, so every rule has something to judge.
+/// The witness runs as designed. The node's first locator read was
+/// dispatched under its starting generation, submitted before the growth's
+/// apply completed, and completed after it. The node adopted A3, then A5 and
+/// A9 under two newer generations, queued a status for each tip on both
+/// sessions, published each tip, and dispatched a fresh locator read after
+/// adopting A5, so every rule has something to judge.
 #[test]
-fn the_grow_witness_holds_a_read_across_the_growth() {
+fn the_grow_witness_holds_a_locator_across_the_growth() {
     let scenario = grow_witness();
     for input in inputs(16, 256) {
         let run = run(&scenario, input);
-        let is_read =
-            |request: &StorageRequest| matches!(request, StorageRequest::ReadHeaderPath { .. });
+        let is_locator =
+            |request: &StorageRequest| matches!(request, StorageRequest::ContinuationLocator);
         let is_apply =
             |request: &StorageRequest| matches!(request, StorageRequest::ApplyHeaderTarget { .. });
-        let (read_at, read_done) = nth(&run.report, 1, is_read).expect("the node serves");
-        let read_generation = run
-            .report
-            .log
-            .entries()
-            .iter()
-            .find_map(|entry| match &entry.obs {
-                Observation::Storage {
-                    instance: 0,
-                    fact:
-                        StorageFact::Submitted {
-                            request: StorageRequest::ReadHeaderPath { scope, .. },
-                            ..
-                        },
-                    ..
-                } => Some(scope.header_generation),
-                _ => None,
-            })
-            .expect("the node reads a path");
-        let (_, grown) = nth(&run.report, 2, is_apply).expect("the node applies the growth");
+        let (held_at, held_done) = nth(&run.report, 1, is_locator).expect("the node locates");
+        let (_, grown) = nth(&run.report, 1, is_apply).expect("the node applies the growth");
         let grown = grown.expect("the growth's apply completes");
-        let read_done = read_done.expect("the held read completes");
+        let held_done = held_done.expect("the held locator read completes");
         assert!(
-            read_at < grown && grown < read_done,
-            "{read_at} {grown} {read_done}"
+            held_at < grown && grown < held_done,
+            "{held_at} {grown} {held_done}"
         );
 
         let adoptions = run.adoption().adoptions();
@@ -311,7 +299,7 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
             .iter()
             .map(|adoption| adoption.header_best.height.0)
             .collect();
-        assert_eq!(tips, [3, 5, 7]);
+        assert_eq!(tips, [3, 5, 9]);
         let generations: Vec<u64> = adoptions
             .iter()
             .map(|adoption| adoption.header_generation.get())
@@ -320,14 +308,18 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
             generations.windows(2).all(|pair| pair[0] < pair[1]),
             "{generations:?}"
         );
-        // The held read is from before the growth, which adopts a newer
-        // generation while it's held.
-        assert!(
-            generations[..2].contains(&read_generation),
-            "read under {read_generation}, adopted {generations:?}"
-        );
 
         let facts = run.adoption().facts();
+        // The held read is the first one dispatched, under the starting
+        // generation, which the growth's adoption replaces while it's held.
+        let first_locator = facts
+            .iter()
+            .find_map(|stamped| match stamped.fact {
+                AdoptionFact::LocatorDispatched { generation, .. } => Some(generation.get()),
+                _ => None,
+            })
+            .expect("the node dispatches a locator read");
+        assert_eq!(first_locator, generations[0], "{generations:?}");
         let count = |is: &dyn Fn(&AdoptionFact) -> bool| {
             facts.iter().filter(|stamped| is(&stamped.fact)).count()
         };
@@ -345,7 +337,7 @@ fn the_grow_witness_holds_a_read_across_the_growth() {
                     }
                 }
             }
-            assert_eq!(tips, [3, 5, 7], "session {}", session.session_id);
+            assert_eq!(tips, [3, 5, 9], "session {}", session.session_id);
         }
         let second = facts
             .iter()

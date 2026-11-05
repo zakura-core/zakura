@@ -19,5 +19,5 @@ git apply -R qa/native-mutations/header-sync/unsent-tip/unsent-tip.patch
 Required failure: the tip rule breaks with `UnpublishedTip`, so
 `every_adopted_tip_is_published` fails. The generation and status tests
 still pass. The mirrors run the same patched reactor, so the witness no longer
-has the shape `the_grow_witness_holds_a_read_across_the_growth` checks, and
+has the shape `the_grow_witness_holds_a_locator_across_the_growth` checks, and
 that test fails too. It checks no rule.

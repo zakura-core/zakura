@@ -32,7 +32,7 @@ use zakura_chain::{
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
 };
-use zakura_consensus::{router::RouterError, VerifyBlockError};
+use zakura_consensus::{router::RouterError, EarlyRelay, VerifyBlockError};
 use zakura_network::{AddressBook, InventoryResponse};
 use zakura_node_services::mempool;
 use zakura_rpc::PendingBlockRegistry;
@@ -222,12 +222,20 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
 
 /// Returns an admitted block or a committed block from any active chain.
 ///
+/// With `early_relay`, also returns a block published for early relay. Only requests from a
+/// connection that negotiated early block relay may pass it.
+///
 /// Peers can request a hash on any active chain, even when this node does not consider it best.
 async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
+    early_relay: Option<EarlyRelay>,
     hash: block::Hash,
 ) -> Result<Option<BlockHandle>, zn::BoxError> {
+    if let Some(block) = early_relay.and_then(|relay| relay.get(hash)) {
+        metrics::counter!("consensus.early_relay.served").increment(1);
+        return Ok(Some(block));
+    }
     if let Some(block) = pending_blocks.get(hash) {
         return Ok(Some(block.into()));
     }
@@ -397,6 +405,9 @@ pub struct Inbound {
 
     /// Early-advertised mined blocks waiting for contextual commit.
     pending_blocks: PendingBlockRegistry,
+
+    /// Verified tip children served to negotiated early-relay peers before their commit.
+    early_relay: Option<EarlyRelay>,
 }
 
 impl Inbound {
@@ -426,7 +437,14 @@ impl Inbound {
                 zcashd_compat_peer_ips,
             )),
             pending_blocks: PendingBlockRegistry::default(),
+            early_relay: None,
         }
+    }
+
+    /// Serves `early_relay` blocks to connections that negotiated early block relay.
+    pub fn with_early_relay(mut self, early_relay: Option<EarlyRelay>) -> Self {
+        self.early_relay = early_relay;
+        self
     }
 
     /// Shares one pending-block registry with the mining RPCs.
@@ -614,6 +632,7 @@ impl Service<zn::Request> for Inbound {
     fn call(&mut self, req: zn::Request) -> Self::Future {
         let pruned_block_not_found_logger = self.pruned_block_not_found_logger.clone();
         let pending_blocks = self.pending_blocks.clone();
+        let early_relay = self.early_relay.clone();
         let (cached_peer_addr_response, block_downloads, mempool, state) = match &mut self.setup {
             Setup::Initialized {
                 cached_peer_addr_response,
@@ -648,12 +667,16 @@ impl Service<zn::Request> for Inbound {
                 }.boxed()
             }
             request @ (zn::Request::BlocksByHash(_)
-            | zn::Request::BlocksByHashFrom { .. }) => {
-                let (hashes, source) = match request {
-                    zn::Request::BlocksByHash(hashes) => (hashes, None),
+            | zn::Request::BlocksByHashFrom { .. }
+            | zn::Request::EarlyBlocksByHash(_)) => {
+                // Only a negotiated connection creates `EarlyBlocksByHash`, so only it can
+                // receive a block before that block's commit finishes.
+                let (hashes, source, early_relay) = match request {
+                    zn::Request::BlocksByHash(hashes) => (hashes, None, None),
                     zn::Request::BlocksByHashFrom { hashes, source } => {
-                        (hashes, Some(source))
+                        (hashes, Some(source), None)
                     }
+                    zn::Request::EarlyBlocksByHash(hashes) => (hashes, None, early_relay),
                     _ => unreachable!("matched block inventory request"),
                 };
                 let log_pruned_block =
@@ -687,6 +710,7 @@ impl Service<zn::Request> for Inbound {
                         let block = match block_by_hash_or_pending(
                             state.clone(),
                             pending_blocks.clone(),
+                            early_relay.clone(),
                             hash,
                         )
                         .await
@@ -886,7 +910,7 @@ impl Service<zn::Request> for Inbound {
                 unreachable!("ping requests are handled internally");
             }
 
-            zn::Request::AdvertiseBlockToAll(_) | zn::Request::AdvertiseMinedBlock(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
+            zn::Request::AdvertiseBlockToAll(_) | zn::Request::AdvertiseMinedBlock(_) | zn::Request::AdvertiseEarlyBlock(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
         };
 
         async move {

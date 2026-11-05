@@ -273,6 +273,9 @@ pub(crate) struct BlockGossipPeer {
     pub(crate) version: Version,
     /// Configured sidecars may wait for a busy connection to write inventory.
     pub(crate) sidecar: bool,
+    /// Whether this connection negotiated early block relay, so it may receive
+    /// [`Request::AdvertiseEarlyBlock`] inventory.
+    pub(crate) early_block_relay: bool,
 }
 
 impl BlockGossipPeer {
@@ -564,11 +567,12 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         &mut self,
         request: Request,
     ) -> BoxFuture<'static, Result<Response, BoxError>> {
-        let (block, mined) = match request {
+        let (block, mined, early) = match request {
             Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
-                (block, false)
+                (block, false, false)
             }
-            Request::AdvertiseMinedBlock(block) => (block, true),
+            Request::AdvertiseMinedBlock(block) => (block, true, false),
+            Request::AdvertiseEarlyBlock(block) => (block, false, true),
             other => {
                 return futures::future::ready(Err(format!(
                     "block advertiser cannot send {}",
@@ -597,11 +601,17 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     .iter()
                     .filter(|peer| {
                         peer.version >= minimum_version
+                            && (!early || peer.early_block_relay)
                             && !peer.sender.is_closed()
                             && !peer.address.is_some_and(|addr| bans.contains(addr.ip()))
                     })
                     .cloned()
                     .collect();
+                // An early advert is only useful before the committed tip broadcast, so it never
+                // waits for a negotiated peer to connect.
+                if early && candidates.is_empty() {
+                    return Ok(Response::Nil);
+                }
                 if !candidates.is_empty() {
                     match broadcast_block(candidates, block.hash, window, mined, slots.clone())
                         .await
@@ -676,6 +686,7 @@ mod tests {
                 registry: None,
                 version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
                 sidecar: false,
+                early_block_relay: false,
             },
             receiver,
         )
@@ -1700,6 +1711,54 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(slots.available_uploads(), 1);
         assert!(receiver.try_recv().is_err());
+    }
+
+    fn mainnet_advertiser(
+        peers: watch::Receiver<Vec<BlockGossipPeer>>,
+    ) -> BlockAdvertiser<zakura_chain::chain_tip::NoChainTip> {
+        BlockAdvertiser {
+            fanout: AdvertFanout::from_config(&Config::default()),
+            peers,
+            slots: BlockUploadSlots::new(1),
+            minimum_peer_version: MinimumPeerVersion::new(
+                zakura_chain::chain_tip::NoChainTip,
+                &zakura_chain::parameters::Network::Mainnet,
+            ),
+            bans: BannedIps::default(),
+            refresh: None,
+        }
+    }
+
+    /// Early adverts go only to peers that negotiated early block relay.
+    #[tokio::test(start_paused = true)]
+    async fn early_advert_skips_peers_without_early_relay() {
+        let (committed_only, mut committed_rx) = peer();
+        let (mut early, mut early_rx) = peer();
+        early.early_block_relay = true;
+        let (_published, peers) = watch::channel(vec![committed_only, early]);
+        let hash = block::Hash([75; 32]);
+        let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+            mainnet_advertiser(peers),
+            Request::AdvertiseEarlyBlock(hash.into()),
+        ));
+        accept(&mut early_rx, hash).await;
+        assert!(broadcast.await.unwrap().is_ok());
+        assert!(committed_rx.try_recv().is_err());
+    }
+
+    /// Without a negotiated peer, an early advert finishes at once instead of waiting for one.
+    #[tokio::test(start_paused = true)]
+    async fn early_advert_without_early_peers_finishes_at_once() {
+        let (committed_only, mut committed_rx) = peer();
+        let (_published, peers) = watch::channel(vec![committed_only]);
+        let result = tower::ServiceExt::oneshot(
+            mainnet_advertiser(peers),
+            Request::AdvertiseEarlyBlock(block::Hash([76; 32]).into()),
+        )
+        .now_or_never()
+        .expect("the advert does not wait");
+        assert!(matches!(result, Ok(Response::Nil)));
+        assert!(committed_rx.try_recv().is_err());
     }
 
     #[test]

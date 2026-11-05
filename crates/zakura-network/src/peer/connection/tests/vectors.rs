@@ -1335,6 +1335,7 @@ async fn block_gossip_slot_tracks_connection_write() {
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         sidecar: false,
+        early_block_relay: false,
     };
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
@@ -1452,6 +1453,7 @@ async fn truncated_block_request_releases_gossip_slot() {
         registry: None,
         version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         sidecar: false,
+        early_block_relay: false,
     };
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let decoy = block::Hash([1; 32]);
@@ -2852,4 +2854,117 @@ async fn queued_block_advert_is_revoked_by_ban(form: BanAddressForm) {
     })
     .await
     .expect("the revoked advert is answered before the request timeout");
+}
+
+/// A negotiated early-relay connection marks both directions of block inventory: the peer's
+/// `getdata` reaches the inbound service as an early request, and blocks the peer sends this
+/// node arrive as early-relay deliveries.
+#[tokio::test(start_paused = true)]
+async fn early_relay_connection_tags_block_requests_and_deliveries() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, mut inbound, mut outbound, _error_slot) =
+        super::new_early_relay_test_connection::<PanicAssertion>();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (_tx, block) = response_vectors();
+
+    peer_tx
+        .send(Ok(Message::GetData(vec![block.hash().into()])))
+        .await
+        .expect("connection is open");
+    inbound
+        .expect_request(Request::EarlyBlocksByHash(IndexSet::from([block.hash()])))
+        .await
+        .respond(Response::Blocks(vec![crate::InventoryResponse::Available(
+            (block.clone().into(), None),
+        )]));
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::Block(block.clone().into()))
+    );
+
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![block.hash().into()]))
+    );
+    peer_tx
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .expect("connection is open");
+    let response = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    assert!(matches!(response, Response::EarlyBlocks(ref blocks) if blocks.len() == 1));
+
+    connection_task.abort();
+}
+
+/// A connection without early block relay keeps ordinary block requests and deliveries.
+#[tokio::test(start_paused = true)]
+async fn ordinary_connection_keeps_committed_block_requests_and_deliveries() {
+    let _init_guard = zakura_test::init();
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, mut inbound, mut outbound, _error_slot) = new_test_connection();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let (_tx, block) = response_vectors();
+
+    peer_tx
+        .send(Ok(Message::GetData(vec![block.hash().into()])))
+        .await
+        .expect("connection is open");
+    inbound
+        .expect_request(Request::BlocksByHash(IndexSet::from([block.hash()])))
+        .await
+        .respond(Response::Blocks(vec![crate::InventoryResponse::Missing(
+            block.hash(),
+        )]));
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::NotFound(vec![block.hash().into()]))
+    );
+
+    let (request, response) = client_request(Request::BlocksByHash([block.hash()].into()));
+    client_tx.send(request).await.expect("connection is open");
+    assert_eq!(
+        outbound.next().await,
+        Some(Message::GetData(vec![block.hash().into()]))
+    );
+    peer_tx
+        .send(Ok(Message::Block(block.clone().into())))
+        .await
+        .expect("connection is open");
+    let response = response
+        .await
+        .expect("connection responds")
+        .expect("peer sent the block");
+    assert!(matches!(response, Response::Blocks(ref blocks) if blocks.len() == 1));
+
+    connection_task.abort();
+}
+
+/// Outbound callers cannot send the inbound-only early block request.
+#[tokio::test(start_paused = true)]
+async fn outbound_early_block_request_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    let (_peer_tx, peer_rx) = mpsc::channel(4);
+    let (connection, mut client_tx, _inbound, _outbound, _error_slot) =
+        super::new_early_relay_test_connection::<PanicAssertion>();
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+
+    let (request, response) =
+        client_request(Request::EarlyBlocksByHash([block::Hash([1; 32])].into()));
+    client_tx.send(request).await.expect("connection is open");
+    let error = response
+        .await
+        .expect("connection responds")
+        .expect_err("outbound early requests are rejected");
+    assert_eq!(error.inner_debug(), "InboundOnlyRequest");
+
+    connection_task.abort();
 }

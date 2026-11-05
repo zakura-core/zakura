@@ -2203,7 +2203,7 @@ fn record_block_response_source(
     source: BlockBodySource,
     requested_hashes: Option<&IndexSet<block::Hash>>,
 ) -> Response {
-    if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
+    if let (Some(blocks), Some(requested_hashes)) = (response.block_statuses(), requested_hashes) {
         for block in blocks {
             match block {
                 InventoryResponse::Available((block, _))
@@ -2615,7 +2615,7 @@ fn request_candidates<R: Rng + ?Sized>(
 
 fn all_inventory_missing(response: &Response) -> bool {
     match response {
-        Response::Blocks(blocks) => {
+        Response::Blocks(blocks) | Response::EarlyBlocks(blocks) => {
             blocks.is_empty() || blocks.iter().all(|block| block.is_missing())
         }
         Response::Transactions(transactions) => {

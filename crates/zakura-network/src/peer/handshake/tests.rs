@@ -875,6 +875,7 @@ fn p2p_v2_upgrade_uses_main_version_services_only() {
         remote: inconsistent_remote,
         negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         is_protected_peer: false,
+        early_block_relay: false,
     };
 
     assert!(!should_attempt_zakura_upgrade(&config, &connection_info));
@@ -902,6 +903,7 @@ fn p2p_v2_upgrade_requires_local_enable_and_remote_service_bit() {
         remote: version(remote_services),
         negotiated_version: constants::CURRENT_NETWORK_PROTOCOL_VERSION,
         is_protected_peer: false,
+        early_block_relay: false,
     };
 
     assert!(!should_attempt_zakura_upgrade(
@@ -1104,4 +1106,43 @@ async fn mutual_p2p_v2_selected_upgrade_skips_legacy_connection() {
     assert!(address_book_rx.try_recv().is_err());
     assert_eq!(local_counter.update_count(), 0);
     assert_eq!(remote_counter.update_count(), 0);
+}
+
+/// Early block relay is on for a connection only when both ends advertise the service bit.
+#[tokio::test]
+async fn early_block_relay_requires_both_ends_to_opt_in() {
+    let _init_guard = zakura_test::init();
+
+    let config = |enabled| Config {
+        experimental_early_block_relay: enabled,
+        ..test_config(P2pStack::Legacy)
+    };
+
+    assert!(
+        !configured_advertised_services(&config(false), PeerServices::NODE_NETWORK)
+            .contains(PeerServices::NODE_EARLY_BLOCK_RELAY)
+    );
+    // A caller-supplied bit cannot enable the feature without the config.
+    assert!(!configured_advertised_services(
+        &config(false),
+        PeerServices::NODE_NETWORK | PeerServices::NODE_EARLY_BLOCK_RELAY,
+    )
+    .contains(PeerServices::NODE_EARLY_BLOCK_RELAY));
+    assert!(
+        configured_advertised_services(&config(true), PeerServices::NODE_NETWORK)
+            .contains(PeerServices::NODE_EARLY_BLOCK_RELAY)
+    );
+
+    let (local, remote) = negotiate_test_pair(config(true), config(true)).await;
+    assert!(local.early_block_relay);
+    assert!(remote.early_block_relay);
+
+    for (local_enabled, remote_enabled) in [(true, false), (false, true), (false, false)] {
+        let (local, remote) =
+            negotiate_test_pair(config(local_enabled), config(remote_enabled)).await;
+        assert!(
+            !local.early_block_relay && !remote.early_block_relay,
+            "one-sided opt-in ({local_enabled}, {remote_enabled}) must keep committed relay",
+        );
+    }
 }

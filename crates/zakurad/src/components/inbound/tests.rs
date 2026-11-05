@@ -34,7 +34,7 @@ async fn peer_block_lookup_queries_all_active_chains() {
     let state = Buffer::new(BoxService::new(state), 1);
 
     assert_eq!(
-        block_by_hash_or_pending(state, PendingBlockRegistry::default(), hash)
+        block_by_hash_or_pending(state, PendingBlockRegistry::default(), None, hash)
             .await
             .expect("the state lookup succeeds"),
         Some(block.into()),
@@ -69,7 +69,7 @@ async fn peer_block_lookup_serves_admitted_block_before_state() {
         .expect("the registry accepts the admitted block");
 
     assert_eq!(
-        block_by_hash_or_pending(state, pending_blocks, hash)
+        block_by_hash_or_pending(state, pending_blocks, None, hash)
             .await
             .expect("the pending lookup succeeds"),
         Some(block.into()),
@@ -291,4 +291,97 @@ fn pruned_block_not_found_peer_ips_canonicalize_mapped_ipv6() {
         canonical_ip(IpAddr::V6(ipv4.to_ipv6_mapped())),
         IpAddr::V4(ipv4)
     );
+}
+
+/// Only a request from a connection that negotiated early block relay is served a block that
+/// this node published before its commit finished.
+#[tokio::test]
+async fn only_early_block_requests_see_the_early_relay_block() -> Result<(), crate::BoxError> {
+    use std::sync::Arc;
+
+    use indexmap::IndexSet;
+    use tokio::sync::oneshot;
+    use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
+    use tracing::Span;
+    use zakura_chain::{block::Block, parameters::Network, serialization::ZcashDeserializeInto};
+    use zakura_network::{
+        constants::DEFAULT_MAX_CONNS_PER_IP,
+        AddressBook,
+        InventoryResponse::{Available, Missing},
+        Request, Response,
+    };
+    use zakura_test::mock_service::MockService;
+
+    use super::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData};
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
+    let hash = block.hash();
+
+    let early_relay = zakura_consensus::EarlyRelay::default();
+    let _published = early_relay
+        .publish(block.clone().into(), hash)
+        .expect("the early-relay slot is free");
+
+    // State has not committed the block yet.
+    let state = tower::service_fn(|request: zakura_state::Request| async move {
+        assert!(
+            matches!(request, zakura_state::Request::AnyChainBlock(_)),
+            "unexpected state request: {request:?}"
+        );
+        Ok::<_, zakura_state::BoxError>(zakura_state::Response::Block(None))
+    });
+    let (setup_tx, setup_rx) = oneshot::channel();
+    let mut inbound = Inbound::new(MAX_INBOUND_CONCURRENCY, false, None, Vec::new(), setup_rx)
+        .with_early_relay(Some(early_relay));
+    let (_chain_tip_sender, latest_chain_tip, _chain_tip_change) =
+        zakura_state::ChainTipSender::new(None, &network);
+    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let setup = InboundSetupData {
+        address_book: Arc::new(std::sync::Mutex::new(AddressBook::new(
+            "0.0.0.0:0".parse()?,
+            &network,
+            DEFAULT_MAX_CONNS_PER_IP,
+            Span::none(),
+        ))),
+        block_download_peer_set: tower::util::BoxCloneSyncService::new(Buffer::new(
+            BoxService::new(MockService::build().for_unit_tests::<
+                zakura_network::Request,
+                zakura_network::Response,
+                crate::BoxError,
+            >()),
+            1,
+        )),
+        block_verifier: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+        mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+        state: Buffer::new(BoxService::new(state), 1),
+        latest_chain_tip,
+        network,
+        misbehavior_sender,
+    };
+    assert!(
+        setup_tx.send(setup).is_ok(),
+        "the inbound service is waiting for setup"
+    );
+
+    let hashes = IndexSet::from([hash]);
+    let response = inbound
+        .ready()
+        .await?
+        .call(Request::BlocksByHash(hashes.clone()))
+        .await?;
+    assert_eq!(response, Response::Blocks(vec![Missing(hash)]));
+
+    let response = inbound
+        .ready()
+        .await?
+        .call(Request::EarlyBlocksByHash(hashes))
+        .await?;
+    assert_eq!(
+        response,
+        Response::Blocks(vec![Available((block.into(), None))])
+    );
+    Ok(())
 }

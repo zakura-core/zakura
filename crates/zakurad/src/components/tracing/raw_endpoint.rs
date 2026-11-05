@@ -2,7 +2,7 @@
 
 use std::{
     convert::Infallible,
-    io,
+    io::{self, Read, Seek},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -19,13 +19,18 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+use zakura_node_services::task::spawn_erased;
+
+mod worker;
+use worker::Worker;
 
 const MAX_RANGE_BYTES: u64 = 1024 * 1024;
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 // Explicit export allowlist, independent of other files in the trace directory.
 const TABLES: &[&str] = &[
@@ -77,36 +82,48 @@ pub(crate) async fn init(
     let bound_address = listener.local_addr()?;
     let authority = bound_address.to_string();
     info!(%authority, "raw trace endpoint enabled; local users can read sensitive trace data");
-    let task = tokio::spawn(async move {
-        // One active request bounds disk work, memory and slow-client resources.
-        loop {
+    let worker = Worker::new()?;
+    let task = spawn_erased(async move {
+        // Admission for filesystem work outlives this cancellable connection.
+        while let Some((stream, _)) = accept_with_backoff(|| listener.accept(), &shutdown).await {
+            let service = service_fn(|request| handle(request, &directory, &authority, &worker));
+            let connection = async {
+                let _ = http1::Builder::new()
+                    .keep_alive(false)
+                    .max_buf_size(8192)
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            };
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                accepted = listener.accept() => {
-                    let (stream, _) = match accepted {
-                        Ok(connection) => connection,
-                        Err(error) => {
-                            warn!(?error, "raw trace endpoint failed to accept a connection");
-                            break;
-                        }
-                    };
-                    let service = service_fn(|request| handle(request, &directory, &authority));
-                    let connection = async {
-                        let _ = http1::Builder::new()
-                            .keep_alive(false)
-                            .max_buf_size(8192)
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
-                    };
-                    tokio::select! {
-                        _ = shutdown.cancelled() => break,
-                        _ = tokio::time::timeout(CONNECTION_TIMEOUT, connection) => {}
-                    }
-                }
+                _ = tokio::time::timeout(CONNECTION_TIMEOUT, connection) => {}
             }
         }
     });
     Ok(Some((task, bound_address)))
+}
+
+/// Retry accept errors without spinning, and let shutdown interrupt the backoff.
+async fn accept_with_backoff<T, F, Fut>(mut accept: F, shutdown: &CancellationToken) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return None,
+            accepted = accept() => accepted,
+        };
+        match accepted {
+            Ok(connection) => return Some(connection),
+            Err(error) => warn!(?error, "raw trace endpoint accept failed; retrying"),
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            _ = tokio::time::sleep(ACCEPT_BACKOFF) => {}
+        }
+    }
 }
 
 /// Reject browser access and nonliteral authorities before resolving a table.
@@ -141,9 +158,10 @@ async fn handle<B>(
     request: Request<B>,
     directory: &Path,
     authority: &str,
+    worker: &Worker,
 ) -> Result<Response<Body>, Infallible> {
     let result = match requested_table(&request, authority) {
-        Ok(table) => export(directory, table, request.headers()).await,
+        Ok(table) => export(worker, directory, table, request.headers()).await,
         Err(status) => Err(status),
     };
     let mut response = result.unwrap_or_else(|status| {
@@ -253,21 +271,74 @@ impl TracePrefix {
     }
 }
 
-/// Open a fixed table and stream only the file length observed at open time.
-/// Range responses preserve raw bytes, including partial JSONL records.
+/// Submit all filesystem operations to the one admitted dedicated worker.
 async fn export(
+    worker: &Worker,
     directory: &Path,
     table: &str,
     headers: &hyper::HeaderMap,
 ) -> Result<Response<Body>, StatusCode> {
+    let directory = directory.to_owned();
+    let table = table.to_owned();
+    let headers = headers.clone();
+    let (reply, response) = oneshot::channel();
+    let (chunks, receiver) = mpsc::channel(1);
+    worker
+        .try_execute(move || {
+            if reply.is_closed() {
+                return;
+            }
+            match prepare_export(&directory, &table, &headers) {
+                Ok(mut prepared) => {
+                    if reply.send(Ok(prepared.response())).is_err() {
+                        return;
+                    }
+                    if let Err(error) = prepared.stream(&chunks) {
+                        let _ = chunks.blocking_send(Err(error));
+                    }
+                }
+                Err(status) => {
+                    let _ = reply.send(Err(status));
+                }
+            }
+        })
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let response = response
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)??;
+    let frames = stream::unfold(receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|chunk| (chunk.map(hyper::body::Frame::data), receiver))
+    });
+    Ok(response.map(|()| StreamBody::new(frames).boxed_unsync()))
+}
+
+struct PreparedExport {
+    file: std::fs::File,
+    prefix: TracePrefix,
+    start: u64,
+    end: u64,
+    status: StatusCode,
+}
+
+/// Open only the allowlisted table and freeze its append-only prefix bound.
+fn prepare_export(
+    directory: &Path,
+    table: &str,
+    headers: &hyper::HeaderMap,
+) -> Result<PreparedExport, StatusCode> {
     let unavailable = StatusCode::SERVICE_UNAVAILABLE;
-    let mut options = tokio::fs::OpenOptions::new();
+    let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
     let mut file = options
         .open(directory.join(format!("{table}.jsonl")))
-        .await
         .map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 StatusCode::NOT_FOUND
@@ -275,7 +346,7 @@ async fn export(
                 unavailable
             }
         })?;
-    let metadata = file.metadata().await.map_err(|_| unavailable)?;
+    let metadata = file.metadata().map_err(|_| unavailable)?;
     if !metadata.is_file() {
         return Err(unavailable);
     }
@@ -292,7 +363,6 @@ async fn export(
     } else {
         TracePrefix::capture(&metadata).map_err(|_| unavailable)?
     };
-    let identity = prefix.token();
     let length = prefix.length;
     let (start, end, status) = if let Some(range) = headers.get(hyper::header::RANGE) {
         let (start, end) =
@@ -304,64 +374,93 @@ async fn export(
     } else {
         (0, length, StatusCode::OK)
     };
-    file.seek(io::SeekFrom::Start(start))
-        .await
-        .map_err(|_| unavailable)?;
-    let count = end - start;
-    let chunks = stream::try_unfold(
-        (file, count, prefix),
-        |(mut file, remaining, prefix)| async move {
-            if remaining == 0 {
-                return Ok::<_, io::Error>(None);
-            }
-            let size = usize::try_from(remaining.min(64 * 1024)).expect("64 KiB fits usize");
+    if start != 0 {
+        file.seek(io::SeekFrom::Start(start))
+            .map_err(|_| unavailable)?;
+    }
+    Ok(PreparedExport {
+        file,
+        prefix,
+        start,
+        end,
+        status,
+    })
+}
+
+impl PreparedExport {
+    fn response(&self) -> Response<()> {
+        let mut response = Response::new(());
+        *response.status_mut() = self.status;
+        let headers = response.headers_mut();
+        headers.insert(
+            hyper::header::CONTENT_LENGTH,
+            (self.end - self.start).into(),
+        );
+        headers.insert(
+            hyper::header::ACCEPT_RANGES,
+            hyper::header::HeaderValue::from_static("bytes"),
+        );
+        headers.insert(
+            "x-trace-file-id",
+            self.prefix
+                .token()
+                .parse()
+                .expect("numeric identity is a valid header"),
+        );
+        if self.status == StatusCode::PARTIAL_CONTENT {
+            headers.insert(
+                hyper::header::CONTENT_RANGE,
+                format!(
+                    "bytes {}-{}/{}",
+                    self.start,
+                    self.end - 1,
+                    self.prefix.length
+                )
+                .parse()
+                .expect("numeric range is a valid header"),
+            );
+        }
+        response
+    }
+
+    /// Backpressure retains worker admission; a disconnected receiver stops the
+    /// job after the current syscall returns. No Tokio blocking jobs are spawned.
+    fn stream(&mut self, chunks: &mpsc::Sender<io::Result<Bytes>>) -> io::Result<()> {
+        let mut remaining = self.end - self.start;
+        while remaining > 0 && !chunks.is_closed() {
+            let size = usize::try_from(remaining.min(64 * 1024)).map_err(io::Error::other)?;
             let mut buffer = vec![0; size];
-            let read = file.read(&mut buffer).await?;
+            let read = self.file.read(&mut buffer)?;
             if read == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "trace truncated during export",
                 ));
             }
-            // The producer only appends. Check the captured lower length bound
-            // after each read, allowing growth without changing this response.
-            prefix.validate(&file.metadata().await?)?;
+            self.prefix.validate(&self.file.metadata()?)?;
             buffer.truncate(read);
-            let remaining = remaining - u64::try_from(read).expect("read size fits u64");
-            Ok(Some((
-                hyper::body::Frame::data(Bytes::from(buffer)),
-                (file, remaining, prefix),
-            )))
-        },
-    );
-    let mut response = Response::new(StreamBody::new(chunks).boxed_unsync());
-    *response.status_mut() = status;
-    let response_headers = response.headers_mut();
-    response_headers.insert(hyper::header::CONTENT_LENGTH, count.into());
-    response_headers.insert(
-        hyper::header::ACCEPT_RANGES,
-        "bytes".parse().expect("static header is valid"),
-    );
-    response_headers.insert(
-        "x-trace-file-id",
-        identity
-            .parse()
-            .expect("numeric identity is a valid header"),
-    );
-    if status == StatusCode::PARTIAL_CONTENT {
-        response_headers.insert(
-            hyper::header::CONTENT_RANGE,
-            format!("bytes {start}-{}/{length}", end - 1, length = length)
-                .parse()
-                .expect("numeric range is a valid header"),
-        );
+            remaining -= u64::try_from(read).map_err(io::Error::other)?;
+            if chunks.blocking_send(Ok(Bytes::from(buffer))).is_err() {
+                break;
+            }
+        }
+        Ok(())
     }
-    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn export(
+        directory: &Path,
+        table: &str,
+        headers: &hyper::HeaderMap,
+    ) -> Result<Response<Body>, StatusCode> {
+        let worker = Worker::new().unwrap();
+        super::export(&worker, directory, table, headers).await
+    }
 
     #[tokio::test]
     async fn disabled_and_unsafe_configurations() {
@@ -508,6 +607,9 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             b"first\n"[..]
         );
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &vec![b'x'; 256 * 1024])
+            .await
+            .unwrap();
         let response = export(dir.path(), "conn", &hyper::HeaderMap::new())
             .await
             .unwrap();
@@ -691,6 +793,161 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_http_and_disconnects_leave_listener_usable() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("conn.jsonl"), b"row\n")
+            .await
+            .unwrap();
+        let shutdown = CancellationToken::new();
+        let (task, address) = init(
+            Some("127.0.0.1:0".parse().unwrap()),
+            Some(dir.path().to_owned()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for request in [
+            "GET /traces/conn HTTP/1.1\r\nHost: attacker.example\r\n\r\n".to_owned(),
+            format!("GET /traces/conn HTTP/1.1\r\nHost: {address}\r\nOrigin: http://attacker.example\r\n\r\n"),
+            format!("GET /traces/%2e%2e%2fsecret HTTP/1.1\r\nHost: {address}\r\n\r\n"),
+            format!("GET /traces/conn HTTP/1.1\r\nHost: {address}\r\nRange: bytes=18446744073709551616-\r\n\r\n"),
+            format!("GET /traces/conn HTTP/1.1\r\nHost: {address}\r\nX-Trace-File-Id: 1:2:18446744073709551616\r\n\r\n"),
+            format!("GET /traces/conn HTTP/1.1\r\nHost: {address}\r\nX-Oversized: {}\r\n\r\n", "x".repeat(16 * 1024)),
+        ] {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            socket.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut response)).await.unwrap();
+            assert!(!response.starts_with(b"HTTP/1.1 200"));
+            assert!(!response.ends_with(b"row\n"));
+        }
+        for _ in 0..16 {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            socket
+                .write_all(b"GET /traces/conn HTTP/1.1\r\n")
+                .await
+                .unwrap();
+        }
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(format!("GET /traces/conn HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"row\n"));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_filesystem_job_rejects_later_http_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = Worker::new().unwrap();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let (started, entered) = oneshot::channel();
+        worker
+            .try_execute(move || {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = || {
+            Request::builder()
+                .uri("/traces/conn")
+                .header(HOST, "127.0.0.1:9000")
+                .body(())
+                .unwrap()
+        };
+        for _ in 0..100 {
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                handle(request(), dir.path(), "127.0.0.1:9000", &worker),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            // Discard each HTTP response, as disconnected clients do.
+        }
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = handle(request(), dir.path(), "127.0.0.1:9000", &worker)
+                    .await
+                    .unwrap();
+                if response.status() == StatusCode::NOT_FOUND {
+                    break;
+                }
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_accept_error_retries_after_backoff() {
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        let value = accept_with_backoff(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    Ok(7)
+                })
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(value, Some(7));
+        assert_eq!(attempts, 2);
+        assert_eq!(started.elapsed(), ACCEPT_BACKOFF);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_accept_backoff() {
+        let shutdown = CancellationToken::new();
+        let cancel = shutdown.clone();
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep(ACCEPT_BACKOFF / 2).await;
+            cancel.cancel();
+        });
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        let value = accept_with_backoff(
+            || {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(io::Error::from(io::ErrorKind::Other)))
+            },
+            &shutdown,
+        )
+        .await;
+        assert!(value.is_none());
+        assert_eq!(attempts, 1);
+        assert_eq!(started.elapsed(), ACCEPT_BACKOFF / 2);
+        cancellation.await.unwrap();
     }
 
     #[test]

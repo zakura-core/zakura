@@ -124,5 +124,20 @@ a request and exports only the fixed table allowlist.
 The server processes one connection at a time, disables keep-alive, bounds HTTP
 headers, limits range responses to 1 MiB, and closes connections after 30 seconds.
 Slow local clients can delay other readers but cannot create unbounded concurrent
-request tasks. It stops when the node shuts down. These limits do not remove the
-existing disk and CPU cost of enabling trace capture.
+request tasks. Accept errors retry after a one-second, shutdown-cancellable backoff.
+
+One dedicated thread performs all trace filesystem operations, including open,
+metadata, seek and read. It does not use the node's shared Tokio blocking pool.
+Admission belongs to the filesystem job until it exits, not to the HTTP request:
+a timeout or disconnect cannot release the slot while a syscall is still running.
+Further exports return 503 while the worker is occupied. A one-slot response
+channel applies backpressure, allowing at most one queued and one worker-owned
+64 KiB chunk, plus the chunk being sent by HTTP and the fixed worker thread stack.
+There is no unbounded job queue or per-request worker thread.
+
+Shutdown closes the listener and response channel. The worker exits after its
+current job returns. An operating-system filesystem syscall cannot be forcibly
+cancelled; permanently stalled storage can strand this single dedicated thread
+and its file handle until process exit, but cannot accumulate workers or occupy
+the node's shared blocking pool. These limits do not remove the existing disk
+and CPU cost of enabling trace capture.

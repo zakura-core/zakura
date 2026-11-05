@@ -29,7 +29,7 @@
 
 use std::io;
 
-use blake2b_simd::{Hash as Blake2bHash, Params, State};
+use blake2b_simd::{many::update_many, Hash as Blake2bHash, Params, State};
 
 use crate::{
     orchard,
@@ -621,10 +621,34 @@ fn hash_bundle_txid(
         return *format.empty_txid_hash();
     };
 
+    let mut memos = bundle_memos_hasher(format);
+    for action in bundle.actions() {
+        memos.update(action_memo(action));
+    }
+    hash_bundle_txid_with_memos(bundle, format, &finalize_node_hash(memos))
+}
+
+/// A new state for an Orchard-style bundle's memos digest, which commits to each
+/// action's [`action_memo`] in order.
+fn bundle_memos_hasher(format: BundleCommitmentFormat) -> State {
+    hasher(format.personalizations().actions_memos)
+}
+
+/// The 512-byte memo part of an action's note ciphertext, the largest
+/// contiguous per-action input to the txid digest.
+fn action_memo(action: &orchard::Action) -> &[u8] {
+    &action.enc_ciphertext.0[52..564]
+}
+
+/// [`hash_bundle_txid`] for a present bundle, given its finished memos digest.
+fn hash_bundle_txid_with_memos(
+    bundle: &orchard::ShieldedData,
+    format: BundleCommitmentFormat,
+    memos: &[u8; 32],
+) -> [u8; 32] {
     let personalizations = format.personalizations();
     let mut h = hasher(personalizations.bundle);
     let mut ch = hasher(personalizations.actions_compact);
-    let mut mh = hasher(personalizations.actions_memos);
     let mut nh = hasher(personalizations.actions_noncompact);
     for action in bundle.actions() {
         ch.update(&<[u8; 32]>::from(action.nullifier));
@@ -632,15 +656,13 @@ fn hash_bundle_txid(
         update_serialized(&mut ch, &action.ephemeral_key);
         ch.update(&action.enc_ciphertext.0[..52]);
 
-        mh.update(&action.enc_ciphertext.0[52..564]);
-
         update_serialized(&mut nh, &action.cv);
         nh.update(&<[u8; 32]>::from(action.rk));
         nh.update(&action.enc_ciphertext.0[564..]);
         nh.update(&action.out_ciphertext.0[..]);
     }
     h.update(ch.finalize().as_bytes());
-    h.update(mh.finalize().as_bytes());
+    h.update(memos);
     h.update(nh.finalize().as_bytes());
     h.update(&[bundle.flags.bits()]);
     h.update(&bundle.value_balance.zatoshis().to_le_bytes());
@@ -680,16 +702,25 @@ fn combine_txid_digests(
 }
 
 fn txid_inner(parts: &Zip244Parts) -> Hash {
-    // Compute the level-1 nodes, substituting personalized empty hashes
-    // for absent bundles.
-    let header = hash_header(parts);
-    let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
-    let sapling = hash_sapling_txid(parts.sapling, parts.version);
     let orchard = hash_bundle_txid(parts.orchard, parts.version.orchard_format());
     let ironwood = parts
         .version
         .has_ironwood()
         .then(|| hash_bundle_txid(parts.ironwood, BundleCommitmentFormat::IronwoodV6));
+    txid_with_bundle_digests(parts, &orchard, ironwood.as_ref())
+}
+
+/// The txid of `parts`, given its Orchard and (from v6) Ironwood bundle digests.
+fn txid_with_bundle_digests(
+    parts: &Zip244Parts,
+    orchard: &[u8; 32],
+    ironwood: Option<&[u8; 32]>,
+) -> Hash {
+    // Compute the level-1 nodes, substituting personalized empty hashes
+    // for absent bundles.
+    let header = hash_header(parts);
+    let transparent = hash_transparent_txid(parts.inputs, parts.outputs);
+    let sapling = hash_sapling_txid(parts.sapling, parts.version);
 
     Hash(
         combine_txid_digests(
@@ -697,8 +728,8 @@ fn txid_inner(parts: &Zip244Parts) -> Hash {
             &header,
             &transparent,
             &sapling,
-            &orchard,
-            ironwood.as_ref(),
+            orchard,
+            ironwood,
         )
         .as_bytes()
         .try_into()
@@ -782,8 +813,23 @@ fn hash_bundle_auth(
         return *format.empty_auth_hash();
     };
 
-    let mut h = hasher(format.personalizations().auth);
+    let mut h = bundle_auth_hasher(format);
     h.update(&bundle.proof.0[..]);
+    finish_bundle_auth(h, bundle, format)
+}
+
+/// A new state for an Orchard-style bundle's auth digest, which starts with the
+/// bundle's whole proof, the largest contiguous input to the auth digest.
+fn bundle_auth_hasher(format: BundleCommitmentFormat) -> State {
+    hasher(format.personalizations().auth)
+}
+
+/// Finishes [`hash_bundle_auth`] from a state that has already hashed the proof.
+fn finish_bundle_auth(
+    mut h: State,
+    bundle: &orchard::ShieldedData,
+    format: BundleCommitmentFormat,
+) -> [u8; 32] {
     for action in bundle.actions.iter() {
         update_serialized(&mut h, &action.spend_auth_sig);
     }
@@ -799,15 +845,25 @@ fn hash_bundle_auth(
 /// Reference implementation:
 /// <https://github.com/zcash/librustzcash/blob/4367ba26ed57624544e2350f055a5df89079474a/zcash_primitives/src/transaction/txid.rs#L426-L448>
 fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
-    // Compute the level-1 nodes, substituting personalized empty hashes
-    // for absent bundles.
-    let transparent = hash_transparent_auth(parts.inputs, parts.outputs);
-    let sapling = hash_sapling_auth(parts.sapling, parts.version);
     let orchard = hash_bundle_auth(parts.orchard, parts.version.orchard_format());
     let ironwood = parts
         .version
         .has_ironwood()
         .then(|| hash_bundle_auth(parts.ironwood, BundleCommitmentFormat::IronwoodV6));
+    auth_digest_with_bundle_digests(parts, &orchard, ironwood.as_ref())
+}
+
+/// The auth digest of `parts`, given its Orchard and (from v6) Ironwood bundle
+/// auth digests.
+fn auth_digest_with_bundle_digests(
+    parts: &Zip244Parts,
+    orchard: &[u8; 32],
+    ironwood: Option<&[u8; 32]>,
+) -> AuthDigest {
+    // Compute the level-1 nodes, substituting personalized empty hashes
+    // for absent bundles.
+    let transparent = hash_transparent_auth(parts.inputs, parts.outputs);
+    let sapling = hash_sapling_auth(parts.sapling, parts.version);
 
     let mut personal = [0u8; 16];
     personal[..12].copy_from_slice(ZCASH_AUTH_PERSONALIZATION_PREFIX);
@@ -817,9 +873,9 @@ fn auth_digest_inner(parts: &Zip244Parts) -> AuthDigest {
     let mut h = hasher(&personal);
     h.update(&transparent);
     h.update(&sapling);
-    h.update(&orchard);
+    h.update(orchard);
     if let Some(ironwood) = ironwood {
-        h.update(&ironwood);
+        h.update(ironwood);
     }
 
     AuthDigest(
@@ -1003,6 +1059,139 @@ impl Zip244SighashCache {
         h.update(outputs.as_bytes());
         h.update(txin.as_bytes());
         finalize_node_hash(h)
+    }
+}
+
+// --- SIMD lanes for long inputs (prototype) ---------------------------------
+
+/// Transactions hashed together by [`txids_and_auth_digests`]. Every lane state lives in a
+/// fixed array of this size, so the batch path does not allocate.
+pub(crate) const LANE_GROUP: usize = 16;
+
+/// Whether `transaction` has the long Orchard-style memo and proof inputs that
+/// [`txids_and_auth_digests`] hashes in SIMD lanes.
+pub(crate) fn uses_simd_lanes(transaction: &Transaction) -> bool {
+    transaction.has_orchard_shielded_data() || transaction.has_ironwood_shielded_data()
+}
+
+/// One Orchard-style bundle in a lane group, with the format it is committed under.
+type LaneBundle<'a> = Option<(&'a orchard::ShieldedData, BundleCommitmentFormat)>;
+
+/// Txid and auth digests of up to [`LANE_GROUP`] Orchard-style bundles.
+///
+/// Each bundle's two long inputs are hashed in BLAKE2b SIMD lanes alongside the other
+/// bundles': its memos (512 bytes per action) and its proof (2,720 bytes plus 2,272 per
+/// action). The short per-action fields stay on the scalar path, where lanes cost more
+/// than they save.
+fn hash_bundles_in_lanes(
+    bundles: &[LaneBundle<'_>; LANE_GROUP],
+) -> [Option<([u8; 32], [u8; 32])>; LANE_GROUP] {
+    if bundles.iter().all(Option::is_none) {
+        return [None; LANE_GROUP];
+    }
+
+    let mut memos: [Option<State>; LANE_GROUP] =
+        std::array::from_fn(|i| bundles[i].map(|(_, format)| bundle_memos_hasher(format)));
+    let max_actions = bundles
+        .iter()
+        .flatten()
+        .map(|(bundle, _)| bundle.actions.len())
+        .max()
+        .unwrap_or(0);
+    // A memos digest commits to each action's memo in order, so lanes advance every bundle by
+    // one action at a time. Bundles with fewer actions drop out of later rounds.
+    for action in 0..max_actions {
+        update_many(memos.iter_mut().zip(bundles).filter_map(|(state, bundle)| {
+            let (bundle, _) = (*bundle)?;
+            Some((
+                state.as_mut()?,
+                action_memo(&bundle.actions.get(action)?.action),
+            ))
+        }));
+    }
+
+    let mut auths: [Option<State>; LANE_GROUP] =
+        std::array::from_fn(|i| bundles[i].map(|(_, format)| bundle_auth_hasher(format)));
+    update_many(
+        auths
+            .iter_mut()
+            .zip(bundles)
+            .filter_map(|(state, bundle)| Some((state.as_mut()?, &bundle.as_ref()?.0.proof.0[..]))),
+    );
+
+    std::array::from_fn(|i| {
+        let (bundle, format) = bundles[i]?;
+        let memos = finalize_node_hash(memos[i].take()?);
+        let auth = auths[i].take()?;
+        Some((
+            hash_bundle_txid_with_memos(bundle, format, &memos),
+            finish_bundle_auth(auth, bundle, format),
+        ))
+    })
+}
+
+/// Computes [`txid_and_auth_digest`] for each v5/v6 transaction in `transactions`, hashing
+/// up to [`LANE_GROUP`] transactions' Orchard and Ironwood memos and proofs together in
+/// BLAKE2b SIMD lanes.
+///
+/// Entries for other versions are `None`. Results are in the order of `transactions`.
+pub(crate) fn txids_and_auth_digests<'a>(
+    transactions: impl ExactSizeIterator<Item = &'a Transaction>,
+    mut write: impl FnMut(usize, Option<(Hash, AuthDigest)>),
+) {
+    let mut transactions = transactions.enumerate().peekable();
+    while transactions.peek().is_some() {
+        let group: [Option<(usize, &Transaction)>; LANE_GROUP] =
+            std::array::from_fn(|_| transactions.next());
+        let parts: [Option<Zip244Parts>; LANE_GROUP] =
+            std::array::from_fn(|i| group[i].and_then(|(_, tx)| zip244_parts(tx)));
+
+        let orchard = hash_bundles_in_lanes(&std::array::from_fn(|i| {
+            let parts = parts[i].as_ref()?;
+            Some((parts.orchard?, parts.version.orchard_format()))
+        }));
+        let ironwood = hash_bundles_in_lanes(&std::array::from_fn(|i| {
+            let parts = parts[i]
+                .as_ref()
+                .filter(|parts| parts.version.has_ironwood())?;
+            Some((parts.ironwood?, BundleCommitmentFormat::IronwoodV6))
+        }));
+
+        for i in 0..LANE_GROUP {
+            let Some((index, _)) = group[i] else {
+                break;
+            };
+            let Some(parts) = &parts[i] else {
+                write(index, None);
+                continue;
+            };
+            let orchard_format = parts.version.orchard_format();
+            let (orchard_txid, orchard_auth) = orchard[i].unwrap_or((
+                *orchard_format.empty_txid_hash(),
+                *orchard_format.empty_auth_hash(),
+            ));
+            let ironwood = parts.version.has_ironwood().then(|| {
+                ironwood[i].unwrap_or((
+                    *BundleCommitmentFormat::IronwoodV6.empty_txid_hash(),
+                    *BundleCommitmentFormat::IronwoodV6.empty_auth_hash(),
+                ))
+            });
+            write(
+                index,
+                Some((
+                    txid_with_bundle_digests(
+                        parts,
+                        &orchard_txid,
+                        ironwood.as_ref().map(|(txid, _)| txid),
+                    ),
+                    auth_digest_with_bundle_digests(
+                        parts,
+                        &orchard_auth,
+                        ironwood.as_ref().map(|(_, auth)| auth),
+                    ),
+                )),
+            );
+        }
     }
 }
 

@@ -26,10 +26,10 @@ curl --fail http://127.0.0.1:9009/traces/block_sync
 `legacy_peer_request`, and `legacy_sync`. Missing files return 404; unavailable
 or unsafe files return 503. Other paths, methods and query parameters are rejected.
 
-A request without `Range` streams the whole current file, stopping at the length
-observed when it was opened. A detected file change aborts the stream. Memory is
-bounded to 64 KiB chunks; the connection has a 30-second deadline, so large or
-slow transfers may end early. Empty files return an empty 200 response.
+A request without `Range` streams a fixed prefix of the current file, stopping at
+the length observed when it was opened. Appends beyond that length are excluded.
+Memory is bounded to 64 KiB chunks; the connection has a 30-second deadline,
+so large or slow transfers may end early. Empty files return an empty 200 response.
 
 Use a single inclusive byte range to select a portion:
 
@@ -51,26 +51,47 @@ curl --fail -H 'Range: bytes=1048576-' \
   http://127.0.0.1:9009/traces/block_sync -o next-part.jsonl
 ```
 
-Nonzero offsets require this header (428 otherwise). A changed file identity
-returns 409; start a new capture rather than concatenating different generations.
-After an interrupted transfer, resume after the last byte actually received.
-Responses preserve exact bytes, including partial JSONL lines; collectors must
-join byte portions before parsing lines. No record boundary is silently dropped.
+Nonzero offsets require this header (428 otherwise); malformed tokens return 400.
+The token contains the file's device, inode and captured length. Every resumed
+range is interpreted against that original length, including `Content-Range`'s
+total. Appends do not change the token or extend the response. Replacement or an
+observed length below the captured bound returns 409. During streaming an observed
+shrink or premature EOF aborts the body. Start a new collection on 409; never
+concatenate portions from different tokens.
 
-The identity includes the opened file's device, inode, length, modification time
-and change time (including nanoseconds). This is deliberately conservative:
-**even append invalidates resume**. Growth, truncation, same-inode rewrites and
-replacement between requests return 409 when the old identity is supplied.
-During streaming, metadata is checked after each read and before releasing that
-chunk. A detected change or premature EOF aborts the body. Discard an interrupted
-snapshot if its identity no longer matches; do not splice it into a new one.
+After an interrupted transfer, resume after the last byte actually received with
+the same token. Responses preserve exact bytes, including partial JSONL lines;
+join portions before parsing lines. At the original end, further ranges return
+416 even if the source has grown. Omit the token to capture a fresh prefix and
+see newer rows. There is no wait for future rows or live-tail subscription.
 
-Reliable multipart resume therefore needs a quiescent file. Active tables may
-need a new request starting at zero after each write. This is an initial snapshot
-export API, not a lossless live-follow protocol. Metadata is not a content hash;
-coarse filesystem timestamp resolution or privileged timestamp manipulation can
-hide same-size rewrites. Use a trusted local filesystem and operator-controlled
-directory without in-place edits. Do not assume consistency across tables.
+## Consistency model: append-only source
+
+This is a fixed-prefix view of an **append-only** file, not an immutable filesystem
+snapshot or content-hash validator. The current `zakura-jsonl-trace` writer opens
+files with `create(true).append(true)`, retains its handles, and appends buffered
+rows; it has no built-in truncate or rotation path. That producer can keep writing
+while an earlier prefix is streamed or resumed. Tests exercise the actual writer
+and appends before/between body reads and range requests.
+
+**Disable external copytruncate and in-place editing for files being collected.**
+The continuous-sync controller in `deploy/continuous-sync/continuous-sync.py`
+and its logrotate template currently use copytruncate; their default rotation
+setup is incompatible with this endpoint's resume contract. This PR does not
+change that controller or silently disable its retention policy.
+
+Device/inode and a minimum length detect replacement and observed truncation.
+They cannot detect truncate-and-regrow above the captured length between checks,
+same-inode overwrites, or inode reuse. These unsupported mutations can mix bytes
+without an error; the token must not be treated as proof against them. There is
+no retained file history, copy, content hashing or per-client cursor state.
+Use a trusted local filesystem and an operator-controlled append-only directory,
+and start a new capture after node restarts or operator file changes.
+Rename/replacement between requests returns 409. An already-open stream remains
+on the old descriptor; it never switches to the replacement pathname. However,
+the current writer also keeps its old descriptor, so renaming files is not a
+supported way to redirect its future output. Do not assume consistency across
+tables or that a captured last line is complete.
 
 Reading does not flush writers or wait for future rows. Existing buffering,
 dropped rows and rotation still apply. There is no acknowledgement, retention

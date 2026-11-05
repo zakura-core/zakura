@@ -194,30 +194,62 @@ fn byte_range(value: &str, length: u64) -> Result<(u64, u64), StatusCode> {
     Ok((start, end + 1))
 }
 
-/// A conservative snapshot validator, not a persistent capture identifier.
-/// Even append changes it: safe resume requires an unchanged file.
-fn file_identity(metadata: &std::fs::Metadata) -> io::Result<String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec()
-        ))
+/// A fixed prefix of an append-only trace file. This is not a content hash.
+/// External copy-truncate, in-place edits and inode reuse are unsupported.
+struct TracePrefix {
+    device: u64,
+    inode: u64,
+    length: u64,
+}
+
+impl TracePrefix {
+    fn capture(metadata: &std::fs::Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "raw trace export requires Unix",
+            ))
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "raw trace export requires Unix",
-        ))
+
+    fn parse(value: &str) -> Option<Self> {
+        let mut fields = value.split(':');
+        let prefix = Self {
+            device: fields.next()?.parse().ok()?,
+            inode: fields.next()?.parse().ok()?,
+            length: fields.next()?.parse().ok()?,
+        };
+        fields.next().is_none().then_some(prefix)
+    }
+
+    fn token(&self) -> String {
+        format!("{}:{}:{}", self.device, self.inode, self.length)
+    }
+
+    /// Appends preserve the prefix. Reject replacement and observed truncation.
+    /// A truncate followed by regrowth between checks is not detectable here.
+    fn validate(&self, metadata: &std::fs::Metadata) -> io::Result<()> {
+        let current = Self::capture(metadata)?;
+        if current.device != self.device
+            || current.inode != self.inode
+            || current.length < self.length
+        {
+            return Err(io::Error::other(
+                "trace replaced or truncated; start a new prefix",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -247,32 +279,38 @@ async fn export(
     if !metadata.is_file() {
         return Err(unavailable);
     }
-    let identity = file_identity(&metadata).map_err(|_| unavailable)?;
-    if let Some(expected) = headers.get("x-trace-file-id") {
-        if expected.to_str().ok() != Some(identity.as_str()) {
-            return Err(StatusCode::CONFLICT);
-        }
-    }
+    let prefix = if let Some(expected) = headers.get("x-trace-file-id") {
+        let prefix = expected
+            .to_str()
+            .ok()
+            .and_then(TracePrefix::parse)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        prefix
+            .validate(&metadata)
+            .map_err(|_| StatusCode::CONFLICT)?;
+        prefix
+    } else {
+        TracePrefix::capture(&metadata).map_err(|_| unavailable)?
+    };
+    let identity = prefix.token();
+    let length = prefix.length;
     let (start, end, status) = if let Some(range) = headers.get(hyper::header::RANGE) {
-        let (start, end) = byte_range(
-            range.to_str().map_err(|_| StatusCode::BAD_REQUEST)?,
-            metadata.len(),
-        )?;
+        let (start, end) =
+            byte_range(range.to_str().map_err(|_| StatusCode::BAD_REQUEST)?, length)?;
         if start > 0 && !headers.contains_key("x-trace-file-id") {
             return Err(StatusCode::PRECONDITION_REQUIRED);
         }
         (start, end, StatusCode::PARTIAL_CONTENT)
     } else {
-        (0, metadata.len(), StatusCode::OK)
+        (0, length, StatusCode::OK)
     };
     file.seek(io::SeekFrom::Start(start))
         .await
         .map_err(|_| unavailable)?;
     let count = end - start;
-    let stream_identity = identity.clone();
     let chunks = stream::try_unfold(
-        (file, count, stream_identity),
-        |(mut file, remaining, identity)| async move {
+        (file, count, prefix),
+        |(mut file, remaining, prefix)| async move {
             if remaining == 0 {
                 return Ok::<_, io::Error>(None);
             }
@@ -285,18 +323,14 @@ async fn export(
                     "trace truncated during export",
                 ));
             }
-            // Check after reading and before exposing bytes: a changing file cannot
-            // silently become a different snapshot under a resume token.
-            if file_identity(&file.metadata().await?)? != identity {
-                return Err(io::Error::other(
-                    "trace changed during export; restart the snapshot",
-                ));
-            }
+            // The producer only appends. Check the captured lower length bound
+            // after each read, allowing growth without changing this response.
+            prefix.validate(&file.metadata().await?)?;
             buffer.truncate(read);
             let remaining = remaining - u64::try_from(read).expect("read size fits u64");
             Ok(Some((
                 hyper::body::Frame::data(Bytes::from(buffer)),
-                (file, remaining, identity),
+                (file, remaining, prefix),
             )))
         },
     );
@@ -317,13 +351,9 @@ async fn export(
     if status == StatusCode::PARTIAL_CONTENT {
         response_headers.insert(
             hyper::header::CONTENT_RANGE,
-            format!(
-                "bytes {start}-{}/{length}",
-                end - 1,
-                length = metadata.len()
-            )
-            .parse()
-            .expect("numeric range is a valid header"),
+            format!("bytes {start}-{}/{length}", end - 1, length = length)
+                .parse()
+                .expect("numeric range is a valid header"),
         );
     }
     Ok(response)
@@ -431,13 +461,6 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             &data[4..9]
         );
-        tokio::fs::write(&path, b"changed and longer data\n")
-            .await
-            .unwrap();
-        assert_eq!(
-            export(dir.path(), "block_sync", &headers).await.err(),
-            Some(StatusCode::CONFLICT)
-        );
         tokio::fs::write(&path, b"short\n").await.unwrap();
         assert_eq!(
             export(dir.path(), "block_sync", &headers).await.err(),
@@ -458,11 +481,15 @@ mod tests {
             export(dir.path(), "block_sync", &headers).await.err(),
             Some(StatusCode::CONFLICT)
         );
+        assert_eq!(
+            current.into_body().collect().await.unwrap().to_bytes(),
+            b"short\n"[..]
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn stream_reports_appends_and_truncation() {
+    async fn stream_allows_appends_and_reports_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conn.jsonl");
         tokio::fs::write(&path, b"first\n").await.unwrap();
@@ -477,12 +504,142 @@ mod tests {
         tokio::io::AsyncWriteExt::write_all(&mut writer, b"second\n")
             .await
             .unwrap();
-        assert!(response.into_body().collect().await.is_err());
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            b"first\n"[..]
+        );
         let response = export(dir.path(), "conn", &hyper::HeaderMap::new())
             .await
             .unwrap();
         writer.set_len(0).await.unwrap();
         assert!(response.into_body().collect().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_keeps_original_prefix_while_table_grows() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conn.jsonl");
+        let original = vec![b'x'; 2 * 1024 * 1024];
+        tokio::fs::write(&path, &original).await.unwrap();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::RANGE, "bytes=0-".parse().unwrap());
+        let first = export(dir.path(), "conn", &headers).await.unwrap();
+        let identity = first.headers()["x-trace-file-id"].clone();
+        let mut writer = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let mut first_body = first.into_body();
+        let head = first_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        writer.write_all(b"new rows\n").await.unwrap();
+        let tail = first_body.collect().await.unwrap().to_bytes();
+        let first_bytes = [head.as_ref(), tail.as_ref()].concat();
+        assert_eq!(first_bytes.len(), 1024 * 1024);
+        headers.insert("x-trace-file-id", identity);
+        headers.insert(hyper::header::RANGE, "bytes=1048576-".parse().unwrap());
+        let second = export(dir.path(), "conn", &headers).await.unwrap();
+        assert_eq!(
+            second.headers()[hyper::header::CONTENT_RANGE],
+            "bytes 1048576-2097151/2097152"
+        );
+        writer.write_all(b"more rows\n").await.unwrap();
+        let second_bytes = second.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            [first_bytes.as_slice(), second_bytes.as_ref()].concat(),
+            original
+        );
+        headers.insert(hyper::header::RANGE, "bytes=2097152-".parse().unwrap());
+        assert_eq!(
+            export(dir.path(), "conn", &headers).await.err(),
+            Some(StatusCode::RANGE_NOT_SATISFIABLE)
+        );
+        let fresh = export(dir.path(), "conn", &hyper::HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.into_body().collect().await.unwrap().to_bytes().len(),
+            original.len() + 19
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_node_writer_preserves_exported_prefix() {
+        use zakura_jsonl_trace::{JsonlTraceConfig, JsonlTracer, JsonlWriteEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conn.jsonl");
+        let guard = JsonlTracer::spawn_guard_with_config(
+            dir.path().to_owned(),
+            JsonlTraceConfig {
+                buffer_flush_bytes: 1,
+                max_batch_events: 1,
+                ..JsonlTraceConfig::default()
+            },
+        );
+        let tracer = guard.tracer();
+        let send = |value| {
+            tracer
+                .try_send(JsonlWriteEvent {
+                    table: "conn",
+                    file_name: "conn.jsonl",
+                    line: format!("{{\"value\":{value}}}").into_bytes(),
+                })
+                .unwrap()
+        };
+        send(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tokio::fs::metadata(&path)
+                .await
+                .map_or(true, |meta| meta.len() == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first = export(dir.path(), "conn", &hyper::HeaderMap::new())
+            .await
+            .unwrap();
+        let identity = first.headers()["x-trace-file-id"].clone();
+        send(2);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tokio::fs::metadata(&path).await.unwrap().len() <= 12 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            first.into_body().collect().await.unwrap().to_bytes(),
+            b"{\"value\":1}\n"[..]
+        );
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-trace-file-id", identity);
+        headers.insert(hyper::header::RANGE, "bytes=1-".parse().unwrap());
+        let resumed = export(dir.path(), "conn", &headers).await.unwrap();
+        assert_eq!(
+            resumed.into_body().collect().await.unwrap().to_bytes(),
+            b"\"value\":1}\n"[..]
+        );
+        tokio::time::timeout(Duration::from_secs(2), guard.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn prefix_tokens_reject_malformed_or_overflowing_fields() {
+        for token in ["", "1:2", "1:2:3:4", "x:2:3", "1:2:18446744073709551616"] {
+            assert!(TracePrefix::parse(token).is_none());
+        }
     }
 
     #[cfg(unix)]

@@ -248,7 +248,15 @@ async fn untraced_supervisor<F>(
 where
     F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
 {
-    run_dial_supervisor(peer_id, registered, ZakuraTrace::noop(), policy, dial).await
+    run_dial_supervisor(
+        peer_id,
+        registered,
+        ZakuraTrace::noop(),
+        policy,
+        CancellationToken::new(),
+        dial,
+    )
+    .await
 }
 
 fn count_dial(
@@ -713,6 +721,43 @@ async fn a_bounded_dial_ends_at_once_on_an_alpn_mismatch() {
     );
 }
 
+/// A stopped supervisor lets its in-flight dial finish and starts no new
+/// attempt, so a cancelled hand-off still learns that dial's result.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_supervisor_starts_no_new_attempt() {
+    let (_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = CancellationToken::new();
+    let dial = {
+        let calls = calls.clone();
+        let stop = stop.clone();
+        move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stop = stop.clone();
+            Box::pin(async move {
+                stop.cancel();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                DialResult::Failed
+            }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
+        }
+    };
+    let end = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_dial_supervisor(
+            redial_test_peer_id(),
+            registered,
+            ZakuraTrace::noop(),
+            RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
+            stop,
+            dial,
+        ),
+    )
+    .await
+    .expect("a stopped supervisor ends after its in-flight dial");
+    assert_eq!(end, RedialEnd::Ended);
+    assert_eq!(dial_count(&calls), 1, "a stopped supervisor dialed again");
+}
+
 /// A dial that answers with an ALPN mismatch while its first call starts a
 /// healthy-length registration from another connection.
 fn overlapped_mismatch(
@@ -794,6 +839,7 @@ async fn redial_attempts_trace_their_registration_phases() {
             registered,
             trace,
             RedialPolicy::connect_once(Duration::from_millis(1), Duration::from_millis(1), 2),
+            CancellationToken::new(),
             dial,
         ),
     )
@@ -827,6 +873,7 @@ async fn a_scored_registration_traces_no_dial() {
         registered,
         trace,
         RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(1), 1),
+        CancellationToken::new(),
         count_dial(&Default::default(), DialResult::Failed),
     ));
     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -856,6 +903,7 @@ async fn a_dropped_supervisor_traces_a_cancelled_dial() {
         registered,
         trace,
         RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(1)),
+        CancellationToken::new(),
         dial,
     );
     assert!(
@@ -883,6 +931,7 @@ async fn a_panicking_dial_traces_its_end() {
         registered,
         trace,
         RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(1)),
+        CancellationToken::new(),
         dial,
     ));
     let joined = tokio::time::timeout(Duration::from_secs(5), supervisor)

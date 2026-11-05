@@ -4,7 +4,11 @@ use std::{net::SocketAddr, str::FromStr};
 
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
-use zakura_rt::{collections::HashMap, sync::oneshot, task::JoinHandle};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{oneshot, CancellationToken},
+    task::JoinHandle,
+};
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
@@ -43,7 +47,14 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         let endpoint = endpoint.clone();
         let limits = limits.clone();
         tasks.push(spawn_erased_named("bootstrap_dial", async move {
-            native_dial_supervised(endpoint, node_addr, limits, policy).await;
+            native_dial_supervised(
+                endpoint,
+                node_addr,
+                limits,
+                policy,
+                CancellationToken::new(),
+            )
+            .await;
         }));
     }
     tasks

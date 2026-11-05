@@ -8,7 +8,7 @@ use std::{future::Future, pin::Pin, time::Duration};
 
 use zakura_quic::NodeAddr;
 use zakura_rt::{
-    sync::{oneshot, watch},
+    sync::{oneshot, watch, CancellationToken},
     time::Instant,
 };
 
@@ -153,11 +153,15 @@ enum DialResult {
 /// race where the seed's endpoint is not yet listening, and reconnection after
 /// a drop. The retry/backoff policy lives in [`run_dial_supervisor`]; this just
 /// supplies the real dial attempt and the supervisor's registration watch.
+///
+/// No attempt starts once `stop` is cancelled. The caller bounds an attempt
+/// that is already in flight.
 pub(crate) async fn native_dial_supervised(
     endpoint: ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
+    stop: CancellationToken,
 ) -> RedialEnd {
     let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
         tracing::warn!(?node_addr, "invalid Zakura bootstrap node id; not dialing");
@@ -167,7 +171,7 @@ pub(crate) async fn native_dial_supervised(
     let shutdown = endpoint.background_shutdown_token();
     let registered = endpoint.supervisor().subscribe();
     let trace = endpoint.trace();
-    let supervised = run_dial_supervisor(peer_id, registered, trace, policy, move || {
+    let supervised = run_dial_supervisor(peer_id, registered, trace, policy, stop, move || {
         let endpoint = endpoint.clone();
         let node_addr = node_addr.clone();
         let limits = limits.clone();
@@ -245,6 +249,7 @@ async fn run_dial_supervisor<F>(
     registered: watch::Receiver<Vec<ZakuraPeerId>>,
     trace: ZakuraTrace,
     policy: RedialPolicy,
+    stop: CancellationToken,
     dial: F,
 ) -> RedialEnd
 where
@@ -255,6 +260,7 @@ where
         registered,
         dial,
         trace,
+        stop,
         attempts: 0,
     }
     .run(RedialState::new(policy))
@@ -268,6 +274,8 @@ struct RedialIO<F> {
     registered: watch::Receiver<Vec<ZakuraPeerId>>,
     dial: F,
     trace: ZakuraTrace,
+    /// Once cancelled, no attempt starts.
+    stop: CancellationToken,
     /// Attempts this supervisor has started, which numbers the next one.
     attempts: u64,
 }
@@ -282,9 +290,13 @@ where
     /// dialed us first) so the two directions do not churn duplicate connections.
     /// Exits when `policy.max_attempts` consecutive attempts fail, when a
     /// `connect_once` peer connects or finishes serving, or when the supervisor's
-    /// registration watch closes (node shutdown).
+    /// registration watch closes (node shutdown), or before the next attempt
+    /// once `stop` is cancelled.
     async fn run(mut self, mut state: RedialState) -> RedialEnd {
         loop {
+            if self.stop.is_cancelled() {
+                return RedialEnd::Ended;
+            }
             let (mut result, mut attempt) = match state.start(self.peer_is_registered()) {
                 RedialStart::Dial => {
                     let mut attempt = self.start_attempt();

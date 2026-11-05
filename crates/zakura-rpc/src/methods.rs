@@ -1099,13 +1099,15 @@ enum TemplateAnswer {
     Rejection,
     /// The mempool transactions changed since the client's long poll ID.
     Mempool,
-    /// The template's time range expired while the long poll was waiting.
+    /// The template's time range expired while the long poll was waiting, or the client's long
+    /// poll ID is from another time range on the same tip.
     MaxTime,
 }
 
 impl TemplateAnswer {
-    /// Returns why a request on the current tip returned work: it had no long poll ID, its
-    /// time range expired, the rejection revision moved, or else the mempool changed.
+    /// Returns why a request on the current tip returned work. When several things changed,
+    /// the label is the first of: no long poll ID, a time range change, a rejection revision
+    /// change, and otherwise a mempool change.
     ///
     /// A long poll ID on another tip returns before this point, so it is never classified here.
     fn for_same_tip(
@@ -1115,7 +1117,12 @@ impl TemplateAnswer {
     ) -> Self {
         match client_long_poll_id {
             None => Self::NoLongPoll,
-            Some(_) if max_time_reached => Self::MaxTime,
+            Some(client)
+                if max_time_reached
+                    || client.max_timestamp != server_long_poll_id.max_timestamp =>
+            {
+                Self::MaxTime
+            }
             Some(client) if client.revision != server_long_poll_id.revision => Self::Rejection,
             Some(_) => Self::Mempool,
         }
@@ -1134,45 +1141,41 @@ impl TemplateAnswer {
     }
 }
 
+/// The log target for per-answer `getblocktemplate` timings. Operators opt in with the
+/// `zakura_rpc::getblocktemplate=debug` filter directive.
+const GET_BLOCK_TEMPLATE_LOG_TARGET: &str = "zakura_rpc::getblocktemplate";
+
 /// Logs one `getblocktemplate` answer with why it returned, how long the request waited before
-/// building (`wait`), and how long building and validating the template took (`build`).
+/// that happened (`wait`), and how long it then took to answer (`build`), including fetches,
+/// transaction selection, validation and any rebuilds of superseded templates.
 ///
-/// Answers for a new chain tip log at info, so a pool can join them against its own timings at
-/// the default log level. Other answers are frequent and log at debug.
+/// `woke` is when the request first saw the change it returns for: the start of the loop pass
+/// that found it, or the moment the tip wait finished.
 fn log_template_answer(
     reason: TemplateAnswer,
     template: &GetBlockTemplateResponse,
     request_started: tokio::time::Instant,
-    build_started: tokio::time::Instant,
+    woke: tokio::time::Instant,
     rebuilds: usize,
 ) {
     let GetBlockTemplateResponse::TemplateMode(template) = template else {
         return;
     };
-    let wait = build_started.saturating_duration_since(request_started);
-    let build = build_started.elapsed();
+    let wait = woke.saturating_duration_since(request_started);
+    let build = woke.elapsed();
 
-    macro_rules! log_answer {
-        ($level:ident) => {
-            tracing::$level!(
-                reason = reason.as_str(),
-                height = template.height,
-                previous_block_hash = %template.previous_block_hash,
-                transactions = template.transactions.len(),
-                submit_old = ?template.submit_old,
-                ?wait,
-                ?build,
-                rebuilds,
-                "answered getblocktemplate"
-            )
-        };
-    }
-
-    if matches!(reason, TemplateAnswer::OldTip | TemplateAnswer::NewTip) {
-        log_answer!(info);
-    } else {
-        log_answer!(debug);
-    }
+    tracing::debug!(
+        target: GET_BLOCK_TEMPLATE_LOG_TARGET,
+        reason = reason.as_str(),
+        height = template.height,
+        previous_block_hash = %template.previous_block_hash,
+        transactions = template.transactions.len(),
+        submit_old = ?template.submit_old,
+        ?wait,
+        ?build,
+        rebuilds,
+        "answered getblocktemplate"
+    );
 }
 
 /// The outcome of validating one server mining template.
@@ -3588,6 +3591,9 @@ where
         // 20 seconds) even though fresh work is one read away, so rebuild from current
         // state instead. The bound guards against pathological tip or rejection churn.
         let mut max_time_reached = false;
+        // When the request first saw the change it returns for. Rebuilds keep it, so their
+        // time counts as answering rather than waiting.
+        let mut first_wake = None;
         'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
                 metrics::counter!("mining.template.rebuilt").increment(1);
@@ -3601,7 +3607,17 @@ where
             //
             // Set up the loop.
             // The loop returns the server long poll ID, which should be different to the client one.
-            let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old, reason) = loop {
+            let (
+                server_long_poll_id,
+                chain_info,
+                mempool_txs,
+                mempool_tx_deps,
+                submit_old,
+                reason,
+                woke,
+            ) = loop {
+                let pass_started = tokio::time::Instant::now();
+
                 // Check if we are synced to the tip.
                 // The result of this check can change during long polling.
                 //
@@ -3652,7 +3668,7 @@ where
                             .same_tip(client_long_poll_id)
                     })
                 {
-                    let build_started = tokio::time::Instant::now();
+                    let woke = *first_wake.get_or_insert(pass_started);
                     if let Some(template) = self
                         .new_tip_template(
                             None,
@@ -3667,7 +3683,7 @@ where
                             TemplateAnswer::OldTip,
                             &template,
                             request_started,
-                            build_started,
+                            woke,
                             rebuild,
                         );
                         return Ok(template);
@@ -3735,6 +3751,7 @@ where
                         mempool_tx_deps,
                         submit_old,
                         reason,
+                        *first_wake.get_or_insert(pass_started),
                     );
                 }
 
@@ -3858,7 +3875,7 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
-                        let build_started = tokio::time::Instant::now();
+                        let woke = *first_wake.get_or_insert_with(tokio::time::Instant::now);
                         let precomputed_coinbase = precomputed_coinbase?;
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
                         let Some(rejection_state) =
@@ -3889,7 +3906,7 @@ where
                                 TemplateAnswer::NewTip,
                                 &template,
                                 request_started,
-                                build_started,
+                                woke,
                                 rebuild,
                             );
                             return Ok(template);
@@ -3919,7 +3936,6 @@ where
             // Apart from random weighted transaction selection,
             // the template only depends on the previously fetched data.
             // This processing fails only if the coinbase transaction cannot be built.
-            let build_started = tokio::time::Instant::now();
 
             tracing::debug!(
                 mempool_tx_hashes = ?mempool_txs
@@ -3973,7 +3989,7 @@ where
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?
             {
-                log_template_answer(reason, &template, request_started, build_started, rebuild);
+                log_template_answer(reason, &template, request_started, woke, rebuild);
                 return Ok(template);
             }
         }

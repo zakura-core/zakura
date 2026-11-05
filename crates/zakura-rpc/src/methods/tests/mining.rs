@@ -1425,34 +1425,40 @@ async fn shielded_template_rewards() {
     assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }
 
-/// A same-tip long poll answer is labelled by the first thing that changed: no ID, an expired
-/// time range, a new rejection revision, and otherwise the mempool.
+/// A same-tip long poll answer is labelled by the first thing that changed: no ID, the time
+/// range, the rejection revision, and otherwise the mempool.
 #[test]
 fn same_tip_template_answer_reasons() {
-    let id =
+    let client =
         LongPollInput::new(Height(1), Hash([1; 32]), DateTime32::from(100), vec![]).generate_id();
-    let mut new_revision = id;
+    let mut new_mempool = client;
+    new_mempool.mempool_transaction_count += 1;
+    let mut new_revision = new_mempool;
     new_revision.revision += 1;
+    let mut new_time_range = new_revision;
+    new_time_range.max_timestamp += 1;
 
     assert_eq!(
-        TemplateAnswer::for_same_tip(None, &id, false),
-        TemplateAnswer::NoLongPoll
-    );
-    assert_eq!(
-        TemplateAnswer::for_same_tip(None, &id, true),
+        TemplateAnswer::for_same_tip(None, &new_time_range, true),
         TemplateAnswer::NoLongPoll,
-        "a request without an ID never waited, so it can't have reached the max time"
+        "a request without an ID never waited, so nothing woke it"
     );
     assert_eq!(
-        TemplateAnswer::for_same_tip(Some(&id), &new_revision, true),
-        TemplateAnswer::MaxTime
+        TemplateAnswer::for_same_tip(Some(&client), &new_revision, true),
+        TemplateAnswer::MaxTime,
+        "the time range expired while this request waited"
     );
     assert_eq!(
-        TemplateAnswer::for_same_tip(Some(&id), &new_revision, false),
+        TemplateAnswer::for_same_tip(Some(&client), &new_time_range, false),
+        TemplateAnswer::MaxTime,
+        "the client's ID is from an earlier time range on this tip"
+    );
+    assert_eq!(
+        TemplateAnswer::for_same_tip(Some(&client), &new_revision, false),
         TemplateAnswer::Rejection
     );
     assert_eq!(
-        TemplateAnswer::for_same_tip(Some(&id), &id, false),
+        TemplateAnswer::for_same_tip(Some(&client), &new_mempool, false),
         TemplateAnswer::Mempool
     );
 }

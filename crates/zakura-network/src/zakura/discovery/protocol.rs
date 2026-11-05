@@ -831,8 +831,8 @@ impl ZakuraDiscoveryEntry {
     /// canonical form.
     ///
     /// A connection confirms only the remote address it authenticated: the
-    /// address of the record owner's own `Hello` session, or the address a
-    /// successful local dial reached. A trusted static/operator import confirms
+    /// record addresses on the IP of the record owner's own `Hello` session,
+    /// or the exact address a successful local dial reached. A trusted static/operator import confirms
     /// every address of its record. Third-party gossip confirms nothing.
     ///
     /// An entry with a confirmed address is eligible for peer samples. A
@@ -1759,8 +1759,8 @@ impl ZakuraDiscoveryHandle {
     /// Addressless or locally non-dialable records can still update active services, because the
     /// live connection is already established; they are still rejected from dialable storage.
     ///
-    /// The import confirms `remote_addr`, the connection's authenticated remote
-    /// address, if the record lists it, and no other address.
+    /// The import confirms the record addresses on `remote_ip`, the
+    /// connection's authenticated remote IP, and no other address.
     ///
     /// Signature verification runs outside the discovery lock. A record identical to the
     /// stored one skips it, and policy runs in one short lock hold.
@@ -1768,7 +1768,7 @@ impl ZakuraDiscoveryHandle {
         &self,
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
-        remote_addr: Option<SocketAddr>,
+        remote_ip: Option<IpAddr>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let verified = self
             .verify_connected_peer_record(record, peer_node_id)
@@ -1778,7 +1778,7 @@ impl ZakuraDiscoveryHandle {
         let mut changes = Vec::new();
         let result = self.inner.lock().await.install_connected_peer_record(
             verified.result,
-            remote_addr,
+            remote_ip,
             &connected_node_ids,
             now,
             &mut changes,
@@ -1795,7 +1795,7 @@ impl ZakuraDiscoveryHandle {
         session: &DiscoverySessionKey,
         record: ZakuraNodeRecord,
         peer_node_id: NodeId,
-        remote_addr: Option<SocketAddr>,
+        remote_ip: Option<IpAddr>,
     ) -> Result<ImportOutcome, SessionRecordError> {
         let verified = self
             .verify_connected_peer_record(record, peer_node_id)
@@ -1806,7 +1806,7 @@ impl ZakuraDiscoveryHandle {
         let result = self.inner.lock().await.install_session_record(
             session,
             verified.result,
-            remote_addr,
+            remote_ip,
             &connected_node_ids,
             now,
             &mut changes,
@@ -2271,9 +2271,11 @@ impl ZakuraDiscoveryBook {
     /// Imports one peer record whose author checks already passed, and appends
     /// each resulting change to `changes`, including on failure.
     ///
-    /// `authenticated_addr` is the remote address of the connection that
-    /// delivered the record. When `source` is the record's author, the import
-    /// confirms that address if the record lists it, and no other.
+    /// `authenticated_ip` is the remote IP of the connection that delivered
+    /// the record. When `source` is the record's author, the import confirms
+    /// the record addresses on that IP, whatever their port, and no other.
+    /// The port is ignored because a peer behind NAT connects from a port
+    /// other than the one it listens on.
     ///
     /// Expiry, storage limits, address policy, and sequence order still run
     /// here.
@@ -2281,12 +2283,12 @@ impl ZakuraDiscoveryBook {
         &mut self,
         record: VerifiedRecord,
         source: Option<NodeId>,
-        authenticated_addr: Option<SocketAddr>,
+        authenticated_ip: Option<IpAddr>,
         now: u64,
         context: &DiscoveryRecordValidationContext,
         changes: &mut Vec<BookChange>,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let metadata = import_metadata(&record, source, authenticated_addr, false, now);
+        let metadata = import_metadata(&record, source, authenticated_ip, false, now);
         self.install_record(record, metadata, now, context, changes)
     }
 
@@ -3160,20 +3162,26 @@ fn relay_of(source: Option<NodeId>, node_id: NodeId) -> Option<NodeId> {
 ///
 /// Trusted static configuration confirms every address of its record. A
 /// first-party import, from the record's author over a connection, confirms
-/// only that connection's `authenticated_addr`. The author's own self-record
-/// inside its `Peers` response, and every third-party gossiped record, confirm
-/// nothing.
+/// only the record addresses on that connection's `authenticated_ip`. The
+/// author's own self-record inside its `Peers` response, and every
+/// third-party gossiped record, confirm nothing.
 fn import_metadata(
     record: &ZakuraNodeRecord,
     source: Option<NodeId>,
-    authenticated_addr: Option<SocketAddr>,
+    authenticated_ip: Option<IpAddr>,
     is_static: bool,
     now: u64,
 ) -> DiscoveryEntryMetadata {
     let confirmed_addrs = if is_static {
         record.body.direct_addrs.clone()
-    } else if source == Some(record.body.node_id) {
-        authenticated_addr.into_iter().collect()
+    } else if let Some(ip) = authenticated_ip.filter(|_| source == Some(record.body.node_id)) {
+        record
+            .body
+            .direct_addrs
+            .iter()
+            .copied()
+            .filter(|addr| addr.ip().to_canonical() == ip.to_canonical())
+            .collect()
     } else {
         Vec::new()
     };
@@ -4100,7 +4108,7 @@ mod tests {
     }
 
     /// Imports `record` as its author's own `Hello` over a connection from the
-    /// record's first address, which the import confirms.
+    /// IP of the record's first address, which the import confirms.
     fn import_confirmed_record(
         book: &mut ZakuraDiscoveryBook,
         record: ZakuraNodeRecord,
@@ -4109,22 +4117,22 @@ mod tests {
     }
 
     /// Imports `record` at `now` as its author's own `Hello` over a connection
-    /// from the record's first address.
+    /// from the IP of the record's first address.
     fn import_hello(
         book: &mut ZakuraDiscoveryBook,
         record: ZakuraNodeRecord,
         now: u64,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
-        let authenticated_addr = record.body.direct_addrs.first().copied();
-        import_hello_from(book, record, authenticated_addr, now)
+        let authenticated_ip = record.body.direct_addrs.first().map(SocketAddr::ip);
+        import_hello_from(book, record, authenticated_ip, now)
     }
 
     /// Imports `record` at `now` as its author's own `Hello` over a connection
-    /// from `authenticated_addr`.
+    /// from `authenticated_ip`.
     fn import_hello_from(
         book: &mut ZakuraDiscoveryBook,
         record: ZakuraNodeRecord,
-        authenticated_addr: Option<SocketAddr>,
+        authenticated_ip: Option<IpAddr>,
         now: u64,
     ) -> Result<ImportOutcome, DiscoveryBookError> {
         let source = record.body.node_id;
@@ -4136,7 +4144,7 @@ mod tests {
         book.import_verified_record(
             verified,
             Some(source),
-            authenticated_addr,
+            authenticated_ip,
             now,
             &context,
             &mut Vec::new(),
@@ -4236,12 +4244,12 @@ mod tests {
 
     /// Imports one peer record through the relayed-batch path and asserts the book accepted it.
     /// Imports `record` as its author's own `Hello` over a connection from the
-    /// record's first address, which the import confirms.
+    /// IP of the record's first address, which the import confirms.
     async fn import_hello_record(handle: &ZakuraDiscoveryHandle, record: ZakuraNodeRecord) {
         let author = record.body.node_id;
-        let authenticated_addr = record.body.direct_addrs.first().copied();
+        let authenticated_ip = record.body.direct_addrs.first().map(SocketAddr::ip);
         handle
-            .import_connected_peer_record(record, author, authenticated_addr)
+            .import_connected_peer_record(record, author, authenticated_ip)
             .await
             .expect("authentic test record imports into the book");
     }
@@ -7974,19 +7982,21 @@ mod tests {
         ZakuraNodeRecord::sign(record_body, secret).expect("test record signs")
     }
 
-    /// Issue #1993: a peer's own `Hello` confirms only the address its
-    /// connection authenticated. A victim address the record also lists stays
-    /// unconfirmed, and a connection from an unlisted address confirms nothing.
+    /// Issue #1993: a peer's own `Hello` confirms only the record addresses on
+    /// the IP its connection authenticated, on any port. A victim address on
+    /// another IP stays unconfirmed, and a connection from an IP the record
+    /// doesn't list confirms nothing.
     #[test]
-    fn hello_confirms_only_the_authenticated_address() {
+    fn hello_confirms_only_the_authenticated_ip() {
         let mut book = ZakuraDiscoveryBook::default();
         let secret = secret_key();
         let node_id = secret.public();
         let (authenticated, victim) = (test_addr(1), test_addr(2));
-        let record = record_listing(&secret, 1, vec![authenticated, victim]);
+        let same_ip = SocketAddr::new(authenticated.ip(), 18233);
+        let record = record_listing(&secret, 1, vec![authenticated, same_ip, victim]);
 
-        // A connection from an address the record doesn't list confirms nothing.
-        import_hello_from(&mut book, record.clone(), Some(test_addr(3)), NOW)
+        // A connection from an IP the record doesn't list confirms nothing.
+        import_hello_from(&mut book, record.clone(), Some(test_addr(3).ip()), NOW)
             .expect("the hello imports");
         let entry = book.get(&node_id).expect("the hello's record is stored");
         assert!(entry.confirmed_addrs().is_empty());
@@ -7994,14 +8004,12 @@ mod tests {
             .sample_peers(10, &[], &[], NOW, test_requester())
             .is_empty());
 
-        // The IPv4-mapped form of a listed address is that address.
-        let mapped = SocketAddr::new(
-            IpAddr::V6(Ipv4Addr::new(45, 33, 30, 1).to_ipv6_mapped()),
-            authenticated.port(),
-        );
+        // The IPv4-mapped form of a listed IP is that IP, and every record
+        // address on it is confirmed.
+        let mapped = IpAddr::V6(Ipv4Addr::new(45, 33, 30, 1).to_ipv6_mapped());
         import_hello_from(&mut book, record.clone(), Some(mapped), NOW).expect("the hello imports");
         let entry = book.get(&node_id).expect("the hello's record is stored");
-        assert_eq!(entry.confirmed_addrs(), &[authenticated]);
+        assert_eq!(entry.confirmed_addrs(), &[authenticated, same_ip]);
         assert!(!entry.confirmed_addrs().contains(&victim));
         assert_eq!(
             book.sample_peers(10, &[], &[], NOW, test_requester()),

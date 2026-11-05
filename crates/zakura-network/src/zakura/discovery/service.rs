@@ -7,7 +7,7 @@
 //! travels in one transport frame whose type is the message's discriminator;
 //! `wire` defines the payloads and their bounds.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::IpAddr, sync::Arc};
 
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
@@ -423,7 +423,7 @@ impl Service for DiscoveryService {
             // author; drop the stream without registering an exchange.
             return;
         };
-        let remote_addr = peer.remote_addr;
+        let remote_ip = peer.remote_ip;
         let session = PeerStreamSession::new(
             peer.id.clone(),
             ZAKURA_STREAM_DISCOVERY,
@@ -501,7 +501,7 @@ impl Service for DiscoveryService {
                     query_pool,
                     connection_owners,
                     peer_node_id,
-                    remote_addr,
+                    remote_ip,
                     discovery_session,
                     slot,
                     recv,
@@ -535,8 +535,8 @@ struct DiscoveryExchangeStart {
     query_pool: ReservationPool,
     connection_owners: Vec<Arc<dyn Service>>,
     peer_node_id: NodeId,
-    /// The connection's authenticated remote address.
-    remote_addr: Option<SocketAddr>,
+    /// The connection's authenticated remote IP.
+    remote_ip: Option<IpAddr>,
     discovery_session: DiscoveryPeerSession,
     /// The session's record, which also names the session.
     slot: SessionSlot,
@@ -556,7 +556,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         query_pool,
         connection_owners,
         peer_node_id,
-        remote_addr,
+        remote_ip,
         discovery_session,
         slot,
         recv,
@@ -596,7 +596,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         serving,
         queries: queries.clone(),
         peer_node_id,
-        remote_addr,
+        remote_ip,
         session: discovery_session.clone(),
         key: slot.key.clone(),
         state: state.clone(),
@@ -675,9 +675,9 @@ struct DiscoverySink {
     /// This session's queries, whose answers the reader claims.
     queries: Queries,
     peer_node_id: NodeId,
-    /// The connection's authenticated remote address, the only address the
-    /// peer's `Hello` can confirm.
-    remote_addr: Option<SocketAddr>,
+    /// The connection's authenticated remote IP. The peer's `Hello` confirms
+    /// only the record addresses on it.
+    remote_ip: Option<IpAddr>,
     session: DiscoveryPeerSession,
     /// The session this reader serves.
     key: DiscoverySessionKey,
@@ -870,13 +870,13 @@ impl DiscoverySink {
         Ok(())
     }
 
-    /// Imports the peer's own record, which confirms only the connection's
-    /// remote address. An authentic record counts as initial progress even
-    /// when local policy drops it.
+    /// Imports the peer's own record, which confirms only the record
+    /// addresses on the connection's remote IP. An authentic record counts as
+    /// initial progress even when local policy drops it.
     async fn handle_hello(&self, record: ZakuraNodeRecord) -> Result<(), SinkReject> {
         if let Err(error) = self
             .handle
-            .import_session_record(&self.key, record, self.peer_node_id, self.remote_addr)
+            .import_session_record(&self.key, record, self.peer_node_id, self.remote_ip)
             .await
         {
             match error.verdict() {
@@ -1784,7 +1784,7 @@ mod tests {
             serving,
             queries: test_queries(&send, &cancel),
             peer_node_id,
-            remote_addr: None,
+            remote_ip: None,
             session: DiscoveryPeerSession {
                 peer_id: peer_id.clone(),
                 direction: ServicePeerDirection::Inbound,
@@ -1843,10 +1843,11 @@ mod tests {
         Ok(())
     }
 
-    /// Issue #1993: the reader confirms only its connection's remote address
-    /// from the peer's `Hello`, not a victim address the record also lists.
+    /// Issue #1993: the reader confirms the peer's `Hello` addresses on its
+    /// connection's remote IP, even from another source port as behind NAT,
+    /// and not a victim address on another IP.
     #[tokio::test]
-    async fn hello_confirms_only_the_sessions_remote_address() -> Result<(), crate::BoxError> {
+    async fn hello_confirms_only_the_sessions_remote_ip() -> Result<(), crate::BoxError> {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
         let handshake = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
         let handle = ZakuraDiscoveryHandle::new(
@@ -1876,12 +1877,14 @@ mod tests {
             ServiceAdmissionDecision::Admit
         );
         let (mut sink, _recv) = discovery_sink_for_session(&handle, &peer_id, peer_node_id, 0, 1);
-        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 51)), 8233);
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 51)), 8233);
         let victim = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, 52)), 8233);
-        sink.remote_addr = Some(remote);
+        // The peer's NAT maps its connection to another source port.
+        let source = SocketAddr::new(listen.ip(), 50_000);
+        sink.remote_ip = Some(source.ip());
 
         let mut body = signed_discovery_record(&peer_secret, &handshake)?.body;
-        body.direct_addrs = vec![remote, victim];
+        body.direct_addrs = vec![listen, victim];
         sink.handle_hello(ZakuraNodeRecord::sign(body, &peer_secret)?)
             .await
             .expect("the hello imports");
@@ -1891,7 +1894,7 @@ mod tests {
             .iter()
             .find(|entry| entry.record.body.node_id == peer_node_id)
             .expect("the hello's record is stored");
-        assert_eq!(entry.confirmed_addrs, vec![remote]);
+        assert_eq!(entry.confirmed_addrs, vec![listen]);
         Ok(())
     }
 

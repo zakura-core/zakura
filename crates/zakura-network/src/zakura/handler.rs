@@ -1929,6 +1929,7 @@ impl ZakuraSupervisorHandle {
                 ZakuraRegistration::Registered {
                     conn_id,
                     peer_id,
+                    remote_ip,
                     disconnect_token,
                 }
             }
@@ -2033,6 +2034,7 @@ enum ZakuraRegistration {
     Registered {
         conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
         disconnect_token: CancellationToken,
     },
     Duplicate {
@@ -3145,11 +3147,11 @@ impl ZakuraProtocolHandler {
         &self,
         connection: Connection,
         peer_id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
         mut outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
         context: RegisteredConnectionServeContext,
         mut cleanup_guard: RegisteredPeerCleanupGuard,
     ) -> Result<(), ZakuraHandlerError> {
-        let remote_addr = Some(connection.admitted_addr());
         let limits = context.limits;
         let conn = context.conn;
         let conn_id = context.conn_id;
@@ -3282,7 +3284,7 @@ impl ZakuraProtocolHandler {
                 .add_peer(Peer::new_with_conn_id_and_direction_and_close_cause(
                     conn_id,
                     peer_id.clone(),
-                    remote_addr,
+                    remote_ip,
                     accepted_capabilities,
                     context.direction,
                     HashMap::new(),
@@ -3337,7 +3339,7 @@ impl ZakuraProtocolHandler {
                         .add_escalated_peer(Peer::new_with_service_streams(
                             conn_id,
                             peer_id.clone(),
-                            remote_addr,
+                            remote_ip,
                             opened_capabilities,
                             context.direction,
                             std::mem::take(&mut service_streams),
@@ -3426,7 +3428,7 @@ impl ZakuraProtocolHandler {
                                 Peer::new_with_service_streams(
                                     conn_id,
                                     peer_id.clone(),
-                                    remote_addr,
+                                    remote_ip,
                                     accepted_capabilities,
                                     context.direction,
                                     service_streams,
@@ -3547,7 +3549,7 @@ impl ZakuraProtocolHandler {
                             Peer::new_with_service_streams(
                                 conn_id,
                                 peer_id.clone(),
-                                remote_addr,
+                                remote_ip,
                                 accepted_capabilities,
                                 context.direction,
                                 service_streams,
@@ -4174,6 +4176,7 @@ impl ZakuraProtocolHandler {
             ZakuraRegistration::Registered {
                 conn_id,
                 peer_id,
+                remote_ip,
                 disconnect_token,
             } => {
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
@@ -4193,6 +4196,7 @@ impl ZakuraProtocolHandler {
                 self.serve_connection(
                     connection,
                     peer_id,
+                    remote_ip,
                     outbound_rx,
                     RegisteredConnectionServeContext {
                         limits: context.limits,
@@ -8500,7 +8504,7 @@ mod tests {
         registry.add_peer(Peer::new_with_conn_id_and_direction(
             winning_conn,
             peer.clone(),
-            Some(SocketAddr::new(remote_ip, 8233)),
+            Some(remote_ip),
             ZAKURA_CAP_LEGACY_GOSSIP,
             ServicePeerDirection::Inbound,
             streams,
@@ -8515,7 +8519,7 @@ mod tests {
         registry.add_peer(Peer::new_with_conn_id_and_direction(
             losing_conn,
             peer.clone(),
-            Some(SocketAddr::new(remote_ip, 8233)),
+            Some(remote_ip),
             ZAKURA_CAP_LEGACY_GOSSIP,
             ServicePeerDirection::Inbound,
             stale_streams,

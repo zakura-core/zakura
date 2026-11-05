@@ -37,12 +37,12 @@ fn controlled_disclosure_replays_signed_samples_across_insertion_orders() {
         for record in records {
             // Each author's own `Hello` confirms the one address it lists.
             let source = record.body.node_id;
-            let authenticated_addr = record.body.direct_addrs.first().copied();
+            let authenticated_ip = record.body.direct_addrs.first().map(SocketAddr::ip);
             let verified = VerifiedRecord::verify(record, &context(START)).unwrap();
             book.import_verified_record(
                 verified,
                 Some(source),
-                authenticated_addr,
+                authenticated_ip,
                 START,
                 &context(START),
                 &mut Vec::new(),

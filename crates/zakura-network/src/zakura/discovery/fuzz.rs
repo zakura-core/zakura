@@ -500,9 +500,9 @@ impl BookDriver {
                 let expires = now.saturating_add_signed(expires_in);
                 let record = record(signer, author_address(author), sequence, expires);
                 let context = context(now);
-                // The author's own `Hello` arrives on a connection from its address.
-                let (source, authenticated_addr) = match supplier {
-                    Supplier::Author => (Some(node_id), Some(author_socket(author))),
+                // The author's own `Hello` arrives on a connection from its IP.
+                let (source, authenticated_ip) = match supplier {
+                    Supplier::Author => (Some(node_id), Some(author_socket(author).ip())),
                     Supplier::Relay(index) => (Some(relay(index)), None),
                     Supplier::Nobody => (None, None),
                 };
@@ -511,7 +511,7 @@ impl BookDriver {
                     Ok(verified) => self.book.import_verified_record(
                         verified,
                         source,
-                        authenticated_addr,
+                        authenticated_ip,
                         now,
                         &context,
                         &mut self.changes,
@@ -1183,7 +1183,7 @@ impl StateDriver {
                 let result = self.state.install_session_record(
                     &session(peer, conn_id, session_id),
                     verified,
-                    Some(socket(hello_address(peer))),
+                    Some(socket(hello_address(peer)).ip()),
                     &connected,
                     now,
                     &mut Vec::new(),

@@ -587,8 +587,9 @@ impl VerifiedSet {
         ancestors
     }
 
-    /// Clears a list of mined transaction ids from the lists of dependencies for
-    /// any other transactions in the mempool and removes their dependents.
+    /// Removes mined parents from their children's tracked dependencies.
+    ///
+    /// Only groups with edges to detach need ordering-index updates.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
         let affected: HashSet<_> = mined_ids
             .iter()
@@ -757,11 +758,10 @@ impl VerifiedSet {
         }
     }
 
-    /// Returns `true` if the given `transaction` has any spend conflicts with transactions in the
-    /// mempool.
+    /// Returns `true` if `tx` has spend conflicts with stored transactions.
     ///
-    /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
-    /// same nullifier.
+    /// Two transactions conflict if they spend the same UTXO or reveal the same
+    /// nullifier.
     fn has_spend_conflicts(&self, tx: &transaction::Transaction) -> bool {
         Self::has_conflicts(&self.spent_outpoints, tx.spent_outpoints())
             || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())

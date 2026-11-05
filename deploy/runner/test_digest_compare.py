@@ -12,6 +12,20 @@ import digest_probe as probe
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_remote_reads_require_owned_trust_file_and_strict_verification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trust = Path(directory) / "known_hosts"
+            trust.write_text("public test fixture\n")
+            remote = comparison.RemoteNodes(Path("helper"), trust)
+            result = SimpleNamespace(returncode=0, stdout="{}", stderr="")
+            with patch.object(comparison.subprocess, "run", return_value=result) as run:
+                remote.invoke("us-west-0", "sample", "{}")
+            arguments = run.call_args.args[0]
+            self.assertIn(f"UserKnownHostsFile={trust.resolve()}", arguments)
+            self.assertIn("StrictHostKeyChecking=yes", arguments)
+            with self.assertRaises(FileNotFoundError):
+                comparison.RemoteNodes(Path("helper"), trust.with_name("absent"))
+
     def test_watcher_recovers_transport_failures_before_reporting_collector_status(self):
         failure = SimpleNamespace(returncode=4, stdout="", stderr='ssh-check: {"result":"unreachable","cause":"network","execution":"not_started"}')
         status = SimpleNamespace(returncode=0, stdout=json.dumps({"state":"stopped","at":0}), stderr="")

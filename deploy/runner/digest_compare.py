@@ -31,15 +31,16 @@ def write_json(path, value):
 class RemoteNodes:
     """Use the registered runner's existing SSH identity and the standard bounded check helper."""
 
-    def __init__(self, helper):
+    def __init__(self, helper, known_hosts):
         self.helper = helper
+        self.known_hosts = known_hosts.resolve(strict=True)
         self.source = (ROOT / "digest_probe.py").read_text()
 
     def invoke(self, node, operation, value):
         if node not in HOSTS:
             raise ValueError("node is outside the approved comparison pair")
         duration = 120 if operation == "profile" else 30
-        command = [sys.executable, str(self.helper), "--command", "python3", "--check-timeout", str(duration), "--limit", str(duration + 10), HOSTS[node], "--", "python3", "-c", self.source, operation, value]
+        command = [sys.executable, str(self.helper), "--command", "python3", "--check-timeout", str(duration), "--limit", str(duration + 10), "-o", f"UserKnownHostsFile={self.known_hosts}", "-o", "StrictHostKeyChecking=yes", HOSTS[node], "--", "python3", "-c", self.source, operation, value]
         result = subprocess.run(command, capture_output=True, text=True, timeout=duration + 15)
         if result.returncode:
             # The helper's final JSON contains a classified, bounded diagnostic.
@@ -252,12 +253,12 @@ def markdown(report):
     return "\n".join(lines) + "\n"
 
 
-def collect(manifest_path, output, helper):
+def collect(manifest_path, output, helper, known_hosts):
     manifest = json.loads(manifest_path.read_text())
     if set(manifest["nodes"]) != set(HOSTS):
         raise ValueError("manifest must name exactly the approved pair")
     output.mkdir(parents=True, exist_ok=True)
-    remote = RemoteNodes(helper)
+    remote = RemoteNodes(helper, known_hosts)
     cursors_path = output / "cursors.json"
     cursors = json.loads(cursors_path.read_text()) if cursors_path.exists() else {}
     pid_maps = {node: {str(key): value for key, value in cursors.get(node, {}).get("pid_map", {}).items()} for node in HOSTS}
@@ -447,6 +448,9 @@ def watch(helper, thread, state_path):
                 raise RuntimeError(f"controller status check failed: exit {result.returncode}; classification={json.dumps(diagnostic, sort_keys=True)}")
             transport_failures = 0
             status = json.loads(result.stdout)
+            if status["state"] == "collecting" and time.time() - status["at"] <= 60 and "collector_failed_or_stalled" in events:
+                events.remove("collector_failed_or_stalled")
+                state_path.write_text(json.dumps(sorted(events)))
             event = None
             if status["state"] in {"failed", "stopped"} or time.time() - status["at"] > 60:
                 event = "collector_failed_or_stalled"
@@ -480,13 +484,14 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ssh-helper", type=Path)
+    parser.add_argument("--known-hosts", type=Path)
     parser.add_argument("--phase", choices=["phase1", "swapping", "phase2"])
     parser.add_argument("--thread")
     args = parser.parse_args(argv)
     if args.operation == "collect":
-        if args.ssh_helper is None:
-            parser.error("collect requires --ssh-helper")
-        collect(args.manifest, args.output, args.ssh_helper)
+        if args.ssh_helper is None or args.known_hosts is None:
+            parser.error("collect requires --ssh-helper and --known-hosts")
+        collect(args.manifest, args.output, args.ssh_helper, args.known_hosts)
     elif args.operation == "activate":
         if not args.phase:
             parser.error("activate requires --phase")

@@ -82,7 +82,9 @@ curl -H 'Range: bytes=<bytes read>-' -H 'If-Range: <etag>' \
 | 200 | The file was replaced. | Discard the old rows and store the new `ETag`. |
 
 One request per poll is enough. A collector that follows many tables can poll
-`GET /traces` and request only the tables whose length grew.
+`GET /traces` and request only the tables whose length or `ETag` changed. A
+replacement can be the same size as the old file or shorter, so a length check
+alone misses it.
 
 ## Status codes
 

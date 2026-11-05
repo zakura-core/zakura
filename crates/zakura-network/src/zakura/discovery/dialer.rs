@@ -151,7 +151,7 @@ mod tests {
                 [silent.local_addr()?],
             );
             let endpoint = node.endpoint();
-            assert!(!endpoint.has_discovery_admission_capacity());
+            assert_eq!(endpoint.discovery_admission_capacity(), 0);
             let (admitted_ip, _admitted_rx) = tokio::sync::oneshot::channel();
             let (registration, _registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {

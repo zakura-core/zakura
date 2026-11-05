@@ -1,6 +1,6 @@
 //! The candidate dialer's policy: which candidate addresses it may dial, the
 //! attempts in flight with their per-IP reservations, the backoff each
-//! `(node, IP)` pair earned, and the local-limit pause.
+//! `(node, IP)` pair earned, and when the next dial round may start.
 //!
 //! The dialer loop does the IO: it asks the supervisor for per-IP capacity,
 //! spawns and joins the dial workers, and updates the discovery book. These
@@ -165,10 +165,12 @@ pub(super) struct CandidateDialerState {
     /// The number of in-flight attempts that reserved each canonical IP.
     in_flight_by_ip: HashMap<IpAddr, usize>,
     backoff_by_node_ip: HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
-    /// After a dial hits a local limit, wait one tick before the next round:
-    /// the limit doesn't back off the candidate, so an immediate retry would
-    /// spin while the node stays full.
-    paused_until: Option<Instant>,
+    /// The earliest time the next round may start, or `None` before the
+    /// first round. Each round starts one dial interval after the last, and
+    /// a local limit pushes it to one interval after the limit: the limit
+    /// doesn't back off the candidate, so an immediate retry would spin
+    /// while the node stays full.
+    next_round: Option<Instant>,
     next_sequence: u64,
 }
 
@@ -182,7 +184,7 @@ impl CandidateDialerState {
             in_flight: HashMap::default(),
             in_flight_by_ip: HashMap::default(),
             backoff_by_node_ip: HashMap::default(),
-            paused_until: None,
+            next_round: None,
             next_sequence: 0,
         }
     }
@@ -190,18 +192,25 @@ impl CandidateDialerState {
     /// Starts a dial round at `now`.
     ///
     /// Prunes backoff entries that expired more than the maximum backoff ago,
-    /// then returns whether the round may dial. It may not while a local-limit
-    /// pause holds; a round at or after the pause's end clears the pause.
+    /// then returns whether the round may dial. It may not before
+    /// [`Self::next_round`]. A round that may dial sets the next round one
+    /// dial interval after `now`.
     pub(super) fn begin_round(&mut self, now: Instant) -> bool {
         let retention = self.backoff_max;
         self.backoff_by_node_ip
             .retain(|_, backoff| now.saturating_duration_since(backoff.retry_at) <= retention);
 
-        if self.paused_until.is_some_and(|until| now < until) {
+        if self.next_round.is_some_and(|next_round| now < next_round) {
             return false;
         }
-        self.paused_until = None;
+        self.next_round = Some(now + ZAKURA_DISCOVERY_DIAL_INTERVAL);
         true
+    }
+
+    /// Returns the earliest time the next round may start, which is `now`
+    /// before the first round.
+    pub(super) fn next_round(&self, now: Instant) -> Instant {
+        self.next_round.unwrap_or(now)
     }
 
     /// Returns the nodes that have an attempt in flight.
@@ -294,8 +303,8 @@ impl CandidateDialerState {
     /// Releases the IPs the attempt reserved when the dialer recorded it, even
     /// if the node's addresses changed since. Applies the result's backoff to
     /// those IPs; `admitted_ip` is the IP whose handshake TLS authenticated, if
-    /// the dial got that far. A local limit pauses the next round without
-    /// backing off the candidate.
+    /// the dial got that far. A local limit delays the next round to one dial
+    /// interval after `now` without backing off the candidate.
     ///
     /// Returns `false`, and changes nothing, when `key` is not in flight.
     pub(super) fn complete(
@@ -311,7 +320,11 @@ impl CandidateDialerState {
         };
 
         if result == DiscoveryDialResult::LocalResourceLimit {
-            self.paused_until = Some(now + ZAKURA_DISCOVERY_DIAL_INTERVAL);
+            let after_limit = now + ZAKURA_DISCOVERY_DIAL_INTERVAL;
+            self.next_round = Some(
+                self.next_round
+                    .map_or(after_limit, |at| at.max(after_limit)),
+            );
         }
         for ip in &attempt.reserved_ips {
             let count = self

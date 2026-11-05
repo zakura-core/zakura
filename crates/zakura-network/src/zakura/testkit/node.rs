@@ -835,15 +835,13 @@ mod tests {
         let supervisor = node.supervisor();
         assert!(
             !supervisor
-                .can_accept_remote_ip_with_in_flight(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
-                .await,
+                .can_accept_remote_ip_with_in_flight(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             "peer1 must be charged to the confirmed loopback path, filling the cap-1 bucket for \
              127.0.0.1 so a second same-loopback identity is turned away",
         );
         assert!(
             supervisor
-                .can_accept_remote_ip_with_in_flight(decoy.ip(), 0)
-                .await,
+                .can_accept_remote_ip_with_in_flight(decoy.ip(), 0),
             "the advertised decoy address was never connected to, so its bucket must be empty; \
              charging it there is the bypass this test guards",
         );

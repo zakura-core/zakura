@@ -883,6 +883,18 @@ pub struct ZakuraDiscoveryDialCandidate {
     pub is_static: bool,
 }
 
+/// What a dialer did with one offered dial candidate.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DialAdmission {
+    /// The dialer will dial the candidate. It counts toward the round's limit.
+    Admitted,
+    /// The dialer can't dial the candidate now. The next candidate takes its
+    /// place.
+    Skipped,
+    /// The dialer can't dial any more candidates this round.
+    Exhausted,
+}
+
 impl ZakuraDiscoveryDialCandidate {
     /// Converts this candidate into a dial address.
     pub fn node_addr(&self) -> NodeAddr {
@@ -1908,28 +1920,39 @@ impl ZakuraDiscoveryHandle {
         wanted_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
-        self.dial_candidates_with(wanted_services, &[], in_flight_node_ids)
-            .await
+        let mut selected = Vec::new();
+        self.admit_dial_candidates_with(wanted_services, &[], in_flight_node_ids, |candidate| {
+            selected.push(candidate);
+            DialAdmission::Admitted
+        })
+        .await;
+        selected
     }
 
-    /// Returns service-matching candidates first, followed by general candidates.
-    pub(crate) async fn dial_candidates_preferring_any_service(
+    /// Offers service-matching candidates to `admit` first, followed by
+    /// general candidates, until it admits the free dial slots' worth.
+    pub(crate) async fn admit_dial_candidates_preferring_any_service(
         &self,
         preferred_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
-    ) -> Vec<ZakuraDiscoveryDialCandidate> {
-        self.dial_candidates_with(&[], preferred_services, in_flight_node_ids)
+        admit: impl FnMut(ZakuraDiscoveryDialCandidate) -> DialAdmission,
+    ) {
+        self.admit_dial_candidates_with(&[], preferred_services, in_flight_node_ids, admit)
             .await
     }
 
-    /// Returns dial candidates that advertise every `required_services` entry,
-    /// those advertising any `preferred_services` entry first.
-    async fn dial_candidates_with(
+    /// Offers dial candidates that advertise every `required_services` entry
+    /// to `admit`, those advertising any `preferred_services` entry first,
+    /// until it admits the free dial slots' worth.
+    ///
+    /// The book stays locked while `admit` runs, so `admit` must not wait.
+    async fn admit_dial_candidates_with(
         &self,
         required_services: &[ZakuraServiceId],
         preferred_services: &[ZakuraServiceId],
         in_flight_node_ids: &[NodeId],
-    ) -> Vec<ZakuraDiscoveryDialCandidate> {
+        admit: impl FnMut(ZakuraDiscoveryDialCandidate) -> DialAdmission,
+    ) {
         let connected = self.connected.borrow().clone();
         // An attempt stays in flight after its peer registers, until the
         // attempt settles. Such a peer counts once, as in flight.
@@ -1946,13 +1969,13 @@ impl ZakuraDiscoveryHandle {
             in_flight_node_ids.len(),
         );
         if limit == 0 {
-            return Vec::new();
+            return;
         }
 
         let connected_node_ids = connected_peer_node_ids(&connected);
         let now = current_unix_secs();
         let state = self.inner.lock().await;
-        state.dial_candidates(
+        state.admit_dial_candidates(
             limit,
             required_services,
             preferred_services,
@@ -1962,7 +1985,8 @@ impl ZakuraDiscoveryHandle {
             },
             now,
             &mut zakura_rt::rand::rng(),
-        )
+            admit,
+        );
     }
 
     pub(crate) async fn dial_backoff(&self) -> (Duration, Duration) {
@@ -2436,7 +2460,8 @@ impl ZakuraDiscoveryBook {
         node_ids
     }
 
-    /// Returns bounded dial candidates for later dial-loop code.
+    /// Returns at most `limit` dial candidates in dial order.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dial_candidates<R: rand_10::Rng + ?Sized>(
         &self,
@@ -2448,6 +2473,41 @@ impl ZakuraDiscoveryBook {
         dial_backoff: (Duration, Duration),
         rng: &mut R,
     ) -> Vec<ZakuraDiscoveryDialCandidate> {
+        let mut selected = Vec::new();
+        self.admit_dial_candidates(
+            limit,
+            required_services,
+            preferred_services,
+            exclusions,
+            now,
+            dial_backoff,
+            rng,
+            |candidate| {
+                selected.push(candidate);
+                DialAdmission::Admitted
+            },
+        );
+        selected
+    }
+
+    /// Offers dial candidates to `admit` in dial order until it admits
+    /// `limit` of them, it reports [`DialAdmission::Exhausted`], or the book
+    /// runs out.
+    ///
+    /// A candidate that `admit` skips doesn't count, so the next candidate in
+    /// order takes its place.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_dial_candidates<R: rand_10::Rng + ?Sized>(
+        &self,
+        limit: usize,
+        required_services: &[ZakuraServiceId],
+        preferred_services: &[ZakuraServiceId],
+        exclusions: DialCandidateExclusions<'_>,
+        now: u64,
+        dial_backoff: (Duration, Duration),
+        rng: &mut R,
+        mut admit: impl FnMut(ZakuraDiscoveryDialCandidate) -> DialAdmission,
+    ) {
         let connected_node_ids: HashSet<_> =
             exclusions.connected_node_ids.iter().copied().collect();
         let in_flight_node_ids: HashSet<_> =
@@ -2501,11 +2561,11 @@ impl ZakuraDiscoveryBook {
 
         // Bounded top-k selection instead of a full sort. The book can hold `max_records`
         // (default 10_000) entries and this selection runs under the global discovery mutex on the
-        // per-second candidate-dialer path, yet only `limit` candidates are ever returned. Sorting
-        // the whole candidate set (O(n log n)) just to `take(limit)` is replaced with an O(n)
-        // partial select of the best `limit` candidates plus an O(limit log limit) sort of the
-        // survivors, keeping the order identical within each preference group. See finding
-        // `claude-discovery-expensive-work-under-global-mutex` (SR-2/SR-4).
+        // per-second candidate-dialer path, yet only `limit` candidates are ever admitted. When
+        // `admit` takes the best `limit`, an O(n) partial select plus an O(limit log limit) sort
+        // of the survivors replaces sorting the whole set, keeping the order identical within each
+        // preference group. See finding `claude-discovery-expensive-work-under-global-mutex`
+        // (SR-2/SR-4). Only skips sort the rest.
         let mut keyed: Vec<((bool, DialCandidateSortKey), DialCandidateRef<'_>)> = candidates
             .into_iter()
             .map(|candidate| {
@@ -2522,17 +2582,26 @@ impl ZakuraDiscoveryBook {
             })
             .collect();
 
-        let take = limit.min(keyed.len());
-        if take < keyed.len() {
-            keyed.select_nth_unstable_by(take, |a, b| a.0.cmp(&b.0));
-            keyed.truncate(take);
+        let head = limit.min(keyed.len());
+        if head < keyed.len() {
+            keyed.select_nth_unstable_by(head, |a, b| a.0.cmp(&b.0));
         }
-        keyed.sort_unstable_by_key(|a| a.0);
+        keyed[..head].sort_unstable_by_key(|a| a.0);
 
-        keyed
-            .into_iter()
-            .map(|(_, candidate)| candidate.into_candidate())
-            .collect()
+        let mut admitted = 0;
+        for index in 0..keyed.len() {
+            if admitted == limit {
+                return;
+            }
+            if index == head {
+                keyed[head..].sort_unstable_by_key(|a| a.0);
+            }
+            match admit(keyed[index].1.into_candidate()) {
+                DialAdmission::Admitted => admitted += 1,
+                DialAdmission::Skipped => {}
+                DialAdmission::Exhausted => return,
+            }
+        }
     }
 
     /// Marks a dial attempt for `node_id`.
@@ -3003,6 +3072,7 @@ enum DiscoveryDirectAddrPolicy {
     StaticConfigured,
 }
 
+#[derive(Clone, Copy)]
 enum DialCandidateRef<'a> {
     SignedRecord(&'a ZakuraDiscoveryEntry),
     StaticConfigured(&'a ZakuraStaticDiscoveryCandidate),
@@ -8122,6 +8192,69 @@ mod tests {
         );
     }
 
+    /// The book offers candidates past a skipped best `limit`, in dial order,
+    /// until `admit` admits `limit` of them. `Exhausted` ends the offers.
+    #[test]
+    fn admit_dial_candidates_refills_skipped_slots_in_dial_order() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let records = (1u8..=10)
+            .map(|index| signed_record_with(index.into(), service(1), test_addr(index)))
+            .collect::<Vec<_>>();
+        for record in &records {
+            import_confirmed_record(&mut book, record.clone()).expect("test record imports");
+        }
+        // Strictly increasing failure counts make the whole dial order
+        // deterministic: fewer failures first. With no dial attempt marked,
+        // no failure backs a record off.
+        for (failures, record) in records.iter().enumerate() {
+            for _ in 0..failures {
+                book.mark_dial_failure(&record.body.node_id, NOW);
+            }
+        }
+        let offer = |skip: usize, exhaust_after: Option<usize>| {
+            let mut offered = Vec::new();
+            book.admit_dial_candidates(
+                3,
+                &[service(1)],
+                &[],
+                DialCandidateExclusions {
+                    connected_node_ids: &[],
+                    in_flight_node_ids: &[],
+                },
+                NOW,
+                (
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                    DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+                ),
+                &mut StdRng::seed_from_u64(99),
+                |candidate| {
+                    offered.push(candidate.node_id);
+                    if exhaust_after == Some(offered.len()) {
+                        DialAdmission::Exhausted
+                    } else if offered.len() <= skip {
+                        DialAdmission::Skipped
+                    } else {
+                        DialAdmission::Admitted
+                    }
+                },
+            );
+            offered
+        };
+        let dial_order = records
+            .iter()
+            .map(|record| record.body.node_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(offer(0, None), dial_order[..3]);
+        assert_eq!(
+            offer(4, None),
+            dial_order[..7],
+            "four skips need four more candidates"
+        );
+        assert_eq!(offer(10, None), dial_order, "skips can drain the book");
+        assert_eq!(offer(4, Some(5)), dial_order[..5]);
+    }
+
     #[tokio::test]
     async fn handle_samples_records_through_storage_path() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -8367,6 +8500,21 @@ mod tests {
             .is_empty());
     }
 
+    /// Every candidate the dialer would be offered, preferring `services`.
+    async fn candidates_preferring_any_service(
+        handle: &ZakuraDiscoveryHandle,
+        services: &[ZakuraServiceId],
+    ) -> Vec<ZakuraDiscoveryDialCandidate> {
+        let mut offered = Vec::new();
+        handle
+            .admit_dial_candidates_preferring_any_service(services, &[], |candidate| {
+                offered.push(candidate);
+                DialAdmission::Admitted
+            })
+            .await;
+        offered
+    }
+
     #[tokio::test]
     async fn dial_candidates_prefer_any_matching_service() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());
@@ -8386,9 +8534,8 @@ mod tests {
             .await
             .is_empty());
 
-        let prioritized = handle
-            .dial_candidates_preferring_any_service(&[service(1), service(2)], &[])
-            .await;
+        let prioritized =
+            candidates_preferring_any_service(&handle, &[service(1), service(2)]).await;
         assert_eq!(prioritized.len(), 3);
         assert_eq!(
             prioritized[..2]
@@ -8399,9 +8546,7 @@ mod tests {
         );
         assert_eq!(prioritized[2].node_id, neither.body.node_id);
 
-        let general = handle
-            .dial_candidates_preferring_any_service(&[], &[])
-            .await;
+        let general = candidates_preferring_any_service(&handle, &[]).await;
         assert_eq!(
             general
                 .iter()

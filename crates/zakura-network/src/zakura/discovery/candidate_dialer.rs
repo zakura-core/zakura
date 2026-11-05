@@ -28,13 +28,13 @@ use zakura_rt::{
 };
 
 use super::dialer::native_discovery_dial;
-use super::protocol::{ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
+use super::protocol::{DialAdmission, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryHandle};
 use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::{DialOwner, DialPhase, DiscoveryDialPhaseEvent, DiscoveryDialResultEvent};
 use crate::zakura::{
     handler::{DialRegistration, DialReport},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId, ZakuraServiceId,
-    ZakuraTrace,
+    ZakuraSupervisorHandle, ZakuraTrace,
 };
 
 #[cfg(any(test, feature = "p2p-fuzz"))]
@@ -131,7 +131,6 @@ pub(crate) async fn run_native_discovery_dialer(
 ) {
     let shutdown = endpoint.background_shutdown_token();
     let trace = endpoint.trace();
-    let mut registered = endpoint.supervisor().subscribe();
     let mut state = CandidateDialerState::new(discovery.dial_backoff().await);
     let mut io = CandidateDialerIO {
         endpoint,
@@ -146,27 +145,26 @@ pub(crate) async fn run_native_discovery_dialer(
         if shutdown.is_cancelled() {
             break;
         }
-        if state.begin_round(Instant::now()) {
+        let now = Instant::now();
+        if state.begin_round(now) {
             io.spawn_dial_round(&mut state).await;
         }
+        // A worker completion wakes the loop before the round deadline, and
+        // `begin_round` then refuses to start a round, so completions can't
+        // speed up the cadence.
+        let next_round = state.next_round(now);
 
         zakura_rt::select! {
             biased;
-            // Endpoint shutdown cancels this token. The dialer holds an endpoint
-            // clone, so the supervisor registration watch never closes on its
-            // own; this is the only reliable teardown signal.
+            // Endpoint shutdown cancels this token. It is the only teardown
+            // signal, because the dialer holds an endpoint clone.
             _ = shutdown.cancelled() => break,
             joined = io.workers.next(), if !io.workers.is_empty() => {
                 if let Some((attempt, outcome)) = joined {
                     io.settle(&mut state, attempt, outcome).await;
                 }
             }
-            changed = registered.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-            }
-            _ = zakura_rt::time::sleep(ZAKURA_DISCOVERY_DIAL_INTERVAL) => {}
+            _ = zakura_rt::time::sleep_until(next_round) => {}
         }
     }
     io.shutdown(&mut state).await;
@@ -184,39 +182,18 @@ struct CandidateDialerIO {
 }
 
 impl CandidateDialerIO {
-    /// Dials the discovery book's candidates while the endpoint has admission
-    /// capacity, one worker per attempt that `state` records.
+    /// Dials the discovery book's candidates that [`admit_dial_round`]
+    /// records, one worker per attempt.
     async fn spawn_dial_round(&mut self, state: &mut CandidateDialerState) {
-        if !self.endpoint.has_discovery_admission_capacity() {
-            return;
-        }
-
-        let candidates = self
-            .discovery
-            .dial_candidates_preferring_any_service(
-                &self.sought_services,
-                &state.in_flight_node_ids(),
-            )
-            .await;
-
-        for candidate in candidates {
-            if !self.endpoint.has_discovery_admission_capacity() {
-                return;
-            }
-            let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
-                &self.endpoint,
-                state,
-                &candidate,
-                Instant::now(),
-            )
-            .await
-            else {
-                continue;
-            };
-            let Some(attempt) = state.record_attempt(candidate.node_id, reserved_ips) else {
-                continue;
-            };
-
+        let admitted = admit_dial_round(
+            &self.endpoint,
+            &self.discovery,
+            &self.sought_services,
+            state,
+            Instant::now(),
+        )
+        .await;
+        for (attempt, node_addr) in admitted {
             self.discovery.mark_dial_attempt(&attempt.node_id).await;
             metrics::counter!("zakura.p2p.discovery.dial.started").increment(1);
             trace_dial_phase(&self.trace, attempt, DialPhase::Recorded);
@@ -312,10 +289,68 @@ impl Future for DiscoveryDialWorker {
     }
 }
 
+/// Records an attempt in `state` for each discovery-book candidate that this
+/// round can dial at `now`, in the book's dial order, and returns the
+/// attempts with the addresses to dial.
+///
+/// A candidate that `state` or the endpoint can't take now doesn't use a dial
+/// slot, so the next candidate in order takes its place. Skipped candidates
+/// include those whose IPs are all at the per-IP cap or in backoff, and those
+/// with more addresses than the endpoint has free discovery slots: the
+/// transport claims a slot for every address or fails the whole dial as a
+/// local limit.
+async fn admit_dial_round(
+    endpoint: &ZakuraEndpoint,
+    discovery: &ZakuraDiscoveryHandle,
+    sought_services: &[ZakuraServiceId],
+    state: &mut CandidateDialerState,
+    now: Instant,
+) -> Vec<(DialAttemptKey, NodeAddr)> {
+    // No worker of this round dials before the round ends, so the round
+    // counts down the slots its own attempts will claim.
+    let mut free_slots = endpoint.discovery_admission_capacity();
+    if free_slots == 0 {
+        return Vec::new();
+    }
+    let supervisor = endpoint.supervisor();
+    let in_flight_node_ids = state.in_flight_node_ids();
+    let mut admitted = Vec::new();
+    discovery
+        .admit_dial_candidates_preferring_any_service(
+            sought_services,
+            &in_flight_node_ids,
+            |candidate| {
+                if free_slots == 0 {
+                    return DialAdmission::Exhausted;
+                }
+                let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
+                    &supervisor,
+                    state,
+                    &candidate,
+                    now,
+                ) else {
+                    return DialAdmission::Skipped;
+                };
+                if reserved_ips.len() > free_slots {
+                    return DialAdmission::Skipped;
+                }
+                let claimed_slots = reserved_ips.len();
+                let Some(attempt) = state.record_attempt(candidate.node_id, reserved_ips) else {
+                    return DialAdmission::Skipped;
+                };
+                free_slots -= claimed_slots;
+                admitted.push((attempt, node_addr));
+                DialAdmission::Admitted
+            },
+        )
+        .await;
+    admitted
+}
+
 /// Returns the addresses of `candidate` to dial and the canonical IPs they
 /// reserve: the addresses `state` allows whose IPs the supervisor accepts.
-async fn discovery_node_addr_with_reserved_ip_capacity(
-    endpoint: &ZakuraEndpoint,
+fn discovery_node_addr_with_reserved_ip_capacity(
+    supervisor: &ZakuraSupervisorHandle,
     state: &CandidateDialerState,
     candidate: &ZakuraDiscoveryDialCandidate,
     now: Instant,
@@ -323,10 +358,8 @@ async fn discovery_node_addr_with_reserved_ip_capacity(
     let mut direct_addrs = Vec::new();
     let mut reserved_ips = Vec::new();
     for address in state.candidate_addresses(candidate, now) {
-        if endpoint
-            .supervisor()
+        if supervisor
             .can_accept_remote_ip_with_in_flight(address.ip, state.in_flight_dials_to(address.ip))
-            .await
         {
             reserved_ips.push(address.ip);
             direct_addrs.push(address.addr);

@@ -1169,11 +1169,15 @@ impl ZakuraEndpoint {
         }
     }
 
-    /// Whether discovery has an admission permit and can start an address
-    /// attempt while preserving inbound capacity (zakura-quic ADM-12).
-    /// Multi-address dials still reserve all their slots in the transport.
-    pub(crate) fn has_discovery_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0 && self.quic.has_discovery_capacity()
+    /// How many address attempts discovery can start now while preserving
+    /// inbound capacity (zakura-quic ADM-12): none without an admission
+    /// permit, otherwise the transport's free discovery slots. A dial claims
+    /// a slot for every address it tries, or fails with none claimed.
+    pub(crate) fn discovery_admission_capacity(&self) -> usize {
+        if self.handler.admission.available_permits() == 0 {
+            return 0;
+        }
+        self.quic.discovery_capacity()
     }
 
     /// Stop accepting, close every native connection and drain background tasks.
@@ -2008,18 +2012,15 @@ impl ZakuraSupervisorHandle {
     /// per-IP cap, counting `in_flight_count` dials this caller already has in
     /// flight to that IP. Used by the discovery dialer to reserve per-IP slots
     /// before launching a candidate dial.
-    pub(crate) async fn can_accept_remote_ip_with_in_flight(
+    pub(crate) fn can_accept_remote_ip_with_in_flight(
         &self,
         remote_ip: IpAddr,
         in_flight_count: usize,
     ) -> bool {
-        let remote_ip = canonical_ip(remote_ip);
-        let state = self.inner.lock().await;
-        state
-            .ip_slots
-            .registered(remote_ip)
+        self.ip_slots
+            .registered(canonical_ip(remote_ip))
             .saturating_add(in_flight_count)
-            < state.max_connections_per_ip
+            < self.max_connections_per_ip
     }
 }
 
@@ -9041,7 +9042,7 @@ mod tests {
         })
         .await?
         .expect("v2_p2p is enabled in test config");
-        assert!(endpoint.has_discovery_admission_capacity());
+        assert!(endpoint.discovery_admission_capacity() > 0);
 
         // Three dials to a socket that never answers hold every live slot.
         let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -9061,7 +9062,7 @@ mod tests {
         }
 
         assert!(endpoint.handler.admission.available_permits() > 0);
-        assert!(!endpoint.has_discovery_admission_capacity());
+        assert_eq!(endpoint.discovery_admission_capacity(), 0);
         for dial in dials {
             dial.abort();
         }
@@ -9752,9 +9753,7 @@ mod tests {
 
         for alias in [ipv4, mapped, compatible, six_to_four, teredo, nat64] {
             assert!(
-                !supervisor
-                    .can_accept_remote_ip_with_in_flight(alias, 0)
-                    .await,
+                !supervisor.can_accept_remote_ip_with_in_flight(alias, 0),
                 "{alias} must share the occupied IPv4 identity bucket"
             );
         }

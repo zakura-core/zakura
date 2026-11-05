@@ -56,8 +56,8 @@ const MODEL_BACKOFF_BASE_MS: u64 = 2_000;
 
 const MODEL_BACKOFF_MAX_MS: u64 = 20_000;
 
-/// One dial interval: the local-limit pause.
-const MODEL_PAUSE_MS: u64 = 1_000;
+/// One dial interval: the round cadence and the local-limit pause.
+const MODEL_DIAL_INTERVAL_MS: u64 = 1_000;
 
 fn model_nodes() -> Vec<NodeId> {
     (10..).take(MODEL_NODES).map(node_id).collect()
@@ -108,7 +108,8 @@ pub(super) struct ModelAttempt {
 #[derive(Debug, Default)]
 pub(super) struct DialerModel {
     now_ms: u64,
-    paused_until_ms: Option<u64>,
+    /// The earliest time the next round may start.
+    next_round_ms: Option<u64>,
     pub(super) in_flight: Vec<ModelAttempt>,
     settled: Vec<DialAttemptKey>,
     /// `(node, ip)` → `(failure count, retry deadline)`.
@@ -139,10 +140,13 @@ impl DialerModel {
         let now = self.now_ms;
         self.backoff
             .retain(|_, &mut (_, retry_at)| now.saturating_sub(retry_at) <= MODEL_BACKOFF_MAX_MS);
-        if self.paused_until_ms.is_some_and(|until| now < until) {
+        if self
+            .next_round_ms
+            .is_some_and(|next_round| now < next_round)
+        {
             return false;
         }
-        self.paused_until_ms = None;
+        self.next_round_ms = Some(now + MODEL_DIAL_INTERVAL_MS);
         true
     }
 
@@ -164,7 +168,8 @@ impl DialerModel {
         self.settled.push(attempt.key);
         match result {
             DiscoveryDialResult::LocalResourceLimit => {
-                self.paused_until_ms = Some(self.now_ms + MODEL_PAUSE_MS);
+                let after_limit = self.now_ms + MODEL_DIAL_INTERVAL_MS;
+                self.next_round_ms = Some(self.next_round_ms.unwrap_or(0).max(after_limit));
             }
             DiscoveryDialResult::Failed | DiscoveryDialResult::AlpnMismatch => {
                 for ip in attempt.ips {

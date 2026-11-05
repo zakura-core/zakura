@@ -44,8 +44,10 @@
 //!   run that ends first is inconclusive ([`SessionEvidence::end_check`]), not
 //!   failed, so that rule never breaks the run.
 //!
-//! The facts stay out of the observation log, so pinned Plans keep their
-//! format. A test reads them from the run's
+//! The view freezes with the run's log, before the scheduler's shutdown
+//! resumes suspended tasks, so their cleanup can't change what the run ended
+//! with. The facts stay out of the observation log, so pinned Plans keep
+//! their format. A test reads them from the run's
 //! [`Ports`](crate::harness::header_sync::Ports) or
 //! [`WirePorts`](crate::harness::header_sync::WirePorts) after the run.
 //!
@@ -178,6 +180,8 @@ struct SessionLedger {
     kept: HashSet<BodyWorkOwner>,
     /// Own-9's facts, once the transport reports here.
     own9: Option<Own9>,
+    /// Set once the run's log froze. Nothing changes the view after that.
+    frozen: bool,
     /// The first rule the run broke.
     broken: Option<String>,
 }
@@ -250,6 +254,18 @@ impl SessionEvidence {
         ledger.run = Some(run);
     }
 
+    /// Freezes the view with its run's log, so the events the run's
+    /// shutdown cleanup reports, such as a generation's exit, change none of
+    /// its facts, rules or end check.
+    pub(crate) fn freeze(&self) {
+        self.ledger().frozen = true;
+    }
+
+    /// Locks the ledger for a change, or `None` once it's frozen.
+    fn live(&self) -> Option<MutexGuard<'_, SessionLedger>> {
+        Some(self.ledger()).filter(|ledger| !ledger.frozen)
+    }
+
     /// Turns the join on: the topology reports every link it makes here.
     pub(crate) fn expect_links(&self) {
         self.ledger().joined = true;
@@ -272,10 +288,13 @@ impl SessionEvidence {
     }
 
     /// Feeds one of the transport's events, as it reports it. Events the
-    /// own-9 rules don't read, and every event before
-    /// [`SessionEvidence::expect_transport`], are ignored.
+    /// own-9 rules don't read, every event before
+    /// [`SessionEvidence::expect_transport`], and every event once the view
+    /// froze are ignored.
     pub(crate) fn transport(&self, event: &TransportEvent) {
-        let mut ledger = self.ledger();
+        let Some(mut ledger) = self.live() else {
+            return;
+        };
         match event {
             TransportEvent::Registered { conn_id, remote } => {
                 ledger.registered(*conn_id, *remote);
@@ -331,7 +350,9 @@ impl SessionEvidence {
         direction: ServicePeerDirection,
     ) {
         let connection = origin.connection;
-        let mut ledger = self.ledger();
+        let Some(mut ledger) = self.live() else {
+            return;
+        };
         ledger.facts.push(SessionFact::LinkOpened {
             peer: name.to_owned(),
             connection,
@@ -356,7 +377,9 @@ impl SessionEvidence {
 
     /// Records that the link on `connection` closed, unless it already did.
     pub(crate) fn link_closed(&self, connection: u64) {
-        let mut ledger = self.ledger();
+        let Some(mut ledger) = self.live() else {
+            return;
+        };
         let Some(link) = ledger.links.get_mut(&connection) else {
             return;
         };
@@ -370,10 +393,12 @@ impl SessionEvidence {
     }
 
     /// Feeds one of the reactor's events, keeping the session facts and
-    /// checking both rules. Events neither rule reads are ignored, so a tap
-    /// feeds every event.
+    /// checking both rules. Events neither rule reads, and every event once
+    /// the view froze, are ignored, so a tap feeds every event.
     pub(crate) fn reactor(&self, event: &ReactorEvent) {
-        self.ledger().reactor(event);
+        if let Some(mut ledger) = self.live() {
+            ledger.reactor(event);
+        }
     }
 
     /// The first rule the run broke.

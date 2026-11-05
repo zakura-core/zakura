@@ -49,3 +49,57 @@ impl ReservationEvidence {
             .clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zakura_network::zakura::{
+        observe::{ReactorEvent, ReservationEnd, ReservationPurpose},
+        ZakuraPeerId,
+    };
+    use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
+
+    use super::ReservationEvidence;
+    use crate::harness::header_node::{session::SessionEvidence, tap::ReactorTap};
+
+    /// A tap keeps every accounting fact it's handed, through its capacity
+    /// handle or its own, in order, and nothing else.
+    #[test]
+    fn the_tap_keeps_accounting_facts_in_order() {
+        let mut sim = crate::Sim::new(
+            crate::harness::header_sync::storage_config(),
+            crate::PlanInput::Bytes(Vec::new()),
+        );
+        let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+        let evidence = ReservationEvidence::default();
+        let (observer, _tap) = ReactorTap::with_evidence(
+            &mut sim,
+            &port,
+            "node",
+            SessionEvidence::default(),
+            evidence.clone(),
+        );
+        let capacity = observer
+            .capacity_observer()
+            .expect("the tap hands the queue its own capacity handle");
+        let opened = ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: ZakuraPeerId::new(vec![2; 32]).expect("32 bytes is a valid peer ID"),
+            purpose: ReservationPurpose::Ordinary,
+            headers: 2,
+            request: None,
+        };
+        let ended = ReactorEvent::ReservationEnded {
+            reservation: 1,
+            released: 2,
+            cause: ReservationEnd::Cancelled,
+        };
+
+        capacity.observe(opened.clone());
+        observer.observe(ReactorEvent::StorageJoined { call: 1 });
+        observer.observe(ended.clone());
+
+        assert_eq!(evidence.facts(), [opened, ended]);
+    }
+}

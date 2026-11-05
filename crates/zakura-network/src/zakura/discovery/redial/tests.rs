@@ -42,9 +42,8 @@ fn repeated_local_limits_keep_the_remote_failure_budget() {
     assert_eq!(state.record(DialResult::Failed), RedialNext::Stop);
 }
 
-// A healthy connection keeps its outcome while its deregistration lags, a
-// lasting registration upgrades a failed dial, and no registration upgrades an
-// ALPN mismatch.
+// A healthy connection keeps its outcome while its deregistration lags, and a
+// lasting registration upgrades a failed dial.
 #[test]
 fn lagging_registration_only_upgrades_an_attempt() {
     let brief = Duration::from_millis(1);
@@ -60,13 +59,31 @@ fn lagging_registration_only_upgrades_an_attempt() {
         DialResult::Failed.with_lagging_registration(HEALTHY),
         DialResult::Healthy
     );
+}
+
+/// A maintained loop waits out a lagging registration before it scores a
+/// failure, but scores an ALPN mismatch at once: no registration can rescore
+/// it (V12 F-519, F-563).
+#[test]
+fn an_alpn_mismatch_skips_the_lagging_registration_wait() {
+    let policy = RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30));
+    let state = RedialState::new(policy);
+    assert!(state.waits_for_lagging_deregistration(DialResult::Failed));
+    assert!(!state.waits_for_lagging_deregistration(DialResult::AlpnMismatch));
+}
+
+/// A bounded upgrade dial stops at its first ALPN mismatch, because its
+/// endpoint holds the node-ID floor. A configured bootstrap peer waits the
+/// floor out (V12 F-562, F-563).
+#[test]
+fn only_a_bounded_dial_stops_at_an_alpn_mismatch() {
+    let (initial, max) = (Duration::from_secs(1), Duration::from_secs(30));
+    let mut bounded = RedialState::new(RedialPolicy::maintain_bounded(initial, max, 6));
+    assert_eq!(bounded.record(DialResult::AlpnMismatch), RedialNext::Stop);
+    let mut maintained = RedialState::new(RedialPolicy::maintain(initial, max));
     assert_eq!(
-        DialResult::AlpnMismatch.with_lagging_registration(HEALTHY - brief),
-        DialResult::AlpnMismatch
-    );
-    assert_eq!(
-        DialResult::AlpnMismatch.with_lagging_registration(HEALTHY),
-        DialResult::AlpnMismatch
+        maintained.record(DialResult::AlpnMismatch),
+        RedialNext::WaitOut(ZAKURA_ALPN_MISMATCH_BACKOFF)
     );
 }
 
@@ -227,7 +244,8 @@ async fn untraced_supervisor<F>(
     registered: watch::Receiver<Vec<ZakuraPeerId>>,
     policy: RedialPolicy,
     dial: F,
-) where
+) -> RedialEnd
+where
     F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
 {
     run_dial_supervisor(peer_id, registered, ZakuraTrace::noop(), policy, dial).await
@@ -648,51 +666,76 @@ async fn alpn_floor_holds_through_a_registration_from_another_connection() {
     }
 }
 
-/// A healthy registration that outlives an ALPN-mismatched dial leaves the
-/// mismatch's backoff floor in place (V12 F-519).
+/// A healthy registration from another connection that overlaps an
+/// ALPN-mismatched dial neither delays nor erases the mismatch's floor
+/// (V12 F-519).
 #[tokio::test(start_paused = true)]
 async fn a_lagging_registration_keeps_the_alpn_floor() {
     let peer_id = redial_test_peer_id();
     let (registered_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let lasted = HEALTHY + Duration::from_secs(1);
+    let supervisor = tokio::spawn(untraced_supervisor(
+        peer_id.clone(),
+        registered,
+        RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
+        overlapped_mismatch(&calls, registered_tx, peer_id),
+    ));
 
-    let dial_calls = calls.clone();
-    let dial_peer_id = peer_id.clone();
-    let dial = move || {
-        let call = dial_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // The floor starts at the mismatch, not when the registration ends.
+    tokio::time::sleep(ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
+    assert_eq!(dial_count(&calls), 1, "the redial cut the ALPN floor short");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(dial_count(&calls), 2, "the redial runs once the floor ends");
+    supervisor.abort();
+}
+
+/// A bounded upgrade dial ends at its first ALPN mismatch and reports it, even
+/// while another connection keeps the peer registered. No task waits out the
+/// floor, and no cancellation can discard the mismatch (V12 F-562, F-563).
+#[tokio::test(start_paused = true)]
+async fn a_bounded_dial_ends_at_once_on_an_alpn_mismatch() {
+    let peer_id = redial_test_peer_id();
+    let (registered_tx, registered) = tokio::sync::watch::channel(Vec::<ZakuraPeerId>::new());
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started = tokio::time::Instant::now();
+    let end = untraced_supervisor(
+        peer_id.clone(),
+        registered,
+        RedialPolicy::maintain_bounded(Duration::from_secs(1), Duration::from_secs(30), 6),
+        overlapped_mismatch(&calls, registered_tx, peer_id),
+    )
+    .await;
+    assert_eq!(end, RedialEnd::AlpnMismatch);
+    assert_eq!(dial_count(&calls), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the dial waited for the other connection's registration to end",
+    );
+}
+
+/// A dial that answers with an ALPN mismatch while its first call starts a
+/// healthy-length registration from another connection.
+fn overlapped_mismatch(
+    calls: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    registered_tx: watch::Sender<Vec<ZakuraPeerId>>,
+    peer_id: ZakuraPeerId,
+) -> impl FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>> {
+    let calls = calls.clone();
+    move || {
+        let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let registered_tx = registered_tx.clone();
-        let dial_peer_id = dial_peer_id.clone();
+        let peer_id = peer_id.clone();
         Box::pin(async move {
             if call == 0 {
-                // Another connection registers the peer for longer than the
-                // healthy threshold, overlapping the mismatched dial.
-                let _ = registered_tx.send(vec![dial_peer_id]);
+                let _ = registered_tx.send(vec![peer_id]);
                 tokio::spawn(async move {
-                    tokio::time::sleep(lasted).await;
+                    tokio::time::sleep(HEALTHY + Duration::from_secs(1)).await;
                     let _ = registered_tx.send(Vec::new());
                 });
             }
             DialResult::AlpnMismatch
-        }) as Pin<Box<dyn Future<Output = DialResult> + Send>>
-    };
-    let supervisor = tokio::spawn(untraced_supervisor(
-        peer_id,
-        registered,
-        RedialPolicy::maintain(Duration::from_secs(1), Duration::from_secs(30)),
-        dial,
-    ));
-
-    // The floor starts once the lagging registration ends.
-    tokio::time::sleep(lasted + ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
-    assert_eq!(
-        dial_count(&calls),
-        1,
-        "the lagging registration erased the ALPN floor"
-    );
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(dial_count(&calls), 2, "the redial runs once the floor ends");
-    supervisor.abort();
+        })
+    }
 }
 
 /// A trace that queues its rows, and the queue's `(owner, attempt, phase)`

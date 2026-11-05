@@ -248,6 +248,9 @@ pub(crate) enum ZakuraUpgradeDialStart {
     AlreadyRunning,
     /// The dial address contains an invalid peer identity.
     InvalidPeerId,
+    /// An earlier upgrade dial to this peer ended on an ALPN mismatch less
+    /// than [`ZAKURA_ALPN_MISMATCH_BACKOFF`] ago (zakura-quic DIAL-5).
+    AlpnBackoff,
 }
 
 /// An error from the Zakura handshake upgrade hook.
@@ -344,7 +347,9 @@ impl ZakuraHandshakeConnector {
         let cancel_guard = match dial_start {
             ZakuraUpgradeDialStart::Started => Some(UpgradeDialCancelGuard { endpoint, peer_id }),
             ZakuraUpgradeDialStart::AlreadyRunning => None,
-            ZakuraUpgradeDialStart::InvalidPeerId => return ZakuraNativeHandoff::Failed,
+            ZakuraUpgradeDialStart::InvalidPeerId | ZakuraUpgradeDialStart::AlpnBackoff => {
+                return ZakuraNativeHandoff::Failed;
+            }
         };
         let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
         match (cancel_guard, conn_id) {

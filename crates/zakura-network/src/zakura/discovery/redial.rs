@@ -47,6 +47,10 @@ pub(crate) struct RedialPolicy {
     /// peers and legacy->Zakura upgrade hand-offs set this because they are the
     /// active owners of the Zakura dial.
     redial_after_drop: bool,
+    /// Stop at the first ALPN mismatch instead of waiting out its floor. The
+    /// upgrade hand-off sets this: its endpoint holds the floor per node ID
+    /// (zakura-quic DIAL-5), so no task outlives a mismatched address.
+    alpn_mismatch_stops: bool,
 }
 
 impl RedialPolicy {
@@ -58,15 +62,19 @@ impl RedialPolicy {
             max_attempts: None,
             registered_settle_timeout: ZAKURA_REDIAL_HEALTHY_CONNECTION,
             redial_after_drop: true,
+            alpn_mismatch_stops: false,
         }
     }
 
     /// Maintain a connection like [`Self::maintain`], but stop after `attempts`
-    /// consecutive failed dials (legacy->Zakura upgrade hand-offs).
+    /// consecutive failed dials or at the first ALPN mismatch (legacy->Zakura
+    /// upgrade hand-offs).
     ///
     /// A peer-supplied upgrade address must not get a dial that lives forever.
     /// A healthy connection resets the failure count, so a live peer keeps its
-    /// dial through brief drops, and a peer that stops answering loses it.
+    /// dial through brief drops, and a peer that stops answering loses it. The
+    /// caller holds the ALPN floor when [`native_dial_supervised`] returns
+    /// [`RedialEnd::AlpnMismatch`].
     pub(crate) fn maintain_bounded(
         initial_backoff: Duration,
         max_backoff: Duration,
@@ -74,6 +82,7 @@ impl RedialPolicy {
     ) -> Self {
         Self {
             max_attempts: Some(attempts),
+            alpn_mismatch_stops: true,
             ..Self::maintain(initial_backoff, max_backoff)
         }
     }
@@ -102,8 +111,19 @@ impl RedialPolicy {
             max_attempts: Some(attempts),
             registered_settle_timeout,
             redial_after_drop: false,
+            alpn_mismatch_stops: false,
         }
     }
+}
+
+/// Why [`native_dial_supervised`] returned.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RedialEnd {
+    /// The last dial reached a peer that speaks another ALPN. The caller holds
+    /// the node-ID floor (zakura-quic DIAL-5) before it dials the peer again.
+    AlpnMismatch,
+    /// The policy stopped for another reason, or the endpoint shut down.
+    Ended,
 }
 
 /// Outcome of one dial attempt, as seen by [`run_dial_supervisor`].
@@ -138,10 +158,10 @@ pub(crate) async fn native_dial_supervised(
     node_addr: NodeAddr,
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
-) {
+) -> RedialEnd {
     let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
         tracing::warn!(?node_addr, "invalid Zakura bootstrap node id; not dialing");
-        return;
+        return RedialEnd::Ended;
     };
 
     let shutdown = endpoint.background_shutdown_token();
@@ -168,8 +188,8 @@ pub(crate) async fn native_dial_supervised(
     // only signal that reliably ends the loop at teardown.
     zakura_rt::select! {
         biased;
-        _ = shutdown.cancelled() => {}
-        _ = supervised => {}
+        _ = shutdown.cancelled() => RedialEnd::Ended,
+        end = supervised => end,
     }
 }
 
@@ -226,7 +246,8 @@ async fn run_dial_supervisor<F>(
     trace: ZakuraTrace,
     policy: RedialPolicy,
     dial: F,
-) where
+) -> RedialEnd
+where
     F: FnMut() -> Pin<Box<dyn Future<Output = DialResult> + Send>>,
 {
     RedialIO {
@@ -262,7 +283,7 @@ where
     /// Exits when `policy.max_attempts` consecutive attempts fail, when a
     /// `connect_once` peer connects or finishes serving, or when the supervisor's
     /// registration watch closes (node shutdown).
-    async fn run(mut self, mut state: RedialState) {
+    async fn run(mut self, mut state: RedialState) -> RedialEnd {
         loop {
             let (mut result, mut attempt) = match state.start(self.peer_is_registered()) {
                 RedialStart::Dial => {
@@ -276,13 +297,13 @@ where
                     zakura_rt::select! {
                         changed = self.registered.changed() => {
                             if changed.is_err() {
-                                return;
+                                return RedialEnd::Ended;
                             }
                             state.registration_changed();
                             continue;
                         }
                         _ = zakura_rt::time::sleep(timeout) => {
-                            return;
+                            return RedialEnd::Ended;
                         }
                     }
                 }
@@ -303,7 +324,7 @@ where
                 RedialStart::ScoreRegistration => {
                     let mut attempt = self.start_attempt();
                     let Some(registered_for) = self.await_deregistration(&mut attempt).await else {
-                        return;
+                        return RedialEnd::Ended;
                     };
                     (DialResult::lasting(registered_for), attempt)
                 }
@@ -314,15 +335,18 @@ where
             // so the residual registration does not become a second attempt on the
             // next loop iteration. A concurrent registration that remains healthy
             // can still upgrade a failed dial to a healthy connection.
-            if state.waits_for_lagging_deregistration() && self.peer_is_registered() {
+            if state.waits_for_lagging_deregistration(result) && self.peer_is_registered() {
                 let Some(registered_for) = self.await_deregistration(&mut attempt).await else {
-                    return;
+                    return RedialEnd::Ended;
                 };
                 result = result.with_lagging_registration(registered_for);
             }
 
             match state.record(result) {
-                RedialNext::Stop => return,
+                RedialNext::Stop if result == DialResult::AlpnMismatch => {
+                    return RedialEnd::AlpnMismatch;
+                }
+                RedialNext::Stop => return RedialEnd::Ended,
                 RedialNext::RedialNow => {}
                 // Back off, but wake early only if the peer appears in the supervisor
                 // from another connection. Ignore unrelated peer-set changes,
@@ -332,12 +356,12 @@ where
                     if !sleep_unless_registered(&mut self.registered, Some(&self.peer_id), wait)
                         .await
                     {
-                        return;
+                        return RedialEnd::Ended;
                     }
                 }
                 RedialNext::WaitOut(wait) => {
                     if !sleep_unless_registered(&mut self.registered, None, wait).await {
-                        return;
+                        return RedialEnd::Ended;
                     }
                 }
             }

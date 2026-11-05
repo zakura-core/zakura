@@ -50,7 +50,9 @@ use zakura_rt::{
 };
 
 use self::trace::ZakuraConnTrace;
-use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::discovery::{
+    self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialEnd, RedialPolicy,
+};
 use super::peer_memory::{
     budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
     PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
@@ -198,8 +200,9 @@ pub const DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The upgrade dial targets a peer-supplied address, so it must not redial
 /// forever. Six attempts back off 1 + 2 + 4 + 8 + 16 = 31 s between dials, and
 /// each dial can wait up to [`DEFAULT_ZAKURA_CONTROL_TIMEOUT`] to connect, so
-/// the dial ends within about 90 s after the peer stops answering. The legacy
-/// crawler then re-upgrades the peer if it is still reachable.
+/// the dial ends within about 90 s after the peer stops answering. An ALPN
+/// mismatch ends it at once. The legacy crawler then re-upgrades the peer if it
+/// is still reachable.
 const ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS: usize = 6;
 const CONTROL_LENGTH_BYTES: usize = 4;
 const STREAM_PRELUDE_FIXED_BYTES: usize = 4 + 2 + 2 + 1;
@@ -894,6 +897,10 @@ pub struct ZakuraEndpoint {
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
     upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, UpgradeDialOwnership>>>,
+    /// When each peer's ALPN-mismatch floor ends, for upgrade dials that ended
+    /// on a mismatch. No upgrade dial starts for a peer inside its floor
+    /// (zakura-quic DIAL-5).
+    upgrade_alpn_floors: Arc<StdMutex<HashMap<ZakuraPeerId, Instant>>>,
 }
 
 #[derive(Debug)]
@@ -1061,10 +1068,9 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
-        spawn_erased_named(
-            "native_dial",
-            native_dial_supervised(endpoint, node_addr, limits, policy),
-        )
+        spawn_erased_named("native_dial", async move {
+            native_dial_supervised(endpoint, node_addr, limits, policy).await;
+        })
     }
 
     /// Start one maintained native dial for a legacy handoff.
@@ -1074,7 +1080,9 @@ impl ZakuraEndpoint {
     /// legacy upgrades do not create a swarm of independent maintained QUIC
     /// dial loops to the same peer. The dial gives up after
     /// [`ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS`] consecutive failures because the
-    /// peer chose the address.
+    /// peer chose the address. A dial that ends on an ALPN mismatch starts the
+    /// peer's [`ZAKURA_ALPN_MISMATCH_BACKOFF`] floor, and no dial starts inside
+    /// it.
     pub(crate) fn start_upgrade_native_dial(&self, node_addr: NodeAddr) -> ZakuraUpgradeDialStart {
         let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
             return ZakuraUpgradeDialStart::InvalidPeerId;
@@ -1092,6 +1100,9 @@ impl ZakuraEndpoint {
         if upgrade_dials.contains_key(&peer_id) {
             return ZakuraUpgradeDialStart::AlreadyRunning;
         }
+        if self.in_upgrade_alpn_floor(&peer_id) {
+            return ZakuraUpgradeDialStart::AlpnBackoff;
+        }
 
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
@@ -1105,7 +1116,11 @@ impl ZakuraEndpoint {
         let task_peer_id = peer_id.clone();
         let dial = spawn_erased_named("upgrade_dial", async move {
             let _lifetime_guard = task_lifetime.drop_guard();
-            native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
+            if native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await
+                == RedialEnd::AlpnMismatch
+            {
+                endpoint.hold_upgrade_alpn_floor(task_peer_id.clone());
+            }
             endpoint
                 .supervisor
                 .forget_retained_native_metadata(&task_peer_id);
@@ -1123,6 +1138,34 @@ impl ZakuraEndpoint {
             },
         );
         ZakuraUpgradeDialStart::Started
+    }
+
+    /// Starts `peer_id`'s ALPN-mismatch floor, and drops the floors that ended.
+    fn hold_upgrade_alpn_floor(&self, peer_id: ZakuraPeerId) {
+        let now = Instant::now();
+        let mut floors = self
+            .upgrade_alpn_floors
+            .lock()
+            .expect("Zakura upgrade ALPN floor mutex is never poisoned");
+        floors.retain(|_, until| *until > now);
+        floors.insert(peer_id, now + ZAKURA_ALPN_MISMATCH_BACKOFF);
+    }
+
+    /// Whether `peer_id` is inside the ALPN-mismatch floor of an earlier
+    /// upgrade dial.
+    fn in_upgrade_alpn_floor(&self, peer_id: &ZakuraPeerId) -> bool {
+        let mut floors = self
+            .upgrade_alpn_floors
+            .lock()
+            .expect("Zakura upgrade ALPN floor mutex is never poisoned");
+        match floors.get(peer_id) {
+            Some(until) if *until > Instant::now() => true,
+            Some(_) => {
+                floors.remove(peer_id);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Returns how many maintained upgrade dials this endpoint owns.
@@ -1219,6 +1262,7 @@ impl ZakuraEndpoint {
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -1279,6 +1323,7 @@ impl ZakuraEndpoint {
             block_sync_actions: block_sync_actions
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -4854,6 +4899,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+        upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
     };
     let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
@@ -9276,6 +9322,62 @@ mod tests {
         assert_eq!(
             endpoint.start_upgrade_native_dial(node_addr),
             crate::zakura::ZakuraUpgradeDialStart::AlreadyRunning,
+        );
+
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// An upgrade dial to a peer-supplied address that speaks another ALPN
+    /// ends at once, and no upgrade dial to that node ID starts again until
+    /// the ten-minute floor ends (zakura-quic DIAL-5, V12 F-562, F-563).
+    #[tokio::test]
+    async fn alpn_mismatched_upgrade_dial_ends_and_holds_the_node_floor() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let config = Config::for_test(P2pStack::Dual);
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled in test config");
+        let other_cohort = LocalEndpointFactory::new().endpoint(0x0A17_0001).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        other_cohort.serve(CaptureConnection {
+            alpn: b"/zakura/another-cohort/0",
+            connection_tx,
+            stream_tx,
+        })?;
+        let node_addr = LocalEndpointFactory::node_addr(&other_cohort).await;
+        let peer_id = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec())?;
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(node_addr.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+        timeout(Duration::from_secs(10), async {
+            while endpoint.upgrade_dial_count() > 0 {
+                zakura_rt::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mismatched upgrade dial ends without waiting out the floor");
+
+        tokio::time::pause();
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(node_addr.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+        );
+        tokio::time::advance(ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(node_addr.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(node_addr),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
         );
 
         endpoint.cancel_upgrade_native_dial(&peer_id);

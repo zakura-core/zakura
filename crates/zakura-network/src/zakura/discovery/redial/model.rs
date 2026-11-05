@@ -32,6 +32,7 @@ impl ModelPolicy {
                 max_attempts: Some(attempts),
                 registered_settle_timeout: settle,
                 redial_after_drop: false,
+                alpn_mismatch_stops: false,
             },
             ModelMode::Maintain => RedialPolicy::maintain(self.initial, self.max),
             ModelMode::MaintainBounded { attempts } => {
@@ -42,6 +43,12 @@ impl ModelPolicy {
 
     fn maintains(self) -> bool {
         !matches!(self.mode, ModelMode::ConnectOnce { .. })
+    }
+
+    /// Only the bounded upgrade policy stops at an ALPN mismatch, because its
+    /// endpoint holds the floor.
+    fn alpn_mismatch_stops(self) -> bool {
+        matches!(self.mode, ModelMode::MaintainBounded { .. })
     }
 
     fn max_attempts(self) -> Option<usize> {
@@ -95,6 +102,7 @@ impl RedialModel {
                 RedialNext::RedialNow
             }
             DialResult::Healthy => RedialNext::Stop,
+            DialResult::AlpnMismatch if self.policy.alpn_mismatch_stops() => RedialNext::Stop,
             DialResult::LocalLimit => RedialNext::RetryAfter(self.policy.initial),
             DialResult::Failed | DialResult::AlpnMismatch => {
                 let doublings = self.failures;
@@ -237,17 +245,16 @@ pub(super) fn run(
                 break;
             }
         };
+        let waits = policy.maintains() && attempt != DialResult::AlpnMismatch;
         assert_eq!(
-            state.waits_for_lagging_deregistration(),
-            policy.maintains(),
+            state.waits_for_lagging_deregistration(attempt),
+            waits,
             "{PROPERTY}: lagging registration wait"
         );
         let attempt = match lagging {
-            Some(lasted) if start == RedialStart::Dial && policy.maintains() => {
+            Some(lasted) if start == RedialStart::Dial && waits => {
                 let rescored = attempt.with_lagging_registration(Duration::from_secs(lasted));
-                let expected = if attempt != DialResult::AlpnMismatch
-                    && RedialModel::score(lasted) == DialResult::Healthy
-                {
+                let expected = if RedialModel::score(lasted) == DialResult::Healthy {
                     DialResult::Healthy
                 } else {
                     attempt

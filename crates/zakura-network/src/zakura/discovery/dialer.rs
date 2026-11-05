@@ -43,7 +43,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         let endpoint = endpoint.clone();
         let limits = limits.clone();
         tasks.push(spawn_erased_named("bootstrap_dial", async move {
-            native_dial_supervised(endpoint, node_addr, limits, policy).await
+            native_dial_supervised(endpoint, node_addr, limits, policy).await;
         }));
     }
     tasks

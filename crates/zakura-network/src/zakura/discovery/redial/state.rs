@@ -52,11 +52,9 @@ impl DialResult {
     /// Rescores this attempt after the peer's registration outlived it.
     ///
     /// A registration that lasted `lasted` long enough to be healthy upgrades
-    /// the attempt to healthy; a shorter one leaves the attempt's result. An
-    /// ALPN mismatch keeps its result, because another connection's
-    /// registration says nothing about the protocol at the dialed address.
+    /// the attempt to healthy; a shorter one leaves the attempt's result.
     pub(super) fn with_lagging_registration(self, lasted: Duration) -> Self {
-        if self != Self::AlpnMismatch && Self::lasting(lasted) == Self::Healthy {
+        if Self::lasting(lasted) == Self::Healthy {
             Self::Healthy
         } else {
             self
@@ -106,13 +104,16 @@ impl RedialState {
         self.reset();
     }
 
-    /// Whether the loop waits for a registration that outlives an attempt to
+    /// Whether the loop waits for a registration that outlives `attempt` to
     /// end before it scores the attempt.
     ///
     /// The connection deregistration can land after the dial future returns.
     /// Waiting keeps the residual registration from becoming a second attempt.
-    pub(super) fn waits_for_lagging_deregistration(&self) -> bool {
-        self.policy.redial_after_drop
+    /// An ALPN mismatch never registered on the dialed connection, and another
+    /// connection's registration says nothing about the protocol at the dialed
+    /// address, so the loop scores a mismatch at once.
+    pub(super) fn waits_for_lagging_deregistration(&self, attempt: DialResult) -> bool {
+        self.policy.redial_after_drop && attempt != DialResult::AlpnMismatch
     }
 
     /// Applies one attempt's result and chooses the next step.
@@ -122,10 +123,14 @@ impl RedialState {
     /// without counting an attempt or growing the backoff. A failure or an
     /// ALPN mismatch counts an attempt, stops at the policy's maximum, and
     /// otherwise waits out the backoff, which then doubles up to its maximum.
-    /// An ALPN mismatch waits at least [`ZAKURA_ALPN_MISMATCH_BACKOFF`], and a
+    /// An ALPN mismatch stops a policy whose owner holds the node-ID floor.
+    /// Otherwise it waits at least [`ZAKURA_ALPN_MISMATCH_BACKOFF`], and a
     /// registration from another connection doesn't cut that wait short.
     pub(super) fn record(&mut self, attempt: DialResult) -> RedialNext {
         match attempt {
+            DialResult::AlpnMismatch if self.policy.alpn_mismatch_stops => {
+                return RedialNext::Stop;
+            }
             DialResult::Healthy => {
                 if !self.policy.redial_after_drop {
                     return RedialNext::Stop;

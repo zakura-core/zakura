@@ -40,7 +40,7 @@ pub use peer::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 #[cfg(test)]
 pub(crate) use protocol::discovery_dial_slot_limit;
 pub use protocol::*;
-pub(crate) use redial::{native_dial_supervised, RedialPolicy};
+pub(crate) use redial::{native_dial_supervised, RedialEnd, RedialPolicy};
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use redial::{replay_redial_bytes, RedialReplaySummary};
 pub(crate) use runtime::{

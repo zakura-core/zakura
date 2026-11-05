@@ -6,7 +6,8 @@
 //! its own: the failure blames the header peer, that peer is the source the
 //! request named, and the category is `malformed_protocol` or
 //! `invalid_header`. [`FaultEvidence::penalized`] then wants a matching
-//! `Misbehavior` for each one. This is the first rule of
+//! `Misbehavior` for each one, reported while the reactor handled the call
+//! that took the failed reply. This is the first rule of
 //! `header-sync/header-fault-penalized`. A disconnect before the failure
 //! settles changes nothing it owes.
 
@@ -35,9 +36,8 @@ pub struct OwedPenalty {
     pub session_id: u64,
     /// The `Misbehavior` reason its category calls for.
     pub reason: &'static str,
-    /// The storage fact at which the reactor took the failed reply. The
-    /// penalty comes after it.
-    pub taken: u64,
+    /// The reactor port call that submitted the operation, if one did.
+    pub call: Option<u64>,
 }
 
 /// The `Misbehavior` reason a failure owes, from production's rule applied
@@ -61,14 +61,13 @@ pub fn owed(
     entries: &[Entry],
     attributions: &FaultAttributions,
 ) -> Result<Vec<OwedPenalty>, String> {
-    let mut requests: BTreeMap<u64, (&'static str, &str, u64)> = BTreeMap::new();
-    let mut failed: BTreeMap<u64, (&'static str, &str, u64, &str)> = BTreeMap::new();
+    let mut requests: BTreeMap<u64, Request<'_>> = BTreeMap::new();
+    let mut failed: BTreeMap<u64, (Request<'_>, &str)> = BTreeMap::new();
     let mut owed = Vec::new();
     for entry in entries {
         let Observation::Storage {
             service,
             instance: NODE,
-            seq,
             fact,
             ..
         } = &entry.obs
@@ -84,6 +83,7 @@ pub fn owed(
                 request:
                     StorageRequest::PrepareHeaderTarget { owner, source, .. }
                     | StorageRequest::ApplyHeaderTarget { owner, source, .. },
+                call,
                 ..
             } => {
                 let stage = match fact {
@@ -93,7 +93,15 @@ pub fn owed(
                     } => "prepare",
                     _ => "apply",
                 };
-                requests.insert(*id, (stage, source, owner.session_id));
+                requests.insert(
+                    *id,
+                    Request {
+                        stage,
+                        source,
+                        session_id: owner.session_id,
+                        call: *call,
+                    },
+                );
             }
             StorageFact::Completed {
                 id,
@@ -101,26 +109,26 @@ pub fn owed(
                     StorageResult::PrepareFailed { category } | StorageResult::ApplyFailed { category },
                 ..
             } => {
-                let (stage, source, session_id) = *requests.get(id).ok_or_else(|| {
+                let request = *requests.get(id).ok_or_else(|| {
                     format!("UnknownOperation: operation {id} failed with no logged request")
                 })?;
-                failed.insert(*id, (stage, source, session_id, category));
+                failed.insert(*id, (request, category));
             }
             StorageFact::ReplyTaken { id } => {
-                let Some((stage, source, session_id, category)) = failed.remove(id) else {
+                let Some((request, category)) = failed.remove(id) else {
                     continue;
                 };
                 let blame = attributions.get(NODE, *id).ok_or_else(|| {
                     format!("MissingAttribution: failed operation {id} has no attribution")
                 })?;
-                if let Some(reason) = owes_penalty(source, category, &blame) {
+                if let Some(reason) = owes_penalty(request.source, category, &blame) {
                     owed.push(OwedPenalty {
                         op: *id,
-                        stage,
-                        source: source.to_owned(),
-                        session_id,
+                        stage: request.stage,
+                        source: request.source.to_owned(),
+                        session_id: request.session_id,
                         reason,
-                        taken: *seq,
+                        call: request.call,
                     });
                 }
             }
@@ -128,6 +136,15 @@ pub fn owed(
         }
     }
     Ok(owed)
+}
+
+/// A logged prepare or apply request, as [`owed`] reads it.
+#[derive(Clone, Copy)]
+struct Request<'a> {
+    stage: &'static str,
+    source: &'a str,
+    session_id: u64,
+    call: Option<u64>,
 }
 
 /// The node's fault evidence: whom its storage failures blamed, and, once
@@ -158,57 +175,54 @@ impl FaultEvidence {
     }
 
     /// The penalty rule over `entries`, the run's log: each penalty
-    /// [`owed`] is matched by a `Misbehavior` the reactor reported after it
-    /// took the failed reply, naming the source's peer, the work's session as
-    /// its origin and the reason the category calls for. One `Misbehavior`
-    /// matches one penalty. A penalty still unmatched when a settled run ends
-    /// is a break, since the reactor reports it while it handles the reply
-    /// it took. Unmatched at any other end, or before the run has ended, it's
-    /// inconclusive.
+    /// [`owed`] is matched by a `Misbehavior` naming the source's peer, the
+    /// work's session as its origin and the reason the category calls for,
+    /// which the reactor reported while it handled the call that submitted
+    /// the operation: strictly between that call's `CallEnded` and `Handled`,
+    /// in the tap's order. A `Misbehavior` from another completion, even
+    /// against the same session, matches nothing. A penalty still unmatched
+    /// when a settled run ends is a break. Unmatched at any other end, or
+    /// before the run has ended, it's inconclusive.
     pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
         let owed = match owed(entries, &self.attributions) {
             Ok(owed) => owed,
             Err(why) => return Acceptance::Violated(why),
         };
-        let mut penalties: Vec<(u64, &str, &str, Option<u64>)> = entries
+        let events: Vec<&ReactorFact> = entries
             .iter()
             .filter_map(|entry| match &entry.obs {
-                Observation::Reactor {
-                    storage_seq,
-                    event:
-                        ReactorFact::Misbehavior {
-                            peer,
-                            reason,
-                            origin,
-                            ..
-                        },
-                    ..
-                } => Some((*storage_seq, peer.as_str(), reason.as_str(), *origin)),
+                Observation::Reactor { event, .. } => Some(event),
                 _ => None,
             })
             .collect();
-        let mut unpenalized = Vec::new();
-        for penalty in owed {
-            let found = penalties.iter().position(|(after, peer, reason, origin)| {
-                *after >= penalty.taken
-                    && *peer == penalty.source
-                    && *reason == penalty.reason
-                    && *origin == Some(penalty.session_id)
-            });
-            match found {
-                Some(at) => {
-                    penalties.remove(at);
-                }
-                None => unpenalized.push(penalty),
-            }
-        }
-        let Some(first) = unpenalized.first() else {
+        let penalized = |penalty: &OwedPenalty| {
+            let Some(call) = penalty.call else {
+                return false;
+            };
+            let Some(start) = events.iter().position(
+                |event| matches!(event, ReactorFact::CallEnded { call: ended, .. } if *ended == call),
+            ) else {
+                return false;
+            };
+            events[start + 1..]
+                .iter()
+                .take_while(
+                    |event| !matches!(event, ReactorFact::Handled { call: handled, .. } if *handled == call),
+                )
+                .any(|event| {
+                    matches!(event, ReactorFact::Misbehavior { peer, reason, origin, .. }
+                        if *peer == penalty.source
+                            && reason == penalty.reason
+                            && *origin == Some(penalty.session_id))
+                })
+        };
+        let Some(first) = owed.iter().find(|penalty| !penalized(penalty)) else {
             return Acceptance::Holds;
         };
         let what = format!(
-            "{} operation {} failed with a header-peer fault of {} in session {}, and no {} \
-             Misbehavior from that session followed",
-            first.stage, first.op, first.source, first.session_id, first.reason
+            "{} operation {} failed with a header-peer fault of {} in session {}, and the \
+             reactor reported no {} Misbehavior from that session while it handled call {:?}",
+            first.stage, first.op, first.source, first.session_id, first.reason, first.call
         );
         match self.settled.get() {
             Some(true) => Acceptance::Violated(format!("UnpenalizedFault: {what}")),
@@ -252,8 +266,9 @@ mod tests {
         }
     }
 
-    /// Operation `id`: a prepare from `source` in `session_id`, failing
-    /// with `category` and taken by the reactor, as facts `id * 10` on.
+    /// Operation `id`: a prepare from `source` in `session_id` that reactor
+    /// call `id` submitted, failing with `category` and taken by the
+    /// reactor, as facts `id * 10` on.
     fn failed_prepare(id: u64, source: &str, session_id: u64, category: &str) -> Vec<Entry> {
         let owner = WorkOwner {
             kind: "header".to_owned(),
@@ -282,7 +297,7 @@ mod tests {
                         headers: 1,
                     },
                     digest: String::new(),
-                    call: None,
+                    call: Some(id),
                 },
             ),
             storage(
@@ -302,24 +317,44 @@ mod tests {
         ]
     }
 
-    /// The reactor's `Misbehavior` against `peer` from session `origin`,
-    /// after storage fact `storage_seq`.
-    fn misbehavior(storage_seq: u64, peer: &str, origin: u64) -> Entry {
+    /// The reactor's `event`.
+    fn reactor(event: ReactorFact) -> Entry {
         Entry {
-            step: storage_seq,
+            step: 0,
             obs: Observation::Reactor {
                 instance: 0,
-                seq: storage_seq,
-                storage_seq,
+                seq: 0,
+                storage_seq: 0,
                 node: "node".to_owned(),
-                event: ReactorFact::Misbehavior {
-                    peer: peer.to_owned(),
-                    reason: "invalid-header".to_owned(),
-                    origin: Some(origin),
-                    current: None,
-                },
+                event,
             },
         }
+    }
+
+    /// The reactor's `Misbehavior` against `peer` from session `origin`.
+    fn misbehavior(peer: &str, origin: u64) -> Entry {
+        reactor(ReactorFact::Misbehavior {
+            peer: peer.to_owned(),
+            reason: "invalid-header".to_owned(),
+            origin: Some(origin),
+            current: None,
+        })
+    }
+
+    /// The reactor's handling of call `call`'s completion, during which it
+    /// reported `during`.
+    fn handled(call: u64, during: Vec<Entry>) -> Vec<Entry> {
+        let mut entries = vec![reactor(ReactorFact::CallEnded {
+            call,
+            end: "replied".to_owned(),
+            op: Some(call),
+        })];
+        entries.extend(during);
+        entries.push(reactor(ReactorFact::Handled {
+            call,
+            panicked: false,
+        }));
+        entries
     }
 
     /// Fault evidence for a settled run, where each operation in `blamed`
@@ -377,32 +412,50 @@ mod tests {
                 source: "aa".to_owned(),
                 session_id: 3,
                 reason: "invalid-header",
-                taken: 12,
+                call: Some(1),
             }]
         );
     }
 
+    /// The penalty must come while the reactor handles the call that took
+    /// the failed reply, against the work's session.
     #[test]
-    fn each_penalty_needs_its_own_misbehavior_after_the_reply() {
+    fn the_penalty_comes_while_the_failing_call_is_handled() {
+        let attributed = evidence(&[(1, blame("aa"))]);
+        let broken = |log: &[Entry]| {
+            matches!(attributed.penalized(log),
+                Acceptance::Violated(why) if why.starts_with("UnpenalizedFault"))
+        };
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        // Another session's or peer's penalty during the handling.
+        log.extend(handled(1, vec![misbehavior("aa", 4), misbehavior("bb", 3)]));
+        assert!(broken(&log));
+        // A matching penalty for a later completion, such as a malformed
+        // page from the same session, isn't this failure's.
+        log.extend(handled(2, vec![misbehavior("aa", 3)]));
+        assert!(broken(&log));
+        // A matching penalty before the call ended isn't either.
+        let mut early = failed_prepare(1, "aa", 3, "invalid_header");
+        early.push(misbehavior("aa", 3));
+        early.extend(handled(1, Vec::new()));
+        assert!(broken(&early));
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, vec![misbehavior("aa", 3)]));
+        assert_eq!(attributed.penalized(&log), Acceptance::Holds);
+    }
+
+    /// Each failure needs its own call's penalty.
+    #[test]
+    fn each_failure_needs_its_own_penalty() {
         let attributed = evidence(&[(1, blame("aa")), (2, blame("aa"))]);
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
-        // Before the reactor took the reply, or from another session.
-        log.push(misbehavior(11, "aa", 3));
-        log.push(misbehavior(12, "aa", 4));
-        assert!(matches!(
-            attributed.penalized(&log[..]),
-            Acceptance::Violated(why) if why.starts_with("UnpenalizedFault")
-        ));
-        log.push(misbehavior(12, "aa", 3));
-        assert_eq!(attributed.penalized(&log), Acceptance::Holds);
-        // A second fault in the same session needs a second penalty.
         log.extend(failed_prepare(2, "aa", 3, "invalid_header"));
+        log.extend(handled(1, vec![misbehavior("aa", 3)]));
+        log.extend(handled(2, Vec::new()));
         assert!(matches!(
             attributed.penalized(&log),
             Acceptance::Violated(why) if why.contains("operation 2")
         ));
-        log.push(misbehavior(22, "aa", 3));
-        assert_eq!(attributed.penalized(&log), Acceptance::Holds);
     }
 
     #[test]

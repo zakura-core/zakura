@@ -569,3 +569,92 @@ fn shutdown_cleanup_cannot_retire_a_session() {
         EndCheck::Inconclusive(vec![("peer-0".to_owned(), 5)])
     );
 }
+
+/// A run that ended with `outcome` after a drain that `exhausted` or not.
+fn run_end(outcome: crate::Outcome, exhausted: bool) -> RunEnd {
+    RunEnd {
+        outcome,
+        steps: 100,
+        violation: None,
+        drain: Some(crate::end::Drain {
+            steps: 10,
+            exhausted,
+        }),
+        harness: None,
+    }
+}
+
+/// A departed session own-9 never retired is a leak once the run settled,
+/// and inconclusive when the run stopped first or hasn't ended.
+#[test]
+fn an_unretired_session_is_a_leak_only_in_a_settled_run() {
+    let open = vec![("peer-0".to_owned(), 5)];
+    for (end, check) in [
+        (None, EndCheck::Inconclusive(open.clone())),
+        (
+            Some(run_end(crate::Outcome::Budget, true)),
+            EndCheck::Inconclusive(open.clone()),
+        ),
+        (
+            Some(run_end(crate::Outcome::Budget, false)),
+            EndCheck::Unretired(open.clone()),
+        ),
+        (
+            Some(run_end(
+                crate::Outcome::Idle {
+                    status: crate::IdleStatus::Quiescent,
+                },
+                false,
+            )),
+            EndCheck::Unretired(open.clone()),
+        ),
+    ] {
+        let view = own9();
+        view.reactor(&admitted(5, None, wire(1, 8, 5)));
+        view.reactor(&ReactorEvent::SessionEnded {
+            peer: mirror(),
+            session_id: 5,
+            reason: "test",
+        });
+        if let Some(end) = &end {
+            view.end(end);
+        }
+        assert_eq!(view.end_check(), check, "{end:?}");
+        view.ledger().retire(1, None);
+        assert_eq!(view.end_check(), EndCheck::Complete, "{end:?}");
+    }
+}
+
+/// The reactor's refusal of a session for its peer's cooldown.
+fn refused(session_id: u64) -> ReactorEvent {
+    ReactorEvent::SessionRefused {
+        peer: mirror(),
+        session_id,
+    }
+}
+
+/// A refused session joins exactly one of the harness's links that it never
+/// admitted, by peer and session ID, and is recorded as a fact.
+#[test]
+fn a_refused_session_joins_its_unadmitted_link() {
+    let view = linked(&[1, 2]);
+    assert_eq!(broken(&view, &[refused(2)]), None);
+    assert!(view.facts().contains(&SessionFact::SessionRefused {
+        peer: "mirror-0".to_owned(),
+        session_id: 2,
+    }));
+    let why = broken(&linked(&[1]), &[refused(2)]).expect("no link names session 2");
+    assert!(why.starts_with("SessionJoin:"), "{why}");
+    let why = broken(&linked(&[1]), &[admitted(1, None, origin(1)), refused(1)])
+        .expect("the link was admitted");
+    assert!(why.starts_with("SessionJoin:"), "{why}");
+}
+
+/// Under own-9, a refused session joins exactly one header `Session` row by
+/// peer and session ID.
+#[test]
+fn a_refused_session_joins_its_own9_row() {
+    assert_eq!(broken(&own9(), &[refused(5)]), None);
+    let why = broken(&own9(), &[refused(6)]).expect("no row has session 6");
+    assert!(why.starts_with("Own9Join:"), "{why}");
+}

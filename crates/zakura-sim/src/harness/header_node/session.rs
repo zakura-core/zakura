@@ -17,7 +17,9 @@
 //!   connection, and carries that link's whole origin. It must agree with
 //!   that link on peer, direction and session ID, so a wrong session ID fails
 //!   even when the origin is right. A link is admitted at most once. A refused link has no
-//!   admission, so the reverse isn't required.
+//!   admission, so the reverse isn't required. A session the reactor refuses
+//!   for its peer's readmission cooldown matches exactly one opened link by
+//!   peer and session ID, which it never admitted.
 //! - **Departed sessions stay inert.** A session leaves the reactor's view when
 //!   another replaces it or when its disconnect ends it. After that, no
 //!   `Started` and no ordinary `Dispatched { Apply }` names it. A late
@@ -37,12 +39,16 @@
 //!   it names the same peer and session ID. Exactly one `generation-installed`
 //!   on that connection has the origin's generation. The handler installs each
 //!   generation under its session ID, so the generation also equals the
-//!   admitted session ID.
+//!   admitted session ID. A session the reactor refuses for its peer's
+//!   readmission cooldown matches exactly one header `Session` row by peer and
+//!   session ID.
 //! - **Own-9 ends.** Each session that leaves the reactor's view, by its end or
 //!   its replacement, is retired by own-9 by the run's end, in either order:
-//!   its generation's `generation-exited`, or its connection's `torn-down`. A
-//!   run that ends first is inconclusive ([`SessionEvidence::end_check`]), not
-//!   failed, so that rule never breaks the run.
+//!   its generation's `generation-exited`, or its connection's `torn-down`.
+//!   [`SessionEvidence::end_check`] judges it once the run ends. A settled
+//!   run that leaves one open never will retire it, which is a leak. A run
+//!   that stopped first is inconclusive. That rule never breaks the run
+//!   itself.
 //!
 //! The view freezes with the run's log, before the scheduler's shutdown
 //! resumes suspended tasks, so their cleanup can't change what the run ended
@@ -66,7 +72,7 @@ use zakura_network::zakura::{
 };
 use zakura_rt::sim::RunId;
 
-use crate::peer::peer_of;
+use crate::{peer::peer_of, RunEnd};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -116,6 +122,14 @@ pub enum SessionFact {
         /// Why its service reported the disconnect.
         reason: String,
     },
+    /// The node's reactor refused a session for its peer's readmission
+    /// cooldown, as [`ReactorEvent::SessionRefused`] reports it.
+    SessionRefused {
+        /// The peer, or its digest if no link named it.
+        peer: String,
+        /// The refused session.
+        session_id: u64,
+    },
     /// Own-9 retired a session that left the reactor's view, the first time
     /// the view saw it do so.
     SessionRetired {
@@ -144,8 +158,11 @@ pub enum EndCheck {
     /// Every departed session was retired. A view with no own-9 facts has
     /// nothing to retire.
     Complete,
-    /// The run ended before own-9 retired these sessions, each named by
-    /// peer and session ID.
+    /// The run settled with these sessions open, each named by peer and
+    /// session ID. Nothing is left to retire them.
+    Unretired(Vec<(String, u64)>),
+    /// The run stopped, or hasn't ended, before own-9 retired these
+    /// sessions.
     Inconclusive(Vec<(String, u64)>),
 }
 
@@ -182,6 +199,8 @@ struct SessionLedger {
     own9: Option<Own9>,
     /// Set once the run's log froze. Nothing changes the view after that.
     frozen: bool,
+    /// Whether the run settled, once it has ended.
+    settled: Option<bool>,
     /// The first rule the run broke.
     broken: Option<String>,
 }
@@ -321,7 +340,16 @@ impl SessionEvidence {
         }
     }
 
-    /// Whether own-9 retired every session that left the reactor's view.
+    /// Records how the run ended, and whether it [`settled`].
+    ///
+    /// [`settled`]: super::adoption::settled
+    pub fn end(&self, end: &RunEnd) {
+        self.ledger().settled = Some(super::adoption::settled(end));
+    }
+
+    /// Whether own-9 retired every session that left the reactor's view:
+    /// [`EndCheck::Unretired`] if the run settled with one open, and
+    /// [`EndCheck::Inconclusive`] if it stopped first or hasn't ended.
     pub fn end_check(&self) -> EndCheck {
         let ledger = self.ledger();
         let open: Vec<(String, u64)> = ledger
@@ -332,6 +360,8 @@ impl SessionEvidence {
             .collect();
         if open.is_empty() {
             EndCheck::Complete
+        } else if ledger.settled == Some(true) {
+            EndCheck::Unretired(open)
         } else {
             EndCheck::Inconclusive(open)
         }
@@ -670,9 +700,59 @@ impl SessionLedger {
         Ok(())
     }
 
+    /// Checks `peer`'s session `session_id`, which the reactor refused for
+    /// its readmission cooldown, against own-9's header `Session` rows or the
+    /// harness's links, whichever the view joins to.
+    fn refused(&mut self, peer: &ZakuraPeerId, session_id: u64) -> Result<(), String> {
+        let name = self.name(peer);
+        let refused = format!("the node refused session {session_id} from {name}");
+        if let Some(own9) = &self.own9 {
+            let rows = own9
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.kind == ZAKURA_STREAM_HEADER_SYNC
+                        && row.peer.as_deref() == Some(name.as_str())
+                        && row.session_id == session_id
+                })
+                .count();
+            if rows != 1 {
+                return Err(format!(
+                    "Own9Join: {refused}, which {rows} header Session rows name"
+                ));
+            }
+        } else if self.joined {
+            let links = self
+                .links
+                .values()
+                .filter(|link| link.peer == *peer && link.session_id == session_id)
+                .collect::<Vec<_>>();
+            match links[..] {
+                [link] if !link.admitted => {}
+                [_] => return Err(format!("SessionJoin: {refused}, whose link it admitted")),
+                _ => {
+                    return Err(format!(
+                        "SessionJoin: {refused}, which {} links name",
+                        links.len()
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Records `event`'s session fact, if it has one, and checks it.
     fn reactor(&mut self, event: &ReactorEvent) {
         match event {
+            ReactorEvent::SessionRefused { peer, session_id } => {
+                self.facts.push(SessionFact::SessionRefused {
+                    peer: self.name(peer),
+                    session_id: *session_id,
+                });
+                if let Err(why) = self.refused(peer, *session_id) {
+                    self.break_rule(why);
+                }
+            }
             ReactorEvent::SessionAdmitted {
                 peer,
                 session_id,

@@ -124,15 +124,38 @@ pub fn spawn_header_sync_reactor(
         );
         (observer, targets)
     });
-    let task = spawn_erased_named("header_sync_reactor", reactor.run());
-    // The observer takes the probe once the reactor's task exists, which
-    // only a simulated run schedules.
-    #[cfg(zakura_sim)]
-    if let (Some((observer, targets)), Some(id)) = (probe, task.task_id()) {
-        observer.resource_probe(targets.on(id));
-    }
-    Ok((handle, actions, task))
+    Ok((
+        handle,
+        actions,
+        hand_over_probe!(
+            spawn_erased_named("header_sync_reactor", reactor.run()),
+            probe
+        ),
+    ))
 }
+
+/// The spawned reactor task `$task`, once `$probe`'s observer, if any, has
+/// taken a probe stamped with its id. Only a simulated run schedules the
+/// task, so outside one nothing is handed over.
+#[cfg(zakura_sim)]
+macro_rules! hand_over_probe {
+    ($task:expr, $probe:ident) => {{
+        let task = $task;
+        if let (Some((observer, targets)), Some(id)) = ($probe, task.task_id()) {
+            observer.resource_probe(targets.on(id));
+        }
+        task
+    }};
+}
+
+/// `$task` alone: release builds have no probe.
+#[cfg(not(zakura_sim))]
+macro_rules! hand_over_probe {
+    ($task:expr, $probe:ident) => {
+        $task
+    };
+}
+use hand_over_probe;
 
 fn build_header_sync_reactor(
     mut startup: HeaderSyncStartup,

@@ -1957,6 +1957,7 @@ async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
 /// on the control and candidate revisions; fixture setup is outside timings.
 #[tokio::test]
 #[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
+#[allow(clippy::print_stdout, reason = "manual benchmark results")]
 async fn benchmark_mempool_idle_poll() -> Result<(), Report> {
     use std::{hint::black_box, time::Instant};
 

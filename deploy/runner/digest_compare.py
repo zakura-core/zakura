@@ -428,7 +428,16 @@ def watch(helper, thread, state_path):
             command = [sys.executable, str(helper), "--path", "/var/lib/zakura-digest-compare/pr2022/status.json", "root@159.65.183.89", "--", "cat", "/var/lib/zakura-digest-compare/pr2022/status.json"]
             result = subprocess.run(command, capture_output=True, text=True, timeout=100)
             if result.returncode:
-                raise RuntimeError(f"controller status check failed: exit {result.returncode}")
+                # Preserve classification without exporting remote output or potentially sensitive errors.
+                diagnostic = {}
+                for line in result.stderr.splitlines():
+                    if line.startswith("ssh-check: {"):
+                        try:
+                            record = json.loads(line.removeprefix("ssh-check: "))
+                            diagnostic = {key: record[key] for key in ("result", "cause", "step", "execution", "status", "precondition") if key in record}
+                        except ValueError:
+                            pass
+                raise RuntimeError(f"controller status check failed: exit {result.returncode}; classification={json.dumps(diagnostic, sort_keys=True)}")
             status = json.loads(result.stdout)
             event = None
             if status["state"] in {"failed", "stopped"} or time.time() - status["at"] > 60:

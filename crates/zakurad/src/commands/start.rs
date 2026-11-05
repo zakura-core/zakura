@@ -538,6 +538,16 @@ impl StartCmd {
         // Cancel detached tasks before dropping the state services, whose teardown blocks.
         let _shutdown_on_drop = shutdown.clone().drop_guard();
 
+        if let Some(task) = crate::components::tracing::raw_endpoint::init(
+            config.tracing.raw_endpoint_addr,
+            config.network.zakura.trace_dir.clone(),
+            shutdown.clone(),
+        )
+        .await?
+        {
+            node_tasks.track(&task);
+        }
+
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
         // load_shed middleware ensures that we reduce the size of the peer set

@@ -45,7 +45,8 @@ pub(crate) async fn init(
     })?;
     #[cfg(unix)]
     {
-        let (task, _) = server::start(address, directory, shutdown).await?;
+        let fs_threads = fs_threads::FsThreads::process();
+        let (task, _) = server::start(address, directory, fs_threads, shutdown).await?;
         Ok(Some(task))
     }
     #[cfg(not(unix))]

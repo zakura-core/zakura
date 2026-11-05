@@ -43,7 +43,6 @@ use super::{
 };
 
 /// Connections served at once. Further clients wait in the listen backlog.
-/// Each connection also has at most one filesystem thread.
 const MAX_CONNECTIONS: usize = 4;
 /// How long a request's headers, a client's reading, or the file reading may
 /// stall before the connection is dropped. A transfer that keeps making
@@ -58,11 +57,13 @@ const BUSY: Refusal = Refusal::new(
 
 type Body = UnsyncBoxBody<Bytes, io::Error>;
 
-/// Bind `address` and serve `directory` until `shutdown`. Returns the task and
-/// the bound address, which differs from `address` when its port is 0.
+/// Bind `address` and serve `directory`, reading files on `fs_threads`, until
+/// `shutdown`. Returns the task and the bound address, which differs from
+/// `address` when its port is 0.
 pub(super) async fn start(
     address: SocketAddr,
     directory: PathBuf,
+    fs_threads: FsThreads,
     shutdown: CancellationToken,
 ) -> io::Result<(JoinHandle<()>, SocketAddr)> {
     let listener = TcpListener::bind(address).await?;
@@ -71,7 +72,7 @@ pub(super) async fn start(
     let endpoint = Arc::new(Endpoint {
         directory,
         authority: bound.to_string(),
-        fs_threads: FsThreads::new(MAX_CONNECTIONS),
+        fs_threads,
     });
     Ok((spawn_erased(serve(listener, endpoint, shutdown)), bound))
 }

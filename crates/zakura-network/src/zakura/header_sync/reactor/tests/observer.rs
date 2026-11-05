@@ -36,8 +36,8 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, session admissions and ends, or the adopted state and its
-    /// publications.
+    /// reservations, session admissions, refusals and ends, readmission cooldowns,
+    /// or the adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -49,6 +49,8 @@ impl Recorder {
                         | ReactorEvent::ReservationOpened { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
+                        | ReactorEvent::SessionRefused { .. }
+                        | ReactorEvent::CooldownStarted { .. }
                         | ReactorEvent::CallEnded {
                             end: CallEnd::Dropped,
                             ..
@@ -1632,6 +1634,99 @@ fn stale_prepare_reports_its_own_session() {
         .state
         .unproductive_peer_cooldowns
         .contains_key(&peer));
+}
+
+/// The penalty events in `events`: each `Misbehavior`, `CooldownStarted`,
+/// `SessionAdmitted` and `SessionRefused`, in order.
+fn penalties(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReactorEvent::Misbehavior { .. }
+                    | ReactorEvent::CooldownStarted { .. }
+                    | ReactorEvent::SessionAdmitted { .. }
+                    | ReactorEvent::SessionRefused { .. }
+            )
+        })
+        .collect()
+}
+
+/// A peer disconnects while the node prepares its invalid headers. The failed
+/// prepare still reports `Misbehavior` against the departed session, then the
+/// cooldown it installs, and the peer's reconnect is refused. With a zero
+/// cooldown, nothing is installed, so nothing is reported and the reconnect
+/// is admitted.
+#[test]
+fn a_late_fault_cools_down_the_peer_and_refuses_its_reconnect() {
+    for cooldown in [
+        std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    ] {
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, snapshot) = observed_reactor(
+            Arc::new(ScriptedPort::default()),
+            Some(recorder.clone()),
+            crate::zakura::ZakuraTrace::noop(),
+        );
+        reactor.startup.config.unproductive_peer_cooldown = cooldown;
+        let peer = peer();
+        let _outbound = connect(&mut reactor, &peer, 1);
+        let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+        reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the seeded request is active")
+            .phase = HeaderTargetPhase::Preparing;
+        reactor.handle_peer_disconnected(&peer, 1, "test disconnect");
+        recorder.take_all();
+
+        reactor.handle_header_target_prepared(
+            peer.clone(),
+            source,
+            owner,
+            HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+        );
+        let _reconnect = connect(&mut reactor, &peer, 2);
+
+        let misbehavior = ReactorEvent::Misbehavior {
+            peer: peer.clone(),
+            reason: HeaderSyncMisbehavior::InvalidHeader,
+            origin: Some(1),
+            current: None,
+        };
+        let expected = if cooldown.is_zero() {
+            vec![
+                misbehavior,
+                ReactorEvent::SessionAdmitted {
+                    peer: peer.clone(),
+                    session_id: 2,
+                    direction: ServicePeerDirection::Inbound,
+                    replaced: None,
+                    origin: None,
+                },
+            ]
+        } else {
+            vec![
+                misbehavior,
+                ReactorEvent::CooldownStarted {
+                    peer: peer.clone(),
+                    origin: 1,
+                    cooldown,
+                },
+                ReactorEvent::SessionRefused {
+                    peer: peer.clone(),
+                    session_id: 2,
+                },
+            ]
+        };
+        assert_eq!(
+            penalties(recorder.take_all()),
+            expected,
+            "cooldown {cooldown:?}"
+        );
+    }
 }
 
 /// A dispatch for session 1's work while session 2 is current reports both

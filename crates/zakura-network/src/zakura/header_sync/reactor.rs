@@ -731,6 +731,13 @@ impl HeaderSyncReactor {
         self.refresh_committed_snapshot();
         let peer = session.peer_id().clone();
         if self.state.readmission_refused(&peer, Instant::now()) {
+            observe!(
+                self,
+                ReactorEvent::SessionRefused {
+                    peer: peer.clone(),
+                    session_id: session.session_id(),
+                }
+            );
             session.cancel_token().cancel();
             metrics::counter!("sync.header.peer.readmission_refused.total").increment(1);
             return;
@@ -2988,7 +2995,8 @@ impl HeaderSyncReactor {
     ///
     /// In test and simulator builds, it reports `Misbehavior` with `owner`'s
     /// session as the origin, or else `reported`, the session of the message
-    /// that showed the violation.
+    /// that showed the violation, then `CooldownStarted` if it installed a
+    /// cooldown.
     fn dispatch_misbehavior(
         &mut self,
         peer: ZakuraPeerId,
@@ -3041,11 +3049,24 @@ impl HeaderSyncReactor {
             );
         });
         if owner.is_some() {
+            #[cfg(any(test, zakura_sim))]
+            let installed = self.state.cooldowns_installed;
             self.state.start_readmission_cooldown(
                 &peer,
                 Instant::now(),
                 self.startup.config.unproductive_peer_cooldown,
             );
+            #[cfg(any(test, zakura_sim))]
+            if let Some(owner) = owner.filter(|_| self.state.cooldowns_installed != installed) {
+                observe!(
+                    self,
+                    ReactorEvent::CooldownStarted {
+                        peer: peer.clone(),
+                        origin: owner.session_id(),
+                        cooldown: self.startup.config.unproductive_peer_cooldown,
+                    }
+                );
+            }
             if faulted.is_none() {
                 // No disconnect follows to publish the cooldown, and the service
                 // would keep reopening a session the reactor refuses.

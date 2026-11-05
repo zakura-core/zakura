@@ -201,6 +201,26 @@ pub enum ReactorEvent {
         /// `peer`'s current session when the violation was dispatched.
         current: Option<u64>,
     },
+    /// The reactor refused a session from `peer` because `peer`'s readmission
+    /// cooldown still holds. Nothing else about the reactor changes.
+    SessionRefused {
+        /// The refused peer.
+        peer: ZakuraPeerId,
+        /// The refused session's ID, as its service handed it over.
+        session_id: u64,
+    },
+    /// The reactor installed a readmission cooldown for `peer` after a fault
+    /// in session `origin`'s work. Reported right after the `Misbehavior` it
+    /// follows, and only when an entry is installed, so a zero cooldown
+    /// reports nothing.
+    CooldownStarted {
+        /// The cooled peer.
+        peer: ZakuraPeerId,
+        /// The session whose work showed the fault.
+        origin: u64,
+        /// How long the reactor refuses `peer`'s sessions from now.
+        cooldown: std::time::Duration,
+    },
     /// The reactor adopted a committed snapshot as the state it schedules and
     /// publishes from: once at construction, then each time it observes a
     /// different one. Reported before the reactor retires the work the

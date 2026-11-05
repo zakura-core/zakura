@@ -221,8 +221,8 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
 }
 
 /// The session ID of the redial's header stream: own-9's header `Session`
-/// row on the peer's second connection, whose generation own-9 parked and
-/// never installed.
+/// row on the peer's second connection, whose generation own-9 parked,
+/// never installed, and then let exit.
 fn redialed(report: &RunReport) -> u64 {
     let entries = report.log.entries();
     let rows: Vec<(u64, u64)> = entries
@@ -241,25 +241,36 @@ fn redialed(report: &RunReport) -> u64 {
     let [_, (connection, session_id)] = rows[..] else {
         panic!("the peer opens one header session per connection: {rows:?}");
     };
-    let generation = |parked: bool| {
-        entries.iter().any(|entry| match &entry.obs {
+    let steps: Vec<&SessionStepFact> = entries
+        .iter()
+        .filter_map(|entry| match &entry.obs {
             Observation::Transport {
                 connection: Some(on),
-                event: TransportFact::SessionLifecycle { step, .. },
+                event:
+                    TransportFact::SessionLifecycle {
+                        kind: ZAKURA_STREAM_HEADER_SYNC,
+                        step,
+                    },
                 ..
-            } if *on == connection => {
-                if parked {
-                    matches!(step, SessionStepFact::GenerationParked { generation } if *generation == session_id)
-                } else {
-                    matches!(step, SessionStepFact::GenerationInstalled { generation, .. } if *generation == session_id)
-                }
-            }
+            } if *on == connection => Some(step),
+            _ => None,
+        })
+        .filter(|step| match step {
+            SessionStepFact::GenerationInstalled { generation, .. }
+            | SessionStepFact::GenerationParked { generation }
+            | SessionStepFact::GenerationExited { generation, .. } => *generation == session_id,
             _ => false,
         })
-    };
+        .collect();
     assert!(
-        generation(true) && !generation(false),
-        "own-9 parks the redial's generation and never installs it"
+        matches!(
+            steps[..],
+            [
+                SessionStepFact::GenerationParked { .. },
+                SessionStepFact::GenerationExited { current: false, .. }
+            ]
+        ),
+        "own-9 parks the redial's generation, never installs it, and lets it exit: {steps:?}"
     );
     session_id
 }

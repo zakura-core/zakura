@@ -95,15 +95,18 @@ python3 scripts/check_mutation_pilot.py --evidence "$BUNDLE_DIR"
 python3 -m unittest discover -s scripts/tests -p test_check_mutation_pilot.py -v
 ```
 
-Without `--evidence`, the checker verifies the repository inputs. It checks
-the case count and fault classes, patch, sidecar, witness, production and
-checker hashes, patch bindings, target bindings and the `holds` witness for
-each intended property. It checks the empty discovery corpus. It rejects a
-tree whose build inputs differ from either pinned revision.
+By default, the checker verifies the repository inputs under `qa/`. It checks
+the case count and fault classes, patch, sidecar and witness hashes, patch
+bindings, target bindings and the `holds` witness for each intended property.
+It checks the empty discovery corpus.
+With `--at-pin`, it also checks the production and checker hashes and the lock
+hashes, and it rejects a tree whose build inputs differ from either pinned
+revision. A pilot run needs `--at-pin`; later commits on `main` fail it.
 With `--evidence`, it also checks the extracted bundle against the
 catalogue. Each baseline must have nonzero intended applicability, a passing
 witness, no other property outcome than held or not applicable, a quiescent
-end and zero cleanup failures. Each calibration run must be complete and
+end and zero cleanup failures. Its record and replay exit codes come from the
+bundle's `baseline/results.json`, whose hash the catalogue pins. Each calibration run must be complete and
 clean, with matching build identity and applicability label.
 The checker reruns no replay, proves no causal trigger semantics and runs no
 mutation. The tests build a small synthetic checkout and bundle.
@@ -144,18 +147,10 @@ harnesses.
 | `header-publisher-policy` | 8 | 8 |
 | `header-reactor-policy` | 26 | 23 |
 
-Six unmodified calibration runs exited zero with complete stats, no
-violations, no abandoned runs and no cleanup failures. Peak RSS was 32–33 MiB.
-Other builds ran concurrently, so throughput is host-specific.
-
-| Target | Requested seconds | Elapsed seconds | Inputs | Applicable inputs |
-| --- | ---: | ---: | ---: | ---: |
-| `block_decoded_retention` | 5 | 6.032 | 41,685 | 32,496 |
-| `block_reactor_policy` | 5 | 6.026 | 56,272 | 32,760 |
-| `discovery_record_book` | 5 | 6.027 | 5,484 | 0 |
-| `discovery_record_book` | 30 | 31.024 | 21,699 | 0 |
-| `header_publisher_policy` | 5 | 6.026 | 87,963 | 66,117 |
-| `header_reactor_policy` | 5 | 6.027 | 85,923 | 8,057 |
+Six unmodified calibration runs exit zero with complete stats, no
+violations, no abandoned runs and no cleanup failures. Each run's measured
+duration, input count and applicability are in the bundle under
+`calibration/<target>/`. Throughput is host-specific.
 
 **Record-book applicability remains open.** `discovery_record_book` applied
 to zero of 27,183 cold-start inputs. Its `Holds` gate requires an

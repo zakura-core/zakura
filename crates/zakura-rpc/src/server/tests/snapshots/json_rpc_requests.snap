@@ -9,9 +9,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === 2.0 call without params
 POST content-type=Some("application/json")
@@ -20,9 +20,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === bitcoind 1.0 call
 POST content-type=Some("application/json")
@@ -31,9 +31,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 63
+content-length: 64
 
-{"id":1,"result":{"standard_fee":400,"version":0},"error":null}
+{"id":1,"result":{"standard_fee":1000,"version":0},"error":null}
 
 === lightwalletd 1.0 call
 POST content-type=Some("application/json")
@@ -42,9 +42,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 83
+content-length: 84
 
-{"jsonrpc":"1.0","id":"lwd","result":{"standard_fee":400,"version":0},"error":null}
+{"jsonrpc":"1.0","id":"lwd","result":{"standard_fee":1000,"version":0},"error":null}
 
 === 1.0 call without params
 POST content-type=Some("application/json")
@@ -108,9 +108,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 70
+content-length: 71
 
-{"jsonrpc":"2.0","id":"abc","result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":"abc","result":{"standard_fee":1000,"version":0}}
 
 === escaped string id
 POST content-type=Some("application/json")
@@ -119,9 +119,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 72
+content-length: 73
 
-{"jsonrpc":"2.0","id":"a\"bc","result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":"a\"bc","result":{"standard_fee":1000,"version":0}}
 
 === null id
 POST content-type=Some("application/json")
@@ -141,9 +141,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":0,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":0,"result":{"standard_fee":1000,"version":0}}
 
 === max id
 POST content-type=Some("application/json")
@@ -152,9 +152,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 85
+content-length: 86
 
-{"jsonrpc":"2.0","id":18446744073709551615,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":18446744073709551615,"result":{"standard_fee":1000,"version":0}}
 
 === too large id
 POST content-type=Some("application/json")
@@ -295,9 +295,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === method case
 POST content-type=Some("application/json")
@@ -339,9 +339,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === duplicate field
 POST content-type=Some("application/json")
@@ -372,9 +372,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 48156
+content-length: 48190
 
-<48156 bytes, FNV-1a 0082e0f068c0e4f5>
+<48190 bytes, FNV-1a 0bad1a752c9ccc7b>
 
 === extra params are ignored
 POST content-type=Some("application/json")
@@ -383,9 +383,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === object params with no args
 POST content-type=Some("application/json")
@@ -394,9 +394,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === object params with unknown key
 POST content-type=Some("application/json")
@@ -405,9 +405,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === string params with no args
 POST content-type=Some("application/json")
@@ -416,9 +416,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === null params with no args
 POST content-type=Some("application/json")
@@ -427,9 +427,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === number params with no args
 POST content-type=Some("application/json")
@@ -438,9 +438,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === positional param
 POST content-type=Some("application/json")
@@ -900,9 +900,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 72
+content-length: 73
 
-{"jsonrpc":"2.0","id":"été","result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":"été","result":{"standard_fee":1000,"version":0}}
 
 === batch
 POST content-type=Some("application/json")
@@ -911,9 +911,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 218
+content-length: 219
 
-[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}},{"jsonrpc":"2.0","id":3,"error":{"code":-1,"message":"Invalid params"}}]
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}},{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}},{"jsonrpc":"2.0","id":3,"error":{"code":-1,"message":"Invalid params"}}]
 
 === batch with notification and invalid entries
 POST content-type=Some("application/json")
@@ -922,9 +922,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 463
+content-length: 464
 
-[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":5,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":6,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":"last","error":{"code":-1,"message":"No blocks in state"}}]
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":5,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":6,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}},{"jsonrpc":"2.0","id":"last","error":{"code":-1,"message":"No blocks in state"}}]
 
 === empty batch
 POST content-type=Some("application/json")
@@ -977,9 +977,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 67001
+content-length: 68001
 
-<67001 bytes, FNV-1a eec5e36e1cb32fdd>
+<68001 bytes, FNV-1a 7aba11b6ead8368d>
 
 === too large batch
 POST content-type=Some("application/json")
@@ -1077,9 +1077,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === long leading whitespace
 POST content-type=Some("application/json")
@@ -1088,9 +1088,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === trailing data
 POST content-type=Some("application/json")
@@ -1201,9 +1201,9 @@ POST content-type=None
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === text/plain
 POST content-type=Some("text/plain")
@@ -1212,9 +1212,9 @@ POST content-type=Some("text/plain")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === text/plain charset
 POST content-type=Some("text/plain; charset=utf-8")
@@ -1223,9 +1223,9 @@ POST content-type=Some("text/plain; charset=utf-8")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === application/json charset
 POST content-type=Some("application/json; charset=utf-8")
@@ -1234,9 +1234,9 @@ POST content-type=Some("application/json; charset=utf-8")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === application/json uppercase
 POST content-type=Some("Application/JSON")
@@ -1245,9 +1245,9 @@ POST content-type=Some("Application/JSON")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === application/json-rpc
 POST content-type=Some("application/json-rpc")
@@ -1256,9 +1256,9 @@ POST content-type=Some("application/json-rpc")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === application/json with spaces
 POST content-type=Some("application/json ; charset=utf-8")
@@ -1303,9 +1303,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === too large request
 POST content-type=Some("application/json")

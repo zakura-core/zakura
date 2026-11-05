@@ -9,9 +9,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 66
+content-length: 67
 
-{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}}
+{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}}
 
 === oversized response
 POST content-type=Some("application/json")
@@ -42,9 +42,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 135
+content-length: 137
 
-[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":2,"result":{"standard_fee":400,"version":0}}]
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}},{"jsonrpc":"2.0","id":2,"result":{"standard_fee":1000,"version":0}}]
 
 === oversized batch response
 POST content-type=Some("application/json")
@@ -64,9 +64,9 @@ POST content-type=Some("application/json")
 HTTP/1.1 200 OK
 content-type: application/json; charset=utf-8
 connection: close
-content-length: 184
+content-length: 185
 
-[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":400,"version":0}},{"jsonrpc":"2.0","id":2,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 300"}}]
+[{"jsonrpc":"2.0","id":1,"result":{"standard_fee":1000,"version":0}},{"jsonrpc":"2.0","id":2,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 300"}}]
 
 === no credentials
 POST content-type=Some("application/json")

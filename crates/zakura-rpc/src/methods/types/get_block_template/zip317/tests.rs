@@ -67,7 +67,7 @@ fn reserves_network_specific_header_and_transaction_count_sizes() {
 }
 
 #[test]
-fn selects_transaction_at_1000_zatoshis_per_action() {
+fn selects_transaction_at_400_zatoshis_per_action() {
     let network = Network::Mainnet;
     let unmined_tx = network
         .unmined_transactions_in_blocks(..)
@@ -75,7 +75,7 @@ fn selects_transaction_at_1000_zatoshis_per_action() {
         .expect("test network has an unmined transaction")
         .transaction;
     let actions = transaction::zip317::conventional_actions(unmined_tx.transaction());
-    let miner_fee = Amount::try_from(i64::from(actions) * 1_000).expect("fee fits in amount");
+    let miner_fee = Amount::try_from(i64::from(actions) * 400).expect("fee fits in amount");
     let verified_tx = transaction::VerifiedUnminedTx::new(
         unmined_tx,
         miner_fee,

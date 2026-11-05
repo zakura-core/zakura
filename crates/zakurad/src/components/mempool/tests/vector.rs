@@ -22,7 +22,7 @@ use zakura_chain::{
     fmt::humantime_seconds,
     parameters::Network,
     serialization::ZcashDeserializeInto,
-    transaction::{Transaction, VerifiedUnminedTx},
+    transaction::{self, Transaction, VerifiedUnminedTx},
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
@@ -1823,6 +1823,189 @@ async fn disabled_mempool_waits_for_sync_status_and_tip_distance() -> Result<(),
     service.dummy_call().await;
     assert!(!service.is_enabled());
 
+    Ok(())
+}
+
+/// A post-verification fixture with a unique input and one standard output.
+fn expiry_fixture_transaction(
+    index: u64,
+    expiry_height: Height,
+    input: Option<OutPoint>,
+) -> VerifiedUnminedTx {
+    let input = input.unwrap_or_else(|| {
+        let mut hash = [0; 32];
+        hash[..8].copy_from_slice(&index.to_le_bytes());
+        OutPoint::from_usize(transaction::Hash(hash), 0)
+    });
+    let transaction = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: transaction::LockTime::unlocked(),
+        expiry_height,
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint: input,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: Amount::new(1_000_000),
+            lock_script: p2pkh_script([0; 20]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    VerifiedUnminedTx::new(
+        transaction.into(),
+        Amount::new(10_000),
+        0,
+        0,
+        Arc::new(Vec::new()),
+    )
+    .expect("fixture fee covers its conventional fee")
+}
+
+/// Expiry on a growing tip removes descendants and pending gossip at the
+/// boundary, while preserving later-expiring and non-expiring transactions.
+#[tokio::test]
+async fn mempool_expiry_follows_block_growth() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        mut changes,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    // Block 1 resets the tip at the first network-upgrade boundary. Block 2
+    // then exercises ordinary growth with a populated mempool.
+    let block1: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block1),
+    )
+    .await?;
+    mempool.dummy_call().await;
+
+    let parent = expiry_fixture_transaction(1, Height(2), None);
+    let outpoint = OutPoint::from_usize(parent.transaction.id().mined_id(), 0);
+    let child = expiry_fixture_transaction(2, Height(3), Some(outpoint));
+    let later = expiry_fixture_transaction(3, Height(3), None);
+    let no_expiry = expiry_fixture_transaction(4, Height(0), None);
+    let expired = HashSet::from([parent.transaction.id(), child.transaction.id()]);
+    let survivors = HashSet::from([later.transaction.id(), no_expiry.transaction.id()]);
+    mempool
+        .storage()
+        .insert(parent, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(child, vec![outpoint], Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(later, Vec::new(), Some(Height(1)))?;
+    mempool
+        .storage()
+        .insert(no_expiry, Vec::new(), Some(Height(1)))?;
+    let ActiveState::Enabled {
+        pending_gossip_tx_ids,
+        ..
+    } = &mut mempool.active_state
+    else {
+        panic!("mempool was enabled above");
+    };
+    pending_gossip_tx_ids.extend(expired.iter().chain(&survivors).copied());
+
+    // No new block: transactions remain, including the parent whose expiry is
+    // exactly the next block height.
+    mempool.dummy_call().await;
+    assert_eq!(mempool.storage().transaction_count(), 4);
+
+    let block2: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+    timeout(
+        CHAIN_TIP_UPDATE_WAIT_LIMIT,
+        commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, block2),
+    )
+    .await?;
+    mempool.dummy_call().await;
+    assert_eq!(mempool.storage().transaction_count(), 2);
+    assert_eq!(
+        timeout(Duration::from_secs(3), changes.recv()).await??,
+        MempoolChange::invalidated(expired),
+    );
+    assert_eq!(
+        mempool.storage().tx_ids().collect::<HashSet<_>>(),
+        survivors
+    );
+    let ActiveState::Enabled {
+        pending_gossip_tx_ids,
+        ..
+    } = &mempool.active_state
+    else {
+        panic!("mempool stays enabled after growth");
+    };
+    assert_eq!(*pending_gossip_tx_ids, survivors);
+    Ok(())
+}
+
+/// Measures actual service polling with an unchanged tip. Run the same harness
+/// on the control and candidate revisions; fixture setup is outside timings.
+#[tokio::test]
+#[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
+async fn benchmark_mempool_idle_poll() -> Result<(), Report> {
+    use std::{hint::black_box, time::Instant};
+
+    const POLLS: u32 = 2_000;
+    const SAMPLES: usize = 21;
+    let default_count =
+        Config::default().tx_cost_limit / transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
+    for count in [0, default_count / 8, default_count] {
+        let (
+            mut mempool,
+            _peer_set,
+            _state_service,
+            _chain_tip_change,
+            _tx_verifier,
+            mut recent_syncs,
+            _changes,
+        ) = setup(&Network::Mainnet, Config::default().tx_cost_limit, true).await;
+        mempool.enable(&mut recent_syncs).await;
+        for index in 0..count {
+            mempool.storage().insert(
+                expiry_fixture_transaction(index, Height(100), None),
+                Vec::new(),
+                Some(Height(0)),
+            )?;
+        }
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..POLLS {
+            assert!(mempool.poll_ready(&mut cx).is_ready());
+        }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let start = Instant::now();
+            for _ in 0..POLLS {
+                assert!(black_box(mempool.poll_ready(black_box(&mut cx))).is_ready());
+            }
+            samples.push(start.elapsed() / POLLS);
+        }
+        samples.sort();
+        println!(
+            "idle_poll transactions={count} polls_per_sample={POLLS} samples={SAMPLES} \
+             median_ns={} min_ns={} max_ns={}",
+            samples[SAMPLES / 2].as_nanos(),
+            samples[0].as_nanos(),
+            samples[SAMPLES - 1].as_nanos(),
+        );
+        assert_eq!(
+            mempool.storage().transaction_count(),
+            usize::try_from(count)?
+        );
+    }
     Ok(())
 }
 

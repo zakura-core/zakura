@@ -2,6 +2,8 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+use rand_10::{rngs::StdRng, SeedableRng};
+
 use zcash_transparent::address::TransparentAddress;
 
 use zakura_chain::{
@@ -20,7 +22,88 @@ use crate::methods::types::{
     transaction::TransactionTemplate,
 };
 
-use super::{block_template_overhead_bytes, select_mempool_transactions};
+use super::{block_template_overhead_bytes, fee_weighted_order, select_mempool_transactions};
+
+#[test]
+fn weighted_order_preserves_every_candidate_exactly_once() {
+    let mut rng = StdRng::seed_from_u64(317);
+    assert_eq!(fee_weighted_order(Vec::new(), &mut rng).count(), 0);
+
+    let mut transactions: Vec<_> = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .take(3)
+        .collect();
+    for (tx, weight) in transactions.iter_mut().zip([0.000_001, 1.1, 13.0]) {
+        tx.fee_weight_ratio = weight;
+    }
+    let expected: std::collections::HashSet<_> =
+        transactions.iter().map(|tx| tx.transaction.id()).collect();
+    assert_eq!(expected.len(), 3);
+
+    for _ in 0..100 {
+        let selected: Vec<_> = fee_weighted_order(transactions.clone(), &mut rng).collect();
+        assert_eq!(selected.len(), expected.len());
+        assert_eq!(
+            selected
+                .iter()
+                .map(|tx| tx.transaction.id())
+                .collect::<std::collections::HashSet<_>>(),
+            expected,
+        );
+    }
+
+    let single = transactions.pop().expect("three test candidates exist");
+    assert_eq!(
+        fee_weighted_order(vec![single.clone()], &mut rng).collect::<Vec<_>>(),
+        vec![single],
+    );
+}
+
+#[test]
+fn weighted_order_draws_proportionally_from_remaining_candidates() {
+    let mut rng = StdRng::seed_from_u64(317);
+    let mut transactions: Vec<_> = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .take(3)
+        .collect();
+    for (tx, weight) in transactions.iter_mut().zip([1.0, 3.0, 6.0]) {
+        tx.fee_weight_ratio = weight;
+    }
+    let ids: Vec<_> = transactions.iter().map(|tx| tx.transaction.id()).collect();
+    let mut first_counts = [0_i32; 3];
+    let mut first_two_counts = [0_i32; 3];
+
+    for _ in 0..10_000 {
+        let mut ordered = fee_weighted_order(transactions.clone(), &mut rng);
+        let first = ordered.next().expect("three test candidates exist");
+        let first_index = ids
+            .iter()
+            .position(|id| *id == first.transaction.id())
+            .unwrap();
+        first_counts[first_index] += 1;
+
+        if first_index == 2 {
+            let second = ordered.next().expect("two candidates remain");
+            let second_index = ids
+                .iter()
+                .position(|id| *id == second.transaction.id())
+                .unwrap();
+            first_two_counts[second_index] += 1;
+        }
+    }
+
+    // Check the first draw's 1:3:6 weights and the remaining 1:3 weights
+    // after the heaviest candidate is removed. Tolerances are deliberately
+    // broad; the fixed seed also makes failures reproducible.
+    for (count, expected) in first_counts.into_iter().zip([1_000, 3_000, 6_000]) {
+        assert!((count - expected).abs() < 250, "{first_counts:?}");
+    }
+    assert_eq!(first_two_counts[2], 0);
+    assert!(
+        (4 * first_two_counts[0] - first_counts[2]).abs() < 500,
+        "{first_two_counts:?}",
+    );
+}
 
 /// Replaces `transaction`'s inner transaction with one that has exactly
 /// `target_size` serialized bytes.

@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use rand_10::{
-    distr::{weighted::WeightedIndex, Distribution},
-    rng as thread_rng,
+    distr::{Distribution, Open01},
+    rng as thread_rng, Rng,
 };
 
 use zakura_chain::{
@@ -99,7 +99,7 @@ pub fn select_mempool_transactions(
             .partition(|(tx_id, _tx)| !tx_dependencies.contains_key(tx_id));
 
     // Setup the transaction lists.
-    let (mut conventional_fee_txs, mut low_fee_txs): (Vec<_>, Vec<_>) = independent_mempool_txs
+    let (conventional_fee_txs, low_fee_txs): (Vec<_>, Vec<_>) = independent_mempool_txs
         .into_values()
         .partition(VerifiedUnminedTx::pays_conventional_fee);
 
@@ -107,50 +107,48 @@ pub fn select_mempool_transactions(
 
     // Set up limit tracking.
     let mut limits = BlockTemplateLimits::initial(net, height, coinbase_resources);
-    // > Repeat while there is any candidate transaction
-    // > that pays at least the conventional fee:
-    let mut conventional_fee_tx_weights = setup_fee_weighted_index(&conventional_fee_txs);
+    let mut rng = thread_rng();
 
-    while let Some(tx_weights) = conventional_fee_tx_weights {
-        conventional_fee_tx_weights = checked_add_transaction_weighted_random(
-            &mut conventional_fee_txs,
-            &mut dependent_mempool_txs,
-            tx_weights,
-            &mut selected_txs,
-            &mempool_tx_deps,
-            &mut limits,
-        );
-    }
-
-    // > Repeat while there is any candidate transaction:
-    let mut low_fee_tx_weights = setup_fee_weighted_index(&low_fee_txs);
-
-    while let Some(tx_weights) = low_fee_tx_weights {
-        low_fee_tx_weights = checked_add_transaction_weighted_random(
-            &mut low_fee_txs,
-            &mut dependent_mempool_txs,
-            tx_weights,
-            &mut selected_txs,
-            &mempool_tx_deps,
-            &mut limits,
-        );
+    // Exhaust conventional-fee candidates before considering low-fee ones.
+    for candidates in [conventional_fee_txs, low_fee_txs] {
+        for candidate_tx in fee_weighted_order(candidates, &mut rng) {
+            checked_add_transaction(
+                candidate_tx,
+                &mut dependent_mempool_txs,
+                &mut selected_txs,
+                &mempool_tx_deps,
+                &mut limits,
+            );
+        }
     }
 
     Ok(selected_txs)
 }
 
-/// Returns a fee-weighted index and the total weight of `transactions`.
+/// Orders candidates by fee weight without replacement in O(n log n) time.
 ///
-/// Returns `None` if there are no transactions, or if the weights are invalid.
-fn setup_fee_weighted_index(transactions: &[VerifiedUnminedTx]) -> Option<WeightedIndex<f32>> {
-    if transactions.is_empty() {
-        return None;
-    }
+/// Independent exponential clocks with rates equal to the fee weights give
+/// each remaining candidate a probability proportional to its weight of being
+/// next. Sorting those clocks is equivalent to repeated weighted draws, without
+/// rebuilding cumulative weights after every draw or accumulating subtraction
+/// error. Each candidate occurs exactly once, even if it does not fit the block.
+fn fee_weighted_order(
+    transactions: Vec<VerifiedUnminedTx>,
+    rng: &mut impl Rng,
+) -> impl Iterator<Item = VerifiedUnminedTx> {
+    let mut candidates: Vec<_> = transactions
+        .into_iter()
+        .map(|tx| {
+            // Verified transactions have finite, strictly positive fee weights.
+            // Open01 keeps the logarithm finite and strictly negative.
+            let uniform: f64 = Open01.sample(rng);
+            let clock = -uniform.ln() / f64::from(tx.fee_weight_ratio);
+            (clock, tx)
+        })
+        .collect();
 
-    let tx_weights: Vec<f32> = transactions.iter().map(|tx| tx.fee_weight_ratio).collect();
-
-    // Setup the transaction weights.
-    WeightedIndex::new(tx_weights).ok()
+    candidates.sort_unstable_by(|(left, _), (right, _)| left.total_cmp(right));
+    candidates.into_iter().map(|(_, tx)| tx)
 }
 
 /// Checks if every item in `candidate_tx_deps` is present in `selected_txs`.
@@ -206,33 +204,19 @@ fn dependencies_depth(
     current_level
 }
 
-/// Chooses a random transaction from `txs` using the weighted index `tx_weights`,
-/// and tries to add it to `selected_txs`.
+/// Tries to add `candidate_tx` and its dependents to `selected_txs`.
 ///
-/// If it fits in the supplied limits, adds it to `selected_txs`, and updates the limits.
-///
-/// Updates the weights of chosen transactions to zero, even if they weren't added,
-/// so they can't be chosen again.
-///
-/// Returns the updated transaction weights.
-/// If all transactions have been chosen, returns `None`.
-// TODO: Refactor these arguments into a struct and this function into a method.
-#[allow(clippy::too_many_arguments)]
-fn checked_add_transaction_weighted_random(
-    candidate_txs: &mut Vec<VerifiedUnminedTx>,
+/// If it fits in the supplied limits, adds it to `selected_txs`, updates the
+/// limits, and considers dependents whose dependencies have all been selected.
+fn checked_add_transaction(
+    candidate_tx: VerifiedUnminedTx,
     dependent_txs: &mut HashMap<transaction::Hash, VerifiedUnminedTx>,
-    tx_weights: WeightedIndex<f32>,
     selected_txs: &mut Vec<SelectedMempoolTx>,
     mempool_tx_deps: &TransactionDependencies,
     limits: &mut BlockTemplateLimits,
-) -> Option<WeightedIndex<f32>> {
-    // > Pick one of those transactions at random with probability in direct proportion
-    // > to its weight_ratio, and remove it from the set of candidate transactions
-    let (new_tx_weights, candidate_tx) =
-        choose_transaction_weighted_random(candidate_txs, tx_weights);
-
+) {
     if !limits.try_add(&candidate_tx) {
-        return new_tx_weights;
+        return;
     }
 
     let tx_dependencies = mempool_tx_deps.dependencies();
@@ -291,8 +275,6 @@ fn checked_add_transaction_weighted_random(
 
         current_level_dependents = next_level_dependents;
     }
-
-    new_tx_weights
 }
 
 /// Tracks the remaining capacity of a block template against every limit a
@@ -431,21 +413,4 @@ struct RemainingShieldedLimits {
     sapling_ios: u32,
     sprout_joinsplits: u32,
     cost: u32,
-}
-
-/// Choose a transaction from `transactions`, using the previously set up `weighted_index`.
-///
-/// If some transactions have not yet been chosen, returns the weighted index and the transaction.
-/// Otherwise, just returns the transaction.
-fn choose_transaction_weighted_random(
-    candidate_txs: &mut Vec<VerifiedUnminedTx>,
-    weighted_index: WeightedIndex<f32>,
-) -> (Option<WeightedIndex<f32>>, VerifiedUnminedTx) {
-    let candidate_position = weighted_index.sample(&mut thread_rng());
-    let candidate_tx = candidate_txs.swap_remove(candidate_position);
-
-    // We have to regenerate this index each time we choose a transaction, due to floating-point sum inaccuracies.
-    // If we don't, some chosen transactions can end up with a tiny non-zero weight, leading to duplicates.
-    // <https://github.com/rust-random/rand/blob/4bde8a0adb517ec956fcec91665922f6360f974b/src/distributions/weighted_index.rs#L173-L183>
-    (setup_fee_weighted_index(candidate_txs), candidate_tx)
 }

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Verify the pilot catalogue against this tree, and optionally an evidence bundle.
 
-Without `--evidence`, check the catalogue's in-repository inputs: patches,
-sidecars, witness inputs, production and checker sources, the empty discovery
-corpus and the build-input revisions. With `--evidence DIR`, also check the
-extracted evidence bundle: baseline traces, witness results and calibration
-runs. Neither mode runs a mutant, a replay or a discovery campaign.
+By default, check the catalogue's inputs under `qa/`: patches, sidecars,
+witness inputs and the empty discovery corpus. With `--at-pin`, also check the
+production and checker sources, the lock files and the build-input revisions.
+With `--evidence DIR`, also check the extracted evidence bundle: baseline
+traces, record and replay results, witness results and calibration runs. No
+mode runs a mutant, a replay or a discovery campaign.
 """
 
 import argparse
@@ -16,6 +17,8 @@ import subprocess
 import tomllib
 
 CATALOGUE = "qa/mutation-pilot/catalogue.json"
+# The bundle's record and replay exit status for each retained input.
+BASELINE_RESULTS = "baseline/results.json"
 # Build inputs of the pilot targets. xtask holds the pilot tooling itself, so a
 # runner change does not move the pin.
 SOURCE_PATHS = ["crates", ":(exclude)crates/xtask", "Cargo.toml", "Cargo.lock", ".cargo", "rust-toolchain.toml"]
@@ -107,6 +110,11 @@ def validate(root, evidence=None, at_pin=False):
 
 def validate_evidence(evidence, catalogue, targets, require, check_hash):
     """Check an extracted evidence bundle against the catalogue's recorded results."""
+    check_hash(evidence, BASELINE_RESULTS, catalogue["evidence"]["baseline_results_sha256"])
+    results = json.loads((evidence / BASELINE_RESULTS).read_text())
+    by_input = {row["input"]: row for row in results}
+    require(len(by_input) == len(results), "baseline results repeat an input")
+    require(set(by_input) == {case["witness"] for case in catalogue["cases"]}, "baseline results cover other inputs")
     for case in catalogue["cases"]:
         ident = case["id"]
         baseline = case["baseline"]
@@ -128,7 +136,9 @@ def validate_evidence(evidence, catalogue, targets, require, check_hash):
         require(end["status"] == "quiescent" and not any(end["cleanup"].values()), f"{ident}: baseline did not settle cleanly")
         witness = json.loads((evidence / directory / "witness.json").read_text())
         require(witness == {"property": case["property"], "expect": "holds", "passed": True, "error": None}, f"{ident}: witness did not pass")
-        require(baseline["record_exit"] == baseline["replay_exit"] == 0, f"{ident}: recording or replay failed")
+        result = by_input.get(case["witness"], {})
+        require(result.get("harness") == case["harness"], f"{ident}: baseline result binding differs")
+        require(result.get("record_exit") == result.get("replay_exit") == 0, f"{ident}: recording or replay failed")
 
     build = catalogue["baseline_build"]
     fuzz = catalogue["fuzz_build_inputs"]

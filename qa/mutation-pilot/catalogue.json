@@ -110,9 +110,7 @@
         "trace_sha256": "3d898c93f3a4cec2a396420f79d8e0be86286d03406e33044436dbaa7370ac8e",
         "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
         "applicable": 4,
-        "steps": 4,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 4
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -158,9 +156,7 @@
         "trace_sha256": "c68402875cae13a2c7113ca9ad3590fbe62b3479a10a1b04c20171daedab9124",
         "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
         "applicable": 15,
-        "steps": 15,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 15
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -206,9 +202,7 @@
         "trace_sha256": "3d898c93f3a4cec2a396420f79d8e0be86286d03406e33044436dbaa7370ac8e",
         "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
         "applicable": 4,
-        "steps": 4,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 4
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -254,9 +248,7 @@
         "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
         "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
         "applicable": 1,
-        "steps": 21,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 21
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -302,9 +294,7 @@
         "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
         "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
         "applicable": 1,
-        "steps": 21,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 21
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -350,9 +340,7 @@
         "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
         "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
         "applicable": 1,
-        "steps": 21,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 21
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -398,9 +386,7 @@
         "trace_sha256": "3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac",
         "witness_result_sha256": "6db3effcb6b0fc35e0e98543c04fc1537e586cc0f17be99f1cb59a798e9d2cb9",
         "applicable": 13,
-        "steps": 20,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 20
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -446,9 +432,7 @@
         "trace_sha256": "3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac",
         "witness_result_sha256": "6db3effcb6b0fc35e0e98543c04fc1537e586cc0f17be99f1cb59a798e9d2cb9",
         "applicable": 13,
-        "steps": 20,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 20
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -494,9 +478,7 @@
         "trace_sha256": "03cfee761e1f08c5c395444363a0e5c9a496e58fe222e7d052dc260594c32f93",
         "witness_result_sha256": "103c74a73707c06ac6d9dbf271305aca6d7344d7dd343f3ff06fbdfcae552340",
         "applicable": 23,
-        "steps": 26,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 26
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -544,9 +526,7 @@
         "trace_sha256": "84faa324d25e12321863d69737409cb414918cbc978f348b38bcb3d0c72ec246",
         "witness_result_sha256": "2dca7c92732dc4da60cc17c43eda2511b9e315d30f93d07f02cf9d72b6239e48",
         "applicable": 8,
-        "steps": 8,
-        "record_exit": 0,
-        "replay_exit": 0
+        "steps": 8
       },
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
@@ -647,6 +627,7 @@
     "restrictions": "Calibration used only original builds and seed 11. Its generated corpora are excluded from every scored initial corpus. Build work ran concurrently; throughput is host-specific."
   },
   "evidence": {
-    "bundle": "2043-mut-2-2026-11-05.tar.zst"
+    "bundle": "2043-mut-2-2026-11-05.tar.zst",
+    "baseline_results_sha256": "58c61ef09d2c9c17fcf70bd763900fd7e48b7e59cba36436abdb1383b04bcfa5"
   }
 }

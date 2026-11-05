@@ -65,7 +65,7 @@ class PilotCatalogueTests(unittest.TestCase):
                 "producer_check_dependencies": ["crates/node"],
                 "required_observations": "pool counts",
                 "independent_check": "model handle graph",
-                "baseline": {"directory": "baseline/witness", "applicable": 3, "steps": 2, "record_exit": 0, "replay_exit": 0},
+                "baseline": {"directory": "baseline/witness", "applicable": 3, "steps": 2},
             })
         for command in [
             ["git", "init", "-q"], ["git", "add", "."],
@@ -89,6 +89,7 @@ class PilotCatalogueTests(unittest.TestCase):
                 "manifest_sha256": self.digest("qa/fuzz/sim/Cargo.toml"), "lockfile_sha256": identity["fuzz_lockfile"],
             },
             "cases": cases,
+            "evidence": {"bundle": "fixture.tar.zst"},
             "calibration": {"runs": [{
                 "directory": "calibration/t", "target": "t", "harness": "h", "stats_file": "stats/s.json", "applicability": "observed",
             }]},
@@ -102,6 +103,9 @@ class PilotCatalogueTests(unittest.TestCase):
         self.write_evidence("baseline/witness/trace.jsonl", "".join(json.dumps(row) + "\n" for row in trace))
         self.write_evidence("baseline/witness/witness.json", json.dumps({"property": "h", "expect": "holds", "passed": True, "error": None}))
         self.write_evidence("baseline/witness/input.bin", "input")
+        self.write_evidence(pilot.BASELINE_RESULTS, json.dumps([
+            {"input": WITNESS, "harness": "h", "record_exit": 0, "replay_exit": 0},
+        ]))
         self.write_evidence("calibration/t/run.log", "done\n")
         self.write_evidence("calibration/t/run.json", json.dumps({
             "target": "t", "exit_code": 0, "scored": False, "initial_corpus_inputs": [], "build": identity,
@@ -127,6 +131,7 @@ class PilotCatalogueTests(unittest.TestCase):
 
     def save(self):
         """Record the bundle's current hashes and write the catalogue."""
+        self.catalogue["evidence"]["baseline_results_sha256"] = pilot.digest(self.evidence / pilot.BASELINE_RESULTS)
         for case in self.catalogue["cases"]:
             case["baseline"]["trace_sha256"] = pilot.digest(self.evidence / "baseline/witness/trace.jsonl")
             case["baseline"]["witness_result_sha256"] = pilot.digest(self.evidence / "baseline/witness/witness.json")
@@ -171,6 +176,10 @@ class PilotCatalogueTests(unittest.TestCase):
             trace[-1]["end"]["properties"].append({"property": "other", "outcome": {"inconclusive": "budget"}})
         self.edit_json_evidence("baseline/witness/trace.jsonl", inconclusive)
         self.assertIn("h/case-0: baseline contains another property failure", pilot.validate(self.root, self.evidence))
+
+    def test_failed_replay_in_the_bundle_fails_even_with_matching_hash(self):
+        self.edit_json_evidence(pilot.BASELINE_RESULTS, lambda results: results[0].update(replay_exit=1))
+        self.assertIn("h/case-0: recording or replay failed", pilot.validate(self.root, self.evidence))
 
     def test_tampered_bundle_fails_its_recorded_hash(self):
         (self.evidence / "calibration/t/run.log").write_text("edited\n")

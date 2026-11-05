@@ -11,7 +11,7 @@ and intended assertion. Most cases use library tests. The handoff case uses
 the `zakura-sim` integration test named in its `test_target` field and needs
 `RUSTFLAGS="--cfg zakura_sim"`.
 
-Run `python3 scripts/mutation_inventory.py --output "$TMPDIR/mutations.json"`
+Run `python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"`
 from the repository root to check patch application and binding metadata.
 The command does not apply patches or compile tests. A matching source symbol
 does not prove that Cargo selects a test. Before scoring a native case, verify

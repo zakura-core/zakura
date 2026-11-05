@@ -45,10 +45,10 @@
 //! - **Own-9 ends.** Each session that leaves the reactor's view, by its end or
 //!   its replacement, is retired by own-9 by the run's end, in either order:
 //!   its generation's `generation-exited`, or its connection's `torn-down`.
-//!   [`SessionEvidence::end_check`] judges it once the run ends. A settled
-//!   run that leaves one open never will retire it, which is a leak. A run
-//!   that stopped first is inconclusive. That rule never breaks the run
-//!   itself.
+//!   [`SessionEvidence::end_check`] judges it once the run ends. A run that
+//!   ends idle with one open never will retire it, which is a leak. A run
+//!   that stopped first, at its budget included, is inconclusive. That rule
+//!   never breaks the run itself.
 //!
 //! The view freezes with the run's log, before the scheduler's shutdown
 //! resumes suspended tasks, so their cleanup can't change what the run ended
@@ -72,7 +72,7 @@ use zakura_network::zakura::{
 };
 use zakura_rt::sim::RunId;
 
-use crate::{peer::peer_of, RunEnd};
+use crate::{peer::peer_of, IdleStatus, Outcome, RunEnd};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -158,7 +158,7 @@ pub enum EndCheck {
     /// Every departed session was retired. A view with no own-9 facts has
     /// nothing to retire.
     Complete,
-    /// The run settled with these sessions open, each named by peer and
+    /// The run ended idle with these sessions open, each named by peer and
     /// session ID. Nothing is left to retire them.
     Unretired(Vec<(String, u64)>),
     /// The run stopped, or hasn't ended, before own-9 retired these
@@ -199,8 +199,8 @@ struct SessionLedger {
     own9: Option<Own9>,
     /// Set once the run's log froze. Nothing changes the view after that.
     frozen: bool,
-    /// Whether the run settled, once it has ended.
-    settled: Option<bool>,
+    /// Whether the run ended idle, once it has ended.
+    idle: Option<bool>,
     /// The first rule the run broke.
     broken: Option<String>,
 }
@@ -340,15 +340,22 @@ impl SessionEvidence {
         }
     }
 
-    /// Records how the run ended, and whether it [`settled`].
-    ///
-    /// [`settled`]: super::adoption::settled
+    /// Records whether the run ended idle: with every task finished or
+    /// waiting outside the scheduler, and nothing enabled. Nothing can
+    /// retire a session after that. A drain after the budget runs only
+    /// ready tasks and fires no timer, so a session whose retirement waits
+    /// on one could still retire, and that end doesn't count.
     pub fn end(&self, end: &RunEnd) {
-        self.ledger().settled = Some(super::adoption::settled(end));
+        self.ledger().idle = Some(matches!(
+            end.outcome,
+            Outcome::Idle {
+                status: IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
+            }
+        ));
     }
 
     /// Whether own-9 retired every session that left the reactor's view:
-    /// [`EndCheck::Unretired`] if the run settled with one open, and
+    /// [`EndCheck::Unretired`] if the run ended idle with one open, and
     /// [`EndCheck::Inconclusive`] if it stopped first or hasn't ended.
     pub fn end_check(&self) -> EndCheck {
         let ledger = self.ledger();
@@ -360,7 +367,7 @@ impl SessionEvidence {
             .collect();
         if open.is_empty() {
             EndCheck::Complete
-        } else if ledger.settled == Some(true) {
+        } else if ledger.idle == Some(true) {
             EndCheck::Unretired(open)
         } else {
             EndCheck::Inconclusive(open)

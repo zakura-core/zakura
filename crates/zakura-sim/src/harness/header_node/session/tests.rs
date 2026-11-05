@@ -584,11 +584,13 @@ fn run_end(outcome: crate::Outcome, exhausted: bool) -> RunEnd {
     }
 }
 
-/// A departed session own-9 never retired is a leak once the run settled,
-/// and inconclusive when the run stopped first or hasn't ended.
+/// A departed session own-9 never retired is a leak once the run ended idle,
+/// and inconclusive when the run hasn't ended or stopped first, at its
+/// budget included, since the budget's drain fires no timer.
 #[test]
-fn an_unretired_session_is_a_leak_only_in_a_settled_run() {
+fn an_unretired_session_is_a_leak_only_in_an_idle_run() {
     let open = vec![("peer-0".to_owned(), 5)];
+    let idle = |status| Some(run_end(crate::Outcome::Idle { status }, false));
     for (end, check) in [
         (None, EndCheck::Inconclusive(open.clone())),
         (
@@ -597,15 +599,18 @@ fn an_unretired_session_is_a_leak_only_in_a_settled_run() {
         ),
         (
             Some(run_end(crate::Outcome::Budget, false)),
+            EndCheck::Inconclusive(open.clone()),
+        ),
+        (
+            idle(crate::IdleStatus::Deadlock),
+            EndCheck::Inconclusive(open.clone()),
+        ),
+        (
+            idle(crate::IdleStatus::Quiescent),
             EndCheck::Unretired(open.clone()),
         ),
         (
-            Some(run_end(
-                crate::Outcome::Idle {
-                    status: crate::IdleStatus::Quiescent,
-                },
-                false,
-            )),
+            idle(crate::IdleStatus::WaitingOnExternal),
             EndCheck::Unretired(open.clone()),
         ),
     ] {

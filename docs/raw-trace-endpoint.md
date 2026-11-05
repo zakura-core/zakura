@@ -57,13 +57,21 @@ range is interpreted against that original length, including `Content-Range`'s
 total. Appends do not change the token or extend the response. Replacement or an
 observed length below the captured bound returns 409. During streaming an observed
 shrink or premature EOF aborts the body. Start a new collection on 409; never
-concatenate portions from different tokens.
+concatenate portions from different files.
 
 After an interrupted transfer, resume after the last byte actually received with
 the same token. Responses preserve exact bytes, including partial JSONL lines;
 join portions before parsing lines. At the original end, further ranges return
 416 even if the source has grown. Omit the token to capture a fresh prefix and
 see newer rows. There is no wait for future rows or live-tail subscription.
+
+To follow a growing file without re-reading it, capture a fresh token with
+`Range: bytes=0-0`. When its device and inode match the earlier token's, resume
+at the earlier end with the fresh token. Portions read under two tokens with the
+same device and inode come from the same append-only file. A different device or
+inode means the file was replaced; start again at byte 0.
+`deploy/trace-query/trace_query.py` implements this and mirrors rows into SQLite
+for arbitrary queries.
 
 ## Consistency model: append-only source
 

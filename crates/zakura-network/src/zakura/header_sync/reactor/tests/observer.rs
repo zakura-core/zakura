@@ -879,27 +879,35 @@ async fn synthetic_prepare_ends_not_submitted() {
             StorageDispatch::Started(_)
         ));
         complete_next(&mut reactor).await;
-        assert_eq!(
-            recorder.take(),
-            vec![
-                ReactorEvent::Dispatched {
-                    call,
-                    op: PortCall::Prepare {
-                        peer: peer.clone(),
-                        source,
-                        owner,
-                    },
+        let mut expected = vec![
+            ReactorEvent::Dispatched {
+                call,
+                op: PortCall::Prepare {
+                    peer: peer.clone(),
+                    source,
+                    owner,
                 },
-                ReactorEvent::CallEnded {
-                    call,
-                    end: CallEnd::NotSubmitted,
-                },
-                ReactorEvent::Handled {
-                    call,
-                    panicked: false,
-                },
-            ]
-        );
+            },
+            ReactorEvent::CallEnded {
+                call,
+                end: CallEnd::NotSubmitted,
+            },
+        ];
+        if call == 2 {
+            // The oversized page is the peer's malformed input, even though no
+            // preparing round awaits the call.
+            expected.push(ReactorEvent::Misbehavior {
+                peer: peer.clone(),
+                reason: HeaderSyncMisbehavior::MalformedMessage,
+                origin: Some(7),
+                current: Some(7),
+            });
+        }
+        expected.push(ReactorEvent::Handled {
+            call,
+            panicked: false,
+        });
+        assert_eq!(recorder.take(), expected);
     }
     assert!(port.calls.lock().expect("unpoisoned").is_empty());
     assert_eq!(port.prepares.load(Ordering::SeqCst), 0);
@@ -1475,10 +1483,12 @@ fn current_session_failures_name_their_origin() {
     );
 }
 
-/// A prepare for session 1 that fails after session 2 replaced it is
-/// discarded before any dispatch, so it reports no misbehavior.
+/// A prepare for session 1 that fails after session 2 replaced it leaves the
+/// replacement's round alone. Its invalid headers still came from the peer, so
+/// it reports misbehavior with session 1 as the origin and holds back the
+/// peer's readmission.
 #[test]
-fn stale_prepare_emits_no_misbehavior() {
+fn stale_prepare_reports_its_own_session() {
     let recorder = Arc::new(Recorder::default());
     let (mut reactor, snapshot) = observed_reactor(
         Arc::new(ScriptedPort::default()),
@@ -1504,8 +1514,21 @@ fn stale_prepare_emits_no_misbehavior() {
         old_owner,
         HeaderTargetPreparationResult::Failed(invalid_header_failure(source, old_owner)),
     );
-    assert_eq!(misbehaviors(recorder.take()), vec![]);
+    assert_eq!(
+        misbehaviors(recorder.take()),
+        vec![ReactorEvent::Misbehavior {
+            peer: peer.clone(),
+            reason: HeaderSyncMisbehavior::InvalidHeader,
+            origin: Some(1),
+            current: Some(2),
+        }]
+    );
     assert_eq!(active(&reactor, &peer), replacement);
+    assert!(reactor.sessions.contains_key(&peer));
+    assert!(reactor
+        .state
+        .unproductive_peer_cooldowns
+        .contains_key(&peer));
 }
 
 /// A dispatch for session 1's work while session 2 is current reports both

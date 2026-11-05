@@ -101,8 +101,14 @@ fn try_main() -> Result<(), BoxError> {
         Some("planted") => {
             let mut changed_since = None;
             let mut property = None;
+            let mut targets = false;
             while let Some(arg) = args.next() {
-                if arg == "--changed-since" {
+                if arg == "--targets" {
+                    if targets {
+                        return Err(Box::new(UsageError("expected at most one `--targets`")));
+                    }
+                    targets = true;
+                } else if arg == "--changed-since" {
                     if changed_since.is_some() {
                         return Err(Box::new(UsageError(
                             "expected at most one `--changed-since`",
@@ -120,7 +126,12 @@ fn try_main() -> Result<(), BoxError> {
                     )));
                 }
             }
-            planted::run(&repo_root()?, property.as_deref(), changed_since.as_deref())
+            planted::run(
+                &repo_root()?,
+                property.as_deref(),
+                changed_since.as_deref(),
+                targets,
+            )
         }
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
@@ -140,6 +151,7 @@ fn try_main() -> Result<(), BoxError> {
         Some("sim-triage") => sim::run(&repo_root()?, "triage", args),
         Some("sim-verify-archive") => sim::run(&repo_root()?, "verify-archive", args),
         Some("sim-campaign") => sim::run(&repo_root()?, "campaign", args),
+        Some("sim-targets") => sim::run(&repo_root()?, "targets", args),
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
                 return Err(Box::new(UsageError(
@@ -346,7 +358,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask check-rt-imports")?;
     writeln!(
         output,
-        "  cargo xtask planted [--changed-since <rev>] [<property-id>]"
+        "  cargo xtask planted [--changed-since <rev>] [--targets] [<property-id>]"
     )?;
     writeln!(
         output,
@@ -387,6 +399,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "  cargo xtask sim-campaign (build|start|resume|close|status|verify|evidence) --store <dir> ..."
+    )?;
+    writeln!(
+        output,
+        "  cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|none]"
     )?;
     writeln!(output)?;
     writeln!(
@@ -435,6 +451,14 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "With --changed-since, it runs only the cases the changes since that revision affect."
+    )?;
+    writeln!(
+        output,
+        "With --targets, it runs only the cases whose harness a simulator fuzz target runs, and"
+    )?;
+    writeln!(
+        output,
+        "also confirms each patched input through that target in fresh processes."
     )?;
     writeln!(output)?;
     writeln!(
@@ -527,5 +551,18 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "manifests, corpus snapshots and failures live in the --store directory."
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Checks each simulator fuzz target qa/suite.toml declares: it resolves the target's"
+    )?;
+    writeln!(
+        output,
+        "harness, builds the target, runs it on the harness's curated seeds, and reports"
+    )?;
+    writeln!(
+        output,
+        "one status per target and the retained bypasses on its harness."
     )
 }

@@ -4,8 +4,8 @@ mod service_session;
 mod trace;
 use service_session::{
     may_open_ordered_stream, spawn_service_session, trace_session_step, ConnectionRoles,
-    DemandChange, DemandWait, PendingSessions, PreparedStream, RemoteCompletion, RemoteDemand,
-    ServiceSessionState, SessionExit, SetupIo,
+    DemandChange, DemandWait, OpenedStream, PendingSessions, PreparedStream, RemoteCompletion,
+    RemoteDemand, ServiceSessionState, SessionExit, SetupIo,
 };
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
@@ -21,7 +21,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt as _, StreamExt as _};
 use rand_10::Rng;
 use thiserror::Error;
 use zakura_chain::{
@@ -2367,8 +2367,15 @@ impl ServiceSessionIO {
     }
 
     /// A local open failed. The caller decides whether the service retries.
-    fn on_open_failed(&self, kind: u16, attempt: u64) {
+    fn on_open_failed(&mut self, kind: u16, attempt: u64) {
+        self.session(kind).open_failed();
         self.trace(kind, SessionStep::AttemptFailed { attempt });
+    }
+
+    /// Whether `kind`'s local open, whose streams are ready, may install its
+    /// generation. A peer session that took the service meanwhile wins.
+    fn accepts_local_open(&mut self, kind: u16, connection_cancelled: bool) -> bool {
+        self.session(kind).accepts_local_open(connection_cancelled)
     }
 
     /// A session's workers finished. Returns the backoff that its service now
@@ -3332,16 +3339,21 @@ impl ZakuraProtocolHandler {
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
-                let admitted = match self
-                    .open_traced_session(
+                // The peer paces this open through stream credit. Local
+                // shutdown or eviction cancels the connection meanwhile, and
+                // dropping the open resets its streams and returns its permits.
+                let opened = zakura_rt::select! {
+                    biased;
+                    () = connection_token.cancelled() => break,
+                    opened = self.open_traced_session(
                         &open_context,
                         stream,
                         &mut session_io,
                         &mut workers,
                         &mut message_buckets,
-                    )
-                    .await
-                {
+                    ) => opened,
+                };
+                let admitted = match opened {
                     Ok(admitted) => admitted,
                     Err(ZakuraHandlerError::SessionFull) => {
                         // Demand is advisory: another connection can reserve the
@@ -3401,6 +3413,9 @@ impl ZakuraProtocolHandler {
             }
         }
 
+        // Local reopens whose transport IO is in flight, created on the first
+        // reopen.
+        let mut local_opens: Option<FuturesUnordered<BoxFuture<'_, _>>> = None;
         loop {
             let session_deadline = pending_sessions.deadline();
             zakura_rt::select! {
@@ -3451,17 +3466,42 @@ impl ZakuraProtocolHandler {
                         continue;
                     }
 
-                    match self
-                        .open_traced_session(
+                    // The peer paces `open_bi` and the prelude write through
+                    // stream credit, so they run beside this loop. The service
+                    // is reserved only once the streams are ready.
+                    let attempt = session_io.begin_attempt(stream.kind);
+                    let open = &open_context;
+                    local_opens.get_or_insert_with(FuturesUnordered::new).push(
+                        async move { (stream, attempt, self.open_session_streams(open, stream).await) }
+                            .boxed(),
+                    );
+                }
+                Some((stream, attempt, opened)) = async { local_opens.as_mut()?.next().await },
+                    if local_opens.as_ref().is_some_and(|opens| !opens.is_empty()) =>
+                {
+                    let opened = match opened {
+                        Ok(members)
+                            if !session_io
+                                .accepts_local_open(stream.kind, connection_token.is_cancelled()) =>
+                        {
+                            // A peer session took the service while this open
+                            // ran. Dropping the members resets their streams.
+                            drop(members);
+                            session_io.on_open_failed(stream.kind, attempt);
+                            continue;
+                        }
+                        Ok(members) => self.admit_opened_session(
                             &open_context,
                             stream,
-                            &mut session_io,
+                            members,
                             &mut workers,
                             &mut message_buckets,
-                        )
-                        .await
-                    {
+                        ),
+                        Err(error) => Err(error),
+                    };
+                    match opened {
                         Ok(admitted) => {
+                            session_io.on_opened(admitted.kind, admitted.session_id, attempt);
                             #[cfg(any(test, zakura_sim))]
                             let admitted = session_io.with_origin(conn_id, admitted, true);
                             let service_streams = admitted.into_service_streams();
@@ -3480,6 +3520,7 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
+                            session_io.on_open_failed(stream.kind, attempt);
                             let delay = session_io.schedule_transport_backoff(stream.kind);
                             debug!(
                                 ?error,
@@ -3698,6 +3739,8 @@ impl ZakuraProtocolHandler {
         }
 
         connection_token.cancel();
+        // An open still in flight resets its streams and returns its permits.
+        drop(local_opens);
         drop(incoming_setup);
         drop(pending_sessions);
         let drained = drain_stream_workers(&mut workers).await;
@@ -3730,10 +3773,12 @@ impl ZakuraProtocolHandler {
         message_buckets: &mut MessageRateBuckets,
     ) -> Result<AdmittedSession, ZakuraHandlerError> {
         let attempt = session_io.begin_attempt(stream.kind);
-        let opened = self
-            .open_service_session(open, stream, workers, message_buckets)
-            .boxed()
-            .await;
+        let opened = match self.open_session_streams(open, stream).boxed().await {
+            Ok(members) => {
+                self.admit_opened_session(open, stream, members, workers, message_buckets)
+            }
+            Err(error) => Err(error),
+        };
         match &opened {
             Ok(admitted) => session_io.on_opened(admitted.kind, admitted.session_id, attempt),
             Err(_) => session_io.on_open_failed(stream.kind, attempt),
@@ -3741,13 +3786,14 @@ impl ZakuraProtocolHandler {
         opened
     }
 
-    async fn open_service_session(
+    /// Open every member stream of `stream`'s service session and write their
+    /// preludes. This is only transport IO, which the peer paces through
+    /// stream credit; [`Self::admit_opened_session`] reserves the service.
+    async fn open_session_streams(
         &self,
         open: &SessionOpenContext<'_>,
         stream: Stream,
-        workers: &mut JoinSet<()>,
-        message_buckets: &mut MessageRateBuckets,
-    ) -> Result<AdmittedSession, ZakuraHandlerError> {
+    ) -> Result<Vec<OpenedStream>, ZakuraHandlerError> {
         let layout = self
             .registry
             .session_layout(stream)
@@ -3755,34 +3801,55 @@ impl ZakuraProtocolHandler {
         if layout.primary() != stream {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
+        let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
+        let mut opened = Vec::with_capacity(layout.streams().len());
+        for member in layout.streams().iter().copied() {
+            opened.push(
+                self.open_ordered_stream(
+                    open.connection,
+                    member,
+                    wire_id,
+                    open.stream_sem,
+                    open.resources,
+                    open.limits,
+                )
+                .await?,
+            );
+        }
+        Ok(opened)
+    }
+
+    /// Reserve `stream`'s service for the opened `members` and start the
+    /// session's workers. A refused reservation drops the members, which
+    /// resets their streams.
+    fn admit_opened_session(
+        &self,
+        open: &SessionOpenContext<'_>,
+        stream: Stream,
+        members: Vec<OpenedStream>,
+        workers: &mut JoinSet<()>,
+        message_buckets: &mut MessageRateBuckets,
+    ) -> Result<AdmittedSession, ZakuraHandlerError> {
         let reservation = self
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
             .reserve_session(open.direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
-        let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
-        let mut prepared = Vec::with_capacity(layout.streams().len());
-        for member in layout.streams().iter().copied() {
-            let mut member = self
-                .prepare_ordered_stream(
-                    open.connection,
-                    member,
-                    wire_id,
-                    open.stream_sem,
-                    open.resources,
-                    message_buckets,
-                    open.limits,
-                    open.connection_token.clone(),
-                    open.close_cause.clone(),
-                    open.freshness_tx.clone(),
-                    open.conn.clone(),
-                    open.peer_id.clone(),
-                )
-                .await?;
+        let prepared = members.into_iter().map(|member| {
+            let mut member = self.prepare_opened_stream(
+                member,
+                message_buckets,
+                open.limits,
+                open.connection_token.clone(),
+                open.close_cause.clone(),
+                open.freshness_tx.clone(),
+                open.conn.clone(),
+                open.peer_id.clone(),
+            );
             member.set_session_resources(reservation.clone());
-            prepared.push(member);
-        }
+            member
+        });
         Ok(spawn_service_session(
             workers,
             prepared,
@@ -4687,6 +4754,9 @@ async fn spawn_zakura_endpoint_inner(
     let sought_services = sought_services_with_custom(&custom_services);
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
+        Some(discovery::AuthoredSequenceFile::new(
+            config.zakura_discovery_sequence_file(&local_node_id),
+        )),
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),
         &handshake_config,
@@ -7897,6 +7967,7 @@ mod tests {
             let (_connected_tx, connected) = watch::channel(Vec::new());
             let discovery = discovery::build_discovery_handle(
                 secret_key.clone(),
+                None,
                 discovery_direct_addrs(config, local_node_id),
                 Vec::new(),
                 &ZakuraHandshakeConfig::for_network_with_dev_cohort(&config.network, None),
@@ -9213,6 +9284,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         let discovery = crate::zakura::discovery::build_discovery_handle(
             NodeSecretKey::generate(),
+            None,
             Vec::new(),
             crate::zakura::discovery::default_advertised_services(),
             &handshake,

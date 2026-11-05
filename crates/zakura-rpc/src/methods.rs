@@ -864,7 +864,8 @@ pub trait RpcServer {
 
     /// Returns the recommended standard fee per logical action, in zatoshis.
     ///
-    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
+    /// Returns at least 1,000 zatoshis per action, with `version` 0.
+    /// Uses Zakura's ZIP 317 marginal fee when it exceeds this floor.
     /// A dynamic estimate can replace this value without changing the parameters or
     /// result shape.
     ///
@@ -4115,7 +4116,7 @@ where
 
     async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
         Ok(GetStandardFeeResponse {
-            standard_fee: transaction::zip317::MARGINAL_FEE,
+            standard_fee: transaction::zip317::MARGINAL_FEE.max(1_000),
             version: 0,
         })
     }

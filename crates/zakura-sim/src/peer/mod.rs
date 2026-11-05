@@ -129,6 +129,14 @@ pub(crate) fn key_index(index: usize) -> u32 {
     u32::try_from(index + 1).expect("a scenario has few peers")
 }
 
+/// The peer ID the node knows scripted peer `index` by, under the
+/// scenario's `seed`: the public half of the key the peer binds with.
+pub fn peer_id(seed: [u8; 32], index: usize) -> zakura_network::zakura::ZakuraPeerId {
+    let key = SeededInputs::node_key(seed, key_index(index)).public();
+    zakura_network::zakura::ZakuraPeerId::new(key.as_bytes().to_vec())
+        .expect("a node key's 32 bytes are a valid peer ID")
+}
+
 /// Which end of a peer's connection dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

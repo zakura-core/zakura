@@ -335,6 +335,17 @@ impl ServiceSessionState {
         !connection_cancelled && self.opens_locally() && !self.has_active_session()
     }
 
+    /// The generation this state installed for its local opens, or for its
+    /// peer's.
+    #[cfg(any(test, zakura_sim))]
+    pub(in crate::zakura::handler) fn installed(&self, opened_locally: bool) -> Option<u64> {
+        if opened_locally {
+            self.local_session_id
+        } else {
+            self.remote_session_id
+        }
+    }
+
     /// Adopt a locally opened generation. The caller drops any reopen wait.
     pub(in crate::zakura::handler) fn opened(&mut self, session_id: u64) {
         self.clear_wait();

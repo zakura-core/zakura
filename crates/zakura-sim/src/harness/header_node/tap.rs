@@ -335,7 +335,7 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
-    /// `sessions`, which this tap's run binds.
+    /// `sessions`, which this tap's run binds and freezes with its log.
     ///
     /// # Panics
     ///
@@ -348,6 +348,10 @@ impl ReactorTap {
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
+        sim.on_frozen({
+            let sessions = sessions.clone();
+            move || sessions.freeze()
+        });
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,

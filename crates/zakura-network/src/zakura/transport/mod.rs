@@ -69,14 +69,14 @@ pub(crate) use pipe::{
     spawn_supervised_pipe, CloseCause, Edge, Flow, Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
 pub use registry::{RegistryError, ServiceRegistry, SessionLayout};
-#[cfg(any(test, zakura_sim))]
-pub use service::CloseCauseReader;
 pub(crate) use service::ServiceStream;
 pub use service::{
     BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
     SessionOpening, SessionPolicy, SessionResources, SessionStep, Sink, SinkReject, Source, Stream,
     StreamMode, StreamQueueDepths, StreamWritePolicy,
 };
+#[cfg(any(test, zakura_sim))]
+pub use service::{CloseCauseReader, SessionOrigin};
 pub use session::{OrderedSendError, PeerStreamSession};
 #[cfg(any(test, zakura_sim))]
 pub use sim_reader::{read_framed_channel, StreamReader};

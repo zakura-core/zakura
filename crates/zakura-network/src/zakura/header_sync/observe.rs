@@ -1,9 +1,9 @@
 //! Synchronous header-sync reactor events for simulator tests.
 //!
 //! The reactor reports its port calls, active-request starts and
-//! retirements, refused offers, header reservations, session admissions, the
-//! committed state it adopts and what it publishes from that state to an
-//! installed [`HeaderSyncObserver`].
+//! retirements, refused offers, header reservations, session admissions and
+//! ends, the committed state it adopts and what it publishes from that state
+//! to an installed [`HeaderSyncObserver`].
 //! This module exists only in test and `zakura_sim` builds. Production builds
 //! compile none of it, and the reactor's `observe!` macro drops its tokens.
 
@@ -24,7 +24,7 @@ pub use super::{
     reactor::HeaderRequestTerminal,
     scheduler::peer_work::{HeaderTargetPhase, HeaderWorkEnd, StorageCallKind},
 };
-use crate::zakura::ZakuraPeerId;
+use crate::zakura::{ServicePeerDirection, SessionOrigin, ZakuraPeerId};
 
 mod ledger;
 
@@ -165,10 +165,30 @@ pub enum ReactorEvent {
         peer: ZakuraPeerId,
     },
     /// The reactor admitted a session from `peer`, replacing any session it
-    /// held for that peer.
+    /// held for that peer. The replaced session leaves the reactor's view
+    /// here, since its later disconnect finds another session and does
+    /// nothing.
     SessionAdmitted {
         /// The admitted peer.
         peer: ZakuraPeerId,
+        /// The admitted session's ID, as its service handed it over.
+        session_id: u64,
+        /// The direction of the session's connection.
+        direction: ServicePeerDirection,
+        /// The session this one replaced, if the reactor held one for `peer`.
+        replaced: Option<u64>,
+        /// Where the transport got the session, if its peer said.
+        origin: Option<SessionOrigin>,
+    },
+    /// The reactor removed `peer`'s current session on its disconnect. A
+    /// disconnect of a session the reactor no longer holds reports nothing.
+    SessionEnded {
+        /// The peer.
+        peer: ZakuraPeerId,
+        /// The ended session.
+        session_id: u64,
+        /// Why the service reported the disconnect.
+        reason: &'static str,
     },
     /// The reactor dispatched a violation by `peer` to storage.
     Misbehavior {

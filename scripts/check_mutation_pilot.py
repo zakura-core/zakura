@@ -16,7 +16,9 @@ import subprocess
 import tomllib
 
 CATALOGUE = "qa/mutation-pilot/catalogue.json"
-SOURCE_PATHS = ["crates", "Cargo.toml", "Cargo.lock", ".cargo", "rust-toolchain.toml"]
+# Build inputs of the pilot targets. xtask holds the pilot tooling itself, so a
+# runner change does not move the pin.
+SOURCE_PATHS = ["crates", ":(exclude)crates/xtask", "Cargo.toml", "Cargo.lock", ".cargo", "rust-toolchain.toml"]
 
 
 def digest(path):
@@ -33,8 +35,13 @@ def git_unchanged(root, revision, paths):
     return compared.returncode == 0 and untracked.returncode == 0 and not untracked.stdout.strip()
 
 
-def validate(root, evidence=None):
-    """Return every inconsistency between the catalogue, this tree and `evidence`."""
+def validate(root, evidence=None, at_pin=False):
+    """Return every inconsistency between the catalogue, this tree and `evidence`.
+
+    The default checks the pilot's own inputs, which live under `qa/`. With
+    `at_pin`, it also requires this tree's production, oracle and lock files to
+    equal the pinned revisions, which a pilot run needs.
+    """
     catalogue = json.loads((root / CATALOGUE).read_text())
     cases = catalogue["cases"]
     errors = []
@@ -60,8 +67,9 @@ def validate(root, evidence=None):
         require(binding["input"] == case["witness"] and binding["checks"] == case["producer_check_dependencies"], f"{ident}: retained patch binding differs")
         changed = {line[6:] for line in patch.read_text().splitlines() if line.startswith("+++ b/")}
         require(changed == set(case["production_files"]), f"{ident}: changed files differ")
-        for path, expected in [*case["production_files"].items(), *case["oracle_and_generator_files"].items()]:
-            check_hash(root, path, expected)
+        if at_pin:
+            for path, expected in [*case["production_files"].items(), *case["oracle_and_generator_files"].items()]:
+                check_hash(root, path, expected)
         require(bool(case["required_observations"] and case["independent_check"]), f"{ident}: checker evidence missing")
         check_hash(root, case["witness"], case["witness_sha256"])
         sidecar = (root / case["witness"]).with_suffix(".toml")
@@ -83,11 +91,12 @@ def validate(root, evidence=None):
     build = catalogue["baseline_build"]
     fuzz = catalogue["fuzz_build_inputs"]
     require(build["git"] == catalogue["source_revision"] and not build["dirty"], "baseline source identity differs")
-    check_hash(root, "Cargo.lock", build["lockfile"])
-    check_hash(root, "qa/fuzz/sim/Cargo.toml", fuzz["manifest_sha256"])
-    check_hash(root, "qa/fuzz/sim/Cargo.lock", fuzz["lockfile_sha256"])
-    require(git_unchanged(root, catalogue["source_revision"], SOURCE_PATHS), "current build inputs differ from the baseline source revision")
-    require(git_unchanged(root, fuzz["source_revision"], ["qa/fuzz/sim"]), "fuzz build inputs differ from the calibrated revision")
+    if at_pin:
+        check_hash(root, "Cargo.lock", build["lockfile"])
+        check_hash(root, "qa/fuzz/sim/Cargo.toml", fuzz["manifest_sha256"])
+        check_hash(root, "qa/fuzz/sim/Cargo.lock", fuzz["lockfile_sha256"])
+        require(git_unchanged(root, catalogue["source_revision"], SOURCE_PATHS), "current build inputs differ from the baseline source revision")
+        require(git_unchanged(root, fuzz["source_revision"], ["qa/fuzz/sim"]), "fuzz build inputs differ from the calibrated revision")
 
     calibrations = catalogue["calibration"]["runs"]
     require({run["target"] for run in calibrations} == {case["target"] for case in cases}, "calibration target set differs")
@@ -152,16 +161,19 @@ def validate_evidence(evidence, catalogue, targets, require, check_hash):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--evidence", type=Path, help="extracted evidence bundle directory")
+    parser.add_argument("--at-pin", action="store_true", help="also require this tree's build inputs to equal the pinned revisions")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     try:
-        errors = validate(root, args.evidence)
+        errors = validate(root, args.evidence, args.at_pin)
     except (OSError, KeyError, ValueError, TypeError, IndexError) as error:
         errors = [f"invalid pilot catalogue or evidence: {error!r}"]
     for error in errors:
         print(error)
     if not errors:
         scope = "catalogue inputs and evidence bundle" if args.evidence else "catalogue inputs"
+        if args.at_pin:
+            scope += " at the pinned revisions"
         print(f"Pilot {scope} verified")
     return int(bool(errors))
 

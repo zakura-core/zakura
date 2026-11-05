@@ -186,18 +186,28 @@ class PilotCatalogueTests(unittest.TestCase):
 
     def test_untracked_build_input_fails(self):
         self.write("crates/node/src/extra.rs", "// untracked\n")
-        self.assertIn("current build inputs differ from the baseline source revision", pilot.validate(self.root))
+        self.assertIn("current build inputs differ from the baseline source revision", pilot.validate(self.root, at_pin=True))
+
+    def test_later_build_inputs_pass_without_the_pin_check(self):
+        self.write("crates/node/src/extra.rs", "// untracked\n")
+        with (self.root / ORACLE).open("a") as stream:
+            stream.write("// changed oracle\n")
+        self.assertEqual(pilot.validate(self.root), [])
+
+    def test_a_tooling_change_keeps_the_pin(self):
+        self.write("crates/xtask/src/extra.rs", "// runner change\n")
+        self.assertEqual(pilot.validate(self.root, at_pin=True), [])
 
     def test_oracle_drift_fails(self):
         with (self.root / ORACLE).open("a") as stream:
             stream.write("// changed oracle\n")
-        errors = pilot.validate(self.root)
+        errors = pilot.validate(self.root, at_pin=True)
         self.assertIn(f"hash differs: {ORACLE}", errors)
         self.assertIn("current build inputs differ from the baseline source revision", errors)
 
     def test_fuzz_lock_drift_fails(self):
         self.write("qa/fuzz/sim/Cargo.lock", "version = 5\n")
-        errors = pilot.validate(self.root)
+        errors = pilot.validate(self.root, at_pin=True)
         self.assertIn("hash differs: qa/fuzz/sim/Cargo.lock", errors)
         self.assertIn("fuzz build inputs differ from the calibrated revision", errors)
 

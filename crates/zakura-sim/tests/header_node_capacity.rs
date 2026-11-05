@@ -21,18 +21,19 @@ use zakura_sim::{
         self,
         header_node::{
             capacity::{CapacityEvidence, CapacityReading},
-            policy::{OpKind, Select, Trigger},
+            policy::{Allow, Hold, OpKind, Select, Trigger},
             reservation::ReservationEvidence,
             session::SessionEvidence,
             tap::ReactorTap,
-            Chain, ControlAction, ControlStep, DispatchFlag, HeaderNode,
+            Chain, ControlAction, ControlStep, DispatchFlag, HeaderNode, Policy,
         },
         header_sync::{Dialer, MirrorSpec, Storage, StorageScenario},
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
+    observe::{ReactorFact, StorageFact, StorageRequest},
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
-    HarnessFailure, MemorySink, NoChecks, PlanInput, RunReport, Sim,
+    HarnessFailure, MemorySink, NoChecks, Observation, PlanInput, RunReport, Sim,
 };
 use zakura_storage::header::{adapter::EnginePort, fixture::HeaderFixture};
 
@@ -61,9 +62,21 @@ fn step(peer: &str, action: ControlAction, when: Trigger) -> ControlStep {
 /// The capacity witness: `mirror-0`, at A300 so its round continues past
 /// one fair share, has its link closed once the node reserves headers for
 /// it, then relinks once the close is made, and the node shuts down once it
-/// submits its first prepare, which holds that round's staged headers.
+/// submits its first prepare, which holds that round's staged headers. The
+/// prepare is held until the shutdown closes the second link, so the stop
+/// finds those headers still held.
 pub fn witness() -> StorageScenario {
+    let first_prepare = || Select::nth(OpKind::Prepare, 1);
     StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: first_prepare(),
+                until: Trigger::Count(2, Box::new(Trigger::Closed("mirror-0".to_owned()))),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
         mirrors: vec![MirrorSpec {
             chain: Chain::main(300),
             dialer: Dialer::Mirror,
@@ -82,7 +95,7 @@ pub fn witness() -> StorageScenario {
             step(
                 "node",
                 ControlAction::Shutdown,
-                Trigger::Submitted(Select::nth(OpKind::Prepare, 1)),
+                Trigger::Submitted(first_prepare()),
             ),
         ],
         ..StorageScenario::default()
@@ -94,11 +107,45 @@ fn claims(reading: &CapacityReading) -> bool {
     reading.reserved + reading.owned > 0
 }
 
+/// How the node's first prepare call ended, as its tap logged it, if it
+/// did. The call is joined to its storage operation by the operation's id.
+fn prepare_end(report: &RunReport) -> Option<String> {
+    let prepare = report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Storage {
+                instance: 0,
+                fact:
+                    StorageFact::Submitted {
+                        id,
+                        request: StorageRequest::PrepareHeaderTarget { .. },
+                        ..
+                    },
+                ..
+            } => Some(*id),
+            _ => None,
+        })?;
+    report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Reactor {
+                event: ReactorFact::CallEnded { end, op, .. },
+                ..
+            } if *op == Some(prepare) => Some(end.clone()),
+            _ => None,
+        })
+}
+
 /// Through a close, a relink and a shutdown, the probe's reads match the
 /// work queue's accounting at quiet boundaries while the node holds
 /// capacity, and once the stopped reactor is gone they read nothing
-/// reserved or owned. The node shuts down holding the headers its prepare
-/// took, so the teardown reads show they all came back.
+/// reserved or owned. The shutdown drops the held prepare, which held its
+/// round's headers until then, so the teardown reads show they all came
+/// back.
 #[test]
 fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
     let scenario = witness();
@@ -110,19 +157,16 @@ fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
                 .any(|reading| reading.compared && claims(reading)),
             "a quiet read compares held capacity: {readings:#?}"
         );
-        let stop = report
-            .picks
-            .iter()
-            .find(|pick| pick.identity == "peer:node:shutdown")
-            .expect("the node shuts down")
-            .step;
+        assert_eq!(
+            prepare_end(&report).as_deref(),
+            Some("dropped"),
+            "the shutdown drops the held prepare, so the reactor held its headers until it stopped"
+        );
         assert!(
             readings
                 .iter()
-                .rev()
-                .find(|reading| reading.step <= stop)
-                .is_some_and(claims),
-            "the node holds capacity as it shuts down: {readings:#?}"
+                .any(|reading| !reading.teardown && reading.owned > 0),
+            "the probe reads the prepare's headers owned: {readings:#?}"
         );
         let teardown = readings
             .iter()

@@ -213,7 +213,10 @@ fn benchmark_mempool_full_block_deletion() {
         usize::try_from(Config::default().tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD)
             .unwrap();
     let mut factory = TxFactory::new();
-    for count in [default_count / 8, default_count] {
+    for (count, conflicts) in [default_count / 8, default_count]
+        .into_iter()
+        .flat_map(|count| [0, 1].map(|conflicts| (count, conflicts)))
+    {
         let (block, members) = full_block(&mut factory);
         assert!(members.len() <= count);
         let block_cost: u64 = members.iter().map(VerifiedUnminedTx::cost).sum();
@@ -229,7 +232,17 @@ fn benchmark_mempool_full_block_deletion() {
                 .insert(factory.tx(10_000), Vec::new(), None)
                 .unwrap();
         }
-        for tx in &members {
+        let mut stored = members.clone();
+        if conflicts != 0 {
+            // The block mines a different TXID with the same nullifier as one
+            // stored transaction, so conflict discovery must scan the pool.
+            let mut transaction = stored[0].transaction.transaction().as_ref().clone();
+            *transaction.expiry_height_mut() = zakura_chain::block::Height(0);
+            stored[0].transaction = transaction.into();
+            assert_ne!(stored[0].transaction.id(), members[0].transaction.id());
+            assert_eq!(stored[0].cost(), members[0].cost());
+        }
+        for tx in &stored {
             storage.insert(tx.clone(), Vec::new(), None).unwrap();
         }
         let mined = block
@@ -245,11 +258,11 @@ fn benchmark_mempool_full_block_deletion() {
                 storage.reject_and_remove_same_effects(black_box(&mined), black_box(transactions)),
             );
             let elapsed = start.elapsed();
-            assert_eq!(removed.mined.len(), members.len());
-            assert!(removed.invalidated.is_empty());
+            assert_eq!(removed.mined.len(), members.len() - conflicts);
+            assert_eq!(removed.invalidated.len(), conflicts);
             assert_eq!(storage.transaction_count(), background_count);
             storage.chain_rejected_same_effects.clear();
-            for tx in &members {
+            for tx in &stored {
                 storage.insert(tx.clone(), Vec::new(), None).unwrap();
             }
             assert_eq!(storage.transaction_count(), count);
@@ -265,7 +278,7 @@ fn benchmark_mempool_full_block_deletion() {
         }
         samples.sort();
         println!(
-            "full_block transactions={count} block_bytes={} block_transactions={} removed={} \
+            "full_block transactions={count} conflicts={conflicts} block_bytes={} block_transactions={} removed={} \
              median_ns={} min_ns={} max_ns={}",
             block.zcash_serialized_size(),
             block.transactions.len(),

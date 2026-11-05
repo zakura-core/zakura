@@ -318,7 +318,9 @@ fn params_can_pass_through_unchanged(params: &RawValue) -> bool {
         return false;
     };
 
-    !value.bytes().any(|byte| matches!(byte, b'"' | b'\\'))
+    // A block's hex is megabytes long, and a vectorized search scans it far faster than a byte
+    // loop.
+    memchr::memchr2(b'"', b'\\', value.as_bytes()).is_none()
 }
 
 /// A JSON-RPC 2.0 call with only the standard fields, borrowed from the request body.

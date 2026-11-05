@@ -41,6 +41,16 @@ pub(super) struct ReactorState {
     /// request timeouts, or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
+    /// Unproductive-request strikes of peers whose last session ended, with the
+    /// deadline until which a reconnect resumes them.
+    ///
+    /// The deadline is one readmission cooldown after the disconnect, so a peer
+    /// that stays away that long has served the penalty its strikes lead to.
+    /// Each entry represents one identity that held a strike when its session
+    /// ended. The reactor prunes expired entries with the cooldowns, and the
+    /// admitted peer limits bound the count, so cycling fresh identities only
+    /// ends the earliest holds.
+    pub(super) departed_strikes: HashMap<ZakuraPeerId, (u32, Instant)>,
     pub(super) request_deadlines: HashMap<ZakuraPeerId, Instant>,
     /// Sessions whose subscription this node closed, with the deadline for
     /// its terminal outcome. See [`super::HeaderSyncReactor::close_subscription`].
@@ -79,6 +89,7 @@ impl ReactorState {
             cached_pass_budget: CachedPassBudget::new(now),
             cached_pass_deferred: false,
             unproductive_peer_cooldowns: HashMap::new(),
+            departed_strikes: HashMap::new(),
             request_deadlines: HashMap::new(),
             close_deadlines: HashMap::new(),
             pending_closes: HashMap::new(),
@@ -95,29 +106,68 @@ impl ReactorState {
     /// Install fresh scheduling facts for `peer`'s new session, and return
     /// whether they replace an earlier session's facts.
     ///
+    /// A replacement keeps the earlier session's unproductive-request strikes, and
+    /// a reconnect before `now` passes the departed session's hold resumes them,
+    /// so neither replacing nor reconnecting a session resets them.
+    ///
     /// A new peer joins the back of the repair supplier order. A replacement
     /// keeps its position until [`Self::rotate_supplier`] moves it.
     ///
     /// The replaced session's pending `Close` dies with it. The peer's pending
     /// locator read stays pending until its storage operation settles.
-    pub(super) fn admit_session(&mut self, peer: &ZakuraPeerId) -> bool {
+    pub(super) fn admit_session(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
         self.bump_scheduling_revision();
-        let replaced = self
-            .peers
-            .insert(peer.clone(), PeerSchedule::default())
-            .is_some();
+        let previous = self.peers.insert(peer.clone(), PeerSchedule::default());
+        let replaced = previous.is_some();
+        let departed = self
+            .departed_strikes
+            .remove(peer)
+            .filter(|(_, until)| *until > now)
+            .map(|(strikes, _)| strikes);
+        let strikes = previous
+            .map(|previous| previous.unproductive_requests)
+            .or(departed)
+            .unwrap_or(0);
+        self.peers
+            .get_mut(peer)
+            .expect("the fresh schedule was just inserted")
+            .unproductive_requests = strikes;
         if !replaced {
             self.vct_supplier_order.push_back(peer.clone());
         }
         replaced
     }
 
-    /// Remove `peer`'s session facts and its pending `Close`.
-    pub(super) fn remove_session(&mut self, peer: &ZakuraPeerId) {
-        if self.peers.remove(peer).is_some() {
+    /// Remove `peer`'s session facts and its pending `Close`, and hold its
+    /// unproductive-request strikes for `hold` after `now` so a reconnect
+    /// resumes them.
+    ///
+    /// At most `max_departed` peers keep held strikes; past that, the hold that
+    /// ends first ends now. A zero `hold` holds nothing.
+    pub(super) fn remove_session(
+        &mut self,
+        peer: &ZakuraPeerId,
+        now: Instant,
+        hold: Duration,
+        max_departed: usize,
+    ) {
+        if let Some(schedule) = self.peers.remove(peer) {
             self.bump_scheduling_revision();
+            if schedule.unproductive_requests > 0 && !hold.is_zero() {
+                self.departed_strikes
+                    .insert(peer.clone(), (schedule.unproductive_requests, now + hold));
+                while self.departed_strikes.len() > max_departed {
+                    let earliest = self
+                        .departed_strikes
+                        .iter()
+                        .min_by_key(|(_, (_, until))| *until)
+                        .map(|(peer, _)| peer.clone())
+                        .expect("an over-limit map has an entry");
+                    self.departed_strikes.remove(&earliest);
+                }
+            }
         }
         self.close_deadlines.remove(peer);
         self.pending_closes.remove(peer);
@@ -259,8 +309,10 @@ impl ReactorState {
         }
     }
 
-    /// Drop the cooldowns that end by `now`, and return whether any did.
+    /// Drop the cooldowns and held strikes that end by `now`, and return whether
+    /// any cooldown did.
     pub(super) fn prune_readmission_cooldowns(&mut self, now: Instant) -> bool {
+        self.departed_strikes.retain(|_, (_, until)| *until > now);
         let before = self.unproductive_peer_cooldowns.len();
         self.unproductive_peer_cooldowns
             .retain(|_, until| *until > now);
@@ -773,7 +825,8 @@ pub(super) struct PeerSchedule {
     /// stall, or repair preemption also keeps its offer until the blocker clears.
     /// Failed locator reads, sends, and ordinary attempts remain spent.
     pub(super) status_spent: bool,
-    /// Consecutive requests this session answered with nothing usable.
+    /// Consecutive requests this peer's sessions answered with nothing usable,
+    /// since it last supplied usable work. See [`ReactorState::departed_strikes`].
     pub(super) unproductive_requests: u32,
 }
 

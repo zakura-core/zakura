@@ -166,3 +166,9 @@ feature_missing = "warn"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Globalization", "Win32_System_Com"] }
+
+# sha2 0.10 gates runtime ARM SHA-2 acceleration behind this feature.
+# Its accelerated implementation assumes little-endian inputs, and its assembly
+# dependency supports these native build targets. Other targets keep the portable backend.
+[target.'cfg(all(target_arch = "aarch64", target_endian = "little", any(target_os = "linux", target_os = "macos")))'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }

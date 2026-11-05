@@ -273,7 +273,7 @@ fn resolve_target(repo_root: &Path, target: &str) -> Result<String, BoxError> {
 /// that runs no registered harness, maps to `None`, and only minimizing that
 /// target fails. `zakura-sim confirm` checks that the harness is registered,
 /// and [`ran_harness`] that the target runs it.
-fn fuzz_targets(repo_root: &Path) -> Result<BTreeMap<String, Option<String>>, BoxError> {
+pub(super) fn fuzz_targets(repo_root: &Path) -> Result<BTreeMap<String, Option<String>>, BoxError> {
     let manifest = fuzz_dir(repo_root).join("Cargo.toml");
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let output = Command::new(cargo)
@@ -365,9 +365,67 @@ fn minimize(
     request: &Request,
     interrupt: &AtomicBool,
 ) -> Result<Report, BoxError> {
+    with_tools(
+        repo_root,
+        &repo_root.join("target"),
+        request,
+        interrupt,
+        minimize_with,
+    )
+}
+
+/// Builds and pins the tools in the checkout at `repo_root`, into the
+/// `sim` and `sim-fuzz` target directories under `builds`, then confirms
+/// the request's input in fresh processes, as [`minimize`] confirms an
+/// original before `tmin`, and writes the report. Its status is
+/// [`Status::Confirmed`] if every check passed. `cargo xtask planted
+/// --targets` confirms a patched input through its fuzz target this way.
+/// The request's `runs` and `wall` limits don't apply.
+pub(super) fn confirm(
+    repo_root: &Path,
+    builds: &Path,
+    request: &Request,
+    interrupt: &AtomicBool,
+) -> Result<Report, BoxError> {
+    with_tools(repo_root, builds, request, interrupt, confirm_with)
+}
+
+/// Confirms the original with `tools`, as [`minimize_with`] does before
+/// `tmin`, and writes and returns the report. If the wrapper itself fails,
+/// the report keeps what ran before the failure, with [`Status::Error`].
+pub(super) fn confirm_with(
+    request: &Request,
+    tools: &Tools,
+    original: Original,
+    started: Instant,
+    interrupt: &AtomicBool,
+) -> Result<Report, BoxError> {
+    let mut report = Report::new(request, original, Status::Confirmed, started);
+    if let Err(error) = check_original(request, tools, &mut report, interrupt) {
+        report.status = Status::Error;
+        report.reason = Some(error.to_string());
+        return write_report(request, report, started).map_err(|_| error);
+    }
+    write_report(request, report, started)
+}
+
+/// What runs once the tools are built: the request, the tools, the
+/// preserved original, the start and the interrupt flag.
+type WithTools = fn(&Request, &Tools, Original, Instant, &AtomicBool) -> Result<Report, BoxError>;
+
+/// Preserves the original, builds and pins the tools under `builds`, and
+/// runs `then` with them. A build that fails or is interrupted writes its
+/// own report.
+fn with_tools(
+    repo_root: &Path,
+    builds: &Path,
+    request: &Request,
+    interrupt: &AtomicBool,
+    then: WithTools,
+) -> Result<Report, BoxError> {
     let started = Instant::now();
     let original = preserve_original(request)?;
-    let built = match build_tools(repo_root, request, interrupt) {
+    let built = match build_tools(repo_root, builds, request, interrupt) {
         Ok(Ok(tools)) => tools,
         Ok(Err(Stop::Failed(reason))) => {
             let report =
@@ -383,7 +441,7 @@ fn minimize(
         }
         Err(error) => return wrapper_failed(request, original, started, error),
     };
-    minimize_with(request, &built, original, started, interrupt)
+    then(request, &built, original, started, interrupt)
 }
 
 /// Why building the tools stopped short of them, when the wrapper itself
@@ -414,17 +472,19 @@ fn interrupted_before_start(request: &Request, original: Original, started: Inst
         .with_reason("interrupted while building the tools")
 }
 
-/// Builds `zakura-sim` and the fuzz target, logging into `<out>/logs/`, and
-/// copies both into `<out>/bin/`.
+/// Builds `zakura-sim` and the fuzz target into `<builds>/sim` and
+/// `<builds>/sim-fuzz`, logging into `<out>/logs/`, and copies both into
+/// `<out>/bin/`.
 fn build_tools(
     repo_root: &Path,
+    builds: &Path,
     request: &Request,
     interrupt: &AtomicBool,
 ) -> Result<Result<Tools, Stop>, BoxError> {
     let logs = request.out.join(LOGS_DIR);
     fs::create_dir_all(&logs)?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let sim_target = repo_root.join("target").join("sim");
+    let sim_target = builds.join("sim");
     let mut build_sim = Command::new(&cargo);
     build_sim
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
@@ -438,7 +498,7 @@ fn build_tools(
         return Ok(Err(stop));
     }
 
-    let fuzz_target = repo_root.join("target").join("sim-fuzz");
+    let fuzz_target = builds.join("sim-fuzz");
     let fuzz_build = FuzzBuild {
         fuzz_dir: fuzz_dir(repo_root),
         target_dir: fuzz_target.clone(),
@@ -531,6 +591,12 @@ fn build(
             log.display()
         ))),
     })
+}
+
+/// The directory under `<out>` that holds the pinned copies of `zakura-sim`
+/// and the fuzz target.
+pub(super) fn bin_dir(out: &Path) -> PathBuf {
+    out.join(BIN_DIR)
 }
 
 /// The fuzz target binary cargo-fuzz built under `target_dir`, in its one
@@ -656,6 +722,9 @@ pub(super) enum Status {
     Minimized,
     /// The original passed every check, and no smaller candidate did.
     OriginalKept,
+    /// The original passed every check, and only its confirmation was
+    /// asked for ([`confirm`]), so `tmin` didn't run.
+    Confirmed,
     /// The original failed a check, so nothing was reduced.
     OriginalRejected,
     /// SIGINT, SIGTERM or SIGHUP stopped the run. The original's copy, and any
@@ -677,6 +746,7 @@ impl fmt::Display for Status {
         f.write_str(match self {
             Status::Minimized => "minimized",
             Status::OriginalKept => "original-kept",
+            Status::Confirmed => "confirmed",
             Status::OriginalRejected => "original-rejected",
             Status::Interrupted => "interrupted",
             Status::BuildFailed => "build-failed",
@@ -980,14 +1050,16 @@ pub(super) fn minimize_with(
     write_report(request, report, started)
 }
 
-/// [`minimize_with`]'s steps: fills in `report`, with the wrapper's own
-/// failures as errors.
-fn reduce(
+/// Records the pinned build in `report`, checks that the harness registers
+/// the property, and confirms the original in fresh processes. Returns
+/// whether the original passed. Otherwise `report` ends
+/// [`Status::Interrupted`] or [`Status::OriginalRejected`].
+fn check_original(
     request: &Request,
     tools: &Tools,
     report: &mut Report,
     interrupt: &AtomicBool,
-) -> Result<(), BoxError> {
+) -> Result<bool, BoxError> {
     let out = &request.out;
     report.build = Some(BuildRecord {
         source: tools.source.clone(),
@@ -1010,7 +1082,7 @@ fn reduce(
             Status::Interrupted,
             "interrupted while checking the property",
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // The original, in fresh processes.
@@ -1020,7 +1092,7 @@ fn reduce(
             Status::Interrupted,
             "interrupted while checking the original",
         );
-        return Ok(());
+        return Ok(false);
     };
     if let (Some(build), Some(file)) = (report.build.as_mut(), &verdict.confirmation_file) {
         let confirmation = read_json(&out.join(file))?;
@@ -1032,8 +1104,29 @@ fn reduce(
     report.original.check = Some(verdict);
     if !accepted {
         report.end(Status::OriginalRejected, detail);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// [`minimize_with`]'s steps: fills in `report`, with the wrapper's own
+/// failures as errors. Checks the original with [`check_original`], then
+/// runs `tmin` and confirms its candidates.
+fn reduce(
+    request: &Request,
+    tools: &Tools,
+    report: &mut Report,
+    interrupt: &AtomicBool,
+) -> Result<(), BoxError> {
+    if !check_original(request, tools, report, interrupt)? {
         return Ok(());
     }
+    let out = &request.out;
+    let checker = Checker {
+        request,
+        tools,
+        interrupt,
+    };
 
     // The reduction.
     let tmin_dir = out.join(TMIN_DIR);

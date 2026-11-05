@@ -112,8 +112,8 @@ mutation. The tests build a small synthetic checkout and bundle.
 
 `cargo xtask planted pilot` runs the paired experiments from this
 catalogue (mut-3). It checks out each pinned revision in fresh worktrees,
-so it runs from a later tree such as `main`. The Python checker's tree pin
-then fails, but the runner checks the same pins itself: each patch, witness
+so it runs from a later tree such as `main`. There the Python checker's
+`--at-pin` check fails, so the runner checks the pins itself: each patch, witness
 input and production file must match its catalogue hash, and each trace or
 fuzz build must pair with the catalogue's build identity. The runner builds
 the original and every mutant in separate worktrees and target directories

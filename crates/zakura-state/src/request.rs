@@ -385,9 +385,9 @@ pub struct SemanticallyVerifiedBlock {
     /// The precomputed ZIP-244 authorizing-data commitment root for this block,
     /// if it was computed during verification.
     ///
-    /// The checkpoint verifier can set this ahead of the single-threaded
-    /// finalized committer. `None` means the committer falls back to computing
-    /// it from the block's transactions.
+    /// Checkpoint and semantic block verification can compute this before commit.
+    /// The root must come from this block's transactions. `None` means the
+    /// committer falls back to computing it from those transactions.
     pub auth_data_root: Option<AuthDataRoot>,
     /// Original verifier receipt order, also forwarded by trusted mirrors.
     ///
@@ -910,6 +910,12 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
 }
 
 /// Returns the transaction IDs and ZIP-244 authorizing-data root for `block`.
+///
+/// Unlike the semantic verifier, which checks the transaction Merkle root before it hashes any
+/// authorizing data, these constructors run for a body that is already bound to its header: a
+/// block another verifier committed, a block read back from disk, or the tip loaded at start-up.
+/// They need both the IDs and the root, so each transaction's shared ZIP-244 decomposition is
+/// walked once, in parallel across the block.
 fn transaction_hashes_and_auth_data_root(
     block: &block::BlockRef,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {

@@ -1141,41 +1141,59 @@ impl TemplateAnswer {
     }
 }
 
-/// The log target for per-answer `getblocktemplate` timings. Operators opt in with the
-/// `zakura_rpc::getblocktemplate=debug` filter directive.
+/// The log target for per-answer `getblocktemplate` timings. Operators can silence it with the
+/// `zakura_rpc::getblocktemplate=warn` filter directive.
 const GET_BLOCK_TEMPLATE_LOG_TARGET: &str = "zakura_rpc::getblocktemplate";
 
-/// Logs one `getblocktemplate` answer with why it returned, how long the request waited before
-/// that happened (`wait`), and how long it then took to answer (`build`), including fetches,
-/// transaction selection, validation and any rebuilds of superseded templates.
+/// Logs one `getblocktemplate` answer: why the request first woke (`reason`), which path built
+/// the returned template (`answer`), how long the request waited before it woke (`wait`), and
+/// how long it then took to answer (`build`), including fetches, transaction selection,
+/// validation and any rebuilds of superseded templates. `reason` and `answer` differ only when
+/// a rebuild returned through another path.
 ///
-/// `woke` is when the request first saw the change it returns for: the start of the loop pass
-/// that found it, or the moment the tip wait finished.
+/// `wake` is when and why the request first saw a change to return for: the start of the loop
+/// pass that found it, or the moment the tip wait finished.
+///
+/// Answers on a new tip log at info, once per block for each long poller, because release
+/// builds compile out debug logs and pools need these to join their timings with ours. Other
+/// answers can come every few seconds, so they log at debug.
 fn log_template_answer(
-    reason: TemplateAnswer,
+    wake: (tokio::time::Instant, TemplateAnswer),
+    answer: TemplateAnswer,
     template: &GetBlockTemplateResponse,
     request_started: tokio::time::Instant,
-    woke: tokio::time::Instant,
     rebuilds: usize,
 ) {
     let GetBlockTemplateResponse::TemplateMode(template) = template else {
         return;
     };
+    let (woke, reason) = wake;
     let wait = woke.saturating_duration_since(request_started);
     let build = woke.elapsed();
 
-    tracing::debug!(
-        target: GET_BLOCK_TEMPLATE_LOG_TARGET,
-        reason = reason.as_str(),
-        height = template.height,
-        previous_block_hash = %template.previous_block_hash,
-        transactions = template.transactions.len(),
-        submit_old = ?template.submit_old,
-        ?wait,
-        ?build,
-        rebuilds,
-        "answered getblocktemplate"
-    );
+    macro_rules! log_answer {
+        ($level:ident) => {
+            tracing::$level!(
+                target: GET_BLOCK_TEMPLATE_LOG_TARGET,
+                reason = reason.as_str(),
+                answer = answer.as_str(),
+                height = template.height,
+                previous_block_hash = %template.previous_block_hash,
+                transactions = template.transactions.len(),
+                submit_old = ?template.submit_old,
+                ?wait,
+                ?build,
+                rebuilds,
+                "answered getblocktemplate"
+            )
+        };
+    }
+
+    if matches!(answer, TemplateAnswer::OldTip | TemplateAnswer::NewTip) {
+        log_answer!(info);
+    } else {
+        log_answer!(debug);
+    }
 }
 
 /// The outcome of validating one server mining template.
@@ -3591,8 +3609,8 @@ where
         // 20 seconds) even though fresh work is one read away, so rebuild from current
         // state instead. The bound guards against pathological tip or rejection churn.
         let mut max_time_reached = false;
-        // When the request first saw the change it returns for. Rebuilds keep it, so their
-        // time counts as answering rather than waiting.
+        // When and why the request first saw a change to return for. Rebuilds keep it, so
+        // their time counts as answering rather than waiting.
         let mut first_wake = None;
         'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
@@ -3614,7 +3632,7 @@ where
                 mempool_tx_deps,
                 submit_old,
                 reason,
-                woke,
+                wake,
             ) = loop {
                 let pass_started = tokio::time::Instant::now();
 
@@ -3668,7 +3686,7 @@ where
                             .same_tip(client_long_poll_id)
                     })
                 {
-                    let woke = *first_wake.get_or_insert(pass_started);
+                    let wake = *first_wake.get_or_insert((pass_started, TemplateAnswer::OldTip));
                     if let Some(template) = self
                         .new_tip_template(
                             None,
@@ -3680,10 +3698,10 @@ where
                         .await?
                     {
                         log_template_answer(
+                            wake,
                             TemplateAnswer::OldTip,
                             &template,
                             request_started,
-                            woke,
                             rebuild,
                         );
                         return Ok(template);
@@ -3751,7 +3769,7 @@ where
                         mempool_tx_deps,
                         submit_old,
                         reason,
-                        *first_wake.get_or_insert(pass_started),
+                        *first_wake.get_or_insert((pass_started, reason)),
                     );
                 }
 
@@ -3875,7 +3893,8 @@ where
                     }
 
                     precomputed_coinbase = wait_for_new_tip => {
-                        let woke = *first_wake.get_or_insert_with(tokio::time::Instant::now);
+                        let wake = *first_wake
+                            .get_or_insert_with(|| (tokio::time::Instant::now(), TemplateAnswer::NewTip));
                         let precomputed_coinbase = precomputed_coinbase?;
                         let chain_info = fetch_chain_info(read_state.clone()).await?;
                         let Some(rejection_state) =
@@ -3903,10 +3922,10 @@ where
                             .await?
                         {
                             log_template_answer(
+                                wake,
                                 TemplateAnswer::NewTip,
                                 &template,
                                 request_started,
-                                woke,
                                 rebuild,
                             );
                             return Ok(template);
@@ -3989,7 +4008,7 @@ where
                 .finish_mining_template(template, &chain_info, miner_params)
                 .await?
             {
-                log_template_answer(reason, &template, request_started, woke, rebuild);
+                log_template_answer(wake, reason, &template, request_started, rebuild);
                 return Ok(template);
             }
         }

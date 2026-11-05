@@ -1425,28 +1425,30 @@ async fn shielded_template_rewards() {
     assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }
 
-/// A same-tip long poll answer is labelled by the first thing that changed: no ID, the time
-/// range, the rejection revision, and otherwise the mempool.
+/// A same-tip long poll answer is labelled by what changed, and when several things changed, by
+/// the first of: no ID, the time range, the rejection revision, and otherwise the mempool.
 #[test]
 fn same_tip_template_answer_reasons() {
     let client =
         LongPollInput::new(Height(1), Hash([1; 32]), DateTime32::from(100), vec![]).generate_id();
     let mut new_mempool = client;
     new_mempool.mempool_transaction_count += 1;
-    let mut new_revision = new_mempool;
+    let mut new_revision = client;
     new_revision.revision += 1;
-    let mut new_time_range = new_revision;
+    let mut new_time_range = client;
     new_time_range.max_timestamp += 1;
+    let mut everything_new = new_mempool;
+    everything_new.revision += 1;
+    everything_new.max_timestamp += 1;
 
+    // One change at a time.
     assert_eq!(
-        TemplateAnswer::for_same_tip(None, &new_time_range, true),
-        TemplateAnswer::NoLongPoll,
-        "a request without an ID never waited, so nothing woke it"
+        TemplateAnswer::for_same_tip(Some(&client), &new_mempool, false),
+        TemplateAnswer::Mempool
     );
     assert_eq!(
-        TemplateAnswer::for_same_tip(Some(&client), &new_revision, true),
-        TemplateAnswer::MaxTime,
-        "the time range expired while this request waited"
+        TemplateAnswer::for_same_tip(Some(&client), &new_revision, false),
+        TemplateAnswer::Rejection
     );
     assert_eq!(
         TemplateAnswer::for_same_tip(Some(&client), &new_time_range, false),
@@ -1454,11 +1456,25 @@ fn same_tip_template_answer_reasons() {
         "the client's ID is from an earlier time range on this tip"
     );
     assert_eq!(
-        TemplateAnswer::for_same_tip(Some(&client), &new_revision, false),
-        TemplateAnswer::Rejection
+        TemplateAnswer::for_same_tip(Some(&client), &new_mempool, true),
+        TemplateAnswer::MaxTime,
+        "the time range expired while this request waited"
+    );
+
+    // Precedence.
+    assert_eq!(
+        TemplateAnswer::for_same_tip(None, &everything_new, true),
+        TemplateAnswer::NoLongPoll,
+        "a request without an ID never waited, so nothing woke it"
     );
     assert_eq!(
-        TemplateAnswer::for_same_tip(Some(&client), &new_mempool, false),
-        TemplateAnswer::Mempool
+        TemplateAnswer::for_same_tip(Some(&client), &everything_new, false),
+        TemplateAnswer::MaxTime
+    );
+    let mut revision_and_mempool = new_mempool;
+    revision_and_mempool.revision += 1;
+    assert_eq!(
+        TemplateAnswer::for_same_tip(Some(&client), &revision_and_mempool, false),
+        TemplateAnswer::Rejection
     );
 }

@@ -95,6 +95,11 @@ pub(super) struct Entry {
     /// reactor removes only a closed entry, so a disconnect it handles late
     /// cannot remove a replacement admitted in the meantime.
     pub(super) session_closed: bool,
+    /// The free slots of the current generation's outbound stream queue.
+    /// Serving responses and reactor Status sends share the queue with the
+    /// routine, so they can fill it between two slot publications. Floor
+    /// preference reads it live.
+    pub(super) outbound: Option<crate::zakura::regulation::SlotBudget>,
 }
 
 impl Entry {
@@ -117,14 +122,22 @@ impl Entry {
             generation,
             conn_id: None,
             session_closed: false,
+            outbound: None,
         }
     }
 
+    /// Whether this session serves `height` and can send a request now: its
+    /// last publication showed a free slot, and its outbound queue still has
+    /// room.
     fn can_serve_with_room(&self, height: block::Height) -> bool {
         self.received_status
             && self.servable_low <= height
             && height <= self.servable_high
             && self.slots.available_slots > 0
+            && self
+                .outbound
+                .as_ref()
+                .is_none_or(|outbound| outbound.available() > 0)
     }
 
     /// Only a session that could carry the floor can have made another routine
@@ -689,6 +702,20 @@ impl PeerRegistry {
     /// between deferring to another peer and waiting for work.
     pub(super) fn subscribe_floor_ranking(&self) -> &Notify {
         &self.floor_ranking_changed
+    }
+
+    /// Record `outbound` as `generation`'s outbound stream queue, so floor
+    /// preference sees the queue fill without waiting for a publication. A
+    /// superseded generation records nothing.
+    pub(super) fn attach_outbound(
+        &self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+        outbound: &crate::zakura::FramedSend,
+    ) {
+        self.lock()
+            .state
+            .attach_outbound(peer, generation, outbound.capacity_probe());
     }
 
     /// The handoff flag of `generation`'s entry, which its routine sets while

@@ -1,0 +1,264 @@
+    Updating crates.io index
+     Locking 40 packages to latest compatible versions
+      Adding proc-macro-crate v3.5.0
+      Adding ref-cast v1.0.27
+      Adding ref-cast-impl v1.0.27
+      Adding sha2-asm v0.6.4
+      Adding toml_edit v0.25.13+spec-1.1.0 (available: v0.25.18+spec-1.1.0)
+    Updating zakura-address v4.0.0 -> v5.1.0
+    Updating zakura-bellman v4.0.0 -> v5.1.0
+      Adding zakura-bento v0.1.0
+      Adding zakura-bento-core v0.1.0
+      Adding zakura-bento-macros v0.1.0
+    Updating zakura-bls12-381 v4.0.0 -> v5.1.0
+    Updating zakura-chain v11.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-chain) -> v12.0.0
+    Updating zakura-equihash v4.0.0 -> v5.1.0
+    Updating zakura-halo2-gadgets v4.0.0 -> v5.1.0
+    Updating zakura-halo2-poseidon v4.0.0 -> v5.1.0
+    Updating zakura-halo2-proofs v4.0.0 -> v5.1.0
+    Updating zakura-header-chain v5.0.1 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-header-chain) -> v5.0.2
+    Updating zakura-jubjub v4.0.0 -> v5.1.0
+    Updating zakura-network v11.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-network) -> v13.0.0
+    Updating zakura-node-services v5.0.1 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-node-services) -> v5.1.0
+    Updating zakura-note-encryption v4.0.0 -> v5.1.0
+    Updating zakura-orchard v4.0.0 -> v5.1.0
+    Updating zakura-orchard-legacy v4.0.0 -> v5.1.0
+    Updating zakura-pairing v4.0.0 -> v5.1.0
+    Updating zakura-pasta-curves v4.0.0 -> v5.1.0
+    Updating zakura-primitives v4.0.0 -> v5.1.0
+    Updating zakura-protocol v4.0.0 -> v5.1.0
+    Updating zakura-quic v0.1.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-quic) -> v0.2.0
+    Updating zakura-reddsa v4.0.0 -> v5.1.0
+    Updating zakura-redjubjub v4.0.0 -> v5.1.0
+    Updating zakura-rt v0.1.0-rc0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-rt) -> v0.1.0
+    Updating zakura-sapling-crypto v4.0.0 -> v5.1.0
+      Adding zakura-sensei v0.1.0
+      Adding zakura-sensei-artifacts v0.1.0
+      Adding zakura-sensei-macros v0.1.0
+      Adding zakura-sensei-shared v0.1.0
+    Updating zakura-sinsemilla v4.0.0 -> v5.1.0
+    Updating zakura-transparent v4.0.0 -> v5.1.0
+      Adding zakura-udon v0.2.0
+      Adding zakura-zcash-script v0.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling libc v0.2.191
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling serde_core v1.0.229
+   Compiling rand_core v0.10.1
+   Compiling version_check v0.9.5
+   Compiling subtle v2.6.1
+   Compiling serde v1.0.229
+   Compiling cpufeatures v0.3.1
+   Compiling shlex v2.0.1
+   Compiling generic-array v0.14.7
+   Compiling find-msvc-tools v0.1.15
+   Compiling pin-project-lite v0.2.17
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayvec v0.7.8
+   Compiling crossbeam-utils v0.8.23
+   Compiling getrandom v0.4.3
+   Compiling crossbeam-epoch v0.9.21
+   Compiling once_cell v1.21.4
+   Compiling crossbeam-deque v0.8.8
+   Compiling syn v2.0.119
+   Compiling syn v3.0.9
+   Compiling blake2b_simd v1.0.5
+   Compiling ff v0.14.0
+   Compiling rayon-core v1.13.0
+   Compiling jobserver v0.1.35
+   Compiling either v1.19.0
+   Compiling cc v1.10.0
+   Compiling group v0.14.0
+   Compiling static_assertions v1.1.0
+   Compiling zakura-pasta-curves v5.1.0
+   Compiling tracing-core v0.1.36
+   Compiling rayon v1.12.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling memchr v2.8.3
+   Compiling digest v0.10.7
+   Compiling slab v0.4.12
+   Compiling futures-sink v0.3.34
+   Compiling futures-core v0.3.34
+   Compiling futures-task v0.3.34
+   Compiling futures-channel v0.3.34
+   Compiling cpufeatures v0.2.17
+   Compiling thiserror v2.0.21
+   Compiling futures-io v0.3.34
+   Compiling serde_derive v1.0.229
+   Compiling futures-macro v0.3.34
+   Compiling thiserror-impl v2.0.21
+   Compiling zakura-pairing v5.1.0
+   Compiling bytes v1.12.1
+   Compiling tokio-macros v2.7.2
+   Compiling futures-util v0.3.34
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling autocfg v1.5.1
+   Compiling cmov v0.5.4
+   Compiling zakura-bls12-381 v5.1.0
+   Compiling maybe-rayon v0.1.1
+   Compiling ctutils v0.4.6
+   Compiling tokio v1.54.1
+   Compiling sha2 v0.10.9
+   Compiling getrandom v0.2.17
+   Compiling corez v0.1.1
+   Compiling secp256k1-sys v0.14.1
+   Compiling semver v1.0.28
+   Compiling zakura-jubjub v5.1.0
+   Compiling rustc_version v0.4.1
+   Compiling zeroize_derive v1.5.0
+   Compiling tracing-attributes v0.1.31
+   Compiling zeroize v1.9.1
+   Compiling hybrid-array v0.4.15
+   Compiling tracing v0.1.44
+   Compiling crypto-common v0.2.2
+   Compiling inout v0.2.5
+   Compiling block-buffer v0.12.1
+   Compiling nonempty v0.11.0
+   Compiling hex v0.4.3
+   Compiling curve25519-dalek v4.1.3
+   Compiling getset v0.1.7
+   Compiling ring v0.17.14
+   Compiling zcash_spec v0.2.1
+   Compiling cipher v0.5.2
+   Compiling chacha20 v0.10.2
+   Compiling universal-hash v0.6.1
+   Compiling aead v0.6.1
+   Compiling poly1305 v0.9.1
+   Compiling equivalent v1.0.3
+   Compiling rand v0.10.3
+   Compiling crunchy v0.2.4
+   Compiling chacha20poly1305 v0.11.0
+   Compiling zakura-note-encryption v5.1.0
+   Compiling zakura-protocol v5.1.0
+   Compiling bounded-vec v0.9.0
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling bs58 v0.5.1
+   Compiling num-traits v0.2.19
+   Compiling sha1 v0.10.7
+   Compiling ripemd v0.1.3
+   Compiling incrementalmerkletree v0.8.2
+   Compiling blake2s_simd v1.0.5
+   Compiling bitflags v2.13.2
+   Compiling allocator-api2 v0.2.21
+   Compiling bech32 v0.11.1
+   Compiling foldhash v0.2.0
+   Compiling signature v2.2.0
+   Compiling ed25519 v2.2.3
+   Compiling zakura-address v5.1.0
+   Compiling hashbrown v0.16.1
+   Compiling zakura-bellman v5.1.0
+   Compiling zakura-reddsa v5.1.0
+   Compiling zakura-halo2-proofs v5.1.0
+   Compiling zakura-sinsemilla v5.1.0
+   Compiling zakura-halo2-poseidon v5.1.0
+   Compiling tokio-util v0.7.20
+   Compiling zakura-redjubjub v5.1.0
+   Compiling futures-executor v0.3.34
+   Compiling rand_core v0.6.4
+   Compiling rustversion v1.0.23
+   Compiling ref-cast v1.0.27
+   Compiling byteorder v1.5.0
+   Compiling untrusted v0.9.0
+   Compiling uint v0.10.2
+   Compiling ed25519-zebra v4.2.0
+   Compiling futures v0.3.34
+   Compiling tokio-stream v0.1.19
+   Compiling zakura-sapling-crypto v5.1.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling ref-cast-impl v1.0.27
+   Compiling zmij v1.0.23
+   Compiling rustls v0.23.46
+   Compiling chrono v0.4.45
+   Compiling zakura-rt v0.1.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-rt)
+   Compiling rustls-webpki v0.103.16
+   Compiling zakura-mmr-tree v0.1.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-mmr-tree)
+   Compiling zakura-equihash v5.1.0
+   Compiling zakura-halo2-gadgets v5.1.0
+   Compiling itertools v0.14.0
+   Compiling secp256k1 v0.33.1
+   Compiling serde_json v1.0.154
+   Compiling zakura-zcash-script v0.0.1
+   Compiling rapidhash v4.5.1
+   Compiling zakura-transparent v5.1.0
+   Compiling rand_pcg v0.10.2
+   Compiling rustc-hash v2.1.3
+   Compiling tinyvec v1.13.3
+   Compiling tower-layer v0.3.3
+   Compiling sync_wrapper v1.0.2
+   Compiling itoa v1.0.18
+   Compiling tower-service v0.3.3
+   Compiling lru-slab v0.1.3
+   Compiling tower v0.5.3
+   Compiling quinn-proto v0.11.19
+   Compiling metrics v0.24.6
+   Compiling pin-project-internal v1.1.13
+   Compiling zakura-orchard-legacy v5.1.0
+   Compiling zakura-orchard v5.1.0
+   Compiling corosensei v0.3.4
+   Compiling hashbrown v0.17.1
+   Compiling pin-project v1.1.13
+   Compiling zakura-jsonl-trace v1.2.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-jsonl-trace)
+   Compiling indexmap v2.14.2
+   Compiling zakura-quic v0.2.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-quic)
+   Compiling winnow v1.0.3
+   Compiling scopeguard v1.2.0
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling zakura-sim v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim)
+   Compiling libfuzzer-sys v0.4.13
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling toml v1.1.2+spec-1.1.0
+   Compiling zakura-primitives v5.1.0
+   Compiling zakura-chain v12.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-chain)
+   Compiling zakura-scheduler v0.1.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-scheduler)
+   Compiling arbitrary v1.5.0
+   Compiling zakura-header-chain v5.0.2 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-header-chain)
+   Compiling zakura-node-services v5.1.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-node-services)
+   Compiling zakura-network v13.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-network)
+   Compiling zakura-storage v0.1.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-storage)
+   Compiling zakura-sim-fuzz v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/qa/fuzz/sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 08s
+discovery_record_book (discovery/record-book): build-failed: the checkout at /home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim/../.. changed during the build, from Checkout { git: "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57", dirty: false, source: "65f7e72e7913985945bcc9255778cb0f96d4a3b265acd895dbe842bf89b837ff", lockfile: "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade", fuzz_lockfile: "67e85093c3cfa23ff637a8ae2731bb3e498c05b733be818e52922cebf7592885" } to Checkout { git: "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57", dirty: true, source: "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be", lockfile: "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade", fuzz_lockfile: "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc" }; build again from a tree that doesn't change
+  applied: discovery/record-book
+  retained bypass: discovery/record-book qa/planted/discovery/record-book/keep-old-relay-attribution.patch
+  retained bypass: discovery/record-book qa/planted/discovery/record-book/skip-book-eviction.patch
+  retained bypass: discovery/record-book qa/planted/discovery/record-book/widen-disclosure-window.patch
+  retained bypass: discovery/record-book qa/planted/discovery/record-book/wrong-eviction-victim.patch
+   Compiling zakura-sim v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim)
+   Compiling zakura-sim-fuzz v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/qa/fuzz/sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 58s
+block_decoded_retention (block/decoded-retention): build-failed: the checkout at /home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim/../.. changed during the build, from Checkout { git: "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57", dirty: true, source: "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be", lockfile: "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade", fuzz_lockfile: "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc" } to Checkout { git: "b2e0456474e47e6264c912b2f6b50d09c8603115", dirty: false, source: "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be", lockfile: "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade", fuzz_lockfile: "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc" }; build again from a tree that doesn't change
+  applied: block/decoded-retention
+  retained bypass: block/decoded-retention qa/planted/block/decoded-retention/double-release.patch
+  retained bypass: block/decoded-retention qa/planted/block/decoded-retention/missing-admission.patch
+  retained bypass: block/decoded-retention qa/planted/block/decoded-retention/raw-header-escape.patch
+  retained bypass: block/decoded-retention qa/planted/block/decoded-retention/raw-transaction-escape.patch
+   Compiling zakura-sim v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim)
+   Compiling zakura-sim-fuzz v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/qa/fuzz/sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 59s
+header_reactor_policy (header/reactor-policy): ready
+  applied: header/reactor-policy
+  retained bypass: header/reactor-policy qa/planted/header/reactor-policy/locator-call-settles-without-removal.patch
+   Compiling zakura-sim v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim)
+   Compiling zakura-sim-fuzz v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/qa/fuzz/sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 04s
+block_reactor_policy (block/reactor-policy): ready
+  applied: block/reactor-policy
+  retained bypass: block/reactor-policy qa/planted/block/reactor-policy/lost-forced-retry.patch
+  retained bypass: block/reactor-policy qa/planted/block/reactor-policy/refusal-consumes-query-id.patch
+  retained bypass: block/reactor-policy qa/planted/block/reactor-policy/stale-scope-completes-query.patch
+   Compiling zakura-sim v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim)
+   Compiling zakura-sim-fuzz v0.0.0 (/home/evan/src/valar/zakura.mut-1-witness-readiness/qa/fuzz/sim)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 06s
+header_publisher_policy (header/publisher-policy): ready
+  applied: header/publisher-policy
+  retained bypass: header/publisher-policy qa/planted/header/publisher-policy/lost-credit.patch
+  retained bypass: header/publisher-policy qa/planted/header/publisher-policy/lost-job.patch
+  retained bypass: header/publisher-policy qa/planted/header/publisher-policy/lost-terminal.patch
+report in /home/evan/.tmp/mut-1-witness-readiness/targets/readiness.json
+error: 2 of 5 targets aren't ready: discovery_record_book is build-failed, block_decoded_retention is build-failed

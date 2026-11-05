@@ -1,0 +1,15 @@
+WARNING: Failed to find function "__sanitizer_acquire_crash_state".
+WARNING: Failed to find function "__sanitizer_print_stack_trace".
+WARNING: Failed to find function "__sanitizer_set_death_callback".
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 3300723936
+INFO: Loaded 1 modules   (52913 inline 8-bit counters): 52913 [0x55fac3e3e0f0, 0x55fac3e4afa1), 
+INFO: Loaded 1 PC tables (52913 PCs): 52913 [0x55fac3e4afa8,0x55fac3f19ab8), 
+INFO: 65536 Extra Counters
+/home/evan/.tmp/mut-1-witness-readiness/targets-retry/discovery_record_book/fuzzer: Running 1 inputs 1 time(s) each.
+Running: /home/evan/.tmp/mut-1-witness-readiness/targets-retry/discovery_record_book/seeds/345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2
+Executed /home/evan/.tmp/mut-1-witness-readiness/targets-retry/discovery_record_book/seeds/345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2 in 9 ms
+***
+*** NOTE: fuzzing was not performed, you have only
+***       executed the target code on a fixed set of inputs.
+***

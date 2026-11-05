@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "harness": "discovery/record-book",
+  "pid": 4120590,
+  "started_unix": 1793846682,
+  "written_unix": 1793846682,
+  "complete": true,
+  "counts": {
+    "runs": 1,
+    "outcomes": {
+      "clean": 1
+    },
+    "ends": {
+      "idle/quiescent": 1
+    },
+    "drains_exhausted": 0,
+    "cleanup": {
+      "abandoned": 0,
+      "leaked_tasks": 0,
+      "unwound": 0,
+      "panicked": 0,
+      "unwind_failures": 0
+    },
+    "properties": {
+      "discovery/record-book": {
+        "status": "active",
+        "held": 1,
+        "evaluations": 13,
+        "not_applicable": 0,
+        "inconclusive": {},
+        "violated": 0
+      }
+    },
+    "features": {}
+  }
+}

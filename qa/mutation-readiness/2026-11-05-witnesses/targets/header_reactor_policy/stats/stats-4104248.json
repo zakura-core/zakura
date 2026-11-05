@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "harness": "header/reactor-policy",
+  "pid": 4104248,
+  "started_unix": 1793846250,
+  "written_unix": 1793846250,
+  "complete": true,
+  "counts": {
+    "runs": 1,
+    "outcomes": {
+      "clean": 1
+    },
+    "ends": {
+      "idle/quiescent": 1
+    },
+    "drains_exhausted": 0,
+    "cleanup": {
+      "abandoned": 0,
+      "leaked_tasks": 0,
+      "unwound": 0,
+      "panicked": 0,
+      "unwind_failures": 0
+    },
+    "properties": {
+      "header/reactor-policy": {
+        "status": "active",
+        "held": 1,
+        "evaluations": 23,
+        "not_applicable": 0,
+        "inconclusive": {},
+        "violated": 0
+      }
+    },
+    "features": {}
+  }
+}

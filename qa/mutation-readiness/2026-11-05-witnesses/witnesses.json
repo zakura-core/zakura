@@ -1,0 +1,463 @@
+{
+  "source_revision": "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57",
+  "scope": "Every requirement from the superseded own-15 source inventory. Existing native tests do not close simulator replay or mutation sensitivity gaps.",
+  "rows": [
+    {
+      "id": "own-2.output-saturation",
+      "requirement": "Publisher output saturation",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests.rs",
+          "selector": "zakura::header_sync::v9::publisher::tests::cancel_stops_a_terminal_that_waits_for_a_full_queue",
+          "tier": "native-runtime"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests.rs",
+          "selector": "zakura::header_sync::v9::publisher::tests::a_terminal_keeps_its_slot_through_the_output_path",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": [
+        2027
+      ]
+    },
+    {
+      "id": "own-2.storage-cancellation",
+      "requirement": "Publisher cancellation during a storage call",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests.rs",
+          "selector": "zakura::header_sync::v9::publisher::tests::a_cancelled_read_keeps_its_lease_and_budgets_until_storage_answers",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": [
+        2027
+      ]
+    },
+    {
+      "id": "own-2.abandoned-job-panic",
+      "requirement": "An abandoned publisher job panics",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests.rs",
+          "selector": "zakura::header_sync::v9::publisher::tests::an_abandoned_page_job_panic_reaches_the_session_owner",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-2.concurrent-terminal",
+      "requirement": "A publisher terminal waits while another page completes",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/header_sync/v9/publisher/tests.rs",
+          "selector": "zakura::header_sync::v9::publisher::tests::a_terminal_wait_keeps_the_other_page_moving",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-4.action-queue-refusal",
+      "requirement": "A full action queue refuses a needed-block query",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/tests.rs",
+          "selector": "zakura::block_sync::tests::failed_needed_block_query_keeps_retrying_when_action_queue_is_full",
+          "tier": "native-runtime"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/tests/query_lifecycle.rs",
+          "selector": "zakura::block_sync::tests::query_lifecycle::full_action_channel_keeps_the_accepted_query_and_its_next_id",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "The simulator reactor-query-lifecycle coverage row still has a Pending bypass: no committed input fills or closes the action channel.",
+      "related_prs": []
+    },
+    {
+      "id": "own-4.work-rejection",
+      "requirement": "Shared work rejects after the reactor observation",
+      "disposition": "new-work",
+      "tests": [],
+      "remaining": "Add a controlled runtime rejection between observation and admission, then assert unchanged query authority and retained retry.",
+      "related_prs": []
+    },
+    {
+      "id": "own-4.peer-task-termination",
+      "requirement": "A block peer task terminates",
+      "disposition": "partial-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/tests.rs",
+          "selector": "zakura::block_sync::tests::routine_disconnect_returns_outstanding_and_releases_budget",
+          "tier": "native-runtime"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/transport/pipe.rs",
+          "selector": "zakura::transport::pipe::tests::supervised_peer_task_runs_teardown_and_disconnect_on_panic",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "Orderly block-routine disconnect and shared peer-task panic supervision have separate tests. Add a composed block peer-task panic witness with exact session cleanup and surviving peer progress.",
+      "related_prs": []
+    },
+    {
+      "id": "own-4.shutdown-query",
+      "requirement": "Shutdown while a block query is pending",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/tests/query_lifecycle.rs",
+          "selector": "zakura::block_sync::tests::query_lifecycle::shutdown_with_an_accepted_query_closes_both_reply_routes",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "The native reactor shutdown witness exists. The header shutdown hooks in #2027 remain reusable for header-only simulator work, not this block path.",
+      "related_prs": [
+        2027
+      ]
+    },
+    {
+      "id": "own-5.fence-refusal",
+      "requirement": "Writer fence refuses request publication",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine/fill/tests.rs",
+          "selector": "zakura::block_sync::peer_routine::fill::tests::fence_retirement_before_publication_rolls_back_funding",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "The native failure matrix pauses phases without a concurrent scheduler. Simulator scheduling and intended mutation proof remain open.",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.transport-close",
+      "requirement": "Transport closes during publication",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine/fill/tests.rs",
+          "selector": "zakura::block_sync::peer_routine::fill::tests::a_transport_close_during_publication_settles_the_claim",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "The native failure matrix covers the actual PeerRoutine publication boundary without a concurrent scheduler.",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.reset-publication",
+      "requirement": "Reset races request publication",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/work_queue/request_write/tests.rs",
+          "selector": "zakura::block_sync::work_queue::request_write::tests::reset_cannot_interleave_outstanding_publication_and_enqueue",
+          "tier": "runtime-owner"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine/lifecycle_tests.rs",
+          "selector": "zakura::block_sync::peer_routine::lifecycle_tests::a_reset_before_writer_start_skips_the_published_request",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.writer-start-publication",
+      "requirement": "Writer starts during publication",
+      "disposition": "new-work",
+      "tests": [],
+      "remaining": "Add a controlled writer-start interleaving at the full PeerRoutine publication boundary; a reset-before-start test does not establish this race.",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.guard-contention",
+      "requirement": "Guard cleanup under contention",
+      "disposition": "partial-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/work_queue/request_write/tests.rs",
+          "selector": "zakura::block_sync::work_queue::request_write::tests::queued_expiry_racing_reset_settles_each_reservation_once",
+          "tier": "runtime-owner"
+        }
+      ],
+      "remaining": "Owner expiry/reset races are covered. Session guard cleanup under contended admission still needs a dedicated witness.",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.waiter-setup",
+      "requirement": "Capacity releases during waiter setup",
+      "disposition": "partial-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/work_queue/request_write/tests.rs",
+          "selector": "zakura::block_sync::work_queue::request_write::tests::capacity_release_wakes_after_unlocking_the_work_queue",
+          "tier": "runtime-owner"
+        }
+      ],
+      "remaining": "This test registers its waiter before releasing capacity. Add the setup-window interleaving; do not infer it from an already-registered waiter.",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.cancel-decode",
+      "requirement": "Cancellation during decode",
+      "disposition": "partial-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/tests.rs",
+          "selector": "zakura::block_sync::tests::add_peer_connection_shutdown_cancels_pending_block_validation",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "The test cancels while decode capacity is unavailable. Cancellation during an executing decode still needs its own witness.",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.cancel-send",
+      "requirement": "Cancellation during send",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine/lifecycle_tests.rs",
+          "selector": "zakura::block_sync::peer_routine::lifecycle_tests::receipt_waits_for_admission_before_settlement",
+          "tier": "native-runtime"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine/lifecycle_tests.rs",
+          "selector": "zakura::block_sync::peer_routine::lifecycle_tests::receipt_keeps_funding_until_the_production_send_completes",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.buffered-close",
+      "requirement": "A buffered response exists at connection close",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine.rs",
+          "selector": "zakura::block_sync::peer_routine::tests::buffered_responses_are_considered_before_stream_failure",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-5.old-session-drop",
+      "requirement": "An old session drops after replacement",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/block_sync/peer_routine/lifecycle_tests.rs",
+          "selector": "zakura::block_sync::peer_routine::lifecycle_tests::a_stale_session_cleanup_leaves_the_replacement_request",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-7.verification-wait-cancel",
+      "requirement": "Cancellation while waiting for verification",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/service.rs",
+          "selector": "zakura::discovery::service::tests::cancelled_session_drops_a_hello_waiting_for_a_verification_slot",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-7.verification-mutex",
+      "requirement": "Verification occurs outside the global mutex",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/protocol.rs",
+          "selector": "zakura::discovery::protocol::tests::import_peer_records_verifies_signatures_without_holding_global_mutex",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-7.replaced-publication",
+      "requirement": "Publication after session replacement",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/service.rs",
+          "selector": "zakura::discovery::service::tests::a_replaced_session_installs_no_answer_from_verification",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.output-full",
+      "requirement": "Discovery output queue is full",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/service.rs",
+          "selector": "zakura::discovery::service::tests::a_peer_that_stops_reading_breaks_the_margin_after_two_unsent_answers",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.verification-cancel",
+      "requirement": "Cancellation during discovery verification",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/protocol.rs",
+          "selector": "zakura::discovery::protocol::tests::cancelled_verification_caller_keeps_the_running_worker_and_payload_charged",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.replaced-settlement",
+      "requirement": "Discovery replacement during settlement",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/service.rs",
+          "selector": "zakura::discovery::service::tests::discovery_source_replaced_during_settle_does_not_complete_exchange",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.timeout-answers",
+      "requirement": "Discovery timeout with pending answers",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/service.rs",
+          "selector": "zakura::discovery::service::tests::timed_out_close_waits_for_a_delivered_answer_or_a_hello",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.foreign-registration",
+      "requirement": "A discovery connection registers elsewhere",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/candidate_dialer/tests.rs",
+          "selector": "zakura::discovery::candidate_dialer::tests::connected_elsewhere_leaves_the_record_unconfirmed",
+          "tier": "native-runtime"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/candidate_dialer/tests.rs",
+          "selector": "zakura::discovery::candidate_dialer::tests::another_connections_registration_end_does_not_credit_an_unregistered_dial",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.delayed-registration",
+      "requirement": "Discovery registration arrives late",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/candidate_dialer/tests.rs",
+          "selector": "zakura::discovery::candidate_dialer::tests::a_served_dial_with_a_delayed_registration_is_short_lived",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.worker-panic",
+      "requirement": "Discovery worker panic recovery",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/candidate_dialer/tests.rs",
+          "selector": "zakura::discovery::candidate_dialer::tests::panicked_worker_returns_metadata_needed_to_release_reservations",
+          "tier": "native-runtime"
+        },
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/candidate_dialer/tests.rs",
+          "selector": "zakura::discovery::candidate_dialer::tests::panicked_attempt_releases_its_original_reservations",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.worker-shutdown",
+      "requirement": "Discovery shutdown with live workers",
+      "disposition": "existing-test",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/candidate_dialer/tests.rs",
+          "selector": "zakura::discovery::candidate_dialer::tests::shutdown_joins_started_and_unpolled_workers_before_discarding_reservations",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.dial-progress",
+      "requirement": "Bounded discovery dial progress",
+      "disposition": "new-work",
+      "tests": [],
+      "remaining": "Define a progress bound and drive eligible work through admission, dial and exact registration under contention. Existing policy/settlement tests do not prove bounded progress.",
+      "related_prs": []
+    },
+    {
+      "id": "own-8.other-service",
+      "requirement": "Another service is admitted while discovery completes",
+      "disposition": "deferred-integration",
+      "tests": [
+        {
+          "source": "crates/zakura-network/src/zakura/discovery/service.rs",
+          "selector": "zakura::discovery::service::tests::a_service_admitted_during_the_answer_wait_keeps_the_connection",
+          "tier": "native-runtime"
+        }
+      ],
+      "remaining": "Native coverage exists. Multi-service simulator composition remains deferred with sim-9.3/xsync-3; no reviewed completion is claimed.",
+      "related_prs": []
+    }
+  ]
+}

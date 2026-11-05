@@ -1,0 +1,260 @@
+{
+  "build_revision": "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57",
+  "binary_sha256": "16dd4762480c9bcf08377e06f0f55b1564d37405f7b8977cdd19b170488a48c8",
+  "child_seconds": 10,
+  "aggregate_seconds": 90,
+  "results": [
+    {
+      "selector": "zakura::block_sync::peer_routine::lifecycle_tests::a_reset_before_writer_start_skips_the_published_request",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.008,
+      "log": "00.log"
+    },
+    {
+      "selector": "zakura::block_sync::peer_routine::lifecycle_tests::a_stale_session_cleanup_leaves_the_replacement_request",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.007,
+      "log": "01.log"
+    },
+    {
+      "selector": "zakura::block_sync::peer_routine::lifecycle_tests::receipt_keeps_funding_until_the_production_send_completes",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.009,
+      "log": "02.log"
+    },
+    {
+      "selector": "zakura::block_sync::peer_routine::lifecycle_tests::receipt_waits_for_admission_before_settlement",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.01,
+      "log": "03.log"
+    },
+    {
+      "selector": "zakura::block_sync::peer_routine::tests::buffered_responses_are_considered_before_stream_failure",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.021,
+      "log": "04.log"
+    },
+    {
+      "selector": "zakura::block_sync::tests::add_peer_connection_shutdown_cancels_pending_block_validation",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.01,
+      "log": "05.log"
+    },
+    {
+      "selector": "zakura::block_sync::tests::failed_needed_block_query_keeps_retrying_when_action_queue_is_full",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.508,
+      "log": "06.log"
+    },
+    {
+      "selector": "zakura::block_sync::work_queue::request_write::tests::capacity_release_wakes_after_unlocking_the_work_queue",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.005,
+      "log": "07.log"
+    },
+    {
+      "selector": "zakura::block_sync::work_queue::request_write::tests::queued_expiry_racing_reset_settles_each_reservation_once",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.006,
+      "log": "08.log"
+    },
+    {
+      "selector": "zakura::block_sync::work_queue::request_write::tests::receiver_closing_after_slot_reservation_settles_publication_once",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.005,
+      "log": "09.log"
+    },
+    {
+      "selector": "zakura::block_sync::work_queue::request_write::tests::reset_cannot_interleave_outstanding_publication_and_enqueue",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.025,
+      "log": "10.log"
+    },
+    {
+      "selector": "zakura::discovery::candidate_dialer::tests::a_served_dial_with_a_delayed_registration_is_short_lived",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.005,
+      "log": "11.log"
+    },
+    {
+      "selector": "zakura::discovery::candidate_dialer::tests::another_connections_registration_end_does_not_credit_an_unregistered_dial",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.005,
+      "log": "12.log"
+    },
+    {
+      "selector": "zakura::discovery::candidate_dialer::tests::connected_elsewhere_leaves_the_record_unconfirmed",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.041,
+      "log": "13.log"
+    },
+    {
+      "selector": "zakura::discovery::candidate_dialer::tests::panicked_attempt_releases_its_original_reservations",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.006,
+      "log": "14.log"
+    },
+    {
+      "selector": "zakura::discovery::candidate_dialer::tests::panicked_worker_returns_metadata_needed_to_release_reservations",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.005,
+      "log": "15.log"
+    },
+    {
+      "selector": "zakura::discovery::candidate_dialer::tests::shutdown_joins_started_and_unpolled_workers_before_discarding_reservations",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.009,
+      "log": "16.log"
+    },
+    {
+      "selector": "zakura::discovery::protocol::tests::cancelled_verification_caller_keeps_the_running_worker_and_payload_charged",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.009,
+      "log": "17.log"
+    },
+    {
+      "selector": "zakura::discovery::protocol::tests::import_peer_records_verifies_signatures_without_holding_global_mutex",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.104,
+      "log": "18.log"
+    },
+    {
+      "selector": "zakura::discovery::service::tests::a_peer_that_stops_reading_breaks_the_margin_after_two_unsent_answers",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.212,
+      "log": "19.log"
+    },
+    {
+      "selector": "zakura::discovery::service::tests::a_replaced_session_installs_no_answer_from_verification",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.145,
+      "log": "20.log"
+    },
+    {
+      "selector": "zakura::discovery::service::tests::a_service_admitted_during_the_answer_wait_keeps_the_connection",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.008,
+      "log": "21.log"
+    },
+    {
+      "selector": "zakura::discovery::service::tests::cancelled_session_drops_a_hello_waiting_for_a_verification_slot",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.06,
+      "log": "22.log"
+    },
+    {
+      "selector": "zakura::discovery::service::tests::discovery_source_replaced_during_settle_does_not_complete_exchange",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.007,
+      "log": "23.log"
+    },
+    {
+      "selector": "zakura::discovery::service::tests::timed_out_close_waits_for_a_delivered_answer_or_a_hello",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.008,
+      "log": "24.log"
+    },
+    {
+      "selector": "zakura::header_sync::v9::publisher::tests::a_cancelled_read_keeps_its_lease_and_budgets_until_storage_answers",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.027,
+      "log": "25.log"
+    },
+    {
+      "selector": "zakura::header_sync::v9::publisher::tests::a_terminal_keeps_its_slot_through_the_output_path",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.04,
+      "log": "26.log"
+    },
+    {
+      "selector": "zakura::header_sync::v9::publisher::tests::a_terminal_wait_keeps_the_other_page_moving",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.039,
+      "log": "27.log"
+    },
+    {
+      "selector": "zakura::header_sync::v9::publisher::tests::an_abandoned_page_job_panic_reaches_the_session_owner",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.007,
+      "log": "28.log"
+    },
+    {
+      "selector": "zakura::header_sync::v9::publisher::tests::cancel_stops_a_terminal_that_waits_for_a_full_queue",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.04,
+      "log": "29.log"
+    },
+    {
+      "selector": "zakura::block_sync::peer_routine::fill::tests::a_transport_close_during_publication_settles_the_claim",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.007,
+      "log": "30.log"
+    },
+    {
+      "selector": "zakura::block_sync::peer_routine::fill::tests::fence_retirement_before_publication_rolls_back_funding",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.007,
+      "log": "31.log"
+    },
+    {
+      "selector": "zakura::block_sync::tests::query_lifecycle::full_action_channel_keeps_the_accepted_query_and_its_next_id",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.258,
+      "log": "32.log"
+    },
+    {
+      "selector": "zakura::block_sync::tests::query_lifecycle::shutdown_with_an_accepted_query_closes_both_reply_routes",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.006,
+      "log": "33.log"
+    },
+    {
+      "selector": "zakura::block_sync::tests::routine_disconnect_returns_outstanding_and_releases_budget",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.011,
+      "log": "34.log"
+    },
+    {
+      "selector": "zakura::transport::pipe::tests::supervised_peer_task_runs_teardown_and_disconnect_on_panic",
+      "status": "passed",
+      "exit_code": 0,
+      "seconds": 0.005,
+      "log": "35.log"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+
+running 1 test
+test zakura::discovery::service::tests::a_peer_that_stops_reading_breaks_the_margin_after_two_unsent_answers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2637 filtered out; finished in 0.21s
+

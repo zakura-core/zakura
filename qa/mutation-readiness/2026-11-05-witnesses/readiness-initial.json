@@ -1,0 +1,253 @@
+{
+  "version": 1,
+  "sanitizer": "none",
+  "targets": [
+    {
+      "target": "discovery_record_book",
+      "harness": "discovery/record-book",
+      "status": "build-failed",
+      "detail": "the checkout at /home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim/../.. changed during the build, from Checkout { git: \"8c63fa3ec2348b036e1a24bd9fa6c677eca49c57\", dirty: false, source: \"65f7e72e7913985945bcc9255778cb0f96d4a3b265acd895dbe842bf89b837ff\", lockfile: \"53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade\", fuzz_lockfile: \"67e85093c3cfa23ff637a8ae2731bb3e498c05b733be818e52922cebf7592885\" } to Checkout { git: \"8c63fa3ec2348b036e1a24bd9fa6c677eca49c57\", dirty: true, source: \"45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be\", lockfile: \"53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade\", fuzz_lockfile: \"c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc\" }; build again from a tree that doesn't change",
+      "seeds": [
+        {
+          "file": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+          "sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+          "outcome": "clean",
+          "applied": [
+            "discovery/record-book"
+          ]
+        }
+      ],
+      "quarantined": [],
+      "applied": [
+        "discovery/record-book"
+      ],
+      "unapplied": [],
+      "build": null,
+      "fuzzer_runs": null,
+      "bypasses": [
+        {
+          "property": "discovery/record-book",
+          "patch": "qa/planted/discovery/record-book/keep-old-relay-attribution.patch"
+        },
+        {
+          "property": "discovery/record-book",
+          "patch": "qa/planted/discovery/record-book/skip-book-eviction.patch"
+        },
+        {
+          "property": "discovery/record-book",
+          "patch": "qa/planted/discovery/record-book/widen-disclosure-window.patch"
+        },
+        {
+          "property": "discovery/record-book",
+          "patch": "qa/planted/discovery/record-book/wrong-eviction-victim.patch"
+        }
+      ]
+    },
+    {
+      "target": "block_decoded_retention",
+      "harness": "block/decoded-retention",
+      "status": "build-failed",
+      "detail": "the checkout at /home/evan/src/valar/zakura.mut-1-witness-readiness/crates/zakura-sim/../.. changed during the build, from Checkout { git: \"8c63fa3ec2348b036e1a24bd9fa6c677eca49c57\", dirty: true, source: \"45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be\", lockfile: \"53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade\", fuzz_lockfile: \"c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc\" } to Checkout { git: \"b2e0456474e47e6264c912b2f6b50d09c8603115\", dirty: false, source: \"45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be\", lockfile: \"53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade\", fuzz_lockfile: \"c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc\" }; build again from a tree that doesn't change",
+      "seeds": [
+        {
+          "file": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+          "sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+          "outcome": "clean",
+          "applied": [
+            "block/decoded-retention"
+          ]
+        }
+      ],
+      "quarantined": [],
+      "applied": [
+        "block/decoded-retention"
+      ],
+      "unapplied": [],
+      "build": null,
+      "fuzzer_runs": null,
+      "bypasses": [
+        {
+          "property": "block/decoded-retention",
+          "patch": "qa/planted/block/decoded-retention/double-release.patch"
+        },
+        {
+          "property": "block/decoded-retention",
+          "patch": "qa/planted/block/decoded-retention/missing-admission.patch"
+        },
+        {
+          "property": "block/decoded-retention",
+          "patch": "qa/planted/block/decoded-retention/raw-header-escape.patch"
+        },
+        {
+          "property": "block/decoded-retention",
+          "patch": "qa/planted/block/decoded-retention/raw-transaction-escape.patch"
+        }
+      ]
+    },
+    {
+      "target": "header_reactor_policy",
+      "harness": "header/reactor-policy",
+      "status": "ready",
+      "detail": null,
+      "seeds": [
+        {
+          "file": "crates/zakura-sim/tests/fixtures/header-reactor-policy.bin",
+          "sha256": "1bb8d5f2c6f679f5a1dab02b0cfcd6472b955f7b408a14bc9e703cb68f664511",
+          "outcome": "clean",
+          "applied": [
+            "header/reactor-policy"
+          ]
+        }
+      ],
+      "quarantined": [],
+      "applied": [
+        "header/reactor-policy"
+      ],
+      "unapplied": [],
+      "build": {
+        "package": "qa/fuzz/sim",
+        "target": "header_reactor_policy",
+        "harness": "header/reactor-policy",
+        "git": "b2e0456474e47e6264c912b2f6b50d09c8603115",
+        "dirty": false,
+        "source": "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be",
+        "lockfile": "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade",
+        "fuzz_lockfile": "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc",
+        "rustc": "rustc 1.99.0-nightly (da80ed070 2026-07-14)",
+        "cargo_fuzz": "cargo-fuzz 0.13.2",
+        "libfuzzer_sys": "0.4.13",
+        "rustflags": "--cfg zakura_sim",
+        "cargo_args": [
+          "--sanitizer",
+          "none",
+          "--no-default-features"
+        ]
+      },
+      "fuzzer_runs": 1,
+      "bypasses": [
+        {
+          "property": "header/reactor-policy",
+          "patch": "qa/planted/header/reactor-policy/locator-call-settles-without-removal.patch"
+        }
+      ]
+    },
+    {
+      "target": "block_reactor_policy",
+      "harness": "block/reactor-policy",
+      "status": "ready",
+      "detail": null,
+      "seeds": [
+        {
+          "file": "crates/zakura-sim/tests/fixtures/block-reactor-identity.bin",
+          "sha256": "be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a",
+          "outcome": "clean",
+          "applied": [
+            "block/reactor-policy"
+          ]
+        },
+        {
+          "file": "crates/zakura-sim/tests/fixtures/block-reactor-policy.bin",
+          "sha256": "866eab29ee4b80c036ede067022d9d7cd8906370f6065b9e322e2a9e3c8da9a8",
+          "outcome": "clean",
+          "applied": [
+            "block/reactor-policy"
+          ]
+        }
+      ],
+      "quarantined": [],
+      "applied": [
+        "block/reactor-policy"
+      ],
+      "unapplied": [],
+      "build": {
+        "package": "qa/fuzz/sim",
+        "target": "block_reactor_policy",
+        "harness": "block/reactor-policy",
+        "git": "b2e0456474e47e6264c912b2f6b50d09c8603115",
+        "dirty": false,
+        "source": "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be",
+        "lockfile": "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade",
+        "fuzz_lockfile": "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc",
+        "rustc": "rustc 1.99.0-nightly (da80ed070 2026-07-14)",
+        "cargo_fuzz": "cargo-fuzz 0.13.2",
+        "libfuzzer_sys": "0.4.13",
+        "rustflags": "--cfg zakura_sim",
+        "cargo_args": [
+          "--sanitizer",
+          "none",
+          "--no-default-features"
+        ]
+      },
+      "fuzzer_runs": 2,
+      "bypasses": [
+        {
+          "property": "block/reactor-policy",
+          "patch": "qa/planted/block/reactor-policy/lost-forced-retry.patch"
+        },
+        {
+          "property": "block/reactor-policy",
+          "patch": "qa/planted/block/reactor-policy/refusal-consumes-query-id.patch"
+        },
+        {
+          "property": "block/reactor-policy",
+          "patch": "qa/planted/block/reactor-policy/stale-scope-completes-query.patch"
+        }
+      ]
+    },
+    {
+      "target": "header_publisher_policy",
+      "harness": "header/publisher-policy",
+      "status": "ready",
+      "detail": null,
+      "seeds": [
+        {
+          "file": "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin",
+          "sha256": "d873835827624015735be3ddf3be8fef8a25af2e62ffe5532d1297aa7887525b",
+          "outcome": "clean",
+          "applied": [
+            "header/publisher-policy"
+          ]
+        }
+      ],
+      "quarantined": [],
+      "applied": [
+        "header/publisher-policy"
+      ],
+      "unapplied": [],
+      "build": {
+        "package": "qa/fuzz/sim",
+        "target": "header_publisher_policy",
+        "harness": "header/publisher-policy",
+        "git": "b2e0456474e47e6264c912b2f6b50d09c8603115",
+        "dirty": false,
+        "source": "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be",
+        "lockfile": "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade",
+        "fuzz_lockfile": "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc",
+        "rustc": "rustc 1.99.0-nightly (da80ed070 2026-07-14)",
+        "cargo_fuzz": "cargo-fuzz 0.13.2",
+        "libfuzzer_sys": "0.4.13",
+        "rustflags": "--cfg zakura_sim",
+        "cargo_args": [
+          "--sanitizer",
+          "none",
+          "--no-default-features"
+        ]
+      },
+      "fuzzer_runs": 1,
+      "bypasses": [
+        {
+          "property": "header/publisher-policy",
+          "patch": "qa/planted/header/publisher-policy/lost-credit.patch"
+        },
+        {
+          "property": "header/publisher-policy",
+          "patch": "qa/planted/header/publisher-policy/lost-job.patch"
+        },
+        {
+          "property": "header/publisher-policy",
+          "patch": "qa/planted/header/publisher-policy/lost-terminal.patch"
+        }
+      ]
+    }
+  ]
+}

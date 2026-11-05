@@ -1,0 +1,17 @@
+WARNING: Failed to find function "__sanitizer_acquire_crash_state".
+WARNING: Failed to find function "__sanitizer_print_stack_trace".
+WARNING: Failed to find function "__sanitizer_set_death_callback".
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 504578414
+INFO: Loaded 1 modules   (49897 inline 8-bit counters): 49897 [0x55a369a67870, 0x55a369a73b59), 
+INFO: Loaded 1 PC tables (49897 PCs): 49897 [0x55a369a73b60,0x55a369b369f0), 
+INFO: 65536 Extra Counters
+/home/evan/.tmp/mut-1-witness-readiness/targets/block_reactor_policy/fuzzer: Running 2 inputs 1 time(s) each.
+Running: /home/evan/.tmp/mut-1-witness-readiness/targets/block_reactor_policy/seeds/be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a
+Executed /home/evan/.tmp/mut-1-witness-readiness/targets/block_reactor_policy/seeds/be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a in 0 ms
+Running: /home/evan/.tmp/mut-1-witness-readiness/targets/block_reactor_policy/seeds/866eab29ee4b80c036ede067022d9d7cd8906370f6065b9e322e2a9e3c8da9a8
+Executed /home/evan/.tmp/mut-1-witness-readiness/targets/block_reactor_policy/seeds/866eab29ee4b80c036ede067022d9d7cd8906370f6065b9e322e2a9e3c8da9a8 in 0 ms
+***
+*** NOTE: fuzzing was not performed, you have only
+***       executed the target code on a fixed set of inputs.
+***

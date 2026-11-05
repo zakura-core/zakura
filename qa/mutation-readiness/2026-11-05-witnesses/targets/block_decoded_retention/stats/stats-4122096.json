@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "harness": "block/decoded-retention",
+  "pid": 4122096,
+  "started_unix": 1793846811,
+  "written_unix": 1793846811,
+  "complete": true,
+  "counts": {
+    "runs": 1,
+    "outcomes": {
+      "clean": 1
+    },
+    "ends": {
+      "idle/quiescent": 1
+    },
+    "drains_exhausted": 0,
+    "cleanup": {
+      "abandoned": 0,
+      "leaked_tasks": 0,
+      "unwound": 0,
+      "panicked": 0,
+      "unwind_failures": 0
+    },
+    "properties": {
+      "block/decoded-retention": {
+        "status": "active",
+        "held": 1,
+        "evaluations": 1,
+        "not_applicable": 0,
+        "inconclusive": {},
+        "violated": 0
+      }
+    },
+    "features": {}
+  }
+}

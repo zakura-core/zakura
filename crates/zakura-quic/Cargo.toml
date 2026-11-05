@@ -1,6 +1,6 @@
 [package]
 name = "zakura-quic"
-version = "0.2.0"
+version = "0.3.0"
 authors.workspace = true
 description = "Direct QUIC transport for Zakura's native P2P stack, built on quinn-proto. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -31,7 +31,7 @@ socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
 tracing = { workspace = true }
-zakura-rt = { path = "../zakura-rt", version = "0.1.0" }
+zakura-rt = { path = "../zakura-rt", version = "0.2.0" }
 zeroize = { workspace = true }
 
 [dev-dependencies]

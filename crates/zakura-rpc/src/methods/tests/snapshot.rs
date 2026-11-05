@@ -1313,9 +1313,9 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .parse()
         .expect("unexpected invalid LongPollId");
 
-    // Fake the ChainInfo and FullTransaction responses
+    // Fake the ChainInfo response. This ID names another tip, so the node answers with
+    // coinbase-only work on the current tip without asking the mempool.
     let mock_read_state_request_handler = make_mock_read_state_request_handler();
-    let mock_mempool_request_handler = make_mock_mempool_request_handler();
 
     let get_block_template_fut = rpc_mock_state.get_block_template(
         GetBlockTemplateParameters {
@@ -1325,11 +1325,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .into(),
     );
 
-    let (get_block_template, ..) = tokio::join!(
-        get_block_template_fut,
-        mock_mempool_request_handler,
-        mock_read_state_request_handler,
-    );
+    let (get_block_template, ..) =
+        tokio::join!(get_block_template_fut, mock_read_state_request_handler,);
 
     let GetBlockTemplateResponse::TemplateMode(get_block_template) =
         get_block_template.expect("unexpected error in getblocktemplate RPC call")

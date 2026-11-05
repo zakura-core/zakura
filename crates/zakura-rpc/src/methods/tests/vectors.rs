@@ -3641,6 +3641,129 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
     }
 }
 
+/// A long poll that starts, or loops back, after the tip moved must answer from the new tip
+/// without waiting for the mempool to process that block.
+///
+/// This is the pool's turnaround gap: the node answers a mempool wake, a block lands before the
+/// pool sends its next long poll, and that request carries the old tip's long poll ID.
+#[tokio::test]
+async fn long_poll_from_old_tip_does_not_wait_for_mempool() {
+    let _init_guard = zakura_test::init();
+    let old_tip = Hash([1; 32]);
+    let new_tip = Hash([2; 32]);
+    let old_height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    let new_height = old_height.next().unwrap();
+
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(old_height);
+    tip_sender.send_best_tip_hash(old_tip);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    // The mempool's view of the tip, which lags the state's after a block is committed.
+    let (mempool_tip, mempool_tip_rx) = tokio::sync::watch::channel(old_tip);
+    let mempool = tower::service_fn(move |_| {
+        let last_seen_tip_hash = *mempool_tip_rx.borrow();
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash,
+            })
+        }
+    });
+
+    let old_chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: old_height,
+        tip_hash: old_tip,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let (chain_info, chain_info_rx) = tokio::sync::watch::channel(old_chain_info.clone());
+    let read_state = tower::service_fn(move |request| {
+        let chain_info = chain_info_rx.borrow().clone();
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(chain_info),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    // Background preparation is not under test: answer it without rejecting the template.
+    let verifier = tower::service_fn(|_| async {
+        Err::<Hash, BoxError>("verifier unavailable in this test".into())
+    });
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = TestRpcImpl::new_for_tests(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "long poll test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier, 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let old_template = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    assert_eq!(old_template.previous_block_hash, old_tip);
+
+    // A block lands. The state and the tip watch move on, but the mempool hasn't processed it.
+    chain_info.send_modify(|info| {
+        info.tip_height = new_height;
+        info.tip_hash = new_tip;
+    });
+    tip_sender.send_best_tip_height(new_height);
+    tip_sender.send_best_tip_hash(new_tip);
+
+    let long_poll = rpc.get_block_template(Some(GetBlockTemplateParameters::new(
+        GetBlockTemplateRequestMode::Template,
+        None,
+        vec![],
+        Some(old_template.long_poll_id),
+        None,
+    )));
+    let new_template = tokio::time::timeout(Duration::from_secs(2), long_poll)
+        .await
+        .expect("a long poll from the old tip answers without waiting for the mempool")
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+
+    assert_eq!(new_template.previous_block_hash, new_tip);
+    assert_eq!(new_template.height, new_height.next().unwrap().0);
+    assert!(
+        new_template.transactions.is_empty(),
+        "the first template on a new tip is coinbase-only, like a long poll woken by the tip"
+    );
+    assert_eq!(new_template.submit_old, Some(false));
+    drop(mempool_tip);
+}
+
 #[tokio::test]
 async fn template_rejection_wakes_long_poll_and_validates_recovery() {
     check_template_rejection_recovery(false).await;

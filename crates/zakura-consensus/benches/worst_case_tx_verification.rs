@@ -470,7 +470,7 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
             stats.verifier_checks += candidate.counts.verifier_check_counts();
 
             Request::Block {
-                transaction_hash: candidate.transaction.hash(),
+                transaction_id: candidate.transaction.unmined_id(),
                 transaction: candidate.transaction.clone().into(),
                 known_outpoint_hashes: known_outpoint_hashes.clone(),
                 known_utxos: known_utxos.clone(),

@@ -34,7 +34,12 @@ whose target has no harness or no campaign.
   encodes the scenario in the action grammar of
   `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
   isn't the harness's generator, 2, runs the default scenario. Pass
-  `-max_len=4096`, the input size the grammar is built for.
+  `-max_len=4096`, the input size the grammar is built for, and
+  `-len_control=0`. A run takes tens to hundreds of milliseconds, so
+  libFuzzer's default length control keeps mutations inside the prefix for
+  hours. Its committed seeds,
+  `crates/zakura-sim/tests/fixtures/header-storage-*.bin`, each use part of
+  the grammar and carry Plan bytes past the prefix.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only

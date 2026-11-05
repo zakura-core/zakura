@@ -5,12 +5,17 @@
 //!
 //! [`HonestChain::with_invalid_tip`]: zakura_sim::peer::honest::HonestChain::with_invalid_tip
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{OnceCell, RefCell},
+    rc::Rc,
+};
 
 use super::steer::{before, Steer};
+use zakura_network::zakura::ZakuraHeaderSyncConfig;
 use zakura_sim::{
     harness::{
         header_node::{
+            fault::{CooldownEvidence, FaultEvidence},
             policy::{Allow, Hold, OpKind, Select, Trigger},
             Chain, Policy,
         },
@@ -116,17 +121,40 @@ pub type LastView = Rc<RefCell<Option<StorageView>>>;
 /// [`HeaderWire`], keeping the last view its checks read and recording the
 /// run's end in it, so a test can judge the view-side evidence after the
 /// run.
-pub struct Watched {
+pub type Watched = Watching<false>;
+
+/// [`Watched`], but its view's fault evidence never sees the node's
+/// cooldowns, as a node that installs none would show. It's the planted
+/// bypass of `header-sync/header-fault-penalized`.
+pub type Uncooled = Watching<true>;
+
+/// [`Watched`], or with `UNCOOLED`, [`Uncooled`].
+pub struct Watching<const UNCOOLED: bool> {
     wire: HeaderWire,
     last: LastView,
+    /// The fault evidence an [`Uncooled`] view gives, made at its first
+    /// read: the node's attributions, with no cooldowns.
+    uncooled: OnceCell<FaultEvidence>,
 }
 
-impl HasView for Watched {
+impl<const UNCOOLED: bool> HasView for Watching<UNCOOLED> {
     type View = StorageView;
 
     /// The wire harness's view, also kept as the last one read.
     fn view(&self) -> StorageView {
-        let view = self.wire.view();
+        let mut view = self.wire.view();
+        if UNCOOLED {
+            view.faults = self
+                .uncooled
+                .get_or_init(|| {
+                    FaultEvidence::new(
+                        view.faults.attributions().clone(),
+                        CooldownEvidence::default(),
+                        ZakuraHeaderSyncConfig::default().unproductive_peer_cooldown,
+                    )
+                })
+                .clone();
+        }
         *self.last.borrow_mut() = Some(view.clone());
         view
     }
@@ -137,8 +165,12 @@ impl HasView for Watched {
     }
 }
 
-impl Subsystem for Watched {
-    const NAME: &'static str = "test/header-wire-watched";
+impl<const UNCOOLED: bool> Subsystem for Watching<UNCOOLED> {
+    const NAME: &'static str = if UNCOOLED {
+        "test/header-wire-uncooled"
+    } else {
+        "test/header-wire-watched"
+    };
     const GENERATOR: u32 = HeaderWire::GENERATOR;
     const SCENARIO_BYTES: usize = HeaderWire::SCENARIO_BYTES;
     type Scenario = WireScenario;
@@ -156,9 +188,10 @@ impl Subsystem for Watched {
 
     /// The wire harness.
     fn build(sim: &mut Sim, scenario: &WireScenario, (ports, last): Self::Prepared) -> Self {
-        Watched {
+        Watching {
             wire: HeaderWire::build(sim, scenario, ports),
             last,
+            uncooled: OnceCell::new(),
         }
     }
 

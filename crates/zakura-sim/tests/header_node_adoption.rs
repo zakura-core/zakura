@@ -29,7 +29,7 @@ use zakura_sim::{
     },
     observe::{StorageFact, StorageRequest},
     property::{HasView, Property, Sources},
-    MemorySink, Observation, PlanInput, RunConfig, RunReport, Sim,
+    MemorySink, Observation, PlanInput, RunConfig, RunEnd, RunReport, Sim,
 };
 
 /// [`Storage`], keeping the last view its checks read, so a test can judge
@@ -61,6 +61,11 @@ impl HasView for Adopting {
         let view = self.storage.view();
         *self.last.borrow_mut() = Some(view.clone());
         view
+    }
+
+    /// The storage harness's record of the run's end.
+    fn ended(&self, end: &RunEnd) {
+        self.storage.ended(end);
     }
 }
 
@@ -379,6 +384,39 @@ fn every_live_session_gets_the_adopted_status() {
 #[test]
 fn every_adopted_tip_is_published() {
     sweep("tip", |run| run.adoption().tip());
+}
+
+/// One tip change, with nothing after it: the node at A3 syncs A5 from
+/// `mirror-0` and adopts nothing more, so only the run's end can show the A5
+/// tip unpublished. Every run settles, and the tip rule holds, so a reactor
+/// that never sends A5 breaks it at the end with `UnpublishedTip`.
+#[test]
+fn a_single_tip_change_is_published_by_a_settled_end() {
+    let scenario = StorageScenario {
+        node: Chain::main(3),
+        mirrors: vec![MirrorSpec {
+            chain: Chain::main(5),
+            dialer: Dialer::Mirror,
+        }],
+        policy: Policy::converging(),
+        controls: Vec::new(),
+    };
+    for input in inputs(16, 256) {
+        let run = run(&scenario, input);
+        let tips: Vec<u32> = run
+            .adoption()
+            .adoptions()
+            .iter()
+            .map(|adoption| adoption.header_best.height.0)
+            .collect();
+        assert_eq!(tips, [3, 5]);
+        assert!(
+            run.report.end.drain.is_none_or(|drain| !drain.exhausted),
+            "{:?}",
+            run.report.end
+        );
+        assert_eq!(run.adoption().tip(), Acceptance::Holds);
+    }
 }
 
 /// Runs cut off early break no rule: whatever they owe when the budget ends

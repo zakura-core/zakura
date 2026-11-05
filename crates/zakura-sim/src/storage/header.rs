@@ -9,13 +9,21 @@
 //! [`Observation::StorageState`], and then reads the log back to confirm
 //! the checker will see exactly what was drained. Any failure ends the run
 //! with [`HarnessFailure::SourceEvidence`](crate::HarnessFailure).
+//!
+//! A failed prepare or apply is logged with its error's category alone. Whom
+//! the error blames stays out of the log, so pinned Plans and traces keep
+//! their format: the source keeps it in [`FaultAttributions`], which a
+//! harness's view reads.
 
 use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    rc::Rc,
     sync::{Arc, Weak},
     time::Duration,
 };
 
-use zakura_header_chain::{HeaderSyncWorkOwner, HeaderWorkOwner};
+use zakura_header_chain::{Attribution, HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
     controlled::{ControlledPort, Fact, FactKind, OpId},
@@ -74,6 +82,74 @@ pub struct HeaderStorage {
     /// instance, so one-instance runs keep their identities, and
     /// `header-<index>` for each later one, so instances never share one.
     label: String,
+    /// What each failed prepare and apply blamed.
+    attributions: FaultAttributions,
+}
+
+/// Whom a failed prepare or apply blamed, with each source as the hex of its
+/// digest, as the log writes sources.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Blame {
+    /// No peer.
+    None,
+    /// The peer that delivered the headers.
+    HeaderPeer(String),
+    /// The peer that delivered a body.
+    BodyPeer(String),
+    /// The peer that delivered auxiliary metadata.
+    AuxPeer(String),
+}
+
+impl Blame {
+    /// `attribution` in plain fields.
+    fn of(attribution: Attribution) -> Self {
+        match attribution {
+            Attribution::None => Blame::None,
+            Attribution::HeaderPeer(source) => Blame::HeaderPeer(hex(&source.digest())),
+            Attribution::BodyPeer(source) => Blame::BodyPeer(hex(&source.digest())),
+            Attribution::AuxPeer(source) => Blame::AuxPeer(hex(&source.digest())),
+        }
+    }
+}
+
+/// Whom each failed prepare and apply blamed, by storage instance and
+/// operation ID: the part of their result the logged
+/// [`StorageResult::PrepareFailed`] and [`StorageResult::ApplyFailed`] leave
+/// out. The storage source fills it as it logs each completion, so it holds
+/// exactly the failures the log does. Cloning shares it.
+#[derive(Clone, Debug, Default)]
+pub struct FaultAttributions(Rc<RefCell<BTreeMap<(u64, u64), Blame>>>);
+
+impl FaultAttributions {
+    /// Whom operation `id` of storage `instance` blamed, if it's a failed
+    /// prepare or apply the log holds.
+    pub fn get(&self, instance: u64, id: u64) -> Option<Blame> {
+        self.0.borrow().get(&(instance, id)).cloned()
+    }
+
+    /// Every attribution so far, by instance and operation ID.
+    pub fn all(&self) -> BTreeMap<(u64, u64), Blame> {
+        self.0.borrow().clone()
+    }
+
+    /// Records whom `fact` blamed, if it completes a failed prepare or apply
+    /// of storage `instance`.
+    fn record(&self, instance: u64, fact: &Fact) {
+        let FactKind::Completed(completion) = &fact.kind else {
+            return;
+        };
+        let (ResultIdentity::PrepareFailed { attribution, .. }
+        | ResultIdentity::ApplyFailed { attribution, .. }) = &completion.result
+        else {
+            return;
+        };
+        self.insert(instance, completion.id.0, Blame::of(*attribution));
+    }
+
+    /// Records that operation `id` of storage `instance` blamed `blame`.
+    pub(crate) fn insert(&self, instance: u64, id: u64, blame: Blame) {
+        self.0.borrow_mut().insert((instance, id), blame);
+    }
 }
 
 impl HeaderStorage {
@@ -131,7 +207,13 @@ impl HeaderStorage {
                 index => format!("{SERVICE}-{index}"),
             },
             id,
+            attributions: FaultAttributions::default(),
         }
+    }
+
+    /// Whom each failed prepare and apply this source logged blamed.
+    pub fn attributions(&self) -> FaultAttributions {
+        self.attributions.clone()
     }
 }
 
@@ -317,12 +399,12 @@ fn result(result: &ResultIdentity) -> StorageResult {
         ResultIdentity::PageUnavailable => StorageResult::PageUnavailable,
         ResultIdentity::Released => StorageResult::Released,
         ResultIdentity::Prepared => StorageResult::Prepared,
-        ResultIdentity::PrepareFailed(category) => StorageResult::PrepareFailed {
+        ResultIdentity::PrepareFailed { category, .. } => StorageResult::PrepareFailed {
             category: category.metrics_label().to_owned(),
         },
         ResultIdentity::Applied => StorageResult::Applied,
         ResultIdentity::ResourceStalled => StorageResult::ResourceStalled,
-        ResultIdentity::ApplyFailed(category) => StorageResult::ApplyFailed {
+        ResultIdentity::ApplyFailed { category, .. } => StorageResult::ApplyFailed {
             category: category.metrics_label().to_owned(),
         },
         ResultIdentity::Selected(at) => StorageResult::Selected { at: point(*at) },
@@ -560,6 +642,9 @@ impl ActionSource for HeaderStorage {
         // After setup, the state is logged only when it may have changed.
         let with_state = self.delivered.is_none() || !facts.is_empty();
         let last = facts.last().map_or(delivered, |fact| fact.seq);
+        for fact in &facts {
+            self.attributions.record(self.id.index, fact);
+        }
         let mut sent: Vec<Observation> = facts
             .into_iter()
             .map(|fact| observation(fact, self.id.index))

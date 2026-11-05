@@ -15,6 +15,7 @@
 //! [`session`] view.
 
 pub mod adoption;
+pub mod fault;
 mod pair;
 pub mod policy;
 pub mod session;
@@ -55,7 +56,7 @@ use self::{
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
-    storage::{HeaderStorage, HEADER_SERVICE},
+    storage::{FaultAttributions, HeaderStorage, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -276,6 +277,11 @@ impl PolicySource {
     /// The predicates, for a [`Control`] gated by the same counts.
     pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
         self.predicates.clone()
+    }
+
+    /// Whom each failed prepare and apply of the node's storage blamed.
+    pub fn attributions(&self) -> FaultAttributions {
+        self.storage.attributions()
     }
 }
 

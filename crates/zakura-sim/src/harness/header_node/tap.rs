@@ -20,6 +20,19 @@
 //! the call still existed, or the run fails as `UnpairedDrop`. A run that ends
 //! before the teardown is done leaves that open.
 //!
+//! A reactor that goes away during the run fails it as `ReactorGone`, unless
+//! the harness stopped it on purpose. A [`TapShutdown`] tells the tap so
+//! before the stop begins. The drain that finds the observer gone is then the
+//! tap's final read: it logs the reactor's last events and runs the teardown
+//! checks above. A reactor that unwound still fails as `ReactorGone`, and a
+//! run that ends idle or at its budget before that read fails as
+//! `ShutdownIncomplete`.
+//!
+//! The reactor's reservations and admissions stay out of the log, like its
+//! retained-header ownership, so pinned Plans keep their format. The tap hands
+//! them to its [`PolicySource`](super::PolicySource), whose triggers count
+//! them.
+//!
 //! The reactor's adopted state and what it publishes from it stay out of the
 //! log too. The tap keeps them, with the generations of its `Started` and
 //! locator `Dispatched` events, in an [`AdoptionEvidence`] that the harness's
@@ -50,6 +63,7 @@ use zakura_storage::header::controlled::ControlledPort;
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     pair::{PairError, Pairer},
+    policy::LinkEffect,
 };
 use crate::{
     draws::Failure,
@@ -91,6 +105,8 @@ struct TapState {
     port_gone: AtomicBool,
     /// Set when the reactor unwound, which leaves its calls and ownership open.
     unwound: AtomicBool,
+    /// Set when the harness began stopping the reactor on purpose.
+    shutdown: AtomicBool,
     buffer: Mutex<Buffer>,
     /// Checks each call's identity and retained headers as events arrive.
     work: Mutex<WorkCheck>,
@@ -112,6 +128,9 @@ struct Buffer {
     last: u64,
     /// Each event with its number and storage watermark, in order.
     events: Vec<(u64, u64, ReactorEvent)>,
+    /// Each reservation and admission, by its peer, in order. They stay out
+    /// of the log, so they take no number.
+    effects: Vec<(LinkEffect, ZakuraPeerId)>,
 }
 
 impl TapState {
@@ -140,6 +159,26 @@ impl TapState {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         work.ledger.finish()
     }
+
+    /// Whether the harness stopped the reactor and it ended without
+    /// unwinding.
+    fn stopped(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+            && self.observer.strong_count() == 0
+            && !self.unwound.load(Ordering::Relaxed)
+    }
+}
+
+/// Tells a tap that the harness is stopping its reactor on purpose.
+#[derive(Clone)]
+pub struct TapShutdown(Arc<TapState>);
+
+impl TapShutdown {
+    /// Marks the stop begun. Call it before anything the reactor reads
+    /// changes.
+    pub fn begin(&self) {
+        self.0.shutdown.store(true, Ordering::Relaxed);
+    }
 }
 
 /// A tap publishes reactor events.
@@ -155,15 +194,25 @@ impl LiveEvidence for TapState {
     }
 
     /// `PortGone` once an event found the node's port dropped, and
-    /// `ReactorGone` once the observer is.
+    /// `ReactorGone` once the observer is, unless the harness stopped the
+    /// reactor and it ended without unwinding.
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
-        } else if self.observer.strong_count() == 0 {
+        } else if self.observer.strong_count() == 0 && !self.stopped() {
             Some("ReactorGone: the tapped reactor dropped its observer during the run")
         } else {
             None
         }
+    }
+
+    /// `ShutdownIncomplete` once the harness began stopping the reactor and
+    /// it still holds its observer, so its last events and the teardown
+    /// checks haven't happened.
+    fn unfinished(&self) -> Option<&'static str> {
+        (self.shutdown.load(Ordering::Relaxed) && self.observer.strong_count() > 0).then_some(
+            "ShutdownIncomplete: the run ended before the stopped reactor dropped its observer",
+        )
     }
 }
 
@@ -202,14 +251,33 @@ impl HeaderSyncObserver for TapObserver {
                 return;
             }
         }
-        // Ownership events stay out of the observation log, whose format pinned
-        // Plans fix.
+        // Ownership, reservation and admission events stay out of the
+        // observation log, whose format pinned Plans fix.
         if matches!(
             event,
             ReactorEvent::HeadersHeld { .. } | ReactorEvent::HeadersEnded { .. }
         ) {
             if in_run {
                 state.check_work(&event);
+            }
+            return;
+        }
+        let effect = match &event {
+            ReactorEvent::ReservationOpened { peer } => {
+                Some((LinkEffect::ReservationOpened, peer.clone()))
+            }
+            ReactorEvent::SessionAdmitted { peer, .. } => {
+                Some((LinkEffect::SessionAdmitted, peer.clone()))
+            }
+            _ => None,
+        };
+        if let Some(effect) = effect {
+            // Only a live reactor reserves or admits, so neither happens in
+            // the run's own shutdown.
+            if in_run {
+                state.buffer().effects.push(effect);
+            } else {
+                state.refused.store(true, Ordering::Relaxed);
             }
             return;
         }
@@ -272,6 +340,7 @@ impl ReactorTap {
                 refused: AtomicBool::new(false),
                 port_gone: AtomicBool::new(false),
                 unwound: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
                 buffer: Mutex::default(),
                 work: Mutex::default(),
                 adoption: AdoptionEvidence::default(),
@@ -311,6 +380,17 @@ impl ReactorTap {
     /// The reactor's adoption facts, which the tap fills as they happen.
     pub fn adoption(&self) -> AdoptionEvidence {
         self.state.adoption.clone()
+    }
+
+    /// The notice the harness gives this tap when it stops the reactor.
+    pub fn shutdown(&self) -> TapShutdown {
+        TapShutdown(self.state.clone())
+    }
+
+    /// Takes the reservations and admissions recorded since the last call,
+    /// by peer, in order.
+    pub(crate) fn take_effects(&mut self) -> Vec<(LinkEffect, ZakuraPeerId)> {
+        mem::take(&mut self.state.buffer().effects)
     }
 }
 

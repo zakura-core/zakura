@@ -26,6 +26,10 @@ WORKFLOWS = {
 COVERAGE_PROPERTY = re.compile(r'^\s*property: "([^"]+)"', re.MULTILINE)
 
 
+# Flags the campaign matrix carries in their own columns.
+MATRIX_FLAGS = ("rss_limit_mb", "max_len", "detect_leaks")
+
+
 def suite_arg(target, flag):
     """Return the value of `-<flag>=` in a suite target's args, or None."""
     prefix = f"-{flag}="
@@ -162,6 +166,12 @@ def campaign_matrix(root, package):
                 "rss_mb": int(suite_arg(target, "rss_limit_mb") or defaults["rss-mb"]),
                 "max_len": int(suite_arg(target, "max_len") or 0),
                 "detect_leaks": int(suite_arg(target, "detect_leaks") or 1),
+                # The workflow passes the row's remaining args to libFuzzer unchanged.
+                "extra_args": " ".join(
+                    arg
+                    for arg in target.get("args", [])
+                    if not arg.startswith(tuple(f"-{flag}=" for flag in MATRIX_FLAGS))
+                ),
             }
         )
     return {"include": rows}

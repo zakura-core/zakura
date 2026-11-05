@@ -134,6 +134,11 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "block-sync-capacity-frontier-first" | "block-sync-capacity-reply-first" => {
             value(BlockScenario::capacity_release())
         }
+        "header-storage-default" => value(StorageScenario::default()),
+        "header-storage-close-relink" => value(StorageScenario::close_relink()),
+        "header-storage-grow" => value(StorageScenario::grow()),
+        "header-storage-holds" => value(StorageScenario::holds()),
+        "header-storage-triggers" => value(StorageScenario::triggers()),
         _ => None,
     }
 }

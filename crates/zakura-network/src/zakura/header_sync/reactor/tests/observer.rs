@@ -35,8 +35,9 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call, without retained-header ownership
-    /// or the adopted state and its publications.
+    /// The events recorded since the last call, without retained-header ownership,
+    /// reservations, session admissions, or the adopted state and its
+    /// publications.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -45,6 +46,8 @@ impl Recorder {
                     event,
                     ReactorEvent::HeadersHeld { .. }
                         | ReactorEvent::HeadersEnded { .. }
+                        | ReactorEvent::ReservationOpened { .. }
+                        | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::CallEnded {
                             end: CallEnd::Dropped,
                             ..
@@ -1395,6 +1398,38 @@ fn no_observer_evaluates_nothing() {
             panicked: false,
         }]
     );
+}
+
+/// Each installed session reports its admission once, a replacement included,
+/// and a refused one reports none.
+#[test]
+fn admitted_sessions_are_observed() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = ZakuraPeerId::new(vec![0x51; 32]).expect("the test peer ID has the required length");
+    let admitted = || {
+        recorder
+            .take_all()
+            .into_iter()
+            .filter(|event| matches!(event, ReactorEvent::SessionAdmitted { .. }))
+            .collect::<Vec<_>>()
+    };
+    let one = [ReactorEvent::SessionAdmitted { peer: peer.clone() }];
+
+    let _first = connect(&mut reactor, &peer, 1);
+    assert_eq!(admitted(), one, "the first session is admitted");
+    let _second = connect(&mut reactor, &peer, 2);
+    assert_eq!(admitted(), one, "its replacement is admitted");
+    reactor.state.unproductive_peer_cooldowns.insert(
+        peer.clone(),
+        Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let _refused = connect(&mut reactor, &peer, 3);
+    assert_eq!(admitted(), [], "a refused readmission isn't");
 }
 
 /// The `Misbehavior` events in `events`.

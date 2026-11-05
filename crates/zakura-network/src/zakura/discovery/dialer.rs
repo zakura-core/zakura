@@ -152,10 +152,10 @@ mod tests {
             );
             let endpoint = node.endpoint();
             assert!(!endpoint.has_discovery_admission_capacity());
-            let (admitted_ip, _admitted_rx) = tokio::sync::oneshot::channel();
+            let (admitted_addr, _admitted_rx) = tokio::sync::oneshot::channel();
             let (registration, _registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_ip,
+                admitted_addr,
                 registration,
             };
             let result = tokio::time::timeout(

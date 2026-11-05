@@ -1929,7 +1929,6 @@ impl ZakuraSupervisorHandle {
                 ZakuraRegistration::Registered {
                     conn_id,
                     peer_id,
-                    remote_ip,
                     disconnect_token,
                 }
             }
@@ -2034,7 +2033,6 @@ enum ZakuraRegistration {
     Registered {
         conn_id: ZakuraConnId,
         peer_id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
         disconnect_token: CancellationToken,
     },
     Duplicate {
@@ -3147,11 +3145,11 @@ impl ZakuraProtocolHandler {
         &self,
         connection: Connection,
         peer_id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
         mut outbound_rx: mpsc::Receiver<ZakuraOutboundFrame>,
         context: RegisteredConnectionServeContext,
         mut cleanup_guard: RegisteredPeerCleanupGuard,
     ) -> Result<(), ZakuraHandlerError> {
+        let remote_addr = Some(connection.admitted_addr());
         let limits = context.limits;
         let conn = context.conn;
         let conn_id = context.conn_id;
@@ -3284,7 +3282,7 @@ impl ZakuraProtocolHandler {
                 .add_peer(Peer::new_with_conn_id_and_direction_and_close_cause(
                     conn_id,
                     peer_id.clone(),
-                    remote_ip,
+                    remote_addr,
                     accepted_capabilities,
                     context.direction,
                     HashMap::new(),
@@ -3339,7 +3337,7 @@ impl ZakuraProtocolHandler {
                         .add_escalated_peer(Peer::new_with_service_streams(
                             conn_id,
                             peer_id.clone(),
-                            remote_ip,
+                            remote_addr,
                             opened_capabilities,
                             context.direction,
                             std::mem::take(&mut service_streams),
@@ -3428,7 +3426,7 @@ impl ZakuraProtocolHandler {
                                 Peer::new_with_service_streams(
                                     conn_id,
                                     peer_id.clone(),
-                                    remote_ip,
+                                    remote_addr,
                                     accepted_capabilities,
                                     context.direction,
                                     service_streams,
@@ -3549,7 +3547,7 @@ impl ZakuraProtocolHandler {
                             Peer::new_with_service_streams(
                                 conn_id,
                                 peer_id.clone(),
-                                remote_ip,
+                                remote_addr,
                                 accepted_capabilities,
                                 context.direction,
                                 service_streams,
@@ -4176,7 +4174,6 @@ impl ZakuraProtocolHandler {
             ZakuraRegistration::Registered {
                 conn_id,
                 peer_id,
-                remote_ip,
                 disconnect_token,
             } => {
                 metrics::counter!("zakura.p2p.conn.accepted", "role" => context.role).increment(1);
@@ -4196,7 +4193,6 @@ impl ZakuraProtocolHandler {
                 self.serve_connection(
                     connection,
                     peer_id,
-                    remote_ip,
                     outbound_rx,
                     RegisteredConnectionServeContext {
                         limits: context.limits,
@@ -5014,9 +5010,9 @@ pub(crate) enum DialRegistration {
 
 /// The channels on which a discovery dial reports its progress.
 pub(crate) struct DialReport {
-    /// Receives the IP whose handshake TLS authenticated, before the control
-    /// handshake starts.
-    pub(crate) admitted_ip: oneshot::Sender<IpAddr>,
+    /// Receives the address whose handshake TLS authenticated, before the
+    /// control handshake starts.
+    pub(crate) admitted_addr: oneshot::Sender<SocketAddr>,
     /// Receives how registration ended. The dial drops it unsent when it ends
     /// before registration, or when this node refuses the peer for a reason
     /// other than a local limit.
@@ -5094,7 +5090,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     };
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
-        let _ = report.admitted_ip.send(connection.admitted_ip());
+        let _ = report.admitted_addr.send(connection.admitted_addr());
         report.registration
     });
     let remote_node_id = connection.remote_id();
@@ -8504,7 +8500,7 @@ mod tests {
         registry.add_peer(Peer::new_with_conn_id_and_direction(
             winning_conn,
             peer.clone(),
-            Some(remote_ip),
+            Some(SocketAddr::new(remote_ip, 8233)),
             ZAKURA_CAP_LEGACY_GOSSIP,
             ServicePeerDirection::Inbound,
             streams,
@@ -8519,7 +8515,7 @@ mod tests {
         registry.add_peer(Peer::new_with_conn_id_and_direction(
             losing_conn,
             peer.clone(),
-            Some(remote_ip),
+            Some(SocketAddr::new(remote_ip, 8233)),
             ZAKURA_CAP_LEGACY_GOSSIP,
             ServicePeerDirection::Inbound,
             stale_streams,

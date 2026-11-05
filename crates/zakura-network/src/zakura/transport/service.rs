@@ -1,6 +1,6 @@
 //! Zakura protocol service trait surface.
 
-use std::{fmt, future::Future, net::IpAddr, pin::Pin, time::Duration};
+use std::{fmt, future::Future, net::SocketAddr, pin::Pin, time::Duration};
 
 use thiserror::Error;
 use zakura_rt::{collections::HashMap, sync::CancellationToken, time::Instant};
@@ -301,8 +301,9 @@ pub struct Peer {
     pub id: ZakuraPeerId,
     /// Supervisor registration generation that owns this service session.
     pub conn_id: ZakuraConnId,
-    /// Remote IP address when the transport knows it.
-    pub remote_ip: Option<IpAddr>,
+    /// The remote socket address the connection authenticated, when the
+    /// transport knows it.
+    pub remote_addr: Option<SocketAddr>,
     /// Capabilities accepted by both peers.
     pub negotiated: u64,
     /// Direction of the underlying authenticated connection.
@@ -317,7 +318,7 @@ impl Peer {
     /// Build a peer from already-opened transport streams.
     pub fn new(
         id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
         negotiated: u64,
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
@@ -325,7 +326,7 @@ impl Peer {
         Self::new_with_conn_id_and_direction(
             0,
             id,
-            remote_ip,
+            remote_addr,
             negotiated,
             ServicePeerDirection::Inbound,
             streams,
@@ -336,7 +337,7 @@ impl Peer {
     /// Build a peer from already-opened transport streams and a known direction.
     pub fn new_with_direction(
         id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
@@ -345,7 +346,7 @@ impl Peer {
         Self::new_with_conn_id_and_direction(
             0,
             id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             streams,
@@ -362,7 +363,7 @@ impl Peer {
     /// This is the in-memory way to open a versioned session, such as a
     /// simulator linking two nodes with [`framed_channel`](super::framed_channel)s.
     ///
-    /// The peer has no remote IP and a fresh close cause. Its stream's
+    /// The peer has no remote address and a fresh close cause. Its stream's
     /// cancellation token is a child of `cancel_token`, so cancelling
     /// `cancel_token` closes the connection and the session with it.
     ///
@@ -403,7 +404,7 @@ impl Peer {
     pub(crate) fn new_with_conn_id_and_direction(
         conn_id: ZakuraConnId,
         id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
@@ -412,7 +413,7 @@ impl Peer {
         Self::new_with_conn_id_and_direction_and_close_cause(
             conn_id,
             id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             streams,
@@ -425,7 +426,7 @@ impl Peer {
     pub(crate) fn new_with_conn_id_and_direction_and_close_cause(
         conn_id: ZakuraConnId,
         id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
@@ -444,7 +445,7 @@ impl Peer {
         Self::new_with_service_streams(
             conn_id,
             id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             streams,
@@ -457,7 +458,7 @@ impl Peer {
     pub(crate) fn new_with_service_streams(
         conn_id: ZakuraConnId,
         id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
@@ -472,7 +473,7 @@ impl Peer {
         Self::new_with_service_cancel_token(
             conn_id,
             id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             streams,
@@ -486,7 +487,7 @@ impl Peer {
     pub(crate) fn new_with_service_cancel_token(
         conn_id: ZakuraConnId,
         id: ZakuraPeerId,
-        remote_ip: Option<IpAddr>,
+        remote_addr: Option<SocketAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
@@ -497,7 +498,7 @@ impl Peer {
         Self {
             id,
             conn_id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             streams,
@@ -577,7 +578,7 @@ impl Peer {
     ) -> (
         ZakuraPeerId,
         ZakuraConnId,
-        Option<IpAddr>,
+        Option<SocketAddr>,
         u64,
         ServicePeerDirection,
         HashMap<u16, ServiceStream>,
@@ -587,7 +588,7 @@ impl Peer {
         (
             self.id,
             self.conn_id,
-            self.remote_ip,
+            self.remote_addr,
             self.negotiated,
             self.direction,
             self.streams,

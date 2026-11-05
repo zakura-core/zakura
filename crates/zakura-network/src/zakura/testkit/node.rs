@@ -856,7 +856,7 @@ mod tests {
     // handshake won. The dial must report that address, not the decoy, in
     // either address order, and must report it before the peer registers.
     #[tokio::test]
-    async fn outbound_dial_reports_the_admitted_ip_before_registration() {
+    async fn outbound_dial_reports_the_admitted_addr_before_registration() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         use crate::zakura::handler::{
@@ -891,10 +891,10 @@ mod tests {
                 .await
                 .expect("dialer spawns");
             let mut peer_set_rx = node.supervisor().subscribe();
-            let (admitted_ip_tx, mut admitted_ip_rx) = tokio::sync::oneshot::channel();
+            let (admitted_addr_tx, mut admitted_addr_rx) = tokio::sync::oneshot::channel();
             let (registration_tx, registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_ip: admitted_ip_tx,
+                admitted_addr: admitted_addr_tx,
                 registration: registration_tx,
             };
             let endpoint = node.endpoint();
@@ -917,10 +917,10 @@ mod tests {
             .await
             .expect("peer registers before the timeout")
             .expect("peer-set watcher stays open");
-            assert_eq!(
-                admitted_ip_rx.try_recv().ok(),
-                Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                "dialer {seed} reports the loopback path its handshake won, before registration",
+            let admitted_addr = admitted_addr_rx.try_recv().ok();
+            assert!(
+                admitted_addr.is_some_and(|addr| peer_loopback.direct.contains(&addr)),
+                "dialer {seed} reports the loopback path its handshake won, before registration: {admitted_addr:?}",
             );
             assert_eq!(
                 tokio::time::timeout(TEST_NET_TIMEOUT, registration_rx)

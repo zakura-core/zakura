@@ -506,7 +506,7 @@ impl ServiceRegistry {
         let (
             peer_id,
             conn_id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             mut streams,
@@ -533,7 +533,7 @@ impl ServiceRegistry {
             service.add_peer(Peer::new_with_service_cancel_token(
                 conn_id,
                 peer_id.clone(),
-                remote_ip,
+                remote_addr,
                 negotiated,
                 direction,
                 service_streams,
@@ -552,7 +552,7 @@ impl ServiceRegistry {
         let (
             peer_id,
             conn_id,
-            remote_ip,
+            remote_addr,
             negotiated,
             direction,
             mut streams,
@@ -586,7 +586,7 @@ impl ServiceRegistry {
             service.add_peer(Peer::new_with_service_cancel_token(
                 conn_id,
                 peer_id.clone(),
-                remote_ip,
+                remote_addr,
                 negotiated,
                 direction,
                 service_streams,
@@ -698,7 +698,7 @@ mod tests {
             let (
                 peer_id,
                 _conn_id,
-                _remote_ip,
+                _remote_addr,
                 _negotiated,
                 _direction,
                 streams,

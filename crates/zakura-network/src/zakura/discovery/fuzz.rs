@@ -84,6 +84,21 @@ fn context(now: u64) -> DiscoveryRecordValidationContext {
     }
 }
 
+/// The last octet of book author `index`'s one public address.
+fn author_address(index: usize) -> u8 {
+    10 + u8::try_from(index).expect("test indexes are small")
+}
+
+/// Book author `index`'s one public address, which its records list.
+fn author_socket(index: usize) -> SocketAddr {
+    socket(author_address(index))
+}
+
+/// The public address with last octet `address` that test records list.
+fn socket(address: u8) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 33, 30, address)), 8233)
+}
+
 /// A discovery record by `signer` with one public address.
 fn record(signer: &NodeSecretKey, address: u8, sequence: u64, expires: u64) -> ZakuraNodeRecord {
     record_with_services(
@@ -106,10 +121,7 @@ fn record_with_services(
     ZakuraNodeRecord::sign(
         ZakuraNodeRecordBody {
             node_id: signer.public(),
-            direct_addrs: vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(45, 33, 30, address)),
-                8233,
-            )],
+            direct_addrs: vec![socket(address)],
             services,
             zakura_protocol_min: ZAKURA_PROTOCOL_VERSION_CURRENT,
             zakura_protocol_max: ZAKURA_PROTOCOL_VERSION_CURRENT,
@@ -410,7 +422,7 @@ fn observed_entry(book: &ZakuraDiscoveryBook, node_id: NodeId) -> Option<ModelEn
         sequence: entry.record().body.sequence,
         expires: entry.record().body.expires_at_unix_secs,
         source: entry.source(),
-        confirmed: entry.last_confirmed().is_some(),
+        confirmed: entry.is_confirmed(),
         failures: entry.failure_count(),
         last_seen: entry.last_seen(),
         last_success: entry.last_success(),
@@ -486,19 +498,20 @@ impl BookDriver {
                 let signer = &self.authors[author];
                 let node_id = signer.public();
                 let expires = now.saturating_add_signed(expires_in);
-                let address = 10 + u8::try_from(author).expect("test indexes are small");
-                let record = record(signer, address, sequence, expires);
+                let record = record(signer, author_address(author), sequence, expires);
                 let context = context(now);
-                let source = match supplier {
-                    Supplier::Author => Some(node_id),
-                    Supplier::Relay(index) => Some(relay(index)),
-                    Supplier::Nobody => None,
+                // The author's own `Hello` arrives on a connection from its address.
+                let (source, authenticated_addr) = match supplier {
+                    Supplier::Author => (Some(node_id), Some(author_socket(author))),
+                    Supplier::Relay(index) => (Some(relay(index)), None),
+                    Supplier::Nobody => (None, None),
                 };
                 // Every supplier's record takes the production path: verify, then install.
                 let result = match VerifiedRecord::verify(record, &context) {
                     Ok(verified) => self.book.import_verified_record(
                         verified,
                         source,
+                        authenticated_addr,
                         now,
                         &context,
                         &mut self.changes,
@@ -511,7 +524,8 @@ impl BookDriver {
             }
             BookOp::DialSuccess(author) => {
                 let node_id = self.authors[author].public();
-                self.book.mark_dial_success(&node_id, now);
+                self.book
+                    .mark_dial_success(&node_id, Some(author_socket(author)), now);
                 self.model.dial_success(node_id, now);
             }
             BookOp::DialFailure(author) => {
@@ -928,10 +942,14 @@ fn services(node_id: NodeId, expires: u64) -> Services {
     }
 }
 
+/// The last octet of state peer `peer`'s one public address.
+fn hello_address(peer: usize) -> u8 {
+    100 + u8::try_from(peer).expect("test indexes are small")
+}
+
 /// A peer's own `Hello` record, valid for the whole test.
 fn hello(peer: usize) -> ZakuraNodeRecord {
-    let address = 100 + u8::try_from(peer).expect("test indexes are small");
-    record(&peer_secret(peer), address, 1, START + 50_000)
+    record(&peer_secret(peer), hello_address(peer), 1, START + 50_000)
 }
 
 fn session(peer: usize, conn_id: ZakuraConnId, session_id: u64) -> DiscoverySessionKey {
@@ -1165,6 +1183,7 @@ impl StateDriver {
                 let result = self.state.install_session_record(
                     &session(peer, conn_id, session_id),
                     verified,
+                    Some(socket(hello_address(peer))),
                     &connected,
                     now,
                     &mut Vec::new(),

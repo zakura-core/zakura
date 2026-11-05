@@ -35,9 +35,19 @@ fn controlled_disclosure_replays_signed_samples_across_insertion_orders() {
             records.reverse();
         }
         for record in records {
+            // Each author's own `Hello` confirms the one address it lists.
             let source = record.body.node_id;
-            book.import_record(record, Some(source), START, &context(START))
-                .unwrap();
+            let authenticated_addr = record.body.direct_addrs.first().copied();
+            let verified = VerifiedRecord::verify(record, &context(START)).unwrap();
+            book.import_verified_record(
+                verified,
+                Some(source),
+                authenticated_addr,
+                START,
+                &context(START),
+                &mut Vec::new(),
+            )
+            .unwrap();
         }
         let mut rng = StdRng::seed_from_u64(42);
         let mut history = Vec::new();
@@ -201,7 +211,8 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
         ServiceAdmissionDecision::Admit
     );
 
-    let late = state.install_session_record(&a, verified_for_a, &connected, now, &mut Vec::new());
+    let late =
+        state.install_session_record(&a, verified_for_a, None, &connected, now, &mut Vec::new());
     assert!(matches!(late, Err(SessionRecordError::Superseded)));
     assert_eq!(
         late.map_err(|error| error.verdict()),
@@ -228,7 +239,7 @@ fn late_verification_for_a_replaced_session_changes_nothing() {
         VerifiedRecord::verify(hello(0), &context(now)).expect("the hello is authentic");
     assert_eq!(
         state
-            .install_session_record(&b, verified_for_b, &connected, now, &mut Vec::new())
+            .install_session_record(&b, verified_for_b, None, &connected, now, &mut Vec::new())
             .ok(),
         Some(ImportOutcome::Added)
     );
@@ -317,7 +328,7 @@ fn signed_record_expiry_does_not_expire_the_live_summary_ttl() {
     );
     let verified = VerifiedRecord::verify(short_lived, &context(now)).expect("authentic");
     state
-        .install_session_record(&a, verified, &connected, now, &mut Vec::new())
+        .install_session_record(&a, verified, None, &connected, now, &mut Vec::new())
         .expect("the record installs");
     state
         .receive_session_live_summaries(&a, node_id, services(node_id, u64::MAX), &connected, now)
@@ -387,7 +398,7 @@ fn connection_churn_cannot_grow_retained_service_hints() {
         let verified =
             VerifiedRecord::verify(record, &context(START)).expect("the fixture is authentic");
         state
-            .install_connected_peer_record(verified, &[peer.public()], START, &mut Vec::new())
+            .install_connected_peer_record(verified, None, &[peer.public()], START, &mut Vec::new())
             .expect("the record installs");
         assert_eq!(
             state.retained_hints().len(),
@@ -534,7 +545,7 @@ const STATE_TRACE_WITNESS: &[u8] = &[
 #[should_panic(expected = "discovery/record-book")]
 fn discovery_book_witness_rejects_unearned_confirmation() {
     run_book(decode_book_v2(BOOK_TRACE_WITNESS), 0, |book, now| {
-        book.mark_dial_success(&author(0).public(), now);
+        book.mark_dial_success(&author(0).public(), Some(author_socket(0)), now);
     });
 }
 
@@ -568,6 +579,7 @@ fn discovery_state_witness_rejects_unearned_service_hint() {
                     .install_session_record(
                         &session(0, conn, id),
                         verified,
+                        None,
                         &[],
                         START,
                         &mut Vec::new(),

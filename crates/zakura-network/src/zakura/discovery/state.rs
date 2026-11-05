@@ -477,7 +477,7 @@ impl DiscoveryState {
             outcome.attempted += 1;
             match self
                 .book
-                .import_verified_record(record, source, now, &context, changes)
+                .import_verified_record(record, source, None, now, &context, changes)
             {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
@@ -494,6 +494,7 @@ impl DiscoveryState {
         &mut self,
         session: &DiscoverySessionKey,
         record: VerifiedRecord,
+        remote_addr: Option<SocketAddr>,
         connected: &[NodeId],
         now: u64,
         changes: &mut Vec<BookChange>,
@@ -501,7 +502,7 @@ impl DiscoveryState {
         if !self.is_current_session(session) {
             return Err(SessionRecordError::Superseded);
         }
-        Ok(self.install_connected_peer_record(record, connected, now, changes)?)
+        Ok(self.install_connected_peer_record(record, remote_addr, connected, now, changes)?)
     }
 
     /// Installs a connected peer's own record and updates its service hints.
@@ -512,9 +513,13 @@ impl DiscoveryState {
     ///
     /// The install first drops hints of peers no longer `connected`, so
     /// connection churn cannot grow the hints past the connection limit.
+    ///
+    /// The book confirms `remote_addr`, the connection's authenticated remote
+    /// address, if the record lists it, and no other address.
     pub(super) fn install_connected_peer_record(
         &mut self,
         record: VerifiedRecord,
+        remote_addr: Option<SocketAddr>,
         connected: &[NodeId],
         now: u64,
         changes: &mut Vec<BookChange>,
@@ -535,6 +540,7 @@ impl DiscoveryState {
         let import_result = self.book.import_verified_record(
             record.clone(),
             Some(peer_node_id),
+            remote_addr,
             now,
             &context,
             changes,

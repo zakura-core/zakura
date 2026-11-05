@@ -423,6 +423,7 @@ def activate(manifest_path, output, phase):
 def watch(helper, thread, state_path):
     """Wake the owning desktop chat on crossover, first report, failures, or a stale collector."""
     events = set(json.loads(state_path.read_text())) if state_path.exists() else set()
+    transport_failures = 0
     while True:
         try:
             command = [sys.executable, str(helper), "--path", "/var/lib/zakura-digest-compare/pr2022/status.json", "root@159.65.183.89", "--", "cat", "/var/lib/zakura-digest-compare/pr2022/status.json"]
@@ -437,7 +438,14 @@ def watch(helper, thread, state_path):
                             diagnostic = {key: record[key] for key in ("result", "cause", "step", "execution", "status", "precondition") if key in record}
                         except ValueError:
                             pass
+                if diagnostic.get("result") == "unreachable" and diagnostic.get("cause") == "network" and diagnostic.get("execution") == "not_started":
+                    transport_failures += 1
+                    if transport_failures <= 3:
+                        print(json.dumps({"event": "transport_retry", "attempt": transport_failures, "classification": diagnostic}), flush=True)
+                        time.sleep(min(15 * transport_failures, 30))
+                        continue
                 raise RuntimeError(f"controller status check failed: exit {result.returncode}; classification={json.dumps(diagnostic, sort_keys=True)}")
+            transport_failures = 0
             status = json.loads(result.stdout)
             event = None
             if status["state"] in {"failed", "stopped"} or time.time() - status["at"] > 60:

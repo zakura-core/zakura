@@ -4,12 +4,34 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
 import digest_compare as comparison
 import digest_probe as probe
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_watcher_recovers_transport_failures_before_reporting_collector_status(self):
+        failure = SimpleNamespace(returncode=4, stdout="", stderr='ssh-check: {"result":"unreachable","cause":"network","execution":"not_started"}')
+        status = SimpleNamespace(returncode=0, stdout=json.dumps({"state":"stopped","at":0}), stderr="")
+        queued = SimpleNamespace(returncode=0, stdout="Queued message", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(comparison.subprocess, "run", side_effect=[failure, failure, status, queued]) as run, patch.object(comparison.time, "sleep") as sleep:
+                comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30])
+        self.assertEqual(run.call_count, 4)
+
+    def test_watcher_does_not_retry_authentication_failure(self):
+        failure = SimpleNamespace(returncode=5, stdout="", stderr='ssh-check: {"result":"auth_refused"}')
+        queued = SimpleNamespace(returncode=0, stdout="Queued message", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(comparison.subprocess, "run", side_effect=[failure, queued]) as run, patch.object(comparison.time, "sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, "auth_refused"):
+                    comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
+        sleep.assert_not_called()
+        self.assertEqual(run.call_count, 2)
+
     def setUp(self):
         self.control = {"transitions": [{"phase": "phase1", "at": 0}]}
         self.revisions = {"baseline": {"sha256": "a" * 64}, "candidate": {"sha256": "b" * 64}}

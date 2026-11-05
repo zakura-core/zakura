@@ -161,7 +161,7 @@ It does not complete mut-1.2's compilation and sensitivity gate.
 ### Reproduce
 
 ```sh
-python3 scripts/mutation_inventory.py --output "$TMPDIR/mutations.json"
+python3 scripts/mutation_inventory.py --output "${TMPDIR:-/tmp}/mutations.json"
 python3 -m unittest discover -s scripts/tests -p test_mutation_inventory.py -v
 python3 scripts/check-fuzz-campaign.py
 ```

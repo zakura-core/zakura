@@ -55,12 +55,29 @@ pub fn owes_penalty(source: &str, category: &str, blame: &Blame) -> Option<&'sta
 
 /// Each penalty the node's storage facts in `entries` owe, in the order the
 /// reactor took the failed replies. A failure whose reply the reactor never
-/// took owes nothing, since the reactor never saw it. An error if a failure
-/// has no attribution in `attributions`, or completes no logged request.
+/// took owes nothing, since the reactor never saw it ([`untaken`] lists
+/// them). An error if a failure has no attribution in `attributions`, or
+/// completes no logged request.
 pub fn owed(
     entries: &[Entry],
     attributions: &FaultAttributions,
 ) -> Result<Vec<OwedPenalty>, String> {
+    scan(entries, attributions).map(|(owed, _)| owed)
+}
+
+/// The operations in `entries` that failed with a fault that would owe a
+/// penalty, but whose reply the reactor never took: it dropped or timed out
+/// the call, or the log ends first. Whether the node should have penalized
+/// them can't be judged from the reactor's side.
+pub fn untaken(entries: &[Entry], attributions: &FaultAttributions) -> Result<Vec<u64>, String> {
+    scan(entries, attributions).map(|(_, untaken)| untaken)
+}
+
+/// [`owed`] and [`untaken`] in one pass over `entries`.
+fn scan(
+    entries: &[Entry],
+    attributions: &FaultAttributions,
+) -> Result<(Vec<OwedPenalty>, Vec<u64>), String> {
     let mut requests: BTreeMap<u64, Request<'_>> = BTreeMap::new();
     let mut failed: BTreeMap<u64, (Request<'_>, &str)> = BTreeMap::new();
     let mut owed = Vec::new();
@@ -118,10 +135,7 @@ pub fn owed(
                 let Some((request, category)) = failed.remove(id) else {
                     continue;
                 };
-                let blame = attributions.get(NODE, *id).ok_or_else(|| {
-                    format!("MissingAttribution: failed operation {id} has no attribution")
-                })?;
-                if let Some(reason) = owes_penalty(request.source, category, &blame) {
+                if let Some(reason) = owes(attributions, *id, request, category)? {
                     owed.push(OwedPenalty {
                         op: *id,
                         stage: request.stage,
@@ -135,7 +149,27 @@ pub fn owed(
             _ => {}
         }
     }
-    Ok(owed)
+    let mut untaken = Vec::new();
+    for (id, (request, category)) in failed {
+        if owes(attributions, id, request, category)?.is_some() {
+            untaken.push(id);
+        }
+    }
+    Ok((owed, untaken))
+}
+
+/// The reason failed operation `id`, from `request`, with `category`, owes,
+/// by its attribution, or an error if it has none.
+fn owes(
+    attributions: &FaultAttributions,
+    id: u64,
+    request: Request<'_>,
+    category: &str,
+) -> Result<Option<&'static str>, String> {
+    let blame = attributions
+        .get(NODE, id)
+        .ok_or_else(|| format!("MissingAttribution: failed operation {id} has no attribution"))?;
+    Ok(owes_penalty(request.source, category, &blame))
 }
 
 /// A logged prepare or apply request, as [`owed`] reads it.
@@ -182,10 +216,12 @@ impl FaultEvidence {
     /// in the tap's order. A `Misbehavior` from another completion, even
     /// against the same session, matches nothing. A penalty still unmatched
     /// when a settled run ends is a break. Unmatched at any other end, or
-    /// before the run has ended, it's inconclusive.
+    /// before the run has ended, it's inconclusive. With nothing unmatched,
+    /// a fault the reactor never took ([`untaken`]) leaves the rule
+    /// inconclusive too, so a node that abandons such work can't pass it.
     pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
-        let owed = match owed(entries, &self.attributions) {
-            Ok(owed) => owed,
+        let (owed, untaken) = match scan(entries, &self.attributions) {
+            Ok(scanned) => scanned,
             Err(why) => return Acceptance::Violated(why),
         };
         let events: Vec<&ReactorFact> = entries
@@ -217,7 +253,13 @@ impl FaultEvidence {
                 })
         };
         let Some(first) = owed.iter().find(|penalty| !penalized(penalty)) else {
-            return Acceptance::Holds;
+            return match untaken.first() {
+                None => Acceptance::Holds,
+                Some(op) => Acceptance::Inconclusive(format!(
+                    "UntakenFault: operation {op} failed with a header-peer fault whose reply \
+                     the reactor never took"
+                )),
+            };
         };
         let what = format!(
             "{} operation {} failed with a header-peer fault of {} in session {}, and the \
@@ -491,6 +533,28 @@ mod tests {
             attributed.penalized(&log),
             Acceptance::Inconclusive(_)
         ));
+    }
+
+    /// A fault whose reply the reactor never took owes no penalty, and leaves
+    /// the rule inconclusive rather than holding.
+    #[test]
+    fn an_untaken_fault_is_inconclusive() {
+        let attributed = evidence(&[(1, blame("aa"))]);
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.pop();
+        assert_eq!(owed(&log, attributed.attributions()).unwrap(), Vec::new());
+        assert_eq!(untaken(&log, attributed.attributions()).unwrap(), vec![1]);
+        assert!(matches!(
+            attributed.penalized(&log),
+            Acceptance::Inconclusive(why) if why.starts_with("UntakenFault")
+        ));
+        // A failure that owes nothing isn't listed.
+        let unblamed = evidence(&[(1, blame("bb"))]);
+        assert_eq!(
+            untaken(&log, unblamed.attributions()).unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(unblamed.penalized(&log), Acceptance::Holds);
     }
 
     #[test]

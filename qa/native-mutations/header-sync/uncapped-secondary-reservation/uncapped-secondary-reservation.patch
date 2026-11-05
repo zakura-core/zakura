@@ -1,0 +1,40 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index caec1c3ec2..f3225eeed7 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -146,7 +146,6 @@ impl HeaderChunkBudget {
+     }
+ 
+     fn publish(&self, usage: HeaderChunkUsage) {
+-        debug_assert!(usage.reserved.saturating_add(usage.owned) <= self.0.capacity);
+         // The conversion is exact because the count is at most 4,000.
+         metrics::gauge!("sync.header.chunk_budget.capacity").set(self.0.capacity as f64);
+         metrics::gauge!("sync.header.chunk_budget.reserved").set(usage.reserved as f64);
+@@ -750,6 +749,14 @@ impl PeerWorkQueue {
+         else {
+             return false;
+         };
++        // Mutation: a second reservation for `peer`, of the whole budget,
++        // that nothing reports or ends.
++        std::mem::forget(sim_arg!(self.budget.reserve(HEADER_CHUNK_BUDGET_CAPACITY_V1); Opening {
++            observer: &ObserverSlot(None),
++            peer,
++            purpose,
++            request: None,
++        }));
+         self.request_reservations.insert(peer.clone(), reservation);
+         true
+     }
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index f9ceaf3034..60ff3c3eff 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -651,7 +651,7 @@ impl HeaderChunkUsage {
+     /// The usage after reserving `count` of `capacity`, or `None` when an empty
+     /// or oversized reservation is refused.
+     pub(super) fn reserve(self, capacity: usize, count: usize) -> Option<Self> {
+-        if count == 0 || count > self.remaining(capacity) {
++        if count == 0 {
+             return None;
+         }
+         Some(Self {

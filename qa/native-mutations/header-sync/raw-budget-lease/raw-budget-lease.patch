@@ -1,0 +1,21 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+index caec1c3ec2..7b0696e983 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work.rs
+@@ -777,6 +777,16 @@ impl PeerWorkQueue {
+         let Ok(lease) = reservation.consume(returned) else {
+             return false;
+         };
++        // Mutation: one more header owned, through a raw reservation whose
++        // lease nothing reports or returns.
++        if let Some(raw) = sim_arg!(self.budget.reserve(1); Opening {
++            observer: &ObserverSlot(None),
++            peer,
++            purpose: ReservationPurpose::Ordinary,
++            request: None,
++        }) {
++            std::mem::forget(raw.consume(1));
++        }
+         #[cfg(any(test, zakura_sim))]
+         let lease = {
+             let (lease, staged) = staged_page(

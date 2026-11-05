@@ -1,0 +1,17 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+index cafdee5a52..ae8f065687 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+@@ -429,7 +429,11 @@ impl HeaderSyncReactor {
+                 self.peer_work_queue.remove_unstarted(peer);
+                 return StorageDispatch::Deferred(key.call);
+             };
+-            (Some(key), Some(port::LocatorReadPermit::new(permit)))
++            let permit = port::LocatorReadPermit::new(permit);
++            // Mutation: a clone of the permit that's never dropped, so the
++            // permit never returns.
++            std::mem::forget(permit.clone());
++            (Some(key), Some(permit))
+         } else {
+             (None, None)
+         };

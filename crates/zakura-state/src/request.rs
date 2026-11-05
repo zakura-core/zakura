@@ -909,8 +909,7 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
 fn transaction_hashes_and_auth_data_root(
     block: &block::BlockRef,
 ) -> (Arc<[transaction::Hash]>, AuthDataRoot) {
-    let digests = block.transaction_digests();
-    (digests.hashes, digests.auth_data_root)
+    (block.transaction_hashes(), block.auth_data_digests().root)
 }
 
 #[cfg(test)]

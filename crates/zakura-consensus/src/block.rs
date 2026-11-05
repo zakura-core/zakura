@@ -584,14 +584,17 @@ where
                     result => result,
                 };
 
-                // Hash each transaction's ID and authorizing-data digest once, for the Merkle
-                // root, the transaction requests and the state's authorizing-data check.
-                let transaction_digests = block.view().transaction_digests();
-                auth_data_root = Some(transaction_digests.auth_data_root);
-                let transaction_hashes = transaction_digests.hashes.clone();
-
+                // The Merkle root check needs only transaction IDs. Authorizing data is hashed
+                // after it and after the quick checks, so a body that does not match its
+                // header, or fails a cheap rule, never has its proofs and signatures hashed.
+                let transaction_hashes = block.view().transaction_hashes();
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
                 let coinbase_tx = quick_checks?;
+
+                // Hash each transaction's authorizing data once, for the transaction requests
+                // and the state's authorizing-data check.
+                let auth_data_digests = block.view().auth_data_digests();
+                auth_data_root = Some(auth_data_digests.root);
 
                 // ZIP 234 derives the block subsidy from the NSM value balance after the parent
                 // block, so a block at or above the start height needs its parent's chain
@@ -695,8 +698,8 @@ where
                 // Dispatch shielded transactions first: their proof batches are the longest
                 // checks, so starting them before the transparent checks shortens the block's
                 // critical path.
-                let (shielded, transparent): (Vec<_>, Vec<_>) = transaction_digests
-                    .unmined_ids()
+                let (shielded, transparent): (Vec<_>, Vec<_>) = auth_data_digests
+                    .unmined_ids(&transaction_hashes)
                     .zip(block.transactions())
                     .partition(|(_, tx)| tx.has_shielded_data());
 
@@ -855,7 +858,7 @@ where
                     new_outputs: known_utxos,
                     transaction_hashes,
                     deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                    auth_data_root: Some(transaction_digests.auth_data_root),
+                    auth_data_root: Some(auth_data_digests.root),
                     receipt_order,
                 };
 

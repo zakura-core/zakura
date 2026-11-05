@@ -75,23 +75,34 @@ pub struct Block {
     pub transactions: Vec<Arc<Transaction>>,
 }
 
-/// A block's transaction digests, in block order, from [`BlockRef::transaction_digests`].
+/// A block's ZIP-244 authorizing-data digests, in block order, from
+/// [`BlockRef::auth_data_digests`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransactionDigests {
-    /// Each transaction's mined ID.
-    pub hashes: Arc<[transaction::Hash]>,
-    /// Each transaction's ZIP-244 authorizing-data digest, `None` before v5.
-    pub auth_digests: Vec<Option<AuthDigest>>,
-    /// The ZIP-244 authorizing-data root over `auth_digests`.
-    pub auth_data_root: AuthDataRoot,
+pub struct AuthDataDigests {
+    /// Each transaction's authorizing-data digest, `None` before v5.
+    digests: Vec<Option<AuthDigest>>,
+    /// The ZIP-244 authorizing-data root over `digests`.
+    pub root: AuthDataRoot,
 }
 
-impl TransactionDigests {
-    /// Each transaction's unmined ID, in block order.
-    pub fn unmined_ids(&self) -> impl ExactSizeIterator<Item = UnminedTxId> + '_ {
-        self.hashes
+impl AuthDataDigests {
+    /// Each transaction's unmined ID, pairing `hashes` with these digests in block order.
+    ///
+    /// # Panics
+    ///
+    /// If `hashes` is not the same block's [`BlockRef::transaction_hashes`].
+    pub fn unmined_ids<'a>(
+        &'a self,
+        hashes: &'a [transaction::Hash],
+    ) -> impl ExactSizeIterator<Item = UnminedTxId> + 'a {
+        assert_eq!(
+            hashes.len(),
+            self.digests.len(),
+            "transaction hashes and authorizing-data digests come from the same block"
+        );
+        hashes
             .iter()
-            .zip(&self.auth_digests)
+            .zip(&self.digests)
             .map(|(&id, auth_digest)| match *auth_digest {
                 None => UnminedTxId::Legacy(id),
                 Some(auth_digest) => UnminedTxId::Witnessed(WtxId { id, auth_digest }),
@@ -534,37 +545,42 @@ impl BlockRef {
             .collect::<AuthDataRoot>()
     }
 
-    /// Compute every transaction ID, every ZIP-244 authorizing-data digest and the
-    /// authorizing-data root, walking each v5/v6 transaction's ZIP-244 data once.
+    /// Apply `f` to every transaction in block order.
     ///
-    /// Blocks with fewer than 64 transactions, and single-worker Rayon pools, hash on
-    /// the calling thread, where splitting costs more than it saves.
-    pub fn transaction_digests(&self) -> TransactionDigests {
+    /// Blocks with fewer than 64 transactions, and single-worker Rayon pools, run on the
+    /// calling thread, where splitting costs more than it saves.
+    fn map_transactions<T, F>(&self, f: F) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(&Transaction) -> T + Send + Sync,
+    {
         use rayon::prelude::*;
 
-        let (hashes, auth_digests): (Vec<_>, Vec<_>) = if self.0.transactions.len()
-            < PARALLEL_TRANSACTION_HASHES_MIN
+        if self.0.transactions.len() < PARALLEL_TRANSACTION_HASHES_MIN
             || rayon::current_num_threads() == 1
         {
-            self.transactions()
-                .map(Transaction::txid_and_auth_digest)
-                .unzip()
+            self.transactions().map(f).collect()
         } else {
-            self.parallel_transactions()
-                .map(Transaction::txid_and_auth_digest)
-                .unzip()
-        };
+            self.parallel_transactions().map(f).collect()
+        }
+    }
 
-        let auth_data_root = auth_digests
+    /// Every transaction's mined ID, in block order.
+    pub fn transaction_hashes(&self) -> Arc<[transaction::Hash]> {
+        self.map_transactions(Transaction::hash).into()
+    }
+
+    /// Every transaction's ZIP-244 authorizing-data digest and their root.
+    ///
+    /// This hashes each v5/v6 transaction's scriptSigs, proofs and signatures, so callers
+    /// run it only for a body whose transaction IDs already match the header.
+    pub fn auth_data_digests(&self) -> AuthDataDigests {
+        let digests = self.map_transactions(Transaction::auth_digest);
+        let root = digests
             .iter()
             .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
             .collect();
-
-        TransactionDigests {
-            hashes: hashes.into(),
-            auth_digests,
-            auth_data_root,
-        }
+        AuthDataDigests { digests, root }
     }
 }
 

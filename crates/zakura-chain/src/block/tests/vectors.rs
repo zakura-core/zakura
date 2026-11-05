@@ -826,7 +826,7 @@ fn time_check_fixed() {
 }
 
 #[test]
-fn transaction_digests_match_separate_computation_across_parallel_cutoff() {
+fn transaction_hashes_and_auth_data_digests_match_separate_computation_across_parallel_cutoff() {
     let _init_guard = zakura_test::init();
 
     // Pre-v5 (genesis, Sapling era) and NU5 blocks, so both auth digest branches are covered.
@@ -898,7 +898,8 @@ fn transaction_digests_match_separate_computation_across_parallel_cutoff() {
                 let mut block = blocks[0].clone();
                 block.transactions = transactions.iter().cycle().take(count).cloned().collect();
 
-                let digests = pool.install(|| block.transaction_digests());
+                let hashes = pool.install(|| block.transaction_hashes());
+                let auth = pool.install(|| block.auth_data_digests());
 
                 let expected_hashes: Vec<_> = block.transactions().map(|tx| tx.hash()).collect();
                 let expected_auth: Vec<_> =
@@ -906,15 +907,27 @@ fn transaction_digests_match_separate_computation_across_parallel_cutoff() {
                 let expected_ids: Vec<_> = block.transactions().map(|tx| tx.unmined_id()).collect();
                 let context = format!("{mix}: {count} transactions with {threads} workers");
 
-                assert_eq!(digests.hashes.as_ref(), expected_hashes, "{context}");
-                assert_eq!(digests.auth_digests, expected_auth, "{context}");
+                assert_eq!(hashes.as_ref(), expected_hashes, "{context}");
+                assert_eq!(auth.digests, expected_auth, "{context}");
                 assert_eq!(
-                    digests.unmined_ids().collect::<Vec<_>>(),
+                    auth.unmined_ids(&hashes).collect::<Vec<_>>(),
                     expected_ids,
                     "{context}"
                 );
-                assert_eq!(digests.auth_data_root, block.auth_data_root(), "{context}");
+                assert_eq!(auth.root, block.auth_data_root(), "{context}");
             }
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "come from the same block")]
+fn unmined_ids_reject_hashes_from_a_different_block() {
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("block fixture deserializes");
+    let auth = block.auth_data_digests();
+    let fewer_hashes = &block.transaction_hashes()[1..];
+
+    let _ = auth.unmined_ids(fewer_hashes).count();
 }

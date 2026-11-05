@@ -534,6 +534,7 @@ async fn quick_header_time_failure_keeps_committed_merkle_binding() {
 }
 
 /// Proposals fail cheap body checks immediately; committed bodies must first match the header.
+/// Neither hashes authorizing data before reporting the failure.
 #[tokio::test]
 async fn quick_body_failures_preserve_committed_merkle_binding() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -594,10 +595,9 @@ async fn quick_body_failures_preserve_committed_merkle_binding() {
                                 zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                                 zs::Request::CheckAuthDataCommitment(commitment) => {
                                     assert!(!proposal && matching_root);
-                                    assert_eq!(
-                                        commitment.auth_data_root,
-                                        Some(commitment.block.auth_data_root())
-                                    );
+                                    // A cheap body failure is reported before any
+                                    // authorizing data is hashed, so state computes the root.
+                                    assert_eq!(commitment.auth_data_root, None);
                                     binding_checks.fetch_add(1, Ordering::SeqCst);
                                     zs::Response::AuthDataCommitment(zs::AuthDataCommitment::Bound)
                                 }

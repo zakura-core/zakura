@@ -862,13 +862,21 @@ impl Subsystem for HeaderWire {
                     peer.adversary.is_none() || peer.honest.is_some(),
                     "an adversary needs an honest chain"
                 );
+                assert!(
+                    !peer.invalid_tip || peer.honest.is_some(),
+                    "an invalid tip needs an honest chain"
+                );
                 peer.honest.as_ref().map(|honest| {
                     let start = honest.subscribe.as_ref().map_or(0, |spec| spec.start);
                     assert!(
                         start <= honest.chain,
                         "an honest peer subscribes from a height on its own chain"
                     );
-                    Arc::new(HonestChain::new(&fixture, honest.chain))
+                    Arc::new(if peer.invalid_tip {
+                        HonestChain::with_invalid_tip(&fixture, honest.chain)
+                    } else {
+                        HonestChain::new(&fixture, honest.chain)
+                    })
                 })
             })
             .collect();

@@ -17,7 +17,10 @@
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
-//! [`super::stage`]), `ConnectionClosed` for a close decided with a cause,
+//! [`super::stage`]), or for a page carrying a header the peer's fixture
+//! made invalid, once the node's storage has run the preparation of that
+//! header for the page's session (hdr-4 ask 4, option (b)), so a page the
+//! node never prepares is never judged, `ConnectionClosed` for a close decided with a cause,
 //! and `Misbehavior` for the connection of the session a reactor
 //! misbehavior names. A misbehavior with no origin session is a harness
 //! failure, and so is a frame the reader reached with no `PeerFrame`, or a
@@ -31,7 +34,9 @@ use std::{
     time::Duration,
 };
 
+use zakura_chain::block;
 use zakura_network::zakura::{v9::RegtestMessage, Frame, MessageRole, MessageRule};
+use zakura_storage::header::Outcome;
 
 use super::{
     adapter::SenderAdapter,
@@ -39,7 +44,11 @@ use super::{
 };
 use crate::{
     model::{FrameHeader, Label},
-    observe::{PeerCredit, ReactorFact, StreamId, TransitionFact, TransportFact},
+    observe::{
+        PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
+        TransportFact,
+    },
+    storage::{hash, HEADER_SERVICE},
     Observation, ObservationLog,
 };
 
@@ -83,6 +92,10 @@ pub(crate) enum RecordBody {
         exhausted: bool,
         exchange: Option<u64>,
         payload: u64,
+        /// The header the peer's fixture made invalid, if this page carries
+        /// it. The node judges such a page when it prepares that header,
+        /// not when it reads it. Not logged.
+        prepares: Option<block::Hash>,
     },
     /// [`Observation::PeerWritten`].
     Written { seq: u64 },
@@ -127,6 +140,17 @@ pub(crate) struct WireEvidence {
     views: BTreeMap<(u64, u64), NodeView>,
     /// Frames whose header the reader has, not judged yet.
     waiting: BTreeMap<FrameKey, Waiting>,
+    /// The invalid header each placed page carries, as the log writes
+    /// hashes, for pages that carry one.
+    invalid: BTreeMap<FrameKey, String>,
+    /// Pages carrying an invalid header that the reader has decided, by the
+    /// header, waiting for its preparation.
+    unprepared: BTreeMap<FrameKey, String>,
+    /// Each preparation the node's storage was asked for: its target's hash
+    /// and its work's session, by operation ID.
+    prepares: BTreeMap<u64, (String, u64)>,
+    /// Judgements a preparation made, for the entry being projected.
+    late: Vec<Observation>,
     /// Labels the node's frames.
     sender: SenderAdapter,
 }
@@ -226,6 +250,7 @@ impl WireEvidence {
             if let Some(obs) = self.project(&entry.obs)? {
                 projected.push(obs);
             }
+            projected.append(&mut self.late);
         }
         for obs in placed.into_iter().chain(projected) {
             log.push(obs);
@@ -268,8 +293,13 @@ impl WireEvidence {
                 exhausted,
                 exchange,
                 payload,
+                prepares,
             } => {
                 self.labels.insert((connection, quic_stream, seq), label);
+                if let Some(invalid) = prepares {
+                    self.invalid
+                        .insert((connection, quic_stream, seq), hash(invalid));
+                }
                 Observation::PeerFrame {
                     connection,
                     stream,
@@ -377,7 +407,7 @@ impl WireEvidence {
                     match self.waiting.get(&key).map(|waiting| waiting.stage) {
                         Some(Stage::Frame) => {
                             self.waiting.remove(&key);
-                            Some(self.judged(key)?)
+                            self.judged(key)?
                         }
                         Some(Stage::Checkpoint) => {
                             return Err(format!(
@@ -415,8 +445,59 @@ impl WireEvidence {
                     connection: *connection,
                 })
             }
+            Observation::Storage {
+                service,
+                instance: 0,
+                fact,
+                ..
+            } if service == HEADER_SERVICE => {
+                self.prepared(fact)?;
+                None
+            }
             _ => None,
         })
+    }
+
+    /// Follows the node's preparations. Once its storage has run one, a
+    /// completion with the engine's outcome whatever it returned, every
+    /// decided page of that work's session carrying the target, the header
+    /// the fixture made invalid, is judged. Each judgement is appended as it
+    /// is found, in frame order.
+    fn prepared(&mut self, fact: &StorageFact) -> Result<(), String> {
+        match fact {
+            StorageFact::Submitted {
+                id,
+                request: StorageRequest::PrepareHeaderTarget { owner, target, .. },
+                ..
+            } => {
+                self.prepares
+                    .insert(*id, (target.hash.clone(), owner.session_id));
+            }
+            StorageFact::Completed { id, outcome, .. } => {
+                let Some((target, session_id)) = self.prepares.remove(id) else {
+                    return Ok(());
+                };
+                if outcome != Outcome::Engine.name() {
+                    return Ok(());
+                }
+                let Some(connection) = self.sessions.get(&session_id).copied() else {
+                    return Ok(());
+                };
+                let judged: Vec<FrameKey> = self
+                    .unprepared
+                    .iter()
+                    .filter(|((on, _, _), invalid)| *on == connection && **invalid == target)
+                    .map(|(key, _)| *key)
+                    .collect();
+                for key in judged {
+                    self.unprepared.remove(&key);
+                    let judged = self.frame_judged(key)?;
+                    self.late.push(judged);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The node's reader has `header` for frame `key`: judges it now if
@@ -452,7 +533,7 @@ impl WireEvidence {
                     },
                 );
             }
-            return self.judged(key).map(Some);
+            return self.judged(key);
         }
         self.waiting.insert(
             key,
@@ -500,7 +581,7 @@ impl WireEvidence {
         }
         if decided {
             self.waiting.remove(&key);
-            return self.judged(key).map(Some);
+            return self.judged(key);
         }
         self.waiting.insert(
             key,
@@ -526,8 +607,22 @@ impl WireEvidence {
             })
     }
 
+    /// `FrameJudged` for frame `key` now that the reader decided it, or
+    /// `None` for a page carrying an invalid header, which waits for that
+    /// header's preparation ([`WireEvidence::prepared`]).
+    fn judged(&mut self, key: FrameKey) -> Result<Option<Observation>, String> {
+        if let Some(invalid) = self.invalid.get(&key) {
+            self.unprepared.insert(key, invalid.clone());
+            return Ok(None);
+        }
+        self.frame_judged(key).map(Some)
+    }
+
     /// `FrameJudged` for frame `key`.
-    fn judged(&self, (connection, quic_stream, seq): FrameKey) -> Result<Observation, String> {
+    fn frame_judged(
+        &self,
+        (connection, quic_stream, seq): FrameKey,
+    ) -> Result<Observation, String> {
         Ok(Observation::FrameJudged {
             connection,
             stream: self.stream(connection, quic_stream)?,
@@ -691,6 +786,7 @@ mod tests {
                 exhausted: false,
                 exchange: None,
                 payload: 0,
+                prepares: None,
             },
         }));
         let mut evidence = WireEvidence::default();

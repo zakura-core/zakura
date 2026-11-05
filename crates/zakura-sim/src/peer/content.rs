@@ -189,6 +189,19 @@ impl ContentLabeller {
         self.chain.as_ref()?.height(hash)
     }
 
+    /// The header the peer's fixture made invalid
+    /// ([`HonestChain::invalid_tip`]), if `message` is a page carrying it.
+    pub(crate) fn invalid_header(&self, message: &RegtestMessage) -> Option<block::Hash> {
+        let invalid = self.chain.as_ref()?.invalid_tip()?.hash;
+        let Message::Headers(page) = message else {
+            return None;
+        };
+        page.entries
+            .iter()
+            .any(|entry| entry.header.hash() == invalid)
+            .then_some(invalid)
+    }
+
     /// `BadContent` if the peer's `message`, `payload_len` bytes long,
     /// breaks a content rule.
     pub(crate) fn label(&self, message: &RegtestMessage, payload_len: usize) -> Labels {

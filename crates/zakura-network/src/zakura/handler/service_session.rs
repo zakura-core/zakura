@@ -246,13 +246,15 @@ pub(super) fn trace_session_step(
 /// Run all members independently and report exit only after every worker finishes.
 pub(super) fn spawn_service_session(
     workers: &mut JoinSet<()>,
-    streams: Vec<PreparedStream>,
+    streams: impl IntoIterator<Item = PreparedStream, IntoIter: ExactSizeIterator>,
     queue_depth: usize,
     opened_locally: bool,
     exits: mpsc::UnboundedSender<SessionExit>,
 ) -> AdmittedSession {
+    let mut streams = streams.into_iter().peekable();
+    let members = streams.len();
     let primary = streams
-        .first()
+        .peek()
         .expect("a validated session has at least one stream");
     if let Some(resources) = &primary.context.session_resources {
         resources.admitted();
@@ -263,7 +265,7 @@ pub(super) fn spawn_service_session(
         kind: primary.stream.kind,
         session_id: primary.context.stream_id,
         cancel_token: cancel.clone(),
-        streams: Vec::with_capacity(streams.len()),
+        streams: Vec::with_capacity(members),
         #[cfg(any(test, zakura_sim))]
         quic_stream: primary.io.0.as_ref().map(|(send, _)| send.id()),
         #[cfg(any(test, zakura_sim))]
@@ -275,7 +277,7 @@ pub(super) fn spawn_service_session(
         opened_locally,
     };
     let mut running = futures::stream::FuturesUnordered::new();
-    let application_drain = Arc::new(Barrier::new(streams.len()));
+    let application_drain = Arc::new(Barrier::new(members));
     for mut prepared in streams {
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =
@@ -333,29 +335,37 @@ pub(super) fn spawn_service_session(
     admitted
 }
 
+/// One locally opened stream whose prelude is written, before the service
+/// reserves a session for it.
+///
+/// Retaining this value keeps its transport stream permit charged. Dropping it
+/// stops the stream through `SetupIo` and releases its resource ownership.
+pub(super) struct OpenedStream {
+    io: SetupIo,
+    stream: Stream,
+    prelude: StreamPrelude,
+    stream_id: u64,
+    permit: OwnedSemaphorePermit,
+    resources: StreamResources,
+}
+
 impl ZakuraProtocolHandler {
-    /// Complete local setup of one outbound stream without starting its worker.
+    /// Open one outbound stream and write its prelude, without reserving its
+    /// service or starting its worker.
     ///
     /// Reserve a transport stream slot, open a bidirectional stream, and write its
     /// prelude under bounded waits. For a multi-stream session, the caller supplies the same
-    /// nonzero `session_id` for every member and attaches their shared service resources
-    /// afterward. The returned value retains the stream slot until handoff or drop.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn prepare_ordered_stream(
+    /// nonzero `session_id` for every member. The peer paces both waits through
+    /// stream credit, so the caller runs this beside the connection reactor.
+    pub(super) async fn open_ordered_stream(
         &self,
         connection: &Connection,
         stream: Stream,
         session_id: Option<u64>,
         stream_sem: &Arc<Semaphore>,
         resources: &ConnectionResources,
-        message_buckets: &mut MessageRateBuckets,
         limits: ZakuraConnectionLimits,
-        connection_token: CancellationToken,
-        close_cause: CloseCause,
-        freshness_tx: watch::Sender<Instant>,
-        conn: ZakuraConnTrace,
-        peer_id: ZakuraPeerId,
-    ) -> Result<PreparedStream, ZakuraHandlerError> {
+    ) -> Result<OpenedStream, ZakuraHandlerError> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let permit = stream_sem
             .clone()
@@ -390,6 +400,38 @@ impl ZakuraProtocolHandler {
         )
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("ordered stream prelude write"))??;
+        Ok(OpenedStream {
+            io,
+            stream,
+            prelude,
+            stream_id,
+            permit,
+            resources: stream_resources,
+        })
+    }
+
+    /// Complete local setup of one opened stream without starting its worker.
+    /// The returned value retains the stream slot until handoff or drop.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_opened_stream(
+        &self,
+        opened: OpenedStream,
+        message_buckets: &mut MessageRateBuckets,
+        limits: ZakuraConnectionLimits,
+        connection_token: CancellationToken,
+        close_cause: CloseCause,
+        freshness_tx: watch::Sender<Instant>,
+        conn: ZakuraConnTrace,
+        peer_id: ZakuraPeerId,
+    ) -> PreparedStream {
+        let OpenedStream {
+            io,
+            stream,
+            prelude,
+            stream_id,
+            permit,
+            resources,
+        } = opened;
         // All members spend the same message-rate budget, so splitting a service
         // across several streams does not double its allowance.
         let bucket_kind = self
@@ -418,7 +460,7 @@ impl ZakuraProtocolHandler {
             message_bucket,
             cadence,
             precheck: PrecheckSlot::default(),
-            resources: stream_resources,
+            resources,
             stream_token: connection_token.child_token(),
             connection_token,
             close_cause,
@@ -426,12 +468,12 @@ impl ZakuraProtocolHandler {
         };
         metrics::counter!("zakura.p2p.stream.accepted", "stream_kind" => stream_kind_label(stream.kind)).increment(1);
         conn.trace_stream("accepted", stream_id, Some(stream_kind_label(stream.kind)));
-        Ok(PreparedStream {
+        PreparedStream {
             io,
             stream,
             prelude,
             context,
-        })
+        }
     }
 }
 

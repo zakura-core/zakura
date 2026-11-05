@@ -266,9 +266,9 @@ impl ZakuraService for DropSink {
 
 /// Starts a real Zakura endpoint over loopback QUIC for an upgrade test.
 ///
-/// Each endpoint gets an explicit test-only iroh identity so parallel tests do
-/// not share the same persisted `~/.zakura` key or write to the user's real
-/// identity file.
+/// Each endpoint gets an explicit test-only iroh identity and a temporary
+/// identity directory, so parallel tests do not share a persisted key or write
+/// into the user's real `~/.zakura`.
 async fn start_test_zakura_endpoint() -> crate::zakura::ZakuraEndpoint {
     start_test_zakura_endpoint_with_registry().await.0
 }
@@ -279,10 +279,11 @@ async fn start_test_zakura_endpoint_with_registry() -> (crate::zakura::ZakuraEnd
     let key_index = TEST_ZAKURA_SECRET_KEY_COUNTER.fetch_add(1, Ordering::Relaxed) % 255 + 1;
     let key_byte = u8::try_from(key_index).expect("key index is in 1..=255 due to modulo");
     let secret = format!("{key_byte:02x}").repeat(32);
-    let config: Config = toml::from_str(&format!(
+    let mut config: Config = toml::from_str(&format!(
         "p2p_stack = 'dual'\nzakura_node_secret_key = '{secret}'\n[zakura]\nlisten_addr = '127.0.0.1:0'"
     ))
     .expect("test Zakura config with explicit identity key must parse");
+    config.identity_dir = crate::config::test_identity_dir();
 
     let peer_registry = PeerRegistry::default();
     let endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(

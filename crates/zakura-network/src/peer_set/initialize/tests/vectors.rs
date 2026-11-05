@@ -57,6 +57,16 @@ use crate::{
 
 use Network::*;
 
+/// [`Config::default`] with a temporary identity directory, so a test that starts a
+/// Zakura endpoint never loads the real `~/.zakura` key or overwrites its discovery
+/// sequence.
+fn test_defaults() -> Config {
+    Config {
+        identity_dir: crate::config::test_identity_dir(),
+        ..Config::default()
+    }
+}
+
 /// The maximum wall-clock time to wait for expected crawler test progress.
 const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -428,7 +438,7 @@ async fn written_peer_cache_can_be_read_manually() {
     let config = Config {
         initial_mainnet_peers: Default::default(),
         cache_dir: CacheDir::custom_path(cache_dir.path()),
-        ..Config::default()
+        ..test_defaults()
     };
     let address_book =
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
@@ -480,7 +490,7 @@ async fn written_peer_cache_is_automatically_read_on_startup() {
     let config = Config {
         initial_mainnet_peers: Default::default(),
         cache_dir: CacheDir::custom_path(cache_dir.path()),
-        ..Config::default()
+        ..test_defaults()
     };
     let address_book =
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
@@ -1320,7 +1330,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 1,
         max_connections_per_ip: usize::MAX,
-        ..Config::default()
+        ..test_defaults()
     };
     let public_inbound_limit = config.peerset_inbound_connection_limit() - 1;
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
@@ -1419,7 +1429,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 1,
         max_connections_per_ip: 1,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1496,7 +1506,7 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 2,
         max_connections_per_ip: usize::MAX,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1574,7 +1584,7 @@ async fn listener_drains_ready_accept_burst_with_short_pacing() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: BURST_CONNECTIONS,
         max_connections_per_ip: usize::MAX,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1630,7 +1640,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     let mut config = Config {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 1,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1902,7 +1912,7 @@ async fn self_connections_should_fail() {
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
-        ..Config::default()
+        ..test_defaults()
     };
 
     let address_book = init_with_peer_limit(
@@ -2010,7 +2020,7 @@ async fn remnant_nonces_from_outbound_connections_are_limited() {
     let config = Config {
         listen_addr,
         peerset_initial_target_size: TEST_PEERSET_INITIAL_TARGET_SIZE,
-        ..Config::default()
+        ..test_defaults()
     };
 
     let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
@@ -2121,7 +2131,7 @@ async fn add_initial_peers_deadlock() {
         network: Network::Mainnet,
         listen_addr: unused_v4,
 
-        ..Config::default()
+        ..test_defaults()
     };
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
@@ -2151,7 +2161,7 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
-        ..Config::default()
+        ..test_defaults()
     };
     config.zakura.listen_addr = Some("127.0.0.1:0".parse().expect("valid test bind address"));
     let inbound_service =
@@ -2214,7 +2224,7 @@ where
     // (localhost should be enough).
     let unused_v4 = "0.0.0.0:0".parse().unwrap();
 
-    let mut default_config = default_config.into().unwrap_or_default();
+    let mut default_config = default_config.into().unwrap_or_else(test_defaults);
     default_config.zakura.listen_addr =
         Some("127.0.0.1:0".parse().expect("valid test bind address"));
 
@@ -2378,7 +2388,7 @@ async fn spawn_replenishment_crawler_with(
     let config = Config {
         peerset_initial_target_size: CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
         crawl_new_peer_interval,
-        ..Config::default()
+        ..test_defaults()
     };
     let outbound_connection_limit = config.peerset_outbound_connection_limit();
 
@@ -2625,7 +2635,7 @@ async fn spawn_boxed_crawler_with_peer_limit(
     >,
 ) -> (Config, Vec<DiscoveredPeer>) {
     // Create a test config.
-    let mut config = Config::default();
+    let mut config = test_defaults();
     if let Some(peerset_initial_target_size) = peerset_initial_target_size {
         config.peerset_initial_target_size = peerset_initial_target_size;
     }
@@ -2926,7 +2936,7 @@ async fn spawn_boxed_inbound_listener_with_peer_limit(
         listen_addr,
         max_connections_per_ip: max_connections_per_ip
             .unwrap_or(constants::DEFAULT_MAX_CONNS_PER_IP),
-        ..Config::default()
+        ..test_defaults()
     };
 
     if let Some(peerset_initial_target_size) = peerset_initial_target_size {
@@ -3123,7 +3133,7 @@ where
         network: Network::Mainnet,
         listen_addr: unused_v4,
 
-        ..Config::default()
+        ..test_defaults()
     };
 
     let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(peer_count + 1);

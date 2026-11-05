@@ -119,9 +119,11 @@ struct Window {
     handled: bool,
 }
 
-/// How the judge checks the cooldown after each matched `Misbehavior`.
+/// Whether the judge judges, and how it checks the cooldown after each
+/// matched `Misbehavior`.
 enum Cooldowns<'c> {
-    /// It doesn't, as [`owed`] and [`untaken`] read only the penalties.
+    /// It judges nothing and only collects what's owed and untaken, for
+    /// [`owed`] and [`untaken`], so no earlier break cuts their lists short.
     Unchecked,
     /// Each matched `Misbehavior` must be followed by a `CooldownStarted` in
     /// `facts` that installs `cooldown`, unless `cooldown` is zero.
@@ -315,6 +317,9 @@ impl Judge {
     /// that no reactor call submitted has no handling to penalize it, so it
     /// breaks at once.
     fn judge(&mut self, cooldowns: &Cooldowns) {
+        if matches!(cooldowns, Cooldowns::Unchecked) {
+            return;
+        }
         let mut pending = std::mem::take(&mut self.pending);
         pending.retain(|index| {
             let penalty = &self.owed[*index];
@@ -1106,5 +1111,34 @@ mod tests {
             evidence.check(&untaken),
             FaultCheck::Open(why) if why.starts_with("UntakenFault")
         ));
+    }
+
+    /// [`owed`] and [`untaken`] list every failure even after an earlier
+    /// one went unpenalized, which the penalty rule calls a break.
+    #[test]
+    fn the_lists_go_on_past_an_unpenalized_fault() {
+        let attributions = FaultAttributions::default();
+        for id in 1..=3 {
+            attributions.insert(NODE, id, blame("aa"));
+        }
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, Vec::new()));
+        log.extend(failed_prepare(2, "aa", 3, "invalid_header"));
+        let mut third = failed_prepare(3, "aa", 3, "invalid_header");
+        third.pop();
+        log.extend(third);
+        let evidence =
+            FaultEvidence::new(attributions, CooldownEvidence::default(), Duration::ZERO);
+        assert!(matches!(
+            evidence.penalized(&log),
+            Acceptance::Violated(why) if why.contains("operation 1")
+        ));
+        let owed: Vec<u64> = owed(&log, evidence.attributions())
+            .unwrap()
+            .iter()
+            .map(|penalty| penalty.op)
+            .collect();
+        assert_eq!(owed, vec![1, 2]);
+        assert_eq!(untaken(&log, evidence.attributions()).unwrap(), vec![3]);
     }
 }

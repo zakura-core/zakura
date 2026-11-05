@@ -21,10 +21,11 @@ defines the broader acceptance criteria.
 
 The fuzz revision keeps the production source of the witness revision.
 It adds only the refreshed `qa/fuzz/sim/Cargo.lock` from mut-1.3.
-`scripts/check_mutation_pilot.py` passes only on a tree whose build inputs
-equal both revisions. This PR's head is such a tree; later commits on `main`
-are not. Run the pilot from a tree where the checker passes, or re-pin the
-catalogue first.
+`scripts/check_mutation_pilot.py` checks the pilot's own inputs under `qa/`
+on any tree. `--at-pin` also requires the tree's production, oracle and lock
+files to equal both revisions, which a pilot run needs. `crates/xtask` holds
+the pilot tooling, so it stays outside the pin. Run the pilot from a tree
+where `--at-pin` passes, or re-pin the catalogue first.
 
 ## Case matrix
 
@@ -89,6 +90,7 @@ in CI.
 
 ```sh
 python3 scripts/check_mutation_pilot.py
+python3 scripts/check_mutation_pilot.py --at-pin
 python3 scripts/check_mutation_pilot.py --evidence "$BUNDLE_DIR"
 python3 -m unittest discover -s scripts/tests -p test_check_mutation_pilot.py -v
 ```

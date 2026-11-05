@@ -363,3 +363,164 @@ fn the_tap_feeds_retirements_to_the_view() {
         }
     }
 }
+
+/// A wire origin: connection `connection`'s QUIC stream `quic_stream`, at
+/// `generation`.
+fn wire(connection: u64, quic_stream: u64, generation: u64) -> Option<SessionOrigin> {
+    Some(SessionOrigin {
+        connection,
+        quic_stream: Some(quic_stream),
+        generation,
+    })
+}
+
+/// A view joined to own-9, where the mirror is scripted peer `peer-0` and
+/// registered connection 1 from its address. Connection 1 has a header
+/// `Session` row on stream 8 for session 5, and installed generation 5.
+fn own9() -> SessionEvidence {
+    let view = SessionEvidence::default();
+    view.expect_transport(vec![(mirror(), "peer-0".to_owned())]);
+    {
+        let mut ledger = view.ledger();
+        ledger.registered(1, crate::peer::peer_addr(0, 0));
+        ledger.session_row(1, 8, ZAKURA_STREAM_HEADER_SYNC, 5);
+        ledger.generation_installed(1, 5);
+    }
+    view
+}
+
+/// An admission that agrees with own-9 passes. Once its session ends, the
+/// view is inconclusive until own-9 retires it, and the retirement is
+/// recorded once.
+#[test]
+fn an_admission_joins_own9_and_its_end_waits_for_retirement() {
+    let view = own9();
+    assert_eq!(broken(&view, &[admitted(5, None, wire(1, 8, 5))]), None);
+    assert_eq!(view.end_check(), EndCheck::Complete);
+    view.reactor(&ReactorEvent::SessionEnded {
+        peer: mirror(),
+        session_id: 5,
+        reason: "test",
+    });
+    assert_eq!(
+        view.end_check(),
+        EndCheck::Inconclusive(vec![("peer-0".to_owned(), 5)])
+    );
+    view.ledger().retire(1, Some(4));
+    assert_ne!(view.end_check(), EndCheck::Complete, "another generation");
+    view.ledger().retire(1, Some(5));
+    view.ledger().retire(1, None);
+    assert_eq!(view.end_check(), EndCheck::Complete);
+    let retired: Vec<_> = view
+        .facts()
+        .into_iter()
+        .filter(|fact| matches!(fact, SessionFact::SessionRetired { .. }))
+        .collect();
+    assert_eq!(
+        retired,
+        [SessionFact::SessionRetired {
+            peer: "peer-0".to_owned(),
+            session_id: 5,
+            by: Retirement::GenerationExited,
+        }]
+    );
+}
+
+/// A retirement that came first retires a session as it departs, by its
+/// generation's exit or its connection's teardown, and a replacement departs
+/// the session it replaced.
+#[test]
+fn own9_retires_a_session_in_either_order() {
+    for (retire, by) in [
+        (Some(5), Retirement::GenerationExited),
+        (None, Retirement::TornDown),
+    ] {
+        let view = own9();
+        view.ledger()
+            .session_row(1, 12, ZAKURA_STREAM_HEADER_SYNC, 6);
+        view.ledger().generation_installed(1, 6);
+        assert_eq!(broken(&view, &[admitted(5, None, wire(1, 8, 5))]), None);
+        view.ledger().retire(1, retire);
+        assert_eq!(broken(&view, &[admitted(6, Some(5), wire(1, 12, 6))]), None);
+        assert!(
+            view.facts().contains(&SessionFact::SessionRetired {
+                peer: "peer-0".to_owned(),
+                session_id: 5,
+                by,
+            }),
+            "{:?}",
+            view.facts()
+        );
+        assert_eq!(view.end_check(), EndCheck::Complete);
+    }
+}
+
+/// An admission with no QUIC stream, on a stream with no row or two rows,
+/// whose row has another kind, peer or session ID, whose generation was
+/// installed never or twice, or whose generation isn't its session ID, each
+/// break the join. So does a row that only arrives after the admission.
+#[test]
+fn every_own9_mismatch_breaks() {
+    let own9_with = |change: &dyn Fn(&mut SessionLedger)| {
+        let view = own9();
+        change(&mut view.ledger());
+        view
+    };
+    let cases: Vec<(SessionEvidence, ReactorEvent, &str)> = vec![
+        (own9(), admitted(5, None, None), "names no QUIC stream"),
+        (own9(), admitted(5, None, origin(1)), "names no QUIC stream"),
+        (own9(), admitted(5, None, wire(1, 9, 5)), "0 Session rows"),
+        (own9(), admitted(5, None, wire(2, 8, 5)), "0 Session rows"),
+        (
+            own9_with(&|ledger| ledger.session_row(1, 8, ZAKURA_STREAM_HEADER_SYNC, 5)),
+            admitted(5, None, wire(1, 8, 5)),
+            "2 Session rows",
+        ),
+        (
+            own9_with(&|ledger| {
+                ledger.session_row(1, 9, 99, 5);
+            }),
+            admitted(5, None, wire(1, 9, 5)),
+            "has kind 99",
+        ),
+        (
+            own9_with(&|ledger| {
+                ledger.registered(2, crate::peer::peer_addr(1, 0));
+                ledger.session_row(2, 8, ZAKURA_STREAM_HEADER_SYNC, 5);
+                ledger.generation_installed(2, 5);
+            }),
+            admitted(5, None, wire(2, 8, 5)),
+            "has peer None",
+        ),
+        (own9(), admitted(6, None, wire(1, 8, 6)), "has session 5"),
+        (
+            own9_with(&|ledger| ledger.session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6)),
+            admitted(6, None, wire(1, 9, 6)),
+            "installed 0 times",
+        ),
+        (
+            own9_with(&|ledger| ledger.generation_installed(1, 5)),
+            admitted(5, None, wire(1, 8, 5)),
+            "installed 2 times",
+        ),
+        (
+            own9_with(&|ledger| {
+                ledger.session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6);
+                ledger.generation_installed(1, 7);
+            }),
+            admitted(6, None, wire(1, 9, 7)),
+            "under its session ID",
+        ),
+    ];
+    for (view, event, why) in cases {
+        let rule = broken(&view, &[event]).expect("the join breaks");
+        assert!(rule.starts_with("Own9Join: "), "{rule}");
+        assert!(rule.contains(why), "{why}: {rule}");
+    }
+    let late = own9();
+    let rule = broken(&late, &[admitted(6, None, wire(1, 9, 6))]).expect("no row yet");
+    late.ledger()
+        .session_row(1, 9, ZAKURA_STREAM_HEADER_SYNC, 6);
+    late.ledger().generation_installed(1, 6);
+    assert_eq!(late.broken(), Some(rule), "a later row joins nothing");
+}

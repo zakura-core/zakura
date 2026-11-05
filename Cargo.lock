@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.2"
+version = "1.8.3"
 dependencies = [
  "bytes",
  "chrono",
@@ -2725,9 +2725,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3539011.0"
+version = "0.3540211.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5515bd2439452aebad7d7e904412f58b49112e5ae3d560b10131426445bbfd2"
+checksum = "b9f6c8108fe16a6debf6f907e914892dbba3549c6e82ec6857103e0f22fec34e"
 
 [[package]]
 name = "zakura-bellman"
@@ -3184,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-quic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "curve25519-dalek",
@@ -3311,7 +3311,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pin-project-lite",
  "rand 0.10.2",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-test"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "eyre",
  "futures",

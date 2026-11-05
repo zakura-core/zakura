@@ -124,6 +124,7 @@ class CampaignCheck(unittest.TestCase):
                         "rss_mb": 2048,
                         "max_len": 512,
                         "detect_leaks": 1,
+                        "extra_args": "",
                     }
                 ]
             },
@@ -142,6 +143,19 @@ class CampaignCheck(unittest.TestCase):
         self.assertEqual(
             (row["seconds"], row["weekly_seconds"], row["rss_mb"], row["max_len"], row["detect_leaks"]),
             (1800, 7200, 4096, 256, 0),
+        )
+
+    def test_the_matrix_passes_the_rows_other_args_through(self):
+        self.write(
+            "qa/suite.toml",
+            SUITE.replace(
+                'args = ["-max_len=512"]',
+                'args = ["-max_len=512", "-len_control=0", "-use_value_profile=1"]',
+            ),
+        )
+        row = CAMPAIGN.campaign_matrix(self.root, "p2p")["include"][0]
+        self.assertEqual(
+            (row["max_len"], row["extra_args"]), (512, "-len_control=0 -use_value_profile=1")
         )
 
     def test_a_coverage_row_without_a_declaration_fails(self):

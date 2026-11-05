@@ -52,7 +52,7 @@ use crate::{
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
-    Observation, RunConfig, Sim,
+    Observation, RunConfig, RunEnd, Sim,
 };
 
 /// The smoke run's scenario. It has no knobs yet.
@@ -523,6 +523,12 @@ impl HasView for Storage {
             sessions: self.topology.sessions(),
         }
     }
+
+    /// Records the run's end in the node's adoption evidence, for its tip
+    /// rule.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
+    }
 }
 
 impl Subsystem for Storage {
@@ -773,6 +779,12 @@ impl HasView for HeaderWire {
             adoption: self.adoption.clone(),
             sessions: Vec::new(),
         }
+    }
+
+    /// Records the run's end in the node's adoption evidence, for its tip
+    /// rule.
+    fn ended(&self, end: &RunEnd) {
+        self.adoption.end(end);
     }
 }
 

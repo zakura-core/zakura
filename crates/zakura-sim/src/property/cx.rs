@@ -6,7 +6,7 @@ use super::{
     Cardinality, Inconclusive, Kind, LivenessBound, Obligation, ObligationKey, Property,
     PropertyId, Subject, Verdict,
 };
-use crate::{check::Violation, model::LabelledFrame, Observation, StepCtx};
+use crate::{check::Violation, end::RunEnd, model::LabelledFrame, Observation, StepCtx};
 
 /// A harness's read-only view of the code under test. Checks read it through
 /// [`CheckCtx::view`].
@@ -32,6 +32,11 @@ pub trait HasView {
     fn captured(&self) -> Capture {
         Capture::Live
     }
+
+    /// Tells the harness how the run ended, before the registry reports.
+    /// Checks see only steps, so a view that needs the end to judge what was
+    /// still owed when the run stopped keeps it from here.
+    fn ended(&self, _end: &RunEnd) {}
 }
 
 /// When a view's state was captured.

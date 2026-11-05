@@ -5,7 +5,8 @@
 //! log, as it keeps retained-header ownership in its ledger, so pinned Plans
 //! and traces keep their format. Each fact carries the virtual time the
 //! reactor reported it at. The store also keeps the time of the tap's last
-//! drain, which bounds how far a run got.
+//! drain, which bounds how far a run got, and, once the run ends, whether it
+//! settled.
 //!
 //! [`AdoptionEvidence::generation`], [`AdoptionEvidence::status`] and
 //! [`AdoptionEvidence::tip`] check hdr-4's adopted-state rules over the
@@ -21,6 +22,8 @@ use std::{
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion};
 use zakura_network::zakura::{observe::ReactorEvent, Status, ZakuraPeerId};
+
+use crate::{IdleStatus, Outcome, RunEnd};
 
 /// How long after an adoption that changes a session's status the reactor
 /// may wait before it queues that status or records a deferral:
@@ -212,6 +215,8 @@ struct Store {
     facts: Vec<Stamped>,
     /// The time of the tap's last drain.
     horizon: Duration,
+    /// Whether the run settled, once it has ended.
+    settled: Option<bool>,
 }
 
 /// One reactor's adoption facts, shared by its tap and the harness's view.
@@ -235,6 +240,23 @@ impl AdoptionEvidence {
     pub(super) fn reach(&self, at: Duration) {
         let mut store = self.store();
         store.horizon = store.horizon.max(at);
+    }
+
+    /// Records how the run ended. It settled if it ended with no task ready
+    /// or parked: idle with every task finished or waiting outside the
+    /// scheduler, or after a drain that ran out of ready tasks. Any other end,
+    /// such as a drain cut off at its bound, a violation or a harness failure,
+    /// can stop a task partway through a synchronous call.
+    pub fn end(&self, end: &RunEnd) {
+        let settled = match end.outcome {
+            Outcome::Idle { status } => matches!(
+                status,
+                IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
+            ),
+            Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
+            Outcome::Violation | Outcome::Harness => false,
+        };
+        self.store().settled = Some(settled);
     }
 
     /// Every fact so far, in the order the reactor reported them.
@@ -296,9 +318,14 @@ impl AdoptionEvidence {
     /// it on the tip watch before the next adoption, and every publication
     /// names the latest adopted tip and reaches a receiver. The harness holds
     /// the watch's receiver for the whole run, so a send with none is a break.
-    /// A run that ends with a tip still owed is inconclusive. Virtual time
-    /// isn't a deadline here, since a harness may hold the reactor's task
-    /// (`Sim::hold_tasks`) while time moves.
+    /// Virtual time isn't a deadline here, since a harness may hold the
+    /// reactor's task (`Sim::hold_tasks`) while time moves.
+    ///
+    /// The reactor adopts and publishes in one synchronous call, but the
+    /// watch send is a preemption point between them. A tip still owed when
+    /// a settled run ends (see [`AdoptionEvidence::end`]) is therefore a
+    /// break, since no task is left partway through that call. A tip still
+    /// owed at any other end, or before the run has ended, is inconclusive.
     pub fn tip(&self) -> Acceptance {
         let store = self.store();
         let mut adopted: Option<Frontier> = None;
@@ -330,11 +357,16 @@ impl AdoptionEvidence {
                 _ => {}
             }
         }
-        match owed {
-            Some((tip, at)) => Acceptance::Inconclusive(format!(
-                "the run ended with {tip:?}, adopted at {at:?}, not yet published"
+        match (owed, store.settled) {
+            (None, _) => Acceptance::Holds,
+            (Some((tip, at)), Some(true)) => unpublished(tip, at),
+            (Some((tip, at)), Some(false)) => Acceptance::Inconclusive(format!(
+                "the run stopped with {tip:?}, adopted at {at:?}, not yet published, \
+                 while a task could be partway through publishing it"
             )),
-            None => Acceptance::Holds,
+            (Some((tip, at)), None) => {
+                Acceptance::Inconclusive(format!("{tip:?}, adopted at {at:?}, isn't published yet"))
+            }
         }
     }
 
@@ -485,6 +517,7 @@ fn unsent(session: u64, due: Duration) -> Acceptance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::end::Drain;
 
     /// An adoption at generation `generation` whose tip is at `height`.
     fn adoption(generation: u64, height: u32) -> Adoption {
@@ -604,9 +637,10 @@ mod tests {
         }
     }
 
-    /// A changed tip is owed before the next adoption: published by then it holds,
-    /// unpublished when time or the next adoption moves on it breaks, and a run
-    /// ending at that instant is inconclusive. A stale or lost publication breaks.
+    /// A changed tip is owed before the next adoption, or by the end of a
+    /// settled run: published by then it holds, and otherwise it breaks. Owed
+    /// while the run goes on, or when it stops unsettled, is inconclusive. A
+    /// stale or lost publication breaks.
     #[test]
     fn a_changed_tip_is_owed_before_the_next_adoption() {
         let (first, second) = (adoption(1, 1), adoption(2, 2));
@@ -635,9 +669,48 @@ mod tests {
         );
         assert_eq!(unchanged.tip(), Acceptance::Holds);
 
-        // Time alone owes nothing: only the next adoption does.
+        // Time alone owes nothing: only the next adoption or a settled end
+        // does.
         let cut = evidence(vec![(0, adopted(&first))], 60_000);
         assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
+        let run_end = |outcome, drain| RunEnd {
+            outcome,
+            steps: 100,
+            violation: None,
+            drain,
+            harness: None,
+        };
+        let drained = |exhausted| {
+            Some(Drain {
+                steps: 10,
+                exhausted,
+            })
+        };
+        for settled in [
+            run_end(Outcome::Budget, drained(false)),
+            run_end(
+                Outcome::Idle {
+                    status: IdleStatus::Quiescent,
+                },
+                None,
+            ),
+        ] {
+            cut.end(&settled);
+            assert!(violates(&cut.tip(), "UnpublishedTip"), "{settled:?}");
+        }
+        // A drain cut off at its bound can leave the reactor partway through
+        // the call that adopts and publishes.
+        cut.end(&run_end(Outcome::Budget, drained(true)));
+        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
+        cut.end(&run_end(
+            Outcome::Idle {
+                status: IdleStatus::Deadlock,
+            },
+            None,
+        ));
+        assert!(matches!(cut.tip(), Acceptance::Inconclusive(_)));
+        held.end(&run_end(Outcome::Budget, drained(false)));
+        assert_eq!(held.tip(), Acceptance::Holds);
         let skipped = evidence(vec![(0, adopted(&first)), (0, adopted(&second))], 0);
         assert!(violates(&skipped.tip(), "UnpublishedTip"));
         let stale = evidence(

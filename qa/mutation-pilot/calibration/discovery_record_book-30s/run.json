@@ -1,0 +1,69 @@
+{
+  "target": "discovery_record_book",
+  "binary_sha256": "b812599d2d1d728f07f7977ff156267a8772a0c63b6fe656bcf3eb1421c835be",
+  "initial_corpus_inputs": [],
+  "seed": 11,
+  "requested_seconds": 30,
+  "elapsed_seconds": 31.024021,
+  "exit_code": 0,
+  "command": [
+    "/home/evan/.tmp/mut-2-calibration/discovery_record_book-30s/fuzzer",
+    "-max_total_time=30",
+    "-max_len=512",
+    "-timeout=10",
+    "-rss_limit_mb=2048",
+    "-seed=11",
+    "-print_final_stats=1",
+    "-artifact_prefix=/home/evan/.tmp/mut-2-calibration/discovery_record_book-30s/artifacts/",
+    "/home/evan/.tmp/mut-2-calibration/discovery_record_book-30s/corpus"
+  ],
+  "environment": {
+    "ZAKURA_SIM_STATS": "/home/evan/.tmp/mut-2-calibration/discovery_record_book-30s/stats",
+    "ZAKURA_SIM_ARTIFACTS": "/home/evan/.tmp/mut-2-calibration/discovery_record_book-30s/sim",
+    "ZAKURA_SIM_ABANDON_LIMIT": "1",
+    "ZAKURA_SIM_FEEDBACK": "on"
+  },
+  "removed_environment": [
+    "ZAKURA_SIM_EXPECT",
+    "ASAN_OPTIONS",
+    "LSAN_OPTIONS",
+    "MSAN_OPTIONS",
+    "TSAN_OPTIONS",
+    "UBSAN_OPTIONS"
+  ],
+  "host_load_average_start": [
+    4.91943359375,
+    4.4833984375,
+    4.8203125
+  ],
+  "host_cpu_count": 24,
+  "started_unix": 1793846778.6053774,
+  "stats_files": [
+    "stats-4121690.json"
+  ],
+  "scored": false,
+  "build": {
+    "package": "qa/fuzz/sim",
+    "target": "discovery_record_book",
+    "harness": "discovery/record-book",
+    "git": "b2e0456474e47e6264c912b2f6b50d09c8603115",
+    "dirty": false,
+    "source": "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be",
+    "lockfile": "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade",
+    "fuzz_lockfile": "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc",
+    "rustc": "rustc 1.99.0-nightly (da80ed070 2026-07-14)",
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "libfuzzer_sys": "0.4.13",
+    "rustflags": "--cfg zakura_sim",
+    "cargo_args": [
+      "--sanitizer",
+      "none",
+      "--no-default-features"
+    ]
+  },
+  "final_corpus_input_count": 350,
+  "final_corpus_manifest_sha256": "a11ff8b06ef7cd633fe5e0dfa121c14f254592b1f1954bc113fc6295a28a809d",
+  "final_corpus_manifest_encoding": "JSON array of {sha256,size}, file-name order, sorted object keys, no spaces, LF terminator; excluded from scoring",
+  "raw_log_sha256": "f1cf9aa3563b533515ad1577d86483a723ccd5f789a508b33ebf2162c1a49446",
+  "log_normalization": "Trailing whitespace removed from each line."
+}

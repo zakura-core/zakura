@@ -7,8 +7,9 @@ corpus. Each case names its causal trigger and the observations that expose
 the changed behavior. The catalogue changes no production code, property,
 generator, witness input or mutation patch.
 
-This package prepares the pilot. It records no new mutant score or discovery
-result. The full retained-suite readiness gate remains open.
+This package prepares the pilot. It records baseline calibration and no
+mutant or scored discovery campaign. The full retained-suite readiness gate
+remains open.
 The [mutation plan](https://valargroup.getoutline.com/doc/6af54d3b-7ca5-4f05-975d-77893109e7ad)
 defines the broader acceptance criteria.
 
@@ -87,14 +88,57 @@ input. A fresh empty corpus prevents those inputs from entering by accident.
 The shared `seeds` loader currently accepts an explicit empty fixture directory.
 The paired runner must also verify the campaign's saved initial snapshot.
 
-The proposed allocation is five seeds (`11`, `23`, `47`, `89`, `179`) and 600
+The allocation is five seeds (`11`, `23`, `47`, `89`, `179`) and 600
 seconds per seed for each original/mutant pair. Each run uses one worker,
 512-byte inputs, a 10-second input limit, 2048 MiB RSS, no restarts, semantic
 feedback and no sanitizer. Each machine decoder bounds its operations to the
 512-byte scenario prefix. Its harness bounds simulator work to 128 steps, or
 129 steps for decoded retention including drain. Confirmation gets 60 seconds
-per child. Shrinking gets 600 seconds and 2000 candidates. Calibration must
-verify these bounds before scoring.
+per child. Shrinking gets 600 seconds and 2000 candidates.
+
+## Baseline calibration
+
+Six unmodified fuzz runs calibrated the bounds above. Each run started a
+fresh empty corpus with seed 11. The first five requested five seconds each.
+The record-book target observed no applicable input, so a separate run used
+the same seed, bounds and generator for 30 seconds. Both results remain below.
+No generator or input repair followed either run.
+
+| Target | Requested seconds | Elapsed seconds | Inputs | Applicable inputs |
+| --- | ---: | ---: | ---: | ---: |
+| `block_decoded_retention` | 5 | 6.032 | 41,685 | 32,496 |
+| `block_reactor_policy` | 5 | 6.026 | 56,272 | 32,760 |
+| `discovery_record_book` | 5 | 6.027 | 5,484 | 0 |
+| `discovery_record_book` | 30 | 31.024 | 21,699 | 0 |
+| `header_publisher_policy` | 5 | 6.026 | 87,963 | 66,117 |
+| `header_reactor_policy` | 5 | 6.027 | 85,923 | 8,057 |
+
+Every process exited zero with complete stats, no violations, no abandoned
+runs and no cleanup failures. Peak RSS ranged from 32 to 33 MiB. The runs
+support the selected resource limits. They do not establish a discovery rate.
+Other builds ran during calibration, so throughput is host-specific. The
+600-second allocation retains the plan's initial proposal; it does not promise
+that any target will reach its trigger within that budget.
+
+**Record-book applicability remains open.** Its `Holds` gate requires an
+installation, replacement, eviction and sample within the same input. Neither
+calibration run satisfied that whole-history gate. Zero applicability does
+not mean that the driver executed no operations. The two record-book cases
+remain in the future discovery denominator. A scored run with zero
+applicability must report that outcome, not coverage or intended detection.
+Their committed sensitivity fixture still passes, and their curated target
+readiness result remains separate from cold-start discovery.
+
+The clean fuzz binaries came from mut-1.3 at
+`b2e0456474e47e6264c912b2f6b50d09c8603115`. Their build identities pin
+`nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, and the refreshed
+simulator fuzz lockfile. `fuzz_build_inputs` records these separately from the
+dev/test witness build. Each `calibration/*/run.json` records its binary hash,
+build identity, command, environment, elapsed time and initial empty corpus.
+The catalogue hashes the run records, stats and log copies. Log copies omit
+trailing whitespace; each run record also retains the raw log's hash.
+Generated calibration corpora remain outside this catalogue and all scored
+inputs. Their counts and manifest hashes provide an audit record.
 
 This command shape supplies the explicit discovery configuration after the
 paired runner has prepared and verified the selected build. `STORE` names a
@@ -143,12 +187,15 @@ python3 scripts/check_mutation_pilot.py
 python3 -m unittest discover -s scripts -p test_check_mutation_pilot.py -v
 ```
 
-The checker verifies hashes and bindings, nonzero intended applicability,
+The checker verifies hashes and bindings, nonzero sensitivity applicability,
 passing witnesses, clean outcomes, recorded replay exits and empty discovery
-inputs. It rejects drift in the source tree. It does not rerun replay, prove
-causal trigger semantics or execute a mutation. The tests reject wrong-ID
-witnesses, zero applicability, another property's failure, copied sensitivity
-inputs and checker drift.
+inputs. It checks calibration build identities, complete input counts and
+applicability labels. It rejects drift in source and fuzz build inputs. It
+does not rerun replay, prove causal trigger semantics or execute a mutation.
+The ten tests reject wrong-ID witnesses, zero sensitivity applicability,
+another property's failure, copied sensitivity inputs, missing corpus
+directories, source/checker drift, misreported calibration applicability and
+calibration cleanup failures.
 
 To repeat one baseline, build the pinned source using the mut-1.1 instructions.
 Set `SIM` to that executable, `INPUT` and `HARNESS` from a catalogue case, and
@@ -161,3 +208,10 @@ timeout 60 "$SIM" replay "$OUT"
 "$SIM" seeds --sim "$HARNESS" \
   --fixtures qa/mutation-pilot/discovery-empty --report "$OUT/empty-seeds.json"
 ```
+
+To repeat calibration, build the selected target with mut-1.3's toolchain and
+flags. Start a new empty directory for each run and use its recorded command
+and environment. `-max_total_time` requests five seconds, or 30 for the second
+record-book run. An outer watchdog allows 15 extra seconds. Remove
+`ZAKURA_SIM_EXPECT` and sanitizer-option variables as the run record specifies.
+Preserve raw process stats and never reuse the generated corpus for scoring.

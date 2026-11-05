@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "status": "review-candidate; no campaign has run",
+  "status": "reviewed case matrix and calibrated bounds; no mutant or scored discovery campaign has run",
   "catalogue_base_revision": "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57",
   "source_revision": "870678be1739ea799e59b4e0bdfe6cf512792710",
   "baseline_build": {
@@ -72,7 +72,7 @@
     "abandon_limit": 1,
     "feedback": "on",
     "sanitizer": "none",
-    "calibration": "pending before scoring; baseline witness timing is not fuzz-throughput calibration",
+    "calibration": "Six baseline-only cold-start runs retained in calibration; discovery record-book did not satisfy its whole-history applicability gate in either 5s or 30s. No generator, witness or corpus repair followed.",
     "paired_runs": "Use identical seed, bounds and initial empty corpus for original and mutant. Start each seed in a fresh store; never carry a previous corpus."
   },
   "confirmation": {
@@ -564,5 +564,88 @@
       },
       "patch_sidecar_sha256": "996997c50d0103e9ccd38ac08e43545070c80c8d4bb85c0224b843bbd3afea53"
     }
-  ]
+  ],
+  "fuzz_build_inputs": {
+    "source_revision": "b2e0456474e47e6264c912b2f6b50d09c8603115",
+    "source_sha256": "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be",
+    "manifest_sha256": "febf8034da1717faf92c633e03e26920e2f7abb69ab8e877275cdab9b47fb1ce",
+    "lockfile_sha256": "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc",
+    "toolchain": "nightly-2026-07-15",
+    "rustc": "rustc 1.99.0-nightly (da80ed070 2026-07-14)",
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "libfuzzer_sys": "0.4.13",
+    "rustflags": "--cfg zakura_sim",
+    "cargo_args": [
+      "--sanitizer",
+      "none",
+      "--no-default-features"
+    ]
+  },
+  "calibration": {
+    "runs": [
+      {
+        "directory": "qa/mutation-pilot/calibration/block_decoded_retention",
+        "target": "block_decoded_retention",
+        "harness": "block/decoded-retention",
+        "run_sha256": "7db04d1b2bbff886f4638f26f3921804d54c9a8077cb4e50caeaf39af16ef1a6",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "eecdc01067acfe19142f245cc612408984121afb3db64dcb530c7b91ed970703",
+        "log_sha256": "a906cbe8baef1689515af2f20fffa7d0cc4fcbb2e27f672d4a38c8619a4ce82c",
+        "applicability": "observed"
+      },
+      {
+        "directory": "qa/mutation-pilot/calibration/block_reactor_policy",
+        "target": "block_reactor_policy",
+        "harness": "block/reactor-policy",
+        "run_sha256": "083604ee05448c090628adc1bb4d198d7be6e45ab9c35f163961a66006dfb4db",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "9c4ce4cc65e00430c8b3029d41f8d2d42a3127c702a0ea8ce18c224ece5d8235",
+        "log_sha256": "067871490af6f96be837a78d221a9eac33a440f7e5c3ea3a7e8cc91e189e1b93",
+        "applicability": "observed"
+      },
+      {
+        "directory": "qa/mutation-pilot/calibration/discovery_record_book",
+        "target": "discovery_record_book",
+        "harness": "discovery/record-book",
+        "run_sha256": "7608ce9a0e0fc3579473c9c7e8514998843cfb6cb1f2b8a99fdf26ed631b05c9",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "1312fedac58a47b9a6e84a0192148bdbe0a766ba1dad4475adfd026a1c97c380",
+        "log_sha256": "084815fc9c702b771801ecfd676092833379a0631ad642b10504f0fee2909c01",
+        "applicability": "not-observed"
+      },
+      {
+        "directory": "qa/mutation-pilot/calibration/discovery_record_book-30s",
+        "target": "discovery_record_book",
+        "harness": "discovery/record-book",
+        "run_sha256": "061a5cd0b6d0189653a982e8a0818b0ef62143fc4657c270e56760c273f15da3",
+        "stats_file": "stats/stats-4121690.json",
+        "stats_sha256": "9962a9049d254825be96bf4ca1cde424ca78d623581f7a3ba0eb0474a7a4caf6",
+        "log_sha256": "ae27ed37ad18c31c7e4f7d99d5ea0569b3875f90b0371075c7b159ea2aa25921",
+        "applicability": "not-observed"
+      },
+      {
+        "directory": "qa/mutation-pilot/calibration/header_publisher_policy",
+        "target": "header_publisher_policy",
+        "harness": "header/publisher-policy",
+        "run_sha256": "1c44ba9a811bc030ef63c9d74b4e792bb1ad99f2659f84365ad2d7b0205218e2",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "77a5ee1a7ce8dfc54032e0118f053d80a7258f563eb78550eb9a6a5ffbb044b5",
+        "log_sha256": "7516aca81632ed177ecef4e0969f7aeca623a458fcc06809187d3e6db49e6bc8",
+        "applicability": "observed"
+      },
+      {
+        "directory": "qa/mutation-pilot/calibration/header_reactor_policy",
+        "target": "header_reactor_policy",
+        "harness": "header/reactor-policy",
+        "run_sha256": "cc58dc5ecd649dc9a867cd2d39086fc96b1fc85a8af3e09854203bbe3c33dcf5",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "3928ed89239a45da0124670d25d54a3d6414f1ea7d1bfa01f327b4f4b7bbcbec",
+        "log_sha256": "22f6b170032098eaec1fe517e6b6cdeafb36374d07c92027b8ac0e9248f388fc",
+        "applicability": "observed"
+      }
+    ],
+    "decision": "Freeze 512-byte inputs at the existing decoder limit, 10s input timeout and 2048MiB RSS. Retain the planned 600s allocation per seed. Calibration completed without resource failures; it does not prove discovery reachability or bound its probability.",
+    "open_gap": "discovery/record-book requires installed, replaced, evicted and sampled in one input for Holds. Neither calibration attempt reached that full gate. Keep both selected cases in the discovery denominator; report not-applicable if the scored run also never applies.",
+    "restrictions": "Calibration used only original builds and seed 11. Its generated corpora are excluded from every scored initial corpus. Build work ran concurrently; throughput is host-specific."
+  }
 }

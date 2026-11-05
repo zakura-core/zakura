@@ -19,7 +19,7 @@ class PilotEvidenceTests(unittest.TestCase):
         self.catalogue_path = self.root / "qa/mutation-pilot/catalogue.json"
         self.catalogue = json.loads((source / "qa/mutation-pilot/catalogue.json").read_text())
         shutil.copytree(source / "qa/mutation-pilot", self.root / "qa/mutation-pilot")
-        paths = {"Cargo.lock", "qa/fuzz/sim/Cargo.toml"}
+        paths = {"Cargo.lock", "qa/fuzz/sim/Cargo.toml", "qa/fuzz/sim/Cargo.lock"}
         for case in self.catalogue["cases"]:
             paths.update(case["production_files"])
             paths.update(case["oracle_and_generator_files"])
@@ -93,6 +93,22 @@ class PilotEvidenceTests(unittest.TestCase):
         with (self.root / path).open("a") as stream:
             stream.write("\n// changed oracle\n")
         self.assertIn(f"hash differs: {path}", pilot.validate(self.root))
+
+    def test_zero_calibration_applicability_cannot_claim_coverage(self):
+        row = next(row for row in self.catalogue["calibration"]["runs"] if row["applicability"] == "not-observed")
+        row["applicability"] = "observed"
+        self.save_catalogue()
+        self.assertTrue(any("calibration applicability differs" in error for error in pilot.validate(self.root)))
+
+    def test_calibration_cleanup_failure_fails_even_with_matching_hash(self):
+        row = self.catalogue["calibration"]["runs"][0]
+        path = self.root / row["directory"] / row["stats_file"]
+        stats = json.loads(path.read_text())
+        stats["counts"]["cleanup"]["leaked_tasks"] = 1
+        path.write_text(json.dumps(stats))
+        row["stats_sha256"] = pilot.digest(path)
+        self.save_catalogue()
+        self.assertTrue(any("calibration contains a failure" in error for error in pilot.validate(self.root)))
 
 
 if __name__ == "__main__":

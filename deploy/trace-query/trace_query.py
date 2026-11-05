@@ -2,19 +2,20 @@
 """Follow Zakura raw trace tables and query them with SQL.
 
 The node side (`[tracing].raw_endpoint_addr`, docs/raw-trace-endpoint.md) only
-streams byte ranges of its JSONL trace files. This is the collecting side:
+serves its JSONL trace files over HTTP with standard byte ranges. This is the collecting side:
 
 - `pull` follows tables on one or more nodes and mirrors their rows into SQLite.
 - `sql` runs an arbitrary read-only query over that mirror.
-- `dump` prints a fresh prefix of one table as JSONL, for `jq` and other pipes.
+- `tables` lists a node's tables with their sizes and ETags.
+- `dump` prints one table as JSONL, for `jq` and other pipes.
 
-Following a growing file. A resumed range is capped at the length its
-`X-Trace-File-Id` captured, so each poll first probes `bytes=0-0` for a fresh
-token. The token is `device:inode:length`. When the device and inode match the
-stored cursor, the poll resumes at the cursor with the fresh token, so it reads
-only appended bytes. A different device or inode, a file shorter than the cursor,
-or a 409 means the file was replaced; the cursor restarts at byte 0 of the new
-file. The cursor only advances past complete lines, so a line the writer has not
+Following a growing file. Each poll sends one request, `Range: bytes=<cursor>-`
+with `If-Range: <etag>`. The ETag names the file (device, inode, birth time), not
+its contents, and the writer only appends. A 206 carries the appended bytes. A
+416 whose length equals the cursor means nothing new; a shorter length means
+the file was truncated, and the cursor restarts at 0. A 200 means the ETag no
+longer matches: the file was replaced, and the body is the new file from byte 0.
+The cursor only advances past complete lines, so a line the writer has not
 finished is fetched again by the next poll.
 
 Rows keep the node's process-relative `ts` (microseconds since that process
@@ -30,6 +31,7 @@ import argparse
 import http.client
 import json
 import logging
+import re
 import sqlite3
 import sys
 import time
@@ -41,44 +43,35 @@ from typing import Iterable, Iterator, Optional
 
 LOG = logging.getLogger("trace_query")
 
-# The node's fixed export allowlist (raw_endpoint.rs `TABLES`).
-TABLES = (
-    "handshake",
-    "conn",
-    "stream",
-    "discovery",
-    "ratelimit",
-    "header_sync",
-    "legacy_request",
-    "block_sync",
-    "commit_state",
-    "quic_conn",
-    "queue_send",
-    "legacy_peer_request",
-    "legacy_sync",
-)
-
-# The node rejects ranges above 1 MiB.
-MAX_RANGE_BYTES = 1024 * 1024
-# The node closes every connection after 30 s.
+# The node serves `<trace_dir>/<name>.jsonl` for names matching this.
+TABLE_NAME = re.compile(r"[a-z0-9_]{1,64}")
+# Names the mirror uses for itself, so no trace table gets a view with them.
+RESERVED_NAMES = {"trace_rows", "trace_cursors"}
+# The node drops a connection that stalls for 30 s.
 REQUEST_TIMEOUT_SECS = 35.0
-# One poll reads at most this much, so a first catch-up of a large file
+READ_CHUNK_BYTES = 256 * 1024
+# One poll reads about this much, so a first catch-up of a large file
 # commits in bounded steps.
-DEFAULT_POLL_BUDGET_BYTES = 64 * MAX_RANGE_BYTES
-MAX_LINE_BYTES = 8 * MAX_RANGE_BYTES
+DEFAULT_POLL_BUDGET_BYTES = 64 * 1024 * 1024
+MAX_LINE_BYTES = 8 * 1024 * 1024
+CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
+UNSATISFIED_RANGE = re.compile(r"bytes \*/(\d+)")
 
 
 class EndpointError(Exception):
-    """The endpoint answered with a status this client does not handle."""
+    """The endpoint answered with a status or headers this client does not accept."""
 
 
-class FileReplaced(Exception):
-    """The file behind a token was replaced or truncated (HTTP 409)."""
+def check_table(table: str) -> str:
+    """Return `table` if the node could serve it; raise ValueError otherwise."""
+    if not isinstance(table, str) or not TABLE_NAME.fullmatch(table):
+        raise ValueError(f"invalid trace table name {table!r}")
+    return table
 
 
 @dataclass
 class Cursor:
-    """How far one table has been read: the file identity and a byte offset.
+    """How far one table has been read: the file's ETag and a byte offset.
 
     `offset` is always the start of a line, so it never splits a JSONL record.
     """
@@ -95,159 +88,137 @@ class Poll:
     rows: list = field(default_factory=list)
     reset: bool = False
     malformed: int = 0
-    # True when the poll stopped at its byte budget before the captured end.
+    # True when the poll stopped at its byte budget before the end of the file.
     more: bool = False
-
-
-@dataclass(frozen=True)
-class Capture:
-    """A fixed prefix the node captured: its `device:inode:length` token, split.
-
-    `file_id` is `device:inode`. An empty file has no token and no identity.
-    """
-
-    token: Optional[str]
-    file_id: Optional[str]
-    length: int
-
-    @classmethod
-    def parse(cls, token: str) -> "Capture":
-        try:
-            device, inode, length = (int(part) for part in token.split(":"))
-        except ValueError:
-            raise EndpointError(f"malformed X-Trace-File-Id {token!r}") from None
-        if min(device, inode, length) < 0:
-            raise EndpointError(f"negative X-Trace-File-Id field {token!r}")
-        return cls(token=token, file_id=f"{device}:{inode}", length=length)
 
 
 class Endpoint:
     """One node's raw trace endpoint."""
 
     def __init__(self, base_url: str, host_header: Optional[str] = None,
-                 timeout: float = REQUEST_TIMEOUT_SECS, range_bytes: int = MAX_RANGE_BYTES):
+                 timeout: float = REQUEST_TIMEOUT_SECS, chunk_bytes: int = READ_CHUNK_BYTES):
         self.base_url = base_url.rstrip("/")
         # A tunnel or proxy changes the URL authority. The node only accepts its
         # literal bound address as Host, so callers pass that through here.
         self.host_header = host_header
         self.timeout = timeout
-        if not 0 < range_bytes <= MAX_RANGE_BYTES:
-            raise ValueError("range_bytes must be between 1 and 1 MiB")
-        self.range_bytes = range_bytes
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be positive")
+        self.chunk_bytes = chunk_bytes
 
-    def _request(self, table: str, headers: dict) -> tuple[int, dict, bytes]:
-        if table not in TABLES:
-            raise ValueError(f"unknown trace table {table!r}")
-        request = urllib.request.Request(f"{self.base_url}/traces/{table}", headers=headers)
+    def _open(self, path: str, headers: dict):
+        """Send one GET; return (status, lower-cased headers, open response or None)."""
+        request = urllib.request.Request(f"{self.base_url}{path}", headers=headers)
         if self.host_header:
             request.add_header("Host", self.host_header)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read(self.range_bytes + 1)
-                if len(body) > self.range_bytes:
-                    raise EndpointError(f"{table}: response exceeds range limit")
-                expected = response.headers.get("Content-Length")
-                if expected is None or not expected.isdecimal() or len(body) != int(expected):
-                    raise EndpointError(f"{table}: short body {len(body)} of {expected} bytes")
-                return response.status, {k.lower(): v for k, v in response.headers.items()}, body
+            response = urllib.request.urlopen(request, timeout=self.timeout)
         except urllib.error.HTTPError as error:
             with error:
-                return error.code, {}, b""
+                return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, None
+        return response.status, {k.lower(): v for k, v in response.headers.items()}, response
+
+    def _chunks(self, table: str, response, length: int) -> Iterator[bytes]:
+        """Yield the body in chunks; raise if it ends before `length` bytes."""
+        remaining = length
+        try:
+            while remaining > 0:
+                chunk = response.read(min(self.chunk_bytes, remaining))
+                if not chunk:
+                    raise EndpointError(f"{table}: body ended {remaining} bytes early")
+                remaining -= len(chunk)
+                yield chunk
         except http.client.HTTPException as error:
             raise EndpointError(f"{table}: interrupted HTTP response: {error}") from error
 
-    def probe(self, table: str) -> Optional["Capture"]:
-        """Capture a fresh prefix. Returns None when the table file is missing."""
-        status, headers, body = self._request(table, {"Range": "bytes=0-0"})
-        if status == 404:
-            return None
-        if status == 416:
-            # Only an empty file rejects byte 0, and the 416 carries no identity.
-            return Capture(token=None, file_id=None, length=0)
-        if status != 206:
-            raise EndpointError(f"{table}: probe returned HTTP {status}")
-        token = headers.get("x-trace-file-id")
-        if not token:
-            raise EndpointError(f"{table}: probe response has no X-Trace-File-Id")
-        capture = Capture.parse(token)
-        if len(body) != 1 or headers.get("content-range") != f"bytes 0-0/{capture.length}":
-            raise EndpointError(f"{table}: invalid probe range")
-        return capture
-
-    def read_range(self, table: str, token: str, start: int, end: int) -> bytes:
-        """Read bytes `start..end` (exclusive) of the prefix that `token` captured."""
-        status, headers, body = self._request(
-            table, {"Range": f"bytes={start}-{end - 1}", "X-Trace-File-Id": token})
-        if status == 409:
-            raise FileReplaced(table)
-        if status != 206:
-            raise EndpointError(f"{table}: range {start}-{end - 1} returned HTTP {status}")
-        length = Capture.parse(token).length
-        if (len(body) != end - start or headers.get("x-trace-file-id") != token
-                or headers.get("content-range") != f"bytes {start}-{end - 1}/{length}"):
-            raise EndpointError(f"{table}: response does not match requested range")
-        return body
+    def tables(self) -> list:
+        """The node's index: one dict per table with `name`, `bytes` and `etag`."""
+        status, _, response = self._open("/traces", {})
+        if status != 200:
+            raise EndpointError(f"index returned HTTP {status}")
+        with response:
+            try:
+                index = json.loads(response.read(16 * 1024 * 1024))
+            except ValueError as error:
+                raise EndpointError(f"index is not JSON: {error}") from None
+        tables = index.get("tables") if isinstance(index, dict) else None
+        if not isinstance(tables, list) or not all(
+                isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                and TABLE_NAME.fullmatch(entry["name"]) for entry in tables):
+            raise EndpointError("index has an unexpected shape")
+        return tables
 
     def dump(self, table: str) -> Iterator[bytes]:
-        """Stream a fresh prefix in bounded chunks; the last line may be incomplete."""
-        capture = self.probe(table)
-        if capture is None:
-            raise EndpointError(f"{table}: no such trace file")
-        token, length = capture.token, capture.length
-        offset = 0
-        while offset < length:
-            end = min(offset + self.range_bytes, length)
-            chunk = self.read_range(table, token, offset, end)
-            if not chunk:
-                raise EndpointError(f"{table}: empty range at {offset}")
-            yield chunk
-            offset += len(chunk)
+        """Stream one table up to its length when the node opened it; the last line may be incomplete."""
+        status, headers, response = self._open(f"/traces/{check_table(table)}", {})
+        if status != 200:
+            raise EndpointError(f"{table}: returned HTTP {status}")
+        with response:
+            yield from self._chunks(table, response, content_length(table, headers))
 
     def poll(self, table: str, cursor: Cursor,
              budget_bytes: int = DEFAULT_POLL_BUDGET_BYTES) -> Poll:
-        """Read the rows appended after `cursor`, up to `budget_bytes`."""
+        """Read the rows appended after `cursor`, up to about `budget_bytes`."""
         if budget_bytes <= 0:
             raise ValueError("budget_bytes must be positive")
-        capture = self.probe(table)
-        if capture is None:
+        headers = {"Range": f"bytes={cursor.offset}-"}
+        if cursor.file_id:
+            headers["If-Range"] = cursor.file_id
+        status, response_headers, response = self._open(f"/traces/{check_table(table)}", headers)
+        if status == 404:
             return Poll(cursor=cursor)
-        if capture.length == 0:
-            # The writer only appends, so an empty file under a cursor is a new file.
-            return Poll(cursor=Cursor(), reset=cursor.offset > 0)
-        token, file_id, length = capture.token, capture.file_id, capture.length
-        reset = False
-        if cursor.file_id != file_id or cursor.offset > length:
-            reset = cursor.file_id is not None
-            cursor = Cursor(file_id, 0)
+        if status == 416:
+            found = UNSATISFIED_RANGE.fullmatch(response_headers.get("content-range", ""))
+            if not found:
+                raise EndpointError(f"{table}: 416 without a valid Content-Range")
+            length = int(found.group(1))
+            if length < cursor.offset:
+                # The writer only appends, so a shorter file was truncated.
+                return Poll(cursor=Cursor(), reset=True)
+            if length > cursor.offset:
+                raise EndpointError(f"{table}: 416 for an offset inside the file")
+            return Poll(cursor=cursor)
 
-        result = Poll(cursor=Cursor(file_id, cursor.offset), reset=reset)
-        # `pending` starts at `line_start`, the first byte not yet returned as a row.
-        line_start = cursor.offset
-        read_to = cursor.offset
-        pending = bytearray()
-        stop = min(length, cursor.offset + budget_bytes)
-        try:
-            # Past the budget, keep reading until one line completes, so a line
-            # longer than the budget still makes progress.
-            while read_to < stop or (line_start == cursor.offset and read_to < length):
-                end = min(read_to + self.range_bytes, length)
-                chunk = self.read_range(table, token, read_to, end)
-                if not chunk:
-                    raise EndpointError(f"{table}: empty range at {read_to}")
-                read_to += len(chunk)
-                pending += chunk
-                line_start = self._take_lines(pending, line_start, result)
-                del pending[: line_start - (read_to - len(pending))]
-        except FileReplaced:
-            # Keep the complete lines already parsed; the next poll restarts.
-            LOG.warning("%s: file replaced during a poll; restarting next poll", table)
-            # Rows still belong to the captured file. Rewind its cursor so a
-            # subsequent probe can detect replacement without relabelling rows.
-            result.cursor.offset = 0
-            return result
-        result.cursor.offset = line_start
-        result.more = read_to < length
+        with response:
+            etag = response_headers.get("etag")
+            if not etag:
+                raise EndpointError(f"{table}: HTTP {status} without an ETag")
+            length = content_length(table, response_headers)
+            if status == 206:
+                found = CONTENT_RANGE.fullmatch(response_headers.get("content-range", ""))
+                if (not found or int(found.group(1)) != cursor.offset
+                        or int(found.group(2)) + 1 - cursor.offset != length
+                        or (cursor.file_id and etag != cursor.file_id)):
+                    raise EndpointError(f"{table}: 206 does not match the requested range")
+                result = Poll(cursor=Cursor(etag, cursor.offset))
+            elif status == 200:
+                # If-Range failed, or there was no ETag yet: the body is the file from byte 0.
+                result = Poll(cursor=Cursor(etag, 0), reset=cursor.file_id is not None)
+            else:
+                raise EndpointError(f"{table}: returned HTTP {status}")
+            self._read_lines(table, response, length, budget_bytes, result)
         return result
+
+    def _read_lines(self, table: str, response, length: int, budget_bytes: int, result: Poll):
+        """Parse complete lines from the body into `result`, stopping after the budget.
+
+        Past the budget it keeps reading until one line completes, so a line longer
+        than the budget still makes progress.
+        """
+        start = result.cursor.offset
+        line_start = start
+        read = 0
+        pending = bytearray()
+        for chunk in self._chunks(table, response, length):
+            read += len(chunk)
+            pending += chunk
+            consumed = self._take_lines(pending, line_start, result)
+            del pending[: consumed - line_start]
+            line_start = consumed
+            if read >= budget_bytes and line_start > start:
+                break
+        result.cursor.offset = line_start
+        result.more = read < length
 
     @staticmethod
     def _take_lines(pending: bytearray, line_start: int, result: Poll) -> int:
@@ -278,6 +249,13 @@ class Endpoint:
                 result.rows.append((offset, row))
             else:
                 result.malformed += 1
+
+
+def content_length(table: str, headers: dict) -> int:
+    value = headers.get("content-length", "")
+    if not value.isdecimal():
+        raise EndpointError(f"{table}: missing Content-Length")
+    return int(value)
 
 
 SCHEMA = """
@@ -318,11 +296,16 @@ class Mirror:
     def __init__(self, path: str):
         self.db = sqlite3.connect(path)
         self.db.executescript(SCHEMA)
-        for table in TABLES:
-            self.db.execute(
-                f'CREATE VIEW IF NOT EXISTS "{table}" AS SELECT node, file_id, offset, event, ts, '
-                f"process_trace_id, fetched_unix, row FROM trace_rows WHERE tbl = '{table}'")
         self.db.commit()
+
+    def ensure_view(self, table: str):
+        """Give `table` a view of the same name over `trace_rows`, unless the mirror uses that name."""
+        if check_table(table) in RESERVED_NAMES:
+            return
+        # `check_table` limits the name to [a-z0-9_], so it is safe inside the SQL text.
+        self.db.execute(
+            f'CREATE VIEW IF NOT EXISTS "{table}" AS SELECT node, file_id, offset, event, ts, '
+            f"process_trace_id, fetched_unix, row FROM trace_rows WHERE tbl = '{table}'")
 
     def cursor(self, node: str, table: str) -> Cursor:
         found = self.db.execute(
@@ -336,6 +319,7 @@ class Mirror:
         now = time.time() if now is None else now
         stored = 0
         with self.db:
+            self.ensure_view(table)
             for offset, row in poll.rows:
                 event = row.get("event")
                 if events and event not in events:
@@ -359,16 +343,22 @@ class Mirror:
                 "DELETE FROM trace_rows WHERE fetched_unix < ?", (older_than_unix,)).rowcount
 
 
-def follow(endpoints: dict, tables: Iterable[str], mirror: Mirror,
+def follow(endpoints: dict, tables: Optional[Iterable[str]], mirror: Mirror,
            events: Optional[set] = None, budget_bytes: int = DEFAULT_POLL_BUDGET_BYTES) -> int:
     """Poll every (node, table) once into `mirror`; return rows stored.
 
-    Each table gets one bounded poll so a busy table cannot starve another.
-    One failing node or table is logged and skipped.
+    `tables=None` follows every table in each node's index. Each table gets one
+    bounded poll so a busy table cannot starve another. One failing node or table
+    is logged and skipped.
     """
     stored = 0
     for node, endpoint in endpoints.items():
-        for table in tables:
+        try:
+            names = list(tables) if tables is not None else [entry["name"] for entry in endpoint.tables()]
+        except (EndpointError, OSError) as error:
+            LOG.warning("%s: %s", node, error)
+            continue
+        for table in names:
             try:
                 poll = endpoint.poll(table, mirror.cursor(node, table), budget_bytes)
             except (EndpointError, OSError) as error:
@@ -418,7 +408,8 @@ def main(argv: Optional[list] = None) -> int:
                       help="a node's endpoint, e.g. local=http://127.0.0.1:9009 (repeatable)")
     pull.add_argument("--host-header", action="append", default=[], metavar="NAME=HOST",
                       help="Host header for a tunnelled node: its literal bound address")
-    pull.add_argument("--table", action="append", required=True, choices=TABLES)
+    pull.add_argument("--table", action="append", type=check_table,
+                      help="a table to follow (repeatable; default every table in each node's index)")
     pull.add_argument("--event", action="append", default=[],
                       help="store only rows with this event (repeatable; default all)")
     pull.add_argument("--follow", type=float, metavar="SECS",
@@ -431,14 +422,23 @@ def main(argv: Optional[list] = None) -> int:
     sql.add_argument("--format", choices=("tsv", "json"), default="tsv")
     sql.add_argument("query")
 
-    dump = commands.add_parser("dump", help="print a fresh prefix of one table as JSONL")
+    tables = commands.add_parser("tables", help="list a node's tables with their sizes and ETags")
+    tables.add_argument("--url", required=True, help="endpoint URL, e.g. http://127.0.0.1:9009")
+    tables.add_argument("--host-header")
+
+    dump = commands.add_parser("dump", help="print one table as JSONL")
     dump.add_argument("--url", required=True, help="endpoint URL, e.g. http://127.0.0.1:9009")
     dump.add_argument("--host-header")
-    dump.add_argument("--table", required=True, choices=TABLES)
+    dump.add_argument("--table", required=True, type=check_table)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.command == "tables":
+        for entry in Endpoint(args.url, args.host_header).tables():
+            print(json.dumps(entry))
+        return 0
 
     if args.command == "dump":
         for chunk in Endpoint(args.url, args.host_header).dump(args.table):

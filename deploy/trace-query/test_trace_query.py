@@ -19,12 +19,15 @@ import trace_query  # noqa: E402
 
 
 class FakeEndpoint(http.server.ThreadingHTTPServer):
-    """Serves `<dir>/<table>.jsonl` with the node's range and token rules (raw_endpoint.rs)."""
+    """Serves `<dir>/<name>.jsonl` with the node's HTTP rules (docs/raw-trace-endpoint.md)."""
 
-    def __init__(self, directory, range_limit):
+    def __init__(self, directory):
         self.directory = Path(directory)
-        self.range_limit = range_limit
         self.requests = []
+        # Test hooks that make the server misbehave.
+        self.lie_content_range = False
+        self.truncate_body_after = None
+        self.ignore_if_range = False
         super().__init__(("127.0.0.1", 0), FakeHandler)
 
     @property
@@ -32,50 +35,58 @@ class FakeEndpoint(http.server.ThreadingHTTPServer):
         return f"http://127.0.0.1:{self.server_address[1]}"
 
 
+def etag_of(stat):
+    return f'"{stat.st_dev:x}-{stat.st_ino:x}-0"'
+
+
 class FakeHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, *args):
         pass
 
-    def send(self, status, body=b"", headers=()):
+    def send(self, status, body=b"", headers=(), length=None):
         self.send_response(status)
         for name, value in headers:
             self.send_header(name, value)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(body) if length is None else length))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         server = self.server
-        server.requests.append((self.path, self.headers.get("Range"), self.headers.get("X-Trace-File-Id")))
-        expected_host = f"127.0.0.1:{server.server_address[1]}"
-        if self.headers.get("Host") != expected_host:
+        server.requests.append((self.path, self.headers.get("Range"), self.headers.get("If-Range")))
+        if self.headers.get("Host") != f"127.0.0.1:{server.server_address[1]}":
             return self.send(403)
+        if self.path == "/traces":
+            tables = [{"name": path.stem, "bytes": path.stat().st_size, "etag": etag_of(path.stat())}
+                      for path in sorted(server.directory.glob("*.jsonl"))]
+            return self.send(200, json.dumps({"tables": tables}).encode(),
+                             [("Content-Type", "application/json")])
         table = self.path.removeprefix("/traces/")
         path = server.directory / f"{table}.jsonl"
-        if not path.exists():
+        if not trace_query.TABLE_NAME.fullmatch(table) or not path.exists():
             return self.send(404)
         stat = path.stat()
-        token = self.headers.get("X-Trace-File-Id")
-        if token:
-            device, inode, length = (int(part) for part in token.split(":"))
-            if (device, inode) != (stat.st_dev, stat.st_ino) or stat.st_size < length:
-                return self.send(409)
+        data = path.read_bytes()
+        etag = etag_of(stat)
+        identity = [("ETag", etag), ("Accept-Ranges", "bytes")]
+        requested = self.headers.get("Range")
+        if_range = self.headers.get("If-Range")
+        if requested and (if_range is None or if_range == etag or server.ignore_if_range):
+            start = int(requested.removeprefix("bytes=").rstrip("-"))
+            if start >= len(data):
+                return self.send(416, b"", identity + [("Content-Range", f"bytes */{len(data)}")])
+            body = data[start:]
+            end = len(data) - 1 + (1 if server.lie_content_range else 0)
+            headers = identity + [("Content-Range", f"bytes {start}-{end}/{len(data)}")]
+            status = 206
         else:
-            device, inode, length = stat.st_dev, stat.st_ino, stat.st_size
-        start_text, _, end_text = self.headers["Range"].removeprefix("bytes=").partition("-")
-        start = int(start_text)
-        if start >= length:
-            return self.send(416)
-        end = min(int(end_text) if end_text else start + server.range_limit - 1, length - 1)
-        if end - start >= server.range_limit:
-            return self.send(416)
-        if start > 0 and not token:
-            return self.send(428)
-        with open(path, "rb") as file:
-            file.seek(start)
-            body = file.read(end + 1 - start)
-        self.send(206, body, [("X-Trace-File-Id", f"{device}:{inode}:{length}"),
-                              ("Content-Range", f"bytes {start}-{end}/{length}")])
+            body, headers, status = data, identity, 200
+        if server.truncate_body_after is not None:
+            return self.send(status, body[:server.truncate_body_after], headers, length=len(body))
+        self.send(status, body, headers)
 
 
 def row(event, **fields):
@@ -87,11 +98,12 @@ class EndpointCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        self.server = FakeEndpoint(self.dir.name, range_limit=16)
+        self.server = FakeEndpoint(self.dir.name)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
-        self.endpoint = trace_query.Endpoint(self.server.url, range_bytes=16)
+        # Small chunks so every poll spans many reads.
+        self.endpoint = trace_query.Endpoint(self.server.url, chunk_bytes=16)
         self.path = Path(self.dir.name) / "commit_state.jsonl"
 
     def append(self, data):
@@ -103,11 +115,11 @@ class EndpointCase(unittest.TestCase):
 
 
 class EndpointTest(EndpointCase):
-    def test_poll_reads_only_appended_rows_across_small_ranges(self):
+    def test_one_request_per_poll_reads_only_appended_rows(self):
         self.append(row("a", height=1) + row("b", height=2))
         first = self.endpoint.poll("commit_state", trace_query.Cursor())
         self.assertEqual(self.events(first), ["a", "b"])
-        self.assertEqual(first.cursor.offset, self.path.stat().st_size)
+        self.assertEqual(first.cursor, trace_query.Cursor(etag_of(self.path.stat()), self.path.stat().st_size))
         self.assertFalse(first.reset)
 
         self.append(row("c", height=3))
@@ -115,10 +127,11 @@ class EndpointTest(EndpointCase):
         second = self.endpoint.poll("commit_state", first.cursor)
         self.assertEqual(self.events(second), ["c"])
         self.assertEqual(second.rows[0][0], first.cursor.offset)
-        # The probe starts at 0; every other range resumes at or after the old cursor.
-        ranges = [int(r.removeprefix("bytes=").split("-")[0]) for _, r, _ in self.server.requests]
-        self.assertEqual(ranges[0], 0)
-        self.assertTrue(all(start >= first.cursor.offset for start in ranges[1:]))
+        self.assertEqual(self.server.requests, [
+            ("/traces/commit_state", f"bytes={first.cursor.offset}-", first.cursor.file_id)])
+
+        idle = self.endpoint.poll("commit_state", second.cursor)
+        self.assertEqual((idle.rows, idle.cursor, idle.reset), ([], second.cursor, False))
 
     def test_partial_line_waits_for_its_newline(self):
         whole = row("a") + row("b")
@@ -130,7 +143,7 @@ class EndpointTest(EndpointCase):
         second = self.endpoint.poll("commit_state", first.cursor)
         self.assertEqual(self.events(second), ["b"])
 
-    def test_replacement_restarts_at_the_new_file(self):
+    def test_replacement_returns_the_new_file(self):
         self.append(row("old") * 3)
         first = self.endpoint.poll("commit_state", trace_query.Cursor())
         replacement = self.path.with_suffix(".new")
@@ -139,15 +152,24 @@ class EndpointTest(EndpointCase):
         second = self.endpoint.poll("commit_state", first.cursor)
         self.assertTrue(second.reset)
         self.assertEqual(self.events(second), ["new"])
+        self.assertEqual(second.rows[0][0], 0)
         self.assertNotEqual(second.cursor.file_id, first.cursor.file_id)
 
+    def test_truncation_restarts_at_byte_zero(self):
+        self.append(row("a") * 3)
+        first = self.endpoint.poll("commit_state", trace_query.Cursor())
+        os.truncate(self.path, 0)
+        self.append(row("b"))
+        truncated = self.endpoint.poll("commit_state", first.cursor)
+        self.assertEqual((truncated.rows, truncated.cursor, truncated.reset), ([], trace_query.Cursor(), True))
+        self.assertEqual(self.events(self.endpoint.poll("commit_state", truncated.cursor)), ["b"])
+
     def test_missing_and_empty_tables(self):
-        cursor = trace_query.Cursor("1:2", 10)
+        cursor = trace_query.Cursor('"1-2-0"', 10)
         self.assertEqual(self.endpoint.poll("commit_state", cursor).cursor, cursor)
         self.path.write_bytes(b"")
-        empty = self.endpoint.poll("commit_state", cursor)
-        self.assertTrue(empty.reset)
-        self.assertEqual((empty.rows, empty.cursor), ([], trace_query.Cursor()))
+        empty = self.endpoint.poll("commit_state", trace_query.Cursor())
+        self.assertEqual((empty.rows, empty.cursor, empty.reset), ([], trace_query.Cursor(), False))
 
     def test_budget_splits_a_catch_up_and_long_lines_still_progress(self):
         self.append(row("a", pad="x" * 40) + row("b"))
@@ -163,30 +185,17 @@ class EndpointTest(EndpointCase):
         poll = self.endpoint.poll("commit_state", trace_query.Cursor())
         self.assertEqual((self.events(poll), poll.malformed), (["a"], 2))
 
-    def test_tunnelled_host_header_and_dump(self):
+    def test_tunnelled_host_header_index_and_dump(self):
         self.append(row("a") + row("b"))
         tunnel = trace_query.Endpoint(self.server.url.replace("127.0.0.1", "localhost"),
                                       host_header=f"127.0.0.1:{self.server.server_address[1]}",
-                                      range_bytes=16)
+                                      chunk_bytes=16)
         self.assertEqual(b"".join(tunnel.dump("commit_state")), self.path.read_bytes())
-        with self.assertRaises(ValueError):
-            list(tunnel.dump("../etc/passwd"))
-
-    def test_replacement_mid_poll_preserves_row_identity(self):
-        self.append(row("old") * 3)
-        original = self.endpoint.read_range
-        old_id = self.endpoint.probe("commit_state").file_id
-
-        def replace_after_first_row(table, token, start, end):
-            if start >= len(row("old")):
-                raise trace_query.FileReplaced(table)
-            return original(table, token, start, end)
-
-        with patch.object(self.endpoint, "read_range", side_effect=replace_after_first_row):
-            poll = self.endpoint.poll("commit_state", trace_query.Cursor())
-        self.assertEqual(self.events(poll), ["old"])
-        self.assertEqual(poll.cursor.file_id, old_id)
-        self.assertEqual(poll.cursor.offset, 0)
+        self.assertEqual(tunnel.tables(), [{"name": "commit_state", "bytes": self.path.stat().st_size,
+                                            "etag": etag_of(self.path.stat())}])
+        for name in ("../etc/passwd", "Conn", "x" * 65):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                list(tunnel.dump(name))
 
     def test_oversized_unfinished_line_fails_without_advancing(self):
         self.append(b"x" * 100)
@@ -196,16 +205,21 @@ class EndpointTest(EndpointCase):
                 self.endpoint.poll("commit_state", cursor, budget_bytes=16)
         self.assertEqual(cursor, trace_query.Cursor())
 
-    def test_wrong_range_or_token_is_rejected(self):
-        self.append(row("a"))
-        token = self.endpoint.probe("commit_state").token
-        for headers in ({"content-range": "bytes 0-1/99", "x-trace-file-id": token},
-                        {"content-range": f"bytes 0-1/{self.path.stat().st_size}",
-                         "x-trace-file-id": "1:2:99"}):
-            with self.subTest(headers=headers), patch.object(
-                    self.endpoint, "_request", return_value=(206, headers, b"xx")):
+    def test_mismatched_range_etag_or_short_body_is_rejected(self):
+        self.append(row("a") + row("b"))
+        first = self.endpoint.poll("commit_state", trace_query.Cursor())
+        self.append(row("c"))
+        cases = {
+            "content range": (first.cursor, "lie_content_range", True),
+            "short body": (first.cursor, "truncate_body_after", 3),
+        }
+        for name, (cursor, hook, value) in cases.items():
+            with self.subTest(name), patch.object(self.server, hook, value):
                 with self.assertRaises(trace_query.EndpointError):
-                    self.endpoint.read_range("commit_state", token, 0, 2)
+                    self.endpoint.poll("commit_state", cursor)
+        # A 206 under a different ETag than the cursor's means the server ignored If-Range.
+        with patch.object(self.server, "ignore_if_range", True), self.assertRaises(trace_query.EndpointError):
+            self.endpoint.poll("commit_state", trace_query.Cursor('"other-0-0"', first.cursor.offset))
 
     def test_invalid_metadata_does_not_poison_sqlite_batch(self):
         self.append(row([], ts=2**100) + row("a"))
@@ -266,8 +280,16 @@ class MirrorTest(EndpointCase):
         self.assertEqual(mirror.store("local", "commit_state", poll), 1)
         self.assertEqual(mirror.store("local", "commit_state", poll), 0)
 
+    def test_follow_without_tables_uses_the_index(self):
+        self.append(row("a"))
+        (Path(self.dir.name) / "trace_rows.jsonl").write_bytes(row("b"))
+        mirror = self.mirror()
+        self.assertEqual(trace_query.follow({"local": self.endpoint}, None, mirror), 2)
+        # A table named like the mirror's own table gets no view, so the mirror stays intact.
+        _, rows = trace_query.run_query(mirror_path(mirror), "SELECT tbl, event FROM trace_rows ORDER BY tbl")
+        self.assertEqual(rows, [("commit_state", "a"), ("trace_rows", "b")])
+
     def test_cli_pull_then_sql(self):
-        self.server.range_limit = trace_query.MAX_RANGE_BYTES
         self.append(row("commit_finish", hash="aa"))
         db = str(Path(self.dir.name) / "cli.sqlite")
         self.assertEqual(trace_query.main(

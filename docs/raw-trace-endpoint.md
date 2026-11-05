@@ -83,6 +83,8 @@ curl -H 'Range: bytes=<bytes read>-' -H 'If-Range: <etag>' \
 
 One request per poll is enough. A collector that follows many tables can poll
 `GET /traces` and request only the tables whose length grew.
+`deploy/trace-query/trace_query.py` follows tables this way and mirrors their
+rows into SQLite for arbitrary queries.
 
 ## Status codes
 

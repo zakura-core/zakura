@@ -1,8 +1,8 @@
 # Trace query client
 
 `trace_query.py` is the collecting side of the raw trace endpoint
-([`docs/raw-trace-endpoint.md`](../../docs/raw-trace-endpoint.md)). The node only
-streams byte ranges of its JSONL trace tables. This client follows those tables
+([`docs/raw-trace-endpoint.md`](../../docs/raw-trace-endpoint.md)). The node serves
+its JSONL trace tables over HTTP with standard byte ranges and ETags. This client follows those tables
 on one or more nodes, mirrors their rows into SQLite, and runs arbitrary SQL over
 the mirror. It uses only the Python standard library.
 
@@ -27,6 +27,7 @@ python3 trace_query.py pull --db traces.sqlite \
   --follow 10 --retain-hours 48
 ```
 
+Without `--table`, `pull` follows every table in each node's `GET /traces` index.
 `--event NAME` (repeatable) stores only rows with those `event` values.
 `--node` is repeatable, so one mirror can hold several nodes' rows.
 
@@ -43,9 +44,10 @@ python3 trace_query.py sql --db traces.sqlite "
 
 `--format json` prints one JSON object per row. Queries open the mirror read-only.
 
-Stream a fresh prefix of one table for `jq` (the final line may be incomplete):
+List a node's tables, or stream one for `jq` (the final line may be incomplete):
 
 ```sh
+python3 trace_query.py tables --url http://127.0.0.1:9009
 python3 trace_query.py dump --url http://127.0.0.1:9009 --table commit_state | jq .
 ```
 
@@ -54,7 +56,7 @@ python3 trace_query.py dump --url http://127.0.0.1:9009 --table commit_state | j
 | Column | Meaning |
 | --- | --- |
 | `node` | The `--node` name. |
-| `file_id` | The trace file's `device:inode`. A replaced file gets a new value. |
+| `file_id` | The trace file's `ETag`. A replaced file gets a new value. |
 | `offset` | The row's byte offset in that file. With `node`, `tbl` and `file_id` it is the row's key. |
 | `event`, `ts`, `process_trace_id` | Copied from the row. `ts` is microseconds since that node process started, not wall time. |
 | `fetched_unix` | The collector's wall clock when it stored the row. |
@@ -81,7 +83,7 @@ advances past complete lines, so the last unfinished line is read on the next
 poll. Each pass reads up to 64 MiB per table, plus enough bytes to complete its
 first line. Lines above 8 MiB fail the poll without advancing the cursor.
 `pull` without `--follow` performs one pass. Use `--follow` to drain a backlog;
-each pass gives every node and table a turn. `dump` streams bounded chunks.
+each pass gives every node and table a turn. `dump` streams the table in chunks.
 SQL results are materialized in memory; use `LIMIT` for large result sets.
 
 Changing `--event` does not replay rows before a saved cursor. Use a new mirror

@@ -213,7 +213,7 @@ impl VerifiedSet {
         transaction: &UnminedTx,
         spent_mempool_outpoints: &[transparent::OutPoint],
     ) -> Result<HashSet<transaction::Hash>, SameEffectsTipRejectionError> {
-        if self.has_spend_conflicts(transaction) {
+        if self.has_spend_conflicts(transaction.transaction()) {
             return Err(SameEffectsTipRejectionError::SpendConflict);
         }
 
@@ -587,18 +587,83 @@ impl VerifiedSet {
         ancestors
     }
 
-    /// Clears a list of mined transaction ids from the lists of dependencies for
-    /// any other transactions in the mempool and removes their dependents.
+    /// Removes mined parents from their children's tracked dependencies.
+    ///
+    /// Only groups with edges to detach need ordering-index updates.
     pub fn clear_mined_dependencies(&mut self, mined_ids: &HashSet<transaction::Hash>) {
         let affected: HashSet<_> = mined_ids
             .iter()
-            .filter(|id| self.transactions.contains_key(id))
+            .filter(|id| {
+                self.transactions.contains_key(id)
+                    && self.transaction_dependencies.dependents().contains_key(id)
+            })
             .flat_map(|&id| self.dependency_group([id]))
             .collect();
         self.remove_ordering_candidates(&affected);
         self.transaction_dependencies
             .clear_mined_dependencies(mined_ids);
         self.insert_ordering_candidates(&affected);
+    }
+
+    /// Returns stored transaction IDs that share spends with `transactions`.
+    ///
+    /// Probe the existing spend caches first. Only transactions with a cached
+    /// conflict need spend-set construction and a scan of the remaining pool.
+    pub(super) fn conflicting_transactions<'a>(
+        &self,
+        transactions: impl IntoIterator<Item = &'a transaction::Transaction>,
+    ) -> HashSet<UnminedTxId> {
+        let transactions: Vec<_> = transactions
+            .into_iter()
+            .filter(|tx| self.has_spend_conflicts(tx))
+            .collect();
+        if transactions.is_empty() {
+            return HashSet::new();
+        }
+
+        let spent_outpoints: HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.spent_outpoints())
+            .collect();
+        let sprout_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.sprout_nullifiers())
+            .collect();
+        let sapling_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.sapling_nullifiers())
+            .collect();
+        let orchard_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.orchard_nullifiers())
+            .collect();
+        let ironwood_nullifiers: HashSet<_> = transactions
+            .iter()
+            .flat_map(|tx| tx.ironwood_nullifiers())
+            .collect();
+
+        self.transactions
+            .values()
+            .filter_map(|tx| {
+                let transaction = tx.transaction.transaction();
+                (transaction
+                    .spent_outpoints()
+                    .any(|outpoint| spent_outpoints.contains(&outpoint))
+                    || transaction
+                        .sprout_nullifiers()
+                        .any(|nullifier| sprout_nullifiers.contains(nullifier))
+                    || transaction
+                        .sapling_nullifiers()
+                        .any(|nullifier| sapling_nullifiers.contains(nullifier))
+                    || transaction
+                        .orchard_nullifiers()
+                        .any(|nullifier| orchard_nullifiers.contains(nullifier))
+                    || transaction
+                        .ironwood_nullifiers()
+                        .any(|nullifier| ironwood_nullifiers.contains(nullifier)))
+                .then_some(tx.transaction.id())
+            })
+            .collect()
     }
 
     /// Removes the listed transactions and their descendants.
@@ -693,14 +758,11 @@ impl VerifiedSet {
         }
     }
 
-    /// Returns `true` if the given `transaction` has any spend conflicts with transactions in the
-    /// mempool.
+    /// Returns `true` if `tx` has spend conflicts with stored transactions.
     ///
-    /// Two transactions have a spend conflict if they spend the same UTXO or if they reveal the
-    /// same nullifier.
-    fn has_spend_conflicts(&self, unmined_tx: &UnminedTx) -> bool {
-        let tx = unmined_tx.transaction();
-
+    /// Two transactions conflict if they spend the same UTXO or reveal the same
+    /// nullifier.
+    fn has_spend_conflicts(&self, tx: &transaction::Transaction) -> bool {
         Self::has_conflicts(&self.spent_outpoints, tx.spent_outpoints())
             || Self::has_conflicts(&self.sprout_nullifiers, tx.sprout_nullifiers().copied())
             || Self::has_conflicts(&self.sapling_nullifiers, tx.sapling_nullifiers().copied())
@@ -990,6 +1052,32 @@ mod tests {
         let local_score_budget = 2 * (MAX_MEMPOOL_PACKAGE_TRANSACTIONS - 1) * roots.len();
         assert!(verified.eviction_score_evaluations.load(Ordering::Relaxed) <= local_score_budget);
         assert_eq!(verified.eviction_order, before);
+    }
+
+    #[test]
+    fn mined_transactions_without_children_do_not_rescore_indexes() {
+        use std::sync::atomic::Ordering;
+
+        use super::super::fixtures::TxFactory;
+
+        let mut factory = TxFactory::new();
+        let mut verified = VerifiedSet::default();
+        let mut pending = PendingOutputs::default();
+        let independent = factory.tx(10_000);
+        let present = independent.transaction.id().mined_id();
+        let missing = factory.tx(10_000).transaction.id().mined_id();
+        verified
+            .insert(independent, vec![], &mut pending, None)
+            .unwrap();
+        verified
+            .eviction_score_evaluations
+            .store(0, Ordering::Relaxed);
+        verified.clear_mined_dependencies(&HashSet::from([present, missing]));
+        assert_eq!(
+            verified.eviction_score_evaluations.load(Ordering::Relaxed),
+            0
+        );
+        verified.assert_dependency_groups_are_bounded();
     }
 
     #[test]

@@ -332,6 +332,48 @@ proptest! {
 }
 
 proptest! {
+    /// Block cleanup must find the same transparent, Sprout, Sapling, and
+    /// Orchard conflicts as admission, while retaining unrelated transactions.
+    #[test]
+    fn block_spend_cache_checks_preserve_conflict_removal(
+        input in any::<SpendConflictTestInput>()
+    ) {
+        for conflicts in [false, true] {
+            let (stored, mined) = if conflicts {
+                input.clone().conflicting_transactions()
+            } else {
+                input.clone().unconflicting_transactions()
+            };
+            let stored_id = stored.transaction.id();
+            let mined_id = mined.transaction.id();
+            prop_assume!(stored_id.mined_id() != mined_id.mined_id());
+            let mut storage = Storage::new(&Config {
+                tx_cost_limit: 160_000_000,
+                ..Default::default()
+            });
+            storage.insert(stored, Vec::new(), None).unwrap();
+            let mined_ids = HashSet::from([mined_id.mined_id()]);
+            storage.clear_mined_dependencies(&mined_ids);
+            let removed = storage.reject_and_remove_same_effects(
+                &mined_ids,
+                vec![mined.transaction.transaction().clone()],
+            );
+            prop_assert!(removed.mined.is_empty());
+            if conflicts {
+                prop_assert_eq!(removed.invalidated, HashSet::from([stored_id]));
+                prop_assert_eq!(
+                    storage.rejection_error(&stored_id),
+                    Some(SameEffectsChainRejectionError::DuplicateSpend.into())
+                );
+            } else {
+                prop_assert!(removed.invalidated.is_empty());
+                prop_assert!(storage.contains_transaction_exact(&stored_id.mined_id()));
+                prop_assert!(storage.rejection_error(&stored_id).is_none());
+            }
+            storage.verified.assert_dependency_groups_are_bounded();
+        }
+    }
+
     /// Test if a transaction that has a spend conflict with a transaction already in the mempool
     /// is rejected.
     ///

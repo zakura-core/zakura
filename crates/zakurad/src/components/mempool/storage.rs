@@ -692,50 +692,9 @@ impl Storage {
     ) -> RemovedTransactionIds {
         let removed_mined = self.verified.remove_all(mined_ids.iter().copied());
 
-        let spent_outpoints: HashSet<_> = transactions
-            .iter()
-            .flat_map(|tx| tx.as_ref().spent_outpoints())
-            .collect();
-        let sprout_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().sprout_nullifiers())
-            .collect();
-        let sapling_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().sapling_nullifiers())
-            .collect();
-        let orchard_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().orchard_nullifiers())
-            .collect();
-        let ironwood_nullifiers: HashSet<_> = transactions
-            .iter()
-            .flat_map(|transaction| transaction.as_ref().ironwood_nullifiers())
-            .collect();
-
-        let duplicate_spend_ids: HashSet<_> = self
+        let duplicate_spend_ids = self
             .verified
-            .transactions()
-            .values()
-            .map(|tx| (tx.transaction.id(), tx.transaction.transaction()))
-            .filter_map(|(tx_id, tx)| {
-                (tx.spent_outpoints()
-                    .any(|outpoint| spent_outpoints.contains(&outpoint))
-                    || tx
-                        .sprout_nullifiers()
-                        .any(|nullifier| sprout_nullifiers.contains(nullifier))
-                    || tx
-                        .sapling_nullifiers()
-                        .any(|nullifier| sapling_nullifiers.contains(nullifier))
-                    || tx
-                        .orchard_nullifiers()
-                        .any(|nullifier| orchard_nullifiers.contains(nullifier))
-                    || tx
-                        .ironwood_nullifiers()
-                        .any(|nullifier| ironwood_nullifiers.contains(nullifier)))
-                .then_some(tx_id)
-            })
-            .collect();
+            .conflicting_transactions(transactions.iter().map(AsRef::as_ref));
 
         let removed_duplicate_spend = self
             .verified

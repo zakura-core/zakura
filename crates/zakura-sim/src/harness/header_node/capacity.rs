@@ -20,8 +20,9 @@
 //! - `TeardownReserved`, `TeardownOwned` and `TeardownLocatorPermits`: once
 //!   a reactor the harness stopped is gone, nothing stays reserved or owned,
 //!   and every locator permit is free except one for each locator read
-//!   storage still holds pending. They're claim rules too, checked on the
-//!   first read after the reactor is gone. The probe holds the locator semaphore, so
+//!   storage still holds pending. They're claim rules too, checked on every
+//!   read after the reactor is gone against what storage holds then, and
+//!   each reported once. The probe holds the locator semaphore, so
 //!   a permit forgotten without returning still counts.
 //!
 //! These read counters that no owner event reports, so they catch a stray

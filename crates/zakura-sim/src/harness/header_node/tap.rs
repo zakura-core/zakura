@@ -89,7 +89,7 @@ use zakura_network::zakura::{
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
-use zakura_scheduler::{SimInstant, TaskId};
+use zakura_scheduler::{SimInstant, TaskExit, TaskId};
 use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
@@ -306,24 +306,43 @@ impl TapState {
         Ok(())
     }
 
-    /// Whether the harness stopped the reactor and it ended without
-    /// unwinding.
+    /// Whether the harness stopped the reactor and it ended cleanly.
     fn stopped(&self) -> bool {
-        self.shutdown.load(Ordering::Relaxed)
-            && self.reactor_gone()
-            && !self.unwound.load(Ordering::Relaxed)
+        self.shutdown.load(Ordering::Relaxed) && self.ended_cleanly()
     }
 
-    /// Whether the reactor is gone: its task, which its probe names, has
-    /// ended. So a resource that outlives the reactor holding an observer
-    /// clone can't keep it alive. A tap no reactor handed a probe goes by
-    /// its observer, which only the reactor holds.
+    /// Whether the reactor ended without panicking or unwinding.
+    fn ended_cleanly(&self) -> bool {
+        matches!(
+            self.reactor_exit(),
+            Some(TaskExit::Completed | TaskExit::Cancelled)
+        ) && !self.unwound.load(Ordering::Relaxed)
+    }
+
+    /// Whether the reactor is gone.
     fn reactor_gone(&self) -> bool {
+        self.reactor_exit().is_some()
+    }
+
+    /// How the reactor ended, or `None` while it runs: its task's exit, for
+    /// the task its probe names, so a resource that outlives the reactor
+    /// holding an observer clone can neither keep it alive nor hide a
+    /// panic. A tap no reactor handed a probe goes by its observer, which
+    /// only the reactor holds, and whether it unwound.
+    fn reactor_exit(&self) -> Option<TaskExit> {
         match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
             ProbeSlot::Held(probe) => {
-                zakura_scheduler::hooks::task_ended(TaskId::from(probe.task())).unwrap_or(false)
+                zakura_scheduler::hooks::task_exit(TaskId::from(probe.task()))
             }
-            ProbeSlot::Missing | ProbeSlot::Replaced => self.observer.strong_count() == 0,
+            ProbeSlot::Missing | ProbeSlot::Replaced => {
+                (self.observer.strong_count() == 0).then(|| {
+                    if self.unwound.load(Ordering::Relaxed) {
+                        TaskExit::Panicked
+                    } else {
+                        TaskExit::Completed
+                    }
+                })
+            }
         }
     }
 }
@@ -1194,13 +1213,11 @@ impl ActionSource for ReactorTap {
                      its operation {op} given no drop receipt, and no shutdown removed it while \
                      the call still existed"
                 )),
-                _ if self.state.reactor_gone() && !self.state.unwound.load(Ordering::Relaxed) => {
-                    self.state.open_work().map(|()| {
-                        if self.state.shutdown.load(Ordering::Relaxed) {
-                            self.state.settled.store(true, Ordering::Relaxed);
-                        }
-                    })
-                }
+                _ if self.state.ended_cleanly() => self.state.open_work().map(|()| {
+                    if self.state.shutdown.load(Ordering::Relaxed) {
+                        self.state.settled.store(true, Ordering::Relaxed);
+                    }
+                }),
                 _ => Ok(()),
             }
             .and_then(|()| self.read_capacity(log.step()))

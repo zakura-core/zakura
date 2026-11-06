@@ -118,8 +118,8 @@ where
 }
 
 /// A released round returns its reservation and leases once its calls are
-/// handled, and node teardown returns every chunk-budget charge and every
-/// locator permit.
+/// handled, and a stopped node's teardown returns every chunk-budget charge
+/// and every locator permit.
 pub const TEARDOWN_RETURNS_BASELINE: &str = "header-sync/teardown-returns-baseline";
 
 /// The claim rules [`TEARDOWN_RETURNS_BASELINE`] reports: round settlement's,
@@ -154,8 +154,8 @@ where
     Property {
         id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
         claim: "a released header round returns its reservation and leases once its calls are \
-                handled, and node teardown returns every chunk-budget charge and every locator \
-                permit",
+                handled, and a stopped node's teardown returns every chunk-budget charge and \
+                every locator permit",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -181,15 +181,15 @@ where
 /// `OpenOwnership`, `LeakedLease` in the ledger's teardown check), and the
 /// budget holds nothing and every locator permit is free but those storage
 /// still holds for pending reads (`TeardownReserved`, `TeardownOwned`,
-/// `TeardownLocatorPermits` on the first probe read).
+/// `TeardownLocatorPermits` on the probe reads once it's gone).
 ///
 /// Any of those breaks the step's drain found violates. It applies once the
 /// queue released a round or the node settled. A run that ends with a
 /// released round unsettled, or with a stop begun and the node unsettled,
-/// is inconclusive. A run that never stops the node is judged at round
-/// level alone, so it holds once its released rounds settle: node teardown
-/// didn't happen, and today no committed input can stop the node, so every
-/// planted round-level case would otherwise be inconclusive.
+/// is inconclusive. The node half of the claim is about a stopped node, so
+/// a run that never stops the node holds once its released rounds settle.
+/// Today no committed input can stop the node, so every planted round-level
+/// case relies on that.
 fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,

@@ -548,6 +548,32 @@ fn a_cut_off_stop_with_no_property_still_fails() {
     assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
 }
 
+/// The scheduler reports how a task ended, a panic included, to the tap,
+/// whatever still holds that task's observer: the tap judges a reactor's
+/// exit by its task, so a surviving observer clone can't make a panic look
+/// like a clean stop.
+#[test]
+fn the_scheduler_reports_a_reactor_panic() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let panicking = sim
+        .scheduler()
+        .spawn_root("reactor", async { panic!("the reactor panics") });
+    let task = panicking.task();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let reported = Arc::clone(&seen);
+    sim.scheduler().spawn_root("watcher", async move {
+        while zakura_scheduler::hooks::task_exit(task).is_none() {
+            zakura_rt::task::yield_now().await;
+        }
+        *reported.lock().expect("one writer") = zakura_scheduler::hooks::task_exit(task);
+    });
+    let _ = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    assert_eq!(
+        *seen.lock().expect("one writer"),
+        Some(zakura_scheduler::TaskExit::Panicked)
+    );
+}
+
 /// A reactor that unwinds during an announced stop crashed rather than
 /// stopped, so the run still fails as `ReactorGone`.
 #[test]

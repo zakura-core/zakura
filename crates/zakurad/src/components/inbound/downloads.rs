@@ -216,6 +216,68 @@ pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 /// queued rather than applied immediately, so a replacement request can still route back to it.
 pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
 
+/// Requests block `hash` with `request`, and if `hedge` delivers another advertiser before the
+/// response, also requests it from that peer.
+///
+/// Returns the first response that delivers the block. If one request fails or only reports the
+/// block missing, returns the other's response. The losing request is dropped, so its late block
+/// is discarded by the connection as a response to a canceled request.
+async fn request_block_hedged<ZN>(
+    network: ZN,
+    request: zn::Request,
+    hash: block::Hash,
+    hedge: Option<oneshot::Receiver<zn::PeerSource>>,
+) -> Result<zn::Response, BoxError>
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Clone,
+{
+    let first = network.clone().oneshot(request);
+    tokio::pin!(first);
+
+    let Some(hedge) = hedge else {
+        return first.await;
+    };
+    let source = tokio::select! {
+        biased;
+        response = &mut first => return response,
+        source = hedge => match source {
+            Ok(source) => source,
+            // The download finished or no second advertiser came: keep waiting on the first.
+            Err(_) => return first.await,
+        },
+    };
+
+    metrics::counter!("gossip.hedged.block.request.sent.count").increment(1);
+    let second = network.oneshot(zn::Request::BlocksByHashFrom {
+        hashes: std::iter::once(hash).collect(),
+        source,
+    });
+    tokio::pin!(second);
+
+    let delivers_block = |response: &Result<zn::Response, BoxError>| {
+        matches!(response, Ok(zn::Response::Blocks(blocks))
+            if blocks.len() == 1 && blocks[0].available().is_some())
+    };
+    tokio::select! {
+        response = &mut first => {
+            if delivers_block(&response) {
+                metrics::counter!("gossip.hedged.block.winner", "request" => "first").increment(1);
+                response
+            } else {
+                second.await
+            }
+        }
+        response = &mut second => {
+            if delivers_block(&response) {
+                metrics::counter!("gossip.hedged.block.winner", "request" => "second").increment(1);
+                response
+            } else {
+                first.await
+            }
+        }
+    }
+}
+
 /// Returns the highest gossiped block height accepted above `tip_height`.
 ///
 /// The configured limit counts blocks, so this height window scales with the
@@ -366,6 +428,14 @@ struct Admission {
     /// waiting child already holds its advertiser's slot and lock, so charging the parent to
     /// them would refuse or deadlock the very download the child is waiting for.
     parent_recoveries: HashMap<block::Hash, Option<AdvertiserSource>>,
+
+    /// For each advertised download that has not taken a second source yet, the channel that
+    /// gives its task one.
+    ///
+    /// The first peer that advertises the same block from a different IP takes this entry, and
+    /// the task races a request to that peer against its first request. So each advertised block
+    /// has at most two block requests in flight.
+    hedges: HashMap<block::Hash, oneshot::Sender<zn::PeerSource>>,
 }
 
 impl Admission {
@@ -379,6 +449,7 @@ impl Admission {
     /// polls it, and until then a stale entry would misdirect other tasks' parent recoveries.
     fn release(&mut self, hash: &block::Hash) {
         self.parent_recoveries.remove(hash);
+        self.hedges.remove(hash);
 
         if let Some((_, Some(source))) = self.cancel_handles.remove(hash) {
             let source_count = self
@@ -495,6 +566,7 @@ where
         // Tasks retain the admission state, so the stream must cancel them explicitly.
         admission.closed = true;
         admission.cancel_handles.clear();
+        admission.hedges.clear();
     }
 }
 
@@ -712,7 +784,21 @@ where
         let mut admission = self.spawner.admission();
         let queue_len = admission.queue_len();
 
-        if admission.cancel_handles.contains_key(&hash) {
+        if let Some((_, first_source)) = admission.cancel_handles.get(&hash) {
+            // Another legacy peer has the block. If the first request is still waiting, race it
+            // against a request to this peer, once per block.
+            let hedge_source = download_source.clone().filter(|source| {
+                matches!(source, zn::PeerSource::LegacySocket(_))
+                    && first_source.as_ref() != Some(&AdvertiserSource::from(source.clone()))
+            });
+            if let Some(source) = hedge_source {
+                if let Some(hedge) = admission.hedges.remove(&hash) {
+                    if hedge.send(source).is_ok() {
+                        metrics::counter!("gossip.hedged.block.request.count").increment(1);
+                    }
+                }
+            }
+
             debug!(
                 ?hash,
                 queue_len,
@@ -899,6 +985,13 @@ where
         // This oneshot is used to signal cancellation to the download task.
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
+        // Only advertised blocks race a second advertiser. A parent recovery has no advertisers.
+        let hedge = matches!(kind, DownloadKind::Advertised).then(|| {
+            let (hedge_tx, hedge_rx) = oneshot::channel();
+            admission.hedges.insert(hash, hedge_tx);
+            hedge_rx
+        });
+
         let spawner = self.clone();
         let network = self.network.clone();
         let chain_network = self.chain_network.clone();
@@ -935,7 +1028,9 @@ where
             };
 
             let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
+                request_block_hedged(network, request, hash, hedge)
+                    .await
+                    .map_err(|e| (e, None))?
             {
                 // A peer must answer a single-hash block request with exactly one
                 // block entry. A malformed or empty response is a peer fault (e.g.
@@ -1577,6 +1672,248 @@ mod tests {
         let admission = downloads.spawner.admission();
         assert!(admission.source_locks.is_empty());
         assert!(admission.source_counts.is_empty());
+
+        Ok(())
+    }
+
+    /// While a block request waits, the first advertiser of the same block from a different IP
+    /// gets a second request, and the first block to arrive is verified. A peer on the first
+    /// advertiser's IP adds no request.
+    #[tokio::test]
+    async fn second_advertiser_races_a_waiting_block_request() -> Result<(), BoxError> {
+        let block: Arc<Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let legacy = |addr: &str| -> zn::PeerSource {
+            zn::PeerSource::LegacySocket(
+                addr.parse::<std::net::SocketAddr>()
+                    .expect("test address parses")
+                    .into(),
+            )
+        };
+        let slow = legacy("10.0.0.1:8233");
+        let slow_other_port = legacy("10.0.0.1:18233");
+        let fast = legacy("10.0.0.2:8233");
+
+        // The first advertiser never answers. Every other source returns the block.
+        let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel::<zn::PeerSource>();
+        let network = BoxCloneService::new(service_fn({
+            let slow = slow.clone();
+            move |request: zn::Request| {
+                let network_tx = network_tx.clone();
+                let block = block.clone();
+                let slow = slow.clone();
+                async move {
+                    let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                        return Err::<zn::Response, BoxError>("unexpected network request".into());
+                    };
+                    network_tx.send(source.clone())?;
+                    if source == slow {
+                        future::pending::<()>().await;
+                    }
+                    Ok(zn::Response::Blocks(vec![Available((block.into(), None))]))
+                }
+            }
+        }));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            BoxCloneService::new(service_fn(
+                |request: zakura_consensus::Request| async move {
+                    match request {
+                        zakura_consensus::Request::Commit(block) => Ok(block.hash()),
+                        _ => Err("unexpected verifier request".into()),
+                    }
+                },
+            )),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(slow.clone())),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), network_rx.recv()).await?,
+            Some(slow)
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(slow_other_port)),
+            DownloadAction::AlreadyQueued
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), network_rx.recv())
+                .await
+                .is_err(),
+            "the first advertiser's IP adds no request"
+        );
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(fast.clone())),
+            DownloadAction::AlreadyQueued
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(200), network_rx.recv()).await?,
+            Some(fast)
+        );
+
+        let verified = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("the second request's block is verified")
+            .expect("downloads stream is open")
+            .expect("download succeeds");
+        assert_eq!(verified, hash);
+        let admission = downloads.spawner.admission();
+        assert_eq!(admission.queue_len(), 0);
+        assert!(admission.hedges.is_empty(), "the hedge entry is released");
+
+        Ok(())
+    }
+
+    /// While both requests wait, later advertisers add no request: a block has at most two.
+    #[tokio::test]
+    async fn a_block_has_at_most_two_requests() -> Result<(), BoxError> {
+        let block: Arc<Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel::<zn::PeerSource>();
+        let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
+            let network_tx = network_tx.clone();
+            async move {
+                let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                    return Err::<zn::Response, BoxError>("unexpected network request".into());
+                };
+                network_tx.send(source)?;
+                future::pending().await
+            }
+        }));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            BoxCloneService::new(service_fn(|_request: zakura_consensus::Request| {
+                future::pending::<Result<block::Hash, BoxError>>()
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        for (index, octet) in [1u8, 2, 3, 4].into_iter().enumerate() {
+            let source = zn::PeerSource::LegacySocket(
+                std::net::SocketAddr::from(([10, 0, 2, octet], 8233)).into(),
+            );
+            downloads.download_and_verify(hash, Some(source.clone()));
+            let request = tokio::time::timeout(Duration::from_millis(200), network_rx.recv()).await;
+            if index < 2 {
+                assert_eq!(request?, Some(source), "advertiser {index} gets a request");
+            } else {
+                assert!(request.is_err(), "advertiser {index} adds no request");
+            }
+        }
+        drop(block);
+
+        Ok(())
+    }
+
+    /// A second request that only reports the block missing does not end the download: the
+    /// first request's block is still used.
+    #[tokio::test]
+    async fn missing_hedge_response_falls_back_to_the_first_request() -> Result<(), BoxError> {
+        let block: Arc<Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+        let hash = block.hash();
+        let first_addr: std::net::SocketAddr = "10.0.1.1:8233".parse()?;
+        let first = zn::PeerSource::LegacySocket(first_addr.into());
+        let hedge =
+            zn::PeerSource::LegacySocket("10.0.1.2:8233".parse::<std::net::SocketAddr>()?.into());
+
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel::<zn::PeerSource>();
+        let network = BoxCloneService::new(service_fn({
+            let first = first.clone();
+            move |request: zn::Request| {
+                let network_tx = network_tx.clone();
+                let block = block.clone();
+                let first = first.clone();
+                let release_rx = release_rx.clone();
+                async move {
+                    let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                        return Err::<zn::Response, BoxError>("unexpected network request".into());
+                    };
+                    network_tx.send(source.clone())?;
+                    if source == first {
+                        // The first peer answers once the hedge has reported the block missing.
+                        let release = release_rx.lock().await.take().expect("first request once");
+                        release.await?;
+                        Ok(zn::Response::Blocks(vec![Available((block.into(), None))]))
+                    } else {
+                        Ok(zn::Response::Blocks(vec![zn::InventoryResponse::Missing(
+                            hash,
+                        )]))
+                    }
+                }
+            }
+        }));
+        let (_tip_sender, latest_chain_tip, _tip_change) =
+            zs::ChainTipSender::new(None, &Network::Mainnet);
+        let mut downloads = Downloads::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            network,
+            BoxCloneService::new(service_fn(
+                |request: zakura_consensus::Request| async move {
+                    match request {
+                        zakura_consensus::Request::Commit(block) => Ok(block.hash()),
+                        _ => Err("unexpected verifier request".into()),
+                    }
+                },
+            )),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            latest_chain_tip,
+            Network::Mainnet,
+        );
+
+        downloads.download_and_verify(hash, Some(first.clone()));
+        let request = tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await?;
+        assert_eq!(request, Some(first));
+        downloads.download_and_verify(hash, Some(hedge.clone()));
+        let request = tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await?;
+        assert_eq!(request, Some(hedge));
+        // Let the hedge's missing response reach the task before the first peer answers.
+        tokio::task::yield_now().await;
+        release_tx.send(()).expect("first request is waiting");
+
+        let verified = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("the first request's block is verified")
+            .expect("downloads stream is open")
+            .expect("download succeeds");
+        assert_eq!(verified, hash);
 
         Ok(())
     }

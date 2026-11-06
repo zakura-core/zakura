@@ -46,3 +46,36 @@ async fn stopping_the_listener_closes_open_connections() {
         "the connection is closed without a response"
     );
 }
+
+/// The plain listener only speaks HTTP/1, so a client that opens with the HTTP/2 connection
+/// preface has its connection closed, instead of getting the HTTP/2 server's settings frame.
+#[tokio::test]
+async fn http2_prior_knowledge_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let service = tower::service_fn(|_request| async {
+        Ok::<_, tower::BoxError>(Response::new(HttpBody::from("ok")))
+    });
+    let listener_task = tokio::spawn(run_listener(listener, service));
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = [0; 1024];
+    let read = timeout(Duration::from_secs(10), stream.read(&mut response))
+        .await
+        .expect("the server closes the HTTP/2 connection")
+        .unwrap();
+    assert_eq!(
+        read,
+        0,
+        "the server answered the HTTP/2 preface: {:?}",
+        String::from_utf8_lossy(&response[..read])
+    );
+
+    listener_task.abort();
+}

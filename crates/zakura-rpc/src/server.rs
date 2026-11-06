@@ -20,8 +20,7 @@ use hyper::{
     Request, Response,
 };
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo, TokioTimer},
-    server::conn::auto,
+    rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -429,9 +428,10 @@ fn stop_channel() -> (StopHandle, ServerHandle) {
 /// Accepts plain HTTP connections and serves each one in its own task, until the task running
 /// this future is aborted.
 ///
-/// Connections are served with HTTP/1 or HTTP/2, and closed if they don't send a request within
-/// [`FIRST_REQUEST_TIMEOUT`]. When this future is dropped, open connections finish their
-/// in-flight requests and close, like `jsonrpsee`'s server did when it stopped.
+/// Connections are served with HTTP/1, like `zcashd`'s RPC server and this server's TLS
+/// listener, and closed if they don't send a request within [`FIRST_REQUEST_TIMEOUT`]. When this
+/// future is dropped, open connections finish their in-flight requests and close, like
+/// `jsonrpsee`'s server did when it stopped.
 async fn run_listener<S>(listener: TcpListener, service: S)
 where
     S: tower::Service<Request<Incoming>, Response = Response<HttpBody>, Error = tower::BoxError>
@@ -469,19 +469,17 @@ where
 
         let stopped = stop_handle.clone().shutdown();
         tokio::spawn(async move {
-            let builder = auto::Builder::new(TokioExecutor::new());
-            let connection = builder.serve_connection_with_upgrades(
-                TokioIo::new(socket),
-                TowerToHyperService::new(service),
-            );
+            let connection = http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                .with_upgrades();
             tokio::pin!(connection, stopped);
 
-            let result = tokio::select! {
-                result = &mut connection => result,
+            let result: Result<(), tower::BoxError> = tokio::select! {
+                result = &mut connection => result.map_err(Into::into),
                 () = &mut stopped => {
                     // The connection must keep being polled until its graceful shutdown finishes.
                     connection.as_mut().graceful_shutdown();
-                    connection.await
+                    connection.await.map_err(Into::into)
                 }
                 () = no_request_within(&request_received, FIRST_REQUEST_TIMEOUT) => {
                     Err("no request received in time".into())

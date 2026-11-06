@@ -85,6 +85,10 @@ first line. Lines above 8 MiB fail the poll without advancing the cursor.
 `pull` without `--follow` performs one pass. Use `--follow` to drain a backlog;
 each pass gives every node and table a turn. `dump` streams the table in chunks.
 SQL results are materialized in memory; use `LIMIT` for large result sets.
+The mirror uses WAL mode, so `sql` queries run while `pull` writes. A table whose
+store finds the mirror locked by another writer for 30 s keeps its cursor, and
+the next pass retries it. Any other HTTP status than 200, 206, 404 or 416 fails
+that table's poll for the pass.
 
 Changing `--event` does not replay rows before a saved cursor. Use a new mirror
 to collect events that a previous filter excluded. Retention deletes rows but

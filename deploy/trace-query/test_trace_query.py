@@ -28,6 +28,7 @@ class FakeEndpoint(http.server.ThreadingHTTPServer):
         self.lie_content_range = False
         self.truncate_body_after = None
         self.ignore_if_range = False
+        self.fail_with = None
         super().__init__(("127.0.0.1", 0), FakeHandler)
 
     @property
@@ -59,6 +60,8 @@ class FakeHandler(http.server.BaseHTTPRequestHandler):
         server.requests.append((self.path, self.headers.get("Range"), self.headers.get("If-Range")))
         if self.headers.get("Host") != f"127.0.0.1:{server.server_address[1]}":
             return self.send(403)
+        if server.fail_with is not None:
+            return self.send(server.fail_with)
         if self.path == "/traces":
             tables = [{"name": path.stem, "bytes": path.stat().st_size, "etag": etag_of(path.stat())}
                       for path in sorted(server.directory.glob("*.jsonl"))]
@@ -227,6 +230,14 @@ class EndpointTest(EndpointCase):
         self.assertEqual((self.events(poll), poll.malformed), (["a"], 1))
 
 
+    def test_unexpected_status_is_an_endpoint_error(self):
+        self.append(row("a"))
+        for status in (204, 503):
+            with self.subTest(status=status), patch.object(self.server, "fail_with", status), \
+                    self.assertRaisesRegex(trace_query.EndpointError, f"HTTP {status}"):
+                self.endpoint.poll("commit_state", trace_query.Cursor())
+
+
 class MirrorTest(EndpointCase):
     def mirror(self):
         return trace_query.Mirror(str(Path(self.dir.name) / "mirror.sqlite"))
@@ -288,6 +299,41 @@ class MirrorTest(EndpointCase):
         # A table named like the mirror's own table gets no view, so the mirror stays intact.
         _, rows = trace_query.run_query(mirror_path(mirror), "SELECT tbl, event FROM trace_rows ORDER BY tbl")
         self.assertEqual(rows, [("commit_state", "a"), ("trace_rows", "b")])
+
+    def test_follow_skips_a_failing_node_and_keeps_going(self):
+        self.append(row("a"))
+        other = FakeEndpoint(self.dir.name)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+        other.fail_with = 503
+        endpoints = {"down": trace_query.Endpoint(other.url), "local": self.endpoint}
+        with self.assertLogs("trace_query", "WARNING"):
+            self.assertEqual(trace_query.follow(endpoints, ["commit_state"], self.mirror()), 1)
+
+    def test_open_read_does_not_block_follow(self):
+        self.append(row("a"))
+        mirror = self.mirror()
+        reader = sqlite3.connect(mirror_path(mirror))
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM trace_rows").fetchall()
+        self.assertEqual(trace_query.follow({"local": self.endpoint}, ["commit_state"], mirror), 1)
+
+    def test_locked_mirror_keeps_the_cursor_for_the_next_pass(self):
+        self.append(row("a"))
+        with patch.object(trace_query, "BUSY_TIMEOUT_SECS", 0.05):
+            mirror = self.mirror()
+        writer = sqlite3.connect(mirror_path(mirror), isolation_level=None)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN IMMEDIATE")
+        endpoints = {"local": self.endpoint}
+        with self.assertLogs("trace_query", "WARNING") as logs:
+            self.assertEqual(trace_query.follow(endpoints, ["commit_state"], mirror), 0)
+        self.assertIn("database is locked", logs.output[0])
+        self.assertEqual(mirror.cursor("local", "commit_state"), trace_query.Cursor())
+        writer.execute("COMMIT")
+        self.assertEqual(trace_query.follow(endpoints, ["commit_state"], mirror), 1)
 
     def test_cli_pull_then_sql(self):
         self.append(row("commit_finish", hash="aa"))

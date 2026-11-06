@@ -54,6 +54,8 @@ READ_CHUNK_BYTES = 256 * 1024
 # commits in bounded steps.
 DEFAULT_POLL_BUDGET_BYTES = 64 * 1024 * 1024
 MAX_LINE_BYTES = 8 * 1024 * 1024
+# A writer waits this long for another writer's lock before the pass skips the table.
+BUSY_TIMEOUT_SECS = 30.0
 CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+)")
 UNSATISFIED_RANGE = re.compile(r"bytes \*/(\d+)")
 
@@ -116,6 +118,8 @@ class Endpoint:
         except urllib.error.HTTPError as error:
             with error:
                 return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, None
+        except http.client.HTTPException as error:
+            raise EndpointError(f"{path}: malformed HTTP response: {error}") from error
         return response.status, {k.lower(): v for k, v in response.headers.items()}, response
 
     def _chunks(self, table: str, response, length: int) -> Iterator[bytes]:
@@ -178,6 +182,10 @@ class Endpoint:
             if length > cursor.offset:
                 raise EndpointError(f"{table}: 416 for an offset inside the file")
             return Poll(cursor=cursor)
+        if status not in (200, 206):
+            if response is not None:
+                response.close()
+            raise EndpointError(f"{table}: returned HTTP {status}")
 
         with response:
             etag = response_headers.get("etag")
@@ -194,8 +202,6 @@ class Endpoint:
             elif status == 200:
                 # If-Range failed, or there was no ETag yet: the body is the file from byte 0.
                 result = Poll(cursor=Cursor(etag, 0), reset=cursor.file_id is not None)
-            else:
-                raise EndpointError(f"{table}: returned HTTP {status}")
             self._read_lines(table, response, length, budget_bytes, result)
         return result
 
@@ -291,10 +297,13 @@ class Mirror:
     gets a view of the same name, so `SELECT json_extract(row, '$.hash') FROM
     commit_state` works. A row and its table's cursor commit in one transaction,
     so a crash never skips or repeats rows.
+
+    The mirror uses WAL mode, so a long `sql` query never blocks `pull`.
     """
 
     def __init__(self, path: str):
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECS)
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
         self.db.commit()
 
@@ -349,7 +358,8 @@ def follow(endpoints: dict, tables: Optional[Iterable[str]], mirror: Mirror,
 
     `tables=None` follows every table in each node's index. Each table gets one
     bounded poll so a busy table cannot starve another. One failing node or table
-    is logged and skipped.
+    is logged and skipped. A table whose store finds the mirror locked keeps its
+    cursor, so the next pass reads the same rows again.
     """
     stored = 0
     for node, endpoint in endpoints.items():
@@ -368,8 +378,19 @@ def follow(endpoints: dict, tables: Optional[Iterable[str]], mirror: Mirror,
                 LOG.info("%s/%s: trace file replaced; reading the new file", node, table)
             if poll.malformed:
                 LOG.warning("%s/%s: skipped %d malformed lines", node, table, poll.malformed)
-            stored += mirror.store(node, table, poll, events)
+            try:
+                stored += mirror.store(node, table, poll, events)
+            except sqlite3.OperationalError as error:
+                if not is_locked(error):
+                    raise
+                LOG.warning("%s/%s: %s; retrying next pass", node, table, error)
     return stored
+
+
+def is_locked(error: sqlite3.OperationalError) -> bool:
+    """Whether another connection held the lock past the busy timeout."""
+    # SQLITE_BUSY and SQLITE_LOCKED read "database is locked" and "database table is locked".
+    return "is locked" in str(error)
 
 
 def run_query(path: str, query: str, params: Iterable = ()) -> tuple[list, list]:
@@ -464,7 +485,12 @@ def main(argv: Optional[list] = None) -> int:
     while True:
         stored = follow(endpoints, args.table, mirror, events)
         if args.retain_hours is not None:
-            mirror.prune(time.time() - args.retain_hours * 3600)
+            try:
+                mirror.prune(time.time() - args.retain_hours * 3600)
+            except sqlite3.OperationalError as error:
+                if not is_locked(error):
+                    raise
+                LOG.warning("prune: %s; retrying next pass", error)
         LOG.debug("stored %d rows", stored)
         if args.follow is None:
             return 0

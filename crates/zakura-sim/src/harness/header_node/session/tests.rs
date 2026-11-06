@@ -97,6 +97,11 @@ fn dispatched(apply: bool, owner: HeaderSyncWorkOwner) -> ReactorEvent {
                 peer,
                 source,
                 owner,
+                target: zakura_header_chain::Frontier::new(
+                    zakura_chain::block::Height(1),
+                    zakura_chain::block::Hash([0; 32]),
+                ),
+                hashes: Vec::new(),
             }
         },
     }

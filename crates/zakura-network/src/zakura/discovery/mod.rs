@@ -10,6 +10,7 @@ mod protocol;
 mod redial;
 mod requester;
 mod runtime;
+mod sequence_file;
 mod service;
 #[cfg(zakura_sim)]
 pub(crate) use service::discovery_streams;
@@ -40,12 +41,13 @@ pub use peer::{replay_discovery_session_bytes, DiscoverySessionReplaySummary};
 #[cfg(test)]
 pub(crate) use protocol::discovery_dial_slot_limit;
 pub use protocol::*;
-pub(crate) use redial::{native_dial_supervised, RedialPolicy};
+pub(crate) use redial::{native_dial_supervised, RedialEnd, RedialPolicy};
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use redial::{replay_redial_bytes, RedialReplaySummary};
 pub(crate) use runtime::{
     build_discovery_handle, default_advertised_services, effective_discovery_connection_headroom,
 };
+pub(crate) use sequence_file::AuthoredSequenceFile;
 pub use service::{DiscoveryPeerSession, DiscoveryService, DISCOVERY_BUDGET};
 pub(crate) use serving::node_output_bytes as discovery_serving_output_bytes;
 

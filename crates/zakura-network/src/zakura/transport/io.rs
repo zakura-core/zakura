@@ -402,6 +402,12 @@ impl FramedSend {
         self.queue.slots.available()
     }
 
+    /// A handle that reads this queue's free slots. Unlike a `FramedSend`
+    /// clone, it does not keep the stream open.
+    pub(crate) fn capacity_probe(&self) -> crate::zakura::regulation::SlotBudget {
+        self.queue.slots.clone()
+    }
+
     /// Total slots in the bounded transport queue.
     pub fn max_capacity(&self) -> usize {
         self.queue.depth

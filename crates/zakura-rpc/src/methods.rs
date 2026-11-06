@@ -133,9 +133,9 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
-        SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
-        SubmitSolutionParameters, SubmitSolutionResponse,
+        MinedBlockEvent, MinedBlockSubmission, MinedSubmissions, PendingBlockRegistry,
+        SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse,
+        SubmitSolutionErrorResponse, SubmitSolutionParameters, SubmitSolutionResponse,
     },
     subsidy::GetBlockSubsidyResponse,
     transaction::TransactionObject,
@@ -864,7 +864,8 @@ pub trait RpcServer {
 
     /// Returns the recommended standard fee per logical action, in zatoshis.
     ///
-    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
+    /// Returns at least 1,000 zatoshis per action, with `version` 0.
+    /// Uses Zakura's ZIP 317 marginal fee when it exceeds this floor.
     /// A dynamic estimate can replace this value without changing the parameters or
     /// result shape.
     ///
@@ -2020,6 +2021,12 @@ where
     /// Shares one pending-block registry with peer serving.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.gbt.set_pending_blocks(pending_blocks);
+        self
+    }
+
+    /// Shares the in-flight `submitblock` set with block gossip.
+    pub fn with_mined_submissions(mut self, mined_submissions: MinedSubmissions) -> Self {
+        self.gbt.set_mined_submissions(mined_submissions);
         self
     }
 
@@ -4115,7 +4122,7 @@ where
 
     async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
         Ok(GetStandardFeeResponse {
-            standard_fee: transaction::zip317::MARGINAL_FEE,
+            standard_fee: transaction::zip317::MARGINAL_FEE.max(1_000),
             version: 0,
         })
     }

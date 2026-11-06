@@ -8325,6 +8325,57 @@ mod tests {
         assert_eq!(offer(4, Some(5)), dial_order[..5]);
     }
 
+    /// The book sorts the candidates past the best `limit` before it offers
+    /// them. The partial select leaves a short slice fully sorted, so this
+    /// book holds more records than that.
+    #[test]
+    fn admit_dial_candidates_offers_a_long_tail_in_dial_order() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let records = (1u8..=40)
+            .map(|index| signed_record_with(index.into(), service(1), test_addr(index)))
+            .collect::<Vec<_>>();
+        for record in &records {
+            import_confirmed_record(&mut book, record.clone()).expect("test record imports");
+        }
+        // Strictly increasing failure counts make the whole dial order
+        // deterministic: fewer failures first.
+        for (failures, record) in records.iter().enumerate() {
+            for _ in 0..failures {
+                book.mark_dial_failure(&record.body.node_id, NOW);
+            }
+        }
+
+        let mut offered = Vec::new();
+        book.admit_dial_candidates(
+            3,
+            &[service(1)],
+            &[],
+            DialCandidateExclusions {
+                connected_node_ids: &[],
+                in_flight_node_ids: &[],
+            },
+            NOW,
+            (
+                DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+            ),
+            &mut StdRng::seed_from_u64(99),
+            |candidate| {
+                offered.push(candidate.node_id);
+                DialAdmission::Skipped
+            },
+        );
+
+        assert_eq!(
+            offered,
+            records
+                .iter()
+                .map(|record| record.body.node_id)
+                .collect::<Vec<_>>(),
+            "skips draw the rest of the book in dial order"
+        );
+    }
+
     #[tokio::test]
     async fn handle_samples_records_through_storage_path() {
         let (_connected_tx, connected_rx) = watch::channel(Vec::new());

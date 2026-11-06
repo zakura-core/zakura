@@ -1183,6 +1183,91 @@ async fn a_candidate_larger_than_the_free_slots_yields_to_one_that_fits() {
     drop(holder);
 }
 
+// The round counts down one free slot per address it admits. A round that
+// counted one slot per candidate would admit a second candidate whose
+// addresses outnumber the slots the first one leaves, and that dial would
+// fail as a local limit (F-518).
+#[tokio::test]
+async fn a_round_counts_down_one_free_slot_per_admitted_address() {
+    // Six connections leave two discovery dial slots past the headroom, and
+    // five transport discovery slots.
+    let limits = ZakuraLocalLimits {
+        max_connections: 6,
+        max_pending_handshakes: 1,
+        ..ZakuraLocalLimits::from_config(&crate::Config::default())
+    };
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9219)
+        .limits(limits.clone())
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let endpoint = node.endpoint();
+    // A dial to two silent addresses holds two of them.
+    let mut silent = Vec::new();
+    for _ in 0..2 {
+        silent.push(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    }
+    let held = NodeAddr::with_addrs(
+        node_id(100),
+        silent.iter().map(|socket| socket.local_addr().unwrap()),
+    );
+    let holder = AbortOnDropHandle::new(zakura_rt::task::spawn({
+        let endpoint = endpoint.clone();
+        async move { endpoint.dial(held, &limits).await }
+    }));
+    zakura_rt::time::timeout(Duration::from_secs(5), async {
+        while endpoint.discovery_admission_capacity() != 3 {
+            zakura_rt::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the silent dial claims its two slots");
+    let later_ips = [
+        IpAddr::from([203, 0, 113, 9]),
+        IpAddr::from([203, 0, 113, 10]),
+    ];
+    let ranked = insert_ranked_static_candidates(
+        &node.discovery(),
+        1,
+        vec![
+            vec![
+                SocketAddr::new(IpAddr::from([93, 184, 216, 34]), 8233),
+                SocketAddr::new(IpAddr::from([198, 51, 100, 7]), 8233),
+            ],
+            later_ips
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, 8233))
+                .collect(),
+        ],
+    )
+    .await;
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+
+    let admitted = admit_dial_round(
+        &endpoint,
+        &node.discovery(),
+        &[],
+        &mut state,
+        Instant::now(),
+    )
+    .await;
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(attempt, _)| attempt.node_id)
+            .collect::<Vec<_>>(),
+        ranked[..1],
+        "the first candidate's two addresses leave one slot, too few for the second"
+    );
+    for ip in later_ips {
+        assert_eq!(state.in_flight_dials_to(ip), 0);
+    }
+    // A shutdown would wait out the drain of the silent attempts, so the
+    // runtime's end drops the node instead.
+    drop(holder);
+}
+
 // V12 F-510, through the dialer loop: candidates whose dials fail at once
 // complete before the next round. One round dials the four concurrent dial
 // slots' worth. The completions must not start the next round early, and the
@@ -1229,6 +1314,65 @@ async fn the_dialer_loop_dials_once_per_interval_through_completions() {
         undialed().await,
         0,
         "the second round comes one interval after the first"
+    );
+
+    dialer.abort();
+    node.shutdown().await;
+}
+
+// A worker that finishes between rounds wakes the loop. The loop must then
+// sleep until the round deadline that `CandidateDialerState` holds, not a
+// whole interval from the wake, or the next round comes late.
+#[tokio::test(start_paused = true)]
+async fn the_dialer_loop_sleeps_until_the_round_deadline_after_a_completion() {
+    let quic = zakura_quic::QuicConfig::default();
+    let handshake_timeout = quic
+        .handshake_timeout()
+        .expect("the default config bounds handshakes");
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9220)
+        .quic_config(quic.clone())
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let discovery = node.discovery();
+    // Two silent IPs: the second address starts one dial stagger after the
+    // round, so the dial fails one stagger past a round deadline.
+    let mut silent = Vec::new();
+    for ip in ["127.0.0.1:0", "127.0.0.2:0"] {
+        silent.push(tokio::net::UdpSocket::bind(ip).await.unwrap());
+    }
+    discovery
+        .insert_static_candidate(NodeAddr::with_addrs(
+            node_id(1),
+            silent.iter().map(|socket| socket.local_addr().unwrap()),
+        ))
+        .await
+        .expect("a static candidate inserts");
+    let undialed = || async { discovery.dial_candidates(&[], &[]).await.len() };
+
+    let start = Instant::now();
+    let dialer = node.spawn_discovery_dialer();
+    let failed = start + handshake_timeout + quic.dial_stagger();
+    let deadline = start + handshake_timeout + ZAKURA_DISCOVERY_DIAL_INTERVAL;
+    assert!(failed < deadline, "the dial fails between two rounds");
+    zakura_rt::time::sleep_until(failed + quic.dial_stagger()).await;
+    assert_eq!(undialed().await, 0, "the silent candidate is dialed once");
+    // The test node binds only IPv4, so the IPv6 dial fails before it sends
+    // a packet.
+    insert_ranked_static_candidates(
+        &discovery,
+        2,
+        vec![vec![SocketAddr::new(
+            IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]),
+            8233,
+        )]],
+    )
+    .await;
+    zakura_rt::time::sleep_until(deadline + quic.dial_stagger() / 2).await;
+    assert_eq!(
+        undialed().await,
+        0,
+        "the round after the failure starts at its deadline"
     );
 
     dialer.abort();

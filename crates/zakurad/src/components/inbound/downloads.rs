@@ -189,6 +189,10 @@ impl ParentRecovery {
 /// passive queue.
 /// (See #1880 for more details.)
 ///
+/// An advertised download can race a second request, from a second advertiser, against its
+/// first. That request is not charged to its advertiser: it is bounded to one per queued hash,
+/// so the queue holds at most two bodies per slot while the first body is verified.
+///
 /// Malicious blocks will eventually timeout or fail contextual validation.
 /// Once validation fails, the block is dropped, and its memory is deallocated.
 pub const MAX_INBOUND_CONCURRENCY: usize = 200;
@@ -217,6 +221,9 @@ pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 /// queued rather than applied immediately, so a replacement request can still route back to it.
 pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
 
+/// A rejected block body: the error, and the peer that supplied the body if it is to blame.
+type Rejection = (BoxError, Option<PeerSocketAddr>);
+
 /// The outcome of [`request_block_hedged`]: the response that arrived first, and the request
 /// that was still in flight when it did.
 struct HedgedResponse {
@@ -225,11 +232,61 @@ struct HedgedResponse {
 
     /// The other request, if two were racing.
     ///
-    /// The download task keeps it until `response` has passed the checks that bind a body to
-    /// the requested hash and to this node's tip. A peer that answers first with a body those
-    /// checks reject, such as a tip child with a rewritten coinbase height, must not cancel a
-    /// good body that the other peer is still sending.
-    loser: Option<BoxFuture<'static, Result<zn::Response, BoxError>>>,
+    /// The download task keeps it until a body is verified. From NU5, a body can differ from
+    /// the one the block hash commits to in any authorizing data, such as a coinbase height or
+    /// a signature, and only verification proves that it does not. A peer that answers first
+    /// with such a body must not cancel a good one that the other peer is still sending.
+    loser: Option<LoserRequest>,
+}
+
+/// The request that lost a hedge race, still running in its own task.
+///
+/// It runs on its own so that its peer's response is received, and the peer's load accounting
+/// settled, as soon as it arrives rather than when the download task gets to it. Dropping it
+/// aborts the request.
+struct LoserRequest(JoinHandle<Result<zn::Response, BoxError>>);
+
+impl LoserRequest {
+    fn spawn(request: BoxFuture<'static, Result<zn::Response, BoxError>>) -> Self {
+        Self(tokio::spawn(request))
+    }
+
+    async fn response(mut self) -> Result<zn::Response, BoxError> {
+        (&mut self.0)
+            .await
+            .unwrap_or_else(|join_error| Err(join_error.into()))
+    }
+}
+
+impl Drop for LoserRequest {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Chooses the rejection to report when every body received for a hash was rejected.
+///
+/// `Inbound` re-requests the block on a [`GossipedTipChildHeightMismatch`] and scores the peer
+/// a verification error names, so the rejection with the most consequence is reported, and
+/// `first` on a tie.
+fn preferred_rejection(first: Option<Rejection>, second: Rejection) -> Rejection {
+    let Some(first) = first else {
+        return second;
+    };
+    let consequence = |rejection: &Rejection| {
+        if rejection.0.is::<GossipedTipChildHeightMismatch>() {
+            2
+        } else if rejection.1.is_some() {
+            1
+        } else {
+            0
+        }
+    };
+    if consequence(&second) > consequence(&first) {
+        second
+    } else {
+        first
+    }
 }
 
 /// Requests block `hash` with `request`, and if `hedge` delivers another advertiser before the
@@ -261,7 +318,7 @@ where
         response = &mut first => return HedgedResponse { response, loser: None },
         source = hedge => match source {
             Ok(source) => source,
-            // The download finished or no second advertiser came: keep waiting on the first.
+            // The stream shut down, so this task is about to be cancelled.
             Err(_) => return HedgedResponse { response: first.await, loser: None },
         },
     };
@@ -277,11 +334,11 @@ where
     tokio::select! {
         response = &mut first => {
             metrics::counter!("gossip.hedged.block.winner", "request" => "first").increment(1);
-            HedgedResponse { response, loser: Some(second) }
+            HedgedResponse { response, loser: Some(LoserRequest::spawn(second)) }
         }
         response = &mut second => {
             metrics::counter!("gossip.hedged.block.winner", "request" => "second").increment(1);
-            HedgedResponse { response, loser: Some(first) }
+            HedgedResponse { response, loser: Some(LoserRequest::spawn(first)) }
         }
     }
 }
@@ -640,8 +697,8 @@ struct Admission {
     /// So each advertised block has at most two block requests in flight. The peer set routes
     /// the second request like any single-block request, so it can reach another advertiser.
     ///
-    /// The loser is not dropped until the winner's body passes [`check_gossiped_body`], so a
-    /// second advertiser cannot poison a download that was already on the wire.
+    /// The loser is not dropped until the winner's body is verified, so a second advertiser
+    /// cannot poison a download that was already on the wire.
     hedges: HashMap<block::Hash, oneshot::Sender<zn::PeerSource>>,
 }
 
@@ -1240,14 +1297,13 @@ where
             } = request_block_hedged(network, request, hash, hedge).await;
 
             // A rejected body only ends the download once no other request can still deliver
-            // the block. Until then, the other request's response is checked in its place.
-            let mut first_rejection: Option<(BoxError, Option<PeerSocketAddr>)> = None;
-            let AcceptedBody {
-                block,
-                advertiser_addr,
-                height: block_height,
-                tip_height,
-            } = loop {
+            // the block. Until then, the other request's response takes its place. The parent
+            // check and the source lock are shared by every body, because they depend on the
+            // header, which the hash commits to.
+            let mut parent_checked = false;
+            let mut source_guard = None;
+            let mut first_rejection: Option<Rejection> = None;
+            let verified = loop {
                 let checked = response.map_err(|e| (e, None)).and_then(|response| {
                     check_gossiped_body(
                         response,
@@ -1259,88 +1315,97 @@ where
                     )
                 });
                 let rejection = match checked {
-                    Ok(accepted) => break accepted,
                     Err(rejection) => rejection,
+                    Ok(AcceptedBody {
+                        block,
+                        advertiser_addr,
+                        height: block_height,
+                        tip_height,
+                    }) => {
+                        // The parent is checked after the height policies, so only blocks this
+                        // node would verify can start a recovery, and before the source lock,
+                        // so a recovery is not delayed by earlier blocks from the same source.
+                        if kind == DownloadKind::Advertised && !parent_checked {
+                            parent_checked = true;
+                            let parent = block.header().previous_block_hash;
+                            let one_hop_from_tip = tip_height
+                                .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
+                                .is_some_and(|max_height| block_height <= max_height);
+
+                            // A failed read only skips the recovery: the verifier still waits
+                            // for the parent as before.
+                            let parent_is_missing = one_hop_from_tip
+                                && matches!(
+                                    state.clone().oneshot(zs::Request::KnownBlock(parent)).await,
+                                    Ok(zs::Response::KnownBlock(None))
+                                );
+
+                            if parent_is_missing {
+                                let header = *block.header();
+                                let chain_network = chain_network.clone();
+                                let proof_of_work_is_valid =
+                                    tokio::task::spawn_blocking(move || {
+                                        zakura_consensus::proof_of_work_is_valid(
+                                            &header,
+                                            &chain_network,
+                                            &block_height,
+                                            &hash,
+                                        )
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+
+                                let recovery = if proof_of_work_is_valid {
+                                    spawner.recover_parent(parent, download_source.clone())
+                                } else {
+                                    ParentRecovery::InvalidProofOfWork
+                                };
+                                debug!(
+                                    ?hash,
+                                    ?parent,
+                                    ?block_height,
+                                    ?recovery,
+                                    "gossiped block's parent is missing",
+                                );
+                                metrics::counter!(
+                                    "gossip.missing.parent.count",
+                                    "outcome" => recovery.metric_label(),
+                                )
+                                .increment(1);
+                            }
+                        }
+
+                        if source_guard.is_none() {
+                            if let Some(source_lock) = &source_lock {
+                                source_guard = Some(source_lock.clone().lock_owned().await);
+                            }
+                        }
+
+                        match verifier
+                            .clone()
+                            .oneshot(zakura_consensus::Request::Commit(block))
+                            .await
+                        {
+                            Ok(verified_hash) => break (verified_hash, block_height),
+                            Err(e) => (e, advertiser_addr),
+                        }
+                    }
                 };
 
                 let Some(other) = loser.take() else {
-                    // Prefer the rejection that names a peer: that body is scored, and a
-                    // poisoned tip child is re-requested.
-                    return Err(match first_rejection {
-                        Some(first) if first.1.is_some() => first,
-                        _ => rejection,
-                    });
+                    return Err(preferred_rejection(first_rejection, rejection));
                 };
                 debug!(
                     ?hash,
                     error = %rejection.0,
-                    "hedged block response rejected: waiting for the other request"
+                    "hedged block body rejected: waiting for the other request"
                 );
                 metrics::counter!("gossip.hedged.block.fallback.count").increment(1);
                 first_rejection.get_or_insert(rejection);
-                response = other.await;
+                response = other.response().await;
             };
 
-            // The parent is checked after the height policies, so only blocks this node would
-            // verify can start a recovery, and before the source lock, so a recovery is not
-            // delayed by earlier blocks from the same source.
-            if kind == DownloadKind::Advertised {
-                let parent = block.header().previous_block_hash;
-                let one_hop_from_tip = tip_height
-                    .and_then(|tip| tip + MAX_PARENT_RECOVERY_CHILD_HEIGHT_ABOVE_TIP)
-                    .is_some_and(|max_height| block_height <= max_height);
-
-                // A failed read only skips the recovery: the verifier still waits for the
-                // parent as before.
-                let parent_is_missing = one_hop_from_tip
-                    && matches!(
-                        state.oneshot(zs::Request::KnownBlock(parent)).await,
-                        Ok(zs::Response::KnownBlock(None))
-                    );
-
-                if parent_is_missing {
-                    let header = *block.header();
-                    let proof_of_work_is_valid = tokio::task::spawn_blocking(move || {
-                        zakura_consensus::proof_of_work_is_valid(
-                            &header,
-                            &chain_network,
-                            &block_height,
-                            &hash,
-                        )
-                    })
-                    .await
-                    .unwrap_or(false);
-
-                    let recovery = if proof_of_work_is_valid {
-                        spawner.recover_parent(parent, download_source)
-                    } else {
-                        ParentRecovery::InvalidProofOfWork
-                    };
-                    debug!(
-                        ?hash,
-                        ?parent,
-                        ?block_height,
-                        ?recovery,
-                        "gossiped block's parent is missing",
-                    );
-                    metrics::counter!(
-                        "gossip.missing.parent.count",
-                        "outcome" => recovery.metric_label(),
-                    )
-                    .increment(1);
-                }
-            }
-
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
-            };
-
-            verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
-                .await
-                .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+            Ok(verified)
         }
         .map_ok(move |(hash, height)| {
             match kind {
@@ -2336,6 +2401,8 @@ mod tests {
         let honest = zn::PeerSource::LegacySocket(honest_addr);
         let attacker = zn::PeerSource::LegacySocket(attacker_addr);
 
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
         let (_tip_sender, latest_chain_tip) = chain_tip_at(block::Height(1_687_106), parent_hash);
         let (mut downloads, mut network_rx) = downloads_answering(latest_chain_tip, {
             let honest = honest.clone();
@@ -2343,10 +2410,12 @@ mod tests {
                 let canonical = canonical.clone();
                 let poisoned = poisoned.clone();
                 let honest = honest.clone();
+                let release_rx = release_rx.clone();
                 async move {
                     if source == honest {
-                        // The honest peer delivers the canonical body after the attacker.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        // The honest peer delivers the canonical body once released.
+                        let release = release_rx.lock().await.take().expect("honest request once");
+                        release.await?;
                         Ok(zn::Response::Blocks(vec![Available((
                             canonical.into(),
                             Some(honest_addr),
@@ -2378,6 +2447,9 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await?,
             Some(attacker)
         );
+        // Let the attacker's poisoned body reach the task before the honest peer answers.
+        tokio::task::yield_now().await;
+        release_tx.send(()).expect("honest request is waiting");
 
         let verified = tokio::time::timeout(Duration::from_secs(2), downloads.next())
             .await
@@ -2405,16 +2477,20 @@ mod tests {
         let first = zn::PeerSource::LegacySocket(first_addr);
         let attacker = zn::PeerSource::LegacySocket(attacker_addr);
 
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
         let (_tip_sender, latest_chain_tip) = chain_tip_at(block::Height(1_687_106), parent_hash);
         let (mut downloads, mut network_rx) = downloads_answering(latest_chain_tip, {
             let first = first.clone();
             move |source| {
                 let poisoned = poisoned.clone();
                 let first = first.clone();
+                let release_rx = release_rx.clone();
                 async move {
                     if source == first {
-                        // The first peer reports the block missing after the attacker answers.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        // The first peer reports the block missing once released.
+                        let release = release_rx.lock().await.take().expect("first request once");
+                        release.await?;
                         Ok(zn::Response::Blocks(vec![zn::InventoryResponse::Missing(
                             hash,
                         )]))
@@ -2438,6 +2514,9 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await?,
             Some(attacker)
         );
+        // Let the attacker's poisoned body reach the task before the first peer answers.
+        tokio::task::yield_now().await;
+        release_tx.send(()).expect("first request is waiting");
 
         let (error, addr) = tokio::time::timeout(Duration::from_secs(2), downloads.next())
             .await
@@ -2449,6 +2528,113 @@ mod tests {
             .unwrap_or_else(|| panic!("unexpected error: {error}"));
         assert_eq!(mismatch.hash, hash);
         assert_eq!(addr, Some(attacker_addr));
+
+        Ok(())
+    }
+
+    /// A hedge body with the right hash can still fail verification, because the hash does not
+    /// commit to V5 authorizing data. The honest request's body is then verified instead.
+    #[tokio::test]
+    async fn hedge_body_failing_verification_falls_back_to_the_honest_request(
+    ) -> Result<(), BoxError> {
+        let canonical: Arc<Block> =
+            zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.zcash_deserialize_into()?;
+        let hash = canonical.hash();
+        let canonical_height = block::Height(1_687_107);
+        // The forged body claims a height the lookahead window accepts, and its parent is not
+        // the tip, so only verification can reject it.
+        let forged = poison_coinbase_height(&canonical, block::Height(1_687_108));
+        assert_eq!(forged.hash(), hash);
+
+        let honest_addr: PeerSocketAddr = "10.0.5.1:8233".parse()?;
+        let attacker_addr: PeerSocketAddr = "10.0.5.2:8233".parse()?;
+        let honest = zn::PeerSource::LegacySocket(honest_addr);
+        let attacker = zn::PeerSource::LegacySocket(attacker_addr);
+
+        // The tip is far enough below the block that neither body starts a parent recovery.
+        let (_tip_sender, latest_chain_tip) =
+            chain_tip_at(block::Height(1_687_104), block::Hash([0xCC; 32]));
+
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let commits = Arc::new(std::sync::Mutex::new(Vec::<Option<block::Height>>::new()));
+        let (mut downloads, mut network_rx) = downloads_answering(latest_chain_tip, {
+            let honest = honest.clone();
+            move |source| {
+                let canonical = canonical.clone();
+                let forged = forged.clone();
+                let honest = honest.clone();
+                let release_rx = release_rx.clone();
+                async move {
+                    if source == honest {
+                        let release = release_rx.lock().await.take().expect("honest request once");
+                        release.await?;
+                        Ok(zn::Response::Blocks(vec![Available((
+                            canonical.into(),
+                            Some(honest_addr),
+                        ))]))
+                    } else {
+                        Ok(zn::Response::Blocks(vec![Available((
+                            forged.into(),
+                            Some(attacker_addr),
+                        ))]))
+                    }
+                }
+            }
+        });
+        downloads.spawner.verifier = BoxCloneService::new(service_fn({
+            let commits = commits.clone();
+            move |request: zakura_consensus::Request| {
+                let commits = commits.clone();
+                async move {
+                    let zakura_consensus::Request::Commit(block) = request else {
+                        return Err::<block::Hash, BoxError>("unexpected verifier request".into());
+                    };
+                    commits
+                        .lock()
+                        .expect("test mutex")
+                        .push(block.coinbase_height());
+                    if block.coinbase_height() == Some(canonical_height) {
+                        Ok(block.hash())
+                    } else {
+                        Err("forged authorizing data fails verification".into())
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(honest.clone())),
+            DownloadAction::AddedToQueue
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await?,
+            Some(honest)
+        );
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(attacker.clone())),
+            DownloadAction::AlreadyQueued
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), network_rx.recv()).await?,
+            Some(attacker)
+        );
+        // Let the forged body reach the verifier before the honest peer answers.
+        tokio::task::yield_now().await;
+        release_tx.send(()).expect("honest request is waiting");
+
+        let verified = tokio::time::timeout(Duration::from_secs(2), downloads.next())
+            .await
+            .expect("the honest request's block is verified")
+            .expect("downloads stream is open")
+            .expect("download succeeds");
+        assert_eq!(verified, hash);
+        assert_eq!(
+            commits.lock().expect("test mutex").as_slice(),
+            &[Some(block::Height(1_687_108)), Some(canonical_height)],
+            "the forged body is rejected by the verifier, then the honest body is verified"
+        );
+        assert_eq!(downloads.spawner.admission().queue_len(), 0);
 
         Ok(())
     }

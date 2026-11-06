@@ -43,10 +43,13 @@ async fn genesis_read_state(
     crate::service::ReadStateService,
     Arc<Block>,
 ) {
-    let (mut state, read, _, _) =
-        crate::service::StateService::new(config, &Mainnet, Height::MAX, 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        ..
+    } = crate::service::StateService::new(config, &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
     let genesis: Arc<Block> = Arc::new(
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
@@ -54,10 +57,7 @@ async fn genesis_read_state(
     );
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(
-            CheckpointVerifiedBlock::from(genesis.clone()),
-            None,
-        ),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
     )
     .await
     .unwrap()
@@ -225,7 +225,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     );
     timeout(
         deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1), None),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1)),
     )
     .await
     .unwrap()
@@ -361,10 +361,13 @@ async fn find_block_headers_results_keep_their_read_admission() {
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let (mut state, mut read, _, _) =
-        StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        read_state: mut read,
+        ..
+    } = StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
     for bytes in [
         &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..],
         &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
@@ -372,7 +375,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
         let block: Arc<Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
         timeout(
             deadline,
-            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None),
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
         )
         .await
         .unwrap()
@@ -650,6 +653,7 @@ fn test_block_db_round_trip_with(
                 new_outputs: Arc::new(new_outputs),
                 transaction_hashes,
                 deferred_pool_balance_change: None,
+                origin: crate::BlockOrigin::Network,
                 auth_data_root: None,
                 receipt_order: None,
             })

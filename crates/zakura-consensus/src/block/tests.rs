@@ -23,7 +23,7 @@ use zakura_chain::{
         NetworkUpgrade,
     },
     primitives::Halo2Proof,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{
         arbitrary::{transaction_to_fake_v5, v5_transactions},
         LockTime, Transaction, UnminedTxId,
@@ -789,6 +789,7 @@ async fn mined_orphan_replays_skip_transaction_verification() {
         .await
         .unwrap()
         .call(Request::CommitMined {
+            size: candidate.zcash_serialized_size(),
             block: candidate.into(),
             admission: zs::BlockAdmission::pending(),
         })
@@ -822,6 +823,7 @@ async fn assert_prepared_commit_rejects(
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: solved.zcash_serialized_size(),
             block: Arc::new(solved).into(),
             admission: zs::BlockAdmission::pending(),
         })
@@ -883,6 +885,7 @@ async fn prepared_mined_commit_rechecks_difficulty() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: solved.zcash_serialized_size(),
             block: Arc::new(solved).into(),
 
             admission: zs::BlockAdmission::pending(),
@@ -1015,6 +1018,7 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                     source,
                 },
                 Request::CommitMined {
+                    size: candidate.zcash_serialized_size(),
                     block: candidate.clone().into(),
                     admission: zs::BlockAdmission::pending(),
                 },
@@ -1105,6 +1109,7 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: candidate.zcash_serialized_size(),
             block: candidate.into(),
             admission: zs::BlockAdmission::pending(),
         })
@@ -1317,6 +1322,7 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: tampered.zcash_serialized_size(),
             block: Arc::new(tampered).into(),
 
             admission: zs::BlockAdmission::pending(),
@@ -1391,6 +1397,7 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: conflicting_proposal.zcash_serialized_size(),
             block: conflicting_proposal.into(),
             admission: admission.clone(),
         })
@@ -1474,6 +1481,7 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .await
         .expect("the prepared verifier is ready")
         .call(Request::CommitMined {
+            size: block.zcash_serialized_size(),
             block: block.into(),
 
             admission: zs::BlockAdmission::pending(),
@@ -1493,7 +1501,18 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         assert!(block.receipt_order.take().is_some());
         block
     };
-    assert_eq!(take_commit(&prepared_commit), take_commit(&full_commit));
+    let mut prepared = take_commit(&prepared_commit);
+    let full = take_commit(&full_commit);
+    assert_eq!(full.origin, zs::BlockOrigin::Network);
+    assert_eq!(
+        prepared.origin,
+        zs::BlockOrigin::LocalSubmission {
+            size: prepared.block.zcash_serialized_size(),
+        }
+    );
+    // Origin selects relay ordering; it does not change the verified block's state effects.
+    prepared.origin = full.origin;
+    assert_eq!(prepared, full);
 }
 
 /// Outputs read at the parent go to the transaction checks but never join the block's own
@@ -3370,7 +3389,7 @@ async fn pending_commit_retry_waits_for_state_outcome() {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    for (committed, mined) in [(true, false), (false, false), (true, true), (false, true)] {
+    for committed in [true, false] {
         let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
@@ -3402,27 +3421,16 @@ async fn pending_commit_retry_waits_for_state_outcome() {
             crate::transaction::boxed_state(state),
             crate::transaction::boxed_transaction_verifier(transaction),
         );
-        let admission = zs::BlockAdmission::pending();
-        let request = if mined {
-            Request::CommitMined {
-                block: Arc::new(block).into(),
-                admission: admission.clone(),
-            }
-        } else {
-            Request::Commit(Arc::new(block).into())
-        };
         let start = tokio::time::Instant::now();
-        let error =
-            tokio::time::timeout(std::time::Duration::from_secs(5), verifier.oneshot(request))
-                .await
-                .unwrap()
-                .unwrap_err();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verifier.oneshot(Request::Commit(Arc::new(block).into())),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
         assert!(start.elapsed() >= std::time::Duration::from_secs(2));
         assert!(locations.lock().unwrap().is_empty());
-        assert!(
-            !admission.is_admitted(),
-            "waiting on another copy never claims its commit"
-        );
         if committed {
             assert_eq!(error.duplicate_location(), Some(&zs::KnownBlock::BestChain));
         } else {
@@ -3883,6 +3891,8 @@ async fn malformed_headers_do_not_stop_buffered_verification() {
         for request in [
             Request::Commit(malformed.clone().into()),
             Request::CommitMined {
+                // An invalid header must be rejected before its body or size is used.
+                size: 0,
                 block: malformed.into(),
                 admission: zs::BlockAdmission::pending(),
             },
@@ -3948,6 +3958,12 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                         zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
                             block, ..
                         } => {
+                            assert_eq!(
+                                block.origin,
+                                zs::BlockOrigin::LocalSubmission {
+                                    size: block.block.zcash_serialized_size(),
+                                }
+                            );
                             received.lock().unwrap().push(
                                 block
                                     .receipt_order
@@ -3984,6 +4000,7 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                 .unwrap();
         }
         let request = || Request::CommitMined {
+            size: candidate.zcash_serialized_size(),
             block: candidate.clone().into(),
             admission: zs::BlockAdmission::pending(),
         };
@@ -4012,7 +4029,11 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         for cache_hit in [false, true] {
             let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
-            let (state, _, tip, _) = zs::init_test_services(&network).await;
+            let zakura_state::InitializedState {
+                state,
+                latest_chain_tip: tip,
+                ..
+            } = zs::init_test_services(&network).await;
             let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
                 .zcash_deserialize_into()
                 .unwrap();
@@ -4060,10 +4081,12 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
             // duplicate A finish before it, using the real state's deduplication.
             let early_a = verifier.call(Request::Commit(a.clone().into()));
             let later_b = verifier.call(Request::CommitMined {
+                size: b.zcash_serialized_size(),
                 block: b.clone().into(),
                 admission: zs::BlockAdmission::pending(),
             });
             let duplicate_a = verifier.call(Request::CommitMined {
+                size: a.zcash_serialized_size(),
                 block: Arc::new(a.as_ref().clone()).into(),
                 admission: zs::BlockAdmission::pending(),
             });

@@ -10,7 +10,6 @@ use zakura_chain::{
         Block, ChainHistoryBlockTxAuthCommitmentHash, Height, CHAIN_HISTORY_ACTIVATION_RESERVED,
     },
     chain_sync_status::MockSyncStatus,
-    chain_tip::ChainTip,
     parameters::{testnet::ConfiguredActivationHeights, Network},
     serialization::ZcashSerialize,
     transaction::{arbitrary::transaction_to_fake_v5, Transaction},
@@ -19,14 +18,11 @@ use zakura_chain::{
 use zakura_network::{address_book_peers::MockAddressBookPeers, Request, Response};
 use zakura_rpc::{
     methods::{RpcImpl, RpcServer},
-    MinedSubmissions, SubmitBlockChannel,
+    EarlyMinedBlock, EarlyMinedBlockChannel, MinedBlockSubmission, PendingBlockSignal,
 };
 use zakura_test::mock_service::MockService;
 
-use crate::components::sync::{
-    gossip::{gossip_best_tip_block_hashes, BLOCK_GOSSIP_TIMEOUT},
-    BlockGossipError, SyncStatus,
-};
+use crate::components::sync::{gossip::gossip_best_tip_block_hashes, BlockGossipError, SyncStatus};
 
 type Advertisement = (Instant, Request);
 
@@ -61,16 +57,46 @@ async fn assert_no_advertisement(
         assert!(futures::poll!(gossip.as_mut()).is_pending());
         assert!(
             advertisements.try_recv().is_err(),
-            "advertised before release or timeout"
+            "no additional advertisement is expected"
         );
         tokio::task::yield_now().await;
     }
 }
 
-/// The Regtest fixture enters at the semantic-verifier boundary. This adapter skips
-/// cryptographic verification, but state performs the real contextual commit, admission and
-/// tip publication. Only delivery of its successful result back to RPC is held behind a gate.
-async fn delayed_completion(early_inventory: bool, hold_until_timeout: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelayOrdering {
+    HeldRpc,
+    EarlyAfterCommit,
+    EarlyAfterAnotherLocalCommit,
+    RetryAfterFailure,
+    EarlyWaitingForReadiness,
+    EarlyAlreadyDispatched,
+}
+
+/// A service that exposes entry into readiness and never becomes ready.
+struct NeverReady(Arc<std::sync::atomic::AtomicBool>);
+
+impl tower::Service<Request> for NeverReady {
+    type Response = Response;
+    type Error = crate::BoxError;
+    type Future = std::future::Ready<Result<Response, crate::BoxError>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Pending
+    }
+
+    fn call(&mut self, _: Request) -> Self::Future {
+        panic!("an early event must not dispatch after commit while waiting for readiness")
+    }
+}
+
+/// The adapter skips cryptographic verification, but uses real state admission, contextual
+/// commitment and publication. RPC's verification response remains held throughout observation.
+async fn delayed_completion(early_inventory: bool, ordering: RelayOrdering) {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(
         ConfiguredActivationHeights {
@@ -79,10 +105,15 @@ async fn delayed_completion(early_inventory: bool, hold_until_timeout: bool) {
         }
         .into(),
     );
-    let (state, read_state, latest_tip, tip_changes) =
-        zakura_state::init(zakura_state::Config::ephemeral(), &network, Height(0), 0)
-            .await
-            .unwrap();
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip: latest_tip,
+        block_announcements,
+        ..
+    } = zakura_state::init(zakura_state::Config::ephemeral(), &network, Height(0), 0)
+        .await
+        .unwrap();
     let state = Buffer::new(state, 1);
     let genesis = zakura_chain::block::genesis::regtest_genesis_block();
     tokio::time::timeout(
@@ -98,37 +129,36 @@ async fn delayed_completion(early_inventory: bool, hold_until_timeout: bool) {
     .unwrap();
     let candidate = child_of_genesis(&genesis, &network);
 
-    // The real state service needs a multi-thread runtime for its blocking handoff. Keep its
-    // buffer there, and drive RPC/gossip on a separate runtime whose clock can be paused.
+    // State's blocking handoff stays on the outer multi-thread runtime. Drive gossip on a
+    // current-thread runtime so its clock can be frozen while the real writer finishes.
     tokio::task::spawn_blocking(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
             .block_on(async move {
-                let submissions = MinedSubmissions::default();
-                let mining_events = SubmitBlockChannel::new();
+                let mining_events = EarlyMinedBlockChannel::new();
                 let mining_sender = mining_events.sender();
+                let delayed_sender = mining_sender.clone();
                 let (advertise_tx, mut advertisements) = mpsc::unbounded_channel();
+                let fail_next = Arc::new(std::sync::atomic::AtomicBool::new(
+                    ordering == RelayOrdering::RetryAfterFailure,
+                ));
                 let peers = tower::service_fn(move |request| {
+                    let fail = matches!(&request, Request::AdvertiseMinedBlock(_))
+                        && fail_next.swap(false, std::sync::atomic::Ordering::SeqCst);
                     advertise_tx.send((Instant::now(), request)).unwrap();
-                    async { Ok::<_, crate::BoxError>(Response::Nil) }
+                    async move {
+                        if fail { Err::<Response, crate::BoxError>("injected broadcast failure".into()) }
+                        else { Ok(Response::Nil) }
+                    }
                 });
                 let (sync_status, mut recent_syncs) = SyncStatus::new();
                 SyncStatus::sync_close_to_tip(&mut recent_syncs);
                 let gossip = gossip_best_tip_block_hashes(
-                    sync_status,
-                    tip_changes,
-                    peers,
-                    read_state.clone(),
-                    Some(mining_events.receiver()),
-                    submissions.clone(),
+                    sync_status, latest_tip.clone(), block_announcements,
+                    peers, read_state.clone(), Some(mining_events.receiver()),
                 );
                 tokio::pin!(gossip);
                 let (_, initial) = next_advertisement(gossip.as_mut(), &mut advertisements).await;
-                assert!(
-                    matches!(initial, Request::AdvertiseBlock(block, None) if block.hash == genesis.hash())
-                );
+                assert!(matches!(initial, Request::AdvertiseBlock(block, None) if block.hash == genesis.hash()));
 
                 let mut verifier: MockService<_, _, _, crate::BoxError> = MockService::build().for_unit_tests();
                 let mempool: MockService<_, _, _, crate::BoxError> = MockService::build().for_unit_tests();
@@ -136,136 +166,135 @@ async fn delayed_completion(early_inventory: bool, hold_until_timeout: bool) {
                 let (rpc, queue) = RpcImpl::new(
                     network,
                     zakura_rpc::config::mining::Config {
-                        optimistic_block_inventory: early_inventory,
-                        ..Default::default()
+                        optimistic_block_inventory: early_inventory, ..Default::default()
                     },
-                    false,
-                    "test",
-                    "miner relay test",
-                    mempool,
-                    state.clone(),
-                    read_state,
-                    verifier.clone(),
-                    MockSyncStatus::default(),
-                    latest_tip.clone(),
-                    MockAddressBookPeers::default(),
-                    log_rx,
-                    Some(mining_sender),
+                    false, "test", "miner relay test", mempool, state.clone(), read_state,
+                    verifier.clone(), MockSyncStatus::default(), latest_tip,
+                    MockAddressBookPeers::default(), log_rx, Some(mining_sender),
                 );
-                let rpc = rpc.with_mined_submissions(submissions.clone());
                 let bytes = candidate.zcash_serialize_to_vec().unwrap();
                 let submission = tokio::spawn(async move {
                     rpc.submit_block(
-                        serde_json::from_value(serde_json::json!(hex::encode(bytes))).unwrap(),
-                        None,
-                    )
-                    .await
+                        serde_json::from_value(serde_json::json!(hex::encode(bytes))).unwrap(), None,
+                    ).await
                 });
-                let verification_response = verifier
-                    .expect_request_that(|request| {
-                        matches!(request, zakura_consensus::Request::CommitMined { .. })
-                    })
-                    .await;
-                let zakura_consensus::Request::CommitMined { block, admission } =
-                    verification_response.request()
-                else {
-                    unreachable!("the request was checked above");
-                };
-                // Stand in for consensus's authorization of this known fixture. State still
-                // decides whether the real writer handoff permits early inventory.
+                let verification_response = verifier.expect_request_that(|request| {
+                    matches!(request, zakura_consensus::Request::CommitMined { .. })
+                }).await;
+                let origin = verification_response.request().origin();
+                let zakura_consensus::Request::CommitMined { block, admission, .. } =
+                    verification_response.request() else { unreachable!("request checked above") };
+                let admission = admission.clone();
                 admission.authorize_optimistic_relay();
-                let commit = state.oneshot(
+                let mut verified: zakura_state::SemanticallyVerifiedBlock = block.clone().into();
+                verified.origin = origin;
+                let mut release_early = None;
+                let waiting_early = if ordering == RelayOrdering::EarlyWaitingForReadiness {
+                    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let task = tokio::spawn(crate::components::sync::gossip::broadcast_early_with_timeout(
+                        NeverReady(polled.clone()), Request::AdvertiseMinedBlock(
+                            zakura_network::AdvertisedBlock::new(candidate.hash(), candidate.zcash_serialized_size()),
+                        ), admission.clone(),
+                    ));
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !polled.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.unwrap();
+                    Some(task)
+                } else if ordering == RelayOrdering::EarlyAlreadyDispatched {
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                    release_early = Some(release_tx);
+                    let mut started_tx = Some(started_tx);
+                    let mut release_rx = Some(release_rx);
+                    let peers = tower::service_fn(move |_| {
+                        started_tx.take().unwrap().send(()).unwrap();
+                        let release = release_rx.take().unwrap();
+                        async move {
+                            release.await.unwrap();
+                            Ok::<_, crate::BoxError>(Response::Nil)
+                        }
+                    });
+                    let task = tokio::spawn(crate::components::sync::gossip::broadcast_early_with_timeout(
+                        peers, Request::AdvertiseMinedBlock(zakura_network::AdvertisedBlock::new(
+                            candidate.hash(), candidate.zcash_serialized_size(),
+                        )), admission.clone(),
+                    ));
+                    tokio::time::timeout(Duration::from_secs(10), started_rx).await.unwrap().unwrap();
+                    Some(task)
+                } else { None };
+                let committed = tokio::time::timeout(Duration::from_secs(30), state.clone().oneshot(
                     zakura_state::Request::CommitSemanticallyVerifiedBlockWithAdmission {
-                        block: block.clone().into(),
-                        admission: admission.clone(),
+                        block: verified, admission: admission.clone(),
                         requested_at: std::time::Instant::now(),
                     },
-                );
-                // Wait for actual publication before starting the controlled gossip observation.
-                let committed = tokio::time::timeout(Duration::from_secs(30), commit)
-                .await
-                .unwrap()
-                .unwrap();
+                )).await.unwrap().unwrap();
                 let zakura_state::Response::Committed(committed) = committed else {
-                    panic!("the writer must return a commit result");
+                    panic!("the writer returns a commit result");
                 };
-                assert!(admission.is_admitted());
-                assert!(admission.optimistic_relay_authorized());
-                // Retain the responder: the writer has committed, but RPC cannot send its final event yet.
-                let mut verification_response = Some(verification_response);
-                assert_eq!(committed, candidate.hash());
-                assert_eq!(latest_tip.best_tip_hash(), Some(committed));
-                assert!(submissions.contains(&committed));
-                assert!(!submission.is_finished());
-
-                // The actual OS writer has completed. From here, advance only the coordination clock;
-                // next_advertisement keeps real size reads runnable without automatic time jumps.
+                assert!(admission.wait().await);
+                assert!(admission.is_committed());
+                if let Some(waiting) = waiting_early {
+                    if let Some(release) = release_early {
+                        assert!(!waiting.is_finished(), "commit preserves an already dispatched early broadcast");
+                        release.send(()).unwrap();
+                        assert!(tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap());
+                    } else {
+                        assert!(!tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap(),
+                            "commit cancels early readiness without dispatch");
+                    }
+                }
+                assert!(!admission.optimistic_relay_authorized());
                 tokio::time::pause();
                 let committed_at = Instant::now();
-                assert!(futures::poll!(gossip.as_mut()).is_pending());
-                let deadline = submissions
-                    .gossip_deadline(committed, BLOCK_GOSSIP_TIMEOUT)
-                    .unwrap();
-                assert_eq!(deadline - committed_at, Duration::from_secs(90));
-                let (first_at, first) = if early_inventory {
-                    next_advertisement(gossip.as_mut(), &mut advertisements).await
-                } else {
-                    assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
-                    let wait = if hold_until_timeout {
-                        deadline - Instant::now()
-                    } else {
-                        Duration::from_secs(1)
-                    };
-                    tokio::time::advance(wait - Duration::from_millis(1)).await;
-                    assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
-                    // Tokio rounds timers to milliseconds; cross the deadline by one tick.
-                    tokio::time::advance(Duration::from_millis(if hold_until_timeout { 2 } else { 1 })).await;
-                    if !hold_until_timeout {
-                        verification_response.take().unwrap().respond(committed);
-                    }
-                    next_advertisement(gossip.as_mut(), &mut advertisements).await
-                };
-                let delay = first_at.saturating_duration_since(committed_at);
-                let expected_delay = match (early_inventory, hold_until_timeout) {
-                    (true, _) => Duration::ZERO,
-                    (false, false) => Duration::from_secs(1),
-                    (false, true) => deadline - committed_at + Duration::from_millis(1),
-                };
-                assert_eq!(delay, expected_delay);
-                if !early_inventory && hold_until_timeout {
-                    assert!(matches!(first, Request::AdvertiseBlock(block, None) if block.hash == committed));
-                    assert!(submissions.contains(&committed));
-                    assert!(!submission.is_finished());
-                } else {
-                    assert!(matches!(first, Request::AdvertiseMinedBlock(block) if block.hash == committed));
+                let (first_at, first) = next_advertisement(gossip.as_mut(), &mut advertisements).await;
+                assert_eq!(first_at, committed_at, "state publication needs no RPC coordination delay");
+                assert!(matches!(first, Request::AdvertiseMinedBlock(block) if block.hash == committed));
+                assert!(!submission.is_finished());
+                if ordering == RelayOrdering::RetryAfterFailure {
+                    let (_, retry) = next_advertisement(gossip.as_mut(), &mut advertisements).await;
+                    assert!(matches!(retry, Request::AdvertiseMinedBlock(block) if block.hash == committed));
                 }
-                tracing::info!(
-                    early_inventory,
-                    held_until_timeout = hold_until_timeout,
-                    first_advertisement_delay = ?delay,
-                    "observed first block advertisement"
-                );
+                assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
 
-                if let Some(response) = verification_response.take() {
-                    response.respond(committed);
+                if ordering == RelayOrdering::EarlyAfterAnotherLocalCommit {
+                    let mut sibling = (*candidate).clone();
+                    Arc::make_mut(&mut sibling.header).nonce.0[0] ^= 1;
+                    let sibling = Arc::new(sibling);
+                    let sibling_hash = sibling.hash();
+                    let size = sibling.zcash_serialized_size();
+                    let mut verified: zakura_state::SemanticallyVerifiedBlock = sibling.into();
+                    verified.origin = zakura_state::BlockOrigin::LocalSubmission { size };
+                    tokio::time::resume();
+                    state.clone().oneshot(zakura_state::Request::CommitSemanticallyVerifiedBlock(
+                        verified,
+                    )).await.unwrap();
+                    tokio::time::pause();
+                    let (_, other) = next_advertisement(gossip.as_mut(), &mut advertisements).await;
+                    assert!(matches!(other, Request::AdvertiseMinedBlock(block) if block.hash == sibling_hash));
+                    assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
                 }
-                // Resume real time before waiting for task cleanup, so timeouts stay meaningful.
+
+                if ordering != RelayOrdering::HeldRpc {
+                    // Model an early event queued before commit but consumed only after its
+                    // committed broadcast (and possibly a different block's) has finished.
+                    delayed_sender.send(EarlyMinedBlock {
+                        hash: committed, height: Height(1), size: candidate.zcash_serialized_size(),
+                        submitted_at: std::time::Instant::now(), submission: MinedBlockSubmission::FullBlock,
+                        pending: PendingBlockSignal::valid_for_tests(), admission,
+                    }).unwrap();
+                    assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
+                }
+                verification_response.respond(committed);
                 tokio::time::resume();
                 let response = tokio::time::timeout(Duration::from_secs(10), submission)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(
-                    serde_json::to_value(response).unwrap(),
-                    serde_json::Value::Null
-                );
-                assert!(!submissions.contains(&committed));
+                    .await.unwrap().unwrap().unwrap();
+                assert_eq!(serde_json::to_value(response).unwrap(), serde_json::Value::Null);
+                assert_no_advertisement(gossip.as_mut(), &mut advertisements).await;
                 queue.abort();
             });
-    })
-    .await
-    .unwrap();
+    }).await.unwrap();
 }
 
 /// Build a height-1 coinbase block with the history and transaction commitments expected by
@@ -296,15 +325,35 @@ fn child_of_genesis(genesis: &Arc<Block>, network: &Network) -> Arc<Block> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_writer_early_inventory_does_not_wait_for_rpc_completion() {
-    delayed_completion(true, false).await;
+    delayed_completion(true, RelayOrdering::HeldRpc).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_writer_without_early_inventory_waits_for_delayed_rpc_completion() {
-    delayed_completion(false, false).await;
+async fn real_writer_without_early_inventory_does_not_wait_for_rpc_completion() {
+    delayed_completion(false, RelayOrdering::HeldRpc).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_writer_without_early_inventory_relays_after_coordination_timeout() {
-    delayed_completion(false, true).await;
+async fn real_writer_suppresses_early_event_after_committed_broadcast() {
+    delayed_completion(true, RelayOrdering::EarlyAfterCommit).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_writer_suppresses_old_early_event_after_another_local_commit() {
+    delayed_completion(true, RelayOrdering::EarlyAfterAnotherLocalCommit).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_writer_retries_failed_committed_broadcast_without_stale_early_event() {
+    delayed_completion(true, RelayOrdering::RetryAfterFailure).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_writer_cancels_early_broadcast_waiting_for_network_readiness() {
+    delayed_completion(true, RelayOrdering::EarlyWaitingForReadiness).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_writer_keeps_an_already_dispatched_early_broadcast_running() {
+    delayed_completion(true, RelayOrdering::EarlyAlreadyDispatched).await;
 }

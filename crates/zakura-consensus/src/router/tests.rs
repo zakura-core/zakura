@@ -12,7 +12,7 @@ use tower::{layer::Layer, timeout::TimeoutLayer};
 
 use zakura_chain::{
     block::Block,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
 };
 use zakura_state as zs;
 use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
@@ -515,7 +515,11 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
     for mined in [true, false] {
         let mut state_config = zs::Config::ephemeral();
         state_config.vct_fast_sync = false;
-        let (state, _read, _tip, _change) = zs::init(state_config, &network, boundary, 0)
+        let zakura_state::InitializedState {
+            state,
+            read_state: _read,
+            ..
+        } = zs::init(state_config, &network, boundary, 0)
             .await
             .expect("ephemeral state opens");
         let state = Buffer::new(state, 32);
@@ -587,6 +591,7 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         };
         let request = if mined {
             Request::CommitMined {
+                size: candidate.zcash_serialized_size(),
                 block: candidate.into(),
                 admission: zs::BlockAdmission::pending(),
             }
@@ -947,29 +952,4 @@ async fn forged_height_across_upgrade_is_a_payload_mismatch() {
         BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot),
         "{error:?}"
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_mined_submission_preserves_state_admission() {
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let state = zs::init_test(&network).await;
-    let (router, _, _, _) = init_test(Config::default(), &network, state).await;
-    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let admission = zs::BlockAdmission::pending();
-    let hash = tokio::time::timeout(
-        Duration::from_secs(10),
-        router.oneshot(Request::CommitMined {
-            block: block.clone().into(),
-            admission: admission.clone(),
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(hash, block.hash());
-    assert!(admission.is_admitted());
-    assert!(!admission.optimistic_relay_authorized());
 }

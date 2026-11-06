@@ -619,6 +619,7 @@ async fn local_submission_tip_change_waits_for_its_mined_event() {
     let submission = local_submissions
         .reserve(block_two.hash())
         .expect("one submission fits");
+    submission.admission().admit_for_test();
     chain_tip_sender.set_finalized_tip(Some(
         CheckpointVerifiedBlock::from(block_two.clone()).into(),
     ));
@@ -664,6 +665,7 @@ async fn setup_local_tip_test() -> LocalTipTest {
         .zcash_deserialize_into()
         .unwrap();
     let submission = submissions.reserve(block.hash()).unwrap();
+    submission.admission().admit_for_test();
     chain_tip_sender.set_finalized_tip(Some(CheckpointVerifiedBlock::from(block.clone()).into()));
     LocalTipTest {
         block,
@@ -832,4 +834,91 @@ async fn closing_the_mining_channel_releases_a_deferred_tip() {
         .await
         .respond(Response::Nil);
     assert_eq!(closed.elapsed(), Duration::ZERO);
+}
+
+/// A peer can commit while a same-hash RPC is waiting on KnownBlock or doing semantic checks.
+/// Neither stage has state admission, and neither may delay the peer's committed tip.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn peer_commit_does_not_wait_for_unadmitted_local_verification() {
+    let submissions = MinedSubmissions::default();
+    let (mut tips, mut gossip) = setup_gossip_test_with_submissions(submissions.clone()).await;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let reservation = submissions.reserve(block.hash()).unwrap();
+    let changed = Instant::now();
+    tips.set_finalized_tip(Some(CheckpointVerifiedBlock::from(block.clone()).into()));
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseBlock(without_size(&block), None))
+        .await
+        .respond(Response::Nil);
+    assert_eq!(changed.elapsed(), Duration::ZERO);
+    assert!(submissions.contains(&block.hash()));
+    assert!(submissions.reserve(block.hash()).is_err());
+    drop(reservation);
+    gossip.peer_set.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn returning_to_a_stuck_tip_keeps_its_original_deadline() {
+    for other_is_local in [false, true] {
+        let LocalTipTest {
+            block,
+            submissions,
+            submission,
+            mut chain_tip_sender,
+            mut gossip,
+        } = setup_local_tip_test().await;
+        let started = Instant::now();
+        assert!(timeout(
+            Duration::from_millis(10),
+            gossip.peer_set.try_next_request()
+        )
+        .await
+        .is_err());
+        tokio::time::advance(Duration::from_secs(80) - started.elapsed()).await;
+        let other: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let other_reservation = other_is_local.then(|| {
+            let reservation = submissions.reserve(other.hash()).unwrap();
+            reservation.admission().admit_for_test();
+            reservation
+        });
+        chain_tip_sender
+            .set_finalized_tip(Some(CheckpointVerifiedBlock::from(other.clone()).into()));
+        if other_is_local {
+            assert!(timeout(
+                Duration::from_millis(10),
+                gossip.peer_set.try_next_request()
+            )
+            .await
+            .is_err());
+        } else {
+            gossip
+                .peer_set
+                .expect_request(Request::AdvertiseBlock(without_size(&other), None))
+                .await
+                .respond(Response::Nil);
+        }
+        tokio::time::advance(Duration::from_secs(85) - started.elapsed()).await;
+        chain_tip_sender
+            .set_finalized_tip(Some(CheckpointVerifiedBlock::from(block.clone()).into()));
+        assert!(timeout(
+            Duration::from_millis(10),
+            gossip.peer_set.try_next_request()
+        )
+        .await
+        .is_err());
+        tokio::time::advance(BLOCK_GOSSIP_TIMEOUT - started.elapsed()).await;
+        gossip
+            .peer_set
+            .expect_request(Request::AdvertiseBlock(without_size(&block), None))
+            .await
+            .respond(Response::Nil);
+        assert_eq!(started.elapsed(), BLOCK_GOSSIP_TIMEOUT);
+        assert!(submissions.reserve(block.hash()).is_err());
+        drop((submission, other_reservation));
+    }
 }

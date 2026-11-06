@@ -176,7 +176,8 @@ pub(crate) struct StateService {
     /// These blocks are awaiting their parent blocks before they can do contextual verification.
     ///
     /// Indexed by their parent block hash.
-    finalized_state_queued_blocks: HashMap<block::Hash, QueuedCheckpointVerified>,
+    finalized_state_queued_blocks:
+        HashMap<block::Hash, (QueuedCheckpointVerified, Option<BlockAdmission>)>,
 
     /// Channels to send blocks to the block write task.
     block_write_sender: write::BlockWriteSender,
@@ -690,6 +691,7 @@ impl StateService {
     fn queue_and_commit_to_finalized_state(
         &mut self,
         checkpoint_verified: CheckpointVerifiedBlock,
+        admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitCheckpointVerifiedError>> {
         // # Correctness & Performance
         //
@@ -712,7 +714,7 @@ impl StateService {
         } else {
             0
         };
-        let queued = (checkpoint_verified, rsp_tx, attempt);
+        let queued = ((checkpoint_verified, rsp_tx, attempt), admission);
 
         if self.block_write_sender.finalized.is_some() {
             // We're still committing checkpoint verified blocks
@@ -793,7 +795,7 @@ impl StateService {
             Err(TryRecvError::Empty) => {}
         }
 
-        while let Some(queued_block) = self
+        while let Some((queued_block, admission)) = self
             .finalized_state_queued_blocks
             .remove(&self.finalized_block_write_last_sent_hash)
         {
@@ -804,13 +806,17 @@ impl StateService {
             // If we've finished sending finalized blocks, ignore any repeated blocks.
             // (Blocks can be repeated after a syncer reset.)
             if let Some(finalized_block_write_sender) = &self.block_write_sender.finalized {
-                let send_result = finalized_block_write_sender.send(queued_block);
+                let send = || finalized_block_write_sender.send(queued_block);
+                let send_result = match &admission {
+                    Some(admission) => admission.admit_with(false, send),
+                    None => send(),
+                };
 
                 // If the receiver is closed, we can't send any more blocks.
                 if let Err(SendError(queued)) = send_result {
                     // If Zebra is shutting down, drop blocks and return an error.
                     Self::send_checkpoint_verified_block_error(
-                        queued,
+                        (queued, admission),
                         CommitBlockError::WriteTaskExited,
                     );
 
@@ -927,10 +933,13 @@ impl StateService {
 
     /// Send an error on a `QueuedCheckpointVerified` block's result channel, and drop the block
     fn send_checkpoint_verified_block_error(
-        queued: QueuedCheckpointVerified,
+        queued: (QueuedCheckpointVerified, Option<BlockAdmission>),
         error: impl Into<CommitCheckpointVerifiedError>,
     ) {
-        let (finalized, rsp_tx, _) = queued;
+        let ((finalized, rsp_tx, _), admission) = queued;
+        if let Some(admission) = admission {
+            admission.reject();
+        }
 
         // The block sender might have already given up on this block,
         // so ignore any channel send errors.
@@ -1273,6 +1282,58 @@ impl StateService {
         queued_height >= self.full_verifier_utxo_lookahead
     }
 
+    /// Queues a checkpoint-verified block, retaining local submission admission when provided.
+    fn commit_checkpoint_verified(
+        &mut self,
+        finalized: CheckpointVerifiedBlock,
+        checkpoint_admission: Option<BlockAdmission>,
+        span: Span,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>> {
+        let timer = CodeTimer::start();
+        // # Consensus
+        //
+        // A semantic block verification could have called AwaitUtxo
+        // before this checkpoint verified block arrived in the state.
+        // So we need to check for pending UTXO requests sent by running
+        // semantic block verifications.
+        //
+        // This check is redundant for most checkpoint verified blocks,
+        // because semantic verification can only succeed near the final
+        // checkpoint, when all the UTXOs are available for the verifying block.
+        //
+        // (Checkpoint block UTXOs are verified using block hash checkpoints
+        // and transaction merkle tree block header commitments.)
+        self.pending_utxos
+            .check_against_ordered(&finalized.new_outputs);
+
+        // # Performance
+        //
+        // This method doesn't block, access the database, or perform CPU-intensive tasks,
+        // so we can run it directly in the tokio executor's Future threads.
+        let rsp_rx = self.queue_and_commit_to_finalized_state(finalized, checkpoint_admission);
+
+        // TODO:
+        //   - check for panics in the block write task here,
+        //     as well as in poll_ready()
+
+        // The work is all done, the future just waits on a channel for the result
+        timer.finish_desc("CommitCheckpointVerifiedBlock");
+
+        // Await the channel response, flatten the result, map receive errors to
+        // `CommitCheckpointVerifiedError::WriteTaskExited`.
+        // Then flatten the nested Result and convert any errors to a BoxError.
+        async move {
+            rsp_rx
+                .await
+                .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
+                .and_then(|result| result)
+                .map_err(BoxError::from)
+                .map(Response::Committed)
+        }
+        .instrument(span)
+        .boxed()
+    }
+
     /// Sends `ready`, a child of `new_parent` that was never queued, and then all queued blocks
     /// whose parents have recently arrived starting from `new_parent`, to the block write task
     /// which will attempt to validate and commit them.
@@ -1309,12 +1370,19 @@ impl StateService {
                     let candidate_parent = queued_child.0.block.header().previous_block_hash;
                     let optimistic_relay_still_authorized = self
                         .optimistic_relay_still_authorized(admission.as_ref(), candidate_parent);
-                    let send_result =
+                    let send = || {
                         non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
                             queued: queued_child,
                             queued_at: Instant::now(),
                             write_slot,
-                        });
+                        })
+                    };
+                    let send_result = match &admission {
+                        Some(admission) => {
+                            admission.admit_with(optimistic_relay_still_authorized, send)
+                        }
+                        None => send(),
+                    };
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
                         send_result
@@ -1329,10 +1397,6 @@ impl StateService {
 
                         return;
                     };
-
-                    if let Some(admission) = admission {
-                        admission.admit(optimistic_relay_still_authorized);
-                    }
 
                     new_parents.push(hash);
                 }
@@ -1962,49 +2026,10 @@ impl Service<Request> for StateService {
             //
             // The expected error type for this request is `CommitCheckpointVerifiedError`.
             Request::CommitCheckpointVerifiedBlock(finalized) => {
-                let timer = CodeTimer::start();
-                // # Consensus
-                //
-                // A semantic block verification could have called AwaitUtxo
-                // before this checkpoint verified block arrived in the state.
-                // So we need to check for pending UTXO requests sent by running
-                // semantic block verifications.
-                //
-                // This check is redundant for most checkpoint verified blocks,
-                // because semantic verification can only succeed near the final
-                // checkpoint, when all the UTXOs are available for the verifying block.
-                //
-                // (Checkpoint block UTXOs are verified using block hash checkpoints
-                // and transaction merkle tree block header commitments.)
-                self.pending_utxos
-                    .check_against_ordered(&finalized.new_outputs);
-
-                // # Performance
-                //
-                // This method doesn't block, access the database, or perform CPU-intensive tasks,
-                // so we can run it directly in the tokio executor's Future threads.
-                let rsp_rx = self.queue_and_commit_to_finalized_state(finalized);
-
-                // TODO:
-                //   - check for panics in the block write task here,
-                //     as well as in poll_ready()
-
-                // The work is all done, the future just waits on a channel for the result
-                timer.finish_desc("CommitCheckpointVerifiedBlock");
-
-                // Await the channel response, flatten the result, map receive errors to
-                // `CommitCheckpointVerifiedError::WriteTaskExited`.
-                // Then flatten the nested Result and convert any errors to a BoxError.
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
+                self.commit_checkpoint_verified(finalized, None, span)
+            }
+            Request::CommitCheckpointVerifiedBlockWithAdmission { block, admission } => {
+                self.commit_checkpoint_verified(block, Some(admission), span)
             }
 
             // Uses pending_utxos and non_finalized_state_queued_blocks in the StateService.

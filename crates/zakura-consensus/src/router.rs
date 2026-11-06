@@ -437,7 +437,14 @@ where
             }
 
             Some(height) if height <= self.max_checkpoint_height => {
-                self.checkpoint.call(block).map_err(Into::into).boxed()
+                let admission = match request {
+                    Request::CommitMined { admission, .. } => Some(admission),
+                    _ => None,
+                };
+                self.checkpoint
+                    .call_with_admission(block, admission)
+                    .map_err(Into::into)
+                    .boxed()
             }
             // This also covers blocks with no height, which the block verifier
             // will reject immediately.

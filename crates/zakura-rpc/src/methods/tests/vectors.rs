@@ -4316,7 +4316,8 @@ async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
         rx,
         Some(mined_tx),
     );
-    let rpc = Arc::new(rpc);
+    let submissions = MinedSubmissions::default();
+    let rpc = Arc::new(rpc.with_mined_submissions(submissions.clone()));
     let bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
     let request = tokio::spawn({
         let rpc = rpc.clone();
@@ -4328,6 +4329,20 @@ async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
             matches!(request, zakura_consensus::Request::CommitMined { .. })
         })
         .await;
+    let admission = match response.request() {
+        zakura_consensus::Request::CommitMined { admission, .. } => admission.clone(),
+        _ => unreachable!("the matcher accepts only mined submissions"),
+    };
+    let hash = Mainnet.genesis_hash();
+    assert!(submissions.contains(&hash));
+    assert_eq!(
+        submissions.gossip_deadline(hash, std::time::Duration::from_secs(90)),
+        None
+    );
+    admission.admit_for_test();
+    assert!(submissions
+        .gossip_deadline(hash, std::time::Duration::from_secs(90))
+        .is_some());
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     assert_eq!(
@@ -6271,4 +6286,55 @@ async fn rpc_preciousblock_malformed_hash_is_an_invalid_parameter() {
     state.expect_no_requests().await;
     read_state.expect_no_requests().await;
     mempool.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_rpc_constructor_shares_submission_capacity_with_every_clone() {
+    let _init_guard = zakura_test::init();
+    let (state, read_state, latest_chain_tip, _) = zakura_state::init_test_services(&Mainnet).await;
+    let (block_verifier_router, _, _, _) =
+        zakura_consensus::router::init_test(Default::default(), &Mainnet, state.clone()).await;
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let services = crate::node::NodeRpcServices {
+        mempool: Buffer::new(tower::util::BoxService::new(mempool), 1),
+        state,
+        read_state,
+        latest_chain_tip,
+        block_verifier_router,
+        sync_status: crate::node::NodeSyncStatus::new(MockSyncStatus::default()),
+        address_book: Arc::new(std::sync::Mutex::new(zakura_network::AddressBook::new(
+            "127.0.0.1:8233".parse().unwrap(),
+            &Mainnet,
+            1,
+            tracing::Span::none(),
+        ))),
+    };
+    let submissions = MinedSubmissions::default();
+    let (_logs, log_rx) = tokio::sync::watch::channel(None);
+    let (rpc, queue) = crate::node::new_rpc_impl(
+        Mainnet,
+        Default::default(),
+        false,
+        "test".into(),
+        "test".into(),
+        services,
+        log_rx,
+        None,
+        PendingBlockRegistry::default(),
+        submissions.clone(),
+        None,
+    );
+    let clone = rpc.clone();
+    let hash = Mainnet.genesis_hash();
+    let guard = clone.gbt.reserve_mined_submission(hash).unwrap();
+    assert!(submissions.contains(&hash));
+    assert!(rpc.gbt.reserve_mined_submission(hash).is_err());
+    guard.admission().admit_for_test();
+    assert!(submissions
+        .gossip_deadline(hash, std::time::Duration::from_secs(90))
+        .is_some());
+    drop(guard);
+    assert!(!submissions.contains(&hash));
+    assert!(rpc.gbt.reserve_mined_submission(hash).is_ok());
+    queue.abort();
 }

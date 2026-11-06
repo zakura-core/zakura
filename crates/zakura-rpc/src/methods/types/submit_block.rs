@@ -1,7 +1,7 @@
 //! Parameter and response types for the `submitblock` RPC.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -57,17 +57,24 @@ pub struct SubmitSolutionParameters {
 const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_MINED_SUBMISSIONS: usize = 16;
 
-/// Blocks this node is submitting, from `submitblock` until their final mined-block event is
-/// sent. Bounds detached submissions before they reach verification or the writer.
+/// Blocks this node is submitting until verification finishes and any final event is sent.
+/// Bounds detached submissions before they reach verification or the writer.
 ///
-/// Block gossip shares it to tell a tip change caused by a local submission, whose
-/// [`MinedBlockEvent`] follows the tip change, from a relayed block.
+/// Gossip waits only for admitted submissions whose [`MinedBlockEvent`] follows the tip change.
+/// A reservation alone does not establish that the local copy caused a committed tip.
 #[derive(Clone, Debug)]
-pub struct MinedSubmissions(watch::Sender<HashSet<block::Hash>>);
+pub struct MinedSubmissions(watch::Sender<HashMap<block::Hash, SubmissionState>>);
+
+/// Capacity and relay coordination live as long as the owning reservation.
+#[derive(Debug)]
+struct SubmissionState {
+    admission: zakura_state::BlockAdmission,
+    gossip_deadline: Option<tokio::time::Instant>,
+}
 
 impl Default for MinedSubmissions {
     fn default() -> Self {
-        Self(watch::channel(HashSet::new()).0)
+        Self(watch::channel(HashMap::new()).0)
     }
 }
 
@@ -79,9 +86,37 @@ pub struct MinedSubmission {
 }
 
 impl MinedSubmissions {
-    /// Returns whether this node is submitting `hash` and has not yet sent its final event.
+    /// Returns whether `hash` still holds submission capacity, including duplicate verification.
     pub fn contains(&self, hash: &block::Hash) -> bool {
-        self.0.borrow().contains(hash)
+        self.0.borrow().contains_key(hash)
+    }
+
+    /// Returns the fixed relay deadline if state admitted this local submission.
+    ///
+    /// Pending or rejected submissions hold capacity but cannot delay a peer's committed tip.
+    /// The first call for an admitted submission starts the bound; tip switches cannot reset it.
+    pub fn gossip_deadline(
+        &self,
+        hash: block::Hash,
+        max_wait: std::time::Duration,
+    ) -> Option<tokio::time::Instant> {
+        let mut deadline = None;
+        self.0.send_if_modified(|entries| {
+            let Some(entry) = entries.get_mut(&hash) else {
+                return false;
+            };
+            if !entry.admission.is_admitted() {
+                return false;
+            }
+            deadline = Some(
+                *entry
+                    .gossip_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + max_wait),
+            );
+            // Recording a deadline does not change capacity or wake release waiters.
+            false
+        });
+        deadline
     }
 
     /// Waits until `hash` is no longer being submitted, returning immediately if it is absent.
@@ -93,7 +128,7 @@ impl MinedSubmissions {
         let mut changes = self.0.subscribe();
         drop(
             changes
-                .wait_for(|entries| !entries.contains(&hash))
+                .wait_for(|entries| !entries.contains_key(&hash))
                 .await
                 .expect("this borrowed submission set keeps its watch sender alive"),
         );
@@ -105,7 +140,7 @@ impl MinedSubmissions {
     pub fn reserve(&self, hash: block::Hash) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
         let mut result = Ok(());
         self.0.send_if_modified(|entries| {
-            if entries.contains(&hash) {
+            if entries.contains_key(&hash) {
                 result = Err(SubmitBlockErrorResponse::DuplicateInconclusive);
                 return false;
             }
@@ -113,7 +148,14 @@ impl MinedSubmissions {
                 result = Err(SubmitBlockErrorResponse::Inconclusive);
                 return false;
             }
-            entries.insert(hash)
+            entries.insert(
+                hash,
+                SubmissionState {
+                    admission: zakura_state::BlockAdmission::pending(),
+                    gossip_deadline: None,
+                },
+            );
+            true
         });
         result?;
         Ok(MinedSubmission {
@@ -123,11 +165,18 @@ impl MinedSubmissions {
     }
 }
 
+impl MinedSubmission {
+    /// Returns this reservation's admission signal to pass to the block verifier.
+    pub fn admission(&self) -> zakura_state::BlockAdmission {
+        self.submissions.0.borrow()[&self.hash].admission.clone()
+    }
+}
+
 impl Drop for MinedSubmission {
     fn drop(&mut self) {
         self.submissions
             .0
-            .send_if_modified(|entries| entries.remove(&self.hash));
+            .send_if_modified(|entries| entries.remove(&self.hash).is_some());
     }
 }
 
@@ -587,6 +636,26 @@ mod tests {
             .await
             .unwrap();
         assert!(!submissions.contains(&hash));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_admitted_submissions_get_a_fixed_gossip_deadline() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([8; 32]);
+        let wait = std::time::Duration::from_secs(90);
+        assert_eq!(submissions.gossip_deadline(hash, wait), None);
+        let reservation = submissions.reserve(hash).unwrap();
+        assert_eq!(submissions.gossip_deadline(hash, wait), None);
+        reservation.admission().admit_for_test();
+        let first = submissions.gossip_deadline(hash, wait).unwrap();
+        tokio::time::advance(wait).await;
+        assert_eq!(submissions.gossip_deadline(hash, wait), Some(first));
+        assert!(submissions.reserve(hash).is_err());
+        drop(reservation);
+        assert_eq!(submissions.gossip_deadline(hash, wait), None);
+        let replacement = submissions.reserve(hash).unwrap();
+        replacement.admission().admit_for_test();
+        assert_eq!(submissions.gossip_deadline(hash, wait), Some(first + wait));
     }
 
     #[test]

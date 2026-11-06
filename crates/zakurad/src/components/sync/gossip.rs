@@ -131,7 +131,8 @@ pub enum BlockGossipError {
 /// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
 ///
 /// `local_submissions` are the blocks `submitblock` is submitting, shared with the RPC. A local
-/// tip waits for its mined-block event or reservation release, bounded by [`BLOCK_GOSSIP_TIMEOUT`].
+/// tip waits only after state admits its local copy, until its mined-block event or reservation
+/// release, bounded by [`BLOCK_GOSSIP_TIMEOUT`].
 ///
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN, RS>(
@@ -156,9 +157,6 @@ where
     let (mined_block_completion_sender, mut mined_block_completion_receiver) =
         mpsc::unbounded_channel();
     let mut mined_block_broadcasts = MinedBlockBroadcasts::default();
-    // Keep the deadline outside the cancellable tip future. Other mining events must not extend
-    // how long a stuck submission can suppress this committed tip.
-    let mut submission_deadline = None;
 
     loop {
         // Drain local completion notifications from spawned mined-block
@@ -185,7 +183,6 @@ where
             sync_status.clone(),
             chain_state.clone_for_task(),
             &local_submissions,
-            &mut submission_deadline,
             has_mined_receiver,
         )
         .in_current_span();
@@ -332,12 +329,11 @@ where
 /// A local submission queues its final mining event before releasing its reservation. Wait for
 /// that release instead of sleeping, while following newer tips. The caller still selects mining
 /// events and completions first, and rechecks queued events before accepting this fallback.
-/// `submission_deadline` survives cancellation so unrelated events cannot keep resetting the bound.
+/// Each reservation retains its deadline across cancellation and tip changes.
 async fn wait_for_committed_tip(
     mut sync_status: SyncStatus,
     mut chain_tip: ChainTipChange,
     local_submissions: &MinedSubmissions,
-    submission_deadline: &mut Option<(block::Hash, Instant)>,
     has_mined_receiver: bool,
 ) -> Result<((block::Hash, block::Height), ChainTipChange), BlockGossipError> {
     let mut tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
@@ -350,18 +346,11 @@ async fn wait_for_committed_tip(
         let best_tip = tip_action.best_tip_hash_and_height();
         let hash = best_tip.0;
 
-        if !has_mined_receiver || !local_submissions.contains(&hash) {
-            *submission_deadline = None;
+        if !has_mined_receiver {
             return Ok((best_tip, chain_tip));
         }
-
-        let deadline = match *submission_deadline {
-            Some((pending, deadline)) if pending == hash => deadline,
-            _ => {
-                let deadline = Instant::now() + BLOCK_GOSSIP_TIMEOUT;
-                *submission_deadline = Some((hash, deadline));
-                deadline
-            }
+        let Some(deadline) = local_submissions.gossip_deadline(hash, BLOCK_GOSSIP_TIMEOUT) else {
+            return Ok((best_tip, chain_tip));
         };
         if Instant::now() >= deadline {
             warn!(

@@ -751,9 +751,9 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
             pending_blocks,
+            mined_submissions.clone(),
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
-        let rpc_impl = rpc_impl.with_mined_submissions(mined_submissions.clone());
         node_tasks.track(&rpc_tx_queue_handle);
 
         let node_services = ready.as_ref().map(|_| crate::node::NodeServices {

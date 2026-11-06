@@ -1247,8 +1247,23 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[instrument(name = "checkpoint", skip(self, block))]
     fn call(&mut self, block: BlockHandle) -> Self::Future {
+        self.call_with_admission(block, None)
+    }
+}
+
+impl<S> CheckpointVerifier<S>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    /// Verifies a checkpoint submission, retaining its admission signal through the state handoff.
+    #[instrument(name = "checkpoint", skip(self, block, admission))]
+    pub(crate) fn call_with_admission(
+        &mut self,
+        block: BlockHandle,
+        admission: Option<zs::BlockAdmission>,
+    ) -> <Self as Service<BlockHandle>>::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();
@@ -1371,8 +1386,12 @@ where
 
                 // We use a `ServiceExt::oneshot`, so that every state service
                 // `poll_ready` has a corresponding `call`. See #1593.
+                let commit = match admission {
+                    Some(admission) => zs::Request::CommitCheckpointVerifiedBlockWithAdmission { block: req_block.block, admission },
+                    None => zs::Request::CommitCheckpointVerifiedBlock(req_block.block),
+                };
                 match state_service
-                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
+                    .oneshot(commit)
                     .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                     .await?
                 {

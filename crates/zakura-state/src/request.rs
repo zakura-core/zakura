@@ -56,7 +56,7 @@ enum Admission {
         /// Whether consensus authorized optimistic relay for this candidate.
         relay: bool,
     },
-    /// State admitted the block to the active non-finalized write queue.
+    /// State admitted the block to the active write queue.
     Admitted {
         /// Whether optimistic relay was still authorized at admission.
         relay: bool,
@@ -94,17 +94,48 @@ impl BlockAdmission {
         )
     }
 
-    /// Marks the block as admitted to the active non-finalized write queue.
-    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
-        self.0.send_if_modified(|admission| match *admission {
-            Admission::Pending { relay } => {
-                *admission = Admission::Admitted {
-                    relay: relay && optimistic_relay_still_authorized,
+    /// Returns whether state accepted this submission into its active writer channel.
+    ///
+    /// A successful handoff publishes admission before a reader can observe the resulting tip.
+    pub fn is_admitted(&self) -> bool {
+        matches!(*self.0.borrow(), Admission::Admitted { .. })
+    }
+
+    /// Publishes admission atomically with a nonblocking writer handoff.
+    ///
+    /// `send` must not await, inspect this admission, or invoke callbacks. Readers cannot see a
+    /// pending admission after the writer receives the block; a failed send publishes rejection.
+    pub(crate) fn admit_with<T, E>(
+        &self,
+        optimistic_relay_still_authorized: bool,
+        send: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut result = None;
+        self.0.send_if_modified(|admission| {
+            let sent = send();
+            let changed = if let Admission::Pending { relay } = *admission {
+                *admission = if sent.is_ok() {
+                    Admission::Admitted {
+                        relay: relay && optimistic_relay_still_authorized,
+                    }
+                } else {
+                    Admission::Rejected
                 };
                 true
-            }
-            _ => false,
+            } else {
+                false
+            };
+            result = Some(sent);
+            changed
         });
+        result.expect("the watch modification always executes the handoff")
+    }
+
+    /// Marks the block as admitted to the active write queue.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        let _: Result<(), std::convert::Infallible> =
+            self.admit_with(optimistic_relay_still_authorized, || Ok(()));
     }
 
     /// Marks the block as rejected before admission.
@@ -122,7 +153,7 @@ impl BlockAdmission {
     ///
     /// # Correctness
     ///
-    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
+    /// This future never resolves when neither a writer handoff nor rejection occurs. The state rejects
     /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
     /// receives the block leaves the admission pending. Callers must await this future under a
     /// cancellation path, such as a `select!` arm that also awaits verification.
@@ -1016,6 +1047,43 @@ mod tests {
         assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
     }
 
+    #[test]
+    fn admission_is_visible_when_a_writer_observes_its_handoff() {
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        let reader = admission.clone();
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let (received_tx, received_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_rx.recv().unwrap();
+            received_tx.send(()).unwrap();
+            // The writer already received the block, but the enqueue closure has not returned.
+            assert!(reader.is_admitted());
+            assert!(reader.optimistic_relay_authorized());
+        });
+        admission
+            .admit_with(true, || {
+                writer_tx.send(())?;
+                received_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok::<_, std::sync::mpsc::SendError<()>>(())
+            })
+            .unwrap();
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_writer_handoff_rejects_admission_without_optimistic_inventory() {
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        let result = admission.admit_with(true, || Err::<(), _>("writer closed"));
+        assert_eq!(result, Err("writer closed"));
+        assert!(!admission.is_admitted());
+        assert!(!admission.optimistic_relay_authorized());
+        assert!(!admission.wait().await);
+    }
+
     #[tokio::test]
     async fn block_admission_keeps_its_first_terminal_state() {
         let rejected = BlockAdmission::pending();
@@ -1432,6 +1500,15 @@ pub enum Request {
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
+    /// Commits a locally submitted checkpoint block with writer-admission tracking.
+    /// Uses the same verification and response contract as `CommitCheckpointVerifiedBlock`.
+    CommitCheckpointVerifiedBlockWithAdmission {
+        /// The checkpoint-verified block to commit.
+        block: CheckpointVerifiedBlock,
+        /// The local submission's writer-admission notification.
+        admission: BlockAdmission,
+    },
+
     /// Returns [`Response::Tip(Option<(Height, block::Hash)>)`](Response::Tip)
     /// with the current best chain tip.
     Tip,
@@ -1684,7 +1761,10 @@ impl Request {
             Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
                 "commit_semantically_verified_block_with_admission"
             }
-            Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
+            Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CommitCheckpointVerifiedBlockWithAdmission { .. } => {
+                "commit_checkpoint_verified_block"
+            }
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Tip => "tip",
             Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
@@ -2402,6 +2482,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CommitCheckpointVerifiedBlockWithAdmission { .. }
             | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_)

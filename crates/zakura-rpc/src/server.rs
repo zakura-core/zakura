@@ -46,7 +46,7 @@ use zakura_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
     config,
-    methods::{rpc_method_access, RpcAccess, RpcImpl, RpcSurface, RPC_METHOD_ACCESS},
+    methods::{RpcImpl, RpcSurface, RPC_METHOD_ACCESS},
     server::{
         http::{HttpBody, JsonRpcHttpService},
         http_request_compatibility::HttpRequestMiddlewareLayer,
@@ -186,7 +186,11 @@ impl RpcServer {
     {
         conf.validate().map_err(std::io::Error::other)?;
 
-        let surface = primary_rpc_surface(rpc.network(), conf.enable_cookie_auth);
+        let surface = primary_rpc_surface(
+            rpc.network(),
+            conf.enable_cookie_auth,
+            conf.allow_unauthenticated_admin,
+        );
 
         Self::start_inner(rpc, conf, surface, OPENED_RPC_ENDPOINT_MSG).await
     }
@@ -670,17 +674,20 @@ fn enabled_rpc_methods(
 
     Ok(registered
         .into_iter()
-        .filter(|method_name| {
-            surface != RpcSurface::Restricted
-                || rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated)
-        })
+        .filter(|method_name| surface.exposes(method_name))
         .collect())
 }
 
 /// Selects the primary listener's method surface.
-fn primary_rpc_surface(network: &Network, enable_cookie_auth: bool) -> RpcSurface {
+fn primary_rpc_surface(
+    network: &Network,
+    enable_cookie_auth: bool,
+    allow_unauthenticated_admin: bool,
+) -> RpcSurface {
     if enable_cookie_auth || network.is_regtest() {
         RpcSurface::Full
+    } else if allow_unauthenticated_admin {
+        RpcSurface::WithAdmin
     } else {
         RpcSurface::Restricted
     }

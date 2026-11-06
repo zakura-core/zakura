@@ -167,7 +167,7 @@ pub(crate) enum RpcAccess {
     /// Available on restricted unauthenticated Mainnet and Testnet RPC listeners.
     Unauthenticated,
 
-    /// Available only on authenticated listeners, except on Regtest.
+    /// Available on authenticated listeners, on Regtest, or by explicit opt-in.
     Admin,
 
     /// A Regtest control method retained on the full RPC surface.
@@ -180,6 +180,9 @@ pub(crate) enum RpcSurface {
     /// The explicitly classified unauthenticated compatibility method set.
     Restricted,
 
+    /// Compatibility and administrative methods, excluding test controls.
+    WithAdmin,
+
     /// Every registered method.
     Full,
 }
@@ -189,6 +192,10 @@ impl RpcSurface {
     pub(crate) fn exposes(self, method_name: &str) -> bool {
         match self {
             Self::Restricted => rpc_method_access(method_name) == Some(RpcAccess::Unauthenticated),
+            Self::WithAdmin => matches!(
+                rpc_method_access(method_name),
+                Some(RpcAccess::Unauthenticated | RpcAccess::Admin)
+            ),
             Self::Full => true,
         }
     }

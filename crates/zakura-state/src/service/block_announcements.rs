@@ -218,6 +218,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_feed_drains_every_queued_local_commit() {
+        let (sender, mut receiver) = BlockAnnouncementSender::new();
+        sender.publish(None, Some(block(1, true)));
+        sender.publish(None, Some(block(2, true)));
+        drop(sender);
+        assert_eq!(receiver.recv(false).await, Some(block(1, true)));
+        assert_eq!(receiver.recv(false).await, Some(block(2, true)));
+        assert_eq!(receiver.recv(false).await, None);
+    }
+
+    #[tokio::test]
     async fn dropping_receiver_discards_backlog_without_retaining_blocks() {
         let (sender, receiver) = BlockAnnouncementSender::new();
         drop(receiver);

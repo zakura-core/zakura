@@ -333,8 +333,9 @@ async fn real_writer_announces_while_commit_caller_is_suspended() {
             size: local.zcash_serialized_size(),
         });
     let (committed, received) = tokio::sync::oneshot::channel();
+    let caller_state = state.clone();
     let caller = tokio::spawn(async move {
-        state
+        caller_state
             .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
                 checkpoint,
             ))

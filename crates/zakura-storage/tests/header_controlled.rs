@@ -869,6 +869,38 @@ fn a_reset_clamps_its_depth_and_skips_what_it_cant_do() {
     assert!(port.take_facts().is_empty());
 }
 
+/// Retention can evict an invalidated branch, and its operator reason goes
+/// with it. A reconsider then has nothing in force to remove, so it does
+/// nothing rather than name the evicted header.
+#[test]
+fn a_reconsider_skips_an_evicted_invalidation() {
+    let (port, chain) = chain(2);
+    port.reset(ResetRequest::Invalidate { depth: 0 })
+        .expect("the invalidation commits")
+        .expect("the tip is above the anchor");
+    port.take_facts();
+    let fixture = HeaderFixture::regtest();
+    let anchor = fixture.anchor();
+    // More longer forks than the engine keeps candidate tips, so the
+    // invalidated branch is evicted.
+    for branch in 1..=12 {
+        let fork = fixture.extend(anchor, 3, branch);
+        let request = fixture.target_request(&port.engine().snapshot(), anchor, &fork, 10);
+        let prepared =
+            ready(port.engine().prepare_header_target(request)).expect("a fork prepares");
+        ready(port.engine().apply_header_target(prepared)).expect("a fork applies");
+    }
+    assert!(
+        matches!(
+            ready(port.engine().selected_chain_contains(chain[1].hash)),
+            Ok(SelectedChainMembership::NotRetained)
+        ),
+        "the invalidated tip is evicted"
+    );
+    assert_eq!(port.reset(ResetRequest::Reconsider), Ok(None));
+    assert!(port.take_facts().is_empty());
+}
+
 /// A reset between a commit and its delivery shows in the delivery: its
 /// `Completed` carries the generation after the reset, while `Committed`
 /// keeps the commit's.

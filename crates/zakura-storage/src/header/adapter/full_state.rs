@@ -19,9 +19,9 @@ use zakura_rt::sync::watch;
 use super::EnginePort;
 use crate::{
     full_state::{
-        self as state, combined_retention_references, hint_hashes, hint_updates, operator_request,
-        verified_request, BodyMetadata, PreparedAuthority, SchedulerAuthority, StateError,
-        StateIssuedAuthority, VerifiedChain,
+        self as state, combined_retention_references, hint_hashes, hint_updates,
+        invalidation_evidence, operator_request, verified_request, BodyMetadata, PreparedAuthority,
+        SchedulerAuthority, StateError, StateIssuedAuthority, VerifiedChain,
     },
     header::fixture::ScenarioClock,
 };
@@ -223,6 +223,12 @@ impl EnginePort {
             Some(verified),
             || {},
         )
+    }
+
+    /// Whether an operator invalidation of `target` is in force. See
+    /// [`invalidation_evidence`].
+    pub(crate) fn invalidation_in_force(&self, target: block::Hash) -> bool {
+        invalidation_evidence(&self.engine(), target).is_some()
     }
 
     /// The selected header `depth` below the selected tip, or the lowest

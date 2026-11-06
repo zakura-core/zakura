@@ -498,23 +498,10 @@ pub(crate) fn operator_request(
             evidence,
         })
     } else {
-        let invalidation_evidence = engine.graph().header_node(target).and_then(|node| {
-            node.eligibility
-                .direct_reasons
-                .iter()
-                .find_map(|reason| match reason {
-                    EligibilityReason::OperatorInvalid {
-                        id: existing,
-                        evidence,
-                        ..
-                    } if *existing == id => Some(*evidence),
-                    _ => None,
-                })
-        });
         TransitionEvent::OperatorReconsider(OperatorReconsider {
             target,
             id,
-            invalidation_evidence,
+            invalidation_evidence: invalidation_evidence(engine, target),
             evidence,
         })
     };
@@ -522,6 +509,30 @@ pub(crate) fn operator_request(
         expected_version: snapshot.state_version,
         event,
     }
+}
+
+/// The evidence of the operator invalidation in force on `target`, or
+/// `None` if there's none, as zakura-state's
+/// `operator_invalidation_evidence` reads it. Retention that evicts the
+/// header ends its reasons with it.
+pub(crate) fn invalidation_evidence(
+    engine: &HeaderChainEngine,
+    target: block::Hash,
+) -> Option<EvidenceId> {
+    let (id, _) = operator_identity(target);
+    engine.graph().header_node(target).and_then(|node| {
+        node.eligibility
+            .direct_reasons
+            .iter()
+            .find_map(|reason| match reason {
+                EligibilityReason::OperatorInvalid {
+                    id: existing,
+                    evidence,
+                    ..
+                } if *existing == id => Some(*evidence),
+                _ => None,
+            })
+    })
 }
 
 /// zakura-state's `operator_identity`: the invalidation ID and reason

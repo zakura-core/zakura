@@ -397,8 +397,8 @@ struct Ops {
     facts: Vec<Fact>,
     /// Set by shutdown, after which nothing is submitted.
     shut_down: bool,
-    /// The targets of this port's invalidations still in force, oldest
-    /// first.
+    /// The targets of this port's invalidations, oldest first. Some may
+    /// have ended with an eviction, which `reset` checks.
     invalidations: Vec<block::Hash>,
     /// Set once the port is bound to a run.
     bound: bool,
@@ -1112,10 +1112,23 @@ impl ControlledPort {
                     };
                     (ResetKind::Invalidate, target.hash)
                 }
-                ResetRequest::Reconsider => match ops.invalidations.last() {
-                    Some(target) => (ResetKind::Reconsider, *target),
-                    None => return Ok(None),
-                },
+                ResetRequest::Reconsider => {
+                    let remembered = ops.invalidations.clone();
+                    drop(ops);
+                    // Retention may have evicted an invalidated header, which
+                    // ends its invalidation, so only those still in force
+                    // count.
+                    let newest = remembered
+                        .iter()
+                        .rposition(|target| self.engine.invalidation_in_force(*target));
+                    self.ops()
+                        .invalidations
+                        .truncate(newest.map_or(0, |index| index + 1));
+                    match newest {
+                        Some(index) => (ResetKind::Reconsider, remembered[index]),
+                        None => return Ok(None),
+                    }
+                }
             }
         };
         let applied = self

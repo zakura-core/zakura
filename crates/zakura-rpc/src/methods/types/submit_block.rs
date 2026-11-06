@@ -183,7 +183,10 @@ impl Default for PendingBlockRegistry {
 }
 
 /// Reports whether an early-advertised block remains valid.
-#[derive(Debug)]
+///
+/// Cloneable, so each protocol that advertises the block early can cancel its own advertisement
+/// when the block fails contextual verification.
+#[derive(Clone, Debug)]
 pub struct PendingBlockSignal(watch::Receiver<PendingStatus>);
 
 impl PendingBlockSignal {
@@ -201,6 +204,14 @@ impl PendingBlockSignal {
         Self(watch::channel(PendingStatus::Waiting).1)
     }
 
+    /// Returns a signal for a block that is still being verified, with the handle that rejects
+    /// it, so tests in other crates can exercise early-advertisement cancellation.
+    #[cfg(feature = "proptest-impl")]
+    pub fn waiting_for_tests() -> (Self, PendingBlockFailure) {
+        let (sender, receiver) = watch::channel(PendingStatus::Waiting);
+        (Self(receiver), PendingBlockFailure(sender))
+    }
+
     /// Resolves when contextual verification rejects the block.
     pub async fn wait_for_failure(&mut self) {
         loop {
@@ -215,6 +226,19 @@ impl PendingBlockSignal {
                 std::future::pending::<()>().await;
             }
         }
+    }
+}
+
+/// Rejects the block of a [`PendingBlockSignal::waiting_for_tests`] signal.
+#[cfg(feature = "proptest-impl")]
+#[derive(Debug)]
+pub struct PendingBlockFailure(watch::Sender<PendingStatus>);
+
+#[cfg(feature = "proptest-impl")]
+impl PendingBlockFailure {
+    /// Reports that contextual verification rejected the block.
+    pub fn fail(&self) {
+        self.0.send_replace(PendingStatus::Failed);
     }
 }
 

@@ -1,15 +1,25 @@
 //! What scripted peers record, placed by the identity map, and what the
 //! node's evidence means for P3b's close checks (M5-D).
 //!
-//! A peer's task records each frame it sends and reads with its own address
-//! and the QUIC stream, which both ends share. [`WireEvidence`] holds each
-//! record until the transport tap has logged the connection's `registered`
-//! event and the stream's `Session` row, then logs it as a `PeerFrame`,
+//! A peer's task records each frame it sends and reads with its own
+//! [`Remote`], its address and the connection's incarnation there, and the
+//! QUIC stream, which both ends share. [`WireEvidence`] holds each record
+//! until the transport tap has logged the connection's `registered` event
+//! and the stream's `Session` row, then logs it as a `PeerFrame`,
 //! `PeerWritten` or `PeerReceived` with that connection (M5-Q4). Records of
 //! one stream keep their order. A record whose stream can no longer be
 //! admitted, because the node refused it or its handshake, or tore its
 //! connection down, fails the run, so a peer's frames can't drop out of the
 //! log unseen.
+//!
+//! A dialing peer binds a fresh address per dial, so each of its addresses
+//! has one incarnation. A node that redials a listening peer reaches it at
+//! the same address each time (disc-2.2). The peer holds one connection at
+//! a time and refuses the node's other attempts before their handshake, so
+//! the `n`-th connection whose handshake the node reports from that
+//! address is the peer's `n`-th connection. A connection's `Negotiated`
+//! starts it, so one the node cancels during registration, which reports
+//! only `CloseDecided`, still counts.
 //!
 //! Each `PeerReceived` on a header stream is followed by the frame's
 //! `NodeFrame`, which the [`SenderAdapter`] labels under the sender's rules
@@ -71,12 +81,30 @@ struct Waiting {
 /// oldest first.
 pub(crate) type PeerRecords = Rc<RefCell<VecDeque<PeerRecord>>>;
 
+/// The peer's end of one connection, as the node sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Remote {
+    /// The peer's address, which the node sees as the remote.
+    pub(crate) addr: SocketAddr,
+    /// How many connections the peer had at `addr` before this one.
+    pub(crate) incarnation: u64,
+}
+
+impl Remote {
+    /// The first connection at `addr`.
+    pub(crate) fn first(addr: SocketAddr) -> Self {
+        Remote {
+            addr,
+            incarnation: 0,
+        }
+    }
+}
+
 /// One thing a peer did on a header or discovery stream.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerRecord {
-    /// The peer's address on the connection, which the node sees as the
-    /// remote.
-    pub(crate) remote: SocketAddr,
+    /// The peer's end of the connection.
+    pub(crate) remote: Remote,
     /// The QUIC stream.
     pub(crate) quic_stream: u64,
     pub(crate) body: RecordBody,
@@ -126,15 +154,27 @@ pub(crate) struct InvalidPage {
     pub(crate) subscription: u64,
 }
 
+/// The connections the node reported from one remote address.
+#[derive(Clone, Copy, Debug, Default)]
+struct Incarnations {
+    /// The next connection's incarnation.
+    next: u64,
+    /// The connection whose control handshake succeeded and whose
+    /// registration hasn't ended, and whether a cancellation decided its
+    /// close meanwhile.
+    negotiated: Option<(u64, bool)>,
+}
+
 /// The identity map as the log has it, and the labels logged so far.
 #[derive(Debug, Default)]
 pub(crate) struct WireEvidence {
     /// How many log entries it has read.
     seen: usize,
-    /// Each registered connection, by its remote address as the log
-    /// writes it. A remote gets one handshake outcome at most
-    /// ([`WireEvidence::first_outcome`]).
-    connections: BTreeMap<String, u64>,
+    /// Each registered connection, by its remote address as the log writes
+    /// it and its incarnation there.
+    connections: BTreeMap<(String, u64), u64>,
+    /// The connections the node reported from each remote address so far.
+    incarnations: BTreeMap<String, Incarnations>,
     /// Each admitted stream's kind and version, by connection and QUIC
     /// stream.
     streams: BTreeMap<(u64, u64), StreamId>,
@@ -145,8 +185,8 @@ pub(crate) struct WireEvidence {
     /// Each logged `PeerFrame`'s label, by connection, QUIC stream and
     /// `seq`.
     labels: BTreeMap<(u64, u64, u64), Label>,
-    /// Remote addresses whose handshake the node refused.
-    refused_handshakes: BTreeSet<String>,
+    /// Remote incarnations whose handshake the node refused.
+    refused_handshakes: BTreeSet<(String, u64)>,
     /// Streams the node refused, by connection and QUIC stream.
     refused_streams: BTreeSet<(u64, u64)>,
     /// Connections the node tore down.
@@ -203,13 +243,26 @@ impl WireEvidence {
             }
             match &entry.obs {
                 Observation::Transport {
+                    connection: None,
+                    remote,
+                    event: TransportFact::Negotiated { .. },
+                    ..
+                } => self.negotiated(remote),
+                Observation::Transport {
+                    connection: None,
+                    remote,
+                    event: TransportFact::CloseDecided { .. },
+                    ..
+                } => self.cancelled(remote),
+                Observation::Transport {
                     connection: Some(connection),
                     remote,
                     event: TransportFact::Registered,
                     ..
                 } => {
-                    self.first_outcome(remote)?;
-                    self.connections.insert(remote.clone(), *connection);
+                    let incarnation = self.outcome(remote, true);
+                    self.connections
+                        .insert((remote.clone(), incarnation), *connection);
                 }
                 Observation::Transport {
                     connection: None,
@@ -217,8 +270,9 @@ impl WireEvidence {
                     event: TransportFact::HandshakeRefused { .. },
                     ..
                 } => {
-                    self.first_outcome(remote)?;
-                    self.refused_handshakes.insert(remote.clone());
+                    let incarnation = self.outcome(remote, false);
+                    self.refused_handshakes
+                        .insert((remote.clone(), incarnation));
                 }
                 Observation::Transport {
                     connection: Some(connection),
@@ -288,22 +342,44 @@ impl WireEvidence {
         Ok(())
     }
 
-    /// Fails the run once `remote` gets a second handshake outcome,
-    /// registered or refused. Records name their connection by the peer's
-    /// address alone, and a node that redials a listening peer reaches it at
-    /// the same address, with QUIC stream IDs counting from 0 again. So a
-    /// record left from the old connection would be placed on the new one's
-    /// stream, or judged by the old one's ending. Dialing peers bind a fresh
-    /// address per dial, so only a node redial reuses one.
-    fn first_outcome(&self, remote: &str) -> Result<(), String> {
-        if self.connections.contains_key(remote) || self.refused_handshakes.contains(remote) {
-            return Err(format!(
-                "AliasedRemote: {remote} got a second handshake outcome. Peer records are keyed \
-                 by remote address, so the harness doesn't support the node redialing a \
-                 listening peer yet"
-            ));
+    /// The control handshake of `remote`'s next connection succeeded: that
+    /// connection takes the next incarnation.
+    fn negotiated(&mut self, remote: &str) {
+        let at = self.incarnations.entry(remote.to_owned()).or_default();
+        at.negotiated = Some((at.next, false));
+        at.next += 1;
+    }
+
+    /// The node cancelled `remote`'s negotiated connection before it
+    /// registered. Its registration may still succeed, but a refusal
+    /// reports nothing more.
+    fn cancelled(&mut self, remote: &str) {
+        if let Some((_, cancelled)) = self
+            .incarnations
+            .get_mut(remote)
+            .and_then(|at| at.negotiated.as_mut())
+        {
+            *cancelled = true;
         }
-        Ok(())
+    }
+
+    /// The incarnation of the connection whose handshake outcome from
+    /// `remote` the node reported: `registered`, or refused. A node that
+    /// redials a listening peer reaches it at the same address, with QUIC
+    /// stream IDs counting from 0 again, so the incarnation keeps a record
+    /// left from the old connection off the new one's stream. A refusal
+    /// after a cancellation is the next connection's, refused before its
+    /// handshake succeeded.
+    fn outcome(&mut self, remote: &str, registered: bool) -> u64 {
+        let at = self.incarnations.entry(remote.to_owned()).or_default();
+        match at.negotiated.take() {
+            Some((incarnation, cancelled)) if registered || !cancelled => incarnation,
+            _ => {
+                let incarnation = at.next;
+                at.next += 1;
+                incarnation
+            }
+        }
     }
 
     /// Whether `event` names a QUIC stream of `connection` admitted as the
@@ -318,11 +394,16 @@ impl WireEvidence {
             && self.streams.get(&(connection, quic_stream)).copied() == self.discovery
     }
 
+    /// The key of `remote` in [`WireEvidence::connections`].
+    fn key(remote: Remote) -> (String, u64) {
+        (remote.addr.to_string(), remote.incarnation)
+    }
+
     /// `record` as its observations, once its stream is admitted: one, or
     /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
     /// can't label the node's frame.
     fn place(&mut self, record: &PeerRecord) -> Option<Result<Vec<Observation>, String>> {
-        let connection = *self.connections.get(&record.remote.to_string())?;
+        let connection = *self.connections.get(&Self::key(record.remote))?;
         let stream = *self.streams.get(&(connection, record.quic_stream))?;
         let quic_stream = record.quic_stream;
         Some(Ok(vec![match record.body.clone() {
@@ -397,9 +478,10 @@ impl WireEvidence {
     /// Why `record`, still unplaced, never will be, if the node refused its
     /// handshake or stream or tore its connection down.
     fn lost(&self, record: &PeerRecord) -> Option<String> {
-        let remote = record.remote.to_string();
-        let gone = match self.connections.get(&remote) {
-            None => self.refused_handshakes.contains(&remote),
+        let key = Self::key(record.remote);
+        let remote = &key.0;
+        let gone = match self.connections.get(&key) {
+            None => self.refused_handshakes.contains(&key),
             Some(connection) => {
                 self.torn_down.contains(connection)
                     || self
@@ -409,9 +491,9 @@ impl WireEvidence {
         };
         gone.then(|| {
             format!(
-                "UnplacedRecord: {remote}'s record on stream {} can't get an identity, since the \
-                 node refused or closed it before admitting the stream: {:?}",
-                record.quic_stream, record.body
+                "UnplacedRecord: {remote}'s record on stream {} of incarnation {} can't get an \
+                 identity, since the node refused or closed it before admitting the stream: {:?}",
+                record.quic_stream, record.remote.incarnation, record.body
             )
         })
     }
@@ -719,7 +801,7 @@ mod tests {
     /// Peer 0's `PeerFrame` record for its first frame on QUIC stream 4.
     fn status_record() -> PeerRecords {
         Rc::new(RefCell::new(VecDeque::from([PeerRecord {
-            remote: peer_addr(0, 0),
+            remote: Remote::first(peer_addr(0, 0)),
             quic_stream: 4,
             body: RecordBody::Written { seq: 0 },
         }])))
@@ -736,7 +818,7 @@ mod tests {
             payload: Vec::new(),
         };
         let records = Rc::new(RefCell::new(VecDeque::from([PeerRecord {
-            remote: peer_addr(0, 0),
+            remote: Remote::first(peer_addr(0, 0)),
             quic_stream: 4,
             body: RecordBody::Received {
                 seq: 0,
@@ -835,7 +917,7 @@ mod tests {
         };
         let records = PeerRecords::default();
         records.borrow_mut().extend((0..4).map(|seq| PeerRecord {
-            remote: peer_addr(0, 0),
+            remote: Remote::first(peer_addr(0, 0)),
             quic_stream: 4,
             body: RecordBody::Frame {
                 seq,
@@ -918,58 +1000,172 @@ mod tests {
         assert_eq!(feed(&mut log, read(3)), [0, 1, 2, 3]);
     }
 
-    /// A second handshake outcome for a remote address already mapped, as a
-    /// node redial to a listening peer gives, fails the run instead of
-    /// moving the address to the new connection, where a record still
-    /// waiting from the old one would be placed on the new one's stream.
-    /// In the first case a record waits on connection 1's stream 4 when
-    /// connection 2 registers from the same address and admits its own
-    /// stream 4.
+    /// The node's `n`-th handshake outcome from one remote address is the
+    /// peer's `n`-th connection there, as a node redialing a listening peer
+    /// gives. A record still waiting on the first connection's stream 4
+    /// stays off the second's stream 4, and a record of the second is
+    /// placed on it. After a refused first handshake, the second
+    /// connection's record is placed, and the first's can never be.
     #[test]
-    fn a_second_handshake_from_one_remote_fails_the_run() {
+    fn each_incarnation_of_one_remote_has_its_own_connection() {
         let refused = || TransportFact::HandshakeRefused {
             reason: "Zakura control nonce mismatch".to_owned(),
         };
-        let cases = [
-            (Some(1), Some(2), TransportFact::Registered),
-            (Some(1), None, refused()),
-            (None, Some(2), TransportFact::Registered),
-        ];
-        for (first, second, outcome) in cases {
-            // A record from a refused handshake can never be placed, so only
-            // a registered first connection leaves one waiting.
-            let records = match first {
-                Some(_) => status_record(),
-                None => PeerRecords::default(),
-            };
-            let waiting = records.borrow().len();
-            let mut evidence = WireEvidence::default();
-            let mut log = ObservationLog::default();
-            let first_outcome = match first {
-                Some(_) => TransportFact::Registered,
-                None => refused(),
-            };
-            log.push(transport(1, first, first_outcome));
-            evidence
-                .observe(&records, &mut log)
-                .expect("a remote's first outcome is fine");
-            log.push(transport(2, second, outcome.clone()));
-            if let Some(connection) = second {
-                log.push(Observation::Session {
-                    connection,
-                    quic_stream: 4,
-                    kind: 5,
-                    version: 9,
-                    session_id: 1,
-                    peer: "peer-0".to_owned(),
-                });
-            }
-            let error = evidence
-                .observe(&records, &mut log)
-                .expect_err("the second outcome fails the run");
-            assert!(error.starts_with("AliasedRemote"), "{outcome:?}: {error}");
-            assert_eq!(records.borrow().len(), waiting, "nothing was placed");
-        }
+        let session = |connection| Observation::Session {
+            connection,
+            quic_stream: 4,
+            kind: 5,
+            version: 9,
+            session_id: connection,
+            peer: "peer-0".to_owned(),
+        };
+        let written = |incarnation, seq| PeerRecord {
+            remote: Remote {
+                addr: peer_addr(0, 0),
+                incarnation,
+            },
+            quic_stream: 4,
+            body: RecordBody::Written { seq },
+        };
+        let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
+            log.entries()
+                .iter()
+                .filter_map(|entry| match entry.obs {
+                    Observation::PeerWritten {
+                        connection, seq, ..
+                    } => Some((connection, seq)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let records = PeerRecords::default();
+        records.borrow_mut().push_back(written(0, 0));
+        let mut evidence = WireEvidence::default();
+        let mut log = ObservationLog::default();
+        log.push(transport(1, Some(1), TransportFact::Registered));
+        evidence.observe(&records, &mut log).unwrap();
+        records.borrow_mut().push_back(written(1, 7));
+        log.push(transport(2, Some(2), TransportFact::Registered));
+        log.push(session(2));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(placed(&log), [(2, 7)], "only the second's record");
+        assert_eq!(records.borrow().len(), 1, "the first's record waits");
+        log.push(session(1));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(placed(&log), [(2, 7), (1, 0)]);
+
+        let records = PeerRecords::default();
+        records.borrow_mut().push_back(written(1, 3));
+        let mut evidence = WireEvidence::default();
+        let mut log = ObservationLog::default();
+        log.push(transport(1, None, refused()));
+        log.push(transport(2, Some(2), TransportFact::Registered));
+        log.push(session(2));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(placed(&log), [(2, 3)]);
+        records.borrow_mut().push_back(written(0, 0));
+        let error = evidence
+            .observe(&records, &mut log)
+            .expect_err("the refused connection's record can never be placed");
+        assert!(error.starts_with("UnplacedRecord"), "{error}");
+    }
+
+    /// A connection the node cancels during registration reports
+    /// `Negotiated` and then only `CloseDecided` if its registration is
+    /// refused, or `CloseDecided` and then `Registered`. Either way it keeps
+    /// its incarnation, so the next connection's records are placed on the
+    /// next connection, not the one after. A refusal after a cancellation is
+    /// the next connection's.
+    #[test]
+    fn a_cancelled_registration_keeps_its_incarnation() {
+        let negotiated = |seq| {
+            transport(
+                seq,
+                None,
+                TransportFact::Negotiated {
+                    local: 0,
+                    offered: 0,
+                    negotiated: 0,
+                },
+            )
+        };
+        let cancelled = |seq| transport(seq, None, TransportFact::CloseDecided { cause: None });
+        let session = |connection| Observation::Session {
+            connection,
+            quic_stream: 4,
+            kind: 5,
+            version: 9,
+            session_id: connection,
+            peer: "peer-0".to_owned(),
+        };
+        let written = |incarnation, seq| PeerRecord {
+            remote: Remote {
+                addr: peer_addr(0, 0),
+                incarnation,
+            },
+            quic_stream: 4,
+            body: RecordBody::Written { seq },
+        };
+        let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
+            log.entries()
+                .iter()
+                .filter_map(|entry| match entry.obs {
+                    Observation::PeerWritten {
+                        connection, seq, ..
+                    } => Some((connection, seq)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let records = PeerRecords::default();
+        let mut evidence = WireEvidence::default();
+        let mut log = ObservationLog::default();
+        // Incarnation 0 registers as connection 1.
+        log.push(negotiated(1));
+        log.push(transport(2, Some(1), TransportFact::Registered));
+        log.push(transport(3, Some(1), TransportFact::TornDown));
+        // Incarnation 1 is cancelled, and its registration refused.
+        log.push(negotiated(4));
+        log.push(cancelled(5));
+        // Incarnation 2 registers as connection 2.
+        log.push(negotiated(6));
+        log.push(transport(7, Some(2), TransportFact::Registered));
+        log.push(session(2));
+        records.borrow_mut().push_back(written(2, 5));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(placed(&log), [(2, 5)], "incarnation 2 is connection 2");
+        // Incarnation 3 is cancelled, and registers as connection 3.
+        log.push(transport(8, Some(2), TransportFact::TornDown));
+        log.push(negotiated(9));
+        log.push(cancelled(10));
+        log.push(transport(11, Some(3), TransportFact::Registered));
+        log.push(session(3));
+        records.borrow_mut().push_back(written(3, 0));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(
+            placed(&log),
+            [(2, 5), (3, 0)],
+            "incarnation 3 is connection 3"
+        );
+        // Incarnation 4 is cancelled, and incarnation 5 is refused before
+        // its handshake succeeds.
+        log.push(transport(12, Some(3), TransportFact::TornDown));
+        log.push(negotiated(13));
+        log.push(cancelled(14));
+        log.push(transport(
+            15,
+            None,
+            TransportFact::HandshakeRefused {
+                reason: "Zakura control nonce mismatch".to_owned(),
+            },
+        ));
+        records.borrow_mut().push_back(written(5, 0));
+        let error = evidence
+            .observe(&records, &mut log)
+            .expect_err("incarnation 5's record can never be placed");
+        assert!(error.starts_with("UnplacedRecord"), "{error}");
     }
 
     /// A preparation the node's storage ran judges only the pages of its own

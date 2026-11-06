@@ -124,18 +124,22 @@ jobs:
           WEEKLY_CRON: ${{ inputs.weekly_cron }}
           MAX_LEN: ${{ matrix.max_len }}
           DETECT_LEAKS: ${{ matrix.detect_leaks }}
+          EXTRA_ARGS: ${{ matrix.extra_args }}
         run: |
           seconds="${NORMAL_SECONDS}"
           if [ "${SCHEDULE}" = "${WEEKLY_CRON}" ]; then
             seconds="${WEEKLY_SECONDS}"
           fi
+          # The suite row's other args, such as `-len_control=0`. None contains a space.
+          read -r -a extra_args <<< "${EXTRA_ARGS}"
           # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
           # `-max_len=0` lets libFuzzer choose, for a target whose suite row sets no limit.
           cargo fuzz run --fuzz-dir . "${TARGET}" -- \
             -max_total_time="${seconds}" \
             -rss_limit_mb="${RSS_MB}" \
             -max_len="${MAX_LEN}" \
-            -detect_leaks="${DETECT_LEAKS}"
+            -detect_leaks="${DETECT_LEAKS}" \
+            "${extra_args[@]}"
       - name: Replay crash artifacts in a fresh process
         if: failure()
         working-directory: qa/fuzz/${{ inputs.package }}

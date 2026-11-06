@@ -262,6 +262,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/nu7-fork -p 'test_*.py'
 
+      - name: Trace query client tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s deploy/trace-query -p 'test_*.py'
+
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py

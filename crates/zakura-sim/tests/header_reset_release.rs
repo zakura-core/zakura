@@ -146,7 +146,12 @@ fn reset_held_prepare() -> StorageScenario {
 fn a_held_prepare_completes_in_the_reset_generation() {
     let scenario = reset_held_prepare();
     for input in inputs(8, 256) {
-        let report = run(&scenario, input);
+        let ports = Storage::prepare(&scenario);
+        let node = ports.node.clone();
+        let report =
+            run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
         let resets = resets(&report);
         let [(invalidated, kind, target, generation), (reconsidered, again, same, _)] =
             resets.as_slice()
@@ -171,8 +176,9 @@ fn a_held_prepare_completes_in_the_reset_generation() {
             at, *generation,
             "the prepare completes in the reset generation"
         );
-        assert!(
-            report.end.violation.is_none(),
+        assert_eq!(
+            node.engine().snapshot().frontiers.header_best.height.0,
+            6,
             "the node still reaches the mirror's tip"
         );
     }

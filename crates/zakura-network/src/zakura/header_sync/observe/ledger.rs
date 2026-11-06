@@ -39,7 +39,7 @@
 //! break and a property's claim names. The ledger records its break, still
 //! applies the event, so later valid events don't look unknown, and goes on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::block;
 use zakura_header_chain::HeaderSyncWorkOwner;
@@ -69,6 +69,8 @@ struct CallRecord {
     op: PortCall,
     end: Option<CallEnd>,
     held: Option<Held>,
+    /// Whether its completion was handled.
+    handled: bool,
 }
 
 impl CallRecord {
@@ -126,8 +128,8 @@ pub struct HeaderWorkLedger {
     started: BTreeMap<u64, Round>,
     /// The claim breaks not yet taken, in order.
     claims: Vec<ClaimBreak>,
-    /// How many rounds the queue has released.
-    released_rounds: u64,
+    /// Every round the queue has released, by incarnation.
+    released: BTreeSet<u64>,
 }
 
 /// One live reservation.
@@ -206,6 +208,7 @@ impl HeaderWorkLedger {
                     op: op.clone(),
                     end: None,
                     held: None,
+                    handled: false,
                 };
                 if self.calls.insert(*call, record).is_some() {
                     return Err(format!("CallReused: call {call} dispatched twice"));
@@ -240,6 +243,7 @@ impl HeaderWorkLedger {
                     }
                     Some(_) => {}
                 }
+                record.handled = true;
                 let open = record.held.as_ref().is_some_and(|held| !held.ended);
                 let held_round = record.held.as_ref().map(|held| held.incarnation);
                 if open {
@@ -404,7 +408,7 @@ impl HeaderWorkLedger {
                     ));
                 };
                 round.released = true;
-                self.released_rounds = self.released_rounds.saturating_add(1);
+                self.released.insert(*incarnation);
                 self.check_returned(
                     *incarnation,
                     &format!("the queue released round {incarnation}"),
@@ -897,13 +901,29 @@ impl HeaderWorkLedger {
 
     /// How many rounds the queue has released.
     pub fn released_rounds(&self) -> u64 {
-        self.released_rounds
+        // The conversion is exact: a run releases far fewer than 2^64 rounds.
+        self.released.len() as u64
     }
 
     /// How many rounds the queue released that haven't settled: some of
-    /// their staged headers haven't returned.
+    /// their staged headers haven't returned, or a call that held their
+    /// headers hasn't been handled. A dropped call has no handler, so it
+    /// doesn't hold a round's settlement back.
     pub fn unsettled_rounds(&self) -> usize {
-        self.started.values().filter(|round| round.released).count()
+        self.released
+            .iter()
+            .filter(|incarnation| {
+                self.started.contains_key(incarnation)
+                    || self.calls.values().any(|call| {
+                        !call.handled
+                            && call.end != Some(CallEnd::Dropped)
+                            && call
+                                .held
+                                .as_ref()
+                                .is_some_and(|held| held.incarnation == **incarnation)
+                    })
+            })
+            .count()
     }
 
     /// The claim breaks since the last call, in order.
@@ -1747,6 +1767,12 @@ mod tests {
             panicked: false,
         });
         claimed_as(still_held, ClaimRule::OpenOwnership);
+        // The leases are back, but the call that held them isn't handled
+        // yet, so the round hasn't settled.
+        let mut unhandled = held.clone();
+        unhandled.push(returned(1, 1, 3));
+        let unhandled = fold(unhandled).expect("the call's leases return before it's handled");
+        assert_eq!(unhandled.unsettled_rounds(), 1);
         held.extend([
             returned(1, 1, 3),
             ReactorEvent::Handled {
@@ -1754,10 +1780,11 @@ mod tests {
                 panicked: false,
             },
         ]);
-        fold(held)
-            .expect("the call's leases return before its completion is handled")
-            .finish()
-            .expect("nothing stays reserved or owned");
+        let settled =
+            fold(held).expect("the call's leases return before its completion is handled");
+        assert_eq!(settled.released_rounds(), 1);
+        assert_eq!(settled.unsettled_rounds(), 0);
+        settled.finish().expect("nothing stays reserved or owned");
     }
 
     /// A reservation fits its round's request limit: a 401-header repair for

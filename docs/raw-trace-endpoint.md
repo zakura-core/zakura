@@ -82,9 +82,10 @@ curl -H 'Range: bytes=<bytes read>-' -H 'If-Range: <etag>' \
 | 200 | The file was replaced. | Discard the old rows and store the new `ETag`. |
 
 One request per poll is enough. A collector that follows many tables can poll
-`GET /traces` and request only the tables whose length grew.
-`deploy/trace-query/trace_query.py` follows tables this way and mirrors their
-rows into SQLite for arbitrary queries.
+`GET /traces` and request only the tables whose length or `ETag` changed. A
+replacement can be the same size as the old file or shorter, so a length check
+alone misses it. `deploy/trace-query/trace_query.py` follows tables with these
+requests and mirrors their rows into SQLite for arbitrary queries.
 
 ## Status codes
 
@@ -138,10 +139,12 @@ The endpoint refuses symlinks and non-regular files but trusts the directory.
   file read stall for 30 seconds. A transfer that keeps making progress has no
   deadline.
 - Each response reads the file in 256 KiB chunks and holds at most three.
-- Each request runs its file reads on its own thread, at most 4 at once. A
-  read that stalls keeps its thread until the read returns, and further
-  requests get 503 while every thread is taken. The threads are not Tokio's
-  blocking pool, so a stalled disk cannot block the node's other blocking work
-  or its shutdown.
+- Each request runs its file reads on its own thread, at most 4 at once in
+  the whole process. A read that stalls keeps its thread until the read
+  returns, and further requests get 503 while every thread is taken. The
+  threads are not Tokio's blocking pool, so a stalled disk cannot block the
+  node's other blocking work or its shutdown.
 - On shutdown the endpoint closes its listener and connections. Each file
-  thread exits when its current read returns.
+  thread exits when its current read returns. A host that embeds the node and
+  runs it repeatedly in one process shares the 4 threads across runs, so
+  threads stranded by stalled storage cannot accumulate.

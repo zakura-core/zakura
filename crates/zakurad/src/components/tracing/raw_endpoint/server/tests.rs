@@ -33,6 +33,8 @@ impl Server {
         let (task, address) = start(
             "127.0.0.1:0".parse().unwrap(),
             directory.to_owned(),
+            // Each test owns its pool, so parallel tests never see 503.
+            FsThreads::new(crate::components::tracing::raw_endpoint::fs_threads::MAX_FS_THREADS),
             shutdown.clone(),
         )
         .await

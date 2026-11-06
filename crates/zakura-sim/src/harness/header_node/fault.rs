@@ -15,10 +15,16 @@
 //! follows it. Until that cooldown ends, the reactor admits no session from
 //! the peer. [`FaultEvidence::check`] judges this as the run goes, and
 //! [`FaultEvidence::penalized`] judges a finished run.
+//!
+//! A failure whose reply never reached the reactor owes nothing: no caller
+//! was waiting for it, or the reactor's teardown dropped the call that
+//! submitted it (`CallEnded` `dropped`). A prepare or apply can't time out.
+//! So a failure whose reply reached the reactor and is still untaken when a
+//! settled run ends means the reactor lost it, and breaks the rule.
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     rc::Rc,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -66,8 +72,8 @@ pub fn owes_penalty(source: &str, category: &str, blame: &Blame) -> Option<&'sta
 
 /// Each penalty the node's storage facts in `entries` owe, in the order the
 /// reactor took the failed replies. A failure whose reply the reactor never
-/// took owes nothing, since the reactor never saw it ([`untaken`] lists
-/// them). An error if a failure has no attribution in `attributions`, or
+/// took owes no penalty ([`untaken`] lists those whose reply reached it). An
+/// error if a failure has no attribution in `attributions`, or
 /// completes no logged request.
 pub fn owed(
     entries: &[Entry],
@@ -81,9 +87,9 @@ pub fn owed(
 }
 
 /// The operations in `entries` that failed with a fault that would owe a
-/// penalty, but whose reply the reactor never took: it dropped or timed out
-/// the call, or the log ends first. Whether the node should have penalized
-/// them can't be judged from the reactor's side.
+/// penalty, and whose reply reached the reactor, which hasn't taken it by
+/// the log's end. A failure whose reply never reached it isn't listed (see
+/// the module docs).
 pub fn untaken(entries: &[Entry], attributions: &FaultAttributions) -> Result<Vec<u64>, String> {
     let judge = Judge::over(Mode::Scan, &[], entries, attributions);
     match judge.error {
@@ -158,9 +164,13 @@ struct Judge {
     /// Each cooled peer's latest cooldown: when it started and when it ends.
     cooled: HashMap<String, (Duration, Duration)>,
     requests: BTreeMap<u64, Request>,
-    /// Each failed operation whose reply the reactor hasn't taken, with its
-    /// request and category.
+    /// Each failed operation whose reply reached the reactor, which hasn't
+    /// taken it, with its request and category.
     failed: BTreeMap<u64, (Request, String)>,
+    /// The reactor calls its teardown dropped. Their guard reports the drop
+    /// before dropping the future, so the operation can still complete
+    /// after it.
+    dropped: BTreeSet<u64>,
     /// Every penalty owed so far, in the order the replies were taken.
     owed: Vec<OwedPenalty>,
     /// The penalties in [`Judge::owed`] whose call's handling hasn't ended,
@@ -325,12 +335,17 @@ impl Judge {
                 id,
                 result:
                     StorageResult::PrepareFailed { category } | StorageResult::ApplyFailed { category },
+                delivered,
                 ..
             } => {
                 let request = self.requests.get(id).cloned().ok_or_else(|| {
                     format!("UnknownOperation: operation {id} failed with no logged request")
                 })?;
-                if owes(attributions, *id, &request, category)?.is_some() {
+                let reached = *delivered
+                    && !request
+                        .call
+                        .is_some_and(|call| self.dropped.contains(&call));
+                if owes(attributions, *id, &request, category)?.is_some() && reached {
                     self.failed.insert(*id, (request, category.clone()));
                 }
             }
@@ -357,8 +372,13 @@ impl Judge {
     /// Reads one reactor fact, numbered `seq`, into its call's window.
     fn reactor(&mut self, seq: u64, event: &ReactorFact) {
         match event {
-            // A dropped call is never handled.
-            ReactorFact::CallEnded { call, end, .. } if end != "dropped" => {
+            // A dropped call is never handled, and never takes its reply.
+            ReactorFact::CallEnded { call, end, .. } if end == "dropped" => {
+                self.dropped.insert(*call);
+                self.failed
+                    .retain(|_, (request, _)| request.call != Some(*call));
+            }
+            ReactorFact::CallEnded { call, .. } => {
                 self.windows.entry(*call).or_default();
                 self.handling = Some(*call);
             }
@@ -433,7 +453,7 @@ impl Judge {
 
     /// Why the rule can't judge everything it read yet, if it can't: a
     /// penalty whose call's handling hasn't ended, or a failure whose reply
-    /// the reactor hasn't taken.
+    /// reached the reactor, which hasn't taken it.
     fn open(&self) -> Option<String> {
         if let Some(index) = self.pending.first() {
             let penalty = &self.owed[*index];
@@ -445,8 +465,8 @@ impl Judge {
         }
         self.failed.keys().next().map(|op| {
             format!(
-                "UntakenFault: operation {op} failed with a header-peer fault whose reply the \
-                 reactor never took"
+                "UntakenFault: operation {op} failed with a header-peer fault whose reply \
+                 reached the reactor, which never took it"
             )
         })
     }
@@ -699,11 +719,10 @@ impl FaultEvidence {
     }
 
     /// The same rule as [`FaultEvidence::check`] over a finished run's
-    /// `entries`. A penalty still open when a settled run ends is a break.
-    /// Open at any other end, or before the run has ended, it's
-    /// inconclusive. With nothing else open, a fault the reactor never took
-    /// ([`untaken`]) leaves the rule inconclusive too, so a node that
-    /// abandons such work can't pass it.
+    /// `entries`. What's still open when a settled run ends is a break: a
+    /// penalty whose call's handling never ended, or a failure whose reply
+    /// reached the reactor and was never taken ([`untaken`]). Open at any
+    /// other end, or before the run has ended, it's inconclusive.
     pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
         let mode = Mode::Judge {
             cooldown: self.cooldown,
@@ -712,25 +731,28 @@ impl FaultEvidence {
         if let Some(why) = judge.failure() {
             return Acceptance::Violated(why);
         }
-        let Some(&index) = judge.pending.first() else {
-            return match judge.open() {
-                None => Acceptance::Holds,
-                Some(why) => Acceptance::Inconclusive(why),
-            };
+        let what = match judge.pending.first() {
+            Some(&index) => {
+                let penalty = &judge.owed[index];
+                format!(
+                    "UnpenalizedFault: {} operation {} failed with a header-peer fault of {} in \
+                     session {}, and the reactor reported no {} Misbehavior from that session \
+                     while it handled call {:?}",
+                    penalty.stage,
+                    penalty.op,
+                    penalty.source,
+                    penalty.session_id,
+                    penalty.reason,
+                    penalty.call
+                )
+            }
+            None => match judge.open() {
+                Some(why) => why,
+                None => return Acceptance::Holds,
+            },
         };
-        let penalty = &judge.owed[index];
-        let what = format!(
-            "{} operation {} failed with a header-peer fault of {} in session {}, and the \
-             reactor reported no {} Misbehavior from that session while it handled call {:?}",
-            penalty.stage,
-            penalty.op,
-            penalty.source,
-            penalty.session_id,
-            penalty.reason,
-            penalty.call
-        );
         match self.settled.get() {
-            Some(true) => Acceptance::Violated(format!("UnpenalizedFault: {what}")),
+            Some(true) => Acceptance::Violated(what),
             Some(false) => Acceptance::Inconclusive(format!(
                 "the run stopped while a task could be partway through handling it: {what}"
             )),
@@ -999,10 +1021,11 @@ mod tests {
         ));
     }
 
-    /// A fault whose reply the reactor never took owes no penalty, and leaves
-    /// the rule inconclusive rather than holding.
+    /// A fault whose reply reached the reactor but was never taken owes no
+    /// penalty. It breaks the rule once a settled run ends, since the
+    /// reactor lost it, and leaves it inconclusive at any other end.
     #[test]
-    fn an_untaken_fault_is_inconclusive() {
+    fn an_untaken_fault_breaks_only_a_settled_run() {
         let attributed = evidence(&[(1, blame("aa"))]);
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.pop();
@@ -1010,8 +1033,15 @@ mod tests {
         assert_eq!(untaken(&log, attributed.attributions()).unwrap(), vec![1]);
         assert!(matches!(
             attributed.penalized(&log),
-            Acceptance::Inconclusive(why) if why.starts_with("UntakenFault")
+            Acceptance::Violated(why) if why.starts_with("UntakenFault")
         ));
+        for settled in [Some(false), None] {
+            attributed.settled.set(settled);
+            assert!(matches!(
+                attributed.penalized(&log),
+                Acceptance::Inconclusive(why) if why.contains("UntakenFault")
+            ));
+        }
         // A failure that owes nothing isn't listed.
         let unblamed = evidence(&[(1, blame("bb"))]);
         assert_eq!(
@@ -1019,6 +1049,44 @@ mod tests {
             Vec::<u64>::new()
         );
         assert_eq!(unblamed.penalized(&log), Acceptance::Holds);
+    }
+
+    /// A fault whose reply never reached the reactor owes nothing, even in a
+    /// settled run: no caller waited for it, or the reactor's teardown
+    /// dropped its call, before or after the operation completed.
+    #[test]
+    fn a_fault_that_never_reached_the_reactor_owes_nothing() {
+        let attributed = evidence(&[(1, blame("aa"))]);
+        let dropped = reactor(ReactorFact::CallEnded {
+            call: 1,
+            end: "dropped".to_owned(),
+            op: Some(1),
+        });
+        let mut undelivered = failed_prepare(1, "aa", 3, "invalid_header");
+        undelivered.pop();
+        if let Observation::Storage {
+            fact: StorageFact::Completed { delivered, .. },
+            ..
+        } = &mut undelivered[1].obs
+        {
+            *delivered = false;
+        }
+        let mut dropped_after = failed_prepare(1, "aa", 3, "invalid_header");
+        dropped_after.pop();
+        dropped_after.push(dropped.clone());
+        dropped_after.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        let mut dropped_before = failed_prepare(1, "aa", 3, "invalid_header");
+        dropped_before.pop();
+        dropped_before.insert(1, dropped);
+        dropped_before.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        for log in [undelivered, dropped_after, dropped_before] {
+            assert_eq!(
+                untaken(&log, attributed.attributions()).unwrap(),
+                Vec::<u64>::new()
+            );
+            assert_eq!(attributed.penalized(&log), Acceptance::Holds, "{log:?}");
+            assert_eq!(cooled(Vec::new()).check(&log), FaultCheck::Nothing);
+        }
     }
 
     #[test]

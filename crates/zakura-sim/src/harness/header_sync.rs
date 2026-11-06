@@ -1223,7 +1223,11 @@ fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
 
 /// Checks [`HEADER_FAULT_PENALIZED`] after each step, from the node's fault
 /// evidence ([`FaultEvidence::check`]). Something still open is unsettled,
-/// so a run that ends with it is inconclusive.
+/// so a run that ends with it is inconclusive: a penalty whose call is
+/// still being handled, or a failed reply the reactor hasn't taken yet. A
+/// failure whose reply never reached the reactor opens nothing. The registry
+/// runs no check after the run ends, so [`FaultEvidence::penalized`] is what
+/// turns what's open at a settled end into a break.
 fn check_header_fault_penalized<S: HasView<View = StorageView>>(
     cx: &mut CheckCtx<'_, S>,
 ) -> Verdict {

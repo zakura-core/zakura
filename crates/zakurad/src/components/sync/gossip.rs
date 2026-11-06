@@ -508,7 +508,7 @@ mod tests {
 
     use tokio::sync::mpsc;
     use zakura_chain::block;
-    use zakura_rpc::MinedBlockEvent;
+    use zakura_rpc::{MinedBlockEvent, MinedSubmissions};
 
     // Repeat the vector so removing `biased;` reliably exposes randomized
     // selection among the ready events.
@@ -580,6 +580,8 @@ mod tests {
     #[tokio::test]
     async fn mined_block_queued_while_the_tip_resolves_is_preferred() {
         let submitted_hash = block::Hash([3; 32]);
+        let submissions = MinedSubmissions::default();
+        let reservation = submissions.reserve(submitted_hash).unwrap();
         let (mined_block_sender, mut mined_block_receiver) = mpsc::unbounded_channel();
         let (_mark_sender, mut mark_receiver) = mpsc::unbounded_channel();
 
@@ -593,6 +595,8 @@ mod tests {
                     size: 1_000,
                 })
                 .unwrap();
+            drop(reservation);
+            submissions.wait_until_released(submitted_hash).await;
             Ok::<_, ()>("committed tip")
         };
         let event =

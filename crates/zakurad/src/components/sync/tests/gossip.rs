@@ -702,6 +702,20 @@ async fn released_local_submission_without_a_mining_event_relays_its_committed_t
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn releasing_an_uncommitted_submission_does_not_advertise_it() {
+    let submissions = MinedSubmissions::default();
+    let (_chain_tip_sender, mut gossip) =
+        setup_gossip_test_with_submissions(submissions.clone()).await;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let submission = submissions.reserve(block.hash()).unwrap();
+    tokio::task::yield_now().await;
+    drop(submission);
+    gossip.peer_set.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn unfinished_local_submission_does_not_delay_a_newer_relayed_tip() {
     let LocalTipTest {
         submission: _submission,

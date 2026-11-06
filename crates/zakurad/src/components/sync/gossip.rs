@@ -13,7 +13,7 @@ use tracing::Instrument;
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network as zn;
 use zakura_node_services::task::spawn_erased;
-use zakura_rpc::MinedBlockEvent;
+use zakura_rpc::{MinedBlockEvent, MinedSubmissions};
 use zakura_state::{self as zs, ChainTipChange};
 
 use crate::{components::sync::SyncStatus, BoxError};
@@ -101,6 +101,9 @@ pub enum BlockGossipError {
 ///
 /// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
 ///
+/// `local_submissions` are the blocks `submitblock` is submitting, shared with the RPC. Only a tip
+/// change to one of them waits for its mined-block event.
+///
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN, RS>(
     sync_status: SyncStatus,
@@ -108,6 +111,7 @@ pub async fn gossip_best_tip_block_hashes<ZN, RS>(
     broadcast_network: ZN,
     read_state: RS,
     mut mined_block_receiver: Option<mpsc::UnboundedReceiver<MinedBlockEvent>>,
+    local_submissions: MinedSubmissions,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -146,9 +150,10 @@ where
         let mut sync_status = sync_status.clone();
         let mut chain_tip = chain_state.clone_for_task();
 
+        let local_submissions = local_submissions.clone();
         // TODO: Move the contents of this async block to its own method
         let tip_change_close_to_network_tip_fut = async move {
-            /// A brief duration to wait after a tip change for a new message in the mined block channel.
+            /// A brief duration to wait after a local submission's tip change for its mined-block event.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
             // Block gossip has no delay between successive blocks: every relay hop that waits
@@ -157,9 +162,13 @@ where
             // wait for at least one tip change, to make sure we have a new block hash to broadcast
             let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
 
-            // wait for block submissions to be received through the `mined_block_receiver` if the tip
-            // change is from a block submission.
-            tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
+            // A local submission commits, and so changes the tip, before `submitblock` sends its
+            // mined-block event. Wait briefly for that event, so the block is broadcast as a mined
+            // block. A relayed block has no such event, so it does not wait: the timer rounds the
+            // delay up to about a millisecond, which every relay hop would add.
+            if local_submissions.contains(&tip_action.best_tip_hash_and_height().0) {
+                tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
+            }
 
             // wait until we're close to the tip, because broadcasts are only useful for nodes near the tip
             // (if they're a long way from the tip, they use the syncer and block locators), unless a mined block

@@ -19,7 +19,7 @@ use zakura_sim::{
         header_sync::{grammar, Dialer, MirrorSpec, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
-    observe::{StorageFact, StorageRequest},
+    observe::{StorageFact, StorageRequest, StorageResult},
     Identity, MemorySink, Observation, PlanInput, RunReport,
 };
 
@@ -175,6 +175,79 @@ fn a_held_prepare_completes_in_the_reset_generation() {
             report.end.violation.is_none(),
             "the node still reaches the mirror's tip"
         );
+    }
+}
+
+/// The node at A2 syncing from `mirror-0` at A6. The first apply is held
+/// until the node resets, and the reset invalidates the node's tip once
+/// that apply is submitted, so the held apply's headers extend an
+/// invalidated header. Once the apply completes, a reconsider restores
+/// the tip.
+fn reset_held_apply() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(2),
+        mirrors: vec![mirror(Chain::main(6), Dialer::Mirror)],
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Apply, 1),
+                until: Trigger::Reset("node".to_owned()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![
+            node_step(
+                ControlAction::Reset(Reset::Invalidate { depth: 0 }),
+                Some(Trigger::Submitted(Select::nth(OpKind::Apply, 1))),
+            ),
+            node_step(
+                ControlAction::Reset(Reset::Reconsider),
+                Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
+            ),
+        ],
+    }
+}
+
+/// An apply held across an invalidation of its parent completes after the
+/// reset, refused as stale, and leaves the node's selection as the reset
+/// made it: its `Completed` carries the reset's generation.
+#[test]
+fn a_held_apply_across_a_reset_leaves_the_new_selection() {
+    let scenario = reset_held_apply();
+    for input in inputs(8, 256) {
+        let report = run(&scenario, input);
+        let apply = submitted(&report, |request| {
+            matches!(request, StorageRequest::ApplyHeaderTarget { .. })
+        })
+        .expect("the node applies the mirror's headers");
+        let resets = resets(&report);
+        let [(invalidated, kind, _, generation), (reconsidered, again, _, _)] = resets.as_slice()
+        else {
+            panic!("one invalidation and one reconsider: {resets:?}");
+        };
+        assert_eq!(
+            (kind.as_str(), again.as_str()),
+            ("invalidate", "reconsider")
+        );
+        let (done, fact) = completed(&report, apply).expect("the held apply completes");
+        let StorageFact::Completed {
+            generation: at,
+            result,
+            ..
+        } = fact
+        else {
+            unreachable!("`completed` finds completions");
+        };
+        assert_eq!(
+            result,
+            StorageResult::ApplyFailed {
+                category: "stale_target_or_generation".to_owned()
+            },
+            "the reset made the held apply's target stale"
+        );
+        assert!(*invalidated < done && done <= *reconsidered);
+        assert_eq!(at, *generation, "the stale apply selects nothing new");
     }
 }
 
@@ -383,7 +456,7 @@ fn history(report: &RunReport) -> Vec<String> {
 #[test]
 fn reset_and_release_histories_repeat_a_a_and_a_b_a() {
     let plans = inputs(2, 256);
-    for scenario in [reset_held_prepare(), released_read()] {
+    for scenario in [reset_held_prepare(), reset_held_apply(), released_read()] {
         let histories: Vec<_> = [&plans[0], &plans[0], &plans[1], &plans[0]]
             .into_iter()
             .map(|plan| history(&run(&scenario, plan.clone())))
@@ -409,7 +482,7 @@ fn reset_and_release_replay_exact_in_a_fresh_process() {
     let PlanInput::Bytes(plan) = &inputs(1, 256)[0] else {
         unreachable!("fuzz inputs are bytes");
     };
-    for scenario in [reset_held_prepare(), released_read()] {
+    for scenario in [reset_held_prepare(), reset_held_apply(), released_read()] {
         let dir = TempDir::new().unwrap();
         let plan_file = dir.path().join("plan");
         let trace = dir.path().join("trace");

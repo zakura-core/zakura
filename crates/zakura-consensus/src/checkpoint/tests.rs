@@ -2067,6 +2067,7 @@ async fn queued_local_checkpoint_commits_are_announced_after_callers_are_dropped
     let (state, read, _, _, mut announcements) = zs::init_test_services(&Mainnet).await;
     let list: BTreeMap<_, _> = [0usize, 3]
         .into_iter()
+        // The only indices are 0 and 3, so both fit in u32.
         .map(|i| (block::Height(i as u32), blocks[i].hash()))
         .collect();
     let mut verifier =

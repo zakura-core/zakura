@@ -226,6 +226,22 @@ class PilotCatalogueTests(unittest.TestCase):
         self.edit_json_evidence("calibration/t/stats/s.json", unapplied)
         self.assertIn("t: calibration applicability differs", pilot.validate(self.root, self.evidence))
 
+    def test_unapplied_calibration_target_needs_a_discovery_exclusion(self):
+        def unapplied(stats):
+            stats["counts"]["properties"]["h"].update(held=0, not_applicable=4)
+        self.catalogue["calibration"]["runs"][0]["applicability"] = "not-observed"
+        self.edit_json_evidence("calibration/t/stats/s.json", unapplied)
+        self.assertIn("h/case-0: target never applied in calibration, so discovery must exclude it", pilot.validate(self.root, self.evidence))
+        for case in self.catalogue["cases"]:
+            case["discovery_excluded"] = "never applied in calibration"
+        self.save()
+        self.assertEqual(pilot.validate(self.root, self.evidence), [])
+
+    def test_discovery_exclusion_needs_a_reason(self):
+        self.catalogue["cases"][0]["discovery_excluded"] = " "
+        self.save()
+        self.assertIn("h/case-0: discovery exclusion needs a reason", pilot.validate(self.root))
+
     def test_calibration_cleanup_failure_fails_even_with_matching_hash(self):
         self.edit_json_evidence("calibration/t/stats/s.json", lambda stats: stats["counts"]["cleanup"].update(leaked_tasks=1))
         self.assertIn("t: calibration contains a failure", pilot.validate(self.root, self.evidence))

@@ -705,7 +705,7 @@ fn zero_selected_tests_fail() {
         seeds: Vec::new(),
         cleanup: None,
     };
-    assert!(discovery_report(meta(), vec![unseeded]).is_err());
+    assert!(discovery_report(meta(), vec![unseeded], Vec::new()).is_err());
 }
 
 fn meta() -> Meta {
@@ -798,7 +798,13 @@ fn reports_count_classes_and_rates() {
         ],
         cleanup: None,
     };
-    let report = discovery_report(meta(), vec![case]).expect("the report has results");
+    let excluded = Excluded {
+        id: "b".to_owned(),
+        fault_class: "stale".to_owned(),
+        reason: "never applied".to_owned(),
+    };
+    let report = discovery_report(meta(), vec![case], vec![excluded.clone()])
+        .expect("the report has results");
     assert_eq!(
         (
             report.summary.results,
@@ -807,6 +813,36 @@ fn reports_count_classes_and_rates() {
         ),
         (3, 2, 1)
     );
+    assert_eq!(report.summary.by_fault_class["stale"].results, 3);
+    assert_eq!(report.excluded, vec![excluded]);
+}
+
+/// Discovery leaves out exactly the cases the catalogue excludes, the two
+/// record-book cases whose target never applied its property in
+/// calibration. Sensitivity still selects them, and a discovery selection
+/// of only excluded cases fails.
+#[test]
+fn discovery_leaves_out_excluded_cases() {
+    let catalogue = committed_catalogue();
+    let cases = select(&catalogue.cases, &[]).expect("every case");
+    let (scored, excluded) = discovery_cases(&cases).expect("some case is scored");
+    assert_eq!(scored.len(), 8);
+    let ids: Vec<&str> = excluded.iter().map(|case| case.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "discovery/record-book/keep-old-relay-attribution",
+            "discovery/record-book/wrong-eviction-victim"
+        ]
+    );
+    assert!(excluded.iter().all(|case| !case.reason.is_empty()));
+    assert!(scored
+        .iter()
+        .all(|case| case.target != "discovery_record_book"));
+    let only = select(&catalogue.cases, &[ids[0].to_owned()]).expect("one case");
+    assert!(discovery_cases(&only)
+        .expect_err("only an excluded case")
+        .contains("excluded"));
 }
 
 /// The failure kinds a store's paths name.

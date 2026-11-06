@@ -391,7 +391,8 @@
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
       "sensitivity": "not-run in mut-2",
-      "discovery": "not-run",
+      "discovery": "excluded",
+      "discovery_excluded": "discovery_record_book applied its property to zero inputs in both cold-start calibrations (5 s and 30 s), so a scored campaign is NotApplicable before it starts. That's a generator gap, not a result, so the case counts for sensitivity only (pilot review, 2026-11-05).",
       "required_observations": "Book entries, confirmation status, relay attribution counts, entry changes and time.",
       "independent_check": "The independent book model selects entries and relay accounting from decoded operations, then compares actual book snapshots and outcomes.",
       "oracle_and_generator_files": {
@@ -437,7 +438,8 @@
       "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
       "mutation_compilation": "not-run in mut-2",
       "sensitivity": "not-run in mut-2",
-      "discovery": "not-run",
+      "discovery": "excluded",
+      "discovery_excluded": "discovery_record_book applied its property to zero inputs in both cold-start calibrations (5 s and 30 s), so a scored campaign is NotApplicable before it starts. That's a generator gap, not a result, so the case counts for sensitivity only (pilot review, 2026-11-05).",
       "required_observations": "Book entries, confirmation status, relay attribution counts, entry changes and time.",
       "independent_check": "The independent book model selects entries and relay accounting from decoded operations, then compares actual book snapshots and outcomes.",
       "oracle_and_generator_files": {

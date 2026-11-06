@@ -103,6 +103,14 @@ def validate(root, evidence=None, at_pin=False):
 
     calibrations = catalogue["calibration"]["runs"]
     require({run["target"] for run in calibrations} == {case["target"] for case in cases}, "calibration target set differs")
+    # A target that never applied its property in calibration can't score a
+    # discovery campaign, so review must exclude its cases from discovery.
+    unapplied = {run["target"] for run in calibrations} - {run["target"] for run in calibrations if run["applicability"] == "observed"}
+    for case in cases:
+        excluded = case.get("discovery_excluded")
+        require(excluded is None or (isinstance(excluded, str) and excluded.strip() != ""), f"{case['id']}: discovery exclusion needs a reason")
+        if case["target"] in unapplied:
+            require(excluded is not None, f"{case['id']}: target never applied in calibration, so discovery must exclude it")
     if evidence is not None:
         validate_evidence(evidence, catalogue, targets, require, check_hash)
     return errors

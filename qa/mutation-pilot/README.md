@@ -144,7 +144,16 @@ equivalent, through an `equivalent` argument on its catalogue entry. An
 intended violation also needs a fresh `zakura-sim confirm` and an Exact
 replay of the confirmed trace. Each report counts results by class and fault
 class. The rate's denominator leaves out baseline failures, invalid mutants
-and equivalent mutants, and keeps not-applicable results.
+and equivalent mutants, and keeps not-applicable results. `discovery` skips
+each case whose catalogue entry sets `discovery_excluded`, and lists it with
+its reason outside the counts. `sensitivity` still runs it.
+
+A scored run waits for a re-pin. The catalogue pins production at
+`870678be1`, an older `main`, and the fuzz inputs at `b2e0456474`, which
+exists only on the merged stack branches. So `--at-pin` can't pass on
+`main`. The re-pin moves
+both pins onto `main` and records fresh baselines and calibration on the
+campaign host.
 
 ## Reproduce the baselines and calibration
 
@@ -191,10 +200,14 @@ duration, input count and applicability are in the bundle under
 to zero of 27,183 cold-start inputs. Its `Holds` gate requires an
 installation, replacement, eviction and sample within one input. Zero
 applicability is not a pass and not coverage. No generator or input repair
-followed. Both record-book cases stay in the discovery denominator. A scored
-run with zero applicability must report `NotApplicable`, not intended
-detection. Their committed sensitivity fixture still applies 13 times, and
-their curated target readiness passed in mut-1.3.
+followed. A scored campaign on that target would be `NotApplicable` before
+it starts, which is a generator gap, not a result. So both record-book cases
+count for sensitivity only. Each catalogue entry sets `discovery_excluded`
+with that reason. The paired runner then runs no campaign for them, and its
+report lists them outside its counts. The Python checker requires the
+exclusion for every case whose target never applied in calibration. Their
+committed sensitivity fixture still applies 13 times, and their curated
+target readiness passed in mut-1.3.
 
 The 600-second allocation keeps the plan's initial proposal. It does not
 promise that any target reaches its trigger within that budget.

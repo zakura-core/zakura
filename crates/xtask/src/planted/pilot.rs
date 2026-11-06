@@ -29,7 +29,9 @@
 //! in a fresh store. Paired campaigns differ only in their store, name and
 //! build. A mutant finding of the intended property must confirm and replay
 //! Exact in fresh processes. It writes `discovery.json`. A scored campaign
-//! runs on a remote campaign host, never locally or in CI.
+//! runs on a remote campaign host, never locally or in CI. A case whose
+//! catalogue entry sets `discovery_excluded` runs no campaign. The report
+//! lists it with that reason, outside its counts.
 //!
 //! Each result is exactly one class of the plan's table ([`Class`]). Each
 //! report counts its results by class and fault class, and the
@@ -193,6 +195,11 @@ struct Case {
     /// Only review sets it; the runner never infers equivalence.
     #[serde(default)]
     equivalent: Option<String>,
+    /// The review's reason that discovery leaves this case out, such as a
+    /// target whose property never applied in calibration. Only review sets
+    /// it. Sensitivity still runs the case.
+    #[serde(default)]
+    discovery_excluded: Option<String>,
 }
 
 /// What every report records about its run.
@@ -216,7 +223,19 @@ struct Report<T> {
     #[serde(flatten)]
     meta: Meta,
     cases: Vec<T>,
+    /// Selected cases that the experiment left out, which the summary
+    /// doesn't count.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    excluded: Vec<Excluded>,
     summary: Summary,
+}
+
+/// A selected case that discovery left out, and the review's reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct Excluded {
+    id: String,
+    fault_class: String,
+    reason: String,
 }
 
 /// One sensitivity case's result.
@@ -309,10 +328,11 @@ pub(crate) fn run(
         }
         "discovery" => {
             let seeds = select_seeds(&catalogue.discovery.seeds, &seeds)?;
+            let (scored, excluded) = discovery_cases(&cases)?;
             fresh_dir(&out)?;
             meta.built_revision = catalogue.fuzz_build_inputs.source_revision.clone();
-            let rows = discovery(repo_root, &catalogue, &cases, &seeds, &out, &work)?;
-            write_report(&out, discovery_report(meta, rows)?)?
+            let rows = discovery(repo_root, &catalogue, &scored, &seeds, &out, &work)?;
+            write_report(&out, discovery_report(meta, rows, excluded)?)?
         }
         _ => {
             return Err(
@@ -349,6 +369,26 @@ fn select<'a>(cases: &'a [Case], only: &[String]) -> Result<Vec<&'a Case>, Strin
     Ok(selected)
 }
 
+/// Splits the selected `cases` into those discovery runs and those whose
+/// catalogue entry excludes them. Fails if it would run none.
+fn discovery_cases<'a>(cases: &[&'a Case]) -> Result<(Vec<&'a Case>, Vec<Excluded>), String> {
+    let (excluded, scored): (Vec<&Case>, Vec<&Case>) = cases
+        .iter()
+        .partition(|case| case.discovery_excluded.is_some());
+    if scored.is_empty() {
+        return Err("zero cases selected for discovery: each selected case is excluded".to_owned());
+    }
+    let excluded = excluded
+        .into_iter()
+        .map(|case| Excluded {
+            id: case.id.clone(),
+            fault_class: case.fault_class.clone(),
+            reason: case.discovery_excluded.clone().unwrap_or_default(),
+        })
+        .collect();
+    Ok((scored, excluded))
+}
+
 /// The seeds `only` names, or every catalogue seed without it. Fails on a
 /// seed the catalogue doesn't allocate, and on zero seeds.
 fn select_seeds(seeds: &[u32], only: &[u32]) -> Result<Vec<u32>, String> {
@@ -379,15 +419,17 @@ fn sensitivity_report(
     Ok(Report {
         meta,
         cases,
+        excluded: Vec::new(),
         summary,
     })
 }
 
-/// The discovery report over `cases`, counting each case's seeds. Fails on
-/// zero results.
+/// The discovery report over `cases`, counting each case's seeds, and
+/// listing the `excluded` cases outside the counts. Fails on zero results.
 fn discovery_report(
     meta: Meta,
     cases: Vec<DiscoveryCase>,
+    excluded: Vec<Excluded>,
 ) -> Result<Report<DiscoveryCase>, String> {
     let summary = classify::summarize(cases.iter().flat_map(|case| {
         case.seeds
@@ -397,6 +439,7 @@ fn discovery_report(
     Ok(Report {
         meta,
         cases,
+        excluded,
         summary,
     })
 }

@@ -464,6 +464,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<header_sync::Storage>(),
     entry::<block_sync::Storage>(),
     entry::<header_sync::HeaderWire>(),
+    entry::<discovery_service::DiscoveryWire>(),
 ];
 
 /// The harness named `name`.

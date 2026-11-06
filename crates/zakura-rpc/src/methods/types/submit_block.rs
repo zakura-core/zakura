@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 
 use zakura_chain::block;
 
@@ -63,7 +63,14 @@ const MAX_MINED_SUBMISSIONS: usize = 16;
 /// Block gossip shares it to tell a tip change caused by a local submission, whose
 /// [`MinedBlockEvent`] follows the tip change, from a relayed block.
 #[derive(Clone, Debug, Default)]
-pub struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
+pub struct MinedSubmissions(Arc<MinedSubmissionsInner>);
+
+#[derive(Debug, Default)]
+struct MinedSubmissionsInner {
+    entries: Mutex<HashSet<block::Hash>>,
+    /// Wakes [`MinedSubmissions::released`] waiters whenever a reservation is dropped.
+    released: Notify,
+}
 
 /// Holds submission capacity until verification and contextual commit finish.
 #[derive(Debug)]
@@ -73,22 +80,40 @@ pub struct MinedSubmission {
 }
 
 impl MinedSubmissions {
-    /// Returns whether this node is submitting `hash` and has not yet sent its final event.
-    pub fn contains(&self, hash: &block::Hash) -> bool {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashSet<block::Hash>> {
         self.0
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(hash)
+    }
+
+    /// Returns whether this node is submitting `hash` and has not yet sent its final event.
+    pub fn contains(&self, hash: &block::Hash) -> bool {
+        self.entries().contains(hash)
+    }
+
+    /// Waits until this node is not submitting `hash`.
+    ///
+    /// A submission sends its final mined-block event, if any, before it releases its
+    /// reservation, so once this returns that event is already queued.
+    pub async fn released(&self, hash: &block::Hash) {
+        loop {
+            // Register before checking, so a release between the check and the wait still wakes us.
+            let notified = self.0.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.contains(hash) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Records that this node is submitting `hash` until the returned guard is dropped.
     ///
     /// Fails if `hash` is already being submitted, or too many submissions are in flight.
     pub fn reserve(&self, hash: block::Hash) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
-        let mut entries = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = self.entries();
         if entries.contains(&hash) {
             return Err(SubmitBlockErrorResponse::DuplicateInconclusive);
         }
@@ -105,11 +130,8 @@ impl MinedSubmissions {
 
 impl Drop for MinedSubmission {
     fn drop(&mut self) {
-        self.submissions
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.hash);
+        self.submissions.entries().remove(&self.hash);
+        self.submissions.0.released.notify_waiters();
     }
 }
 
@@ -475,6 +497,27 @@ mod tests {
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .expect("the genesis test vector is valid")
+    }
+
+    /// `released` returns at once for a hash that is not reserved, and otherwise when its
+    /// reservation is dropped, even if other reservations remain.
+    #[tokio::test]
+    async fn released_waits_for_the_reservation_to_drop() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([1; 32]);
+        submissions.released(&hash).await;
+
+        let reservation = submissions.reserve(hash).unwrap();
+        let _other = submissions.reserve(block::Hash([2; 32])).unwrap();
+        let released = submissions.released(&hash);
+        tokio::pin!(released);
+        assert!(
+            futures::poll!(released.as_mut()).is_pending(),
+            "the reservation is still held"
+        );
+
+        drop(reservation);
+        assert!(futures::poll!(released.as_mut()).is_ready());
     }
 
     #[test]

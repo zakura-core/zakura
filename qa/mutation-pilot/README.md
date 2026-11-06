@@ -16,11 +16,11 @@ defines the broader acceptance criteria.
 
 | Build | Revision | Toolchain |
 | --- | --- | --- |
-| Dev/test witness simulator | `870678be1739ea799e59b4e0bdfe6cf512792710` | Rust 1.99.0, `--cfg zakura_sim`, no debug information or incremental compilation |
-| Fuzz targets | `b2e0456474e47e6264c912b2f6b50d09c8603115` | `nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, `--sanitizer none` |
+| Dev/test witness simulator | `debba4e31dde0c2d5a01b7988fcf07902bd1a538` | Rust 1.99.0, `--cfg zakura_sim`, no debug information or incremental compilation |
+| Fuzz targets | `debba4e31dde0c2d5a01b7988fcf07902bd1a538` | `nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, `--sanitizer none` |
 
-The fuzz revision keeps the production source of the witness revision.
-It adds only the refreshed `qa/fuzz/sim/Cargo.lock` from mut-1.3.
+Both builds use one `main` commit. #2083 refreshed `qa/fuzz/sim/Cargo.lock`
+on `main`, so the fuzz build needs no commit of its own.
 `scripts/check_mutation_pilot.py` checks the pilot's own inputs under `qa/`
 on any tree. `--at-pin` also requires the tree's production, oracle and lock
 files to equal both revisions, which a pilot run needs. `crates/xtask` holds
@@ -148,12 +148,14 @@ and equivalent mutants, and keeps not-applicable results. `discovery` skips
 each case whose catalogue entry sets `discovery_excluded`, and lists it with
 its reason outside the counts. `sensitivity` still runs it.
 
-A scored run waits for a re-pin. The catalogue pins production at
-`870678be1`, an older `main`, and the fuzz inputs at `b2e0456474`, which
-exists only on the merged stack branches. So `--at-pin` can't pass on
-`main`. The re-pin moves
-both pins onto `main` and records fresh baselines and calibration on the
-campaign host.
+The catalogue first pinned production at `870678be1` and the fuzz inputs
+at `b2e0456474`, which existed only on the stack branches that merged as
+squashes. The re-pin moved both onto `main` at `debba4e31` and recorded
+fresh baselines and calibration on the campaign host. Between the two pins,
+`main` changed three pinned files: `discovery/protocol.rs`,
+`header_sync/reactor/state.rs` and `header_sync/reactor/machine_tests.rs`.
+Every patch still applies. Every baseline trace matches the first pin's
+record for record after its `meta` record, which names the new build.
 
 ## Reproduce the baselines and calibration
 
@@ -169,9 +171,11 @@ timeout 60 "$SIM" replay "$OUT"
   --fixtures qa/mutation-pilot/discovery-empty --report "$OUT/empty-seeds.json"
 ```
 
-Calibration builds each target with the fuzz toolchain above and starts a
-new empty corpus with seed 11. Each run record in the bundle holds its exact
-command and environment. Remove `ZAKURA_SIM_EXPECT` and the sanitizer
+Calibration builds each target as a discovery lane does, with
+`"$SIM" campaign build --store "$STORE" --target "$TARGET" --sanitizer none`,
+and runs the store's fuzzer from a new empty corpus with seed 11. Each run
+record in the bundle holds its exact command, environment and build
+identity. Remove `ZAKURA_SIM_EXPECT` and the sanitizer
 option variables, as the record lists. Never reuse a calibration corpus for
 scoring.
 
@@ -197,7 +201,8 @@ duration, input count and applicability are in the bundle under
 `calibration/<target>/`. Throughput is host-specific.
 
 **Record-book applicability remains open.** `discovery_record_book` applied
-to zero of 27,183 cold-start inputs. Its `Holds` gate requires an
+to zero of 17,071 cold-start inputs at the re-pin (3,617 in 5 s and 13,454
+in 30 s), and to zero of 27,183 at the first pin. Its `Holds` gate requires an
 installation, replacement, eviction and sample within one input. Zero
 applicability is not a pass and not coverage. No generator or input repair
 followed. A scored campaign on that target would be `NotApplicable` before
@@ -214,22 +219,23 @@ promise that any target reaches its trigger within that budget.
 
 ## Evidence bundle
 
-`2043-mut-2-2026-11-05.tar.zst`, SHA-256
-`fbf6210f4be815c2e47cfb43859c41f89335b9149eb1ee65495fc753f2255df2`.
-The mutation plan in Outline holds it as an attachment. Extract it and pass
-`2043-mut-2-2026-11-05/` as `--evidence`. `baseline.directory` and
+`2063-mut-3-repin-2026-11-06.tar.zst`, SHA-256
+`c4fc16e6c00f8394e7bb926f57442b4989d559b1626690f1a2948075e0f0935d`.
+It is an [Outline attachment](https://valargroup.getoutline.com/api/attachments.redirect?id=062d5ce9-ce65-4b7e-be4d-b16b10b05c05),
+listed in the mutation plan's evidence table. Extract it and pass
+`2063-mut-3-repin-2026-11-06/` as `--evidence`. `baseline.directory` and
 `calibration.runs[].directory` in the catalogue resolve inside that
 directory. `SHA256SUMS` inside the bundle covers every other file.
 
 ```text
-2043-mut-2-2026-11-05/SHA256SUMS
-2043-mut-2-2026-11-05/baseline/results.json
-2043-mut-2-2026-11-05/baseline/{block-decoded-retention,block-reactor-identity,block-reactor-policy}/{input.bin,trace.jsonl,witness.json}
-2043-mut-2-2026-11-05/baseline/{discovery-record-book,header-publisher-policy,header-reactor-policy}/{input.bin,trace.jsonl,witness.json}
-2043-mut-2-2026-11-05/baseline/<stem>.log, one per input stem above
-2043-mut-2-2026-11-05/baseline/<stem>-discovery-seeds.json for block-decoded-retention, block-reactor-policy, discovery-record-book, header-publisher-policy, header-reactor-policy
-2043-mut-2-2026-11-05/calibration/{block_decoded_retention,block_reactor_policy,discovery_record_book,header_publisher_policy,header_reactor_policy}/{run.json,run.log,stats/stats-3.json}
-2043-mut-2-2026-11-05/calibration/discovery_record_book-30s/{run.json,run.log,stats/stats-4121690.json}
+2063-mut-3-repin-2026-11-06/SHA256SUMS
+2063-mut-3-repin-2026-11-06/baseline/results.json
+2063-mut-3-repin-2026-11-06/baseline/{block-decoded-retention,block-reactor-identity,block-reactor-policy}/{input.bin,trace.jsonl,witness.json}
+2063-mut-3-repin-2026-11-06/baseline/{discovery-record-book,header-publisher-policy,header-reactor-policy}/{input.bin,trace.jsonl,witness.json}
+2063-mut-3-repin-2026-11-06/baseline/<stem>.log, one per input stem above
+2063-mut-3-repin-2026-11-06/baseline/<stem>-discovery-seeds.json for block-decoded-retention, block-reactor-policy, discovery-record-book, header-publisher-policy, header-reactor-policy
+2063-mut-3-repin-2026-11-06/calibration/{block_decoded_retention,block_reactor_policy,discovery_record_book,header_publisher_policy,header_reactor_policy}/{run.json,run.log,stats/stats-<pid>.json}
+2063-mut-3-repin-2026-11-06/calibration/discovery_record_book-30s/{run.json,run.log,stats/stats-<pid>.json}
 ```
 
 ## Exclusions and remaining work

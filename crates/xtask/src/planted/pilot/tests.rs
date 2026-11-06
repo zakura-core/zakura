@@ -824,7 +824,9 @@ fn reports_count_classes_and_rates() {
 #[test]
 fn discovery_leaves_out_excluded_cases() {
     let catalogue = committed_catalogue();
+    // Sensitivity runs every selected case, the record-book cases included.
     let cases = select(&catalogue.cases, &[]).expect("every case");
+    assert_eq!(cases.len(), 10);
     let (scored, excluded) = discovery_cases(&cases).expect("some case is scored");
     assert_eq!(scored.len(), 8);
     let ids: Vec<&str> = excluded.iter().map(|case| case.id.as_str()).collect();

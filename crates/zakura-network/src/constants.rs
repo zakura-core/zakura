@@ -85,32 +85,32 @@ pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
 /// The default advert window of a block at or above the full size.
 ///
-/// This will be used as `Config.advert_window_min` if it is not configured. It equals
-/// [`DEFAULT_ADVERT_WINDOW_MAX`], so by default every block is advertised to up to 1000 peers at
+/// This will be used as `Config.advert_window_full_block` if it is not configured. It equals
+/// [`DEFAULT_ADVERT_WINDOW_SMALL_BLOCK`], so by default every block is advertised to up to 1000 peers at
 /// once, whatever its size.
-pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 1000;
+pub const DEFAULT_ADVERT_WINDOW_FULL_BLOCK: usize = 1000;
 
 /// The default advert window of a block at or below the small size.
 ///
-/// This will be used as `Config.advert_window_max` if it is not configured.
-pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 1000;
+/// This will be used as `Config.advert_window_small_block` if it is not configured.
+pub const DEFAULT_ADVERT_WINDOW_SMALL_BLOCK: usize = 1000;
 
-/// The `advert_window_min` default before it became [`DEFAULT_ADVERT_WINDOW_MIN`].
+/// The `advert_window_full_block` default before it became [`DEFAULT_ADVERT_WINDOW_FULL_BLOCK`].
 ///
 /// `zakurad generate` wrote it into config files, so a loaded config treats it as unset.
-pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
+pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_FULL_BLOCK: usize = 32;
 
-/// The `advert_window_max` default before it became [`DEFAULT_ADVERT_WINDOW_MAX`].
+/// The `advert_window_small_block` default before it became [`DEFAULT_ADVERT_WINDOW_SMALL_BLOCK`].
 ///
 /// `zakurad generate` wrote it into config files, so a loaded config treats it as unset.
-pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_SMALL_BLOCK: usize = 64;
 
-/// The default block size that gets the maximum advert window, 100 KiB.
+/// The default block size at and below which a block gets the small-block advert window, 100 KiB.
 ///
 /// This will be used as `Config.advert_window_small_size_bytes` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES: u64 = 102_400;
 
-/// The default block size that gets the minimum advert window, 1.5 MiB.
+/// The default block size at and above which a block gets the full-block advert window, 1.5 MiB.
 ///
 /// This will be used as `Config.advert_window_full_size_bytes` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES: u64 = 1_572_864;

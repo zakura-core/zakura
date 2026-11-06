@@ -75,8 +75,8 @@ pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
 /// Chooses how many peers one block broadcast advertises to at once, from the block's size.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdvertFanout {
-    min: usize,
-    max: usize,
+    full_block_window: usize,
+    small_block_window: usize,
     small_size_bytes: u64,
     full_size_bytes: u64,
 }
@@ -85,8 +85,8 @@ impl AdvertFanout {
     /// Returns the fan-out policy in `config`.
     pub(crate) fn from_config(config: &Config) -> Self {
         Self {
-            min: config.advert_window_min,
-            max: config.advert_window_max,
+            full_block_window: config.advert_window_full_block,
+            small_block_window: config.advert_window_small_block,
             small_size_bytes: config.advert_window_small_size_bytes,
             full_size_bytes: config.advert_window_full_size_bytes,
         }
@@ -94,19 +94,25 @@ impl AdvertFanout {
 
     /// Returns the advert window of a block of `size` serialized bytes, and records it in metrics.
     ///
-    /// Blocks at or below `small_size_bytes` use `max`.
-    /// Blocks at or above `full_size_bytes`, and blocks of unknown size, use `min`.
-    /// Between these sizes, the window decreases linearly from `max` to `min`, rounded down.
+    /// Blocks at or below `small_size_bytes` use `small_block_window`.
+    /// Blocks at or above `full_size_bytes`, and blocks of unknown size, use `full_block_window`.
+    /// Between these sizes, the window decreases linearly from `small_block_window` to
+    /// `full_block_window`, rounded down.
     pub(crate) fn window(&self, size: Option<u32>) -> usize {
-        let window = size.map_or(self.min, |size| {
+        let window = size.map_or(self.full_block_window, |size| {
             let size = u64::from(size).max(self.small_size_bytes);
             let below_full = self.full_size_bytes.saturating_sub(size);
             let size_range = self.full_size_bytes.saturating_sub(self.small_size_bytes);
+            let window_range = self
+                .small_block_window
+                .saturating_sub(self.full_block_window);
             // Both factors fit in 64 bits, so the product cannot overflow.
-            let above_min = self.max.saturating_sub(self.min) as u128 * u128::from(below_full)
-                / u128::from(size_range.max(1));
-            // `above_min` is at most `max - min`.
-            usize::try_from(above_min).map_or(self.max, |above_min| self.min + above_min)
+            let above_full =
+                window_range as u128 * u128::from(below_full) / u128::from(size_range.max(1));
+            // `above_full` is at most `window_range`.
+            usize::try_from(above_full).map_or(self.small_block_window, |above_full| {
+                self.full_block_window + above_full
+            })
         });
         if let Some(size) = size {
             metrics::histogram!("peer.block_gossip.advert_block_size_bytes")
@@ -1196,8 +1202,8 @@ mod tests {
     /// can see a broadcast's waves and its size-based window.
     fn sized_window_config() -> Config {
         Config {
-            advert_window_min: 32,
-            advert_window_max: 64,
+            advert_window_full_block: 32,
+            advert_window_small_block: 64,
             ..Config::default()
         }
     }
@@ -1242,13 +1248,13 @@ mod tests {
         assert_eq!(fanout.window(Some(MID_SIZE + 1)), 47);
     }
 
-    /// Equal bounds give a fixed window, and large bounds do not overflow.
+    /// Equal windows give a fixed window, and large windows do not overflow.
     #[test]
     fn advert_window_uses_configured_bounds() {
-        let fanout = |min, max| {
+        let fanout = |full_block, small_block| {
             AdvertFanout::from_config(&Config {
-                advert_window_min: min,
-                advert_window_max: max,
+                advert_window_full_block: full_block,
+                advert_window_small_block: small_block,
                 advert_window_full_size_bytes: u64::MAX,
                 ..Config::default()
             })
@@ -1263,8 +1269,8 @@ mod tests {
     #[test]
     fn advert_window_uses_configured_sizes() {
         let fanout = AdvertFanout::from_config(&Config {
-            advert_window_min: 4,
-            advert_window_max: 12,
+            advert_window_full_block: 4,
+            advert_window_small_block: 12,
             advert_window_small_size_bytes: 100,
             advert_window_full_size_bytes: 1_000,
             ..Config::default()
@@ -1295,7 +1301,7 @@ mod tests {
     /// Sidecars beyond the window are all advertised at once, outside the window.
     #[tokio::test(start_paused = true)]
     async fn sidecars_beyond_the_window_go_first() {
-        // More sidecars than the minimum window of 32, which a 10 MB block uses.
+        // More sidecars than the full-block window of 32, which a 10 MB block uses.
         const SIDECARS: usize = 40;
         let mut peers = plain_peers(SIDECARS + 40);
         for peer in &mut peers[..SIDECARS] {
@@ -1305,7 +1311,7 @@ mod tests {
         assert_eq!(
             wave.len(),
             SIDECARS + 32,
-            "every sidecar plus a minimum window: {wave:?}"
+            "every sidecar plus a full-block window: {wave:?}"
         );
         assert!(
             (0..SIDECARS).all(|sidecar| wave.contains(&sidecar)),
@@ -1574,8 +1580,8 @@ mod tests {
             let slots = BlockUploadSlots::new(1);
             let advertiser = BlockAdvertiser {
                 fanout: AdvertFanout::from_config(&Config {
-                    advert_window_min: 1,
-                    advert_window_max: 2,
+                    advert_window_full_block: 1,
+                    advert_window_small_block: 2,
                     advert_window_small_size_bytes: 0,
                     advert_window_full_size_bytes: 100,
                     ..Config::default()

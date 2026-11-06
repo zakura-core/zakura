@@ -1174,9 +1174,10 @@ impl ActionSource for Control {
             ControlAction::Shutdown if self.shut_down => {
                 Some("the node is already shut down".to_owned())
             }
-            ControlAction::Relink | ControlAction::Reset(_) | ControlAction::Release { .. }
-                if self.shut_down =>
-            {
+            ControlAction::Relink if self.shut_down => {
+                Some(format!("relinking {} after the shutdown", step.peer))
+            }
+            ControlAction::Reset(_) | ControlAction::Release { .. } if self.shut_down => {
                 Some(format!(
                     "a {} of {} after the shutdown",
                     step.action.name(),

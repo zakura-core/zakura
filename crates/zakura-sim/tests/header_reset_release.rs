@@ -465,3 +465,62 @@ fn the_grammar_cant_encode_resets_releases_or_stops() {
     stop.controls = vec![node_step(ControlAction::StopStorage, None)];
     assert!(grammar::encode(&stop).is_err());
 }
+
+/// The failure a step after the node's shutdown gives, as `ControlFailed`
+/// text.
+fn failure_after_shutdown(step: ControlStep) -> String {
+    let scenario = StorageScenario {
+        node: Chain::default(),
+        mirrors: vec![mirror(Chain::main(2), Dialer::Mirror)],
+        // A hold for the release to name, on an operation the run never has.
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Locator, 99),
+                until: Trigger::Released,
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![node_step(ControlAction::Shutdown, None), step],
+    };
+    run_prepared::<Storage>(
+        &scenario,
+        Storage::prepare(&scenario),
+        inputs(1, 64).remove(0),
+        &mut MemorySink::default(),
+        None,
+    )
+    .map(|report| format!("{:?}", report.end))
+    .expect_err("the step can't take effect")
+    .to_string()
+}
+
+/// A relink after the shutdown keeps the failure text it had before resets
+/// and releases existed, and a reset or release after it fails too.
+#[test]
+fn steps_after_the_shutdown_fail_with_their_own_text() {
+    let relink = ControlStep {
+        peer: "mirror-0".to_owned(),
+        action: ControlAction::Relink,
+        when: None,
+    };
+    let failure = failure_after_shutdown(relink);
+    assert!(
+        failure.contains("ControlFailed: relinking mirror-0 after the shutdown"),
+        "{failure}"
+    );
+    for (action, text) in [
+        (
+            ControlAction::Reset(Reset::Reconsider),
+            "ControlFailed: a reset of node after the shutdown",
+        ),
+        (
+            ControlAction::Release { hold: 0 },
+            "ControlFailed: a release of node after the shutdown",
+        ),
+    ] {
+        let failure = failure_after_shutdown(node_step(action, None));
+        assert!(failure.contains(text), "{failure}");
+    }
+}

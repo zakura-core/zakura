@@ -239,8 +239,11 @@ async fn delayed_completion(early_inventory: bool, hold_until_timeout: bool) {
                 } else {
                     assert!(matches!(first, Request::AdvertiseMinedBlock(block) if block.hash == committed));
                 }
-                println!(
-                    "early_inventory={early_inventory}, held_until_timeout={hold_until_timeout}, first_advertisement_delay={delay:?}"
+                tracing::info!(
+                    early_inventory,
+                    held_until_timeout = hold_until_timeout,
+                    first_advertisement_delay = ?delay,
+                    "observed first block advertisement"
                 );
 
                 if let Some(response) = verification_response.take() {

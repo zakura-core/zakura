@@ -677,6 +677,16 @@ impl HeaderSyncReactor {
                 },
                 None,
             ),
+            #[cfg(test)]
+            Event::DropUnproductiveForTest { peer } => {
+                if let Some(session_id) = self
+                    .sessions
+                    .get(&peer)
+                    .map(|handles| handles.session.session_id())
+                {
+                    self.drop_unproductive_peer(&peer, session_id, "test");
+                }
+            }
         }
     }
 

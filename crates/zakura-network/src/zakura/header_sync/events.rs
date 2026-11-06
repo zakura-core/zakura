@@ -389,6 +389,14 @@ pub enum Event {
         /// Commit, stale-work, peer-invalid, or local-failure result.
         result: HeaderTargetAdmissionResult,
     },
+    /// Drops `peer`'s current session as unproductive, which starts its
+    /// readmission cooldown, so transport tests can reach the cooldown
+    /// without staging a failing request.
+    #[cfg(test)]
+    DropUnproductiveForTest {
+        /// The peer to drop.
+        peer: ZakuraPeerId,
+    },
 }
 
 /// Result of resolving one branch-owned VCT repair against durable state.
@@ -419,6 +427,8 @@ impl Event {
             Self::HeaderTargetPrepared { .. } => "header_target_prepared",
             #[cfg(any(test, feature = "zakura-testkit"))]
             Self::HeaderTargetAdmissionReady { .. } => "header_target_admission_ready",
+            #[cfg(test)]
+            Self::DropUnproductiveForTest { .. } => "drop_unproductive_for_test",
         }
     }
 }

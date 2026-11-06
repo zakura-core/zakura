@@ -324,13 +324,17 @@ fn resets_with_nothing_to_do_publish_nothing() {
     }
 }
 
-/// The node at A5 serving `mirror-1` at genesis. Its first page read is
-/// held until a `Release`, which the Plan places once the first acquire has
-/// completed.
+/// The node at A5 serving `mirror-0` at genesis and syncing from
+/// `mirror-1` at A7. Its first page read is held until a `Release`, which
+/// the Plan places once that read is pending and the node's first apply,
+/// which the read doesn't depend on, has completed.
 fn released_read() -> StorageScenario {
     StorageScenario {
         node: Chain::main(5),
-        mirrors: vec![mirror(Chain::default(), Dialer::Node)],
+        mirrors: vec![
+            mirror(Chain::default(), Dialer::Node),
+            mirror(Chain::main(7), Dialer::Mirror),
+        ],
         policy: Policy {
             holds: vec![Hold {
                 select: Select::nth(OpKind::Read, 1),
@@ -342,13 +346,16 @@ fn released_read() -> StorageScenario {
         },
         controls: vec![node_step(
             ControlAction::Release { hold: 0 },
-            Some(Trigger::Completed(Select::nth(OpKind::Acquire, 1))),
+            Some(Trigger::All(vec![
+                Trigger::Submitted(Select::nth(OpKind::Read, 1)),
+                Trigger::Completed(Select::nth(OpKind::Apply, 1)),
+            ])),
         )],
     }
 }
 
-/// A read held until a release completes only after the release's pick,
-/// which comes after the acquire's completion.
+/// A read held until a release is pending at the release's pick and
+/// completes only after it, and the unrelated apply completed first.
 #[test]
 fn a_released_read_completes_after_its_release() {
     let scenario = released_read();
@@ -357,17 +364,27 @@ fn a_released_read_completes_after_its_release() {
         let [release] = picked(&report, "release")[..] else {
             panic!("one release");
         };
-        let acquire = submitted(&report, |request| {
-            matches!(request, StorageRequest::AcquireHeaderPath { .. })
+        let apply = submitted(&report, |request| {
+            matches!(request, StorageRequest::ApplyHeaderTarget { .. })
         })
-        .expect("the node serves an acquire");
+        .expect("the node applies mirror-1's headers");
         let read = submitted(&report, |request| {
             matches!(request, StorageRequest::ReadHeaderPath { .. })
         })
         .expect("the node serves a read");
-        let (acquired, _) = completed(&report, acquire).expect("the acquire completes");
+        let asked = facts(&report)
+            .into_iter()
+            .find_map(|(step, fact)| match fact {
+                StorageFact::Submitted { id, .. } if id == read => Some(step),
+                _ => None,
+            })
+            .expect("the read is submitted");
+        let (applied, _) = completed(&report, apply).expect("the apply completes");
         let (served, _) = completed(&report, read).expect("the read completes");
-        assert!(acquired <= release && release < served);
+        assert!(
+            asked < release && applied < release && release < served,
+            "read submitted {asked}, apply done {applied}, release {release}, read done {served}"
+        );
     }
 }
 

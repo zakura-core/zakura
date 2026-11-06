@@ -6,8 +6,8 @@
 # tests' fuzz inputs: `regenerate_reset_mid_flight_input` in
 # block_semantic_properties.rs writes the first one whose run submits bodies
 # of an old and a new body-work epoch, and where first-completion-wins
-# credits a submission to a request of the other connection. Rerun it when a
-# block-sync change moves the input off that crossing.
+# credits a submission whose body crossed in another request's exchange.
+# Rerun it when a block-sync change moves the input off that crossing.
 harness = "block-sync/storage"
 generator = 2
 sha256 = "db878ab38107f578cd10dfc9ded692e63676cfa3032707cae19e6dbd0a089933"

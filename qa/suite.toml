@@ -304,8 +304,8 @@ reason = "no target yet; `cargo xtask sim-targets` checks one once its table ent
 
 [[missing-target]]
 harness = "discovery/wire"
-owner = "disc-3"
-reason = "no target yet; the goal adds no fuzz target, and disc-3 registers the properties a target would check"
+owner = "fuzz-10"
+reason = "no target yet; no plan maps it to a target, and disc-3 registers the properties one would check"
 
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and

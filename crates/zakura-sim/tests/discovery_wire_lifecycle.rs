@@ -1,9 +1,9 @@
 //! disc-2.3: `discovery/wire`'s saved Plans. Each committed Plan replays to
 //! its pinned end record, and shows the history its scenario exists for: a
-//! completed exchange, a timed-out one, verification one record at a time,
-//! and a dial of a static candidate. A run repeats under its Plan alone,
-//! with another run between, and replays Exact in a fresh process through
-//! `zakura-sim replay`. A history a test needs that never happened fails
+//! completed exchange, a timed-out one, verification on `discovery_verify`
+//! tasks, and a dial of a static candidate. A run repeats under its Plan
+//! alone, with another run between, and replays Exact in a fresh process
+//! through `zakura-sim replay`. A history a test needs that never happened fails
 //! it: a missing observation is a harness failure, never evidence.
 #![cfg(zakura_sim)]
 
@@ -116,8 +116,9 @@ fn closes(report: &RunReport) -> Vec<(u64, String)> {
 }
 
 /// How long after the node admitted its first discovery session the node
-/// closed that session's connection.
-fn admission_to_close(report: &RunReport) -> Duration {
+/// closed that session's connection, and how many timers fired between the
+/// two.
+fn admission_to_close(report: &RunReport) -> (Duration, usize) {
     let entries = report.log.entries();
     let times = times(report);
     let (admitted, connection) = entries
@@ -137,7 +138,14 @@ fn admission_to_close(report: &RunReport) -> Duration {
                 Observation::ConnectionClosed { connection: closed, .. } if *closed == connection)
         })
         .expect("the node closed the session's connection");
-    times[closed] - times[admitted]
+    let fired = entries[admitted..closed]
+        .iter()
+        .map(|entry| match entry.obs {
+            Observation::TimeAdvanced { fired, .. } => fired,
+            _ => 0,
+        })
+        .sum();
+    (times[closed] - times[admitted], fired)
 }
 
 /// The rows of the peers' discovery `PeerFrame`s on `connection`, with
@@ -176,24 +184,17 @@ fn label(task: &str) -> &str {
     last.split('.').next().unwrap_or(last)
 }
 
-/// The `discovery_verify` tasks the run spawned, and the most that were
-/// live at once.
-fn verifications(report: &RunReport) -> (usize, usize) {
-    let (mut spawned, mut live, mut most) = (0, 0_usize, 0);
-    for entry in report.log.entries() {
-        match &entry.obs {
-            Observation::TaskSpawned { task } if label(task) == "discovery_verify" => {
-                spawned += 1;
-                live += 1;
-                most = most.max(live);
-            }
-            Observation::TaskExited { task, .. } if label(task) == "discovery_verify" => {
-                live -= 1;
-            }
-            _ => {}
-        }
-    }
-    (spawned, most)
+/// The `discovery_verify` tasks the run spawned.
+fn verifications(report: &RunReport) -> usize {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.obs,
+                Observation::TaskSpawned { task } if label(task) == "discovery_verify")
+        })
+        .count()
 }
 
 /// The book's record for `node`, read once the run has ended. Every task has
@@ -231,18 +232,22 @@ fn registered_from_peer_0(report: &RunReport) -> Vec<u64> {
 /// `discovery-wire-*.end.json`. Its prefix picks the saved scenario. No run
 /// fails or violates a property, and each shows its history:
 ///
-/// - `exchange`: the peer's three answers are conformant, the node closes
-///   with `discovery_exchange_complete` sooner after the session's
-///   admission than `timed-out`'s initial wait lets it, so `wait_complete`
-///   woke the node, and the book holds the record the peer relayed. The
-///   peer's own `Hello` names its private `10.x` address, so the node drops
-///   that record.
+/// - `exchange`: the peer's three answers are conformant, and the node
+///   closes with `discovery_exchange_complete` before any timer fires after
+///   the session's admission. The initial wait ends on cancellation,
+///   `wait_complete` or its timer, and a cancelled wait closes nothing, so
+///   `wait_complete` woke the node. A wait that times out closes the same
+///   way once its answer wait ends. The book holds the record the peer
+///   relayed. The peer's own `Hello` names its private `10.x` address, so
+///   the node drops that record.
 /// - `timed-out`: the node closes with `discovery_exchange_timed_out` once
-///   its initial wait and its answer wait end, before the peer's held
-///   `Hello` goes.
+///   its initial wait's timer fires and its answer wait ends, later after
+///   admission than `exchange` closes, and before the peer's held `Hello`
+///   goes.
 /// - `verification`: the peer's `Hello` verifies on one `discovery_verify`
 ///   task, and its `Peers` on another, which checks every relayed record.
-///   The two never run at once, and every relayed record enters the book.
+///   Every relayed record enters the book. The run doesn't show the
+///   verification slot rule; `discovery/verification-capacity` covers it.
 /// - `static-dial`: the node dials the listening peer it holds as a static
 ///   candidate, registers the connection, and the exchange on it
 ///   completes.
@@ -272,7 +277,9 @@ fn saved_plans_replay_their_end_records() {
                     book_record(&handle, relayed_node(0)),
                     "{name}: no relayed record"
                 );
-                waits.push((plan, admission_to_close(&report)));
+                let (wait, fired) = admission_to_close(&report);
+                assert_eq!(fired, 0, "{name}: a timer fired before the close");
+                waits.push((plan, wait));
             }
             SavedPlan::TimedOut => {
                 let [(connection, cause)] = &closes[..] else {
@@ -284,7 +291,9 @@ fn saved_plans_replay_their_end_records() {
                     [("peers", "conformant"), ("services", "conformant")],
                     "{name}: the held Hello never goes"
                 );
-                waits.push((plan, admission_to_close(&report)));
+                let (wait, fired) = admission_to_close(&report);
+                assert_ne!(fired, 0, "{name}: no timer ended the initial wait");
+                waits.push((plan, wait));
             }
             SavedPlan::Verification => {
                 assert_eq!(
@@ -297,12 +306,11 @@ fn saved_plans_replay_their_end_records() {
                 );
                 // The Hello's, then the Peers', which checks every relayed
                 // record in one task.
-                let (spawned, most) = verifications(&report);
                 assert_eq!(
-                    spawned, 2,
+                    verifications(&report),
+                    2,
                     "{name}: the Hello's and the Peers' verifications"
                 );
-                assert_eq!(most, 1, "{name}: one verification at a time");
                 for index in 0..RELAYED {
                     assert!(
                         book_record(&handle, relayed_node(index)),

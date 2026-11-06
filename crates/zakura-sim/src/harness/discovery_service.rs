@@ -43,7 +43,8 @@ pub struct NodeSpec {
     /// The verification slots its handle has, in place of the host's count.
     pub verification_slots: usize,
     /// The scripted peers, by distinct index, that it holds as static
-    /// bootstrap candidates and keeps dialing.
+    /// bootstrap candidates and keeps dialing. An index no peer takes names
+    /// an address nobody listens on.
     pub static_candidates: Vec<usize>,
 }
 
@@ -60,51 +61,51 @@ pub fn spawn_node(
     observer: Arc<dyn TransportObserver>,
     dials: DialReporter,
 ) {
-        let bootstrap_peers = bootstrap_peers(seed, &spec.static_candidates);
-        let slots = spec.verification_slots;
-        let handshake = ZakuraHandshakeConfig::for_network(network);
-        WireEndpoint::spawn(
-            sim,
-            network,
-            net,
-            seed,
-            observer,
-            dials,
-            {
-                let bootstrap_count = bootstrap_peers.len();
-                move |supervisor, limits| {
-                    let handle = build_discovery_handle(
-                        SeededInputs::node_key(seed, 0),
-                        // As production passes its listen address. The
-                        // address is private, so the node's record drops it.
-                        vec![NODE_ADDR],
-                        // The node serves discovery alone.
-                        vec![ZakuraServiceId::discovery()],
-                        &handshake,
-                        limits.max_connections,
-                        bootstrap_count,
-                        supervisor.subscribe(),
-                    )
-                    .expect("production's config on the fixture network is valid")
-                    .with_verification_slots(slots);
-                    let service: Arc<dyn Service> = Arc::new(DiscoveryService::new(handle.clone()));
-                    (vec![service], handle)
-                }
-            },
-            |endpoint, limits, handle| async move {
-                insert_static_bootstrap_candidates(&handle, &bootstrap_peers).await;
-                let mut tasks =
-                    spawn_native_bootstrap_dialer(endpoint.clone(), bootstrap_peers, limits.clone());
-                // A node with no custom services seeks none.
-                tasks.push(spawn_native_discovery_dialer(
-                    endpoint,
-                    handle,
-                    limits,
-                    Vec::new(),
-                ));
-                tasks
-            },
-        );
+    let bootstrap_peers = bootstrap_peers(seed, &spec.static_candidates);
+    let slots = spec.verification_slots;
+    let handshake = ZakuraHandshakeConfig::for_network(network);
+    WireEndpoint::spawn(
+        sim,
+        network,
+        net,
+        seed,
+        observer,
+        dials,
+        {
+            let bootstrap_count = bootstrap_peers.len();
+            move |supervisor, limits| {
+                let handle = build_discovery_handle(
+                    SeededInputs::node_key(seed, 0),
+                    // As production passes its listen address. The
+                    // address is private, so the node's record drops it.
+                    vec![NODE_ADDR],
+                    // The node serves discovery alone.
+                    vec![ZakuraServiceId::discovery()],
+                    &handshake,
+                    limits.max_connections,
+                    bootstrap_count,
+                    supervisor.subscribe(),
+                )
+                .expect("production's config on the fixture network is valid")
+                .with_verification_slots(slots);
+                let service: Arc<dyn Service> = Arc::new(DiscoveryService::new(handle.clone()));
+                (vec![service], handle)
+            }
+        },
+        |endpoint, limits, handle| async move {
+            insert_static_bootstrap_candidates(&handle, &bootstrap_peers).await;
+            let mut tasks =
+                spawn_native_bootstrap_dialer(endpoint.clone(), bootstrap_peers, limits.clone());
+            // A node with no custom services seeks none.
+            tasks.push(spawn_native_discovery_dialer(
+                endpoint,
+                handle,
+                limits,
+                Vec::new(),
+            ));
+            tasks
+        },
+    );
 }
 
 /// The bootstrap entries, `<node_id>@<addr>`, for scripted peers `indexes`
@@ -121,8 +122,8 @@ fn bootstrap_peers(seed: [u8; 32], indexes: &[usize]) -> Vec<String> {
 
 /// Adds `net`'s network and a transport tap, spawns the discovery node of
 /// `spec` on Regtest behind it, then spawns each of sim-5's scripted
-/// `peers`, named `peer-<i>`, and adds their action source. A listening
-/// peer is dialed only if `spec` holds it as a static candidate.
+/// `peers`, named `peer-<i>`, and adds their action source. The node
+/// dials a listening peer only if `spec` holds it as a static candidate.
 ///
 /// # Panics
 ///

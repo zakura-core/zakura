@@ -1758,6 +1758,9 @@ where
                 self.remove(&addr);
                 async { Ok(Response::Nil) }.boxed()
             }
+            Request::BanZakuraPeer(_) => {
+                async { Err("Zakura peer bans require the v2 network service".into()) }.boxed()
+            }
             // Only do inventory-aware routing on individual items.
             Request::BlocksByHash(ref hashes) | Request::BlocksByHashFrom { ref hashes, .. }
                 if hashes.len() == 1 =>

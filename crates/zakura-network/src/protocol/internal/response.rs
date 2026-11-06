@@ -13,7 +13,11 @@ use zakura_chain::{
     transaction::{UnminedTx, UnminedTxId},
 };
 
-use crate::{meta_addr::MetaAddr, protocol::internal::InventoryResponse, PeerSocketAddr};
+use crate::{
+    meta_addr::MetaAddr,
+    protocol::internal::{InventoryResponse, PeerSource},
+    PeerSocketAddr,
+};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest::prelude::*;
@@ -101,7 +105,9 @@ pub enum Response {
     /// Each list contains zero or more entries.
     //
     // TODO: make this into a HashMap<UnminedTxId, InventoryResponse<UnminedTx, ()>> - a unique list (#2244)
-    Transactions(Vec<InventoryResponse<(UnminedTx, Option<PeerSocketAddr>), UnminedTxId>>),
+    /// Available items identify the peer that actually supplied the transaction,
+    /// including a fallback supplier. Locally served items have no peer source.
+    Transactions(Vec<InventoryResponse<(UnminedTx, Option<PeerSource>), UnminedTxId>>),
 }
 
 impl fmt::Display for Response {

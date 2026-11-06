@@ -118,9 +118,13 @@ fn transaction_error_peer_log_label(
 ) -> Option<String> {
     match error {
         TransactionDownloadVerifyError::Invalid {
-            advertiser_addr: Some(addr),
+            peer_source: Some(zn::PeerSource::LegacySocket(addr)),
             ..
         } => Some(legacy_peer_log_label(*addr, expose_peer_addresses)),
+        TransactionDownloadVerifyError::Invalid {
+            peer_source: Some(zn::PeerSource::Zakura(peer)),
+            ..
+        } => Some(format!("zakura:{peer:?}")),
         _ => None,
     }
 }
@@ -160,10 +164,10 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
 /// node's chain tip.
 ///
 /// [`peer_action`] decides which failures ban.
-fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
+fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<zn::PeerSource> {
     let TransactionDownloadVerifyError::Invalid {
         error,
-        advertiser_addr: Some(advertiser_addr),
+        peer_source: Some(peer),
         transaction_version,
         ..
     } = error
@@ -177,7 +181,7 @@ fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSo
         PeerAction::Cooldown | PeerAction::Ignore => false,
     };
 
-    bans.then_some(*advertiser_addr)
+    bans.then(|| peer.clone())
 }
 
 /// The number of blocks after a network upgrade activates during which a
@@ -220,7 +224,7 @@ fn transaction_cooldown_peer(
 ) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
-        advertiser_addr: Some(advertiser_addr),
+        peer_source: Some(zn::PeerSource::LegacySocket(advertiser_addr)),
         tip_height,
         transaction_version,
         transaction_network_upgrade,
@@ -447,8 +451,8 @@ fn is_zcashd_compat_peer(zcashd_compat_peer_ips: &HashSet<IpAddr>, peer: PeerSoc
     zcashd_compat_peer_ips.contains(&peer.ip().to_canonical())
 }
 
-/// The longest time the mempool waits for the peer set to accept a disconnect.
-const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest time the mempool waits for a peer ban or disconnect.
+const PEER_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Starts a transaction cooldown for `peer`.
 ///
@@ -484,7 +488,7 @@ fn start_peer_cooldown(
             .oneshot(zn::Request::DisconnectPeer(peer))
             .boxed();
         spawn_erased(async move {
-            let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
+            let result = tokio::time::timeout(PEER_ACTION_TIMEOUT, disconnect).await;
             if !matches!(result, Ok(Ok(_))) {
                 tracing::debug!("could not disconnect a peer after repeated transaction failures");
             }
@@ -994,12 +998,37 @@ impl Service<Request> for Mempool {
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
                         let zcashd_compat_peer_ips = &self.zcashd_compat_peer_ips;
-                        let ban_peer = transaction_ban_peer(&error)
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        let ban_peer = transaction_ban_peer(&error).filter(|peer| match peer {
+                            zn::PeerSource::LegacySocket(addr) => {
+                                !is_zcashd_compat_peer(zcashd_compat_peer_ips, *addr)
+                            }
+                            zn::PeerSource::Zakura(_) => true,
+                        });
                         if let Some(peer) = ban_peer {
-                            let _ = self
-                                .misbehavior_sender
-                                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                            match peer {
+                                zn::PeerSource::LegacySocket(addr) => {
+                                    let _ = self.misbehavior_sender.try_send((
+                                        addr,
+                                        zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+                                    ));
+                                }
+                                zn::PeerSource::Zakura(peer) => {
+                                    let outbound = self.outbound.clone();
+                                    spawn_erased(async move {
+                                        let result = tokio::time::timeout(
+                                            PEER_ACTION_TIMEOUT,
+                                            outbound.oneshot(zn::Request::BanZakuraPeer(peer)),
+                                        )
+                                        .await;
+                                        if !matches!(result, Ok(Ok(zn::Response::Nil))) {
+                                            tracing::warn!(
+                                                ?result,
+                                                "Zakura transaction peer ban failed"
+                                            );
+                                        }
+                                    });
+                                }
+                            }
                         }
 
                         // Only start cooldowns while this node's validation context is

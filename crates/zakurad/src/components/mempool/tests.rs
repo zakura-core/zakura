@@ -20,6 +20,7 @@ use zakura_chain::{
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address},
 };
+use zakura_network as zn;
 use zakura_node_services::mempool::QueueSource;
 use zakura_state::{ChainTipBlock, ChainTipSender};
 
@@ -45,7 +46,12 @@ fn legacy_queue_source_log_labels_require_explicit_opt_in() {
 fn transaction_error_peer_log_labels_require_explicit_opt_in() {
     let error = TransactionDownloadVerifyError::Invalid {
         error: zakura_consensus::error::TransactionError::WrongVersion,
-        advertiser_addr: Some("192.0.2.1:8233".parse().expect("valid test socket")),
+        peer_source: Some(
+            "192.0.2.1:8233"
+                .parse::<zn::PeerSocketAddr>()
+                .expect("valid test socket")
+                .into(),
+        ),
         tip_height: None,
         transaction_version: 4,
         transaction_network_upgrade: None,
@@ -74,11 +80,11 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     };
     use zakura_consensus::{error::TransactionError, transaction::check};
 
-    let peer = "192.0.2.1:8233".parse().expect("valid test socket");
+    let peer: zn::PeerSocketAddr = "192.0.2.1:8233".parse().expect("valid test socket");
     let tip_height = Some(Height(100));
     let invalid = |error| TransactionDownloadVerifyError::Invalid {
         error,
-        advertiser_addr: Some(peer),
+        peer_source: Some(peer.into()),
         tip_height,
         transaction_version: 4,
         transaction_network_upgrade: None,
@@ -162,7 +168,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     // Unattributed failures start nothing.
     let unattributed = |error| TransactionDownloadVerifyError::Invalid {
         error,
-        advertiser_addr: None,
+        peer_source: None,
         tip_height,
         transaction_version: 4,
         transaction_network_upgrade: None,
@@ -221,17 +227,21 @@ fn unshielded_coinbase_spends_ban_the_peer() {
     )
     .expect_err("a coinbase output cannot be spent to a transparent output");
 
-    let peer = "192.0.2.1:8233".parse().expect("valid test socket");
+    let peer: zn::PeerSocketAddr = "192.0.2.1:8233".parse().expect("valid test socket");
     let tip_height = Some(Height(999));
     let failure = TransactionDownloadVerifyError::Invalid {
         error: error.clone(),
-        advertiser_addr: Some(peer),
+        peer_source: Some(peer.into()),
         tip_height,
         transaction_version: 5,
         transaction_network_upgrade: None,
         retried_after_tip_reset: false,
     };
-    assert_eq!(transaction_ban_peer(&failure), Some(peer), "{error:?}");
+    assert_eq!(
+        transaction_ban_peer(&failure),
+        Some(peer.into()),
+        "{error:?}"
+    );
     assert_eq!(
         transaction_cooldown_peer(&failure, tip_height, NetworkUpgrade::Nu6_3, None),
         None

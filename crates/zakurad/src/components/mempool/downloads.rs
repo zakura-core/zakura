@@ -62,7 +62,7 @@ use zakura_chain::{
     transparent,
 };
 use zakura_consensus::transaction as tx;
-use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_network as zn;
 use zakura_node_services::mempool::{Gossip, QueueSource};
 use zakura_state::{self as zs, CloneError};
 
@@ -94,24 +94,10 @@ type TaskResult = Result<
 
 fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource> {
     match source {
-        QueueSource::LegacySocket(_) => None,
+        QueueSource::LegacySocket(addr) => Some(zn::PeerSource::LegacySocket((*addr).into())),
         QueueSource::Zakura(peer_id) => zn::zakura::ZakuraPeerId::new(peer_id.clone())
             .ok()
             .map(zn::PeerSource::Zakura),
-    }
-}
-
-/// Returns the peer address to attribute a peer-pushed transaction's verification
-/// failure to, for the mempool's peer cooldowns.
-///
-/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], whose IP address
-/// keys the cooldowns. Zakura peers yield `None`, matching the advertised-download
-/// path, which also delivers Zakura-served transactions with no advertiser address
-/// (see `legacy_gossip.rs`).
-fn advertiser_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
-    match source {
-        QueueSource::LegacySocket(addr) => Some(PeerSocketAddr::from(*addr)),
-        QueueSource::Zakura(_) => None,
     }
 }
 
@@ -192,7 +178,8 @@ pub enum TransactionDownloadVerifyError {
     #[error("transaction did not pass consensus validation: {error}")]
     Invalid {
         error: zakura_consensus::error::TransactionError,
-        advertiser_addr: Option<PeerSocketAddr>,
+        /// The peer that supplied the transaction, including a fallback supplier.
+        peer_source: Option<zn::PeerSource>,
         tip_height: Option<Height>,
         /// The version of the transaction that failed verification.
         transaction_version: u32,
@@ -522,8 +509,10 @@ where
         let network = self.network.clone();
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
-        let download_source = source.as_ref().and_then(peer_source_from_queue_source);
-        let pushed_advertiser_addr = source.as_ref().and_then(advertiser_addr_from_queue_source);
+        let pushed_peer_source = source.as_ref().and_then(peer_source_from_queue_source);
+        let download_source = pushed_peer_source
+            .clone()
+            .filter(|source| matches!(source, zn::PeerSource::Zakura(_)));
         let max_transaction_bytes = self.max_transaction_bytes;
         let peer_cooldowns = self.peer_cooldowns.clone();
 
@@ -552,7 +541,7 @@ where
 
             trace!(?txid, ?next_height, "got next height");
 
-            let (tx, advertiser_addr) = match gossiped_tx {
+            let (tx, peer_source) = match gossiped_tx {
                 Gossip::Id(txid) => {
                     let request_ids = std::iter::once(txid).collect();
                     let req = match download_source {
@@ -577,7 +566,7 @@ where
                         _ => unreachable!("wrong response to transaction request"),
                     };
 
-                    let (tx, advertiser_addr) = match tx {
+                    let (tx, peer_source) = match tx {
                         zn::InventoryResponse::Available(tx) => tx,
                         zn::InventoryResponse::Missing(_) => {
                             return Err(TransactionDownloadVerifyError::DownloadFailed(
@@ -601,14 +590,14 @@ where
                         "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
                     Self::check_transaction_size(&tx, max_transaction_bytes)?;
-                    (tx, advertiser_addr)
+                    (tx, peer_source)
                 }
                 Gossip::Tx(tx) => {
                     metrics::counter!(
                         "mempool.pushed.transactions.total",
                         "version" => format!("{}",tx.transaction().version()),
                     ).increment(1);
-                    (tx, pushed_advertiser_addr)
+                    (tx, pushed_peer_source)
                 }
             };
 
@@ -616,8 +605,12 @@ where
 
             // A peer can enter a cooldown after this download was queued, and
             // the crawler queues downloads without checking the cooldowns.
-            let is_cooling_down = advertiser_addr
-                .is_some_and(|addr| peer_cooldowns.is_cooling_down(addr.ip(), Instant::now()));
+            let is_cooling_down = match &peer_source {
+                Some(zn::PeerSource::LegacySocket(addr)) => {
+                    peer_cooldowns.is_cooling_down(addr.ip(), Instant::now())
+                }
+                _ => false,
+            };
             if is_cooling_down {
                 return Err(TransactionDownloadVerifyError::PeerCoolingDown);
             }
@@ -651,7 +644,7 @@ where
                 }
                 error => TransactionDownloadVerifyError::Invalid {
                     error,
-                    advertiser_addr,
+                    peer_source,
                     tip_height,
                     transaction_version,
                     transaction_network_upgrade,
@@ -894,6 +887,7 @@ mod tests {
         },
     };
     use tower::{service_fn, util::BoxCloneService};
+    use zakura_network::PeerSocketAddr;
 
     type PendingNetwork = BoxCloneService<zn::Request, zn::Response, BoxError>;
     type PendingVerifier = BoxCloneService<tx::Request, tx::Response, BoxError>;
@@ -1485,23 +1479,37 @@ mod tests {
         assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
     }
 
-    /// A directly pushed transaction from a legacy-socket peer must keep that
-    /// peer's address and the transaction version on the `Invalid` verification
-    /// error, so the mempool can ban or cool down that peer. Regression test for
-    /// the push-path attribution gap.
+    /// Pushed transactions retain their legacy or native source through
+    /// verification failure, including a retry after a chain tip reset.
     #[tokio::test]
     async fn pushed_transaction_attributes_invalid_error_to_peer() {
+        let address = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let native = zn::zakura::ZakuraPeerId::new(vec![7; 32]).unwrap();
         for retried in [false, true] {
-            pushed_transaction_failure_attribution(retried).await;
+            pushed_transaction_failure_attribution(
+                retried,
+                QueueSource::LegacySocket(address.remove_socket_addr_privacy()),
+                zn::PeerSource::LegacySocket(address),
+            )
+            .await;
+            pushed_transaction_failure_attribution(
+                retried,
+                QueueSource::Zakura(native.as_bytes().to_vec()),
+                zn::PeerSource::Zakura(native.clone()),
+            )
+            .await;
         }
     }
 
     /// Checks the peer attribution of a pushed transaction's verification
     /// failure, after a chain tip reset if `retried`.
-    async fn pushed_transaction_failure_attribution(retried: bool) {
+    async fn pushed_transaction_failure_attribution(
+        retried: bool,
+        source: QueueSource,
+        expected_source: zn::PeerSource,
+    ) {
         use zakura_consensus::error::TransactionError;
 
-        let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
         let transaction = empty_v5_transaction(1);
 
         let mut downloads = Downloads::new(
@@ -1527,9 +1535,7 @@ mod tests {
         );
 
         let gossip = Gossip::Tx(transaction);
-        let source = Some(QueueSource::LegacySocket(
-            peer_addr.remove_socket_addr_privacy(),
-        ));
+        let source = Some(source);
         if retried {
             downloads.retry_after_tip_reset(gossip, source)
         } else {
@@ -1550,12 +1556,12 @@ mod tests {
             matches!(
                 error,
                 TransactionDownloadVerifyError::Invalid {
-                    advertiser_addr: Some(addr),
+                    peer_source: Some(ref actual_source),
                     transaction_version: 5,
                     transaction_network_upgrade: Some(NetworkUpgrade::Nu5),
                     retried_after_tip_reset,
                     ..
-                } if addr == peer_addr && retried_after_tip_reset == retried
+                } if *actual_source == expected_source && retried_after_tip_reset == retried
             ),
             "expected the pushed transaction failure to carry the peer address, version, and upgrade, got {error:?}"
         );
@@ -1633,7 +1639,7 @@ mod tests {
                         "unexpected network request: {request:?}"
                     );
                     Ok::<_, BoxError>(zn::Response::Transactions(vec![
-                        zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+                        zn::InventoryResponse::Available((transaction, Some(peer_addr.into()))),
                     ]))
                 }
             })),

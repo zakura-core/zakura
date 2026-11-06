@@ -2086,6 +2086,13 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        if let Request::BanZakuraPeer(peer) = request {
+            let supervisor = self.request.client.supervisor.clone();
+            return Box::pin(async move {
+                supervisor.ban_peer(&peer).await;
+                Ok(Response::Nil)
+            });
+        }
         let route = match &request {
             Request::AdvertiseBlock(..)
             | Request::AdvertiseBlockToAll(..)
@@ -2503,11 +2510,18 @@ impl ZakuraRequestClient {
                 // Match the transport's `Fatal` handling, so source-attributed
                 // retries cannot pick the same misbehaving peer again.
                 if error.is_peer_fault() {
-                    self.supervisor.disconnect_peer(handle.peer_id()).await;
+                    self.supervisor.ban_peer(handle.peer_id()).await;
                 }
                 return Err(error.into());
             }
         };
+        if let Response::Transactions(transactions) = &mut response {
+            for transaction in transactions {
+                if let InventoryResponse::Available((_, source)) = transaction {
+                    *source = Some(PeerSource::Zakura(handle.peer_id().clone()));
+                }
+            }
+        }
         if request_kind == LegacyRequestKind::Ping {
             // The responder can only acknowledge a Ping; the requester stamps the RTT.
             response = Response::Pong(started_at.elapsed());
@@ -2695,6 +2709,7 @@ pub struct LegacyGossipSink {
     inbound_budget: InboundBudget,
     outbound: LegacyGossipOutbound,
     trace: ZakuraTrace,
+    supervisor: ZakuraSupervisorHandle,
 }
 
 impl LegacyGossipSink {
@@ -2735,6 +2750,7 @@ impl LegacyGossipSink {
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             trace,
+            supervisor,
         }
     }
 }
@@ -2778,7 +2794,19 @@ impl LegacyGossipSink {
             return Ok(());
         }
 
-        Self::enqueue_gossip_frame(&self.inbound_tx, &self.inbound_budget, peer_id, frame)
+        let result = Self::enqueue_gossip_frame(
+            &self.inbound_tx,
+            &self.inbound_budget,
+            peer_id.clone(),
+            frame,
+        );
+        if matches!(&result, Err(SinkReject::Protocol(_))) {
+            let supervisor = self.supervisor.clone();
+            tokio::spawn(erased(async move {
+                supervisor.ban_peer(&peer_id).await;
+            }));
+        }
+        result
     }
 
     fn request<'a>(
@@ -2797,7 +2825,15 @@ impl LegacyGossipSink {
                 ));
             }
 
-            let frame = LegacyRequestFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+            let frame = match LegacyRequestFrame::decode_frame(frame) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if error.is_peer_fault() {
+                        self.supervisor.ban_peer(&peer_id).await;
+                    }
+                    return Err(SinkReject::protocol(error));
+                }
+            };
             let Some(charge) = self.inbound_budget.try_charge(frame.retained_bytes()) else {
                 metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "request")
                     .increment(1);
@@ -2894,6 +2930,7 @@ impl ZakuraService for LegacyGossipSink {
         let outbound = self.outbound.clone();
         let inbound_tx = self.inbound_tx.clone();
         let inbound_budget = self.inbound_budget.clone();
+        let supervisor = self.supervisor.clone();
         let peer_id = peer.id.clone();
         let conn_id = peer.conn_id;
         let cancel_token = peer.cancel_token();
@@ -2986,6 +3023,7 @@ impl ZakuraService for LegacyGossipSink {
                     ) {
                         Ok(()) => {}
                         Err(SinkReject::Protocol(error)) => {
+                            supervisor.ban_peer(&peer_id).await;
                             debug!(
                                 ?error,
                                 ?peer_id,
@@ -3809,6 +3847,7 @@ mod tests {
             inbound_budget: InboundBudget::new(LEGACY_INBOUND_RETAINED_BYTES),
             outbound,
             trace: ZakuraTrace::noop(),
+            supervisor: ZakuraSupervisorHandle::new(4),
         }
     }
 
@@ -5129,7 +5168,7 @@ mod tests {
         let response = adapter
             .request_from_source(
                 Request::TransactionsById(HashSet::from([available_id, missing_id])),
-                Some(PeerSource::Zakura(a_peer_id)),
+                Some(PeerSource::Zakura(a_peer_id.clone())),
             )
             .await?;
 
@@ -5139,7 +5178,8 @@ mod tests {
         assert!(transactions.iter().any(|response| {
             matches!(
                 response,
-                InventoryResponse::Available((tx, None)) if tx.id() == transaction.id()
+                InventoryResponse::Available((tx, Some(PeerSource::Zakura(peer))))
+                    if tx.id() == transaction.id() && *peer == a_peer_id
             )
         }));
         assert!(transactions.iter().any(
@@ -5148,6 +5188,35 @@ mod tests {
 
         node_a.shutdown().await;
         node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fallback_transaction_attributes_the_actual_supplier() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let transaction = UnminedTx::from(empty_v5_transaction(2));
+        let declining = inventory_node(163, empty_v5_transaction(3).into()).await?;
+        let supplier = inventory_node(164, transaction.clone()).await?;
+        let client = ZakuraTestNode::builder(165).spawn().await?;
+        client.connect_native(&declining, TEST_NET_TIMEOUT).await?;
+        client.connect_native(&supplier, TEST_NET_TIMEOUT).await?;
+        wait_registered_count(&client, 2).await?;
+        let expected_source = PeerSource::Zakura(node_peer_id(&supplier).await?);
+        let response = LegacyRequestAdapter::new(client.supervisor())
+            .request_from_source(
+                Request::TransactionsById(HashSet::from([transaction.id()])),
+                Some(PeerSource::Zakura(node_peer_id(&declining).await?)),
+            )
+            .await?;
+        assert!(matches!(
+            response,
+            Response::Transactions(items) if matches!(items.as_slice(),
+                [InventoryResponse::Available((received, Some(source)))]
+                    if received.id() == transaction.id() && *source == expected_source)
+        ));
+        declining.shutdown().await;
+        supplier.shutdown().await;
+        client.shutdown().await;
         Ok(())
     }
 
@@ -5513,6 +5582,7 @@ mod tests {
             .await?;
         wait_registered_count(&requester, 2).await?;
         let advertiser_id = node_peer_id(&advertiser).await?;
+        let supplier_id = node_peer_id(&fallback).await?;
 
         let mut adapter = LegacyRequestAdapter::new(requester.supervisor());
         let response = adapter
@@ -5538,7 +5608,8 @@ mod tests {
         };
         assert!(matches!(
             transactions.as_slice(),
-            [InventoryResponse::Available((tx, None))] if tx.id() == transaction.id()
+            [InventoryResponse::Available((tx, Some(PeerSource::Zakura(peer))))]
+                if tx.id() == transaction.id() && *peer == supplier_id
         ));
 
         advertiser.shutdown().await;
@@ -6497,8 +6568,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn inbound_queue_full_drops_without_rejecting_peer_but_malformed_rejects() {
+    #[tokio::test]
+    async fn inbound_queue_full_drops_without_rejecting_peer_but_malformed_rejects() {
         let (inbound_tx, _inbound_rx) = mpsc::channel(1);
         let sink = test_sink(inbound_tx, LegacyGossipOutbound::default());
         let peer_id = ZakuraPeerId::new(vec![4; 32]).expect("test peer id is within bounds");
@@ -7668,6 +7739,62 @@ mod tests {
 
         hostile.shutdown().await;
         node.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_transaction_encoding_bans_inbound_and_outbound_suppliers(
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        for pushed in [false, true] {
+            let node = inventory_node(173, empty_v5_transaction(1).into()).await?;
+            let hostile = HostilePeer::connect_native(&node, 174).await?;
+            wait_registered_count(&node, 1).await?;
+            if pushed {
+                hostile
+                    .send_frame_with_request_id(
+                        ZAKURA_STREAM_LEGACY_REQUESTS,
+                        99,
+                        Frame {
+                            message_type: MSG_REQUEST_PUSH_TRANSACTION,
+                            flags: 0,
+                            payload: vec![0xff; 4],
+                        },
+                    )
+                    .await?;
+            } else {
+                let adapter = LegacyRequestAdapter::new(node.supervisor());
+                let request = adapter.request_from_source(
+                    Request::TransactionsById(HashSet::from([witnessed_tx_id(99)])),
+                    Some(PeerSource::Zakura(hostile.id()?)),
+                );
+                let responder = hostile.respond_to_next_request_with(|request_id| {
+                    let mut payload = request_id.to_le_bytes().to_vec();
+                    payload.push(1);
+                    payload.extend_from_slice(&[0xff; 4]);
+                    vec![Frame {
+                        message_type: MSG_RESPONSE_TRANSACTION,
+                        flags: 0,
+                        payload,
+                    }]
+                });
+                let (result, sent) = futures::join!(request, responder);
+                sent?;
+                assert!(result.is_err());
+            }
+            hostile.wait_for_connection_close(TEST_NET_TIMEOUT).await?;
+            wait_registered_count(&node, 0).await?;
+            hostile.shutdown().await;
+            // A new endpoint with the same key must not reclaim a peer slot.
+            if let Ok(reconnected) = HostilePeer::connect_native(&node, 174).await {
+                reconnected
+                    .wait_for_connection_close(TEST_NET_TIMEOUT)
+                    .await?;
+                reconnected.shutdown().await;
+            }
+            assert!(node.supervisor().registered_ids().await.is_empty());
+            node.shutdown().await;
+        }
         Ok(())
     }
 

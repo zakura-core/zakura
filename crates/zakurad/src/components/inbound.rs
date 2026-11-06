@@ -881,7 +881,9 @@ impl Service<zn::Request> for Inbound {
                 })
                     .boxed()
             }
-            zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
+            zn::Request::DisconnectPeer(_) | zn::Request::BanZakuraPeer(_) => {
+                unreachable!("peer policy requests are local to the network service")
+            },
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }

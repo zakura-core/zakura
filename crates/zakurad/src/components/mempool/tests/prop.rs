@@ -275,7 +275,7 @@ proptest! {
         let peer = zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233));
         let failure = TransactionDownloadVerifyError::Invalid {
             error: error.clone(),
-            advertiser_addr: Some(peer),
+            peer_source: Some(peer.into()),
             tip_height: Some(block::Height(100)),
             transaction_version: 5,
             transaction_network_upgrade: None,
@@ -284,7 +284,7 @@ proptest! {
 
         let should_ban = (error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error))
             || is_unscored_but_bans(&error);
-        prop_assert_eq!(transaction_ban_peer(&failure), should_ban.then_some(peer), "{:?}", error);
+        prop_assert_eq!(transaction_ban_peer(&failure), should_ban.then_some(peer.into()), "{:?}", error);
     }
 
     /// Cooldowns only replace failures that the previous mempool policy banned.
@@ -293,7 +293,7 @@ proptest! {
         for transaction_version in [4, 5, 6] {
             let failure = TransactionDownloadVerifyError::Invalid {
                 error: error.clone(),
-                advertiser_addr: Some(zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+                peer_source: Some(zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233)).into()),
                 tip_height: Some(block::Height(100)),
                 transaction_version,
                 transaction_network_upgrade: None,

@@ -1267,7 +1267,7 @@ where
                     error = %rejection.0,
                     "hedged block response rejected: waiting for the other request"
                 );
-                metrics::counter!("gossip.hedged.block.fallback.count").increment(1);
+                metrics::counter!("gossip.missing.parent.hedged.fallback.count").increment(1);
                 first_rejection.get_or_insert(rejection);
                 response = other.await;
             };

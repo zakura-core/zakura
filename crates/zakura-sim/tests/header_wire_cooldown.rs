@@ -255,6 +255,9 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
             redial.first_torn_down < redial.row,
             "plan {index}: {redial:?}"
         );
+        // These pin this fixture's whole history, not the cooldown: the
+        // parked redial's connection idles out before anything readmits
+        // it, so own-9 only ever admits and ends the first session.
         let session_facts = sessions.facts();
         assert!(
             matches!(

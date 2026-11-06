@@ -24,8 +24,8 @@ use zakura_sim::{
     },
     observe::{StorageFact, StorageRequest},
     peer::{honest::HonestSpec, PeerAction, PeerSpec},
-    property::{HasView, Property, Sources},
-    Observation, RunConfig, RunEnd, Sim, StepCtx,
+    property::{EndViolation, HasView, Property, Sources},
+    Observation, ObservationLog, RunConfig, RunEnd, Sim, StepCtx,
 };
 
 /// The node's chain at the start of each run.
@@ -162,6 +162,13 @@ impl<const UNCOOLED: bool> HasView for Watching<UNCOOLED> {
     /// The wire harness's record of the run's end.
     fn ended(&self, end: &RunEnd) {
         self.wire.ended(end);
+    }
+
+    /// The wire harness's end-of-run violations, judged from the node's
+    /// own fault evidence. An [`Uncooled`] view's break comes from its
+    /// checks first, so the registry keeps that one.
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        self.wire.end_violations(log)
     }
 }
 

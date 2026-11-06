@@ -15,7 +15,7 @@ mod verdict;
 use serde::{Deserialize, Serialize};
 
 pub use assume::{Assume, AssumeRecord, Assumptions};
-pub use cx::{Capture, CheckCtx, HasView};
+pub use cx::{Capture, CheckCtx, EndViolation, HasView};
 pub use id::{BadId, PropertyId};
 pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};
 pub use verdict::{

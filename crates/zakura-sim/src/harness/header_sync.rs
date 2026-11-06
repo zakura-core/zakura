@@ -27,7 +27,7 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        adoption::{AdoptionEvidence, SessionLife},
+        adoption::{Acceptance, AdoptionEvidence, SessionLife},
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
@@ -49,12 +49,12 @@ use crate::{
         PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     property::{
-        Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Inconclusive, Kind, Property,
-        PropertyId, Source, Sources, Status, Verdict,
+        Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
+        Property, PropertyId, Source, Sources, Status, Verdict,
     },
     storage::HEADER_SERVICE,
     table::{sender_properties, table_properties},
-    Observation, RunConfig, RunEnd, Sim,
+    Observation, ObservationLog, RunConfig, RunEnd, Sim,
 };
 
 /// The smoke run's scenario. It has no knobs yet.
@@ -547,6 +547,11 @@ impl HasView for Storage {
         self.adoption.end(end);
         self.faults.end(end);
     }
+
+    /// [`fault_end_violations`].
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        fault_end_violations(&self.faults, log)
+    }
 }
 
 impl Subsystem for Storage {
@@ -830,6 +835,11 @@ impl HasView for HeaderWire {
         self.adoption.end(end);
         self.faults.end(end);
         self.sessions.end(end);
+    }
+
+    /// [`fault_end_violations`].
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        fault_end_violations(&self.faults, log)
     }
 }
 
@@ -1221,13 +1231,17 @@ fn header_fault_penalized<S: HasView<View = StorageView>>() -> Property<S> {
     }
 }
 
+/// What [`HEADER_FAULT_PENALIZED`] expects, as its violations report it.
+const FAULT_PENALIZED_EXPECTED: &str = "each header-peer fault the reactor took is penalized \
+     against its session and cools its peer down, which no session from it skips";
+
 /// Checks [`HEADER_FAULT_PENALIZED`] after each step, from the node's fault
-/// evidence ([`FaultEvidence::check`]). Something still open is unsettled,
-/// so a run that ends with it is inconclusive: a penalty whose call is
-/// still being handled, or a failed reply the reactor hasn't taken yet. A
-/// failure whose reply never reached the reactor opens nothing. The registry
-/// runs no check after the run ends, so [`FaultEvidence::penalized`] is what
-/// turns what's open at a settled end into a break.
+/// evidence ([`FaultEvidence::check`]). Something still open is unsettled: a
+/// penalty whose call is still being handled, or a failed reply the reactor
+/// hasn't taken yet. A failure whose reply never reached the reactor opens
+/// nothing. What's still open when a settled run ends breaks the rule
+/// through [`fault_end_violations`], and at any other end it's
+/// inconclusive.
 fn check_header_fault_penalized<S: HasView<View = StorageView>>(
     cx: &mut CheckCtx<'_, S>,
 ) -> Verdict {
@@ -1238,11 +1252,21 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
             cx.unsettled(Inconclusive::ObligationOpen);
             Verdict::Holds
         }
-        FaultCheck::Broken(why) => cx.violated(
-            "each header-peer fault the reactor took is penalized against its session and \
-             cools its peer down, which no session from it skips",
-            why,
-        ),
+        FaultCheck::Broken(why) => cx.violated(FAULT_PENALIZED_EXPECTED, why),
+    }
+}
+
+/// [`HEADER_FAULT_PENALIZED`]'s break at the run's end, from
+/// [`FaultEvidence::penalized`] over `log`, such as a failed reply the
+/// reactor never took by the time a settled run ended.
+fn fault_end_violations(faults: &FaultEvidence, log: &ObservationLog) -> Vec<EndViolation> {
+    match faults.penalized(log.entries()) {
+        Acceptance::Violated(actual) => vec![EndViolation {
+            property: PropertyId::new(HEADER_FAULT_PENALIZED),
+            expected: FAULT_PENALIZED_EXPECTED.to_owned(),
+            actual,
+        }],
+        Acceptance::Holds | Acceptance::Inconclusive(_) => Vec::new(),
     }
 }
 

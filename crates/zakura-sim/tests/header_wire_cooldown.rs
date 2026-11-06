@@ -227,11 +227,17 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
                     if *cooled == peer && *origin == session && *cooldown == COOLDOWN && *after == seq)
             })
             .unwrap_or_else(|| panic!("plan {index}: no cooldown after the penalty: {facts:?}"));
+        let CooldownFact::Started { at: from, .. } = facts[started] else {
+            unreachable!("matched above");
+        };
+        // Only the cooldown's window is checked here. Where it ends is
+        // pinned by the reactor's unit witness,
+        // `a_late_fault_refuses_reconnects_until_its_cooldown_ends`.
         assert!(
-            !facts[started..].iter().any(
-                |fact| matches!(fact, CooldownFact::Admitted { peer: admitted, .. } if *admitted == peer)
-            ),
-            "plan {index}: nothing from the peer is admitted: {facts:?}"
+            !facts[started..].iter().any(|fact| matches!(fact,
+                CooldownFact::Admitted { peer: admitted, at, .. }
+                    if *admitted == peer && *at < from + COOLDOWN)),
+            "plan {index}: nothing from the peer is admitted in the cooldown: {facts:?}"
         );
 
         // The redial reaches own-9 as a new header session inside the
@@ -239,9 +245,6 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
         // it. The back-off is what parks it: the peer's first connection
         // was torn down first, so no live session collides with it, and
         // the reactor held no session, so a peer slot was free.
-        let CooldownFact::Started { at: from, .. } = facts[started] else {
-            unreachable!("matched above");
-        };
         let redial = redialed(&report);
         let parked = times.at(redial.parked);
         assert!(

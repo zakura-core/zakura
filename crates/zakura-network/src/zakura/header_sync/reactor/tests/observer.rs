@@ -1794,6 +1794,62 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_reconnect() {
     }
 }
 
+/// The cooldown a late fault starts lasts its full length. One second before
+/// it ends, and after maintenance has pruned, a reconnect is still refused.
+/// One second after, maintenance has dropped it and the next reconnect is
+/// admitted.
+#[tokio::test(start_paused = true)]
+async fn a_late_fault_refuses_reconnects_until_its_cooldown_ends() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let cooldown = std::time::Duration::from_secs(60);
+    let second = std::time::Duration::from_secs(1);
+    reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 1);
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the seeded request is active")
+        .phase = HeaderTargetPhase::Preparing;
+    reactor.handle_peer_disconnected(&peer, 1, "test disconnect");
+    reactor.handle_header_target_prepared(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+    );
+    recorder.take_all();
+
+    tokio::time::advance(cooldown - second).await;
+    reactor.refresh_statuses();
+    let _early = connect(&mut reactor, &peer, 2);
+    assert_eq!(
+        penalties(recorder.take_all()),
+        vec![ReactorEvent::SessionRefused {
+            peer: peer.clone(),
+            session_id: 2,
+        }],
+        "one second before the cooldown ends"
+    );
+
+    tokio::time::advance(second * 2).await;
+    reactor.refresh_statuses();
+    let _late = connect(&mut reactor, &peer, 3);
+    assert!(
+        matches!(
+            &penalties(recorder.take_all())[..],
+            [ReactorEvent::SessionAdmitted { session_id: 3, .. }]
+        ),
+        "one second after the cooldown ends"
+    );
+}
+
 /// A dispatch for session 1's work while session 2 is current reports both
 /// sessions, so the harness never charges the replacement.
 #[test]

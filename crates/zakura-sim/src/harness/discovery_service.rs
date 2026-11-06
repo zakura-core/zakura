@@ -88,7 +88,12 @@ pub fn spawn_node(
                 )
                 .expect("production's config on the fixture network is valid")
                 .with_verification_slots(slots);
-                let service: Arc<dyn Service> = Arc::new(DiscoveryService::new(handle.clone()));
+                // Production sizes the serving pools for the node's own
+                // connection cap, not the default one.
+                let service: Arc<dyn Service> = Arc::new(DiscoveryService::with_max_connections(
+                    handle.clone(),
+                    limits.max_connections,
+                ));
                 (vec![service], handle)
             }
         },

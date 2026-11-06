@@ -2,8 +2,9 @@
 //! simulator's discovery node (disc-2.1).
 //!
 //! Each handle calls the crate-private entry point that production's
-//! endpoint builder calls, with the same arguments, and changes nothing in
-//! it. They exist only in the simulator build.
+//! endpoint builder calls, and changes nothing in it. Each one passes the
+//! caller's arguments through, except that [`build_discovery_handle`] passes
+//! no sequence file. They exist only in the simulator build.
 
 use std::net::SocketAddr;
 

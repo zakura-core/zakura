@@ -57,21 +57,34 @@ pub struct SubmitSolutionParameters {
 const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_MINED_SUBMISSIONS: usize = 16;
 
-/// Bounds detached mined submissions before they reach verification or the writer.
+/// Blocks this node is submitting, from `submitblock` until their final mined-block event is
+/// sent. Bounds detached submissions before they reach verification or the writer.
+///
+/// Block gossip shares it to tell a tip change caused by a local submission, whose
+/// [`MinedBlockEvent`] follows the tip change, from a relayed block.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
+pub struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
 
 /// Holds submission capacity until verification and contextual commit finish.
-pub(crate) struct MinedSubmission {
+#[derive(Debug)]
+pub struct MinedSubmission {
     submissions: MinedSubmissions,
     hash: block::Hash,
 }
 
 impl MinedSubmissions {
-    pub(crate) fn reserve(
-        &self,
-        hash: block::Hash,
-    ) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
+    /// Returns whether this node is submitting `hash` and has not yet sent its final event.
+    pub fn contains(&self, hash: &block::Hash) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(hash)
+    }
+
+    /// Records that this node is submitting `hash` until the returned guard is dropped.
+    ///
+    /// Fails if `hash` is already being submitted, or too many submissions are in flight.
+    pub fn reserve(&self, hash: block::Hash) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
         let mut entries = self
             .0
             .lock()

@@ -22,10 +22,10 @@ use zakura_sim::{
     model::{Direction, Label, LabelOutcome, LabelledFrame},
     observe::Exit,
     property::{
-        Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent, HasView,
-        Inconclusive, Kind, Lifecycle, LivenessBound, Obligation, ObligationKey, Property,
-        PropertyId, Registry, RegistryChecker, RegistryError, Source, Sources, Status, Subject,
-        Tee, Verdict,
+        Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent,
+        EndViolation, HasView, Inconclusive, Kind, Lifecycle, LivenessBound, Obligation,
+        ObligationKey, Property, PropertyId, Registry, RegistryChecker, RegistryError, Source,
+        Sources, Status, Subject, Tee, Verdict,
     },
     ActionSource, Boundary, Checker, HarnessFailure, Identity, IdleStatus, Observation,
     ObservationLog, Outcome, Plan, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
@@ -41,6 +41,8 @@ struct World {
     level: Cell<u32>,
     /// When the view was captured. `None` reads the state live.
     captured: Cell<Option<Capture>>,
+    /// The violations the run's end shows.
+    end: RefCell<Vec<EndViolation>>,
 }
 
 impl HasView for World {
@@ -54,6 +56,11 @@ impl HasView for World {
     /// The capture the test set, or a live read.
     fn captured(&self) -> Capture {
         self.captured.get().unwrap_or(Capture::Live)
+    }
+
+    /// The end violations the test set.
+    fn end_violations(&self, _: &ObservationLog) -> Vec<EndViolation> {
+        self.end.borrow().clone()
     }
 }
 
@@ -672,6 +679,59 @@ fn known_violation_does_not_stop_the_run() {
     assert_eq!(
         active.end.violation.map(|v| v.step),
         Some(exit_step(&active.log, "bump.1"))
+    );
+}
+
+/// A violation the view reports only at the run's end counts against its
+/// property, at the run's last step. A property already violated keeps its
+/// first violation, and an ID nothing registered is ignored.
+#[test]
+fn an_end_violation_counts_unless_the_property_already_broke() {
+    let bumps = |twice: bool| {
+        let world = honest();
+        world.end.borrow_mut().extend([
+            EndViolation {
+                property: LEVEL,
+                expected: "settled".to_owned(),
+                actual: "still open".to_owned(),
+            },
+            EndViolation {
+                property: PropertyId::new("test/unregistered"),
+                expected: String::new(),
+                actual: String::new(),
+            },
+        ]);
+        let task_world = world.clone();
+        let known = level(Status::Known { issue: 1523 });
+        report(world, vec![known], Assumptions::none(), move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                if twice {
+                    task::yield_now().await;
+                    bump(&task_world);
+                }
+            });
+        })
+    };
+
+    let ended = bumps(false);
+    assert_eq!(
+        outcome(&ended, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: vec![ended.end.steps]
+        }
+    );
+    assert!(ended
+        .properties
+        .iter()
+        .all(|p| p.property != "test/unregistered"));
+
+    let broke = bumps(true);
+    assert_eq!(
+        outcome(&broke, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: vec![exit_step(&broke.log, "bump.1")]
+        }
     );
 }
 

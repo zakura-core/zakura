@@ -13,7 +13,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use zakura_chain::block;
+use zakura_chain::{block, work::difficulty::CompactDifficulty};
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
     v9::{
@@ -38,6 +38,10 @@ const SESSION: u64 = 0;
 /// datagrams are due within the link's delay, and time moves only once no
 /// task is ready.
 pub(super) const SETTLE: Duration = Duration::from_secs(1);
+
+/// A compact target easier than Regtest's proof-of-work limit, which
+/// preparation rejects from the header alone.
+const EASY_TARGET: u32 = 0x207f_ffff;
 
 /// What an honest peer holds and does.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +116,8 @@ pub struct HonestChain {
     heights: BTreeMap<[u8; 32], u32>,
     /// The `Status` it advertises.
     pub(super) status: Status,
+    /// The header the fixture made invalid, if any: the tip.
+    invalid: Option<Frontier>,
 }
 
 impl HonestChain {
@@ -152,7 +158,40 @@ impl HonestChain {
             headers,
             heights,
             status,
+            invalid: None,
         }
+    }
+
+    /// [`HonestChain::new`], with its tip given a target easier than
+    /// Regtest's proof-of-work limit. The header still decodes, links and
+    /// fits every page rule, so a page carrying it passes the node's wire
+    /// checks, and preparation rejects it. The `Status` advertises it as
+    /// the tip, with the valid chain's work, and the chain records it as
+    /// [`HonestChain::invalid_tip`].
+    ///
+    /// # Panics
+    ///
+    /// If `chain` is 0, since genesis can't be made invalid.
+    pub fn with_invalid_tip(fixture: &HeaderFixture, chain: u32) -> Self {
+        let mut honest = Self::new(fixture, chain);
+        let tip = honest
+            .headers
+            .last_mut()
+            .expect("an invalid tip needs a header");
+        let mut header = **tip;
+        honest.heights.remove(&header.hash().0);
+        header.difficulty_threshold = CompactDifficulty::from_le_bytes(EASY_TARGET.to_le_bytes());
+        let hash = header.hash();
+        *tip = Arc::new(header);
+        honest.heights.insert(hash.0, chain);
+        honest.status.selected_tip_hash = hash;
+        honest.invalid = Some(Frontier::new(block::Height(chain), hash));
+        honest
+    }
+
+    /// The header the fixture made invalid, if any.
+    pub fn invalid_tip(&self) -> Option<Frontier> {
+        self.invalid
     }
 
     /// The height of the header `hash` on this chain, the anchor's

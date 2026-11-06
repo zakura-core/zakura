@@ -637,13 +637,13 @@ jobs:
 
   # Each simulator fuzz target in qa/suite.toml must build, run its harness's
   # curated seeds, and run the harness its manifest maps it to.
-  # `cargo xtask sim-targets` reports one status per target. Each retained
-  # bypass on a target's harness must also fail through that target: the
-  # patched target crashes with the property alone, `zakura-sim confirm`
-  # finds its trigger history, and a fresh replay matches Exact. The ASan
-  # fuzz builds take minutes, so the job runs nightly and on manual
-  # dispatch, never on pull requests or pushes. It checks readiness, not
-  # how well a target searches.
+  # `cargo xtask sim-targets` reports one status per target. The ASan fuzz
+  # builds take minutes, so the job runs nightly and on manual dispatch,
+  # never on pull requests or pushes. It checks readiness, not how well a
+  # target searches. `cargo xtask planted --targets`, which confirms each
+  # retained bypass through its target, rebuilds the patched simulator and
+  # target for each of about 20 cases, so scripts/sim-long-runs.sh runs it
+  # on a remote host instead.
   sim-targets:
     name: zakura_sim targets
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -673,10 +673,6 @@ jobs:
       # and the checker refuses an output directory that isn't empty.
       - name: Check each fuzz target on its seeds
         run: cargo +nightly-2026-07-15 xtask sim-targets --out "${RUNNER_TEMP}/sim-targets"
-      - name: Check each retained bypass through its fuzz target
-        run: cargo +nightly-2026-07-15 xtask planted --targets
-        env:
-          RUSTFLAGS: --cfg zakura_sim
       - name: Upload the readiness report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2

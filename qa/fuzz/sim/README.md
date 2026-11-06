@@ -369,8 +369,11 @@ replay must match Exact. It builds the patched `zakura-sim` and target in
 runs reuse the builds, and both binaries must embed the patched checkout's
 source digest. It prints each target's bypasses, or that it has none.
 
-The nightly `zakura_sim targets` job in `tests-unit.yml` runs both
-commands. It also runs on manual dispatch, never on pull requests.
+The nightly `zakura_sim targets` job in `tests-unit.yml` runs
+`cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
+requests. `planted --targets` rebuilds the patched `zakura-sim` and target
+for each case, which takes hours over the whole catalogue, so it runs on a
+remote host, as [Long runs](#long-runs) says.
 
 ## Seeds
 
@@ -541,7 +544,8 @@ The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
 each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
 runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
 `cargo xtask planted --shard <index>/7`, so each case runs once a week. A
-remote host runs the rest, and its results never block a pull request.
+remote host runs the rest, including `cargo xtask planted --targets`, and its
+results never block a pull request.
 
 `scripts/sim-long-runs.sh` runs them from a checkout on that host. It runs
 `cargo xtask planted` over the whole catalogue, then

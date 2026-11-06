@@ -8,7 +8,7 @@
 
 mod support;
 
-use support::inputs;
+use support::{byte_inputs, inputs};
 use zakura_sim::{
     domain::block_sync_semantic::{
         CAPACITY_RELEASE_WAKES, DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND,
@@ -21,9 +21,11 @@ use zakura_sim::{
             view::PairingKind,
             Policy,
         },
+        block_semantic::RESET_MID_FLIGHT_TAG,
         block_sync::{BlockScenario, Ports, Storage},
         run_prepared, Subsystem,
     },
+    seed::sha256,
     witness::{witness_prepared, Expect, WitnessScenario},
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -150,23 +152,81 @@ fn each_committed_input_draws_its_scenario() {
 /// fails here instead of weakening the planted case.
 #[test]
 fn the_reset_mid_flight_input_holds_submit_only_requested() {
-    let ports = witnessed(
-        committed(RESET_MID_FLIGHT_INPUT),
+    if let Some(shortfall) = reset_mid_flight_shortfall(RESET_MID_FLIGHT_INPUT) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Why `input` falls short of the reset-mid-flight input's role, if it does:
+/// its run must be a witness that holds `submit-only-requested`, pair every
+/// block storage operation, submit bodies of an old and a new epoch, and
+/// credit a submission through first-completion-wins.
+fn reset_mid_flight_shortfall(input: &[u8]) -> Option<String> {
+    let witness = committed(input);
+    let ports = Storage::prepare(&witness.scenario);
+    if let Err(error) = witness_prepared::<Storage>(
+        &witness.scenario,
+        ports.clone(),
+        witness.input,
         SUBMIT_ONLY_REQUESTED,
         Expect::Holds,
-    );
+        &mut MemorySink::default(),
+    ) {
+        return Some(format!("{SUBMIT_ONLY_REQUESTED}: {error}"));
+    }
     let view = ports.view.borrow();
+    if !view.pairing.is_empty() {
+        return Some(format!("{:?}", view.pairing));
+    }
     let model = view.semantic.borrow();
     // Each key counts at least one submission.
     let epochs = &model.submission_epochs;
-    assert!(
-        epochs.len() >= 2 && !epochs.contains_key(&None),
-        "submissions by epoch, which needs an old and a new one: {epochs:?}"
+    if epochs.len() < 2 || epochs.contains_key(&None) {
+        return Some(format!(
+            "submissions by epoch, which needs an old and a new one: {epochs:?}"
+        ));
+    }
+    if model.credited_elsewhere == 0 {
+        return Some("no first-completion-wins credit".to_owned());
+    }
+    None
+}
+
+/// How many fuzz inputs [`regenerate_reset_mid_flight_input`] tries.
+const RESET_MID_FLIGHT_CANDIDATES: usize = 64;
+
+/// Rewrites the committed reset-mid-flight input with the first of
+/// [`RESET_MID_FLIGHT_CANDIDATES`] fuzz inputs that fills the input's role
+/// ([`reset_mid_flight_shortfall`]), and its sidecar's SHA-256 to match. A
+/// block-sync change that moves the input off the crossing needs only this
+/// run, then `cargo xtask planted block-sync/submit-only-requested` to show
+/// that `height-only.patch` is still caught.
+#[test]
+#[ignore = "rewrites the committed input"]
+fn regenerate_reset_mid_flight_input() {
+    let bytes = byte_inputs(RESET_MID_FLIGHT_CANDIDATES, 16_384)
+        .into_iter()
+        .map(|plan| [&RESET_MID_FLIGHT_TAG[..], &plan].concat())
+        .find(|input| reset_mid_flight_shortfall(input).is_none())
+        .expect("some candidate reaches the crossing");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/block-sync-reset-mid-flight"
     );
-    assert!(
-        model.credited_elsewhere > 0,
-        "no first-completion-wins credit"
-    );
+    std::fs::write(format!("{fixture}.bin"), &bytes).expect("the fixture directory exists");
+    let sidecar = format!("{fixture}.toml");
+    let text = std::fs::read_to_string(&sidecar).expect("the input has a sidecar");
+    let text: String = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("sha256 = ") {
+                format!("sha256 = \"{}\"\n", sha256(&bytes))
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&sidecar, text).expect("the sidecar is writable");
 }
 
 /// The reset-mid-flight input's reset supersedes the reactor's query state,

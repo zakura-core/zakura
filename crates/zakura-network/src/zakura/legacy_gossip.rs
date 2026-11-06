@@ -483,6 +483,11 @@ impl LegacyRequestFrame {
 
     /// Decode a Zakura frame into a typed inventory request.
     pub fn decode_frame(frame: Frame) -> Result<Self, LegacyGossipError> {
+        Self::decode_borrowed(&frame)
+    }
+
+    /// [`decode_frame`](Self::decode_frame) without taking the frame.
+    fn decode_borrowed(frame: &Frame) -> Result<Self, LegacyGossipError> {
         if frame.flags != 0 {
             return Err(LegacyGossipError::UnsupportedFlags(frame.flags));
         }
@@ -2830,6 +2835,17 @@ impl LegacyGossipSink {
         Self::enqueue_gossip_frame(&self.inbound_tx, &self.inbound_budget, peer_id, frame)
     }
 
+    /// Every protocol check a request meets before `request` does any work.
+    /// `check_request` runs the same function, so the two can't disagree.
+    fn decode_request(stream_kind: u16, frame: &Frame) -> Result<LegacyRequestFrame, SinkReject> {
+        if stream_kind != ZAKURA_STREAM_LEGACY_REQUESTS {
+            return Err(SinkReject::protocol(
+                "unsupported legacy request stream kind",
+            ));
+        }
+        LegacyRequestFrame::decode_borrowed(frame).map_err(SinkReject::protocol)
+    }
+
     fn request<'a>(
         &'a self,
         peer_id: ZakuraPeerId,
@@ -2840,13 +2856,7 @@ impl LegacyGossipSink {
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
-            if stream_kind != ZAKURA_STREAM_LEGACY_REQUESTS {
-                return Err(SinkReject::protocol(
-                    "unsupported legacy request stream kind",
-                ));
-            }
-
-            let frame = LegacyRequestFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
+            let frame = Self::decode_request(stream_kind, &frame)?;
             let Some(charge) = self.inbound_budget.try_charge(frame.retained_bytes()) else {
                 metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "request")
                     .increment(1);
@@ -3090,6 +3100,10 @@ impl RequestResponseService for LegacyGossipSink {
             max_message_bytes,
             frame,
         )
+    }
+
+    fn check_request(&self, stream_kind: u16, frame: &Frame) -> Result<(), SinkReject> {
+        Self::decode_request(stream_kind, frame).map(drop)
     }
 }
 
@@ -3607,6 +3621,46 @@ mod tests {
 
     fn block_hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
+    }
+
+    /// `check_request`, which runs when a requester stops its response stream
+    /// before the call, rejects what `request` rejects as a protocol fault:
+    /// another stream kind, flags, an unknown type, trailing bytes and a bad
+    /// inventory list. It accepts a valid request.
+    #[test]
+    fn a_request_check_rejects_what_the_request_rejects() {
+        let frame = |message_type, flags, payload: Vec<u8>| Frame {
+            message_type,
+            flags,
+            payload,
+        };
+        let mut one_block = vec![1];
+        one_block.extend_from_slice(&[7; 32]);
+        let mut trailing = one_block.clone();
+        trailing.push(0);
+        let check = |kind, frame: &Frame| LegacyGossipSink::decode_request(kind, frame).map(drop);
+
+        let valid = frame(MSG_REQUEST_BLOCKS_BY_HASH, 0, one_block.clone());
+        assert!(check(ZAKURA_STREAM_LEGACY_REQUESTS, &valid).is_ok());
+        assert!(matches!(
+            check(ZAKURA_STREAM_GOSSIP, &valid),
+            Err(SinkReject::Protocol(_))
+        ));
+        for invalid in [
+            frame(MSG_REQUEST_BLOCKS_BY_HASH, 1, one_block),
+            frame(0xfff0, 0, Vec::new()),
+            frame(MSG_REQUEST_BLOCKS_BY_HASH, 0, trailing),
+            frame(MSG_REQUEST_BLOCKS_BY_HASH, 0, vec![2, 7]),
+            frame(MSG_REQUEST_PING, 0, vec![0]),
+        ] {
+            assert!(
+                matches!(
+                    check(ZAKURA_STREAM_LEGACY_REQUESTS, &invalid),
+                    Err(SinkReject::Protocol(_))
+                ),
+                "{invalid:?}"
+            );
+        }
     }
 
     fn legacy_tx_id(byte: u8) -> UnminedTxId {

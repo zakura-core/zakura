@@ -5963,16 +5963,35 @@ async fn request_stream_worker(
     // A requester that gives up stops the response stream. The stop ends the
     // output wait and the service's call, so the abandoned request releases
     // its funding and no longer runs its backend work. The connection task
-    // already answered the stop with RESET_STREAM. Each select polls its work
-    // before the stop, so a request the service rejects at once still meets
-    // its protocol close.
+    // already answered the stop with RESET_STREAM.
+    //
+    // A stop gives up the answer, not the protocol: a request the service
+    // would reject as protocol-invalid still closes the connection. A stop
+    // during the output wait runs the service's checks on the frame. A stop
+    // during the call can win only after the call's first `Pending`, because
+    // the select polls the call first, and a service returns its protocol
+    // rejections before then (`RequestResponseService::request_frame`).
     let stopped = send.stopped();
     zakura_rt::pin!(stopped);
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         output = context.resources.output.admit(bound.bytes) => output,
-        _ = &mut stopped => return,
+        stop = &mut stopped => {
+            if stop.is_ok() {
+                if let Err(SinkReject::Protocol(error)) =
+                    registry.check_request(prelude.stream_kind, &frame)
+                {
+                    debug!(
+                        ?error,
+                        "Zakura inbound sink rejected a stopped protocol-invalid request"
+                    );
+                    context.close_cause.record("request_protocol_reject");
+                    context.connection_token.cancel();
+                }
+            }
+            return;
+        }
     };
 
     // The raw frame's grant ends with the service's call, which cancelling the

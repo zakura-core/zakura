@@ -1851,6 +1851,7 @@ where
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone().into(),
+            size,
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();

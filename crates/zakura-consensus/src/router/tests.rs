@@ -12,7 +12,7 @@ use tower::{layer::Layer, timeout::TimeoutLayer};
 
 use zakura_chain::{
     block::Block,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
 };
 use zakura_state as zs;
 use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
@@ -588,6 +588,7 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         };
         let request = if mined {
             Request::CommitMined {
+                size: candidate.zcash_serialized_size(),
                 block: candidate.into(),
                 admission: zs::BlockAdmission::pending(),
             }

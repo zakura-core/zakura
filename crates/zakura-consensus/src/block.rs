@@ -544,7 +544,7 @@ where
                         &network,
                         block.clone(),
                         hash,
-                        (height, receipt_order),
+                        (height, receipt_order, request.origin()),
                         admission,
                     )
                     .await?
@@ -911,7 +911,7 @@ async fn try_prepared_fast_path<S>(
     network: &Network,
     block: BlockHandle,
     hash: block::Hash,
-    (height, receipt_order): (block::Height, Option<u64>),
+    (height, receipt_order, origin): (block::Height, Option<u64>, zs::BlockOrigin),
     admission: &zs::BlockAdmission,
 ) -> Result<Option<block::Hash>, VerifyBlockError>
 where
@@ -948,9 +948,7 @@ where
     prepared_block.hash = hash;
     prepared_block.height = height;
     prepared_block.receipt_order = receipt_order;
-    prepared_block.origin = zs::BlockOrigin::LocalSubmission {
-        size: prepared_block.block.zcash_serialized_size(),
-    };
+    prepared_block.origin = origin;
 
     if source == PreparedCandidateSource::ServerTemplate
         && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?

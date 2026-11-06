@@ -45,7 +45,7 @@ use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{run_mempool_transaction_id_gossip, Config as MempoolConfig, Mempool},
-        sync::{self, BlockGossipError, SyncStatus},
+        sync::{self, BlockGossipError, RecentSyncLengths, SyncStatus},
     },
     BoxError,
 };
@@ -95,6 +95,7 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
+        _syncer,
     ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     // yield and sleep until the address book lock is released.
@@ -184,6 +185,7 @@ async fn dual_stack_node_coexists_with_legacy_tcp_peer() -> Result<(), crate::Bo
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
+        _syncer,
     ) = setup(
         Some(Response::Peers(Vec::new())),
         P2pStack::Dual,
@@ -254,6 +256,7 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     let test_block = block::Hash([0x11; 32]);
@@ -351,6 +354,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(
         None,
         P2pStack::Legacy,
@@ -517,6 +521,7 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     let test_tx = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
@@ -649,6 +654,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(
         Some(unrelated_response),
         P2pStack::Legacy,
@@ -804,6 +810,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(
         Some(repeated_response),
         P2pStack::Legacy,
@@ -937,6 +944,7 @@ async fn setup(
     JoinHandle<Result<(), BoxError>>,
     // real open socket addresses
     SocketAddr,
+    RecentSyncLengths,
 ) {
     let _init_guard = zakura_test::init();
 
@@ -1146,6 +1154,7 @@ async fn setup(
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
+        recent_syncs,
     )
 }
 
@@ -1258,8 +1267,7 @@ mod submitblock_test {
                 let next_log = log_written.notified();
                 let sent_mined_block = {
                     let captured_logs = logs.lock().unwrap();
-                    String::from_utf8_lossy(&captured_logs)
-                        .contains("sending committed mined block broadcast")
+                    String::from_utf8_lossy(&captured_logs).contains("sending block announcement")
                 };
 
                 if sent_mined_block {
@@ -1279,7 +1287,8 @@ mod submitblock_test {
         };
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending committed mined block broadcast"));
+        assert!(log_output.contains("sending block announcement"));
+        assert!(log_output.contains("is_block_submission=true"));
 
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle

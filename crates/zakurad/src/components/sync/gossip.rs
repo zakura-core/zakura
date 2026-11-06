@@ -48,12 +48,9 @@ pub enum BlockGossipError {
 /// Once the state has reached the chain tip, broadcast the [`block::Hash`]es
 /// of newly verified blocks to all ready peers.
 ///
-/// Blocks are only gossiped if they are:
-/// - on the best chain, and
-/// - the most recent block verified since the last gossip.
-///
-/// In particular, if a lot of blocks are committed at the same time,
-/// gossips will be disabled or skipped until the state reaches the latest tip.
+/// Ordinary announcements coalesce to the latest best-chain tip and wait until sync is close
+/// to the network tip. Successful local submissions are retained in commit order, including
+/// side-chain blocks, and are announced regardless of sync distance.
 ///
 /// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
 ///

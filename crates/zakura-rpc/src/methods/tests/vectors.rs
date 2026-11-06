@@ -4744,7 +4744,10 @@ async fn completed_mined_verification_precedes_admission() {
         .expect("the genesis block is valid");
     for committed in [true, false] {
         let verifier = tower::service_fn(move |request: zakura_consensus::Request| async move {
-            let zakura_consensus::Request::CommitMined { block, admission } = request else {
+            let zakura_consensus::Request::CommitMined {
+                block, admission, ..
+            } = request
+            else {
                 panic!("a submission must use CommitMined");
             };
             admission.authorize_optimistic_relay();

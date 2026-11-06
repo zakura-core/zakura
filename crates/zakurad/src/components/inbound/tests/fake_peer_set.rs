@@ -45,7 +45,7 @@ use crate::{
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
-        sync::{self, BlockGossipError, SyncStatus},
+        sync::{self, BlockGossipError, RecentSyncLengths, SyncStatus},
     },
     BoxError,
 };
@@ -85,6 +85,7 @@ async fn empty_mempool_requests_return_empty_inventory() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let response = timeout(
@@ -114,6 +115,7 @@ async fn mempool_requests_for_transactions() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(true).await;
 
     let added_transactions: Vec<UnminedTx> = added_transactions
@@ -195,6 +197,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Test `Request::PushTransaction`
@@ -287,6 +290,7 @@ async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), 
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let peer_source =
@@ -373,6 +377,7 @@ async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), cr
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let source =
@@ -456,6 +461,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Test `Request::AdvertiseTransactionIds`
@@ -554,6 +560,7 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let peer_id = zakura_network::zakura::ZakuraPeerId::new(vec![7; 32])
@@ -654,6 +661,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Push test transaction
@@ -952,6 +960,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
+        _syncer,
     ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 2 is the tip child. Rewriting only its
@@ -1058,6 +1067,7 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
+        _syncer,
     ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
@@ -1142,6 +1152,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
         mut chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Get the next block
@@ -1527,6 +1538,7 @@ async fn setup(
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
+    RecentSyncLengths,
 ) {
     let (
         inbound_service,
@@ -1540,6 +1552,7 @@ async fn setup(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         _misbehavior_rx,
+        syncer,
     ) = setup_with_misbehavior_receiver(add_transactions).await;
 
     (
@@ -1553,6 +1566,7 @@ async fn setup(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        syncer,
     )
 }
 
@@ -1582,6 +1596,7 @@ async fn setup_with_misbehavior_receiver(
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
     tokio::sync::mpsc::Receiver<(PeerSocketAddr, u32)>,
+    RecentSyncLengths,
 ) {
     let _init_guard = zakura_test::init();
 
@@ -1785,6 +1800,7 @@ async fn setup_with_misbehavior_receiver(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         misbehavior_rx,
+        recent_syncs,
     )
 }
 

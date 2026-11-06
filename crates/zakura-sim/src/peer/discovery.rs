@@ -494,3 +494,49 @@ impl DiscoveryPeer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Label;
+
+    /// A peer on discovery's stream, with that stream's models started.
+    fn started() -> DiscoveryPeer {
+        let mut peer = DiscoveryPeer::new(
+            discovery_stream(),
+            DiscoveryScript::default(),
+            NodeSecretKey::from_bytes(&[7; 32]),
+            FIXTURE_ADDR,
+        )
+        .expect("the default script is valid");
+        peer.models = Some(Models::new(&peer.stream));
+        peer
+    }
+
+    /// The label of `sent`'s one frame.
+    fn label(sent: &Outgoing) -> Label {
+        match sent.records[..] {
+            [RecordBody::Frame { label, .. }] => label,
+            ref records => panic!("one frame record, not {records:?}"),
+        }
+    }
+
+    /// The peer's frames take reg-5's labels over discovery's rows. A third
+    /// unanswered `GetPeers` passes twice the row's `max_in_flight` of 1, and
+    /// a `Peers` for an exchange the node never opened is unsolicited.
+    #[test]
+    fn discovery_frames_take_the_models_labels() {
+        let mut peer = started();
+        let asks: Vec<_> = (0..3)
+            .map(|_| label(&peer.ask(Request::GetPeers)))
+            .collect();
+        assert_eq!(
+            asks,
+            [Label::Conformant, Label::Conformant, Label::OverMargin]
+        );
+        let peers = DiscoveryMessage::Peers {
+            records: Vec::new(),
+        };
+        assert_eq!(label(&peer.send(&peers, Some(9))), Label::Unsolicited);
+    }
+}

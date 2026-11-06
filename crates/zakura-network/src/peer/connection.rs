@@ -1902,6 +1902,9 @@ where
                     match block {
                         Available((block, _)) => {
                             let hash = block.hash();
+                            // A large block we are advertising waits for an upload slot, so a
+                            // burst of requests for it cannot start every upload at once.
+                            self.block_uploads.wait_for_upload_slot(hash).await;
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;
                                 return;

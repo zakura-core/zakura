@@ -357,12 +357,14 @@ pub struct Config {
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 
-    /// The number of peers that one legacy block broadcast advertises to at once when the block
-    /// is at least `advert_window_full_size_bytes`, or its size is unknown. At least 1.
+    /// The number of peers that one legacy block broadcast writes an `inv` to at once when the
+    /// block is at least `advert_window_full_size_bytes`, or its size is unknown. At least 1.
+    ///
+    /// A peer holds its window entry only while its `inv` is being written, so the window paces
+    /// busy connections, not uploads. Uploads are bounded by the shared upload slots.
     ///
     /// The window grows linearly as the block size falls from `advert_window_full_size_bytes`
     /// to `advert_window_small_size_bytes`.
-    /// Concurrent uploads share one uplink, so a large block goes to fewer peers at a time.
     /// Set `advert_window_min` and `advert_window_max` to the same value for a fixed window.
     ///
     /// Configured block gossip sidecars are always advertised first, outside this window.
@@ -370,8 +372,8 @@ pub struct Config {
     /// Experimental.
     pub advert_window_min: usize,
 
-    /// The number of peers that one legacy block broadcast advertises to at once when the block
-    /// is at or below `advert_window_small_size_bytes`. At least `advert_window_min`.
+    /// The number of peers that one legacy block broadcast writes an `inv` to at once when the
+    /// block is at or below `advert_window_small_size_bytes`. At least `advert_window_min`.
     ///
     /// Experimental.
     pub advert_window_max: usize,
@@ -379,9 +381,9 @@ pub struct Config {
     /// The block size in bytes at and below which a legacy block broadcast uses
     /// `advert_window_max`. Must be below `advert_window_full_size_bytes`.
     ///
-    /// A broadcast of a block at or below this size also gives a peer's window entry back once
-    /// its `inv` is written and the peer has not requested the block, so peers that already have
-    /// the block do not delay the rest of the fan-out.
+    /// A requested body of a larger block, or of a block of unknown size, waits for one of the
+    /// shared upload slots before it is written, so a burst of requests cannot start every upload
+    /// at once. Smaller bodies are written at once.
     ///
     /// Experimental.
     pub advert_window_small_size_bytes: u64,

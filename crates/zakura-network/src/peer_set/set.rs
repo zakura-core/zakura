@@ -1457,7 +1457,7 @@ where
             peers,
             block.hash,
             self.block_gossip_fanout.window(block.size),
-            self.block_gossip_fanout.releases_unrequested(block.size),
+            self.block_gossip_fanout.gates_uploads(block.size),
             mined,
             self.block_gossip_slots.clone(),
         )

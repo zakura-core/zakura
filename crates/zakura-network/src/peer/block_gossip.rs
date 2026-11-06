@@ -1,26 +1,20 @@
 //! Pace legacy block advertisements using the corresponding block writes.
 //!
-//! Each broadcast advertises to at most its advert window of peers at a time, and moves on to
-//! the next peer once an earlier one finishes. [`AdvertFanout`] sizes that window from the
-//! block's size. Configured sidecars are advertised first, outside the window. Writing an `inv`
-//! uses only that window. A peer takes one of the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots,
-//! shared by every broadcast, only once it requests the block, and keeps it through the body
-//! write and its drain allowance. A peer waiting for a slot keeps its window entry, so busy
-//! uploads still slow each broadcast's fan-out, but they cannot delay another block's first
-//! `inv`s.
+//! Each broadcast advertises to every peer, taking one of its advert window entries per peer
+//! only while that peer's `inv` is being written. [`AdvertFanout`] sizes that window from the
+//! block's size. Configured sidecars are advertised first, outside the window. Near the tip most
+//! peers already have the block and never request it, so a peer that has not requested the block
+//! must not hold an entry: each would otherwise delay the rest of the fan-out by
+//! [`BLOCK_REQUEST_WAIT`].
 //!
-//! The slots pace fan-out. They do not gate the body write: the connection answers a `getdata`
-//! at once, and the advert task can take its slot after the write completes. So the window, not
-//! the slots, bounds one broadcast's concurrent body writes, and overlapping broadcasts and
-//! sidecars add to that.
-//!
-//! A small block, one of known size at most `advert_window_small_size_bytes`, gives a peer's
-//! window entry back once its `inv` is written and the peer has not yet requested the block.
-//! Near the tip most peers already have the block and never request it, so otherwise each one
-//! would hold its entry for [`BLOCK_REQUEST_WAIT`] and delay the rest of the fan-out by that long
-//! per window. A small block's body writes are therefore bounded by the connected peers rather
-//! than the window, as with a window that covers every peer. Larger blocks, and blocks of unknown
-//! size, keep their entries until the advertisement finishes.
+//! Uploads are bounded by the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots that every broadcast
+//! shares, not by the window. A peer takes a slot once it requests the block and keeps it through
+//! the body write and its drain allowance. For a block above `advert_window_small_size_bytes`,
+//! or of unknown size, the connection also waits for that slot before it writes the body, for at
+//! most [`UPLOAD_SLOT_WAIT`], so a burst of requests for a large block cannot start every upload
+//! at once. A small block's body is written at once, as its burst is bounded by the connected
+//! peers times the small size. Requests for blocks that no broadcast is advertising to the peer,
+//! such as a syncing peer's, never wait for a slot.
 //!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
@@ -126,30 +120,13 @@ impl AdvertFanout {
         window
     }
 
-    /// Returns whether a broadcast of a block of `size` serialized bytes gives a peer's window
-    /// entry back while the peer has not requested the block.
+    /// Returns whether a requested body of a block of `size` serialized bytes waits for an
+    /// upload slot before it is written.
     ///
-    /// Only blocks of known size at or below `small_size_bytes` do, so a burst of requests for
-    /// a large or unknown block stays bounded by the window.
-    pub(crate) fn releases_unrequested(&self, size: Option<u32>) -> bool {
-        size.is_some_and(|size| u64::from(size) <= self.small_size_bytes)
-    }
-}
-
-/// One peer's entry in its broadcast's advert window.
-struct WindowEntry {
-    _permit: OwnedSemaphorePermit,
-    /// Whether the entry is given back while the peer has not requested the block.
-    release_unrequested: bool,
-}
-
-/// Gives `entry` back if its broadcast does not hold entries for peers that have not requested.
-fn release_unrequested(entry: &mut Option<WindowEntry>) {
-    if entry
-        .as_ref()
-        .is_some_and(|entry| entry.release_unrequested)
-    {
-        *entry = None;
+    /// Blocks above `small_size_bytes`, and blocks of unknown size, wait, so a burst of requests
+    /// for a large block stays bounded by the upload slots.
+    pub(crate) fn gates_uploads(&self, size: Option<u32>) -> bool {
+        !size.is_some_and(|size| u64::from(size) <= self.small_size_bytes)
     }
 }
 
@@ -163,13 +140,21 @@ const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
 pub(super) const BLOCK_REQUEST_WAIT: Duration = Duration::from_secs(3);
 /// Bound both inbound service work and the subsequent block write.
 const BLOCK_UPLOAD_WAIT: Duration = Duration::from_secs(2 * REQUEST_TIMEOUT.as_secs());
+/// The longest a connection waits for an upload slot before writing a gated block body anyway.
+///
+/// A quarter of the peer's own request timeout leaves the body time to arrive, so a full set of
+/// slots delays an upload rather than failing the peer's request.
+pub(super) const UPLOAD_SLOT_WAIT: Duration = Duration::from_secs(REQUEST_TIMEOUT.as_secs() / 4);
 
 #[derive(Clone, Copy, Debug)]
 enum UploadState {
     /// Requests before this advertisement's inventory belong to an earlier generation.
     Queued,
     Waiting,
+    /// The peer requested the block, and its upload has no slot yet.
     Requested(Instant),
+    /// The upload holds a slot, so a gated body can be written.
+    Granted(Instant),
     Written(Instant),
     Finished(bool),
     Revoked,
@@ -185,32 +170,83 @@ impl UploadState {
     }
 }
 
+/// An upload that a local broadcast is tracking for this connection.
+#[derive(Debug)]
+struct TrackedUpload {
+    state: Weak<watch::Sender<UploadState>>,
+    /// Whether the connection waits for an upload slot before writing the body.
+    gated: bool,
+}
+
+impl TrackedUpload {
+    fn upgrade(&self) -> Option<Arc<watch::Sender<UploadState>>> {
+        self.state.upgrade()
+    }
+}
+
 /// Observers exist only while local broadcasts await this connection's uploads.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct BlockUploads(Arc<Mutex<HashMap<block::Hash, Weak<watch::Sender<UploadState>>>>>);
+pub(crate) struct BlockUploads(Arc<Mutex<HashMap<block::Hash, TrackedUpload>>>);
 
 impl BlockUploads {
-    fn register(&self, hash: block::Hash) -> (watch::Receiver<UploadState>, Option<UploadClaim>) {
+    /// Tracks `hash` for a broadcast, or joins the broadcast already tracking it.
+    ///
+    /// The broadcast that claims the upload decides whether its body is gated.
+    fn register(
+        &self,
+        hash: block::Hash,
+        gated: bool,
+    ) -> (watch::Receiver<UploadState>, Option<UploadClaim>) {
         let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        uploads.retain(|_, upload| upload.strong_count() > 0);
-        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+        uploads.retain(|_, upload| upload.state.strong_count() > 0);
+        if let Some(upload) = uploads.get(&hash).and_then(TrackedUpload::upgrade) {
             return (upload.subscribe(), None);
         }
         let (sender, receiver) = watch::channel(UploadState::Queued);
         let sender = Arc::new(sender);
-        uploads.insert(hash, Arc::downgrade(&sender));
+        uploads.insert(
+            hash,
+            TrackedUpload {
+                state: Arc::downgrade(&sender),
+                gated,
+            },
+        );
         (receiver, Some(UploadClaim(sender)))
+    }
+
+    /// Waits until a gated upload of `hash` holds an upload slot, for at most
+    /// [`UPLOAD_SLOT_WAIT`]. Returns at once for an ungated upload, or a block that no local
+    /// broadcast is advertising to this peer.
+    pub(crate) async fn wait_for_upload_slot(&self, hash: block::Hash) {
+        let mut state = {
+            let uploads = self.0.lock().expect("block upload mutex is never poisoned");
+            match uploads.get(&hash) {
+                Some(upload) if upload.gated => match upload.upgrade() {
+                    Some(state) => state.subscribe(),
+                    None => return,
+                },
+                _ => return,
+            }
+        };
+        let granted = timeout(
+            UPLOAD_SLOT_WAIT,
+            state.wait_for(|state| !matches!(state, UploadState::Requested(_))),
+        )
+        .await;
+        if granted.is_err() {
+            metrics::counter!("peer.block_gossip.upload_slot_wait_timeout").increment(1);
+        }
     }
 
     fn update(&self, hash: block::Hash, state: UploadState) {
         let uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+        if let Some(upload) = uploads.get(&hash).and_then(TrackedUpload::upgrade) {
             upload.send_if_modified(|current| {
                 let replace = matches!(*current, UploadState::Waiting)
                     || matches!(
                         (*current, state),
                         (
-                            UploadState::Requested(_),
+                            UploadState::Requested(_) | UploadState::Granted(_),
                             UploadState::Written(_) | UploadState::Finished(_)
                         )
                     );
@@ -225,7 +261,7 @@ impl BlockUploads {
     /// Start tracking requests once the connection writes this advertisement's inventory.
     pub(crate) fn advertised(&self, hash: block::Hash) {
         let uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+        if let Some(upload) = uploads.get(&hash).and_then(TrackedUpload::upgrade) {
             upload.send_if_modified(UploadState::start_waiting);
         }
     }
@@ -249,10 +285,11 @@ impl BlockUploads {
         let uploads = self.0.lock().expect("block upload mutex is never poisoned");
         for upload in hashes
             .into_iter()
-            .filter_map(|hash| uploads.get(hash).and_then(Weak::upgrade))
+            .filter_map(|hash| uploads.get(hash).and_then(TrackedUpload::upgrade))
         {
             upload.send_if_modified(|state| {
-                let requested = matches!(state, UploadState::Requested(_));
+                let requested =
+                    matches!(state, UploadState::Requested(_) | UploadState::Granted(_));
                 if requested {
                     *state = UploadState::Finished(false);
                 }
@@ -267,7 +304,7 @@ impl BlockUploads {
             .lock()
             .expect("block upload mutex is never poisoned")
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(TrackedUpload::upgrade)
         {
             upload.send_if_modified(|state| {
                 if matches!(state, UploadState::Finished(_) | UploadState::Revoked) {
@@ -317,14 +354,15 @@ impl BlockGossipPeer {
     /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.
     ///
     /// Writing the `inv` takes no upload slot. The peer takes one only once it requests the
-    /// block, and keeps it through the block write and the drain allowance.
+    /// block, and keeps it through the block write and the drain allowance. The body is not
+    /// gated on the slot.
     ///
     /// Returns false if the `inv` was not written, or if the peer requested the block and the
     /// upload failed or did not finish in time.
     #[cfg(test)]
     pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
         matches!(
-            self.advertise_outcome(hash, slots, None).await,
+            self.advertise_outcome(hash, slots, None, false).await,
             AdvertOutcome::Sent
         )
     }
@@ -332,22 +370,23 @@ impl BlockGossipPeer {
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
     ///
     /// `entry` is this peer's place in its broadcast's advert window, if it has one. It is held
-    /// until the advertisement finishes, or given back while the peer has not requested the
-    /// block if the entry allows that.
+    /// only until the `inv` is written. If `gated`, the connection waits for this upload's slot
+    /// before writing a requested body.
     async fn advertise_outcome(
         self,
         hash: block::Hash,
         slots: BlockUploadSlots,
-        mut entry: Option<WindowEntry>,
+        mut entry: Option<OwnedSemaphorePermit>,
+        gated: bool,
     ) -> AdvertOutcome {
         let mut retried = false;
         let (mut progress, claim) = loop {
-            let (mut progress, claim) = self.uploads.register(hash);
+            let (mut progress, claim) = self.uploads.register(hash, gated);
             if let Some(claim) = claim {
                 break (progress, claim);
             }
             // Another broadcast already advertised this block to this peer.
-            release_unrequested(&mut entry);
+            entry = None;
             // Early and committed announcements join an existing upload for this peer.
             let succeeded = loop {
                 match *progress.borrow_and_update() {
@@ -392,9 +431,8 @@ impl BlockGossipPeer {
         }
         // The connection usually marks the write first; senders without a connection rely on this.
         claim.0.send_if_modified(UploadState::start_waiting);
-        // Our `inv` is written. A peer that later requests is still served and takes an upload
-        // slot, but it does not take a window entry back.
-        release_unrequested(&mut entry);
+        // Our `inv` is written. A peer that later requests takes an upload slot, not an entry.
+        drop(entry);
 
         let request_deadline = Instant::now() + BLOCK_REQUEST_WAIT;
         let mut upload = None;
@@ -403,11 +441,12 @@ impl BlockGossipPeer {
             let deadline = match state {
                 UploadState::Queued => unreachable!("written inventory leaves the queued state"),
                 UploadState::Waiting => request_deadline,
-                UploadState::Requested(started) => started + BLOCK_UPLOAD_WAIT,
+                UploadState::Requested(started) | UploadState::Granted(started) => {
+                    started + BLOCK_UPLOAD_WAIT
+                }
                 UploadState::Written(written) => {
-                    // A peer that requested while every slot was held keeps this broadcast's
-                    // window entry until it gets one, so busy uploads pace every broadcast's
-                    // further fan-out.
+                    // An ungated body, or one written after its wait for a slot ran out, takes
+                    // its slot now, so it still counts against later uploads.
                     if upload.is_none() {
                         upload = Some(slots.acquire().await);
                     }
@@ -424,6 +463,14 @@ impl BlockGossipPeer {
                 changed = progress.changed() => if changed.is_err() { break false; },
                 slot = slots.acquire(), if requested && upload.is_none() => {
                     upload = Some(slot);
+                    // Lets a gated connection write the body.
+                    claim.0.send_if_modified(|state| match *state {
+                        UploadState::Requested(started) => {
+                            *state = UploadState::Granted(started);
+                            true
+                        }
+                        _ => false,
+                    });
                 }
                 _ = sleep_until(deadline) => {
                     let reason = if matches!(state, UploadState::Waiting) { "no_request" } else { "upload_timeout" };
@@ -525,14 +572,14 @@ struct RevokedCandidates;
 /// Advertises `hash` to `peers`, paced through their block uploads.
 ///
 /// Configured sidecars are all advertised at once, first. Other peers take one of `window`
-/// entries each, in order. If `release_unrequested` is set, a peer gives its entry back while it
-/// has not requested the block; otherwise it holds it until its advertisement finishes. Succeeds
-/// if at least one peer was advertised to.
+/// entries each, in order, and hold it only while their `inv` is written. If `gate_uploads` is
+/// set, each requested body waits for an upload slot before it is written. Succeeds if at least
+/// one peer was advertised to.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
     window: usize,
-    release_unrequested: bool,
+    gate_uploads: bool,
     mined: bool,
     slots: BlockUploadSlots,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
@@ -545,7 +592,7 @@ pub(crate) fn broadcast_block(
         let mut adverts = futures::stream::FuturesUnordered::new();
         // Pushed first, so their adverts are queued first.
         for sidecar in sidecars {
-            adverts.push(sidecar.advertise_outcome(hash, slots.clone(), None));
+            adverts.push(sidecar.advertise_outcome(hash, slots.clone(), None, gate_uploads));
         }
         let mut others = others.into_iter().peekable();
         let mut succeeded = false;
@@ -561,8 +608,7 @@ pub(crate) fn broadcast_block(
                 permit = entries.clone().acquire_owned(), if others.peek().is_some() => {
                     let permit = permit.expect("advert window entries never close their semaphore");
                     let peer = others.next().expect("peeked a remaining peer");
-                    let entry = WindowEntry { _permit: permit, release_unrequested };
-                    adverts.push(peer.advertise_outcome(hash, slots.clone(), Some(entry)));
+                    adverts.push(peer.advertise_outcome(hash, slots.clone(), Some(permit), gate_uploads));
                 }
                 else => break,
             }
@@ -645,7 +691,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         let mut peers = self.peers.clone();
         let slots = self.slots.clone();
         let window = self.fanout.window(block.size);
-        let release_unrequested = self.fanout.releases_unrequested(block.size);
+        let gate_uploads = self.fanout.gates_uploads(block.size);
         async move {
             loop {
                 if let Some(refresh) = &refresh {
@@ -669,7 +715,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                         candidates,
                         block.hash,
                         window,
-                        release_unrequested,
+                        gate_uploads,
                         mined,
                         slots.clone(),
                     )
@@ -780,8 +826,8 @@ mod tests {
     }
 
     /// Like [`connected_peers`], but if `body_write` is set, each peer requests every advertised
-    /// block at once, and its connection writes the body that long afterwards, whether or not
-    /// gossip has an upload slot for it, as the inbound service does.
+    /// block at once. Its connection waits for a gated upload's slot, as the inbound path does,
+    /// then spends `body_write` writing the body.
     fn requesting_peers(
         count: usize,
         body_write: Option<Duration>,
@@ -812,10 +858,11 @@ mod tests {
                             continue;
                         };
                         uploads.requested(hash);
-                        let current = bodies.current.fetch_add(1, SeqCst) + 1;
-                        bodies.max.fetch_max(current, SeqCst);
                         let (uploads, bodies) = (uploads.clone(), bodies.clone());
                         tokio::spawn(async move {
+                            uploads.wait_for_upload_slot(hash).await;
+                            let current = bodies.current.fetch_add(1, SeqCst) + 1;
+                            bodies.max.fetch_max(current, SeqCst);
                             tokio::time::sleep(body_write).await;
                             bodies.current.fetch_sub(1, SeqCst);
                             uploads.written(hash);
@@ -1181,7 +1228,7 @@ mod tests {
             true,
             slots.clone(),
         ));
-        for _ in 0..TEST_WINDOW {
+        for _ in 0..peers.len() {
             assert_eq!(writes.recv().await.unwrap().1, parent);
         }
 
@@ -1194,41 +1241,53 @@ mod tests {
             true,
             slots.clone(),
         ));
-        for _ in 0..TEST_WINDOW {
+        for _ in 0..peers.len() {
             assert_eq!(writes.recv().await.unwrap().1, child);
             assert_eq!(mined.elapsed(), Duration::ZERO, "the child waited");
         }
         accept(&mut busy_rx, parent).await;
         assert!(queued.await.unwrap(), "the queued parent advert is written");
 
-        // Every peer also gets the rest of the parent fan-out once its window entries expire.
-        let (mut parents, mut children) = (TEST_WINDOW, TEST_WINDOW);
-        while parents < peers.len() || children < peers.len() {
-            let write = timeout(Duration::from_secs(60), writes.recv())
-                .await
-                .expect("each window entry expires, so the fan-out reaches every peer");
-            if write.unwrap().1 == parent {
-                parents += 1;
-            } else {
-                children += 1;
-            }
-        }
+        // The parent broadcast still finishes, after its peers' request waits.
         assert!(parent_broadcast.await.unwrap().is_ok());
         assert!(child_broadcast.await.unwrap().is_ok());
     }
 
-    /// Starts a broadcast of a block of `size` bytes to `peers` with the fan-out policy in
-    /// `config`, and returns the peers it advertised to before any advert finished.
-    /// If `release_unrequested` is set, the broadcast uses the policy's choice for that size.
-    async fn first_wave(
+    /// Starts a broadcast of a block of `size` bytes to `peers`, whose connections are too busy
+    /// to write inventory, with the fan-out policy in `config`. Returns the peers whose adverts
+    /// were queued before any inventory wait ran out, which is the window.
+    async fn first_wave(config: Config, peers: Vec<BlockGossipPeer>, size: u32) -> Vec<usize> {
+        let (peers, mut queued) = peers_busy(peers);
+        broadcast_wave(config, peers, size, &mut queued).await
+    }
+
+    /// Like [`first_wave`], but the connections write every advert at once, and the peers never
+    /// request the block. Returns the peers advertised to before the request wait ran out.
+    async fn advertised_at_once(
         config: Config,
         peers: Vec<BlockGossipPeer>,
         size: u32,
-        release_unrequested: bool,
+    ) -> Vec<usize> {
+        let (peers, mut writes) = peers_writing(peers);
+        let (indexes, mut written) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some((index, _)) = writes.recv().await {
+                let _ = indexes.send(index);
+            }
+        });
+        broadcast_wave(config, peers, size, &mut written).await
+    }
+
+    /// Broadcasts a block of `size` bytes with the policy in `config`, and collects the peer
+    /// indexes `events` reports before half the request wait.
+    async fn broadcast_wave(
+        config: Config,
+        peers: Vec<BlockGossipPeer>,
+        size: u32,
+        events: &mut mpsc::UnboundedReceiver<usize>,
     ) -> Vec<usize> {
         let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
         let fanout = AdvertFanout::from_config(&config);
-        let (peers, mut writes) = peers_writing(peers);
         let block = AdvertisedBlock {
             size: Some(size),
             ..block::Hash([40; 32]).into()
@@ -1237,17 +1296,45 @@ mod tests {
             peers,
             block.hash,
             fanout.window(block.size),
-            release_unrequested && fanout.releases_unrequested(block.size),
+            fanout.gates_uploads(block.size),
             false,
             slots,
         ));
         let mut wave = Vec::new();
-        // These peers never request the block, so no advert finishes before the request wait.
-        while let Ok(Some((index, _))) = timeout(BLOCK_REQUEST_WAIT / 2, writes.recv()).await {
+        while let Ok(Some(index)) = timeout(BLOCK_REQUEST_WAIT / 2, events.recv()).await {
             wave.push(index);
         }
         broadcast.abort();
         wave
+    }
+
+    /// Wires `peers`' advert queues to connections that take each advert but never write it,
+    /// and report each advert they take.
+    fn peers_busy(
+        peers: Vec<BlockGossipPeer>,
+    ) -> (Vec<BlockGossipPeer>, mpsc::UnboundedReceiver<usize>) {
+        let (queued_tx, queued) = mpsc::unbounded_channel();
+        let peers = peers
+            .into_iter()
+            .enumerate()
+            .map(|(index, original)| {
+                let (busy, mut receiver) = peer();
+                let queued_tx = queued_tx.clone();
+                tokio::spawn(async move {
+                    // Holding the advert keeps its write pending.
+                    let mut held = Vec::new();
+                    while let Some(advert) = receiver.recv().await {
+                        let _ = queued_tx.send(index);
+                        held.push(advert);
+                    }
+                });
+                BlockGossipPeer {
+                    sidecar: original.sidecar,
+                    ..busy
+                }
+            })
+            .collect();
+        (peers, queued)
     }
 
     /// Wires `peers`' advert queues to connections that write every advert at once.
@@ -1336,10 +1423,10 @@ mod tests {
         assert_eq!(fanout.window(None), 4);
     }
 
-    /// Broadcasts advertise to the window's peers at once, up to the peers they have.
+    /// A broadcast writes inventory to the window's peers at once, up to the peers it has.
     #[tokio::test(start_paused = true)]
     async fn first_wave_follows_block_size() {
-        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size, false);
+        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
         assert_eq!(wave(100, 1_513_987).await.len(), 33);
         assert_eq!(wave(100, 10_000_000).await.len(), 32);
         assert_eq!(wave(100, 2_000).await.len(), 64);
@@ -1348,36 +1435,136 @@ mod tests {
         assert_eq!(wave(40, 2_000).await.len(), 40);
     }
 
-    /// Only blocks of known size at or below the small size give entries back while unrequested.
+    /// Only bodies of blocks above the small size, or of unknown size, wait for upload slots.
     #[test]
-    fn small_known_blocks_release_unrequested_entries() {
+    fn large_and_unknown_blocks_gate_uploads() {
         let fanout = AdvertFanout::from_config(&Config::default());
         for size in [0, 10_775, 102_400] {
-            assert!(fanout.releases_unrequested(Some(size)), "{size} bytes");
+            assert!(!fanout.gates_uploads(Some(size)), "{size} bytes");
         }
         for size in [102_401, 1_513_987, u32::MAX] {
-            assert!(!fanout.releases_unrequested(Some(size)), "{size} bytes");
+            assert!(fanout.gates_uploads(Some(size)), "{size} bytes");
         }
-        assert!(!fanout.releases_unrequested(None), "unknown size");
+        assert!(fanout.gates_uploads(None), "unknown size");
     }
 
-    /// Peers that never request a small block do not hold its window, so every peer is
-    /// advertised to at once. A large block still advertises to one window at a time.
+    /// Peers that never request a block do not hold its window, whatever its size, so every
+    /// peer is advertised to at once.
     #[tokio::test(start_paused = true)]
-    async fn unrequested_peers_do_not_hold_a_small_blocks_window() {
+    async fn unrequested_peers_do_not_hold_the_window() {
         const PEERS: usize = 300;
-        let wave = |size| first_wave(Config::default(), plain_peers(PEERS), size, true);
+        let wave = |size| advertised_at_once(Config::default(), plain_peers(PEERS), size);
         assert_eq!(wave(10_775).await.len(), PEERS, "small block");
         assert_eq!(wave(102_400).await.len(), PEERS, "small size boundary");
-        assert_eq!(wave(102_401).await.len(), 63, "just above the small size");
-        assert_eq!(wave(10_000_000).await.len(), 32, "large block");
+        assert_eq!(
+            wave(102_401).await.len(),
+            PEERS,
+            "just above the small size"
+        );
+        assert_eq!(wave(1_513_987).await.len(), PEERS, "full NU7 block");
+        assert_eq!(wave(10_000_000).await.len(), PEERS, "oversized block");
     }
 
-    /// A released small-block broadcast still finishes, succeeds, and leaves no upload slot
-    /// held, whether its peers never request the block or all request it at once. Requested
-    /// uploads still take the shared upload slots, which never exceed their cap.
+    /// When every peer requests a gated block at once, at most the upload slots' worth of
+    /// bodies are written at a time, and every body is still written. Ungated bodies are written
+    /// at once, which is the burst the gate prevents.
     #[tokio::test(start_paused = true)]
-    async fn released_small_block_broadcast_finishes_and_returns_slots() {
+    async fn gated_uploads_never_exceed_the_upload_slots() {
+        // Two slots' worth of peers, so the second half waits less than `UPLOAD_SLOT_WAIT`.
+        const PEERS: usize = 2 * BLOCK_UPLOAD_CONCURRENCY;
+        for gate_uploads in [true, false] {
+            let hash = block::Hash([0xe0; 32]);
+            let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
+            let (peers, mut writes, bodies) = requesting_peers(PEERS, Some(Duration::from_secs(2)));
+            let started = Instant::now();
+            let broadcast = tokio::spawn(broadcast_block(
+                peers,
+                hash,
+                TEST_WINDOW,
+                gate_uploads,
+                false,
+                slots.clone(),
+            ));
+            for _ in 0..PEERS {
+                writes.recv().await.expect("mock connections stay open");
+            }
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "every peer is advertised at once"
+            );
+            let result = broadcast.await.expect("broadcast task does not panic");
+            assert!(result.is_ok(), "gated {gate_uploads}: {result:?}");
+            assert_eq!(slots.available_uploads(), BLOCK_UPLOAD_CONCURRENCY);
+            let max_bodies = bodies.max.load(std::sync::atomic::Ordering::SeqCst);
+            if gate_uploads {
+                assert_eq!(max_bodies, BLOCK_UPLOAD_CONCURRENCY, "gated body writes");
+            } else {
+                assert_eq!(max_bodies, PEERS, "ungated body writes");
+            }
+        }
+    }
+
+    /// A gated body waits until its upload holds a slot, and no longer than
+    /// [`UPLOAD_SLOT_WAIT`] if none frees. Untracked blocks never wait.
+    #[tokio::test(start_paused = true)]
+    async fn gated_body_waits_for_a_slot_at_most_the_slot_wait() {
+        let uploads = BlockUploads::default();
+        assert!(
+            uploads
+                .wait_for_upload_slot(block::Hash([0xe1; 32]))
+                .now_or_never()
+                .is_some(),
+            "a block no broadcast is advertising does not wait"
+        );
+        for slot_frees in [true, false] {
+            let hash = block::Hash([0xe2; 32]);
+            let slots = BlockUploadSlots::new(1);
+            let held = slots.acquire().await;
+            let (peer, mut receiver) = peer();
+            let uploads = peer.uploads.clone();
+            let advert = tokio::spawn(peer.advertise_outcome(hash, slots.clone(), None, true));
+            accept(&mut receiver, hash).await;
+            uploads.requested(hash);
+            let waiting = Instant::now();
+            let mut wait = tokio::spawn({
+                let uploads = uploads.clone();
+                async move { uploads.wait_for_upload_slot(hash).await }
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(
+                (&mut wait).now_or_never().is_none(),
+                "the body waits for a slot"
+            );
+            if slot_frees {
+                drop(held);
+                wait.await.unwrap();
+                assert_eq!(
+                    waiting.elapsed(),
+                    Duration::from_secs(1),
+                    "the slot is granted"
+                );
+            } else {
+                wait.await.unwrap();
+                assert_eq!(waiting.elapsed(), UPLOAD_SLOT_WAIT, "the wait runs out");
+                drop(held);
+            }
+            uploads.written(hash);
+            tokio::time::advance(BLOCK_WRITE_GRACE).await;
+            assert!(
+                matches!(advert.await.unwrap(), AdvertOutcome::Sent),
+                "slot frees: {slot_frees}"
+            );
+            assert_eq!(slots.available_uploads(), 1);
+        }
+    }
+
+    /// An ungated broadcast still finishes, succeeds, and leaves no upload slot held, whether
+    /// its peers never request the block or all request it at once. Requested uploads still take
+    /// the shared upload slots, which never exceed their cap.
+    #[tokio::test(start_paused = true)]
+    async fn ungated_broadcast_finishes_and_returns_slots() {
         const PEERS: usize = 3 * TEST_WINDOW;
         for body_write in [None, Some(Duration::from_secs(2))] {
             let hash = block::Hash([0xd0; 32]);
@@ -1415,7 +1602,7 @@ mod tests {
         for peer in &mut peers[..SIDECARS] {
             peer.sidecar = true;
         }
-        let wave = first_wave(Config::default(), peers, 10_000_000, false).await;
+        let wave = first_wave(Config::default(), peers, 10_000_000).await;
         assert_eq!(
             wave.len(),
             SIDECARS + 32,
@@ -1487,15 +1674,16 @@ mod tests {
         assert!(committed.await.unwrap().is_ok());
     }
 
-    /// Sustained relay: a block every second to peers that request every block, with bodies
-    /// that take two seconds to write. Each block's first inventory is still immediate, upload
-    /// slots never exceed the cap, and busy uploads stop each broadcast's fan-out at its window.
+    /// Sustained relay: a block every second to peers that request every gated block, with
+    /// bodies that take two seconds to write. Busy uploads of older blocks never delay a newer
+    /// block's inventory: every block reaches every peer at once, and the upload slots never
+    /// exceed their cap.
     #[tokio::test(start_paused = true)]
-    async fn sustained_relay_keeps_uploads_bounded() {
+    async fn sustained_relay_advertises_each_block_at_once() {
         const BLOCKS: u8 = 8;
+        const PEERS: usize = 2 * TEST_WINDOW;
         let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
-        let (peers, mut writes, bodies) =
-            requesting_peers(2 * TEST_WINDOW, Some(Duration::from_secs(2)));
+        let (peers, mut writes, _bodies) = requesting_peers(PEERS, Some(Duration::from_secs(2)));
         let mut broadcasts = Vec::new();
         for block in 0..BLOCKS {
             let hash = block::Hash([0xc0 + block; 32]);
@@ -1504,34 +1692,25 @@ mod tests {
                 peers.clone(),
                 hash,
                 TEST_WINDOW,
-                false,
+                true,
                 false,
                 slots.clone(),
             )));
             let next_block = mined + Duration::from_secs(1);
-            let mut first = None;
+            let mut latest = None;
             let mut count = 0;
             while let Ok(Some((_, written))) =
                 tokio::time::timeout_at(next_block, writes.recv()).await
             {
                 if written == hash {
-                    first.get_or_insert(mined.elapsed());
+                    latest = Some(mined.elapsed());
                     count += 1;
                 }
                 assert!(slots.available_uploads() <= BLOCK_UPLOAD_CONCURRENCY);
             }
-            assert_eq!(first, Some(Duration::ZERO), "block {block} waited");
-            assert!(
-                count <= TEST_WINDOW,
-                "block {block} advertised to {count} peers during busy uploads"
-            );
+            assert_eq!(count, PEERS, "block {block} reached every peer");
+            assert_eq!(latest, Some(Duration::ZERO), "block {block} waited");
         }
-        let max_bodies = bodies.max.load(std::sync::atomic::Ordering::SeqCst);
-        // A body write lasts two block intervals, so the windows of three broadcasts can overlap.
-        assert!(
-            max_bodies <= BLOCK_UPLOAD_CONCURRENCY + 3 * TEST_WINDOW,
-            "{max_bodies} concurrent body writes"
-        );
         broadcasts.iter().for_each(|broadcast| broadcast.abort());
     }
 
@@ -1690,8 +1869,7 @@ mod tests {
             let (published, peers) = watch::channel(vec![first]);
             let slots = BlockUploadSlots::new(1);
             let advertiser = BlockAdvertiser {
-                // A fixed window of two, for a block just above the small size, which holds
-                // entries for peers that have not requested it.
+                // A fixed window of two, which unrequested peers do not hold.
                 fanout: AdvertFanout::from_config(&Config {
                     advert_window_min: 2,
                     advert_window_max: 2,
@@ -1727,16 +1905,16 @@ mod tests {
             );
             let (later, mut writes) = connected_peers(3);
             published.send_replace(later);
-            for _ in 0..2 {
+            let refreshed = Instant::now();
+            for _ in 0..3 {
                 assert_eq!(writes.recv().await.unwrap().1, hash);
             }
-            tokio::task::yield_now().await;
-            assert!(
-                writes.try_recv().is_err(),
-                "the refreshed broadcast keeps its window of two"
+            assert_eq!(
+                refreshed.elapsed(),
+                Duration::ZERO,
+                "the refreshed broadcast reaches every later peer at once"
             );
             tokio::time::advance(BLOCK_REQUEST_WAIT).await;
-            assert_eq!(writes.recv().await.unwrap().1, hash);
             assert!(broadcast.await.unwrap().is_ok());
         })
         .await
@@ -1749,9 +1927,13 @@ mod tests {
             let (peer, mut receiver) = peer();
             let slots = BlockUploadSlots::new(1);
             let hash = block::Hash([62; 32]);
-            let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone(), None));
+            let first =
+                tokio::spawn(
+                    peer.clone()
+                        .advertise_outcome(hash, slots.clone(), None, false),
+                );
             let advert = receiver.recv().await.unwrap();
-            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone(), None));
+            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone(), None, false));
             tokio::task::yield_now().await;
             advert
                 .result
@@ -1849,7 +2031,7 @@ mod tests {
     #[test]
     fn disconnect_preserves_a_completed_authorization_rejection() {
         let uploads = BlockUploads::default();
-        let (progress, claim) = uploads.register(block::Hash([74; 32]));
+        let (progress, claim) = uploads.register(block::Hash([74; 32]), false);
         let claim = claim.unwrap();
         claim.0.send_replace(UploadState::Revoked);
         uploads.disconnected();

@@ -27,6 +27,7 @@ use zakura_chain::{
     parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_state as zs;
 
 use crate::components::{
@@ -124,6 +125,11 @@ struct DownloadTask {
     download_source: Option<zn::PeerSource>,
     advertiser: Option<AdvertiserSource>,
     kind: DownloadKind,
+
+    /// A second source to request the block from at the same time as the first.
+    ///
+    /// Only parent recoveries set this: see [`TaskSpawner::recover_parent`].
+    hedge_source: Option<zn::PeerSource>,
 }
 
 /// What happened when an advertised child revealed that its parent is missing.
@@ -215,6 +221,262 @@ pub const MAX_INBOUND_BLOCK_CONCURRENCY_PER_PEER: usize = 5;
 /// The re-request is bounded because it can be poisoned in turn: the supplying peer's ban is
 /// queued rather than applied immediately, so a replacement request can still route back to it.
 pub const POISONED_GOSSIP_BLOCK_RETRY_LIMIT: usize = 3;
+
+/// The outcome of [`request_block_hedged`]: the response that arrived first, and the request
+/// that was still in flight when it did.
+struct HedgedResponse {
+    /// The first response, from either request.
+    response: Result<zn::Response, BoxError>,
+
+    /// The other request, if two were racing.
+    ///
+    /// The download task keeps it until `response` has passed the checks that bind a body to
+    /// the requested hash and to this node's tip. A peer that answers first with a body those
+    /// checks reject, such as a tip child with a rewritten coinbase height, must not cancel a
+    /// good body that the other peer is still sending.
+    loser: Option<BoxFuture<'static, Result<zn::Response, BoxError>>>,
+}
+
+/// Requests block `hash` with `request`, and if there is a `hedge_source`, also requests it from
+/// that peer at the same time.
+///
+/// Returns the first response to arrive, with the other request still in flight.
+async fn request_block_hedged<ZN>(
+    network: ZN,
+    request: zn::Request,
+    hash: block::Hash,
+    hedge_source: Option<zn::PeerSource>,
+) -> HedgedResponse
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Clone + Send + 'static,
+    ZN::Future: Send,
+{
+    let mut first = network.clone().oneshot(request).boxed();
+
+    let Some(source) = hedge_source else {
+        return HedgedResponse {
+            response: first.await,
+            loser: None,
+        };
+    };
+
+    metrics::counter!("gossip.missing.parent.hedged.request.count").increment(1);
+    let mut second = network
+        .oneshot(zn::Request::BlocksByHashFrom {
+            hashes: std::iter::once(hash).collect(),
+            source,
+        })
+        .boxed();
+
+    // Polling `first` first means `second` is only skipped if `first` answers on its first poll.
+    // Without the bias, a `second` that answers immediately would leave `first` never sent.
+    tokio::select! {
+        biased;
+        response = &mut first => {
+            metrics::counter!("gossip.missing.parent.hedged.winner", "request" => "first").increment(1);
+            HedgedResponse { response, loser: Some(second) }
+        }
+        response = &mut second => {
+            metrics::counter!("gossip.missing.parent.hedged.winner", "request" => "second").increment(1);
+            HedgedResponse { response, loser: Some(first) }
+        }
+    }
+}
+
+/// A block response that passed the checks run before verification.
+struct AcceptedBody {
+    block: BlockHandle,
+
+    /// The peer that supplied the body, for scoring verification failures.
+    advertiser_addr: Option<PeerSocketAddr>,
+
+    height: block::Height,
+
+    /// The tip the body was checked against.
+    tip_height: Option<block::Height>,
+}
+
+/// Checks a block response before verification: it must carry exactly the requested block, at
+/// a height this node would verify, with enough work.
+///
+/// A body that fails here can differ from the body the hash commits to, because V5+ coinbase
+/// `scriptSig`s are not covered by the block hash. So a rejection says nothing about a body
+/// another peer may still be sending for the same hash.
+fn check_gossiped_body(
+    response: zn::Response,
+    hash: block::Hash,
+    kind: DownloadKind,
+    chain_network: &Network,
+    latest_chain_tip: &zs::LatestChainTip,
+    full_verify_concurrency_limit: usize,
+) -> Result<AcceptedBody, (BoxError, Option<PeerSocketAddr>)> {
+    let zn::Response::Blocks(blocks) = response else {
+        unreachable!("wrong response to block request");
+    };
+
+    // A peer must answer a single-hash block request with exactly one
+    // block entry. A malformed or empty response is a peer fault (e.g.
+    // a Zakura peer that tore its connection down mid-response), not a
+    // local invariant, so fail the download gracefully rather than
+    // panicking the task.
+    if blocks.len() != 1 {
+        return Err((
+            format!(
+                "wrong number of blocks in response to a single hash: got {}",
+                blocks.len()
+            )
+            .into(),
+            None,
+        ));
+    }
+
+    let Some((block, advertiser_addr)) = blocks.first().expect("just checked length").available()
+    else {
+        return Err((
+            "unexpected missing block status: single block failures should be errors".into(),
+            None,
+        ));
+    };
+
+    // Bind the delivered block to the hash we requested. A peer that
+    // substitutes a different (even valid) block must not be able to
+    // corrupt our hash/source accounting: the verifier returns the
+    // committed block's hash, and queue cleanup keys on it, so a
+    // mismatch would leave the originally requested entry stale.
+    if block.hash() != hash {
+        return Err((
+            format!(
+                "peer returned block {} in response to a request for {hash}",
+                block.hash()
+            )
+            .into(),
+            advertiser_addr,
+        ));
+    }
+    metrics::counter!("gossip.downloaded.block.count").increment(1);
+
+    // # Security & Performance
+    //
+    // Reject blocks that are too far ahead of our tip,
+    // and blocks that are behind the finalized tip.
+    //
+    // Avoids denial of service attacks. Also reduces wasted work on high blocks
+    // that will timeout before being verified, and low blocks that can never be finalized.
+    let tip_height = latest_chain_tip.best_tip_height();
+
+    // Read separately from `tip_height`, and used only by the new tip-child height check
+    // below. Deriving `tip_height` from this pair instead would couple the existing
+    // lookahead and behind-tip policies to hash availability: a chain tip reporting a
+    // height but not yet a hash would fall into the no-tip regime.
+    let best_tip = latest_chain_tip.best_tip_height_and_hash();
+
+    let max_lookahead_height =
+        max_lookahead_height(chain_network, tip_height, full_verify_concurrency_limit);
+
+    // Get the finalized tip height, assuming we're using the non-finalized state.
+    //
+    // It doesn't matter if we're a few blocks off here, because blocks this low
+    // are part of a fork with much less work. So they would be rejected anyway.
+    //
+    // And if we're still checkpointing, the checkpointer will reject blocks behind
+    // the finalized tip anyway.
+    //
+    // TODO: get the actual finalized tip height
+    let min_accepted_height = tip_height
+        .map(|tip_height| block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT)))
+        .unwrap_or(block::Height(0));
+
+    let Some(block_height) = block.coinbase_height() else {
+        debug!(
+            ?hash,
+            "gossiped block with no height: dropped downloaded block"
+        );
+        metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
+
+        return Err(("gossiped block with no height".into(), None));
+    };
+
+    // Security: authenticate the claimed coinbase height against our own tip before the
+    // height policies below run. See `crate::components::auth_download_height`.
+    //
+    // This matters more here than on the syncer path: an `inv` for the new tip normally
+    // reaches gossip before the syncer asks for it, and `download_and_verify` drops
+    // honest peers' `inv`s for the same hash as `AlreadyQueued` while a download is
+    // outstanding. So a single poisoned response can consume the node's only chance at
+    // the new block until the next sync round, which is what leaves a mining backend
+    // issuing work on an obsolete tip.
+    if let Some(expected_height) =
+        tip_child_mismatch(block.header().previous_block_hash, block_height, best_tip)
+    {
+        debug!(
+            ?hash,
+            ?block_height,
+            ?expected_height,
+            "gossiped tip child claimed the wrong coinbase height: \
+             dropped downloaded block"
+        );
+        metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
+
+        return Err((
+            BoxError::from(GossipedTipChildHeightMismatch {
+                height: block_height,
+                expected_height,
+                hash,
+                parent_recovery: kind == DownloadKind::ParentRecovery,
+            }),
+            advertiser_addr,
+        ));
+    }
+
+    if block_height > max_lookahead_height {
+        debug!(
+            ?hash,
+            ?block_height,
+            ?tip_height,
+            ?max_lookahead_height,
+            lookahead_limit = full_verify_concurrency_limit,
+            "gossiped block height too far ahead of the tip: dropped downloaded block",
+        );
+        metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
+
+        return Err(("gossiped block height too far ahead".into(), None));
+    } else if block_height < min_accepted_height {
+        debug!(
+            ?hash,
+            ?block_height,
+            ?tip_height,
+            ?min_accepted_height,
+            behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+            "gossiped block height behind the finalized tip: dropped downloaded block",
+        );
+        metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+        return Err((
+            "gossiped block height behind the finalized tip".into(),
+            None,
+        ));
+    }
+
+    if !has_sufficient_work(
+        chain_network,
+        tip_height,
+        block_height,
+        block.header().difficulty_threshold,
+    ) {
+        metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
+        return Err((
+            "gossiped block target is easier than the Mainnet admission floor".into(),
+            advertiser_addr,
+        ));
+    }
+
+    Ok(AcceptedBody {
+        block,
+        advertiser_addr,
+        height: block_height,
+        tip_height,
+    })
+}
 
 /// Returns the highest gossiped block height accepted above `tip_height`.
 ///
@@ -366,6 +628,14 @@ struct Admission {
     /// waiting child already holds its advertiser's slot and lock, so charging the parent to
     /// them would refuse or deadlock the very download the child is waiting for.
     parent_recoveries: HashMap<block::Hash, Option<AdvertiserSource>>,
+
+    /// For each advertised download, the first legacy advertiser of the block on a different IP
+    /// from the first source.
+    ///
+    /// A peer that validated a block has its parent. So if the block's parent turns out to be
+    /// missing, its recovery requests the parent from this peer and from the block's first
+    /// source at the same time. One entry per admitted download, released with it.
+    alternate_sources: HashMap<block::Hash, zn::PeerSource>,
 }
 
 impl Admission {
@@ -379,6 +649,7 @@ impl Admission {
     /// polls it, and until then a stale entry would misdirect other tasks' parent recoveries.
     fn release(&mut self, hash: &block::Hash) {
         self.parent_recoveries.remove(hash);
+        self.alternate_sources.remove(hash);
 
         if let Some((_, Some(source))) = self.cancel_handles.remove(hash) {
             let source_count = self
@@ -495,6 +766,7 @@ where
         // Tasks retain the admission state, so the stream must cancel them explicitly.
         admission.closed = true;
         admission.cancel_handles.clear();
+        admission.alternate_sources.clear();
     }
 }
 
@@ -712,7 +984,17 @@ where
         let mut admission = self.spawner.admission();
         let queue_len = admission.queue_len();
 
-        if admission.cancel_handles.contains_key(&hash) {
+        if let Some((_, first_source)) = admission.cancel_handles.get(&hash) {
+            // Another legacy peer on a different IP has the block. Remember it in case the
+            // block's parent turns out to be missing.
+            let alternate = download_source.clone().filter(|source| {
+                matches!(source, zn::PeerSource::LegacySocket(_))
+                    && first_source.as_ref() != Some(&AdvertiserSource::from(source.clone()))
+            });
+            if let Some(alternate) = alternate {
+                admission.alternate_sources.entry(hash).or_insert(alternate);
+            }
+
             debug!(
                 ?hash,
                 queue_len,
@@ -770,6 +1052,7 @@ where
             advertiser,
             download_source,
             kind: DownloadKind::Advertised,
+            hedge_source: None,
         };
 
         let task = self.spawner.spawn_download_task(&mut admission, download);
@@ -808,7 +1091,7 @@ where
             .expect("admission is only mutated by non-panicking bookkeeping code")
     }
 
-    /// Starts recovering `parent`, which an advertised child at `child_height` revealed to be
+    /// Starts recovering `parent`, which the advertised block `child` revealed to be
     /// missing from the state.
     ///
     /// If `parent` already has an inbound download, the child waits on it. Otherwise one
@@ -816,6 +1099,10 @@ where
     /// to a peer that advertised `parent` if there is one, and otherwise to the child's
     /// advertiser, which has the parent if it validated the child. A child without a source
     /// routes the request through the peer set's inventory.
+    ///
+    /// If another peer on a different IP also advertised `child`, the recovery requests the
+    /// parent from it at the same time and keeps the first good body, so one slow peer does not
+    /// hold up both blocks. See [`Admission::alternate_sources`].
     ///
     /// A failed recovery is not retried here: the syncer recovers the parent as before.
     ///
@@ -825,10 +1112,12 @@ where
     /// advertiser, by the inbound queue limit, and to a single hop, because recovered parents
     /// never recover their own parents. The caller only calls this for children close enough
     /// to the tip that one hop could connect them, and whose headers carry valid proof of work,
-    /// so a peer cannot occupy these slots with blocks that cost nothing to make.
+    /// so a peer cannot occupy these slots with blocks that cost nothing to make. Each recovery
+    /// sends at most two block requests.
     fn recover_parent(
         &self,
         parent: block::Hash,
+        child: block::Hash,
         child_source: Option<zn::PeerSource>,
     ) -> ParentRecovery {
         let mut admission = self.admission();
@@ -863,6 +1152,7 @@ where
             download_source: child_source,
             advertiser: None,
             kind: DownloadKind::ParentRecovery,
+            hedge_source: admission.alternate_sources.get(&child).cloned(),
         };
         let task = self.spawn_download_task(&mut admission, download);
         admission.parent_recoveries.insert(parent, charged_source);
@@ -885,6 +1175,7 @@ where
             download_source,
             advertiser,
             kind,
+            hedge_source,
         } = download;
 
         let source_lock = advertiser.as_ref().map(|source| {
@@ -934,172 +1225,52 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
-            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
-            {
-                // A peer must answer a single-hash block request with exactly one
-                // block entry. A malformed or empty response is a peer fault (e.g.
-                // a Zakura peer that tore its connection down mid-response), not a
-                // local invariant, so fail the download gracefully rather than
-                // panicking the task.
-                if blocks.len() != 1 {
-                    return Err((
-                        format!(
-                            "wrong number of blocks in response to a single hash: got {}",
-                            blocks.len()
-                        )
-                        .into(),
-                        None,
-                    ));
-                }
+            let HedgedResponse {
+                mut response,
+                mut loser,
+            } = request_block_hedged(network, request, hash, hedge_source).await;
 
-                let Some(available) = blocks.first().expect("just checked length").available()
-                else {
-                    return Err((
-                        "unexpected missing block status: single block failures should be errors"
-                            .into(),
-                        None,
-                    ));
-                };
-                available
-            } else {
-                unreachable!("wrong response to block request");
-            };
-
-            // Bind the delivered block to the hash we requested. A peer that
-            // substitutes a different (even valid) block must not be able to
-            // corrupt our hash/source accounting: the verifier returns the
-            // committed block's hash, and queue cleanup keys on it, so a
-            // mismatch would leave the originally requested entry stale.
-            if block.hash() != hash {
-                return Err((
-                    format!(
-                        "peer returned block {} in response to a request for {hash}",
-                        block.hash()
-                    )
-                    .into(),
-                    advertiser_addr,
-                ));
-            }
-            metrics::counter!("gossip.downloaded.block.count").increment(1);
-
-            // # Security & Performance
-            //
-            // Reject blocks that are too far ahead of our tip,
-            // and blocks that are behind the finalized tip.
-            //
-            // Avoids denial of service attacks. Also reduces wasted work on high blocks
-            // that will timeout before being verified, and low blocks that can never be finalized.
-            let tip_height = latest_chain_tip.best_tip_height();
-
-            // Read separately from `tip_height`, and used only by the new tip-child height check
-            // below. Deriving `tip_height` from this pair instead would couple the existing
-            // lookahead and behind-tip policies to hash availability: a chain tip reporting a
-            // height but not yet a hash would fall into the no-tip regime.
-            let best_tip = latest_chain_tip.best_tip_height_and_hash();
-
-            let max_lookahead_height =
-                max_lookahead_height(&chain_network, tip_height, full_verify_concurrency_limit);
-
-            // Get the finalized tip height, assuming we're using the non-finalized state.
-            //
-            // It doesn't matter if we're a few blocks off here, because blocks this low
-            // are part of a fork with much less work. So they would be rejected anyway.
-            //
-            // And if we're still checkpointing, the checkpointer will reject blocks behind
-            // the finalized tip anyway.
-            //
-            // TODO: get the actual finalized tip height
-            let min_accepted_height = tip_height
-                .map(|tip_height| {
-                    block::Height(tip_height.0.saturating_sub(zs::MAX_BLOCK_REORG_HEIGHT))
-                })
-                .unwrap_or(block::Height(0));
-
-            let block_height = block
-                .coinbase_height()
-                .ok_or_else(|| {
-                    debug!(
-                        ?hash,
-                        "gossiped block with no height: dropped downloaded block"
-                    );
-                    metrics::counter!("gossip.no.height.dropped.block.count").increment(1);
-
-                    BoxError::from("gossiped block with no height")
-                })
-                .map_err(|e| (e, None))?;
-
-            // Security: authenticate the claimed coinbase height against our own tip before the
-            // height policies below run. See `crate::components::auth_download_height`.
-            //
-            // This matters more here than on the syncer path: an `inv` for the new tip normally
-            // reaches gossip before the syncer asks for it, and `download_and_verify` drops
-            // honest peers' `inv`s for the same hash as `AlreadyQueued` while a download is
-            // outstanding. So a single poisoned response can consume the node's only chance at
-            // the new block until the next sync round, which is what leaves a mining backend
-            // issuing work on an obsolete tip.
-            if let Some(expected_height) =
-                tip_child_mismatch(block.header().previous_block_hash, block_height, best_tip)
-            {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?expected_height,
-                    "gossiped tip child claimed the wrong coinbase height: \
-                     dropped downloaded block"
-                );
-                metrics::counter!("gossip.tip.child.height.mismatch.count").increment(1);
-
-                Err((
-                    BoxError::from(GossipedTipChildHeightMismatch {
-                        height: block_height,
-                        expected_height,
-                        hash,
-                        parent_recovery: kind == DownloadKind::ParentRecovery,
-                    }),
-                    advertiser_addr,
-                ))?;
-            }
-
-            if block_height > max_lookahead_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?max_lookahead_height,
-                    lookahead_limit = full_verify_concurrency_limit,
-                    "gossiped block height too far ahead of the tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.max.height.limit.dropped.block.count").increment(1);
-
-                Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
-            } else if block_height < min_accepted_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?min_accepted_height,
-                    behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                    "gossiped block height behind the finalized tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
-
-                Err("gossiped block height behind the finalized tip")
-                    .map_err(|e| (e.into(), None))?;
-            }
-
-            if !has_sufficient_work(
-                &chain_network,
+            // A rejected body only ends the download once no other request can still deliver
+            // the block. Until then, the other request's response is checked in its place.
+            let mut first_rejection: Option<(BoxError, Option<PeerSocketAddr>)> = None;
+            let AcceptedBody {
+                block,
+                advertiser_addr,
+                height: block_height,
                 tip_height,
-                block_height,
-                block.header().difficulty_threshold,
-            ) {
-                metrics::counter!("gossip.insufficient_work.dropped.block.count").increment(1);
-                return Err((
-                    "gossiped block target is easier than the Mainnet admission floor".into(),
-                    advertiser_addr,
-                ));
-            }
+            } = loop {
+                let checked = response.map_err(|e| (e, None)).and_then(|response| {
+                    check_gossiped_body(
+                        response,
+                        hash,
+                        kind,
+                        &chain_network,
+                        &latest_chain_tip,
+                        full_verify_concurrency_limit,
+                    )
+                });
+                let rejection = match checked {
+                    Ok(accepted) => break accepted,
+                    Err(rejection) => rejection,
+                };
+
+                let Some(other) = loser.take() else {
+                    // Prefer the rejection that names a peer: that body is scored, and a
+                    // poisoned tip child is re-requested.
+                    return Err(match first_rejection {
+                        Some(first) if first.1.is_some() => first,
+                        _ => rejection,
+                    });
+                };
+                debug!(
+                    ?hash,
+                    error = %rejection.0,
+                    "hedged block response rejected: waiting for the other request"
+                );
+                metrics::counter!("gossip.hedged.block.fallback.count").increment(1);
+                first_rejection.get_or_insert(rejection);
+                response = other.await;
+            };
 
             // The parent is checked after the height policies, so only blocks this node would
             // verify can start a recovery, and before the source lock, so a recovery is not
@@ -1132,7 +1303,7 @@ where
                     .unwrap_or(false);
 
                     let recovery = if proof_of_work_is_valid {
-                        spawner.recover_parent(parent, download_source)
+                        spawner.recover_parent(parent, hash, download_source)
                     } else {
                         ParentRecovery::InvalidProofOfWork
                     };

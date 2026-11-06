@@ -118,6 +118,9 @@ struct Harness {
     /// The next request for each of these hashes fails.
     failures: Arc<std::sync::Mutex<HashSet<block::Hash>>>,
 
+    /// Requests directed to these sources never complete, like a peer that stops answering.
+    stalled_sources: Arc<std::sync::Mutex<HashSet<zn::PeerSource>>>,
+
     _tip_sender: zs::ChainTipSender,
 }
 
@@ -144,19 +147,34 @@ impl Harness {
         let gates: Arc<std::sync::Mutex<HashMap<block::Hash, oneshot::Receiver<()>>>> =
             Arc::default();
         let failures: Arc<std::sync::Mutex<HashSet<block::Hash>>> = Arc::default();
+        let stalled_sources: Arc<std::sync::Mutex<HashSet<zn::PeerSource>>> = Arc::default();
 
         let (requests_tx, requests) = mpsc::unbounded_channel();
         let network_gates = gates.clone();
         let network_failures = failures.clone();
+        let network_stalled_sources = stalled_sources.clone();
         let network = BoxCloneService::new(service_fn(move |request: zn::Request| {
             let blocks = blocks.clone();
             let gates = network_gates.clone();
             let failures = network_failures.clone();
+            let stalled_sources = network_stalled_sources.clone();
             let requests_tx = requests_tx.clone();
 
             async move {
                 let hash = requested_hash(&request);
+                let stalled = matches!(
+                    &request,
+                    zn::Request::BlocksByHashFrom { source, .. }
+                        if stalled_sources
+                            .lock()
+                            .expect("stalled source lock is not poisoned")
+                            .contains(source)
+                );
                 requests_tx.send(request)?;
+
+                if stalled {
+                    return future::pending().await;
+                }
 
                 if failures
                     .lock()
@@ -253,6 +271,7 @@ impl Harness {
             commits,
             gates,
             failures,
+            stalled_sources,
             _tip_sender: tip_sender,
         }
     }
@@ -312,6 +331,14 @@ impl Harness {
     fn parent_recoveries(&self) -> usize {
         self.downloads.spawner.admission().parent_recoveries.len()
     }
+
+    /// Makes every later request directed to `source` hang.
+    fn stall(&self, source: zn::PeerSource) {
+        self.stalled_sources
+            .lock()
+            .expect("stalled source lock is not poisoned")
+            .insert(source);
+    }
 }
 
 /// A gossiped child arrives, and its parent was never requested.
@@ -360,6 +387,233 @@ async fn child_before_unrequested_parent_requests_the_parent_from_the_childs_adv
     assert_eq!(results, HashSet::from([parent.hash(), child.hash()]));
     assert_eq!(harness.downloads.spawner.admission().queue_len(), 0);
     assert_eq!(harness.parent_recoveries(), 0);
+}
+
+/// A gossiped child with a second advertiser on another IP reveals that its parent is missing.
+///
+/// The child's first advertiser stops answering after delivering the child, so the parent
+/// recovery requests the parent from both advertisers at once, and the second one's body lets
+/// both blocks commit. With a single recovery request to the first advertiser, neither block
+/// would ever commit.
+#[tokio::test(start_paused = true)]
+async fn missing_parent_is_requested_from_both_advertisers_of_the_child() {
+    let parent = block_1();
+    let child = block_2();
+    let mut harness = Harness::new([parent.clone(), child.clone()]);
+    let release_child = harness.hold(child.hash());
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(legacy(2))),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(child.hash(), legacy(2))
+    );
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(legacy(3))),
+        DownloadAction::AlreadyQueued
+    );
+    harness
+        .assert_no_request("a second advertiser does not request the child again")
+        .await;
+
+    harness.stall(legacy(2));
+    release_child
+        .send(())
+        .expect("the child request is waiting for release");
+
+    let parent_requests = [harness.next_request().await, harness.next_request().await];
+    for expected in [
+        request_from(parent.hash(), legacy(2)),
+        request_from(parent.hash(), legacy(3)),
+    ] {
+        assert!(
+            parent_requests.contains(&expected),
+            "{expected:?} was requested: {parent_requests:?}"
+        );
+    }
+
+    assert_eq!(harness.next_commit().await, parent.hash());
+    assert_eq!(harness.next_commit().await, child.hash());
+    harness
+        .assert_no_request("a recovery sends at most two requests")
+        .await;
+
+    for _ in 0..2 {
+        tokio::time::timeout(EXPECTED_WAIT, harness.downloads.next())
+            .await
+            .expect("a finished download is yielded")
+            .expect("the downloads stream is open")
+            .expect("the download succeeds");
+    }
+    let admission = harness.downloads.spawner.admission();
+    assert_eq!(admission.queue_len(), 0);
+    assert!(admission.parent_recoveries.is_empty());
+    assert!(
+        admission.alternate_sources.is_empty(),
+        "the child's alternate source is released with it"
+    );
+}
+
+/// A child's second advertiser answers the parent recovery first, with a parent body whose
+/// coinbase height is rewritten, which the block hash does not cover.
+///
+/// The rejected body does not cancel the request to the child's first advertiser, whose
+/// canonical parent body arrives later and is verified.
+#[tokio::test]
+async fn poisoned_parent_from_the_alternate_falls_back_to_the_first_advertiser() {
+    use crate::components::auth_download_height::poison_coinbase_height;
+
+    let tip = block_from(&zakura_test::vectors::BLOCK_MAINNET_1687106_BYTES);
+    let parent = block_from(&zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES);
+    let child = block_from(&zakura_test::vectors::BLOCK_MAINNET_1687108_BYTES);
+    assert_eq!(parent.header.previous_block_hash, tip.hash());
+    assert_eq!(child.header.previous_block_hash, parent.hash());
+    let poisoned_parent = poison_coinbase_height(&parent, block::Height(1));
+    assert_eq!(poisoned_parent.hash(), parent.hash());
+
+    let honest = legacy(2);
+    let attacker = legacy(3);
+
+    // The honest peer answers after a delay, so the attacker's inv is admitted first and its
+    // poisoned parent arrives first.
+    let (requests_tx, mut requests) = mpsc::unbounded_channel();
+    let network = BoxCloneService::new(service_fn({
+        let (honest, parent, child) = (honest.clone(), parent.clone(), child.clone());
+        move |request: zn::Request| {
+            let (honest, parent, child) = (honest.clone(), parent.clone(), child.clone());
+            let poisoned_parent = poisoned_parent.clone();
+            let requests_tx = requests_tx.clone();
+            async move {
+                let hash = requested_hash(&request);
+                let zn::Request::BlocksByHashFrom { source, .. } = &request else {
+                    return Err::<zn::Response, BoxError>("unexpected network request".into());
+                };
+                let from_honest = *source == honest;
+                requests_tx.send(request)?;
+
+                let body = if from_honest {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if hash == child.hash() {
+                        child
+                    } else {
+                        parent
+                    }
+                } else {
+                    poisoned_parent
+                };
+                Ok(zn::Response::Blocks(vec![Available((body.into(), None))]))
+            }
+        }
+    }));
+    let verifier = BoxCloneService::new(service_fn(
+        |request: zakura_consensus::Request| async move {
+            match request {
+                zakura_consensus::Request::Commit(block) => Ok(block.hash()),
+                _ => Err("unexpected verifier request".into()),
+            }
+        },
+    ));
+    let state = BoxCloneService::new(service_fn(|request: zs::Request| async move {
+        match request {
+            zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+            zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+            request => Err(format!("unexpected state request: {request:?}").into()),
+        }
+    }));
+
+    let mut tip_block: zs::ChainTipBlock = zs::SemanticallyVerifiedBlock::from(tip).into();
+    tip_block.height = block::Height(1_687_106);
+    let (mut tip_sender, latest_chain_tip, _tip_change) =
+        zs::ChainTipSender::new(None, &Network::Mainnet);
+    tip_sender.set_finalized_tip(tip_block);
+
+    let mut downloads: Downloads<TestNetwork, TestVerifier, TestState> = Downloads::new(
+        MAX_INBOUND_CONCURRENCY,
+        false,
+        network,
+        verifier,
+        state,
+        latest_chain_tip,
+        Network::Mainnet,
+    );
+
+    assert_eq!(
+        downloads.download_and_verify(child.hash(), Some(honest.clone())),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        downloads.download_and_verify(child.hash(), Some(attacker.clone())),
+        DownloadAction::AlreadyQueued
+    );
+
+    let mut verified = HashSet::new();
+    for _ in 0..2 {
+        let hash = tokio::time::timeout(EXPECTED_WAIT, downloads.next())
+            .await
+            .expect("a finished download is yielded")
+            .expect("the downloads stream is open")
+            .expect("the canonical parent and the child are verified");
+        verified.insert(hash);
+    }
+    assert_eq!(verified, HashSet::from([parent.hash(), child.hash()]));
+
+    let mut parent_sources = HashSet::new();
+    while let Ok(request) = requests.try_recv() {
+        if requested_hash(&request) == parent.hash() {
+            let zn::Request::BlocksByHashFrom { source, .. } = request else {
+                unreachable!("checked by the network service");
+            };
+            parent_sources.insert(source);
+        }
+    }
+    assert_eq!(parent_sources, HashSet::from([honest, attacker]));
+}
+
+/// A second advertiser of a child on the same IP as its first is not another source, so the
+/// missing parent is requested once.
+#[tokio::test(start_paused = true)]
+async fn same_ip_advertiser_does_not_hedge_the_parent_recovery() {
+    let parent = block_1();
+    let child = block_2();
+    let mut harness = Harness::new([parent.clone(), child.clone()]);
+    let release_child = harness.hold(child.hash());
+    let same_ip_other_port = zn::PeerSource::LegacySocket(([10, 0, 0, 2], 18233).into());
+
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(legacy(2))),
+        DownloadAction::AddedToQueue
+    );
+    assert_eq!(
+        harness
+            .downloads
+            .download_and_verify(child.hash(), Some(same_ip_other_port)),
+        DownloadAction::AlreadyQueued
+    );
+    assert_eq!(
+        harness.next_request().await,
+        request_from(child.hash(), legacy(2))
+    );
+    release_child
+        .send(())
+        .expect("the child request is waiting for release");
+
+    assert_eq!(
+        harness.next_request().await,
+        request_from(parent.hash(), legacy(2))
+    );
+    assert_eq!(harness.next_commit().await, parent.hash());
+    assert_eq!(harness.next_commit().await, child.hash());
+    harness
+        .assert_no_request("the same-IP advertiser adds no parent request")
+        .await;
 }
 
 /// A gossiped child arrives while its parent is downloading from a slow source.

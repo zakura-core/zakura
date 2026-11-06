@@ -2,6 +2,7 @@
 
 use std::{
     io::IsTerminal,
+    net::SocketAddr,
     ops::{Deref, DerefMut},
     path::PathBuf,
 };
@@ -10,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 mod component;
 mod non_blocking;
+
+pub(crate) mod raw_endpoint;
 
 pub use component::Tracing;
 
@@ -62,6 +65,12 @@ impl From<Config> for InnerConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct InnerConfig {
+    /// Optional loopback-only HTTP endpoint for raw JSONL trace streams.
+    /// Requires `[network.zakura].trace_dir`; disabled by default.
+    /// See `docs/raw-trace-endpoint.md` for access controls and collection limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_endpoint_addr: Option<SocketAddr>,
+
     /// Whether to clear the screen and print the Zakura logo at startup, if standard error is a
     /// terminal.
     ///
@@ -178,6 +187,7 @@ impl Config {
 impl Default for InnerConfig {
     fn default() -> Self {
         Self {
+            raw_endpoint_addr: None,
             use_color: true,
             force_use_color: false,
             filter: None,

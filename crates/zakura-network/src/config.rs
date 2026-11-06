@@ -39,6 +39,7 @@ use crate::{
         DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
+        LEGACY_DEFAULT_ADVERT_WINDOW_MAX, LEGACY_DEFAULT_ADVERT_WINDOW_MIN,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
@@ -365,6 +366,9 @@ pub struct Config {
     /// to `advert_window_small_size_bytes`.
     /// Concurrent uploads share one uplink, so a large block goes to fewer peers at a time.
     /// Set `advert_window_min` and `advert_window_max` to the same value for a fixed window.
+    ///
+    /// The previous defaults, 32 here and 64 for `advert_window_max`, are read as unset, so config
+    /// files generated before the defaults changed get the current ones.
     ///
     /// Configured block gossip sidecars are always advertised first, outside this window.
     ///
@@ -1197,8 +1201,11 @@ struct DConfig {
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
-    advert_window_min: usize,
-    advert_window_max: usize,
+    /// `None` if the config does not set it, so [`resolve_advert_windows`] can derive it from
+    /// the other bound.
+    advert_window_min: Option<usize>,
+    /// `None` if the config does not set it. See `advert_window_min`.
+    advert_window_max: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
 }
@@ -1224,8 +1231,8 @@ impl Default for DConfig {
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
-            advert_window_min: config.advert_window_min,
-            advert_window_max: config.advert_window_max,
+            advert_window_min: None,
+            advert_window_max: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
         }
@@ -1342,8 +1349,8 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
-            advert_window_min,
-            advert_window_max,
+            advert_window_min: Some(advert_window_min),
+            advert_window_max: Some(advert_window_max),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
         }
@@ -1380,6 +1387,8 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        let (advert_window_min, advert_window_max) =
+            resolve_advert_windows(advert_window_min, advert_window_max);
         validate_advert_fanout(
             advert_window_min,
             advert_window_max,
@@ -1533,6 +1542,25 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
         })
+    }
+}
+
+/// Returns the advert windows of a config that sets `advert_window_min` and `advert_window_max`
+/// to `min` and `max`, or `None` if it leaves them out.
+///
+/// Config files written by `zakurad generate` before the defaults changed hold
+/// [`LEGACY_DEFAULT_ADVERT_WINDOW_MIN`] and [`LEGACY_DEFAULT_ADVERT_WINDOW_MAX`], so those values
+/// count as left out. A bound that is left out takes its default, limited by the other bound when
+/// that one is set, so `advert_window_min <= advert_window_max` still holds. For example, a config
+/// that sets only `advert_window_max = 200` gets a minimum of 200, not the default.
+fn resolve_advert_windows(min: Option<usize>, max: Option<usize>) -> (usize, usize) {
+    let min = min.filter(|&min| min != LEGACY_DEFAULT_ADVERT_WINDOW_MIN);
+    let max = max.filter(|&max| max != LEGACY_DEFAULT_ADVERT_WINDOW_MAX);
+    match (min, max) {
+        (Some(min), Some(max)) => (min, max),
+        (Some(min), None) => (min, DEFAULT_ADVERT_WINDOW_MAX.max(min)),
+        (None, Some(max)) => (DEFAULT_ADVERT_WINDOW_MIN.min(max), max),
+        (None, None) => (DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_MAX),
     }
 }
 

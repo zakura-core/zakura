@@ -14,6 +14,14 @@
 //! the slots, bounds one broadcast's concurrent body writes, and overlapping broadcasts and
 //! sidecars add to that.
 //!
+//! A small block, one of known size at most `advert_window_small_size_bytes`, gives a peer's
+//! window entry back once its `inv` is written and the peer has not yet requested the block.
+//! Near the tip most peers already have the block and never request it, so otherwise each one
+//! would hold its entry for [`BLOCK_REQUEST_WAIT`] and delay the rest of the fan-out by that long
+//! per window. A small block's body writes are therefore bounded by the connected peers rather
+//! than the window, as with a window that covers every peer. Larger blocks, and blocks of unknown
+//! size, keep their entries until the advertisement finishes.
+//!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
 //! that never becomes the tip.
@@ -116,6 +124,32 @@ impl AdvertFanout {
         #[allow(clippy::cast_precision_loss)]
         metrics::histogram!("peer.block_gossip.advert_window").record(window as f64);
         window
+    }
+
+    /// Returns whether a broadcast of a block of `size` serialized bytes gives a peer's window
+    /// entry back while the peer has not requested the block.
+    ///
+    /// Only blocks of known size at or below `small_size_bytes` do, so a burst of requests for
+    /// a large or unknown block stays bounded by the window.
+    pub(crate) fn releases_unrequested(&self, size: Option<u32>) -> bool {
+        size.is_some_and(|size| u64::from(size) <= self.small_size_bytes)
+    }
+}
+
+/// One peer's entry in its broadcast's advert window.
+struct WindowEntry {
+    _permit: OwnedSemaphorePermit,
+    /// Whether the entry is given back while the peer has not requested the block.
+    release_unrequested: bool,
+}
+
+/// Gives `entry` back if its broadcast does not hold entries for peers that have not requested.
+fn release_unrequested(entry: &mut Option<WindowEntry>) {
+    if entry
+        .as_ref()
+        .is_some_and(|entry| entry.release_unrequested)
+    {
+        *entry = None;
     }
 }
 
@@ -290,19 +324,30 @@ impl BlockGossipPeer {
     #[cfg(test)]
     pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
         matches!(
-            self.advertise_outcome(hash, slots).await,
+            self.advertise_outcome(hash, slots, None).await,
             AdvertOutcome::Sent
         )
     }
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
-    async fn advertise_outcome(self, hash: block::Hash, slots: BlockUploadSlots) -> AdvertOutcome {
+    ///
+    /// `entry` is this peer's place in its broadcast's advert window, if it has one. It is held
+    /// until the advertisement finishes, or given back while the peer has not requested the
+    /// block if the entry allows that.
+    async fn advertise_outcome(
+        self,
+        hash: block::Hash,
+        slots: BlockUploadSlots,
+        mut entry: Option<WindowEntry>,
+    ) -> AdvertOutcome {
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
             if let Some(claim) = claim {
                 break (progress, claim);
             }
+            // Another broadcast already advertised this block to this peer.
+            release_unrequested(&mut entry);
             // Early and committed announcements join an existing upload for this peer.
             let succeeded = loop {
                 match *progress.borrow_and_update() {
@@ -347,6 +392,9 @@ impl BlockGossipPeer {
         }
         // The connection usually marks the write first; senders without a connection rely on this.
         claim.0.send_if_modified(UploadState::start_waiting);
+        // Our `inv` is written. A peer that later requests is still served and takes an upload
+        // slot, but it does not take a window entry back.
+        release_unrequested(&mut entry);
 
         let request_deadline = Instant::now() + BLOCK_REQUEST_WAIT;
         let mut upload = None;
@@ -476,35 +524,48 @@ struct RevokedCandidates;
 
 /// Advertises `hash` to `peers`, paced through their block uploads.
 ///
-/// Configured sidecars are all advertised at once, first. Other peers are advertised to at most
-/// `window` at a time. Succeeds if at least one peer was advertised to.
+/// Configured sidecars are all advertised at once, first. Other peers take one of `window`
+/// entries each, in order. If `release_unrequested` is set, a peer gives its entry back while it
+/// has not requested the block; otherwise it holds it until its advertisement finishes. Succeeds
+/// if at least one peer was advertised to.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
     window: usize,
+    release_unrequested: bool,
     mined: bool,
     slots: BlockUploadSlots,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
     let mut sidecars = order_peers(peers, mined, &mut rand_10::rng());
     let others = sidecars.split_off(sidecars.iter().take_while(|peer| peer.sidecar).count());
     async move {
-        let advertise = |peers: Vec<BlockGossipPeer>, window: usize| {
-            let slots = slots.clone();
-            futures::stream::iter(peers)
-                .map(move |peer| peer.advertise_outcome(hash, slots.clone()))
-                .buffer_unordered(window)
-        };
-        let sidecar_window = sidecars.len().max(1);
-        // `select` polls the sidecars first, so their adverts are queued first.
-        let mut sends = futures::stream::select(
-            advertise(sidecars, sidecar_window),
-            advertise(others, window),
-        );
+        // More entries than peers changes nothing, and keeps a large configured window within
+        // the semaphore's limit.
+        let entries = Arc::new(Semaphore::new(window.clamp(1, others.len().max(1))));
+        let mut adverts = futures::stream::FuturesUnordered::new();
+        // Pushed first, so their adverts are queued first.
+        for sidecar in sidecars {
+            adverts.push(sidecar.advertise_outcome(hash, slots.clone(), None));
+        }
+        let mut others = others.into_iter().peekable();
         let mut succeeded = false;
         let mut revoked = false;
-        while let Some(outcome) = sends.next().await {
-            succeeded |= matches!(outcome, AdvertOutcome::Sent);
-            revoked |= matches!(outcome, AdvertOutcome::Revoked);
+        loop {
+            tokio::select! {
+                biased;
+                Some(outcome) = adverts.next() => {
+                    succeeded |= matches!(outcome, AdvertOutcome::Sent);
+                    revoked |= matches!(outcome, AdvertOutcome::Revoked);
+                }
+                // Entries are taken one at a time, so peers are advertised to in order.
+                permit = entries.clone().acquire_owned(), if others.peek().is_some() => {
+                    let permit = permit.expect("advert window entries never close their semaphore");
+                    let peer = others.next().expect("peeked a remaining peer");
+                    let entry = WindowEntry { _permit: permit, release_unrequested };
+                    adverts.push(peer.advertise_outcome(hash, slots.clone(), Some(entry)));
+                }
+                else => break,
+            }
         }
         if succeeded {
             Ok(Response::Nil)
@@ -584,6 +645,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         let mut peers = self.peers.clone();
         let slots = self.slots.clone();
         let window = self.fanout.window(block.size);
+        let release_unrequested = self.fanout.releases_unrequested(block.size);
         async move {
             loop {
                 if let Some(refresh) = &refresh {
@@ -603,8 +665,15 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     .cloned()
                     .collect();
                 if !candidates.is_empty() {
-                    match broadcast_block(candidates, block.hash, window, mined, slots.clone())
-                        .await
+                    match broadcast_block(
+                        candidates,
+                        block.hash,
+                        window,
+                        release_unrequested,
+                        mined,
+                        slots.clone(),
+                    )
+                    .await
                     {
                         Err(error) if error.is::<RevokedCandidates>() => {}
                         result => return result,
@@ -784,6 +853,7 @@ mod tests {
             peers.clone(),
             parent,
             TEST_WINDOW,
+            false,
             true,
             slots.clone(),
         ))];
@@ -792,6 +862,7 @@ mod tests {
                 peers.clone(),
                 parent,
                 TEST_WINDOW,
+                false,
                 true,
                 slots.clone(),
             )));
@@ -821,6 +892,7 @@ mod tests {
             peers,
             child,
             TEST_WINDOW,
+            false,
             true,
             slots.clone(),
         )));
@@ -1105,6 +1177,7 @@ mod tests {
             peers.clone(),
             parent,
             TEST_WINDOW,
+            false,
             true,
             slots.clone(),
         ));
@@ -1117,6 +1190,7 @@ mod tests {
             peers.clone(),
             child,
             TEST_WINDOW,
+            false,
             true,
             slots.clone(),
         ));
@@ -1145,7 +1219,13 @@ mod tests {
 
     /// Starts a broadcast of a block of `size` bytes to `peers` with the fan-out policy in
     /// `config`, and returns the peers it advertised to before any advert finished.
-    async fn first_wave(config: Config, peers: Vec<BlockGossipPeer>, size: u32) -> Vec<usize> {
+    /// If `release_unrequested` is set, the broadcast uses the policy's choice for that size.
+    async fn first_wave(
+        config: Config,
+        peers: Vec<BlockGossipPeer>,
+        size: u32,
+        release_unrequested: bool,
+    ) -> Vec<usize> {
         let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
         let fanout = AdvertFanout::from_config(&config);
         let (peers, mut writes) = peers_writing(peers);
@@ -1157,6 +1237,7 @@ mod tests {
             peers,
             block.hash,
             fanout.window(block.size),
+            release_unrequested && fanout.releases_unrequested(block.size),
             false,
             slots,
         ));
@@ -1258,13 +1339,71 @@ mod tests {
     /// Broadcasts advertise to the window's peers at once, up to the peers they have.
     #[tokio::test(start_paused = true)]
     async fn first_wave_follows_block_size() {
-        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
+        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size, false);
         assert_eq!(wave(100, 1_513_987).await.len(), 33);
         assert_eq!(wave(100, 10_000_000).await.len(), 32);
         assert_eq!(wave(100, 2_000).await.len(), 64);
         assert_eq!(wave(100, 102_400).await.len(), 64);
         assert_eq!(wave(100, 102_401).await.len(), 63);
         assert_eq!(wave(40, 2_000).await.len(), 40);
+    }
+
+    /// Only blocks of known size at or below the small size give entries back while unrequested.
+    #[test]
+    fn small_known_blocks_release_unrequested_entries() {
+        let fanout = AdvertFanout::from_config(&Config::default());
+        for size in [0, 10_775, 102_400] {
+            assert!(fanout.releases_unrequested(Some(size)), "{size} bytes");
+        }
+        for size in [102_401, 1_513_987, u32::MAX] {
+            assert!(!fanout.releases_unrequested(Some(size)), "{size} bytes");
+        }
+        assert!(!fanout.releases_unrequested(None), "unknown size");
+    }
+
+    /// Peers that never request a small block do not hold its window, so every peer is
+    /// advertised to at once. A large block still advertises to one window at a time.
+    #[tokio::test(start_paused = true)]
+    async fn unrequested_peers_do_not_hold_a_small_blocks_window() {
+        const PEERS: usize = 300;
+        let wave = |size| first_wave(Config::default(), plain_peers(PEERS), size, true);
+        assert_eq!(wave(10_775).await.len(), PEERS, "small block");
+        assert_eq!(wave(102_400).await.len(), PEERS, "small size boundary");
+        assert_eq!(wave(102_401).await.len(), 63, "just above the small size");
+        assert_eq!(wave(10_000_000).await.len(), 32, "large block");
+    }
+
+    /// A released small-block broadcast still finishes, succeeds, and leaves no upload slot
+    /// held, whether its peers never request the block or all request it at once. Requested
+    /// uploads still take the shared upload slots, which never exceed their cap.
+    #[tokio::test(start_paused = true)]
+    async fn released_small_block_broadcast_finishes_and_returns_slots() {
+        const PEERS: usize = 3 * TEST_WINDOW;
+        for body_write in [None, Some(Duration::from_secs(2))] {
+            let hash = block::Hash([0xd0; 32]);
+            let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
+            let (peers, mut writes, bodies) = requesting_peers(PEERS, body_write);
+            let broadcast = tokio::spawn(broadcast_block(
+                peers,
+                hash,
+                TEST_WINDOW,
+                true,
+                false,
+                slots.clone(),
+            ));
+            let mut advertised = std::collections::HashSet::new();
+            for _ in 0..PEERS {
+                let (index, written) = writes.recv().await.expect("mock connections stay open");
+                assert_eq!(written, hash);
+                assert!(advertised.insert(index), "peer {index} advertised twice");
+                assert!(slots.available_uploads() <= BLOCK_UPLOAD_CONCURRENCY);
+            }
+            let result = broadcast.await.expect("broadcast task does not panic");
+            assert!(result.is_ok(), "{body_write:?}: {result:?}");
+            assert_eq!(slots.available_uploads(), BLOCK_UPLOAD_CONCURRENCY);
+            let max_bodies = bodies.max.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(max_bodies <= PEERS, "{max_bodies} concurrent body writes");
+        }
     }
 
     /// Sidecars beyond the window are all advertised at once, outside the window.
@@ -1276,7 +1415,7 @@ mod tests {
         for peer in &mut peers[..SIDECARS] {
             peer.sidecar = true;
         }
-        let wave = first_wave(Config::default(), peers, 10_000_000).await;
+        let wave = first_wave(Config::default(), peers, 10_000_000, false).await;
         assert_eq!(
             wave.len(),
             SIDECARS + 32,
@@ -1325,6 +1464,7 @@ mod tests {
             vec![peer.clone()],
             hash,
             TEST_WINDOW,
+            false,
             true,
             slots.clone(),
         ));
@@ -1338,6 +1478,7 @@ mod tests {
             vec![peer],
             hash,
             TEST_WINDOW,
+            false,
             true,
             slots.clone(),
         ));
@@ -1363,6 +1504,7 @@ mod tests {
                 peers.clone(),
                 hash,
                 TEST_WINDOW,
+                false,
                 false,
                 slots.clone(),
             )));
@@ -1548,8 +1690,10 @@ mod tests {
             let (published, peers) = watch::channel(vec![first]);
             let slots = BlockUploadSlots::new(1);
             let advertiser = BlockAdvertiser {
+                // A fixed window of two, for a block just above the small size, which holds
+                // entries for peers that have not requested it.
                 fanout: AdvertFanout::from_config(&Config {
-                    advert_window_min: 1,
+                    advert_window_min: 2,
                     advert_window_max: 2,
                     advert_window_small_size_bytes: 0,
                     advert_window_full_size_bytes: 100,
@@ -1567,7 +1711,7 @@ mod tests {
             let hash = block::Hash([61; 32]);
             let mut broadcast = tokio::spawn(tower::ServiceExt::oneshot(
                 advertiser,
-                Request::AdvertiseMinedBlock(AdvertisedBlock::new(hash, 0)),
+                Request::AdvertiseMinedBlock(AdvertisedBlock::new(hash, 1)),
             ));
             let advert = first_rx.recv().await.unwrap();
             advert
@@ -1589,7 +1733,7 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(
                 writes.try_recv().is_err(),
-                "the refreshed broadcast keeps the size-based window of two"
+                "the refreshed broadcast keeps its window of two"
             );
             tokio::time::advance(BLOCK_REQUEST_WAIT).await;
             assert_eq!(writes.recv().await.unwrap().1, hash);
@@ -1605,9 +1749,9 @@ mod tests {
             let (peer, mut receiver) = peer();
             let slots = BlockUploadSlots::new(1);
             let hash = block::Hash([62; 32]);
-            let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone()));
+            let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone(), None));
             let advert = receiver.recv().await.unwrap();
-            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone()));
+            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone(), None));
             tokio::task::yield_now().await;
             advert
                 .result

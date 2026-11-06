@@ -379,6 +379,10 @@ pub struct Config {
     /// The block size in bytes at and below which a legacy block broadcast uses
     /// `advert_window_max`. Must be below `advert_window_full_size_bytes`.
     ///
+    /// A broadcast of a block at or below this size also gives a peer's window entry back once
+    /// its `inv` is written and the peer has not requested the block, so peers that already have
+    /// the block do not delay the rest of the fan-out.
+    ///
     /// Experimental.
     pub advert_window_small_size_bytes: u64,
 

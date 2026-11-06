@@ -494,6 +494,9 @@ pub struct Ports {
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
+    /// The node's released rounds at each drain, which its tap keeps during
+    /// the run.
+    pub rounds: RoundEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -693,6 +696,7 @@ impl Subsystem for Storage {
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
+            rounds: RoundEvidence::default(),
         }
     }
 
@@ -717,10 +721,11 @@ impl Subsystem for Storage {
             ports.sessions.clone(),
             ports.reservations.clone(),
             ports.capacity.clone(),
+            ports.rounds.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
-        let rounds = tap.rounds();
+
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -786,7 +791,7 @@ impl Subsystem for Storage {
             adoption,
             capacity: ports.capacity,
             claims,
-            rounds,
+            rounds: ports.rounds,
             faults,
             topology,
         }
@@ -885,6 +890,9 @@ pub struct WirePorts {
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
+    /// The node's released rounds at each drain, which its tap keeps during
+    /// the run.
+    pub rounds: RoundEvidence,
 }
 
 impl WirePorts {
@@ -1036,6 +1044,7 @@ impl Subsystem for HeaderWire {
             records: PeerRecords::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
+            rounds: RoundEvidence::default(),
         }
     }
 
@@ -1071,10 +1080,11 @@ impl Subsystem for HeaderWire {
             ports.sessions.clone(),
             ports.reservations.clone(),
             ports.capacity.clone(),
+            ports.rounds.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
-        let rounds = tap.rounds();
+
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
         sim.add_source(Box::new(storage.with_tap(tap)));
@@ -1149,7 +1159,7 @@ impl Subsystem for HeaderWire {
             adoption,
             capacity: ports.capacity,
             claims,
-            rounds,
+            rounds: ports.rounds,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),

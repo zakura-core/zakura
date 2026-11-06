@@ -94,6 +94,11 @@ pub enum Request {
     /// The peer set handles this request locally and returns [`super::Response::Nil`].
     DisconnectPeer(PeerSocketAddr),
 
+    /// Ban an authenticated Zakura peer and disconnect its active connection.
+    /// The v2 service handles this locally and returns [`super::Response::Nil`].
+    /// The bounded ban history lasts until eviction or node restart.
+    BanZakuraPeer(ZakuraPeerId),
+
     /// Requests additional peers from the server.
     ///
     /// # Response
@@ -327,6 +332,7 @@ impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&match self {
             Request::DisconnectPeer(_) => "DisconnectPeer".to_string(),
+            Request::BanZakuraPeer(_) => "BanZakuraPeer".to_string(),
             Request::Peers => "Peers".to_string(),
             Request::Ping(_) => "Ping".to_string(),
 
@@ -370,6 +376,7 @@ impl Request {
     pub fn command(&self) -> &'static str {
         match self {
             Request::DisconnectPeer(_) => "DisconnectPeer",
+            Request::BanZakuraPeer(_) => "BanZakuraPeer",
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 

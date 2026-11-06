@@ -11,6 +11,7 @@ use service_session::{
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
 
 use std::{
+    collections::VecDeque,
     future,
     io::{Cursor, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -1527,6 +1528,8 @@ static NEXT_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
 struct ZakuraSupervisorState {
     supervisor: ZakuraPeerSupervisor,
     active_by_peer: HashMap<ZakuraPeerId, ZakuraPeerConnectionEntry>,
+    banned_peers: HashSet<ZakuraPeerId>,
+    ban_order: VecDeque<ZakuraPeerId>,
     ip_slots: IpSlots,
     next_handoff_id: ZakuraHandoffId,
     max_connections_per_ip: usize,
@@ -1728,6 +1731,8 @@ impl ZakuraSupervisorHandle {
             inner: Arc::new(AsyncMutex::new(ZakuraSupervisorState {
                 supervisor: ZakuraPeerSupervisor::default(),
                 active_by_peer: HashMap::new(),
+                banned_peers: HashSet::new(),
+                ban_order: VecDeque::new(),
                 ip_slots: ip_slots.clone(),
                 next_handoff_id: 1,
                 max_connections_per_ip,
@@ -1912,6 +1917,27 @@ impl ZakuraSupervisorHandle {
         }
     }
 
+    /// Ban this authenticated identity across connection generations.
+    /// Uses the same bounded FIFO capacity as the legacy IP ban history.
+    pub(super) async fn ban_peer(&self, peer_id: &ZakuraPeerId) {
+        let mut state = self.inner.lock().await;
+        if state.banned_peers.insert(peer_id.clone()) {
+            state.ban_order.push_back(peer_id.clone());
+            if state.ban_order.len() > crate::constants::MAX_BANNED_IPS {
+                let oldest = state
+                    .ban_order
+                    .pop_front()
+                    .expect("a full ban history contains an oldest peer");
+                state.banned_peers.remove(&oldest);
+            }
+            metrics::counter!("peer.zakura.banned").increment(1);
+            info!(?peer_id, "banned Zakura peer");
+        }
+        if let Some(entry) = state.active_by_peer.get(peer_id) {
+            entry.disconnect_token.cancel();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn register(
         &self,
@@ -1925,6 +1951,10 @@ impl ZakuraSupervisorHandle {
     ) -> ZakuraRegistration {
         let remote_ip = remote_ip.map(canonical_ip);
         let mut state = self.inner.lock().await;
+        if state.banned_peers.contains(&peer_id) {
+            metrics::counter!("peer.zakura.banned_connection_rejected").increment(1);
+            return ZakuraRegistration::Rejected(ZakuraRejectReason::TemporaryUnavailable);
+        }
         // A re-registration for a peer id that is already active from the same
         // IP is a duplicate redial, not a new per-IP allocation: the incumbent
         // already holds that IP slot, and the duplicate branch below either
@@ -3790,6 +3820,16 @@ impl ZakuraProtocolHandler {
                                     connection.close(
                                         VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE),
                                         b"malformed response",
+                                    );
+                                    close_cause.record("bad_response");
+                                    connection_token.cancel();
+                                    let _ = completion.send(Err(error));
+                                }
+                                Err(OutboundRequestError::InvalidEncoding(error)) => {
+                                    self.supervisor.ban_peer(&peer_id).await;
+                                    connection.close(
+                                        VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE),
+                                        b"invalid response encoding",
                                     );
                                     close_cause.record("bad_response");
                                     connection_token.cancel();
@@ -6585,6 +6625,7 @@ async fn write_outbound_request_frame_inner(
 enum OutboundRequestError {
     Local(BoxError),
     Fatal(BoxError),
+    InvalidEncoding(BoxError),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -7037,10 +7078,10 @@ impl LegacyResponseReadState {
             | LegacyResponseKind::Pong
             | LegacyResponseKind::Nil => unreachable!("non-chunk legacy response kind"),
         }
-        .map_err(|error| OutboundRequestError::Fatal(Box::new(error)))?;
+        .map_err(|error| OutboundRequestError::InvalidEncoding(Box::new(error)))?;
         // A valid item padded with junk must not pass as a completed item.
         if !remaining.is_empty() {
-            return Err(OutboundRequestError::Fatal(
+            return Err(OutboundRequestError::InvalidEncoding(
                 "legacy response item has trailing bytes".into(),
             ));
         }
@@ -9883,6 +9924,53 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn supervisor_ban_rejects_reconnect_from_another_ip() {
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let peer = test_peer(8);
+        let cancelled = CancellationToken::new();
+        register_test_peer(&supervisor, peer.clone(), cancelled.clone()).await;
+        let conn_id = supervisor.inner.lock().await.active_by_peer[&peer].conn_id;
+
+        supervisor.ban_peer(&peer).await;
+        assert!(cancelled.is_cancelled());
+        assert!(supervisor.outbound_peer_handles().await.is_empty());
+        supervisor.deregister(&peer, conn_id).await;
+        let registration = register_test_peer_with_hash_and_ip(
+            &supervisor,
+            test_conn_id(),
+            &peer,
+            Some("192.0.2.99".parse().unwrap()),
+            [2; TRANSCRIPT_HASH_BYTES],
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(registration, ZakuraRegistration::Rejected(_)));
+        assert!(supervisor.registered_ids().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_bans_are_bounded_and_repeated_bans_keep_fifo_order() {
+        let supervisor = ZakuraSupervisorHandle::new(4);
+        let peer = |index: usize| {
+            let mut bytes = vec![0; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            ZakuraPeerId::new(bytes).unwrap()
+        };
+        for index in 0..crate::constants::MAX_BANNED_IPS {
+            supervisor.ban_peer(&peer(index)).await;
+        }
+        supervisor.ban_peer(&peer(0)).await;
+        supervisor
+            .ban_peer(&peer(crate::constants::MAX_BANNED_IPS))
+            .await;
+        let state = supervisor.inner.lock().await;
+        assert_eq!(state.banned_peers.len(), crate::constants::MAX_BANNED_IPS);
+        assert_eq!(state.ban_order.len(), state.banned_peers.len());
+        assert!(!state.banned_peers.contains(&peer(0)));
+        assert!(state.banned_peers.contains(&peer(1)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn duplicate_evicts_stale_incumbent_but_keeps_fresh_one() -> Result<(), BoxError> {
         // A duplicate connection for an identity that already has one either
@@ -12593,7 +12681,7 @@ mod tests {
         let mut state = LegacyResponseReadState::new(budget);
         assert!(matches!(
             state.validate_frame(request_id, frame),
-            Err(OutboundRequestError::Fatal(_)),
+            Err(OutboundRequestError::InvalidEncoding(_)),
         ));
 
         Ok(())

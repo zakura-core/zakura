@@ -69,7 +69,7 @@ fn policy_rejection_does_not_start_a_cooldown() {
     );
     let invalid_error = TransactionDownloadVerifyError::Invalid {
         error: consensus_error,
-        advertiser_addr: Some(advertiser_addr),
+        peer_source: Some(advertiser_addr.into()),
         tip_height: Some(block::Height(100)),
         transaction_version: 4,
         transaction_network_upgrade: None,
@@ -91,7 +91,7 @@ fn stale_verification_failures_do_not_start_cooldowns() {
     let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let error = TransactionDownloadVerifyError::Invalid {
         error: TransactionError::Script(zakura_script::Error::ScriptInvalid),
-        advertiser_addr: Some(peer),
+        peer_source: Some(peer.into()),
         tip_height: Some(block::Height(100)),
         transaction_version: 4,
         transaction_network_upgrade: None,
@@ -138,7 +138,7 @@ fn context_dependent_failures_do_not_start_cooldowns() {
     ] {
         let error = TransactionDownloadVerifyError::Invalid {
             error,
-            advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+            peer_source: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233)).into()),
             tip_height: Some(block::Height(100)),
             transaction_version: 5,
             transaction_network_upgrade: None,
@@ -166,14 +166,14 @@ fn failures_retried_after_a_tip_reset_ban_but_start_no_cooldown() {
     ) {
         TransactionDownloadVerifyError::Invalid {
             error,
-            advertiser_addr,
+            peer_source,
             tip_height,
             transaction_version,
             transaction_network_upgrade,
             ..
         } => TransactionDownloadVerifyError::Invalid {
             error,
-            advertiser_addr,
+            peer_source,
             tip_height,
             transaction_version,
             transaction_network_upgrade,
@@ -215,7 +215,7 @@ fn failures_retried_after_a_tip_reset_ban_but_start_no_cooldown() {
     }
 
     let failure = retried(TransactionError::NoInputs, 5);
-    assert_eq!(transaction_ban_peer(&failure), Some(test_peer()));
+    assert_eq!(transaction_ban_peer(&failure), Some(test_peer().into()));
 }
 
 /// Returns a verification failure for a transaction that [`test_peer`] relayed.
@@ -225,7 +225,7 @@ fn relayed_transaction_failure(
 ) -> TransactionDownloadVerifyError {
     TransactionDownloadVerifyError::Invalid {
         error,
-        advertiser_addr: Some(test_peer()),
+        peer_source: Some(test_peer().into()),
         tip_height: Some(block::Height(100)),
         transaction_version,
         transaction_network_upgrade: None,
@@ -285,7 +285,7 @@ fn transaction_data_failures_ban_every_version() {
 
             assert_eq!(
                 transaction_ban_peer(&failure),
-                Some(test_peer()),
+                Some(test_peer().into()),
                 "{error:?}"
             );
             assert_eq!(
@@ -356,7 +356,7 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
             let failure = relayed_transaction_failure(error.clone(), transaction_version);
             assert_eq!(
                 transaction_ban_peer(&failure),
-                Some(test_peer()),
+                Some(test_peer().into()),
                 "{error:?}"
             );
         }
@@ -408,7 +408,7 @@ fn sprout_deposits_start_cooldowns() {
 fn transactions_declaring_a_later_upgrade_start_no_cooldown() {
     let failure = |transaction_network_upgrade| TransactionDownloadVerifyError::Invalid {
         error: TransactionError::DisabledAddToSproutPool,
-        advertiser_addr: Some(test_peer()),
+        peer_source: Some(test_peer().into()),
         tip_height: Some(block::Height(100)),
         transaction_version: 5,
         transaction_network_upgrade,
@@ -487,7 +487,7 @@ fn transactions_for_the_previous_upgrade_start_no_cooldown_in_its_grace_period()
     let failure = |error, transaction_version, transaction_network_upgrade| {
         TransactionDownloadVerifyError::Invalid {
             error,
-            advertiser_addr: Some(test_peer()),
+            peer_source: Some(test_peer().into()),
             tip_height: Some(block::Height(100)),
             transaction_version,
             transaction_network_upgrade,
@@ -571,7 +571,10 @@ fn transactions_for_the_previous_upgrade_start_no_cooldown_in_its_grace_period()
 
     // The grace period does not change bans.
     let v5_script_failure = failure(script_invalid, 5, Some(NetworkUpgrade::Nu6_3));
-    assert_eq!(transaction_ban_peer(&v5_script_failure), Some(test_peer()));
+    assert_eq!(
+        transaction_ban_peer(&v5_script_failure),
+        Some(test_peer().into())
+    );
 }
 
 /// Branch mismatches receive no penalty in either direction.
@@ -580,7 +583,7 @@ fn branch_id_mismatches_never_start_cooldowns() {
     let tip_height = Some(block::Height(100));
     let failure = |transaction_network_upgrade| TransactionDownloadVerifyError::Invalid {
         error: TransactionError::WrongConsensusBranchId,
-        advertiser_addr: Some(test_peer()),
+        peer_source: Some(test_peer().into()),
         tip_height,
         transaction_version: 5,
         transaction_network_upgrade,
@@ -651,6 +654,71 @@ async fn transaction_data_failure_bans_peer_without_a_current_tip() {
         .peer_cooldowns
         .is_cooling_down(test_peer().ip(), Instant::now()));
     peer_set.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_zakura_transaction_bans_supplier_instead_of_advertiser() {
+    let network = Network::Mainnet;
+    let (mut mempool, mut peer_set, _state, _tip, mut verifier, mut recent_syncs, _receiver) =
+        setup(&network, u64::MAX, true).await;
+    let (misbehavior_sender, mut legacy_bans) = tokio::sync::mpsc::channel(1);
+    mempool.misbehavior_sender = misbehavior_sender;
+    mempool.enable(&mut recent_syncs).await;
+    let advertiser = zn::zakura::ZakuraPeerId::new(vec![1; 32]).unwrap();
+    let supplier = zn::zakura::ZakuraPeerId::new(vec![2; 32]).unwrap();
+    let transaction = network
+        .unmined_transactions_in_blocks(2..)
+        .next()
+        .unwrap()
+        .transaction
+        .clone();
+    let txid = transaction.id();
+    mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::QueueFromPeer {
+            transactions: vec![txid.into()],
+            source: QueueSource::Zakura(advertiser.as_bytes().to_vec()),
+        })
+        .await
+        .unwrap();
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request,
+            zn::Request::TransactionsByIdFrom { source: zn::PeerSource::Zakura(peer), .. }
+                if *peer == advertiser)
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Available((
+                transaction,
+                Some(zn::PeerSource::Zakura(supplier.clone())),
+            )),
+        ]));
+    verifier
+        .expect_request_that(|request| {
+            matches!(request,
+            tx::Request::Mempool { transaction, .. } if transaction.id() == txid)
+        })
+        .await
+        .respond(Err(TransactionError::NoInputs));
+    timeout(Duration::from_secs(3), async {
+        while mempool.tx_downloads().in_flight() != 0 {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("verification failure reaches the mempool");
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request,
+            zn::Request::BanZakuraPeer(peer) if *peer == supplier)
+        })
+        .await
+        .respond(zn::Response::Nil);
+    assert!(legacy_bans.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -835,7 +903,7 @@ async fn assert_peer_error_starts_no_cooldown(
         })
         .await
         .respond(zn::Response::Transactions(vec![
-            zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+            zn::InventoryResponse::Available((transaction, Some(peer_addr.into()))),
         ]));
     let verification = tx_verifier
         .expect_request_that(|request| {
@@ -994,7 +1062,7 @@ async fn peer_penalties(
         })
         .await
         .respond(zn::Response::Transactions(vec![
-            zn::InventoryResponse::Available((transaction, Some(peer))),
+            zn::InventoryResponse::Available((transaction, Some(peer.into()))),
         ]));
     tx_verifier
         .expect_request_that(|request| {
@@ -1102,7 +1170,7 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         })
         .await
         .respond(zn::Response::Transactions(vec![
-            zn::InventoryResponse::Available((oversized_transaction.clone(), Some(peer_addr))),
+            zn::InventoryResponse::Available((oversized_transaction.clone(), Some(peer_addr.into()))),
         ]));
 
     timeout(Duration::from_secs(3), async {
@@ -1153,7 +1221,7 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         })
         .await
         .respond(zn::Response::Transactions(vec![
-            zn::InventoryResponse::Available((at_limit_transaction, Some(peer_addr))),
+            zn::InventoryResponse::Available((at_limit_transaction, Some(peer_addr.into()))),
         ]));
     tx_verifier
         .expect_request_that(|request| {
@@ -1256,7 +1324,7 @@ async fn crawled_transaction_from_cooling_down_peer_is_not_verified() -> Result<
             })
             .await
             .respond(zn::Response::Transactions(vec![
-                zn::InventoryResponse::Available((transaction.clone(), Some(serving_peer))),
+                zn::InventoryResponse::Available((transaction.clone(), Some(serving_peer.into()))),
             ]));
 
         if is_verified {

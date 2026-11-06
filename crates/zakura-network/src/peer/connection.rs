@@ -247,7 +247,7 @@ impl Handler {
                     // If we got some of what we wanted, let the internal client know.
                     let available = transactions
                         .into_iter()
-                        .map(|t| InventoryResponse::Available((t, transient_addr)));
+                        .map(|t| InventoryResponse::Available((t, transient_addr.map(Into::into))));
                     let missing = pending_ids.into_iter().map(InventoryResponse::Missing);
 
                     Handler::Finished(Ok(Response::Transactions(
@@ -297,7 +297,7 @@ impl Handler {
                     // If we got some of what we wanted, let the internal client know.
                     let available = transactions
                         .into_iter()
-                        .map(|t| InventoryResponse::Available((t, transient_addr)));
+                        .map(|t| InventoryResponse::Available((t, transient_addr.map(Into::into))));
                     let missing = pending_ids.into_iter().map(InventoryResponse::Missing);
 
                     Handler::Finished(Ok(Response::Transactions(
@@ -1277,7 +1277,9 @@ where
         self.update_state_metrics(format!("Out::Req::{}", request.command()));
 
         let new_handler = match (&self.state, request) {
-            (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
+            (_, DisconnectPeer(_) | BanZakuraPeer(_)) => {
+                unreachable!("the network service handles peer policy requests")
+            },
             // Block adverts reach the connection through its advert queue, which the peer set's
             // block advertiser fills. A `Client` caller that sends one as an ordinary request,
             // such as an isolated connection, gets an error instead of an `inv`.

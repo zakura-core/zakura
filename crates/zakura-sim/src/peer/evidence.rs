@@ -11,9 +11,12 @@
 //! connection down, fails the run, so a peer's frames can't drop out of the
 //! log unseen.
 //!
-//! Each `PeerReceived` is followed by the frame's `NodeFrame`, which the
-//! [`SenderAdapter`] labels under the sender's rules against the peer
-//! updates the node had applied when it started writing the frame (M5-E2).
+//! Each `PeerReceived` on a header stream is followed by the frame's
+//! `NodeFrame`, which the [`SenderAdapter`] labels under the sender's rules
+//! against the peer updates the node had applied when it started writing
+//! the frame (M5-E2). A discovery stream's frames are logged and labelled,
+//! but the evidence judges none of them and labels none of the node's
+//! frames there: disc-3.1 places discovery's stages and its sender rules.
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
@@ -68,7 +71,7 @@ struct Waiting {
 /// oldest first.
 pub(crate) type PeerRecords = Rc<RefCell<VecDeque<PeerRecord>>>;
 
-/// One thing a peer did on a header stream.
+/// One thing a peer did on a header or discovery stream.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerRecord {
     /// The peer's address on the connection, which the node sees as the
@@ -165,9 +168,20 @@ pub(crate) struct WireEvidence {
     late: Vec<Observation>,
     /// Labels the node's frames.
     sender: SenderAdapter,
+    /// The discovery stream, whose frames are logged and never judged.
+    discovery: Option<StreamId>,
 }
 
 impl WireEvidence {
+    /// Evidence that also logs the peers' frames on `discovery`'s stream,
+    /// which it judges none of.
+    pub(crate) fn with_discovery(discovery: StreamId) -> Self {
+        WireEvidence {
+            discovery: Some(discovery),
+            ..WireEvidence::default()
+        }
+    }
+
     /// Reads the identity rows logged since the last call, logs every record
     /// they place, then the P3b observations the node's new evidence means.
     pub(crate) fn observe(
@@ -183,7 +197,9 @@ impl WireEvidence {
                 ..
             } = &entry.obs
             {
-                self.sender.node(*connection, event);
+                if !self.on_discovery(*connection, event) {
+                    self.sender.node(*connection, event);
+                }
             }
             match &entry.obs {
                 Observation::Transport {
@@ -290,6 +306,18 @@ impl WireEvidence {
         Ok(())
     }
 
+    /// Whether `event` names a QUIC stream of `connection` admitted as the
+    /// discovery stream.
+    fn on_discovery(&self, connection: u64, event: &TransportFact) -> bool {
+        let quic_stream = match event {
+            TransportFact::FrameWriteStarted { quic_stream, .. }
+            | TransportFact::Regulated { quic_stream, .. } => *quic_stream,
+            _ => return false,
+        };
+        self.discovery.is_some()
+            && self.streams.get(&(connection, quic_stream)).copied() == self.discovery
+    }
+
     /// `record` as its observations, once its stream is admitted: one, or
     /// a `PeerReceived` and its `NodeFrame`. An error if the sender adapter
     /// can't label the node's frame.
@@ -342,6 +370,17 @@ impl WireEvidence {
                 frame,
                 at,
             } => {
+                let received = Observation::PeerReceived {
+                    connection,
+                    quic_stream,
+                    seq,
+                    message_type,
+                    payload,
+                    credit,
+                };
+                if Some(stream) == self.discovery {
+                    return Some(Ok(vec![received]));
+                }
                 let node_frame =
                     match self
                         .sender
@@ -350,17 +389,7 @@ impl WireEvidence {
                         Ok(node_frame) => node_frame,
                         Err(why) => return Some(Err(why)),
                     };
-                return Some(Ok(vec![
-                    Observation::PeerReceived {
-                        connection,
-                        quic_stream,
-                        seq,
-                        message_type,
-                        payload,
-                        credit,
-                    },
-                    node_frame,
-                ]));
+                return Some(Ok(vec![received, node_frame]));
             }
         }]))
     }
@@ -542,6 +571,9 @@ impl WireEvidence {
                 "UnlabelledFrame: connection {connection} read frame {seq} on stream \
                  {quic_stream} with no PeerFrame"
             ));
+        }
+        if Some(stream) == self.discovery {
+            return Ok(None);
         }
         let rules = rules(stream).ok_or_else(|| {
             format!("UntabledStream: connection {connection} read a frame on untabled {stream}")

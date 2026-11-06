@@ -29,7 +29,9 @@ use zakura_state::{
 };
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
-use crate::components::sync::{self, gossip::BLOCK_GOSSIP_TIMEOUT, BlockGossipError, SyncStatus};
+use crate::components::sync::{
+    self, gossip::BLOCK_GOSSIP_TIMEOUT, BlockGossipError, RecentSyncLengths, SyncStatus,
+};
 
 const MAX_PEER_SET_REQUEST_DELAY: Duration = Duration::from_secs(30);
 
@@ -168,6 +170,24 @@ async fn start_gossip_test_with_submissions(
     initial_tip: AdvertisedBlock,
     local_submissions: MinedSubmissions,
 ) -> GossipTestSetup {
+    start_gossip_test_with_sync_control(
+        chain_tip_change,
+        read_state,
+        initial_tip,
+        local_submissions,
+    )
+    .await
+    .0
+}
+
+/// Like [`start_gossip_test_with_submissions`], but also returns the sync lengths, so the test
+/// can move the node away from and back to the network tip.
+async fn start_gossip_test_with_sync_control(
+    chain_tip_change: ChainTipChange,
+    read_state: ReadState,
+    initial_tip: AdvertisedBlock,
+    local_submissions: MinedSubmissions,
+) -> (GossipTestSetup, RecentSyncLengths) {
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
@@ -195,11 +215,14 @@ async fn start_gossip_test_with_submissions(
         .await
         .respond(Response::Nil);
 
-    GossipTestSetup {
-        peer_set,
-        submitblock_sender,
-        gossip_task_handle,
-    }
+    (
+        GossipTestSetup {
+            peer_set,
+            submitblock_sender,
+            gossip_task_handle,
+        },
+        recent_syncs,
+    )
 }
 
 /// After a successful mined block broadcast, the gossip task marks the tip as seen and does not
@@ -639,4 +662,151 @@ async fn local_submission_tip_change_waits_for_its_mined_event() {
         .await
         .respond(Response::Nil);
     peer_set.expect_no_requests().await;
+}
+
+/// The committed-tip path decides whether to leave a block to the mined path by the tip it
+/// broadcasts, not the tip change that woke it.
+///
+/// A relayed block wakes the committed-tip path, which then waits to get close to the network tip.
+/// Meanwhile a block this node is submitting commits on top of it, and becomes the tip that path
+/// would broadcast, before `submitblock` sends its mined-block event. That block must still be
+/// broadcast once, as a mined block.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn local_submission_superseding_a_relayed_tip_is_left_to_the_mined_path() {
+    let _init_guard = zakura_test::init();
+    let block_one: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let relayed: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let local: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+
+    let (mut chain_tip_sender, _latest_chain_tip, chain_tip_change) = ChainTipSender::new(
+        Some(CheckpointVerifiedBlock::from(block_one.clone()).into()),
+        &Mainnet,
+    );
+    let local_submissions = MinedSubmissions::default();
+    let (
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+        mut recent_syncs,
+    ) = start_gossip_test_with_sync_control(
+        chain_tip_change,
+        read_state_without_sizes(),
+        without_size(&block_one),
+        local_submissions.clone(),
+    )
+    .await;
+
+    // The relayed block wakes the committed-tip path. It is not a local submission, so the path
+    // goes on to wait until the node is close to the network tip.
+    SyncStatus::sync_far_from_tip(&mut recent_syncs);
+    chain_tip_sender.set_finalized_tip(Some(CheckpointVerifiedBlock::from(relayed).into()));
+    tokio::task::yield_now().await;
+
+    // While it waits, a local submission commits on top of the relayed block.
+    let submission = local_submissions
+        .reserve(local.hash())
+        .expect("one submission fits");
+    chain_tip_sender.set_finalized_tip(Some(CheckpointVerifiedBlock::from(local.clone()).into()));
+
+    // The committed-tip path resumes and reads the local block as the tip to broadcast, before
+    // the RPC sends the final event.
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    tokio::task::yield_now().await;
+    submitblock_sender
+        .send(MinedBlockEvent::Committed {
+            hash: local.hash(),
+            height: local.coinbase_height().unwrap(),
+            size: local.zcash_serialized_size(),
+        })
+        .expect("mined block notification should be accepted");
+    drop(submission);
+
+    peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&local)))
+        .await
+        .respond(Response::Nil);
+    peer_set.expect_no_requests().await;
+}
+
+/// Gossip waits for a local submission to finish, not for a fixed delay, so a mined-block event
+/// sent well after the tip change still keeps the block on the mined path.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn local_submission_mined_event_sent_late_is_broadcast_once() {
+    let local_submissions = MinedSubmissions::default();
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            submitblock_sender,
+            gossip_task_handle: _gossip_task_handle,
+        },
+    ) = setup_gossip_test_with_submissions(local_submissions.clone()).await;
+
+    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let submission = local_submissions
+        .reserve(block_two.hash())
+        .expect("one submission fits");
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
+
+    // A slow RPC: far longer than any fixed delay, and within the release bound.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    submitblock_sender
+        .send(MinedBlockEvent::Committed {
+            hash: block_two.hash(),
+            height: block_two.coinbase_height().unwrap(),
+            size: block_two.zcash_serialized_size(),
+        })
+        .expect("mined block notification should be accepted");
+    drop(submission);
+
+    peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
+        .await
+        .respond(Response::Nil);
+    peer_set.expect_no_requests().await;
+}
+
+/// A local submission can finish without a mined-block event, such as when the same block
+/// arrived from a peer first and the submission is rejected as a duplicate. The committed-tip
+/// path then broadcasts the block.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn local_submission_without_a_mined_event_is_gossiped_as_committed() {
+    let local_submissions = MinedSubmissions::default();
+    let (
+        mut chain_tip_sender,
+        GossipTestSetup {
+            mut peer_set,
+            gossip_task_handle: _gossip_task_handle,
+            ..
+        },
+    ) = setup_gossip_test_with_submissions(local_submissions.clone()).await;
+
+    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let submission = local_submissions
+        .reserve(block_two.hash())
+        .expect("one submission fits");
+    chain_tip_sender.set_finalized_tip(Some(
+        CheckpointVerifiedBlock::from(block_two.clone()).into(),
+    ));
+    tokio::task::yield_now().await;
+    drop(submission);
+
+    peer_set
+        .expect_request(Request::AdvertiseBlock(without_size(&block_two), None))
+        .await
+        .respond(Response::Nil);
 }

@@ -1,0 +1,633 @@
+{
+  "schema": 1,
+  "status": "reviewed case matrix and calibrated bounds; no mutant or scored discovery campaign has run",
+  "catalogue_base_revision": "8c63fa3ec2348b036e1a24bd9fa6c677eca49c57",
+  "source_revision": "870678be1739ea799e59b4e0bdfe6cf512792710",
+  "baseline_build": {
+    "git": "870678be1739ea799e59b4e0bdfe6cf512792710",
+    "dirty": false,
+    "source": "190dceb1cfe204290507dbf2b39c4736ade0b01c7f5976db786ecfd0237ba419",
+    "lockfile": "53fc890827e20d7afa90951c207ca2fcc7dc25f450b6ad4dac18f333d2a04ade",
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "target": "x86_64-unknown-linux-gnu",
+    "cfg": [
+      "debug_assertions",
+      "panic=\"unwind\"",
+      "target_abi",
+      "target_arch=\"x86_64\"",
+      "target_endian=\"little\"",
+      "target_env=\"gnu\"",
+      "target_family=\"unix\"",
+      "target_feature=\"fxsr\"",
+      "target_feature=\"sse\"",
+      "target_feature=\"sse2\"",
+      "target_has_atomic=\"16\"",
+      "target_has_atomic=\"32\"",
+      "target_has_atomic=\"64\"",
+      "target_has_atomic=\"8\"",
+      "target_has_atomic=\"ptr\"",
+      "target_has_atomic_primitive_alignment=\"16\"",
+      "target_has_atomic_primitive_alignment=\"32\"",
+      "target_has_atomic_primitive_alignment=\"64\"",
+      "target_has_atomic_primitive_alignment=\"8\"",
+      "target_has_atomic_primitive_alignment=\"ptr\"",
+      "target_os=\"linux\"",
+      "target_pointer_width=\"64\"",
+      "target_vendor=\"unknown\"",
+      "unix",
+      "zakura_sim"
+    ],
+    "features": [],
+    "opt_level": "0",
+    "sanitizer": null,
+    "binary": "c55de99da2f64b6445329b62cde325cf3fde0534c57eba1fc28e40d2b727ea07"
+  },
+  "baseline_binary_sha256": "c55de99da2f64b6445329b62cde325cf3fde0534c57eba1fc28e40d2b727ea07",
+  "baseline_build_flags": {
+    "rustflags": "--cfg zakura_sim",
+    "profile": "dev/test",
+    "debug_info": 0,
+    "incremental": false
+  },
+  "scope": "Ten existing retained production mutations on five transport-free simulator targets. Full-stack readiness remains open.",
+  "discovery": {
+    "corpus": "qa/mutation-pilot/discovery-empty",
+    "corpus_inputs": [],
+    "provenance": "Deliberate cold start. No curated, regression, witness, derived, or carried inputs. libFuzzer generates initial inputs.",
+    "seeds": [
+      11,
+      23,
+      47,
+      89,
+      179
+    ],
+    "seconds_per_seed": 600,
+    "workers": 1,
+    "max_len": 512,
+    "input_timeout_seconds": 10,
+    "rss_limit_mb": 2048,
+    "max_restarts": 0,
+    "abandon_limit": 1,
+    "feedback": "on",
+    "sanitizer": "none",
+    "calibration": "Six baseline-only cold-start runs, kept in the evidence bundle under calibration/; discovery record-book did not satisfy its whole-history applicability gate in either 5s or 30s. No generator, witness or corpus repair followed.",
+    "paired_runs": "Use identical seed, bounds and initial empty corpus for original and mutant. Start each seed in a fresh store; never carry a previous corpus."
+  },
+  "confirmation": {
+    "child_seconds": 60,
+    "shrink_seconds": 600,
+    "shrink_candidates": 2000,
+    "require_exact_replay": true
+  },
+  "cases": [
+    {
+      "id": "block/reactor-policy/lost-forced-retry",
+      "fault_class": "queue-refusal",
+      "patch": "qa/planted/block/reactor-policy/lost-forced-retry.patch",
+      "patch_sha256": "992317db3707e06dd27486b300b868056e14e9cf021096c80dfdf5b074d488b1",
+      "production_files": {
+        "crates/zakura-network/src/zakura/block_sync/reactor/state.rs": "cfe311aa50b05eaf8809baf2e2f55661b418f91707b1340a1897ee88ad20ba4f"
+      },
+      "rationale": "A refusal branch forgets one field of accepted work.",
+      "property": "block/reactor-policy",
+      "diagnostic_properties": [],
+      "harness": "block/reactor-policy",
+      "target": "block_reactor_policy",
+      "generator": 3,
+      "trigger": "A forced query receives Full while an earlier query remains pending.",
+      "expected_intact": "The reactor retains the pending query and sets retry_forced.",
+      "expected_mutated": "The reactor loses the forced retry obligation.",
+      "baseline_trigger_step": 4,
+      "witness": "crates/zakura-sim/tests/fixtures/block-reactor-identity.bin",
+      "witness_sha256": "be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a",
+      "witness_sidecar_sha256": "4cc8c1ecaa09155e6627825c7c408489af8275f664bc9d6fe2b6e9bd755d3138",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura/block_sync/reactor"
+      ],
+      "baseline": {
+        "directory": "baseline/block-reactor-identity",
+        "trace_sha256": "3d898c93f3a4cec2a396420f79d8e0be86286d03406e33044436dbaa7370ac8e",
+        "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
+        "applicable": 4,
+        "steps": 4
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Query action identities, pending identity/scope, next_query_id, retry_forced and retry deadline.",
+      "independent_check": "The model maintains its own pending query, identity counter and retry obligation. It compares each production snapshot and emitted action after each decoded operation.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/block_sync/reactor/state/tests.rs": "1add76ecaed9a8f31c00cd60efd6c6e35f8452ac7554450d66c2036acf812ce8",
+        "crates/zakura-sim/src/harness/block_work.rs": "faff284c250e2971819c0fda694d69067c3d83ea14ce35e80fdcd442031fb856",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "0704dda58516637510ee8aca2f57bd41734c3be7705845ffbe5124f84983077f"
+    },
+    {
+      "id": "block/reactor-policy/refusal-consumes-query-id",
+      "fault_class": "queue-refusal",
+      "patch": "qa/planted/block/reactor-policy/refusal-consumes-query-id.patch",
+      "patch_sha256": "68ea6dfc5ad5974380b99a5a4e03031a65f276fa647c29ac03ce8c81830ae2e6",
+      "production_files": {
+        "crates/zakura-network/src/zakura/block_sync/reactor/state.rs": "cfe311aa50b05eaf8809baf2e2f55661b418f91707b1340a1897ee88ad20ba4f"
+      },
+      "rationale": "Identity allocation moves before dispatch acceptance.",
+      "property": "block/reactor-policy",
+      "diagnostic_properties": [],
+      "harness": "block/reactor-policy",
+      "target": "block_reactor_policy",
+      "generator": 3,
+      "trigger": "A proposed query receives Full.",
+      "expected_intact": "The reactor preserves next_query_id because dispatch refused the proposal.",
+      "expected_mutated": "The refused proposal consumes an identity.",
+      "baseline_trigger_step": 2,
+      "witness": "crates/zakura-sim/tests/fixtures/block-reactor-policy.bin",
+      "witness_sha256": "866eab29ee4b80c036ede067022d9d7cd8906370f6065b9e322e2a9e3c8da9a8",
+      "witness_sidecar_sha256": "47f51b2a75c0158649396689a3833961bca6b18b5fe357da15384eac1e1c0b54",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura/block_sync/reactor"
+      ],
+      "baseline": {
+        "directory": "baseline/block-reactor-policy",
+        "trace_sha256": "c68402875cae13a2c7113ca9ad3590fbe62b3479a10a1b04c20171daedab9124",
+        "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
+        "applicable": 15,
+        "steps": 15
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Query action identities, pending identity/scope, next_query_id, retry_forced and retry deadline.",
+      "independent_check": "The model maintains its own pending query, identity counter and retry obligation. It compares each production snapshot and emitted action after each decoded operation.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/block_sync/reactor/state/tests.rs": "1add76ecaed9a8f31c00cd60efd6c6e35f8452ac7554450d66c2036acf812ce8",
+        "crates/zakura-sim/src/harness/block_work.rs": "faff284c250e2971819c0fda694d69067c3d83ea14ce35e80fdcd442031fb856",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "e5e617f408cfe44bce5e350a93140fa07a7eed04a65bd82d11e30b1ca80ffd78"
+    },
+    {
+      "id": "block/reactor-policy/stale-scope-completes-query",
+      "fault_class": "stale-result",
+      "patch": "qa/planted/block/reactor-policy/stale-scope-completes-query.patch",
+      "patch_sha256": "ae002e957c5eb66a358e811e2d9ed27273ea23999506afa80188e8d1d27e4897",
+      "production_files": {
+        "crates/zakura-network/src/zakura/block_sync/reactor/state.rs": "cfe311aa50b05eaf8809baf2e2f55661b418f91707b1340a1897ee88ad20ba4f"
+      },
+      "rationale": "A completion check validates the sequence but omits its scope.",
+      "property": "block/reactor-policy",
+      "diagnostic_properties": [],
+      "harness": "block/reactor-policy",
+      "target": "block_reactor_policy",
+      "generator": 3,
+      "trigger": "A reply has the pending query ID but a different header generation.",
+      "expected_intact": "The reactor keeps the pending query.",
+      "expected_mutated": "The stale reply removes the pending query.",
+      "baseline_trigger_step": 2,
+      "witness": "crates/zakura-sim/tests/fixtures/block-reactor-identity.bin",
+      "witness_sha256": "be07dcd1fe186c9a718c3a8d381ce697ad6072f8015c11ebe4864b6a8b30cd5a",
+      "witness_sidecar_sha256": "4cc8c1ecaa09155e6627825c7c408489af8275f664bc9d6fe2b6e9bd755d3138",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura/block_sync/reactor"
+      ],
+      "baseline": {
+        "directory": "baseline/block-reactor-identity",
+        "trace_sha256": "3d898c93f3a4cec2a396420f79d8e0be86286d03406e33044436dbaa7370ac8e",
+        "witness_result_sha256": "97c1853a388b02a23e6cbaf2750056697632826b4b3131c59ecbd382fe5d5df5",
+        "applicable": 4,
+        "steps": 4
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Query action identities, pending identity/scope, next_query_id, retry_forced and retry deadline.",
+      "independent_check": "The model maintains its own pending query, identity counter and retry obligation. It compares each production snapshot and emitted action after each decoded operation.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/block_sync/reactor/state/tests.rs": "1add76ecaed9a8f31c00cd60efd6c6e35f8452ac7554450d66c2036acf812ce8",
+        "crates/zakura-sim/src/harness/block_work.rs": "faff284c250e2971819c0fda694d69067c3d83ea14ce35e80fdcd442031fb856",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "0704dda58516637510ee8aca2f57bd41734c3be7705845ffbe5124f84983077f"
+    },
+    {
+      "id": "block/decoded-retention/missing-admission",
+      "fault_class": "boundary-accounting",
+      "patch": "qa/planted/block/decoded-retention/missing-admission.patch",
+      "patch_sha256": "c4519caeb671bb7e139952e44692a72e75e2cc2845dd71f7187dfd66bbafe57e",
+      "production_files": {
+        "crates/zakura-node-services/src/block_memory.rs": "b238cae4f1f1c79c7d408aeb837739bc2c801aa31188171bb40c9b702ec43632"
+      },
+      "rationale": "Admission increments bytes but omits the item count.",
+      "property": "block/decoded-retention",
+      "diagnostic_properties": [],
+      "harness": "block/decoded-retention",
+      "target": "block_decoded_retention",
+      "generator": 1,
+      "trigger": "A decoder allocates its first owned block.",
+      "expected_intact": "The pool reserves one block before returning its owner.",
+      "expected_mutated": "The pool records zero reserved blocks for a live allocation.",
+      "baseline_trigger_step": 1,
+      "witness": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "witness_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "witness_sidecar_sha256": "aa3f681a1df9812bdfea1a0bfe0abc7db7e512b90b2da695304740e69028fc1a",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-node-services/src/block_memory/model.rs"
+      ],
+      "baseline": {
+        "directory": "baseline/block-decoded-retention",
+        "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
+        "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
+        "applicable": 1,
+        "steps": 21
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Pool byte/block counts and closed state; independently measured allocation identity and handle counts; final drain.",
+      "independent_check": "The model tracks an independent handle graph. The driver reads production allocation ownership and pool counters, then compares them after each operation and final drain.",
+      "oracle_and_generator_files": {
+        "crates/zakura-node-services/src/block_memory/model.rs": "b687a3a61d3dec6645dd493e48873e9d0340a5aae494981547c78021d1b10b61",
+        "crates/zakura-sim/src/harness/block_work.rs": "faff284c250e2971819c0fda694d69067c3d83ea14ce35e80fdcd442031fb856",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "3ab4d090e51670c3ffab8c87fe969552490e2a3f59edf883975649bdbb9272c0"
+    },
+    {
+      "id": "block/decoded-retention/double-release",
+      "fault_class": "resource-lifetime",
+      "patch": "qa/planted/block/decoded-retention/double-release.patch",
+      "patch_sha256": "358db37c7fe10785f6efda7ca3829ec9e73789e547f10409e33f8cf1cdc4a0f8",
+      "production_files": {
+        "crates/zakura-node-services/src/block_memory.rs": "b238cae4f1f1c79c7d408aeb837739bc2c801aa31188171bb40c9b702ec43632"
+      },
+      "rationale": "Release decrements an item counter by the wrong amount.",
+      "property": "block/decoded-retention",
+      "diagnostic_properties": [],
+      "harness": "block/decoded-retention",
+      "target": "block_decoded_retention",
+      "generator": 1,
+      "trigger": "The final handle for the first allocation drops.",
+      "expected_intact": "The pool releases one block and stays open.",
+      "expected_mutated": "The pool subtracts two blocks and closes on underflow.",
+      "baseline_trigger_step": 12,
+      "witness": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "witness_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "witness_sidecar_sha256": "aa3f681a1df9812bdfea1a0bfe0abc7db7e512b90b2da695304740e69028fc1a",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-node-services/src/block_memory/model.rs"
+      ],
+      "baseline": {
+        "directory": "baseline/block-decoded-retention",
+        "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
+        "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
+        "applicable": 1,
+        "steps": 21
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Pool byte/block counts and closed state; independently measured allocation identity and handle counts; final drain.",
+      "independent_check": "The model tracks an independent handle graph. The driver reads production allocation ownership and pool counters, then compares them after each operation and final drain.",
+      "oracle_and_generator_files": {
+        "crates/zakura-node-services/src/block_memory/model.rs": "b687a3a61d3dec6645dd493e48873e9d0340a5aae494981547c78021d1b10b61",
+        "crates/zakura-sim/src/harness/block_work.rs": "faff284c250e2971819c0fda694d69067c3d83ea14ce35e80fdcd442031fb856",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "3ab4d090e51670c3ffab8c87fe969552490e2a3f59edf883975649bdbb9272c0"
+    },
+    {
+      "id": "block/decoded-retention/raw-header-escape",
+      "fault_class": "resource-lifetime",
+      "patch": "qa/planted/block/decoded-retention/raw-header-escape.patch",
+      "patch_sha256": "8b4581bf658f3f8b3b27881a2f50cf9c8d86a7a391aa2b977036c2f8e2cf2985",
+      "production_files": {
+        "crates/zakura-node-services/src/block_memory.rs": "b238cae4f1f1c79c7d408aeb837739bc2c801aa31188171bb40c9b702ec43632"
+      },
+      "rationale": "An accessor clones the inner Arc instead of its owner.",
+      "property": "block/decoded-retention",
+      "diagnostic_properties": [],
+      "harness": "block/decoded-retention",
+      "target": "block_decoded_retention",
+      "generator": 1,
+      "trigger": "An owned block produces a header handle that can outlive the block handle.",
+      "expected_intact": "The header keeps the block reservation alive.",
+      "expected_mutated": "The raw header clone loses the reservation owner.",
+      "baseline_trigger_step": 4,
+      "witness": "crates/zakura-sim/tests/fixtures/block-decoded-retention.bin",
+      "witness_sha256": "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846",
+      "witness_sidecar_sha256": "aa3f681a1df9812bdfea1a0bfe0abc7db7e512b90b2da695304740e69028fc1a",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-node-services/src/block_memory/model.rs"
+      ],
+      "baseline": {
+        "directory": "baseline/block-decoded-retention",
+        "trace_sha256": "1c6cf8aa6aa81aa02345cc9b4e7c64f5d2050b183bb9c7ccb4a34984e134d652",
+        "witness_result_sha256": "f23cfe6e8c8709043f111f14545a4a5a8f5414f7c3b45471ac46fdfb1c8cfc6f",
+        "applicable": 1,
+        "steps": 21
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Pool byte/block counts and closed state; independently measured allocation identity and handle counts; final drain.",
+      "independent_check": "The model tracks an independent handle graph. The driver reads production allocation ownership and pool counters, then compares them after each operation and final drain.",
+      "oracle_and_generator_files": {
+        "crates/zakura-node-services/src/block_memory/model.rs": "b687a3a61d3dec6645dd493e48873e9d0340a5aae494981547c78021d1b10b61",
+        "crates/zakura-sim/src/harness/block_work.rs": "faff284c250e2971819c0fda694d69067c3d83ea14ce35e80fdcd442031fb856",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "3ab4d090e51670c3ffab8c87fe969552490e2a3f59edf883975649bdbb9272c0"
+    },
+    {
+      "id": "discovery/record-book/keep-old-relay-attribution",
+      "fault_class": "ownership",
+      "patch": "qa/planted/discovery/record-book/keep-old-relay-attribution.patch",
+      "patch_sha256": "9e92b04ffcb610da734fb98bcc9ed785ad25894f0231b6b32bdc26c87941fa10",
+      "production_files": {
+        "crates/zakura-network/src/zakura/discovery/protocol.rs": "55d3ee8a5b00ec65efcfe4f5eb442cdd2673ba90d33d006c34bfe8007701c657"
+      },
+      "rationale": "An update credits the replacement owner but forgets the old owner.",
+      "property": "discovery/record-book",
+      "diagnostic_properties": [],
+      "harness": "discovery/record-book",
+      "target": "discovery_record_book",
+      "generator": 2,
+      "trigger": "A newer relayed record replaces the source relay for an existing node.",
+      "expected_intact": "The book removes old relay attribution and adds new attribution.",
+      "expected_mutated": "The old relay keeps a stale attribution charge.",
+      "baseline_trigger_step": 14,
+      "witness": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+      "witness_sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+      "witness_sidecar_sha256": "3c864c23939df8221c5062ea9e5e2f9d7c079cd86510902eb4800c5a84ad1976",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura"
+      ],
+      "baseline": {
+        "directory": "baseline/discovery-record-book",
+        "trace_sha256": "3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac",
+        "witness_result_sha256": "6db3effcb6b0fc35e0e98543c04fc1537e586cc0f17be99f1cb59a798e9d2cb9",
+        "applicable": 13,
+        "steps": 20
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Book entries, confirmation status, relay attribution counts, entry changes and time.",
+      "independent_check": "The independent book model selects entries and relay accounting from decoded operations, then compares actual book snapshots and outcomes.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/discovery/fuzz.rs": "bc9c3dac456ff19e84c0689a2cc655ace99af0513f99bd62e61e7ec94124d74c",
+        "crates/zakura-sim/src/harness/discovery_machine.rs": "b3c6776f346ddafa52fecf61439aeb3200b600f1072226bbe296e2868293ca0a",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "70c122411aa97d822e1821ace72ebed732054417f58951895532524ae7241d94"
+    },
+    {
+      "id": "discovery/record-book/wrong-eviction-victim",
+      "fault_class": "eviction-policy",
+      "patch": "qa/planted/discovery/record-book/wrong-eviction-victim.patch",
+      "patch_sha256": "95adfe32b70de60d2f39af6a2d3bc06a2627cf0c492f8fb51cc511747f4008a7",
+      "production_files": {
+        "crates/zakura-network/src/zakura/discovery/protocol.rs": "55d3ee8a5b00ec65efcfe4f5eb442cdd2673ba90d33d006c34bfe8007701c657"
+      },
+      "rationale": "An eviction priority predicate is inverted.",
+      "property": "discovery/record-book",
+      "diagnostic_properties": [],
+      "harness": "discovery/record-book",
+      "target": "discovery_record_book",
+      "generator": 2,
+      "trigger": "The full book contains both confirmed and unconfirmed records.",
+      "expected_intact": "The book prefers an unconfirmed record for eviction.",
+      "expected_mutated": "The book evicts a confirmed record first.",
+      "baseline_trigger_step": 20,
+      "witness": "crates/zakura-sim/tests/fixtures/discovery-record-book.bin",
+      "witness_sha256": "345f795757ac05ac11446171b92f540946f66e6f4327b399883abb583883bdf2",
+      "witness_sidecar_sha256": "3c864c23939df8221c5062ea9e5e2f9d7c079cd86510902eb4800c5a84ad1976",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura"
+      ],
+      "baseline": {
+        "directory": "baseline/discovery-record-book",
+        "trace_sha256": "3fe56993c127cf864392d067ea84f5204004717c9ae8376ef731f079312e05ac",
+        "witness_result_sha256": "6db3effcb6b0fc35e0e98543c04fc1537e586cc0f17be99f1cb59a798e9d2cb9",
+        "applicable": 13,
+        "steps": 20
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Book entries, confirmation status, relay attribution counts, entry changes and time.",
+      "independent_check": "The independent book model selects entries and relay accounting from decoded operations, then compares actual book snapshots and outcomes.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/discovery/fuzz.rs": "bc9c3dac456ff19e84c0689a2cc655ace99af0513f99bd62e61e7ec94124d74c",
+        "crates/zakura-sim/src/harness/discovery_machine.rs": "b3c6776f346ddafa52fecf61439aeb3200b600f1072226bbe296e2868293ca0a",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "41f13b1a55b5e01e25c7ae4d3772959e858671ebf7153481294514f1f22e1642"
+    },
+    {
+      "id": "header/reactor-policy/locator-call-settles-without-removal",
+      "fault_class": "resource-lifetime",
+      "patch": "qa/planted/header/reactor-policy/locator-call-settles-without-removal.patch",
+      "patch_sha256": "34d1a97cac84ad918c6bb7a1fdd918d280b71d7706691a7ef1575ca20d2199a7",
+      "production_files": {
+        "crates/zakura-network/src/zakura/header_sync/reactor/state.rs": "1c0d6c2d40e892bd4f1043d5eb0638fe348095ab9321e2907e8935709790f221"
+      },
+      "rationale": "Settlement updates the session but forgets the call owner.",
+      "property": "header/reactor-policy",
+      "diagnostic_properties": [],
+      "harness": "header/reactor-policy",
+      "target": "header_reactor_policy",
+      "generator": 1,
+      "trigger": "A locator call settles after its session was replaced.",
+      "expected_intact": "The reactor removes the settled call from its pending map.",
+      "expected_mutated": "The settled call remains pending.",
+      "baseline_trigger_step": 7,
+      "witness": "crates/zakura-sim/tests/fixtures/header-reactor-policy.bin",
+      "witness_sha256": "1bb8d5f2c6f679f5a1dab02b0cfcd6472b955f7b408a14bc9e703cb68f664511",
+      "witness_sidecar_sha256": "9bb64dbc578afbe02ad40bba7a8eec2ec3b5baa980bfa4dd45a37d53db525003",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura/header_sync/reactor"
+      ],
+      "baseline": {
+        "directory": "baseline/header-reactor-policy",
+        "trace_sha256": "03cfee761e1f08c5c395444363a0e5c9a496e58fe222e7d052dc260594c32f93",
+        "witness_result_sha256": "103c74a73707c06ac6d9dbf271305aca6d7344d7dd343f3ff06fbdfcae552340",
+        "applicable": 23,
+        "steps": 26
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Locator call IDs, session IDs, pending calls and reads, replacement state.",
+      "independent_check": "The model records locator scheduling and settlement independently, then compares production views at each operation.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/header_sync/reactor/machine_tests.rs": "972303b39ab443b6d0fc18f8703feca717428e315ef0966824b507badde9d460",
+        "crates/zakura-sim/src/harness/header_work.rs": "d16b20a381cb491456f005ce3069b5b4fa5965584f3794aaee6ff391386efb40",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "16706ea584dae0da59335b2cc43bee5121c0cee81035f9f940092d2005a735eb"
+    },
+    {
+      "id": "header/publisher-policy/lost-credit",
+      "fault_class": "boundary-accounting",
+      "patch": "qa/planted/header/publisher-policy/lost-credit.patch",
+      "patch_sha256": "79e4cba41b2e259063c326a034fdfe5bc1f0e1ebc9e42f935c3e078a4f18cef7",
+      "production_files": {
+        "crates/zakura-network/src/zakura/regulation/subscription/publisher.rs": "cd5eb9784440015979dc53553c31fb8506daa4e29f0d7c5e7b5411fb5eebe42d"
+      },
+      "rationale": "A send path updates history but omits credit consumption.",
+      "property": "header/publisher-policy",
+      "diagnostic_properties": [],
+      "harness": "header/publisher-policy",
+      "target": "header_publisher_policy",
+      "generator": 2,
+      "trigger": "A granted subscription publishes a page.",
+      "expected_intact": "The publisher consumes object and byte credit.",
+      "expected_mutated": "The publisher retains unspent credit after sending the page.",
+      "baseline_trigger_step": 3,
+      "witness": "crates/zakura-sim/tests/fixtures/header-publisher-policy.bin",
+      "witness_sha256": "d873835827624015735be3ddf3be8fef8a25af2e62ffe5532d1297aa7887525b",
+      "witness_sidecar_sha256": "e36fbb047cb164979589d3d9daa9f2eee6a8449d44538e18a57282e112e1856f",
+      "witness_provenance": "Existing retained regression fixture; unchanged. Excluded from discovery with all derived inputs.",
+      "producer_check_dependencies": [
+        "crates/zakura-network/src/zakura/header_sync/v9/publisher",
+        "crates/zakura-network/src/zakura/header_sync/v9/publisher.rs",
+        "crates/zakura-network/src/zakura/regulation/subscription"
+      ],
+      "baseline": {
+        "directory": "baseline/header-publisher-policy",
+        "trace_sha256": "84faa324d25e12321863d69737409cb414918cbc978f348b38bcb3d0c72ec246",
+        "witness_result_sha256": "2dca7c92732dc4da60cc17c43eda2511b9e315d30f93d07f02cf9d72b6239e48",
+        "applicable": 8,
+        "steps": 8
+      },
+      "known_bug_disposition": "No failing baseline observed for this selected input. This synthetic retained mutation is not a claim of an unresolved production bug.",
+      "mutation_compilation": "not-run in mut-2",
+      "sensitivity": "not-run in mut-2",
+      "discovery": "not-run",
+      "required_observations": "Subscription granted/consumed credit, published history and active job.",
+      "independent_check": "The model maintains separate subscription credit and page history, then compares the production publisher view after each operation.",
+      "oracle_and_generator_files": {
+        "crates/zakura-network/src/zakura/header_sync/v9/publisher/model.rs": "2e53c33b63932bae5d495c7e50deb7b8ec631f5377ff6dae7effca0ed46cc6c6",
+        "crates/zakura-sim/src/harness/header_work.rs": "d16b20a381cb491456f005ce3069b5b4fa5965584f3794aaee6ff391386efb40",
+        "crates/zakura-sim/src/harness/machine.rs": "3dd29c5ce1759c3335e1679de6ab82943af03da45197d2512f3acd6642aa74c4",
+        "crates/zakura-sim/src/record/machine.rs": "019d38908a5e30817356165571aa49db1c0167b9ccbd6b41ff593a0a3647434c"
+      },
+      "patch_sidecar_sha256": "996997c50d0103e9ccd38ac08e43545070c80c8d4bb85c0224b843bbd3afea53"
+    }
+  ],
+  "fuzz_build_inputs": {
+    "source_revision": "b2e0456474e47e6264c912b2f6b50d09c8603115",
+    "source_sha256": "45997f6f3b7112223d0fd7f189e8a5995193d3d8e868f33d2fc99cfd3439c0be",
+    "manifest_sha256": "febf8034da1717faf92c633e03e26920e2f7abb69ab8e877275cdab9b47fb1ce",
+    "lockfile_sha256": "c12fdc71839a7f02767475d5fbacde8433731fb951c786524dc43769aacca4dc",
+    "toolchain": "nightly-2026-07-15",
+    "rustc": "rustc 1.99.0-nightly (da80ed070 2026-07-14)",
+    "cargo_fuzz": "cargo-fuzz 0.13.2",
+    "libfuzzer_sys": "0.4.13",
+    "rustflags": "--cfg zakura_sim",
+    "cargo_args": [
+      "--sanitizer",
+      "none",
+      "--no-default-features"
+    ]
+  },
+  "calibration": {
+    "runs": [
+      {
+        "directory": "calibration/block_decoded_retention",
+        "target": "block_decoded_retention",
+        "harness": "block/decoded-retention",
+        "run_sha256": "7db04d1b2bbff886f4638f26f3921804d54c9a8077cb4e50caeaf39af16ef1a6",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "eecdc01067acfe19142f245cc612408984121afb3db64dcb530c7b91ed970703",
+        "log_sha256": "a906cbe8baef1689515af2f20fffa7d0cc4fcbb2e27f672d4a38c8619a4ce82c",
+        "applicability": "observed"
+      },
+      {
+        "directory": "calibration/block_reactor_policy",
+        "target": "block_reactor_policy",
+        "harness": "block/reactor-policy",
+        "run_sha256": "083604ee05448c090628adc1bb4d198d7be6e45ab9c35f163961a66006dfb4db",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "9c4ce4cc65e00430c8b3029d41f8d2d42a3127c702a0ea8ce18c224ece5d8235",
+        "log_sha256": "067871490af6f96be837a78d221a9eac33a440f7e5c3ea3a7e8cc91e189e1b93",
+        "applicability": "observed"
+      },
+      {
+        "directory": "calibration/discovery_record_book",
+        "target": "discovery_record_book",
+        "harness": "discovery/record-book",
+        "run_sha256": "7608ce9a0e0fc3579473c9c7e8514998843cfb6cb1f2b8a99fdf26ed631b05c9",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "1312fedac58a47b9a6e84a0192148bdbe0a766ba1dad4475adfd026a1c97c380",
+        "log_sha256": "084815fc9c702b771801ecfd676092833379a0631ad642b10504f0fee2909c01",
+        "applicability": "not-observed"
+      },
+      {
+        "directory": "calibration/discovery_record_book-30s",
+        "target": "discovery_record_book",
+        "harness": "discovery/record-book",
+        "run_sha256": "061a5cd0b6d0189653a982e8a0818b0ef62143fc4657c270e56760c273f15da3",
+        "stats_file": "stats/stats-4121690.json",
+        "stats_sha256": "9962a9049d254825be96bf4ca1cde424ca78d623581f7a3ba0eb0474a7a4caf6",
+        "log_sha256": "ae27ed37ad18c31c7e4f7d99d5ea0569b3875f90b0371075c7b159ea2aa25921",
+        "applicability": "not-observed"
+      },
+      {
+        "directory": "calibration/header_publisher_policy",
+        "target": "header_publisher_policy",
+        "harness": "header/publisher-policy",
+        "run_sha256": "1c44ba9a811bc030ef63c9d74b4e792bb1ad99f2659f84365ad2d7b0205218e2",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "77a5ee1a7ce8dfc54032e0118f053d80a7258f563eb78550eb9a6a5ffbb044b5",
+        "log_sha256": "7516aca81632ed177ecef4e0969f7aeca623a458fcc06809187d3e6db49e6bc8",
+        "applicability": "observed"
+      },
+      {
+        "directory": "calibration/header_reactor_policy",
+        "target": "header_reactor_policy",
+        "harness": "header/reactor-policy",
+        "run_sha256": "cc58dc5ecd649dc9a867cd2d39086fc96b1fc85a8af3e09854203bbe3c33dcf5",
+        "stats_file": "stats/stats-3.json",
+        "stats_sha256": "3928ed89239a45da0124670d25d54a3d6414f1ea7d1bfa01f327b4f4b7bbcbec",
+        "log_sha256": "22f6b170032098eaec1fe517e6b6cdeafb36374d07c92027b8ac0e9248f388fc",
+        "applicability": "observed"
+      }
+    ],
+    "decision": "Freeze 512-byte inputs at the existing decoder limit, 10s input timeout and 2048MiB RSS. Retain the planned 600s allocation per seed. Calibration completed without resource failures; it does not prove discovery reachability or bound its probability.",
+    "open_gap": "discovery/record-book requires installed, replaced, evicted and sampled in one input for Holds. Neither calibration attempt reached that full gate. Keep both selected cases in the discovery denominator; report not-applicable if the scored run also never applies.",
+    "restrictions": "Calibration used only original builds and seed 11. Its generated corpora are excluded from every scored initial corpus. Build work ran concurrently; throughput is host-specific."
+  },
+  "evidence": {
+    "bundle": "2043-mut-2-2026-11-05.tar.zst",
+    "baseline_results_sha256": "58c61ef09d2c9c17fcf70bd763900fd7e48b7e59cba36436abdb1383b04bcfa5"
+  }
+}

@@ -1,0 +1,158 @@
+[
+  {
+    "patch": "block-sync/handoff-floor-availability/missing-availability.patch",
+    "package": "zakura-sim",
+    "test_target": "block_resource_properties",
+    "test": "an_unmeasured_routine_asks_for_the_floor_while_the_others_are_paused",
+    "source": "crates/zakura-sim/tests/block_resource_properties.rs",
+    "rustflags": "--cfg zakura_sim",
+    "required_failure": "asks_for_the_withheld_floor_before_the_reset returns false"
+  },
+  {
+    "patch": "block/decoded-retention/unfunded-state-read.patch",
+    "package": "zakura-state",
+    "test": "service::tests::retired_state_snapshots_and_read_results_keep_decoded_ownership",
+    "source": "crates/zakura-state/src/service/tests.rs",
+    "required_failure": "the retained payload has a settlement owner"
+  },
+  {
+    "patch": "state/disk-results/late-decode-admission.patch",
+    "package": "zakura-node-services",
+    "test": "block_memory::tests::decode_admission_precedes_materialization_and_survives_final_holders",
+    "source": "crates/zakura-node-services/src/block_memory.rs",
+    "required_failure": "The decoder starts with zero reserved blocks instead of one."
+  },
+  {
+    "patch": "state/disk-results/late-tip-admission.patch",
+    "package": "zakura-state",
+    "test": "service::tests::retained_tip_capacity_refuses_invalidation_before_changing_the_writer",
+    "source": "crates/zakura-state/src/service/tests.rs",
+    "required_failure": "A refused invalidation changed the writer's selected tip."
+  },
+  {
+    "patch": "state/disk-results/max-size-reservation.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_reads_reserve_their_recorded_bound_before_decoding",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A read with room for its recorded bound is refused."
+  },
+  {
+    "patch": "state/disk-results/measured-block-reservation.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_reads_reserve_their_recorded_bound_before_decoding",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A read succeeds without room for its recorded bound."
+  },
+  {
+    "patch": "state/disk-results/private-result-pool.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_block_results_keep_shared_admission_through_final_payload_holders",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A returned disk block leaves the shared retained budget unused."
+  },
+  {
+    "patch": "state/read-workers/control-read-starvation.patch",
+    "package": "zakura-state",
+    "test": "service::tests::read_workers_are_shared_with_owned_ranges_after_caller_drop",
+    "source": "crates/zakura-state/src/service/tests.rs",
+    "required_failure": "The chain-tip read cannot progress while the data worker remains occupied."
+  },
+  {
+    "patch": "state/read-workers/early-worker-release.patch",
+    "package": "zakura-state",
+    "test": "request::tests::blocking_read_slot_survives_caller_drop_and_worker_panic",
+    "source": "crates/zakura-state/src/request.rs",
+    "required_failure": "The independently observed live worker no longer owns a slot."
+  },
+  {
+    "patch": "state/read-workers/private-range-pool.patch",
+    "package": "zakura-state",
+    "test": "service::tests::read_workers_are_shared_with_owned_ranges_after_caller_drop",
+    "source": "crates/zakura-state/src/service/tests.rs",
+    "required_failure": "The owned range read finishes while the shared worker remains occupied."
+  },
+  {
+    "patch": "state/read-workers/private-read-pool.patch",
+    "package": "zakura-state",
+    "test": "service::tests::read_workers_are_shared_with_owned_ranges_after_caller_drop",
+    "source": "crates/zakura-state/src/service/tests.rs",
+    "required_failure": "The ordinary read finishes while the shared worker remains occupied."
+  },
+  {
+    "patch": "state/read-workers/shared-blocking-pool.patch",
+    "package": "zakura",
+    "test": "components::tokio::tests::saturated_reads_leave_blocking_threads_for_other_work",
+    "source": "crates/zakurad/src/components/tokio.rs",
+    "required_failure": "An unrelated blocking job times out while reads fill every slot."
+  },
+  {
+    "patch": "state/transaction-results/early-transaction-release.patch",
+    "package": "zakura-node-services",
+    "test": "block_memory::tests::standalone_transaction_reservation_precedes_decode_and_outlives_clones",
+    "source": "crates/zakura-node-services/src/block_memory.rs",
+    "required_failure": "a live standalone allocation retains its charge"
+  },
+  {
+    "patch": "state/transaction-results/hidden-find-refusal.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_header_and_raw_block_results_keep_shared_admission",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "An empty Find response hides a capacity refusal."
+  },
+  {
+    "patch": "state/transaction-results/late-transaction-admission.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_reads_reserve_their_recorded_bound_before_decoding",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A transaction read succeeds without room for its stored bound."
+  },
+  {
+    "patch": "state/transaction-results/private-header-pool.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_header_and_raw_block_results_keep_shared_admission",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A returned disk header leaves the shared budget unused."
+  },
+  {
+    "patch": "state/transaction-results/private-iterator-pool.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_transactions_keep_shared_admission_through_clones_and_database_drop",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "The iterator succeeds while a retained service result fills the shared budget."
+  },
+  {
+    "patch": "state/transaction-results/private-lookup-pool.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_transactions_keep_shared_admission_through_clones_and_database_drop",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A returned disk allocation leaves the shared budget unused."
+  },
+  {
+    "patch": "state/transaction-results/private-raw-block-pool.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_header_and_raw_block_results_keep_shared_admission",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A returned serialized block leaves the shared budget unused."
+  },
+  {
+    "patch": "state/transaction-results/retained-replay-input.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_transactions_keep_shared_admission_through_clones_and_database_drop",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "Historical replay holds one block's transaction while it reads the next."
+  },
+  {
+    "patch": "state/transaction-results/unfunded-header-result.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_header_and_raw_block_results_keep_shared_admission",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A returned header copy carries no standalone charge."
+  },
+  {
+    "patch": "state/transaction-results/unfunded-transaction-result.patch",
+    "package": "zakura-state",
+    "test": "service::finalized_state::zakura_db::block::tests::vectors::disk_transactions_keep_shared_admission_through_clones_and_database_drop",
+    "source": "crates/zakura-state/src/service/finalized_state/zakura_db/block/tests/vectors.rs",
+    "required_failure": "A returned copy carries no standalone charge."
+  }
+]

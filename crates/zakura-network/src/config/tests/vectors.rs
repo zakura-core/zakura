@@ -274,6 +274,31 @@ fn zakura_node_secret_key_is_redacted_from_debug_and_serialization() {
 }
 
 #[test]
+fn test_configs_keep_identity_files_out_of_the_real_identity_dir() {
+    let _init_guard = zakura_test::init();
+
+    let config = Config::for_test(P2pStack::Dual);
+    let other = Config::for_test(P2pStack::Dual);
+    let node_id = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]).public();
+
+    for path in [
+        config.identity_dir.clone(),
+        crate::config::zakura_secret_key_file_path(&config.identity_dir, &config.network),
+        config.zakura_discovery_sequence_file(&node_id),
+    ] {
+        assert!(
+            !path.starts_with(crate::config::default_network_identity_dir()),
+            "test identity files must not land in the real identity dir: {path:?}",
+        );
+        assert!(path.starts_with(std::env::temp_dir()), "{path:?}");
+    }
+    assert_ne!(
+        config.identity_dir, other.identity_dir,
+        "parallel test nodes must not share identity files",
+    );
+}
+
+#[test]
 fn identity_dir_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 
@@ -1695,8 +1720,8 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 
     let config: Config = toml::from_str("").expect("empty config parses");
-    assert_eq!(config.advert_window_min, 32);
-    assert_eq!(config.advert_window_max, 64);
+    assert_eq!(config.advert_window_min, 1000);
+    assert_eq!(config.advert_window_max, 1000);
     assert_eq!(config.advert_window_small_size_bytes, 102_400);
     assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
 
@@ -1717,12 +1742,54 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     assert_eq!(roundtrip, config);
 
     // Equal bounds are a fixed window.
-    let config: Config = toml::from_str("advert_window_min = 64").expect("equal bounds parse");
+    let config: Config = toml::from_str("advert_window_min = 50\nadvert_window_max = 50")
+        .expect("equal bounds parse");
     assert_eq!(config.advert_window_min, config.advert_window_max);
 
     let config: Config = toml::from_str("advert_window_small_size_bytes = 0")
         .expect("a zero small-size boundary parses");
     assert_eq!(config.advert_window_small_size_bytes, 0);
+}
+
+/// Advert windows left at the previous defaults by a generated config load as the current
+/// defaults. Other values are kept, and a bound that is left out or at its previous default
+/// stays within the configured one.
+#[test]
+fn legacy_default_advert_windows_load_as_current_defaults() {
+    let _init_guard = zakura_test::init();
+
+    let windows = |toml: &str| {
+        let config: Config = toml::from_str(toml).expect("advert windows parse");
+        (config.advert_window_min, config.advert_window_max)
+    };
+    for (toml, expected) in [
+        // A config generated before the defaults changed.
+        (
+            "advert_window_min = 32\nadvert_window_max = 64",
+            (1000, 1000),
+        ),
+        ("advert_window_min = 32", (1000, 1000)),
+        ("advert_window_max = 64", (1000, 1000)),
+        // Other values are the operator's.
+        ("advert_window_min = 33\nadvert_window_max = 65", (33, 65)),
+        ("advert_window_min = 16\nadvert_window_max = 64", (16, 1000)),
+        (
+            "advert_window_min = 2000\nadvert_window_max = 64",
+            (2000, 2000),
+        ),
+        // A legacy minimum does not exceed a configured maximum.
+        (
+            "advert_window_min = 32\nadvert_window_max = 200",
+            (200, 200),
+        ),
+        // Neither does a minimum that is left out, so a config that loaded before still loads.
+        ("advert_window_max = 128", (128, 128)),
+        ("advert_window_max = 999", (999, 999)),
+        ("advert_window_min = 1", (1, 1000)),
+        ("advert_window_min = 1001", (1001, 1001)),
+    ] {
+        assert_eq!(windows(toml), expected, "{toml:?}");
+    }
 }
 
 #[test]
@@ -1735,9 +1802,6 @@ fn invalid_advert_fanout_config_is_rejected() {
             "advert_window_min = 10\nadvert_window_max = 9",
             "advert_window_min",
         ),
-        // The default maximum of 64 is below this minimum, and the reverse.
-        ("advert_window_min = 65", "advert_window_min"),
-        ("advert_window_max = 31", "advert_window_max"),
         (
             "advert_window_full_size_bytes = 0",
             "advert_window_full_size_bytes",

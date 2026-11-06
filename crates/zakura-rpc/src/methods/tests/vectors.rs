@@ -4701,26 +4701,22 @@ async fn rpc_client_proposal_can_submit_solution() {
             .await
             .expect("state admission promptly sends an early inventory event")
             .expect("state admission sends an early inventory event");
-    let pending = match early_event {
-        EarlyMinedBlock {
-            hash,
-            size,
-            pending,
-            submission,
-            ..
-        } => {
-            assert_eq!(hash, candidate_hash);
-            assert_eq!(
-                Some(size),
-                pending_blocks
-                    .get(candidate_hash)
-                    .map(|block| block.zcash_serialized_size()),
-                "the event carries the submitted block's size"
-            );
-            assert_eq!(submission, MinedBlockSubmission::CompactHeader);
-            pending
-        }
-    };
+    let EarlyMinedBlock {
+        hash,
+        size,
+        pending,
+        submission: submission_method,
+        ..
+    } = early_event;
+    assert_eq!(hash, candidate_hash);
+    assert_eq!(
+        Some(size),
+        pending_blocks
+            .get(candidate_hash)
+            .map(|block| block.zcash_serialized_size()),
+        "the event carries the submitted block's size"
+    );
+    assert_eq!(submission_method, MinedBlockSubmission::CompactHeader);
     assert_eq!(
         pending_blocks.get(candidate_hash).map(|block| block.hash()),
         Some(candidate_hash),

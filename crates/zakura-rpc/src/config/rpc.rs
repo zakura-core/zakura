@@ -28,8 +28,8 @@ pub struct Config {
     /// On Mainnet and Testnet, disabling [`Self::enable_cookie_auth`] restricts
     /// this listener to the explicitly classified unauthenticated compatibility
     /// methods. Clients can still query chain state, submit transactions, and
-    /// use the mining RPCs, but they cannot call administrative methods such as
-    /// `invalidateblock` or `reconsiderblock`.
+    /// use the mining RPCs. Administrative methods such as `invalidateblock` or
+    /// `reconsiderblock` also require [`Self::allow_unauthenticated_admin`].
     /// Set [`Self::enable_cookie_auth`] when every method should require
     /// credentials.
     ///
@@ -125,10 +125,26 @@ pub struct Config {
     /// Enable cookie-based authentication for the primary RPC listener.
     ///
     /// Authenticated listeners expose the full RPC method set. On Mainnet and
-    /// Testnet, unauthenticated listeners expose only the restricted
-    /// compatibility method set. Regtest keeps the full method set so its local
-    /// test-control RPCs remain available.
+    /// Testnet, unauthenticated listeners expose the compatibility method set,
+    /// plus administrative methods if [`Self::allow_unauthenticated_admin`] is
+    /// enabled. Regtest keeps the full method set so its local test-control
+    /// RPCs remain available.
     pub enable_cookie_auth: bool,
+
+    /// Allow administrative methods on the unauthenticated primary listener.
+    ///
+    /// Defaults to `false`. Takes effect when [`Self::enable_cookie_auth`] is
+    /// `false`, allowing `invalidateblock`, `reconsiderblock`, and `preciousblock`
+    /// alongside the compatibility methods. Test-control methods remain
+    /// unavailable on Mainnet and Testnet. The separate
+    /// [`Self::admin_listen_addr`] always requires cookie authentication.
+    ///
+    /// # Security
+    ///
+    /// Enabling this assumes the administrator has correctly configured
+    /// firewall rules to restrict RPC access to trusted clients. Any client
+    /// that can reach this listener can change the node's chain selection.
+    pub allow_unauthenticated_admin: bool,
 
     /// The maximum size of the response body in bytes.
     pub max_response_body_size: usize,
@@ -187,6 +203,7 @@ impl Default for Config {
 
             // Enable cookie-based authentication by default.
             enable_cookie_auth: true,
+            allow_unauthenticated_admin: false,
 
             // 50 MiB
             max_response_body_size: 52_428_800,
@@ -241,6 +258,25 @@ mod tests {
     use std::path::PathBuf;
 
     use super::Config;
+
+    #[test]
+    fn unauthenticated_admin_requires_explicit_opt_in() {
+        let default: Config = toml::from_str("").expect("empty RPC config uses defaults");
+        assert!(!default.allow_unauthenticated_admin);
+
+        let config: Config = toml::from_str(
+            r#"
+            listen_addr = "0.0.0.0:8232"
+            enable_cookie_auth = false
+            allow_unauthenticated_admin = true
+            "#,
+        )
+        .expect("unauthenticated admin config should deserialize");
+        assert!(config.allow_unauthenticated_admin);
+        config
+            .validate()
+            .expect("firewall-protected listeners can opt in to admin access");
+    }
 
     #[test]
     fn deserialize_defaults_cookie_file_name_when_missing() {

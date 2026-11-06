@@ -94,28 +94,35 @@ fn unclassified_methods_fail_closed() {
 }
 
 #[test]
-fn unauthenticated_production_networks_use_the_restricted_surface() {
-    assert_eq!(
-        primary_rpc_surface(&Network::Mainnet, false),
-        RpcSurface::Restricted
-    );
-    assert_eq!(
-        primary_rpc_surface(&Network::new_default_testnet(), false),
-        RpcSurface::Restricted
-    );
-
-    assert_eq!(
-        primary_rpc_surface(&Network::Mainnet, true),
-        RpcSurface::Full
-    );
-    assert_eq!(
-        primary_rpc_surface(&Network::new_regtest(Default::default()), false),
-        RpcSurface::Full
-    );
+fn primary_surface_respects_authentication_network_and_admin_opt_in() {
+    for network in [Network::Mainnet, Network::new_default_testnet()] {
+        for (auth, admin, expected) in [
+            (false, false, RpcSurface::Restricted),
+            (false, true, RpcSurface::WithAdmin),
+            (true, false, RpcSurface::Full),
+            (true, true, RpcSurface::Full),
+        ] {
+            assert_eq!(primary_rpc_surface(&network, auth, admin), expected);
+        }
+    }
+    let regtest = Network::new_regtest(Default::default());
+    for (auth, admin) in [(false, false), (false, true), (true, false), (true, true)] {
+        assert_eq!(primary_rpc_surface(&regtest, auth, admin), RpcSurface::Full,);
+    }
 }
 
 #[tokio::test]
 async fn segmented_listeners_enforce_methods_and_cookie_auth() {
+    assert_segmented_listener_access(false).await;
+}
+
+#[tokio::test]
+async fn unauthenticated_admin_opt_in_preserves_admin_listener_authentication() {
+    assert_segmented_listener_access(true).await;
+}
+
+/// Checks discovery, method dispatch, batches, and admin listener authentication.
+async fn assert_segmented_listener_access(allow_unauthenticated_admin: bool) {
     let _init_guard = zakura_test::init();
 
     let restricted_port = zakura_test::net::random_known_port();
@@ -135,6 +142,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         cookie_dir: cookie_dir.path().to_path_buf(),
         cookie_file_name: "admin.cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin,
         ..Config::default()
     };
 
@@ -164,6 +172,10 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
     let restricted_task = RpcServer::start(rpc_impl.clone(), conf.clone())
         .await
         .expect("restricted RPC listener should start");
+    assert!(
+        !cookie_dir.path().join("admin.cookie").exists(),
+        "the unauthenticated primary listener must not create a cookie"
+    );
     let admin_task = RpcServer::start_admin(rpc_impl, conf)
         .await
         .expect("admin RPC listener should start");
@@ -198,21 +210,40 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
             "existing unauthenticated integrations require {method}"
         );
     }
-    assert!(!restricted_methods.contains("invalidateblock"));
-    assert!(!restricted_methods.contains("reconsiderblock"));
-    assert!(!restricted_methods.contains("preciousblock"));
-
-    let blocked_call = post(
-        restricted_addr,
-        r#"{"jsonrpc":"2.0","method":"invalidateblock","params":["00"],"id":2}"#,
-        None,
-    )
-    .await
-    .expect("blocked restricted request should complete")
-    .1;
-    let blocked_call: serde_json::Value =
-        serde_json::from_str(&blocked_call).expect("blocked restricted response should be JSON");
-    assert_eq!(blocked_call["error"]["code"], -32601);
+    let expected_admin_error = if allow_unauthenticated_admin {
+        // A malformed hash reaches the handler and returns InvalidParameter.
+        -8
+    } else {
+        // Admin methods are absent by default (MethodNotFound).
+        -32601
+    };
+    for method in ["invalidateblock", "reconsiderblock", "preciousblock"] {
+        assert_eq!(
+            restricted_methods.contains(method),
+            allow_unauthenticated_admin,
+        );
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "method": method, "params": ["00"], "id": 2,
+        })
+        .to_string();
+        let (status, response) = post(restricted_addr, &body, None)
+            .await
+            .expect("unauthenticated admin request should complete");
+        assert!(status.is_success());
+        let response: serde_json::Value =
+            serde_json::from_str(&response).expect("admin response should be JSON");
+        assert_eq!(response["error"]["code"], expected_admin_error);
+    }
+    for method in ["stop", "generate", "addnode"] {
+        assert!(!restricted_methods.contains(method));
+        let body = serde_json::json!({"jsonrpc": "2.0", "method": method, "id": 10}).to_string();
+        let (_, response) = post(restricted_addr, &body, None)
+            .await
+            .expect("unavailable test-control request should complete");
+        let response: serde_json::Value =
+            serde_json::from_str(&response).expect("test-control response should be JSON");
+        assert_eq!(response["error"]["code"], -32601);
+    }
 
     let batch_call = post(restricted_addr, r#"[{"jsonrpc":"2.0","method":"getblockcount","id":6},{"jsonrpc":"2.0","method":"reconsiderblock","params":["00"],"id":7}]"#, None)
         .await
@@ -226,7 +257,7 @@ async fn segmented_listeners_enforce_methods_and_cookie_auth() {
         .iter()
         .find(|response| response["id"] == 7)
         .expect("batch response should contain the blocked request");
-    assert_eq!(blocked_batch_item["error"]["code"], -32601);
+    assert_eq!(blocked_batch_item["error"]["code"], expected_admin_error);
 
     // Every call in a batch must pass through the per-call middleware, which
     // rewrites the JSON-RPC invalid-params code to the `zcashd` legacy code.

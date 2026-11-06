@@ -137,6 +137,9 @@ send_window_bytes = 33554432
 stream_receive_window_bytes = 16777216
 
 [rpc]
+# Takes effect when enable_cookie_auth = false. The administrator is expected
+# to have correctly configured firewall rules restricting access to trusted clients.
+allow_unauthenticated_admin = false
 cookie_dir = "@RPC_COOKIE_DIR@"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false

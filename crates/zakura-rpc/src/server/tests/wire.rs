@@ -623,6 +623,7 @@ async fn response_size_limits_and_cookie_authentication() {
     let cookie_dir = tempfile::tempdir().expect("temporary cookie directory should be created");
     let conf = Config {
         enable_cookie_auth: true,
+        allow_unauthenticated_admin: true,
         cookie_dir: cookie_dir.path().to_path_buf(),
         max_response_body_size: 300,
         ..local_config()

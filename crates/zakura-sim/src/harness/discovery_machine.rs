@@ -8,8 +8,11 @@ use zakura_network::zakura::{BookFact, InstallFact};
 use super::{machine::Machine, HarnessEntry};
 use crate::{record::machine::MachineStep, witness::Expect};
 
-/// One operation per four of the 512 causal bytes.
-const BUDGET: u64 = 128;
+/// One record-book operation per two of the 512 causal bytes.
+const BOOK_BUDGET: u64 = 256;
+
+/// One session-installation operation per four of the 512 causal bytes.
+const STATE_BUDGET: u64 = 128;
 
 /// The model's facts show that the input reached each resource-bearing rule,
 /// including when a mutation stops the real owner from applying it.
@@ -71,8 +74,8 @@ const BOOK: Machine = Machine {
     name: "discovery/record-book",
     identity: "discovery-book",
     claim: "After each operation, the book's entries, relay attribution and exact install, replacement and eviction facts agree with the independent model, and each signed sample stays inside its requester's disclosure window.",
-    generator: 2,
-    budget: BUDGET,
+    generator: 3,
+    budget: BOOK_BUDGET,
     history: |input| {
         zakura_network::zakura::trace_discovery_book_bytes(input)
             .into_iter()
@@ -95,7 +98,7 @@ const STATE: Machine = Machine {
     identity: "discovery-state",
     claim: "After each operation, admitted sessions, retained service hints and each verification result's installation agree with the independent model.",
     generator: 2,
-    budget: BUDGET,
+    budget: STATE_BUDGET,
     history: |input| {
         zakura_network::zakura::trace_discovery_state_bytes(input)
             .into_iter()

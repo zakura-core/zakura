@@ -1,6 +1,7 @@
 //! Scenarios, generated histories, and mutants for discovery's machine drivers.
 
 use proptest::prelude::*;
+use rand_10::Rng;
 
 use super::super::protocol::{RecordVerdict, MAX_SERVICE_SUMMARIES_PER_RESPONSE};
 use super::*;
@@ -119,8 +120,10 @@ proptest! {
  #![proptest_config(ProptestConfig::with_cases(48))]
  #[test]
  fn book_matches_independent_model(seed in any::<u64>(), ops in prop::collection::vec(book_op(), 1..64)) { run_book(ops, seed, |_, _| {}); }
+ // 64 operations at most. Each import signs and verifies a record, and 16
+ // operations already reach every rule (`random_short_inputs_reach_every_book_rule`).
  #[test]
- fn book_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=512)) { run_book(decode_book_v2(&bytes), 0, |_, _| {}); }
+ fn book_bytes_match_the_same_model(bytes in prop::collection::vec(any::<u8>(), 0..=128)) { run_book(decode_book_v3(&bytes), 0, |_, _| {}); }
 }
 
 fn state_op() -> impl Strategy<Value = StateOp> {
@@ -439,7 +442,8 @@ fn successive_responses_cannot_grow_one_peers_live_summaries() {
 
 #[test]
 fn book_trace_reports_exact_install_replacement_and_eviction() {
-    let steps = trace_discovery_book_bytes(BOOK_TRACE_WITNESS);
+    let witness = book_trace_witness();
+    let steps = trace_discovery_book_bytes(&witness);
     assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
     for step in &steps {
         assert_eq!(step.actual, step.expected);
@@ -465,14 +469,114 @@ fn book_trace_reports_exact_install_replacement_and_eviction() {
     let results = || steps.iter().filter_map(|step| step.actual.result);
     assert!(results().any(|result| result == ImportFact::RelayFull));
     assert!(results().any(|result| result == ImportFact::Expired));
+    assert!(results().any(|result| result == ImportFact::IgnoredOlder));
     let entries = || steps.iter().flat_map(|step| &step.actual.entries);
     assert!(entries().any(|entry| entry.last_success.is_some()));
     assert!(entries().any(|entry| entry.failures > 0));
     assert!(steps
         .windows(2)
         .any(|pair| pair[1].actual.now > pair[0].actual.now));
-    assert_eq!(steps, trace_discovery_book_bytes(BOOK_TRACE_WITNESS));
+    assert_eq!(steps, trace_discovery_book_bytes(&witness));
     assert!(trace_discovery_book_bytes(&[]).is_empty());
+}
+
+/// Whether `steps` reach every rule `discovery/record-book` needs before it
+/// applies: an install, a replacement, an eviction and a nonempty sample.
+fn reaches_every_book_rule(steps: &[BookStep]) -> bool {
+    let changes = || steps.iter().flat_map(|step| &step.expected.changes);
+    changes().any(|change| matches!(change, BookFact::Installed { .. }))
+        && changes().any(|change| matches!(change, BookFact::Replaced { .. }))
+        && changes().any(|change| matches!(change, BookFact::Evicted { .. }))
+        && steps.iter().any(|step| !step.sample.is_empty())
+}
+
+/// Random 32-byte inputs, 16 operations each, reach every rule the record-book
+/// property needs. Under decoder v2 almost none did.
+#[test]
+fn random_short_inputs_reach_every_book_rule() {
+    const INPUTS: usize = 32;
+    let mut rng = StdRng::seed_from_u64(11);
+    let reached = (0..INPUTS)
+        .filter(|_| {
+            let mut input = [0; 32];
+            rng.fill_bytes(&mut input);
+            reaches_every_book_rule(&trace_discovery_book_bytes(&input))
+        })
+        .count();
+    assert!(
+        reached * 4 >= INPUTS,
+        "{reached} of {INPUTS} inputs reached every rule"
+    );
+}
+
+/// Each two bytes decoder v3 reads decode to one operation, and the encoder
+/// inverts the decoder.
+#[test]
+fn book_operations_round_trip_through_two_bytes() {
+    for a in 0..=u8::MAX {
+        for b in [0, 17, 127, 128, 191, 192, 255] {
+            let op = decode_book_v3(&[a, b]).next().expect("two bytes decode");
+            assert_eq!(decode_book_v3(&encode_book_v3(&op)).next(), Some(op));
+        }
+    }
+    assert_eq!(decode_book_v3(&[0, 0, 1]).count(), 2);
+}
+
+/// The committed witness holds and reaches each planted bypass's trigger.
+#[test]
+fn committed_book_witness_reaches_each_planted_trigger() {
+    let steps = trace_discovery_book_bytes(&discovery_book_witness_bytes());
+    assert!(steps.iter().all(|step| step.failure.is_none()), "{steps:?}");
+    assert!(reaches_every_book_rule(&steps));
+    let step = |number: usize| &steps[number - 1];
+    let evicted = |number: usize, cause: EvictionFact| {
+        step(number).expected.changes.iter().any(
+            |change| matches!(change, BookFact::Evicted { cause: actual, .. } if *actual == cause),
+        )
+    };
+    // The record limit evicts, so skipping that eviction differs from the model.
+    assert!(evicted(6, EvictionFact::BookLimit));
+    // Four confirmed records stand under a window of three.
+    assert_eq!(step(7).sample.len(), SAMPLE_WINDOW);
+    assert_eq!(
+        step(7)
+            .expected
+            .entries
+            .iter()
+            .filter(|entry| entry.confirmed)
+            .count(),
+        BOOK_MAX_RECORDS
+    );
+    assert!(evicted(13, EvictionFact::RelayQuota));
+    // A later sequence moves author 5's record from relay 0 to relay 1.
+    let author_5 = hex::encode(author(5).public().as_bytes());
+    let relay_1 = hex::encode(relay(1).as_bytes());
+    assert!(step(14).expected.changes.iter().any(|change| matches!(
+        change,
+        BookFact::Replaced { node, source: Some(source), .. }
+            if *node == author_5 && *source == relay_1
+    )));
+    assert_eq!(step(14).expected.relayed, vec![(relay_1, 1)]);
+    // The last import overfills a book of live records, and the record no
+    // peer confirmed is the one that leaves.
+    let last = steps.last().expect("the witness has steps");
+    assert!(last.expected.changes.iter().any(|change| matches!(
+        change,
+        BookFact::Evicted { node, cause: EvictionFact::BookLimit, .. } if *node == author_5
+    )));
+    let before = &steps[steps.len() - 2].expected;
+    assert!(before
+        .entries
+        .iter()
+        .all(|entry| entry.expires >= before.now));
+    assert_eq!(
+        before
+            .entries
+            .iter()
+            .filter(|entry| !entry.confirmed)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -503,25 +607,58 @@ fn session_trace_separates_stale_results_and_retained_hints() {
 }
 
 /// Fills the book, replaces a record, evicts on quota and on the record limit, samples,
-/// moves a record to another relay, rejects on relay quota and expiry, and updates
+/// moves a record to another relay, rejects on relay quota, age and expiry, and updates
 /// dial metadata.
-const BOOK_TRACE_WITNESS: &[u8] = &[
-    // Authors 0..=3 import their own records, valid for 110 seconds.
-    0, 0, 1, 255, 0, 1, 1, 255, 0, 2, 1, 255, 0, 3, 1, 255, // A dial confirms author 0.
-    3, 0, 0, 0, // Author 4 evicts one of the unconfirmed records.
-    0, 4, 1, 255, // Sample four, under a window of three.
-    6, 0, 4, 0, // Author 0 replaces its record with a later sequence.
-    0, 0, 3, 255, // Advance 765 seconds, so every record expires.
-    5, 0, 0, 255, // Relay 0 takes authors 0 and 1.
-    1, 0, 2, 255, 1, 1, 2, 255, // Advance again, so its entries expire.
-    5, 0, 0, 255, // Relay 0's next new record, from author 5, removes them.
-    1, 5, 2, 255, // Relay 1 supplies author 5's later sequence, so the attribution moves.
-    1, 11, 3, 255, // Relay 1 takes author 0, which fills its quota.
-    1, 6, 2, 255, // Relay 1 cannot take author 1.
-    1, 7, 2, 255, // Author 2's record expired before it arrived.
-    0, 2, 2, 0, // A dial fails for author 0.
-    4, 0, 0, 0,
-];
+fn book_trace_witness() -> Vec<u8> {
+    use BookOp::{Advance, DialFailure, DialSuccess, Import, Sample};
+    let import = |author, sequence, expires_in, supplier| Import {
+        author,
+        sequence,
+        expires_in,
+        supplier,
+    };
+    [
+        // Authors 0..=3 import their own records, valid for 900 seconds.
+        import(0, 1, 900, Supplier::Author),
+        import(1, 1, 900, Supplier::Author),
+        import(2, 1, 900, Supplier::Author),
+        import(3, 1, 900, Supplier::Author),
+        // A dial confirms author 0.
+        DialSuccess(0),
+        // Author 4 evicts one of the unconfirmed records.
+        import(4, 1, 900, Supplier::Author),
+        // Sample four, under a window of three.
+        Sample {
+            requester: 0,
+            limit: 4,
+        },
+        // Author 0 replaces its record with a later sequence.
+        import(0, 3, 900, Supplier::Author),
+        // Two epochs pass, so every record expires.
+        Advance(DISCLOSURE_EPOCH),
+        Advance(DISCLOSURE_EPOCH),
+        // Relay 0 takes authors 0 and 1 with lapsed records.
+        import(0, 2, -100, Supplier::Relay(0)),
+        import(1, 2, -100, Supplier::Relay(0)),
+        // Relay 0's next new record, from author 5, removes them.
+        import(5, 2, 3_600, Supplier::Relay(0)),
+        // Relay 1 supplies author 5's later sequence, so the attribution moves.
+        import(5, 3, 3_600, Supplier::Relay(1)),
+        // Relay 1 takes author 0, which fills its quota.
+        import(0, 2, 3_600, Supplier::Relay(1)),
+        // Relay 1 cannot take author 1.
+        import(1, 2, 3_600, Supplier::Relay(1)),
+        // Author 0's earlier sequence orders below the stored one.
+        import(0, 1, 3_600, Supplier::Author),
+        // Author 2's record expired before it arrived.
+        import(2, 0, -400, Supplier::Author),
+        // A dial fails for author 0.
+        DialFailure(0),
+    ]
+    .iter()
+    .flat_map(encode_book_v3)
+    .collect()
+}
 
 /// Installs a current result, rejects a stale result, retains a hint, and reads it.
 const STATE_TRACE_WITNESS: &[u8] = &[
@@ -533,7 +670,7 @@ const STATE_TRACE_WITNESS: &[u8] = &[
 #[test]
 #[should_panic(expected = "discovery/record-book")]
 fn discovery_book_witness_rejects_unearned_confirmation() {
-    run_book(decode_book_v2(BOOK_TRACE_WITNESS), 0, |book, now| {
+    run_book(decode_book_v3(&book_trace_witness()), 0, |book, now| {
         book.mark_dial_success(&author(0).public(), now);
     });
 }
@@ -541,7 +678,7 @@ fn discovery_book_witness_rejects_unearned_confirmation() {
 #[test]
 #[should_panic(expected = "discovery/record-book")]
 fn discovery_book_witness_rejects_extra_dial_failure() {
-    run_book(decode_book_v2(BOOK_TRACE_WITNESS), 0, |book, now| {
+    run_book(decode_book_v3(&book_trace_witness()), 0, |book, now| {
         book.mark_dial_failure(&author(0).public(), now);
     });
 }

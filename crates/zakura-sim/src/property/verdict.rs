@@ -73,8 +73,9 @@ pub enum FactAnswer {
     /// It moves a `BeforeQuiescence` obligation's deadline to this instant.
     /// From then on, the obligation no longer expires at quiescence, but at
     /// the first step whose time is past the instant, before that step's
-    /// observations or facts count. Every matching obligation defers, and a
-    /// later deferral replaces an earlier one.
+    /// observations or facts count. An instant already behind the clock
+    /// expires it at once. Every matching obligation defers, and a later
+    /// deferral replaces an earlier one.
     DefersTo(SimInstant),
 }
 

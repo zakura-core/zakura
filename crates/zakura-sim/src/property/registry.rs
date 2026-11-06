@@ -257,8 +257,9 @@ impl Sources {
 /// 5. It walks the view-side facts the step added, in stamp order, the
 ///    same way, for the obligations facts answer
 ///    ([`FactDischarge`](super::FactDischarge)). A fact can also defer a
-///    `BeforeQuiescence` obligation ([`FactAnswer::DefersTo`]), which then
-///    expires at once if its instant is already behind the clock.
+///    `BeforeQuiescence` obligation ([`FactAnswer::DefersTo`]). One deferred
+///    to an instant already behind the clock expires there, before the
+///    step's later facts.
 /// 6. When no task can run after the step, it expires every
 ///    `BeforeQuiescence` obligation still open that isn't deferred.
 ///
@@ -671,21 +672,16 @@ fn step_property<S: HasView>(
     let floor = state.holds_since.map(|(_, at)| at);
     // Every observation and fact of the step happened at `cx.now`, so none
     // can discharge an obligation whose deadline is already behind it.
-    let expire_overdue = |open: &mut Vec<Open<S::View>>,
-                          events: &mut Vec<CheckEvent>,
-                          violations: &mut Vec<Violation>| {
-        open.retain(|open| {
-            let overdue = open
-                .deadline(floor)
-                .is_some_and(|deadline| cx.now > deadline);
-            if overdue {
-                events.push(event(Lifecycle::Expired));
-                violations.push(expiry(property, open, floor, cx));
-            }
-            !overdue
-        });
-    };
-    expire_overdue(&mut state.open, events, &mut violations);
+    state.open.retain(|open| {
+        let overdue = open
+            .deadline(floor)
+            .is_some_and(|deadline| cx.now > deadline);
+        if overdue {
+            events.push(event(Lifecycle::Expired));
+            violations.push(expiry(property, open, floor, cx));
+        }
+        !overdue
+    });
     for (at, obs) in cx.observations().enumerate() {
         // A point counts toward its `Ops` bound, and can expire it, before it
         // can discharge it.
@@ -730,13 +726,20 @@ fn step_property<S: HasView>(
         let view = &*view.get_or_insert_with(|| handle.view());
         for &stamp in stamps {
             let mut one_discharged = false;
-            state.open.retain_mut(|open| {
-                let discharge = match open.fact(cx.step, view, stamp) {
-                    None | Some(FactAnswer::Unrelated) => false,
-                    Some(FactAnswer::Discharges) => match open.obligation.cardinality {
-                        Cardinality::Every => true,
-                        Cardinality::One => !std::mem::replace(&mut one_discharged, true),
-                    },
+            state
+                .open
+                .retain_mut(|open| match open.fact(cx.step, view, stamp) {
+                    None | Some(FactAnswer::Unrelated) => true,
+                    Some(FactAnswer::Discharges) => {
+                        let discharge = match open.obligation.cardinality {
+                            Cardinality::Every => true,
+                            Cardinality::One => !std::mem::replace(&mut one_discharged, true),
+                        };
+                        if discharge {
+                            events.push(event(Lifecycle::Discharged));
+                        }
+                        !discharge
+                    }
                     Some(FactAnswer::DefersTo(at)) => {
                         assert_eq!(
                             open.obligation.bound,
@@ -745,17 +748,18 @@ fn step_property<S: HasView>(
                         );
                         open.deferred = Some(at);
                         open.obligation.witness.push(cx.step);
-                        false
+                        // A deadline already behind the clock expires before a
+                        // later fact of the step can discharge it.
+                        let overdue = cx.now > at;
+                        if overdue {
+                            events.push(event(Lifecycle::Expired));
+                            violations.push(expiry(property, open, floor, cx));
+                        }
+                        !overdue
                     }
-                };
-                if discharge {
-                    events.push(event(Lifecycle::Discharged));
-                }
-                !discharge
-            });
+                });
         }
     }
-    expire_overdue(&mut state.open, events, &mut violations);
 
     state.open.retain(|open| {
         let gone = open.obligation.bound == LivenessBound::BeforeQuiescence

@@ -190,19 +190,20 @@ pub fn run_prepared<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
-    let (report, ()) = run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_| ())?;
+    let (report, ()) = run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_, _| ())?;
     Ok(report)
 }
 
-/// [`run_prepared`], also returning what `read` takes from the harness once
-/// the run ends, such as its view.
+/// [`run_prepared`], also returning what `read` takes from the harness and
+/// the final log at the run's end, after the checkers report and before the
+/// scheduler shuts down, since shutdown can resume suspended tasks.
 pub(crate) fn run_reading<S: Subsystem, T>(
     scenario: &S::Scenario,
     prepared: S::Prepared,
     input: PlanInput,
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
-    read: impl FnOnce(&S) -> T,
+    read: impl FnOnce(&S, &ObservationLog) -> T,
 ) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
@@ -211,11 +212,25 @@ pub(crate) fn run_reading<S: Subsystem, T>(
     let mut sim = Sim::new(config, input);
     let this = Rc::new(S::build(&mut sim, scenario, prepared));
     let mut checker = registry_checker(&this, assumptions);
-    let report = match extra {
-        Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
-        None => sim.run(&mut *checker, sink),
+    let mut tee;
+    let inner: &mut dyn Checker = match extra {
+        Some(extra) => {
+            tee = Tee(Dyn(&mut *checker), Dyn(extra));
+            &mut tee
+        }
+        None => &mut *checker,
     };
-    let read = read(&this);
+    let mut ending = Ending {
+        inner,
+        read: Some(|log: &ObservationLog| read(&this, log)),
+        read_out: None,
+    };
+    let report = sim.run(&mut ending, sink);
+    let read = ending
+        .read_out
+        .take()
+        .expect("`Sim::run` reports its checker's end once");
+    drop(ending);
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);
@@ -616,6 +631,53 @@ pub struct LinkEntry {
     pub dst: SocketAddr,
     /// The link's model.
     pub model: LinkSpec,
+}
+
+/// A borrowed checker that also runs `read` on the final log once it has
+/// reported its end, and keeps the result.
+struct Ending<'a, F, T> {
+    inner: &'a mut dyn Checker,
+    read: Option<F>,
+    read_out: Option<T>,
+}
+
+impl<F: FnOnce(&ObservationLog) -> T, T> Checker for Ending<'_, F, T> {
+    /// Forwards to the checker.
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        self.inner.after_step(cx)
+    }
+
+    /// Forwards to the checker, then runs `read` on `log`.
+    fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
+        let reports = self.inner.at_end(end, log);
+        self.read_out = self.read.take().map(|read| read(log));
+        reports
+    }
+
+    /// Forwards to the checker.
+    fn events(&mut self) -> Vec<CheckEvent> {
+        self.inner.events()
+    }
+
+    /// Forwards to the checker.
+    fn observe_events(&mut self, events: &[CheckEvent]) {
+        self.inner.observe_events(events);
+    }
+
+    /// Forwards to the checker.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        self.inner.harness_failure()
+    }
+
+    /// Forwards to the checker.
+    fn bounds_livelock(&mut self) -> bool {
+        self.inner.bounds_livelock()
+    }
+
+    /// Forwards to the checker.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        self.inner.step_loop_violation(violation);
+    }
 }
 
 /// A borrowed checker as a sized [`Checker`], so it can sit in a [`Tee`].

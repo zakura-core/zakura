@@ -15,7 +15,7 @@ use crate::{
     harness::{self, run_reading, HarnessError, Subsystem},
     property::{HasView, Status, TriggerHistory},
     record::Record,
-    MemorySink, Outcome, PlanInput, PropertyOutcome, RecordSink, RunReport,
+    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, RecordSink, RunReport,
 };
 
 /// What a witness test expects of its property.
@@ -195,21 +195,25 @@ pub fn witness_prepared<S: Subsystem>(
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
     let registered = Registered::<S>::of(property, expect)?;
-    let reads_view = matches!(registered.trigger_history, Some(TriggerHistory::View(_)));
     let mut sink = EndSeen { sink, ended: false };
-    let read = |harness: &S| reads_view.then(|| harness.view());
-    let (report, view) = match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, read)
-    {
-        Ok(run) => run,
-        Err(HarnessError::Run { failure, .. }) => {
-            return Err(WitnessError::HarnessEnd(failure.to_string()))
-        }
-        Err(error) => return Err(WitnessError::UnsupportedScenario(error.to_string())),
+    // A view trigger is judged before shutdown, which can still change the
+    // view.
+    let read = |harness: &S, log: &ObservationLog| match registered.trigger_history {
+        Some(TriggerHistory::View(history)) => Some(history(&harness.view(), log)),
+        _ => None,
     };
+    let (report, viewed) =
+        match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, read) {
+            Ok(run) => run,
+            Err(HarnessError::Run { failure, .. }) => {
+                return Err(WitnessError::HarnessEnd(failure.to_string()))
+            }
+            Err(error) => return Err(WitnessError::UnsupportedScenario(error.to_string())),
+        };
     if !sink.ended {
         return Err(WitnessError::NoEnd);
     }
-    registered.judge(&report, view.as_ref(), property, expect)
+    registered.judge(&report, viewed, property, expect)
 }
 
 /// Checks `report`, a complete run of `S`, against `expect` for
@@ -249,11 +253,12 @@ impl<S: Subsystem> Registered<S> {
     }
 
     /// Checks `report` against `expect`, then the trigger history, if the
-    /// property has one, over the log and the run's final `view`.
+    /// property has one. `viewed` is a view trigger's result at the run's
+    /// end, or `None` if the judge has only the report.
     fn judge(
         &self,
         report: &RunReport,
-        view: Option<&S::View>,
+        viewed: Option<bool>,
         property: &str,
         expect: Expect,
     ) -> Result<(), WitnessError> {
@@ -261,9 +266,7 @@ impl<S: Subsystem> Registered<S> {
         let reached = match self.trigger_history {
             None => true,
             Some(TriggerHistory::Log(history)) => history(&report.log),
-            Some(TriggerHistory::View(history)) => {
-                history(view.ok_or(WitnessError::NoView)?, &report.log)
-            }
+            Some(TriggerHistory::View(_)) => viewed.ok_or(WitnessError::NoView)?,
         };
         if reached {
             Ok(())

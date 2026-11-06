@@ -5,7 +5,7 @@
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use zakura_rt::{task, time};
+use zakura_rt::{sync::Mutex, task, time};
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{run_harness, Subsystem},
@@ -42,13 +42,16 @@ enum Act {
     Yield,
     /// Sleeps this many milliseconds.
     Sleep(u64),
+    /// Takes a lock, a preemption point inside the poll.
+    Point,
 }
 
-/// The task's acts and the run's live step budget.
+/// The task's acts, the run's live step budget and its drain bound.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Script {
     acts: Vec<Act>,
     budget: u64,
+    drain: u64,
 }
 
 /// One task that records stamped facts, as a tap records owner facts.
@@ -92,7 +95,7 @@ impl Subsystem for Stamped {
     fn config(script: &Script) -> RunConfig {
         RunConfig {
             budget: script.budget,
-            drain_bound: 10,
+            drain_bound: script.drain,
             ..RunConfig::default()
         }
     }
@@ -104,6 +107,7 @@ impl Subsystem for Stamped {
         let facts = Rc::new(RefCell::new(Vec::new()));
         let task_facts = Rc::clone(&facts);
         let acts = script.acts.clone();
+        let lock = Mutex::new(());
         sim.scheduler().spawn_root("stamper", async move {
             for act in acts {
                 match act {
@@ -115,6 +119,7 @@ impl Subsystem for Stamped {
                     }
                     Act::Yield => task::yield_now().await,
                     Act::Sleep(ms) => time::sleep(Duration::from_millis(ms)).await,
+                    Act::Point => drop(lock.lock().expect("no task panics holding it")),
                 }
             }
         });
@@ -145,6 +150,7 @@ impl Subsystem for Stamped {
         Script {
             acts: Vec::new(),
             budget: 50,
+            drain: 10,
         }
     }
 }
@@ -206,6 +212,7 @@ fn run_for(acts: &[Act], budget: u64) -> RunReport {
     let script = Script {
         acts: acts.to_vec(),
         budget,
+        drain: 10,
     };
     match run_harness::<Stamped>(
         &script,
@@ -243,7 +250,7 @@ fn violated(report: &RunReport, id: &str) -> bool {
     matches!(outcome(report, id), PropertyOutcome::Violated { .. })
 }
 
-use Act::{Fact, Sleep, Yield};
+use Act::{Fact, Point, Sleep, Yield};
 use Name::{Defer, Done, Wait, WaitNext};
 
 /// A fact after the trigger's stamp in its own step discharges, and so does
@@ -317,6 +324,32 @@ fn a_lost_deferred_timer_violates_at_the_next_timer() {
     assert_eq!(violation.witness, [1, violation.step]);
 }
 
+/// A deferral to an instant already behind the clock expires at once, so a
+/// later fact of the same step can't discharge it, and a later deferral
+/// can't move it.
+#[test]
+fn an_overdue_deferral_expires_before_later_facts() {
+    for acts in [
+        &[Sleep(10), Fact(Wait), Fact(Defer(5)), Fact(Done)][..],
+        &[
+            Sleep(10),
+            Fact(Wait),
+            Fact(Defer(5)),
+            Fact(Defer(20)),
+            Sleep(5),
+            Fact(Done),
+        ],
+    ] {
+        let report = run(acts);
+        let violation = report.end.violation.as_ref().expect("the deadline passed");
+        assert_eq!(
+            violation.expected, r#"Owner("w") discharged by its deferred deadline, 5000000 ns"#,
+            "{acts:?}"
+        );
+        assert_eq!(violation.actual, "still open at 10000000 ns", "{acts:?}");
+    }
+}
+
 /// A run cut off while the obligation is deferred is inconclusive.
 #[test]
 fn a_run_cut_off_while_deferred_is_inconclusive() {
@@ -335,6 +368,7 @@ fn scenario(acts: &[Act]) -> WitnessScenario<Stamped> {
         scenario: Script {
             acts: acts.to_vec(),
             budget: 50,
+            drain: 10,
         },
         input: Plan::from_fuzz(&[]),
     }
@@ -354,6 +388,25 @@ fn a_view_trigger_history_is_judged_on_the_final_view() {
     );
     assert_eq!(
         witness(scenario(&[Fact(Done)]), SERVED, Expect::Holds),
+        Err(WitnessError::LostTriggerHistory)
+    );
+}
+
+/// A trigger that only the scheduler's shutdown reaches isn't the judged
+/// run's. The run ends with the task stopped at a lock, and shutdown
+/// resumes it to its poll boundary, past the wait it records next.
+#[test]
+fn a_trigger_only_shutdown_reaches_is_lost() {
+    let cut = WitnessScenario::<Stamped> {
+        scenario: Script {
+            acts: vec![Point, Fact(Wait)],
+            budget: 1,
+            drain: 0,
+        },
+        input: Plan::from_fuzz(&[]),
+    };
+    assert_eq!(
+        witness(cut, SERVED, Expect::Holds),
         Err(WitnessError::LostTriggerHistory)
     );
 }

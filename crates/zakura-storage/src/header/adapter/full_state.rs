@@ -19,9 +19,9 @@ use zakura_rt::sync::watch;
 use super::EnginePort;
 use crate::{
     full_state::{
-        self as state, combined_retention_references, hint_hashes, hint_updates, verified_request,
-        BodyMetadata, PreparedAuthority, SchedulerAuthority, StateError, StateIssuedAuthority,
-        VerifiedChain,
+        self as state, combined_retention_references, hint_hashes, hint_updates, operator_request,
+        verified_request, BodyMetadata, PreparedAuthority, SchedulerAuthority, StateError,
+        StateIssuedAuthority, VerifiedChain,
     },
     header::fixture::ScenarioClock,
 };
@@ -186,6 +186,56 @@ impl EnginePort {
             }
             _ => Err(StoreError::Incoherent("body evidence carries a body event").into()),
         }
+    }
+
+    /// Runs an operator invalidation of `target`, or with `invalidate` false
+    /// its reconsideration, as zakura-state's `commit_operator_change` does:
+    /// the event binds full state's best path, and full state itself doesn't
+    /// change. The engine decides whether it commits, changes nothing or is
+    /// stale.
+    ///
+    /// # Errors
+    ///
+    /// If the engine refuses the event, such as an invalidation of the
+    /// finalized anchor.
+    pub(crate) fn operator(
+        &self,
+        target: block::Hash,
+        invalidate: bool,
+    ) -> Result<Applied, StateError> {
+        let mut engine = self.engine();
+        let (request, tips, verified) = {
+            let chain = self.full_state();
+            (
+                operator_request(&engine, &chain, target, invalidate),
+                chain.tips(),
+                engine.snapshot().frontiers.verified_best,
+            )
+        };
+        let mut authority = PreparedAuthority::for_event(&request.event)?;
+        authority.retention_references = tips.clone();
+        authority.verified_tip = Some(verified);
+        self.apply_locked(
+            &mut engine,
+            request,
+            &authority,
+            &tips,
+            Some(verified),
+            || {},
+        )
+    }
+
+    /// The selected header `depth` below the selected tip, or the lowest
+    /// header above the finalized anchor if the chain is shorter, or `None`
+    /// while the tip is the anchor.
+    pub(crate) fn selected_below_tip(&self, depth: u32) -> Option<zakura_header_chain::Frontier> {
+        let engine = self.engine();
+        // The projection runs from the finalized anchor to the tip.
+        let projection = engine.selected_projection();
+        let above_anchor = projection.len().checked_sub(1).filter(|len| *len > 0)?;
+        // Widening u32 to usize is lossless on supported targets.
+        let depth = (depth as usize).min(above_anchor - 1);
+        projection.get(above_anchor - depth).copied()
     }
 
     /// The selected headers from `from` whose bodies full state lacks. See
@@ -447,9 +497,17 @@ impl EnginePort {
                 expected_version,
                 event,
             },
+            TransitionEvent::OperatorInvalidate(event) => TransitionInput::OperatorInvalidate {
+                expected_version,
+                event,
+            },
+            TransitionEvent::OperatorReconsider(event) => TransitionInput::OperatorReconsider {
+                expected_version,
+                event,
+            },
             _ => {
                 return Err(StoreError::Incoherent(
-                    "full state sends only verified-chain and body events",
+                    "full state sends only verified-chain, body and operator events",
                 )
                 .into())
             }

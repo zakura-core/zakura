@@ -27,7 +27,7 @@ use std::{
 use zakura_header_chain::{Attribution, HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId},
+    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
     evidence::{
         CallerPresence, CapacityClass, LeaseFact, LeaseKey, OperationStage, OwnerModel, OwnerState,
         PathPosition, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
@@ -521,6 +521,19 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             id: id.0,
             generation: generation.get(),
             state: hex(&state_digest),
+        },
+        FactKind::Reset {
+            kind,
+            target,
+            generation,
+        } => StorageFact::Reset {
+            kind: match kind {
+                ResetKind::Invalidate => "invalidate",
+                ResetKind::Reconsider => "reconsider",
+            }
+            .to_owned(),
+            target: hash(target),
+            generation: generation.get(),
         },
         FactKind::Completed(completion) => StorageFact::Completed {
             id: completion.id.0,

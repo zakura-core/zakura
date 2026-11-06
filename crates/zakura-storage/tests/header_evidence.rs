@@ -16,7 +16,7 @@ use zakura_node_services::header_chain::{
 };
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId},
+    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
     evidence::{LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, OwnerState, StateField},
     fixture::HeaderFixture,
     Fault, Outcome,
@@ -535,4 +535,30 @@ fn a_committed_apply_delivered_as_a_fault_is_unexpected() {
         })
     );
     drop(call);
+}
+
+/// Nothing changes the engine after shutdown, so a `Reset` head after it
+/// is an effect the model doesn't allow.
+#[test]
+fn a_reset_after_shutdown_is_unexpected() {
+    let (port, chain) = chain(1);
+    let mut model = OwnerModel::new();
+    port.shut_down();
+    let mut facts = port.take_facts();
+    assert_eq!(model.apply(&facts), Ok(()));
+    let mut forged = facts.pop().expect("shutdown publishes a fact");
+    forged.seq += 1;
+    forged.txn += 1;
+    forged.kind = FactKind::Reset {
+        kind: ResetKind::Invalidate,
+        target: chain[0].hash,
+        generation: port.engine().snapshot().header_generation,
+    };
+    assert_eq!(
+        model.apply(std::slice::from_ref(&forged)),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: forged.txn,
+            found: forged.kind.clone(),
+        })
+    );
 }

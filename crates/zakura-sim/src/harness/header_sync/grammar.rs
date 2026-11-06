@@ -336,10 +336,13 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
                 slot[2] = units::<u8>(len.into(), 1, 1, MAX_GROWTH as u8, "a growth")? - 1;
                 GROW
             }
-            ControlAction::Shutdown => {
-                return Err(Unencodable(
-                    "the grammar has no shutdown control step".to_owned(),
-                ))
+            action @ (ControlAction::Shutdown
+            | ControlAction::Reset(_)
+            | ControlAction::Release { .. }
+            | ControlAction::StopStorage) => {
+                return Err(Unencodable(format!(
+                    "the grammar has no {action:?} control step"
+                )))
             }
         };
         slot[1] = mirror_index(&step.peer, mirrors)?;

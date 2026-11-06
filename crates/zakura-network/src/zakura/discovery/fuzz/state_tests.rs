@@ -509,15 +509,58 @@ fn random_short_inputs_reach_every_book_rule() {
     );
 }
 
-/// Each two bytes decoder v3 reads decode to one operation, and the encoder
-/// inverts the decoder.
+/// Each two bytes decoder v3 reads decode to one operation. The two-byte inputs
+/// decode to exactly the operations below, so each import expiry, supplier,
+/// author and sequence, each dial, advance and sample stays reachable, and the
+/// encoder inverts the decoder on each of them.
 #[test]
 fn book_operations_round_trip_through_two_bytes() {
-    for a in 0..=u8::MAX {
-        for b in [0, 17, 127, 128, 191, 192, 255] {
-            let op = decode_book_v3(&[a, b]).next().expect("two bytes decode");
-            assert_eq!(decode_book_v3(&encode_book_v3(&op)).next(), Some(op));
+    let suppliers = [
+        Supplier::Author,
+        Supplier::Relay(0),
+        Supplier::Relay(1),
+        Supplier::Relay(2),
+        Supplier::Nobody,
+    ];
+    let mut expected = Vec::new();
+    for author in 0..AUTHORS {
+        for supplier in suppliers {
+            // A record that expired before it arrived has sequence 0.
+            expected.push(BookOp::Import {
+                author,
+                sequence: 0,
+                expires_in: -400,
+                supplier,
+            });
+            for sequence in 0..4 {
+                for expires_in in [-100, 900, 3_600] {
+                    expected.push(BookOp::Import {
+                        author,
+                        sequence,
+                        expires_in,
+                        supplier,
+                    });
+                }
+            }
         }
+        expected.push(BookOp::DialSuccess(author));
+        expected.push(BookOp::DialFailure(author));
+    }
+    for requester in 0..RELAYS {
+        for limit in 0..5 {
+            expected.push(BookOp::Sample { requester, limit });
+        }
+    }
+    expected.extend((0..64).chain([DISCLOSURE_EPOCH]).map(BookOp::Advance));
+
+    for value in 0..=u16::MAX {
+        let op = decode_book_v3(&value.to_be_bytes())
+            .next()
+            .expect("two bytes decode");
+        assert!(expected.contains(&op), "{value:#06x} decodes to {op:?}");
+    }
+    for op in expected {
+        assert_eq!(decode_book_v3(&encode_book_v3(&op)).next(), Some(op));
     }
     assert_eq!(decode_book_v3(&[0, 0, 1]).count(), 2);
 }

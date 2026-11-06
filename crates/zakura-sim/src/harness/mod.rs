@@ -17,6 +17,7 @@ pub mod block_work;
 pub mod coverage;
 pub mod discovery;
 pub mod discovery_machine;
+pub mod discovery_service;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;

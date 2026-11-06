@@ -783,10 +783,9 @@ pub trait RequestResponseService: Service {
     /// stream before `request_frame` is polled, so a stop never hides a
     /// protocol fault. It must not start backend work or allocate a response.
     /// A service whose `request_frame` can return `SinkReject::Protocol` must
-    /// override it with the same checks. The default accepts every frame.
-    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
-        Ok(())
-    }
+    /// run the same checks here. A service with no protocol rejections returns
+    /// `Ok(())`.
+    fn check_request(&self, stream_kind: u16, frame: &Frame) -> Result<(), SinkReject>;
 }
 
 /// A per-stream reader owned by a service.

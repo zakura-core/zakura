@@ -5878,6 +5878,26 @@ fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
     )
 }
 
+/// Runs a request's service call until it answers, the connection closes or
+/// the requester stops the response stream, and returns `None` for a close or
+/// a stop.
+///
+/// The select polls the call before the stop. A call that returns its protocol
+/// rejection before its first `Pending` therefore reports it even when the
+/// stop is already recorded.
+async fn call_until_stopped<T>(
+    connection_token: &CancellationToken,
+    call: impl future::Future<Output = T>,
+    stopped: std::pin::Pin<&mut impl future::Future>,
+) -> Option<T> {
+    zakura_rt::select! {
+        biased;
+        _ = connection_token.cancelled() => None,
+        response = call => Some(response),
+        _ = stopped => None,
+    }
+}
+
 async fn request_stream_worker(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -5996,18 +6016,21 @@ async fn request_stream_worker(
 
     // The raw frame's grant ends with the service's call, which cancelling the
     // connection or stopping the stream also ends.
-    let response = zakura_rt::select! {
-        biased;
-        _ = context.connection_token.cancelled() => return,
-        response = registry.request(
+    let Some(response) = call_until_stopped(
+        &context.connection_token,
+        registry.request(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
             response_frame_cap,
             context.limits.max_message_bytes,
             frame,
-        ) => response,
-        _ = &mut stopped => return,
+        ),
+        stopped,
+    )
+    .await
+    else {
+        return;
     };
     drop(raw_grant);
     let response_frames = match response {

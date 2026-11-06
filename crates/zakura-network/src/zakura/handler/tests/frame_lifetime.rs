@@ -290,6 +290,10 @@ impl RequestResponseService for WaitingRequests {
             Ok(Vec::new())
         })
     }
+
+    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
+        Ok(())
+    }
 }
 
 /// Every open request runs at once, with no execution slot to wait for. Each
@@ -441,6 +445,10 @@ impl RequestResponseService for AnsweringRequests {
             })
             .collect();
         Box::pin(async move { Ok(frames) })
+    }
+
+    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
+        Ok(())
     }
 }
 
@@ -1059,6 +1067,56 @@ async fn a_stopped_protocol_invalid_request_still_closes_the_connection() -> Res
     );
     assert_eq!(requests.calls(), 0);
     assert_eq!(requests.output.granted(), 0);
+
+    requests.link.close().await;
+    Ok(())
+}
+
+/// A stop that is already recorded when the call starts never hides the call's
+/// protocol fault, because the call arm is polled before the stop arm. A valid
+/// call still yields to that stop at its first `Pending`. The loopback can't
+/// order a stop before the call's first poll, so this drives the call's select
+/// with a stop that has already resolved.
+#[tokio::test]
+async fn an_already_stopped_call_reports_its_protocol_fault() -> Result<(), BoxError> {
+    let mut trailing = one_block_request();
+    trailing.push(0);
+    let requests = LegacyRequests::connect(8 << 20, Vec::new()).await?;
+    let context = tabled_context(None, 128);
+    let call = |payload: Vec<u8>| {
+        requests.registry.request(
+            context.peer_id.clone(),
+            LEGACY_REQUEST_STREAM_KIND,
+            7,
+            1024,
+            context.limits.max_message_bytes,
+            Frame {
+                message_type: LEGACY_REQUEST_BLOCKS_BY_HASH,
+                flags: 0,
+                payload,
+            },
+        )
+    };
+
+    let stopped = std::future::ready(());
+    zakura_rt::pin!(stopped);
+    let response = call_until_stopped(&context.connection_token, call(trailing), stopped).await;
+    assert!(
+        matches!(response, Some(Err(SinkReject::Protocol(_)))),
+        "the stop hid a protocol fault: {response:?}"
+    );
+    assert_eq!(requests.calls(), 0);
+
+    let stopped = std::future::ready(());
+    zakura_rt::pin!(stopped);
+    let response = call_until_stopped(
+        &context.connection_token,
+        call(one_block_request()),
+        stopped,
+    )
+    .await;
+    assert!(response.is_none(), "the stop ends a pending call");
+    assert_eq!(requests.calls(), 1, "the call ran up to its first wait");
 
     requests.link.close().await;
     Ok(())

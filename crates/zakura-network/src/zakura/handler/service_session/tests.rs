@@ -150,6 +150,10 @@ impl crate::zakura::RequestResponseService for SessionService {
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move { Ok(vec![frame]) })
     }
+
+    fn check_request(&self, _: u16, _: &Frame) -> Result<(), SinkReject> {
+        Ok(())
+    }
 }
 
 struct Session {

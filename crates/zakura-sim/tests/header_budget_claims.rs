@@ -24,7 +24,7 @@ use zakura_sim::{
         header_sync::storage_config,
     },
     property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
-    HarnessFailure, MemorySink, Outcome, PlanInput, PropertyOutcome, RunReport, Sim,
+    HarnessFailure, MemorySink, NoChecks, Outcome, PlanInput, PropertyOutcome, RunReport, Sim,
 };
 use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
@@ -64,14 +64,15 @@ fn peer(byte: u8) -> ZakuraPeerId {
 /// Reports two reservations through a tap's capacity handle: a repair of
 /// 3,990 headers, then an ordinary one of 11, within the fair share, for a
 /// peer with none, which takes the claims past 4,000 and breaks
-/// `OverBudget`. Runs it under `chunk-budget-bound`, with the tap's claims
-/// taken for the view if `take`, and returns the report and the view.
-fn over_budget(take: bool) -> (RunReport, Claims) {
+/// `OverBudget`. Runs it under `chunk-budget-bound` reading the tap's
+/// claims if `read`, or reading claims no tap fills otherwise, and returns
+/// the report and the view.
+fn over_budget(read: bool) -> (RunReport, Claims) {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let view = Claims {
-        claims: if take {
+        claims: if read {
             tap.claims()
         } else {
             ClaimEvidence::default()
@@ -114,7 +115,7 @@ fn over_budget(take: bool) -> (RunReport, Claims) {
     (sim.run(&mut checker, &mut MemorySink::default()), view)
 }
 
-/// With the tap's claims taken for the view, the tap records the
+/// With the property reading the tap's claims, the tap records the
 /// `OverBudget` break, the run goes on, and `chunk-budget-bound` reports it
 /// at the step whose drain found it.
 #[test]
@@ -140,10 +141,11 @@ fn an_over_budget_reservation_violates_chunk_budget_bound() {
     ));
 }
 
-/// A tap whose claims nobody took has no property to report the break, so
-/// the break fails the run, as it did before claims moved to properties.
+/// A break no property reports fails the run, as it did before claims
+/// moved to properties: here the property reads other claims, so the
+/// tap's break stays unreported to the run's end.
 #[test]
-fn an_untaken_claim_fails_the_run() {
+fn an_unreported_claim_fails_the_run() {
     let (report, view) = over_budget(false);
     let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
         panic!("expected a source evidence failure, got {:?}", report.end);
@@ -153,4 +155,41 @@ fn an_untaken_claim_fails_the_run() {
         "{detail}"
     );
     assert!(view.claims.records().is_empty());
+}
+
+/// A harness that takes the tap's claims but runs no property still fails
+/// on a break: `Storage` takes them as it's built, and a test may run it
+/// under `NoChecks`. Here the break comes at the reactor's first step and
+/// the task goes on, so the next drain finds it unreported.
+#[test]
+fn a_claim_taken_without_a_property_fails_at_the_next_drain() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let claims = tap.claims();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let capacity = observer
+            .capacity_observer()
+            .expect("the tap hands the queue its own capacity handle");
+        capacity.observe(ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: peer(1),
+            purpose: ReservationPurpose::Repair,
+            headers: 4_001,
+            request: None,
+        });
+        zakura_rt::task::yield_now().await;
+        std::mem::forget(observer);
+    });
+    let report = sim.run(&mut NoChecks, &mut MemorySink::default());
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert!(detail.starts_with("OverBudget: reservation 1"), "{detail}");
+    let records = claims.records();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(report.end.steps, records[0].step + 1, "{:?}", report.end);
 }

@@ -5,6 +5,10 @@
 //! alone can break and a property's claim names, such as the budget's
 //! capacity. The tap records its break here, at the drain that found it,
 //! keeps checking, and the owning property reports it at that step.
+//!
+//! Reading a break through [`ClaimEvidence::at`] marks it reported. A break
+//! nothing reported by the next drain, or by the run's end, fails the run,
+//! so a harness without the owning property still fails on it.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -39,29 +43,46 @@ pub struct ClaimRecord {
     pub detail: String,
 }
 
-/// One reactor's claim breaks, shared by its tap and whoever reads them.
-/// Cloning shares the store.
+/// One reactor's claim breaks, each with whether a property has read it,
+/// shared by its tap and whoever reads them. Cloning shares the store.
 #[derive(Clone, Debug, Default)]
-pub struct ClaimEvidence(Arc<Mutex<Vec<ClaimRecord>>>);
+pub struct ClaimEvidence(Arc<Mutex<Vec<(ClaimRecord, bool)>>>);
 
 impl ClaimEvidence {
-    /// Keeps `record`. Nothing else is called while the lock is held.
+    /// Keeps `record`, unreported. Nothing else is called while the lock is
+    /// held.
     pub(super) fn record(&self, record: ClaimRecord) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(record);
+            .push((record, false));
     }
 
-    /// The breaks of `claims` that step `step`'s drain found, in order.
+    /// The breaks of `claims` that step `step`'s drain found, in order, which
+    /// this marks reported. Only the property that reports them reads them
+    /// this way.
     pub fn at(&self, step: u64, claims: &[Claim]) -> Vec<ClaimRecord> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|record| record.step == step && claims.contains(&record.claim))
-            .cloned()
+            .iter_mut()
+            .filter(|(record, _)| record.step == step && claims.contains(&record.claim))
+            .map(|(record, reported)| {
+                *reported = true;
+                record.clone()
+            })
             .collect()
+    }
+
+    /// The first break no property reported, among those found before step
+    /// `before`, or among all with `None`.
+    pub(super) fn unreported(&self, before: Option<u64>) -> Option<ClaimRecord> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(record, reported)| !reported && before.is_none_or(|step| record.step < step))
+            .map(|(record, _)| record.clone())
     }
 
     /// Every break so far, in order.
@@ -69,6 +90,8 @@ impl ClaimEvidence {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect()
     }
 }

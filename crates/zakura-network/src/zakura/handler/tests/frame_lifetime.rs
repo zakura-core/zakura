@@ -290,10 +290,6 @@ impl RequestResponseService for WaitingRequests {
             Ok(Vec::new())
         })
     }
-
-    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
-        Ok(())
-    }
 }
 
 /// Every open request runs at once, with no execution slot to wait for. Each
@@ -445,10 +441,6 @@ impl RequestResponseService for AnsweringRequests {
             })
             .collect();
         Box::pin(async move { Ok(frames) })
-    }
-
-    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
-        Ok(())
     }
 }
 

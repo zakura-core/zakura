@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use zakura_sim::{
     harness::{
         block_sync::BlockScenario,
-        discovery,
+        discovery, discovery_service,
         fixtures::{PickScenario, Variant, Which},
         header_sync::StorageScenario,
         wire_plans::SavedPlan,
@@ -66,6 +66,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     if let Some(plan) = SavedPlan::ALL
         .into_iter()
         .find(|plan| stem == format!("header-wire-{}", plan.name()))
+    {
+        return value(plan.scenario());
+    }
+    if let Some(plan) = discovery_service::SavedPlan::ALL
+        .into_iter()
+        .find(|plan| stem == format!("discovery-wire-{}", plan.name()))
     {
         return value(plan.scenario());
     }

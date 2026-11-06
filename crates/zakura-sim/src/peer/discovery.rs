@@ -71,6 +71,17 @@ pub(crate) fn record(
     ZakuraNodeRecord::sign(body, secret).expect("a fixture record signs")
 }
 
+/// The key of the author of a script's `index`th relayed record.
+fn relay_author(index: u8) -> NodeSecretKey {
+    NodeSecretKey::from_bytes(&[0x40 + index; 32])
+}
+
+/// The node ID of the author of a script's `index`th relayed record, the
+/// same for every peer's script.
+pub fn relayed_node(index: u8) -> NodeId {
+    relay_author(index).public()
+}
+
 /// The run's UTC, in Unix seconds.
 pub(crate) fn unix_now() -> u64 {
     utc_now()
@@ -284,9 +295,7 @@ impl DiscoveryPeer {
                 script.relays
             ));
         }
-        let relays = (0..script.relays)
-            .map(|author| NodeSecretKey::from_bytes(&[0x40 + author; 32]))
-            .collect();
+        let relays = (0..script.relays).map(relay_author).collect();
         Ok(DiscoveryPeer {
             stream,
             script,

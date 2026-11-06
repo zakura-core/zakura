@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.1.0"
+version = "5.1.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3360,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.3"
+version = "5.0.4"
 dependencies = [
  "hex",
  "ripemd",
@@ -3573,7 +3573,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.10"
+version = "2.2.11"
 dependencies = [
  "clap",
  "eyre",

@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+index cafdee5a52..ebf2860943 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/dispatch.rs
+@@ -572,8 +572,13 @@ impl HeaderSyncReactor {
+             held.hand_to_apply(call);
+             return Some(held);
+         }
++        // Mutation: a call that takes no handoff holds none of its round's
++        // headers.
+         #[cfg_attr(not(any(test, zakura_sim)), allow(unused_mut))]
+-        let mut retained = self.peer_work_queue.retain_headers(peer, call)?;
++        let mut retained = self
++            .peer_work_queue
++            .retain_headers(peer, call)
++            .filter(|_| false)?;
+         #[cfg(any(test, zakura_sim))]
+         retained.observed_by(&self.startup.observer);
+         Some(retained)

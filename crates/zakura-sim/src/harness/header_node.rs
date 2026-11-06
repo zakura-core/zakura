@@ -12,11 +12,16 @@
 //! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
 //! A `Shutdown` step stops the node under test on purpose, which its tap
 //! expects. The tap and the topology's links keep the node's
-//! [`session`] view.
+//! [`session`] view, and the tap keeps its header capacity accounting in a
+//! [`reservation::ReservationEvidence`], and its resource probe's reads in a
+//! [`capacity::CapacityEvidence`].
 
 pub mod adoption;
+pub mod capacity;
+pub mod fault;
 mod pair;
 pub mod policy;
+pub mod reservation;
 pub mod session;
 pub mod tap;
 
@@ -55,7 +60,7 @@ use self::{
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
-    storage::{HeaderStorage, HEADER_SERVICE},
+    storage::{FaultAttributions, HeaderStorage, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -276,6 +281,11 @@ impl PolicySource {
     /// The predicates, for a [`Control`] gated by the same counts.
     pub fn predicates(&self) -> Rc<RefCell<Predicates>> {
         self.predicates.clone()
+    }
+
+    /// Whom each failed prepare and apply of the node's storage blamed.
+    pub fn attributions(&self) -> FaultAttributions {
+        self.storage.attributions()
     }
 }
 

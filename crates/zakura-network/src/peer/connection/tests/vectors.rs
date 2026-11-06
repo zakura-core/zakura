@@ -1375,6 +1375,152 @@ async fn block_gossip_slot_tracks_connection_write() {
     connection_task.abort();
 }
 
+/// Waiting for a body upload slot leaves fresh block inventory writable before its deadline.
+#[tokio::test(start_paused = true)]
+async fn gated_upload_keeps_block_adverts_live() {
+    let _init_guard = zakura_test::init();
+    for release_slot in [true, false] {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            check_gated_upload_adverts(release_slot, false),
+        )
+        .await
+        .expect("inventory and the body finish within the slot wait and drain allowance");
+    }
+}
+
+/// An inventory write failure during a slot wait closes the connection without sending the body.
+#[tokio::test(start_paused = true)]
+async fn gated_upload_stops_after_inventory_write_fails() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        check_gated_upload_adverts(false, true),
+    )
+    .await
+    .expect("an inventory write failure releases the pending upload");
+}
+
+/// Exercises inventory dispatch through the real connection while another upload holds its slot.
+async fn check_gated_upload_adverts(release_slot: bool, fail_inventory: bool) {
+    use crate::{
+        peer::block_gossip::{
+            broadcast_block, BlockGossipPeer, BlockUploadSlots, BlockUploads, BLOCK_ADVERT_QUEUE,
+            BLOCK_REQUEST_WAIT, UPLOAD_SLOT_WAIT,
+        },
+        InventoryResponse,
+    };
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    let (mut peer_tx, peer_rx) = mpsc::channel(1);
+    let (mut connection, _client_tx, mut inbound, mut outbound, error) = new_test_connection();
+    let (sender, receiver) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
+    connection.block_advert_rx = receiver;
+    let gossip = BlockGossipPeer {
+        sender,
+        address: None,
+        uploads: connection.block_uploads.clone(),
+        registry: None,
+        version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+        sidecar: false,
+    };
+
+    // Another connection holds the only slot while this connection's socket stays writable.
+    let slots = BlockUploadSlots::new(1);
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
+    let holder = BlockGossipPeer {
+        sender,
+        uploads: BlockUploads::default(),
+        ..gossip.clone()
+    };
+    let held_hash = block::Hash([91; 32]);
+    let held_uploads = holder.uploads.clone();
+    let held = tokio::spawn(holder.advertise(held_hash, slots.clone()));
+    let advert = receiver.recv().await.unwrap();
+    held_uploads.advertised(held_hash);
+    held_uploads.requested(held_hash);
+    advert.result.send(Ok(())).unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(slots.available_uploads(), 0);
+
+    let connection_task = tokio::spawn(connection.run(peer_rx));
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let body_broadcast = tokio::spawn(broadcast_block(
+        vec![gossip.clone()],
+        hash,
+        1,
+        true,
+        false,
+        slots.clone(),
+    ));
+    assert_eq!(
+        outbound.next().await.unwrap(),
+        Message::Inv(vec![hash.into()])
+    );
+    peer_tx
+        .send(Ok(Message::GetData(vec![hash.into()])))
+        .await
+        .unwrap();
+    inbound
+        .expect_request(Request::BlocksByHash(IndexSet::from([hash])))
+        .await
+        .respond(Response::Blocks(vec![InventoryResponse::Available((
+            block.clone().into(),
+            None,
+        ))]));
+    tokio::task::yield_now().await;
+
+    let waiting = tokio::time::Instant::now();
+    let next_hash = block::Hash([92; 32]);
+    let next_broadcast = tokio::spawn(broadcast_block(
+        vec![gossip],
+        next_hash,
+        1,
+        true,
+        false,
+        slots.clone(),
+    ));
+    if fail_inventory {
+        drop(outbound);
+        assert!(next_broadcast.await.unwrap().is_err());
+        assert!(body_broadcast.await.unwrap().is_err());
+        connection_task.await.unwrap();
+        assert!(error.try_get_error().is_some());
+        held_uploads.written(held_hash);
+        assert!(held.await.unwrap());
+        assert_eq!(slots.available_uploads(), 1);
+        return;
+    }
+    let inventory = tokio::time::timeout(BLOCK_REQUEST_WAIT / 2, outbound.next())
+        .await
+        .expect("fresh inventory must not wait for the earlier body's upload slot")
+        .unwrap();
+    assert_eq!(inventory, Message::Inv(vec![next_hash.into()]));
+    assert_eq!(waiting.elapsed(), Duration::ZERO);
+    assert!(
+        outbound.next().now_or_never().is_none(),
+        "the body still waits"
+    );
+
+    if release_slot {
+        held_uploads.written(held_hash);
+    }
+    assert_eq!(outbound.next().await.unwrap(), Message::Block(block.into()));
+    if !release_slot {
+        assert_eq!(waiting.elapsed(), UPLOAD_SLOT_WAIT);
+        held_uploads.written(held_hash);
+    }
+    assert!(held.await.unwrap());
+    assert!(body_broadcast.await.unwrap().is_ok());
+    assert!(next_broadcast.await.unwrap().is_ok());
+    assert_eq!(slots.available_uploads(), 1);
+    assert!(error.try_get_error().is_none());
+    connection_task.abort();
+}
+
 /// A `headers` response keeps its state read charge until the wire send finishes.
 #[tokio::test(start_paused = true)]
 async fn tcp_headers_response_holds_read_admission_through_the_send() {

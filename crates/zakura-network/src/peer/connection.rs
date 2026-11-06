@@ -1242,6 +1242,27 @@ where
         }
     }
 
+    /// Waits for a body upload slot while continuing to write block inventory.
+    ///
+    /// The slot wait keeps its original deadline. Returns false if an inventory write fails
+    /// and closes the connection, so the caller must not send the pending body.
+    async fn wait_for_block_upload_slot(&mut self, hash: block::Hash) -> bool {
+        let uploads = self.block_uploads.clone();
+        let ready = uploads.wait_for_upload_slot(hash);
+        tokio::pin!(ready);
+
+        while !matches!(self.state, State::Failed) {
+            tokio::select! {
+                biased;
+                () = &mut ready => return true,
+                Some(advert) = self.block_advert_rx.recv() => {
+                    self.send_block_advert(advert, None).await;
+                }
+            }
+        }
+        false
+    }
+
     /// Handle an internal client request, possibly generating outgoing messages to the
     /// remote peer.
     ///
@@ -1902,9 +1923,11 @@ where
                     match block {
                         Available((block, _)) => {
                             let hash = block.hash();
-                            // A large block we are advertising waits for an upload slot, so a
-                            // burst of requests for it cannot start every upload at once.
-                            self.block_uploads.wait_for_upload_slot(hash).await;
+                            // Pace this large body through upload slots while keeping fresh
+                            // block inventory writable.
+                            if !self.wait_for_block_upload_slot(hash).await {
+                                return;
+                            }
                             if let Err(e) = self.peer_tx.send(Message::Block(block)).await {
                                 self.fail_with(e).await;
                                 return;

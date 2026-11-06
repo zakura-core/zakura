@@ -363,7 +363,7 @@ pub struct Config {
     /// block is at least `advert_window_full_size_bytes`, or its size is unknown. At least 1.
     ///
     /// A peer holds its window entry only while its `inv` is being written, so the window paces
-    /// busy connections, not uploads. Uploads are bounded by the shared upload slots.
+    /// busy connections, not uploads. Shared upload slots pace larger bodies, with a bounded wait.
     ///
     /// The window grows linearly as the block size falls from `advert_window_full_size_bytes`
     /// to `advert_window_small_size_bytes`.
@@ -387,8 +387,9 @@ pub struct Config {
     /// `advert_window_max`. Must be below `advert_window_full_size_bytes`.
     ///
     /// A requested body of a larger block, or of a block of unknown size, waits for one of the
-    /// shared upload slots before it is written, so a burst of requests cannot start every upload
-    /// at once. Smaller bodies are written at once.
+    /// shared upload slots before it is written, for at most 5 s. After that wait it is written
+    /// without a slot, so the upload limit is soft under sustained load. Smaller bodies are
+    /// written at once.
     ///
     /// Experimental.
     pub advert_window_small_size_bytes: u64,

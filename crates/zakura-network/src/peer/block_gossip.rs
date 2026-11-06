@@ -7,14 +7,14 @@
 //! must not hold an entry: each would otherwise delay the rest of the fan-out by
 //! [`BLOCK_REQUEST_WAIT`].
 //!
-//! Uploads are bounded by the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots that every broadcast
+//! Uploads are paced by the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots that every broadcast
 //! shares, not by the window. A peer takes a slot once it requests the block and keeps it through
 //! the body write and its drain allowance. For a block above `advert_window_small_size_bytes`,
 //! or of unknown size, the connection also waits for that slot before it writes the body, for at
-//! most [`UPLOAD_SLOT_WAIT`], so a burst of requests for a large block cannot start every upload
-//! at once. A small block's body is written at once, as its burst is bounded by the connected
-//! peers times the small size. Requests for blocks that no broadcast is advertising to the peer,
-//! such as a syncing peer's, never wait for a slot.
+//! most [`UPLOAD_SLOT_WAIT`]. After that wait it writes without a slot, so the upload limit is
+//! soft under sustained load. A small block's body is written at once, as its burst is bounded
+//! by the connected peers times the small size. Requests for blocks that no broadcast is
+//! advertising to the peer, such as a syncing peer's, never wait for a slot.
 //!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
@@ -71,7 +71,7 @@ pub(crate) enum BlockAdvertError {
 
 /// Upload slots shared by every legacy block broadcast.
 ///
-/// A slot paces fan-out after a peer requests the block. It does not delay the body write.
+/// A slot delays a tracked large block's body write for at most [`UPLOAD_SLOT_WAIT`].
 pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
 
 /// Chooses how many peers one block broadcast advertises to at once, from the block's size.
@@ -123,8 +123,8 @@ impl AdvertFanout {
     /// Returns whether a requested body of a block of `size` serialized bytes waits for an
     /// upload slot before it is written.
     ///
-    /// Blocks above `small_size_bytes`, and blocks of unknown size, wait, so a burst of requests
-    /// for a large block stays bounded by the upload slots.
+    /// Blocks above `small_size_bytes`, and blocks of unknown size, wait for a slot for at most
+    /// [`UPLOAD_SLOT_WAIT`] before writing their bodies anyway.
     pub(crate) fn gates_uploads(&self, size: Option<u32>) -> bool {
         !size.is_some_and(|size| u64::from(size) <= self.small_size_bytes)
     }
@@ -1640,7 +1640,7 @@ mod tests {
                 peers,
                 hash,
                 TEST_WINDOW,
-                true,
+                false,
                 false,
                 slots.clone(),
             ));

@@ -901,3 +901,20 @@ fn the_committed_catalogue_pins_its_cases() {
         );
     }
 }
+
+/// An interrupted child stops the pilot with an error, so no result reads
+/// it as an invalid mutant or a harness failure. Every other end passes
+/// through.
+#[test]
+fn an_interrupt_stops_the_pilot() {
+    let error = stop_on_interrupt(ChildEnd::Interrupted).expect_err("an interrupt stops the pilot");
+    assert_eq!(error.to_string(), INTERRUPTED_ERROR);
+    for end in [
+        ChildEnd::Exited(0),
+        ChildEnd::Exited(1),
+        ChildEnd::TimedOut,
+        ChildEnd::Signaled(9),
+    ] {
+        assert_eq!(stop_on_interrupt(end).expect("not an interrupt"), end);
+    }
+}

@@ -82,8 +82,9 @@ const NON_UNWINDING: &str = "panic in a function that cannot unwind";
 /// How often the wrapper checks a child, the deadline and the interrupt.
 const POLL: Duration = Duration::from_millis(20);
 
-/// Set by SIGINT, SIGTERM or SIGHUP.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// Set by SIGINT, SIGTERM or SIGHUP once [`install_interrupt_handler`]
+/// runs. `planted pilot` shares it.
+pub(super) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// What the caller asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1662,7 +1663,9 @@ impl fmt::Display for ChildEnd {
 
 /// Runs `command` in a process group of its own, with stdin closed and its
 /// stdout and stderr in `log`. It's killed with its whole group when
-/// `deadline` passes or `interrupt` is set.
+/// `deadline` passes or `interrupt` is set. The group is also killed when
+/// the child exits, or when waiting for it fails, so no descendant outlives
+/// the call.
 pub(super) fn run_child(
     command: &mut Command,
     log: &Path,
@@ -1683,8 +1686,19 @@ pub(super) fn run_child(
         .map_err(|error| format!("starting {:?}: {error}", command.get_program()))?;
     let started = Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(exit(status));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The child is reaped, but its group lives on while any
+                // descendant does, so its ID still names only that group.
+                kill_group(&mut child);
+                return Ok(exit(status));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Err(error.into());
+            }
         }
         let end = if interrupt.load(Ordering::SeqCst) {
             ChildEnd::Interrupted
@@ -1756,7 +1770,7 @@ fn signal(_: ExitStatus) -> i32 {
 /// process groups, so a terminal's Ctrl-C reaches only the wrapper, which
 /// then kills the running child and writes the report.
 #[cfg(unix)]
-fn install_interrupt_handler() {
+pub(super) fn install_interrupt_handler() {
     extern "C" fn interrupted(_: libc::c_int) {
         INTERRUPTED.store(true, Ordering::SeqCst);
     }
@@ -1772,7 +1786,7 @@ fn install_interrupt_handler() {
 
 /// Outside Unix, an interrupt kills the wrapper as usual.
 #[cfg(not(unix))]
-fn install_interrupt_handler() {}
+pub(super) fn install_interrupt_handler() {}
 
 /// A log's text, lossily, at most its last 64 KiB.
 fn read_log(path: &Path) -> io::Result<String> {

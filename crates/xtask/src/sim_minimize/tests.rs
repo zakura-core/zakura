@@ -1087,3 +1087,53 @@ fn signals_set_the_interrupt_flag() {
         assert!(INTERRUPTED.load(Ordering::SeqCst), "signal {signal}");
     }
 }
+
+/// A child that exits leaves no descendant behind: `run_child` kills the
+/// child's process group once the child itself has exited.
+#[test]
+fn an_exited_child_leaves_no_descendant() {
+    let dir = TempDir::new().unwrap();
+    let pid_file = dir.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 600 & echo $! > \"$1\"")
+        .arg("sh")
+        .arg(&pid_file);
+    let end = run_child(
+        &mut command,
+        &dir.path().join("child.log"),
+        Some(Duration::from_secs(30)),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(end, ChildEnd::Exited(0));
+    let pid: libc::pid_t = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The killed descendant is gone once its new parent reaps it. Until
+    // then it's a zombie, which no longer runs.
+    let gone = || {
+        // SAFETY: signal 0 only checks that the process exists.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        let zombie = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .map(|rest| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false);
+        !exists || zombie
+    };
+    let started = Instant::now();
+    while !gone() && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        gone(),
+        "descendant {pid} still runs after run_child returned"
+    );
+}

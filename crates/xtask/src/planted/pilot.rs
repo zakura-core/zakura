@@ -43,7 +43,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::AtomicBool,
     time::Duration,
 };
 
@@ -57,7 +56,7 @@ use super::{
 use crate::{
     run_command,
     sim::SIM_RUSTFLAGS,
-    sim_minimize::{run_child, ChildEnd},
+    sim_minimize::{install_interrupt_handler, run_child, ChildEnd, INTERRUPTED},
     BoxError, UsageError,
 };
 
@@ -121,8 +120,9 @@ const FUZZ_FIELDS: &[&str] = &[
     "cargo_args",
 ];
 
-/// Never set: the runner's children run to their end or their deadline.
-static NO_INTERRUPT: AtomicBool = AtomicBool::new(false);
+/// The error that stops the pilot after SIGINT, SIGTERM or SIGHUP.
+pub(super) const INTERRUPTED_ERROR: &str =
+    "interrupted: the running child's process group was killed";
 
 /// The parts of the catalogue the runner reads.
 #[derive(Clone, Debug, Deserialize)]
@@ -300,6 +300,9 @@ pub(crate) fn run(
         }
     }
     let out = out.ok_or(UsageError("`planted pilot` needs --out <dir>"))?;
+    // Each child runs in its own process group, which a terminal's signal
+    // doesn't reach. The handler lets the running child's group be killed.
+    install_interrupt_handler();
     let bytes = fs::read(repo_root.join(CATALOGUE))?;
     let catalogue: Catalogue = serde_json::from_slice(&bytes)?;
     let cases = select(&catalogue.cases, &only)?;
@@ -916,7 +919,7 @@ fn campaign_lane(
         ])
         .arg(fuzz_target);
     let log = dir.join("build.log");
-    match run_child(&mut build, &log, None, &NO_INTERRUPT)? {
+    match run_pilot_child(&mut build, &log, None)? {
         ChildEnd::Exited(0) => {}
         end => {
             return Ok(Err(LaneError::Build(format!(
@@ -950,7 +953,7 @@ fn campaign_lane(
     let deadline = Duration::from_secs(bounds.seconds_per_seed) + CAMPAIGN_GRACE;
     // `start` exits 1 for any run that isn't complete, as a run a finding
     // stopped, so the store's records decide.
-    if run_child(&mut start, &log, Some(deadline), &NO_INTERRUPT)? == ChildEnd::TimedOut {
+    if run_pilot_child(&mut start, &log, Some(deadline))? == ChildEnd::TimedOut {
         return Ok(Err(LaneError::Run(format!(
             "`zakura-sim campaign start` ran past {} s; see {}",
             deadline.as_secs(),
@@ -988,7 +991,7 @@ fn campaign_lane(
         .args(["--run", &run, "--out"])
         .arg(&evidence_file);
     let log = dir.join("evidence.log");
-    let evidence = match run_child(&mut evidence, &log, None, &NO_INTERRUPT)? {
+    let evidence = match run_pilot_child(&mut evidence, &log, None)? {
         ChildEnd::Exited(0) => serde_json::from_slice::<Value>(&fs::read(&evidence_file)?)?,
         end => {
             return Ok(Err(LaneError::Run(format!(
@@ -1236,12 +1239,7 @@ fn confirm_and_replay(
         .arg(input)
         .args(["--property", property, "--out"])
         .arg(&confirm_dir);
-    let ended = run_child(
-        &mut confirm,
-        &dir.join("confirm.log"),
-        Some(child),
-        &NO_INTERRUPT,
-    )?;
+    let ended = run_pilot_child(&mut confirm, &dir.join("confirm.log"), Some(child))?;
     let confirmation = fs::read(confirm_dir.join(CONFIRMATION_FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
@@ -1252,15 +1250,13 @@ fn confirm_and_replay(
     let log = dir.join("replay.log");
     let mut replay = Command::new(sim);
     replay.arg("replay").arg(&trace);
-    Ok(
-        match run_child(&mut replay, &log, Some(child), &NO_INTERRUPT)? {
-            ChildEnd::Exited(0) => Ok(()),
-            end => Err(format!(
-                "the confirmed trace doesn't replay Exact: `zakura-sim replay` {end}; see {}",
-                log.display()
-            )),
-        },
-    )
+    Ok(match run_pilot_child(&mut replay, &log, Some(child))? {
+        ChildEnd::Exited(0) => Ok(()),
+        end => Err(format!(
+            "the confirmed trace doesn't replay Exact: `zakura-sim replay` {end}; see {}",
+            log.display()
+        )),
+    })
 }
 
 /// The confirmed trace's directory, relative to the confirmation's, from a
@@ -1481,10 +1477,28 @@ fn build_sim(
         tree.display(),
         log.display()
     );
-    Ok(match run_child(&mut cargo, log, None, &NO_INTERRUPT)? {
+    Ok(match run_pilot_child(&mut cargo, log, None)? {
         ChildEnd::Exited(0) => Ok(target.join("debug").join("zakura-sim")),
         end => Err(format!("`cargo build` {end}; see {}", log.display())),
     })
+}
+
+/// Runs `command` with [`run_child`] and the flag that the pilot's signal
+/// handler sets. An interrupt kills the child's group and stops the pilot.
+fn run_pilot_child(
+    command: &mut Command,
+    log: &Path,
+    deadline: Option<Duration>,
+) -> Result<ChildEnd, BoxError> {
+    stop_on_interrupt(run_child(command, log, deadline, &INTERRUPTED)?)
+}
+
+/// `end`, or the error that stops the pilot if an interrupt ended the child.
+fn stop_on_interrupt(end: ChildEnd) -> Result<ChildEnd, BoxError> {
+    match end {
+        ChildEnd::Interrupted => Err(INTERRUPTED_ERROR.into()),
+        end => Ok(end),
+    }
 }
 
 /// Checks out `rev` in a new detached worktree at `path`, replacing any

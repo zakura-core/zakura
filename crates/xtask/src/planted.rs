@@ -931,12 +931,17 @@ fn record(
         None => format!("exited with {}", zakura_sim.status()?),
         Some(deadline) => {
             let log = out.with_extension("log");
+            // Only the pilot passes a deadline, and it installs the signal
+            // handler that sets the flag.
             let end = sim_minimize::run_child(
                 &mut zakura_sim,
                 &log,
                 Some(deadline),
-                &AtomicBool::new(false),
+                &sim_minimize::INTERRUPTED,
             )?;
+            if end == sim_minimize::ChildEnd::Interrupted {
+                return Err(pilot::INTERRUPTED_ERROR.into());
+            }
             format!("{end}; see {}", log.display())
         }
     };

@@ -82,6 +82,9 @@ independently.
   a healthy connection, and an alternate connection that lifted the ten-minute
   ALPN-mismatch backoff
   ([#2062](https://github.com/zakura-core/zakura/pull/2062)).
+- Reduced redundant block and transaction decoding when fetching inventory over
+  Zakura compatibility streams
+  ([#2057](https://github.com/zakura-core/zakura/pull/2057)).
 
 ## [1.8.3] - 2026-11-05
 

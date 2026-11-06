@@ -50,7 +50,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     rc::Rc,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError,
+    },
     time::Duration,
 };
 
@@ -72,7 +75,7 @@ use zakura_rt::{
 };
 use zakura_scheduler::SimInstant;
 
-pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody};
+pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,
@@ -992,12 +995,31 @@ fn bind_config(addr: SocketAddr) -> QuicBindConfig {
 }
 
 /// Hands each connection the node opens to the peer's task, and holds it
-/// until it closes.
-struct Forward(mpsc::Sender<Conn>);
+/// until it closes. It holds one at a time.
+struct Forward {
+    to_task: mpsc::Sender<Conn>,
+    /// Connections handed over and not closed yet.
+    live: Arc<AtomicUsize>,
+}
+
+/// Counts one live connection of a [`Forward`] until dropped.
+struct Live(Arc<AtomicUsize>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl Acceptor for Forward {
-    /// Accepts every attempt.
-    fn admit(&self, _: &IncomingInfo) -> Admit {
+    /// Accepts an attempt while no other is in its handshake or live, and
+    /// refuses it otherwise. So each connection the node opens reaches the
+    /// peer, and gets its handshake outcome, one after another
+    /// ([`WireEvidence`]'s incarnations).
+    fn admit(&self, incoming: &IncomingInfo) -> Admit {
+        if incoming.pending_total > 0 || self.live.load(Ordering::SeqCst) > 0 {
+            return Admit::Refuse;
+        }
         Admit::Accept
     }
 
@@ -1006,10 +1028,14 @@ impl Acceptor for Forward {
         vec![P2P_V2_ALPN.to_vec()]
     }
 
-    /// Forwards the connection, then holds it until it closes.
+    /// Counts the connection live before the endpoint drops its pending
+    /// handshake, forwards it, then holds it until it closes.
     fn handle(&self, conn: Conn) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let forward = self.0.clone();
+        let forward = self.to_task.clone();
+        self.live.fetch_add(1, Ordering::SeqCst);
+        let live = Live(self.live.clone());
         Box::pin(async move {
+            let _live = live;
             if forward.send(conn.clone()).await.is_ok() {
                 conn.closed().await;
             }
@@ -1250,7 +1276,7 @@ impl PeerTask {
             else {
                 return;
             };
-            let remote = peer_addr(self.index, dial);
+            let remote = Remote::first(peer_addr(self.index, dial));
             if let Ended::Failed = self.serve(&conn, negotiated, remote, scripts).await {
                 return;
             }
@@ -1276,27 +1302,29 @@ impl PeerTask {
         }
     }
 
-    /// Listens for the node's dials, and answers each one's handshake.
+    /// Listens for the node's dials, and answers each one's handshake. Each
+    /// connection is the next incarnation at the peer's address.
     async fn listen(&mut self, local: &Local, scripts: &mut Scripts) {
         let quic = self.bind(0);
-        let (forward, mut incoming) = mpsc::channel(4);
-        quic.serve(Forward(forward))
-            .expect("a peer's endpoint serves");
+        let (to_task, mut incoming) = mpsc::channel(4);
+        quic.serve(Forward {
+            to_task,
+            live: Arc::default(),
+        })
+        .expect("a peer's endpoint serves");
         self.listening.send_replace(true);
         let echo = if self.spec.bad_nonce_echo {
             Echo::Wrong
         } else {
             Echo::Faithful
         };
+        let mut remote = Remote::first(peer_addr(self.index, 0));
         while let Some(conn) = incoming.recv().await {
             let answered =
                 handshake::respond(&conn, conn.remote_id(), self.spec.capabilities, echo, local)
                     .await;
             let ended = match answered {
-                Ok(negotiated) => {
-                    self.serve(&conn, negotiated, peer_addr(self.index, 0), scripts)
-                        .await
-                }
+                Ok(negotiated) => self.serve(&conn, negotiated, remote, scripts).await,
                 Err(_) => {
                     conn.closed().await;
                     Ended::Closed
@@ -1305,12 +1333,13 @@ impl PeerTask {
             if let Ended::Failed = ended {
                 return;
             }
+            remote.incarnation += 1;
         }
     }
 
     /// Records `body` on `remote`'s QUIC stream `quic_stream`, for
     /// [`PeerControl`] to place.
-    fn record(&self, remote: SocketAddr, quic_stream: u64, body: RecordBody) {
+    fn record(&self, remote: Remote, quic_stream: u64, body: RecordBody) {
         self.records.borrow_mut().push_back(PeerRecord {
             remote,
             quic_stream,
@@ -1323,7 +1352,7 @@ impl PeerTask {
     /// False once a write fails, which leaves the rest unwritten.
     async fn write(
         &self,
-        remote: SocketAddr,
+        remote: Remote,
         stream: &mut HeaderStream,
         frames: Vec<Outgoing>,
     ) -> bool {
@@ -1357,7 +1386,7 @@ impl PeerTask {
         &mut self,
         conn: &Conn,
         negotiated: u64,
-        remote: SocketAddr,
+        remote: Remote,
         scripts: &mut Scripts,
     ) -> Ended {
         let header_sync = negotiated & ZAKURA_CAP_HEADER_SYNC != 0;

@@ -9,8 +9,8 @@ use std::{
 use zakura_scheduler::{Op, SimInstant};
 
 use super::{
-    Assume, Assumptions, Capture, Cardinality, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
-    LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
+    Assume, Assumptions, Capture, Cardinality, CheckCtx, EndViolation, FactAnswer, HasView,
+    Inconclusive, Kind, LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
 };
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
@@ -248,13 +248,19 @@ impl Sources {
 ///    the first `Holds` or `Violated` emits `Lifecycle::Applicable`.
 /// 3. It expires each `VirtualTime` obligation whose deadline is behind the
 ///    clock. A discharge at exactly the deadline is in time.
+///    A deferred obligation's deadline is its deferral's instant.
 /// 4. It walks the step's observations in order. A point first counts
 ///    toward each `Ops` bound it reaches, and expires that obligation once
 ///    past `max`. Then the observation discharges the open obligations
 ///    whose trigger it follows and that it matches: the oldest one of
 ///    [`Cardinality::One`], and every one of [`Cardinality::Every`].
-/// 5. When no task can run after the step, it expires every
-///    `BeforeQuiescence` obligation still open.
+/// 5. It walks the view-side facts the step added, in stamp order, the
+///    same way, for the obligations facts answer
+///    ([`FactDischarge`](super::FactDischarge)). A fact can also defer a
+///    `BeforeQuiescence` obligation ([`FactAnswer::DefersTo`]), which then
+///    expires at once if its instant is already behind the clock.
+/// 6. When no task can run after the step, it expires every
+///    `BeforeQuiescence` obligation still open that isn't deferred.
 ///
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
@@ -262,7 +268,7 @@ impl Sources {
 /// keeps every violation its property had.
 pub struct RegistryChecker<S: HasView> {
     properties: Vec<Property<S>>,
-    state: Vec<PropertyState>,
+    state: Vec<PropertyState<S::View>>,
     handle: Rc<S>,
     holds: fn(&S, Assume) -> bool,
     events: Vec<CheckEvent>,
@@ -270,11 +276,12 @@ pub struct RegistryChecker<S: HasView> {
     failure: Option<HarnessFailure>,
     /// True if the scenario declares `BoundedAdversary`.
     bounded: bool,
+    /// The stamp of the last view-side fact the registry offered.
+    offered: Option<u64>,
 }
 
 /// One property's progress through a run.
-#[derive(Default)]
-struct PropertyState {
+struct PropertyState<V> {
     /// True if the scenario declares every assumption the property needs.
     declared: bool,
     /// The first source the property needs that the harness's tier
@@ -288,7 +295,7 @@ struct PropertyState {
     /// Every violation, in order.
     violations: Vec<Violation>,
     /// Open obligations, oldest first.
-    open: Vec<Open>,
+    open: Vec<Open<V>>,
     /// The step and time after which all the property's assumptions have
     /// held. `None` while one doesn't, and always for a property with none.
     holds_since: Option<(u64, SimInstant)>,
@@ -302,20 +309,65 @@ struct PropertyState {
     peaks: BTreeMap<String, u64>,
 }
 
+impl<V> PropertyState<V> {
+    /// A property's state before the run, with whether the scenario
+    /// `declared` its assumptions and the source it needs that the tier
+    /// `excluded`.
+    fn new(declared: bool, excluded: Option<String>) -> Self {
+        PropertyState {
+            declared,
+            excluded,
+            applicable: 0,
+            announced: false,
+            violations: Vec::new(),
+            open: Vec::new(),
+            holds_since: None,
+            ever_held: false,
+            inconclusive: None,
+            unsettled: None,
+            peaks: BTreeMap::new(),
+        }
+    }
+}
+
 /// An open obligation.
-struct Open {
-    obligation: Obligation,
+struct Open<V> {
+    obligation: Obligation<V>,
     /// The step the check opened it at.
     registered: u64,
     /// Points counted toward an `Ops` bound since then.
     ops: u32,
+    /// The deadline a view-side fact deferred it to, if one did.
+    deferred: Option<SimInstant>,
 }
 
-impl Open {
+impl<V> Open<V> {
     /// True if observation `at` of `step` came after the trigger, so it may
     /// discharge the obligation.
     fn follows(&self, step: u64, at: usize) -> bool {
         step > self.registered || self.obligation.trigger.is_some_and(|trigger| at > trigger)
+    }
+
+    /// The answer of the view-side fact with `stamp`, which `step` added, or
+    /// `None` if facts don't answer the obligation or the fact doesn't
+    /// follow its trigger.
+    fn fact(&self, step: u64, view: &V, stamp: u64) -> Option<FactAnswer> {
+        let facts = self.obligation.facts.as_ref()?;
+        let follows = step > self.registered || facts.after.is_some_and(|after| stamp > after);
+        follows.then(|| (facts.answer)(&self.obligation.key, view, stamp))
+    }
+
+    /// The deadline the obligation expires after: its deferral's, or a
+    /// `VirtualTime` bound's from the later of its trigger and
+    /// `holds_since`. `None` for neither, or past the largest instant.
+    fn deadline(&self, holds_since: Option<SimInstant>) -> Option<SimInstant> {
+        match (self.deferred, self.obligation.bound) {
+            (Some(at), _) => Some(at),
+            (None, LivenessBound::VirtualTime(within)) => {
+                deadline(&self.obligation, holds_since, within)
+            }
+            (None, _) => None,
+        }
     }
 }
 
@@ -351,11 +403,10 @@ impl<S: HasView> RegistryChecker<S> {
                         }
                     }
                 }
-                PropertyState {
-                    declared: property.assumes.iter().all(|a| assumptions.declares(*a)),
+                PropertyState::new(
+                    property.assumes.iter().all(|a| assumptions.declares(*a)),
                     excluded,
-                    ..PropertyState::default()
-                }
+                )
             })
             .collect();
         RegistryChecker {
@@ -366,6 +417,7 @@ impl<S: HasView> RegistryChecker<S> {
             events: Vec::new(),
             failure,
             bounded: assumptions.declares(Assume::BoundedAdversary),
+            offered: None,
         }
     }
 
@@ -418,6 +470,27 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         let mut first = None;
         let mut capture = None;
+        let facts = self.handle.stamps_after(self.offered);
+        if let Some(stamps) = &facts {
+            let ordered = std::iter::once(self.offered)
+                .chain(stamps.iter().copied().map(Some))
+                .is_sorted_by(|earlier, later| earlier < later);
+            if !ordered {
+                self.failure
+                    .get_or_insert_with(|| HarnessFailure::SourceEvidence {
+                        source: "view facts".to_owned(),
+                        detail: format!(
+                            "StampsOutOfOrder: after {:?}, the view reports {stamps:?}",
+                            self.offered
+                        ),
+                    });
+                return None;
+            }
+            if let Some(&last) = stamps.last() {
+                self.offered = Some(last);
+            }
+        }
+        let mut view = None;
         for (at, (property, state)) in self.properties.iter().zip(&mut self.state).enumerate() {
             if !state.declared || state.excluded.is_some() {
                 continue;
@@ -440,7 +513,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             let violations = step_property(
                 (&self.properties, at),
                 state,
-                &self.handle,
+                (&self.handle, facts.as_deref(), &mut view),
                 self.holds,
                 &mut self.events,
                 &mut self.failure,
@@ -515,11 +588,12 @@ impl<S: HasView> Checker for RegistryChecker<S> {
 /// Steps one declared property, and returns its violations this step: the
 /// verdict's, the ones the check recorded, then each expired obligation's.
 /// Evidence the check found missing becomes `failure` unless one is already
-/// pending.
+/// pending. `facts` are the stamps of the view-side facts the step added,
+/// and `view` caches the step's view for the properties that read them.
 fn step_property<S: HasView>(
     (properties, at): (&[Property<S>], usize),
-    state: &mut PropertyState,
-    handle: &S,
+    state: &mut PropertyState<S::View>,
+    (handle, facts, view): (&S, Option<&[u64]>, &mut Option<S::View>),
     holds: fn(&S, Assume) -> bool,
     events: &mut Vec<CheckEvent>,
     failure: &mut Option<HarnessFailure>,
@@ -554,7 +628,7 @@ fn step_property<S: HasView>(
     }
 
     let mut violations = Vec::new();
-    let mut ccx = CheckCtx::new(cx, handle, property, properties);
+    let mut ccx = CheckCtx::new(cx, handle, (property, properties), facts);
     let verdict = (property.check)(&mut ccx);
     let parts = ccx.into_parts();
     if let Some(detail) = parts.missing {
@@ -590,24 +664,28 @@ fn step_property<S: HasView>(
             obligation,
             registered: cx.step,
             ops: 0,
+            deferred: None,
         });
     }
 
     let floor = state.holds_since.map(|(_, at)| at);
-    // Every observation of the step happened at `cx.now`, so none can
-    // discharge an obligation whose deadline is already behind it.
-    state.open.retain(|open| {
-        let LivenessBound::VirtualTime(within) = open.obligation.bound else {
-            return true;
-        };
-        let overdue =
-            deadline(&open.obligation, floor, within).is_some_and(|deadline| cx.now > deadline);
-        if overdue {
-            events.push(event(Lifecycle::Expired));
-            violations.push(expiry(property, open, floor, cx));
-        }
-        !overdue
-    });
+    // Every observation and fact of the step happened at `cx.now`, so none
+    // can discharge an obligation whose deadline is already behind it.
+    let expire_overdue = |open: &mut Vec<Open<S::View>>,
+                          events: &mut Vec<CheckEvent>,
+                          violations: &mut Vec<Violation>| {
+        open.retain(|open| {
+            let overdue = open
+                .deadline(floor)
+                .is_some_and(|deadline| cx.now > deadline);
+            if overdue {
+                events.push(event(Lifecycle::Expired));
+                violations.push(expiry(property, open, floor, cx));
+            }
+            !overdue
+        });
+    };
+    expire_overdue(&mut state.open, events, &mut violations);
     for (at, obs) in cx.observations().enumerate() {
         // A point counts toward its `Ops` bound, and can expire it, before it
         // can discharge it.
@@ -642,9 +720,46 @@ fn step_property<S: HasView>(
             !discharge
         });
     }
+    let stamps = facts.unwrap_or_default();
+    if !stamps.is_empty()
+        && state
+            .open
+            .iter()
+            .any(|open| open.obligation.facts.is_some())
+    {
+        let view = &*view.get_or_insert_with(|| handle.view());
+        for &stamp in stamps {
+            let mut one_discharged = false;
+            state.open.retain_mut(|open| {
+                let discharge = match open.fact(cx.step, view, stamp) {
+                    None | Some(FactAnswer::Unrelated) => false,
+                    Some(FactAnswer::Discharges) => match open.obligation.cardinality {
+                        Cardinality::Every => true,
+                        Cardinality::One => !std::mem::replace(&mut one_discharged, true),
+                    },
+                    Some(FactAnswer::DefersTo(at)) => {
+                        assert_eq!(
+                            open.obligation.bound,
+                            LivenessBound::BeforeQuiescence,
+                            "only a BeforeQuiescence obligation defers"
+                        );
+                        open.deferred = Some(at);
+                        open.obligation.witness.push(cx.step);
+                        false
+                    }
+                };
+                if discharge {
+                    events.push(event(Lifecycle::Discharged));
+                }
+                !discharge
+            });
+        }
+    }
+    expire_overdue(&mut state.open, events, &mut violations);
 
     state.open.retain(|open| {
         let gone = open.obligation.bound == LivenessBound::BeforeQuiescence
+            && open.deferred.is_none()
             && cx.status != zakura_scheduler::Status::Running;
         if gone {
             events.push(event(Lifecycle::Expired));
@@ -666,8 +781,8 @@ fn reaches(obs: &Observation, task: &str, op: &str) -> bool {
 
 /// A `VirtualTime` obligation's deadline: `within` after the later of its
 /// trigger and `holds_since`. `None` if that passes the largest instant.
-fn deadline(
-    obligation: &Obligation,
+fn deadline<V>(
+    obligation: &Obligation<V>,
     holds_since: Option<SimInstant>,
     within: std::time::Duration,
 ) -> Option<SimInstant> {
@@ -678,21 +793,28 @@ fn deadline(
 /// The violation an expired obligation reports.
 fn expiry<S: HasView>(
     property: &Property<S>,
-    open: &Open,
+    open: &Open<S::View>,
     holds_since: Option<SimInstant>,
     cx: &StepCtx<'_>,
 ) -> Violation {
     let obligation = &open.obligation;
     let subject = &obligation.key.subject;
-    let (expected, actual) = match obligation.bound {
-        LivenessBound::BeforeQuiescence => (
+    let (expected, actual) = match (open.deferred, obligation.bound) {
+        (Some(at), _) => (
+            format!(
+                "{subject:?} discharged by its deferred deadline, {} ns",
+                at.since_start().as_nanos()
+            ),
+            format!("still open at {} ns", cx.now.since_start().as_nanos()),
+        ),
+        (None, LivenessBound::BeforeQuiescence) => (
             format!("{subject:?} discharged before quiescence"),
             format!(
                 "the scheduler is {:?} after step {} with the obligation from step {} open",
                 cx.status, cx.step, obligation.opened_at
             ),
         ),
-        LivenessBound::VirtualTime(within) => (
+        (None, LivenessBound::VirtualTime(within)) => (
             format!(
                 "{subject:?} discharged by {} ns",
                 deadline(obligation, holds_since, within)
@@ -700,7 +822,7 @@ fn expiry<S: HasView>(
             ),
             format!("still open at {} ns", cx.now.since_start().as_nanos()),
         ),
-        LivenessBound::Ops { task, op, max, .. } => (
+        (None, LivenessBound::Ops { task, op, max, .. }) => (
             format!(
                 "{subject:?} discharged within {max} {} points of {task}",
                 op.name()
@@ -723,7 +845,7 @@ fn expiry<S: HasView>(
 
 /// A property's run outcome, from strongest to weakest: violated,
 /// inconclusive, held, then not applicable.
-fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState) -> PropertyOutcome {
+fn outcome<S: HasView>(property: &Property<S>, state: &PropertyState<S::View>) -> PropertyOutcome {
     if let Some(violation) = state.violations.first() {
         return PropertyOutcome::Violated {
             witness: violation.witness.clone(),

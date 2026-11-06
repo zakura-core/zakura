@@ -190,6 +190,20 @@ pub fn run_prepared<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
+    let (report, ()) = run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_| ())?;
+    Ok(report)
+}
+
+/// [`run_prepared`], also returning what `read` takes from the harness once
+/// the run ends, such as its view.
+pub(crate) fn run_reading<S: Subsystem, T>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+    read: impl FnOnce(&S) -> T,
+) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
@@ -201,6 +215,7 @@ pub fn run_prepared<S: Subsystem>(
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
     };
+    let read = read(&this);
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);
@@ -210,7 +225,7 @@ pub fn run_prepared<S: Subsystem>(
             failure: failure.clone(),
             report: Box::new(report),
         }),
-        _ => Ok(report),
+        _ => Ok((report, read)),
     }
 }
 

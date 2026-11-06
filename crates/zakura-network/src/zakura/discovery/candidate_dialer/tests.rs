@@ -1234,3 +1234,117 @@ async fn the_dialer_loop_dials_once_per_interval_through_completions() {
     dialer.abort();
     node.shutdown().await;
 }
+
+// V12 F-583: each dial holds one of the handler's admission permits from its
+// start. A round that counted only the transport's free slots could admit
+// more dials than free permits, and the extra workers then failed as local
+// limits. The round now admits at most one candidate per free permit.
+#[tokio::test]
+async fn a_round_admits_no_more_dials_than_free_admission_permits() {
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9217)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let endpoint = node.endpoint();
+    let permits = endpoint.discovery_dial_permits();
+    let held = endpoint
+        .hold_admission_permits(u32::try_from(permits - 1).expect("the test node has few permits"));
+    assert_eq!(endpoint.discovery_dial_permits(), 1);
+    assert!(
+        endpoint.discovery_admission_capacity() >= 3,
+        "the transport has a slot for each candidate"
+    );
+    let ranked = insert_ranked_static_candidates(
+        &node.discovery(),
+        1,
+        [[93, 184, 216, 34], [198, 51, 100, 7], [203, 0, 113, 9]]
+            .into_iter()
+            .map(|ip| vec![SocketAddr::new(IpAddr::from(ip), 8233)])
+            .collect(),
+    )
+    .await;
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+
+    let admitted = admit_dial_round(
+        &endpoint,
+        &node.discovery(),
+        &[],
+        &mut state,
+        Instant::now(),
+    )
+    .await;
+
+    assert_eq!(
+        admitted
+            .iter()
+            .map(|(attempt, _)| attempt.node_id)
+            .collect::<Vec<_>>(),
+        ranked[..1]
+    );
+    drop(held);
+}
+
+// V12 F-581: the loop's `select!` settles one finished worker per wake. When
+// several workers finish with the round timer, the ones it hasn't settled
+// still count as in flight, and the round could dial only the slots they
+// leave. The loop now settles every finished worker before it starts a round.
+#[tokio::test]
+async fn finished_workers_settle_before_the_round_starts() {
+    let node = crate::zakura::testkit::ZakuraTestNode::builder(9218)
+        .spawn()
+        .await
+        .expect("dialer spawns");
+    let endpoint = node.endpoint();
+    let mut io = CandidateDialerIO {
+        endpoint: endpoint.clone(),
+        discovery: node.discovery(),
+        limits: ZakuraLocalLimits::from_config(&crate::Config::default()),
+        sought_services: Vec::new(),
+        trace: endpoint.trace(),
+        workers: FuturesUnordered::new(),
+    };
+    let mut state = CandidateDialerState::new(DIAL_BACKOFF);
+    // Three attempts from an earlier round whose workers have finished.
+    let mut finished = Vec::new();
+    for byte in 50..53 {
+        let attempt = state
+            .record_attempt(node_id(byte), vec![IpAddr::from([192, 0, 2, byte])])
+            .expect("a fresh dialer records the attempt");
+        finished.push(attempt.node_id);
+        io.workers.push(DiscoveryDialWorker::spawn(attempt, async {
+            DiscoveryDialOutcome {
+                admitted_ip: None,
+                result: DiscoveryDialResult::Failed,
+                phase: DialPhase::WorkerFinished,
+            }
+        }));
+    }
+    zakura_rt::time::timeout(Duration::from_secs(5), async {
+        while !io.workers.iter().all(|worker| worker.task.is_finished()) {
+            zakura_rt::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the finished workers' tasks end");
+    // Four candidates fill the round's four concurrent dial slots.
+    let ranked = insert_ranked_static_candidates(
+        &node.discovery(),
+        1,
+        (1..=4)
+            .map(|byte| vec![SocketAddr::new(IpAddr::from([203, 0, 113, byte]), 8233)])
+            .collect(),
+    )
+    .await;
+
+    io.start_due_round(&mut state, Instant::now()).await;
+
+    let mut in_flight = state.in_flight_node_ids();
+    in_flight.sort_unstable_by_key(|node_id| *node_id.as_bytes());
+    assert_eq!(
+        in_flight, ranked,
+        "the earlier attempts settle, and the round dials every candidate"
+    );
+    // A shutdown would wait out the drain of the silent attempts, so the
+    // runtime's end drops the node instead.
+    drop(io);
+}

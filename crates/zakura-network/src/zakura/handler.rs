@@ -1243,6 +1243,24 @@ impl ZakuraEndpoint {
         self.quic.discovery_capacity()
     }
 
+    /// How many dials discovery can start now: the handler's free admission
+    /// permits. Each dial holds one permit from its start, or fails as a
+    /// local limit without one.
+    pub(crate) fn discovery_dial_permits(&self) -> usize {
+        self.handler.admission.available_permits()
+    }
+
+    /// Holds `count` of the handler's admission permits until the returned
+    /// permit drops.
+    #[cfg(test)]
+    pub(crate) fn hold_admission_permits(&self, count: u32) -> OwnedSemaphorePermit {
+        self.handler
+            .admission
+            .clone()
+            .try_acquire_many_owned(count)
+            .expect("the test holds free permits")
+    }
+
     /// Stop accepting, close every native connection and drain background tasks.
     pub async fn shutdown(&self) {
         if let Some(tasks) = &self.header_sync_tasks {

@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tracing::debug;
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
@@ -146,9 +146,7 @@ pub(crate) async fn run_native_discovery_dialer(
             break;
         }
         let now = Instant::now();
-        if state.begin_round(now) {
-            io.spawn_dial_round(&mut state).await;
-        }
+        io.start_due_round(&mut state, now).await;
         // A worker completion wakes the loop before the round deadline, and
         // `begin_round` then refuses to start a round, so completions can't
         // speed up the cadence.
@@ -182,6 +180,21 @@ struct CandidateDialerIO {
 }
 
 impl CandidateDialerIO {
+    /// Settles every worker that has already finished, then starts a dial
+    /// round if one is due at `now`.
+    ///
+    /// The loop's `select!` settles one finished worker per wake, so several
+    /// workers that finish with the round timer would otherwise still count
+    /// as in flight and shrink the round.
+    async fn start_due_round(&mut self, state: &mut CandidateDialerState, now: Instant) {
+        while let Some(Some((attempt, outcome))) = self.workers.next().now_or_never() {
+            self.settle(state, attempt, outcome).await;
+        }
+        if state.begin_round(now) {
+            self.spawn_dial_round(state).await;
+        }
+    }
+
     /// Dials the discovery book's candidates that [`admit_dial_round`]
     /// records, one worker per attempt.
     async fn spawn_dial_round(&mut self, state: &mut CandidateDialerState) {
@@ -298,7 +311,8 @@ impl Future for DiscoveryDialWorker {
 /// include those whose IPs are all at the per-IP cap or in backoff, and those
 /// with more addresses than the endpoint has free discovery slots: the
 /// transport claims a slot for every address or fails the whole dial as a
-/// local limit.
+/// local limit. The round also admits no more candidates than the handler has
+/// free admission permits, since each dial holds one.
 async fn admit_dial_round(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
@@ -307,9 +321,10 @@ async fn admit_dial_round(
     now: Instant,
 ) -> Vec<(DialAttemptKey, NodeAddr)> {
     // No worker of this round dials before the round ends, so the round
-    // counts down the slots its own attempts will claim.
+    // counts down the slots and permits its own attempts will claim.
     let mut free_slots = endpoint.discovery_admission_capacity();
-    if free_slots == 0 {
+    let mut free_permits = endpoint.discovery_dial_permits();
+    if free_slots == 0 || free_permits == 0 {
         return Vec::new();
     }
     let supervisor = endpoint.supervisor();
@@ -320,7 +335,7 @@ async fn admit_dial_round(
             sought_services,
             &in_flight_node_ids,
             |candidate| {
-                if free_slots == 0 {
+                if free_slots == 0 || free_permits == 0 {
                     return DialAdmission::Exhausted;
                 }
                 let Some((node_addr, reserved_ips)) = discovery_node_addr_with_reserved_ip_capacity(
@@ -339,6 +354,7 @@ async fn admit_dial_round(
                     return DialAdmission::Skipped;
                 };
                 free_slots -= claimed_slots;
+                free_permits -= 1;
                 admitted.push((attempt, node_addr));
                 DialAdmission::Admitted
             },

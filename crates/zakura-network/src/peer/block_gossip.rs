@@ -112,7 +112,7 @@ impl AdvertFanout {
             metrics::histogram!("peer.block_gossip.advert_block_size_bytes")
                 .record(f64::from(size));
         }
-        // Windows are at most a few hundred peers, so they convert exactly.
+        // Windows are at most a few thousand peers, so they convert exactly.
         #[allow(clippy::cast_precision_loss)]
         metrics::histogram!("peer.block_gossip.advert_window").record(window as f64);
         window
@@ -1192,7 +1192,7 @@ mod tests {
         (0..count).map(|_| peer().0).collect()
     }
 
-    /// The default window falls linearly from 64 at 100 KiB to 32 at 1.5 MiB.
+    /// The default window falls linearly from 2000 at 100 KiB to 1000 at 1.5 MiB.
     #[test]
     fn default_advert_window_follows_block_size() {
         /// A full NU7 block, just below the reference size.
@@ -1202,19 +1202,19 @@ mod tests {
         const MID_SIZE: u32 = (SMALL_SIZE + FULL_SIZE) / 2;
         let fanout = AdvertFanout::from_config(&Config::default());
 
-        assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 33);
-        assert_eq!(fanout.window(Some(FULL_SIZE)), 32);
-        assert_eq!(fanout.window(Some(FULL_SIZE + 1)), 32);
-        assert_eq!(fanout.window(Some(u32::MAX)), 32);
-        assert_eq!(fanout.window(Some(0)), 64);
-        assert_eq!(fanout.window(Some(SMALL_SIZE - 1)), 64);
-        assert_eq!(fanout.window(Some(SMALL_SIZE)), 64);
-        assert_eq!(fanout.window(Some(SMALL_SIZE + 1)), 63);
-        assert_eq!(fanout.window(None), 32);
+        assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 1040);
+        assert_eq!(fanout.window(Some(FULL_SIZE)), 1000);
+        assert_eq!(fanout.window(Some(FULL_SIZE + 1)), 1000);
+        assert_eq!(fanout.window(Some(u32::MAX)), 1000);
+        assert_eq!(fanout.window(Some(0)), 2000);
+        assert_eq!(fanout.window(Some(SMALL_SIZE - 1)), 2000);
+        assert_eq!(fanout.window(Some(SMALL_SIZE)), 2000);
+        assert_eq!(fanout.window(Some(SMALL_SIZE + 1)), 1999);
+        assert_eq!(fanout.window(None), 1000);
         // The mid-point is exact, and the result floors on either side of it.
-        assert_eq!(fanout.window(Some(MID_SIZE)), 48);
-        assert_eq!(fanout.window(Some(MID_SIZE - 1)), 48);
-        assert_eq!(fanout.window(Some(MID_SIZE + 1)), 47);
+        assert_eq!(fanout.window(Some(MID_SIZE)), 1500);
+        assert_eq!(fanout.window(Some(MID_SIZE - 1)), 1500);
+        assert_eq!(fanout.window(Some(MID_SIZE + 1)), 1499);
     }
 
     /// Equal bounds give a fixed window, and large bounds do not overflow.
@@ -1259,24 +1259,28 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn first_wave_follows_block_size() {
         let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
-        assert_eq!(wave(100, 1_513_987).await.len(), 33);
-        assert_eq!(wave(100, 10_000_000).await.len(), 32);
-        assert_eq!(wave(100, 2_000).await.len(), 64);
-        assert_eq!(wave(100, 102_400).await.len(), 64);
-        assert_eq!(wave(100, 102_401).await.len(), 63);
-        assert_eq!(wave(40, 2_000).await.len(), 40);
+        assert_eq!(wave(2_100, 1_513_987).await.len(), 1040);
+        assert_eq!(wave(2_100, 10_000_000).await.len(), 1000);
+        assert_eq!(wave(2_100, 2_000).await.len(), 2000);
+        assert_eq!(wave(2_100, 102_400).await.len(), 2000);
+        assert_eq!(wave(2_100, 102_401).await.len(), 1999);
+        assert_eq!(wave(400, 2_000).await.len(), 400);
     }
 
     /// Sidecars beyond the window are all advertised at once, outside the window.
     #[tokio::test(start_paused = true)]
     async fn sidecars_beyond_the_window_go_first() {
-        // More sidecars than the minimum window of 32, which a 10 MB block uses.
+        // More sidecars than a minimum window of 32, which a 10 MB block uses.
         const SIDECARS: usize = 40;
+        let config = Config {
+            advert_window_min: 32,
+            ..Config::default()
+        };
         let mut peers = plain_peers(SIDECARS + 40);
         for peer in &mut peers[..SIDECARS] {
             peer.sidecar = true;
         }
-        let wave = first_wave(Config::default(), peers, 10_000_000).await;
+        let wave = first_wave(config, peers, 10_000_000).await;
         assert_eq!(
             wave.len(),
             SIDECARS + 32,

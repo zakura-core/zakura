@@ -4,8 +4,8 @@ mod service_session;
 mod trace;
 use service_session::{
     may_open_ordered_stream, spawn_service_session, trace_session_step, ConnectionRoles,
-    DemandChange, DemandWait, PendingSessions, PreparedStream, RemoteCompletion, RemoteDemand,
-    ServiceSessionState, SessionExit, SetupIo,
+    DemandChange, DemandWait, OpenedStream, PendingSessions, PreparedStream, RemoteCompletion,
+    RemoteDemand, ServiceSessionState, SessionExit, SetupIo,
 };
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
@@ -21,7 +21,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt as _, StreamExt as _};
 use rand_10::Rng;
 use thiserror::Error;
 use zakura_chain::{
@@ -45,12 +45,14 @@ use zakura_rt::{
         broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
         MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
     },
-    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet, JoinSetExt},
+    task::{AbortOnDropHandle, JoinHandle, JoinSet, JoinSetExt},
     time::{timeout, Instant},
 };
 
 use self::trace::ZakuraConnTrace;
-use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::discovery::{
+    self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialEnd, RedialPolicy,
+};
 use super::peer_memory::{
     budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
     PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
@@ -198,8 +200,9 @@ pub const DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The upgrade dial targets a peer-supplied address, so it must not redial
 /// forever. Six attempts back off 1 + 2 + 4 + 8 + 16 = 31 s between dials, and
 /// each dial can wait up to [`DEFAULT_ZAKURA_CONTROL_TIMEOUT`] to connect, so
-/// the dial ends within about 90 s after the peer stops answering. The legacy
-/// crawler then re-upgrades the peer if it is still reachable.
+/// the dial ends within about 90 s after the peer stops answering. An ALPN
+/// mismatch ends it at once. The legacy crawler then re-upgrades the peer if it
+/// is still reachable.
 const ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS: usize = 6;
 const CONTROL_LENGTH_BYTES: usize = 4;
 const STREAM_PRELUDE_FIXED_BYTES: usize = 4 + 2 + 2 + 1;
@@ -894,11 +897,16 @@ pub struct ZakuraEndpoint {
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
     upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, UpgradeDialOwnership>>>,
+    /// When each upgrade hint's ALPN-mismatch floor ends, for upgrade dials
+    /// that ended on a mismatch. No upgrade dial starts for a hint inside its
+    /// floor (zakura-quic DIAL-5). See [`upgrade_hint`].
+    upgrade_alpn_floors: Arc<StdMutex<HashMap<NodeAddr, Instant>>>,
 }
 
 #[derive(Debug)]
 struct UpgradeDialOwnership {
-    dial_abort: AbortHandle,
+    /// Cancelled when this endpoint stops owning the dial. The dial then
+    /// starts no new attempt and ends once its in-flight one does.
     lifetime: CancellationToken,
 }
 
@@ -1061,10 +1069,16 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
-        spawn_erased_named(
-            "native_dial",
-            native_dial_supervised(endpoint, node_addr, limits, policy),
-        )
+        spawn_erased_named("native_dial", async move {
+            native_dial_supervised(
+                endpoint,
+                node_addr,
+                limits,
+                policy,
+                CancellationToken::new(),
+            )
+            .await;
+        })
     }
 
     /// Start one maintained native dial for a legacy handoff.
@@ -1074,14 +1088,16 @@ impl ZakuraEndpoint {
     /// legacy upgrades do not create a swarm of independent maintained QUIC
     /// dial loops to the same peer. The dial gives up after
     /// [`ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS`] consecutive failures because the
-    /// peer chose the address.
+    /// peer chose the address. A dial that ends on an ALPN mismatch starts the
+    /// hint's [`ZAKURA_ALPN_MISMATCH_BACKOFF`] floor, and no dial starts inside
+    /// it. See [`upgrade_hint`] for why the floor keys the hint, not the node ID.
     pub(crate) fn start_upgrade_native_dial(&self, node_addr: NodeAddr) -> ZakuraUpgradeDialStart {
         let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
             return ZakuraUpgradeDialStart::InvalidPeerId;
         };
 
         // Hold the registry lock across the spawn so the dedup check and the
-        // abort-handle insert are atomic against a concurrent upgrade to the
+        // ownership insert are atomic against a concurrent upgrade to the
         // same peer. `tokio::spawn` does not await, and the spawned task only
         // re-locks after its (non-instant) dial returns, so this cannot
         // deadlock or `.await` under the lock.
@@ -1092,6 +1108,10 @@ impl ZakuraEndpoint {
         if upgrade_dials.contains_key(&peer_id) {
             return ZakuraUpgradeDialStart::AlreadyRunning;
         }
+        let hint = upgrade_hint(&node_addr);
+        if self.in_upgrade_alpn_floor(&hint) {
+            return ZakuraUpgradeDialStart::AlpnBackoff;
+        }
 
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
@@ -1100,12 +1120,32 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
             ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS,
         );
+        // A cancelled hand-off lets the in-flight attempt run to the bound of a
+        // whole dial (zakura-quic DIAL-4), so an ALPN mismatch that a slower
+        // address delays still starts the floor.
+        let drain = native_dial_timeout(
+            self.quic.config(),
+            node_addr.direct.len(),
+            limits.control_timeout,
+        );
         let lifetime = CancellationToken::new();
         let task_lifetime = lifetime.clone();
         let task_peer_id = peer_id.clone();
-        let dial = spawn_erased_named("upgrade_dial", async move {
+        spawn_erased_named("upgrade_dial", async move {
+            let stop = task_lifetime.clone();
             let _lifetime_guard = task_lifetime.drop_guard();
-            native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
+            let supervised =
+                native_dial_supervised(endpoint.clone(), node_addr, limits, policy, stop.clone());
+            let end = zakura_rt::select! {
+                end = supervised => end,
+                () = async {
+                    stop.cancelled().await;
+                    zakura_rt::time::sleep(drain).await;
+                } => RedialEnd::Ended,
+            };
+            if end == RedialEnd::AlpnMismatch {
+                endpoint.hold_upgrade_alpn_floor(hint);
+            }
             endpoint
                 .supervisor
                 .forget_retained_native_metadata(&task_peer_id);
@@ -1115,14 +1155,36 @@ impl ZakuraEndpoint {
                 .expect("Zakura upgrade dial registry mutex is never poisoned")
                 .remove(&task_peer_id);
         });
-        upgrade_dials.insert(
-            peer_id,
-            UpgradeDialOwnership {
-                dial_abort: dial.abort_handle(),
-                lifetime,
-            },
-        );
+        upgrade_dials.insert(peer_id, UpgradeDialOwnership { lifetime });
         ZakuraUpgradeDialStart::Started
+    }
+
+    /// Starts `hint`'s ALPN-mismatch floor, and drops the floors that ended.
+    fn hold_upgrade_alpn_floor(&self, hint: NodeAddr) {
+        let now = Instant::now();
+        let mut floors = self
+            .upgrade_alpn_floors
+            .lock()
+            .expect("Zakura upgrade ALPN floor mutex is never poisoned");
+        floors.retain(|_, until| *until > now);
+        floors.insert(hint, now + ZAKURA_ALPN_MISMATCH_BACKOFF);
+    }
+
+    /// Whether `hint` is inside the ALPN-mismatch floor of an earlier upgrade
+    /// dial.
+    fn in_upgrade_alpn_floor(&self, hint: &NodeAddr) -> bool {
+        let mut floors = self
+            .upgrade_alpn_floors
+            .lock()
+            .expect("Zakura upgrade ALPN floor mutex is never poisoned");
+        match floors.get(hint) {
+            Some(until) if *until > Instant::now() => true,
+            Some(_) => {
+                floors.remove(hint);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Returns how many maintained upgrade dials this endpoint owns.
@@ -1147,25 +1209,25 @@ impl ZakuraEndpoint {
             .map(|ownership| ownership.lifetime.clone())
     }
 
-    /// Cancel and forget the maintained native dial started by the legacy
-    /// upgrade hand-off for `peer_id`, if this node still owns one.
+    /// Stop the maintained native dial started by the legacy upgrade hand-off
+    /// for `peer_id`, if this node still owns one.
     ///
     /// Called when the upgrade hand-off ends without the peer registering,
     /// including when the outer handshake timeout drops the hand-off. The
     /// maintained dial would otherwise keep redialing a peer-supplied, possibly
     /// unreachable address until its attempt limit, and repeating the failed
     /// upgrade with distinct node ids would grow dial tasks and outbound QUIC
-    /// traffic. A no-op if the dial already ended.
+    /// traffic. The dial starts no new attempt, and its in-flight attempt ends
+    /// within the bound of one whole dial. The dial then forgets the peer. A
+    /// no-op if the dial already ended.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
-        let ownership = self
+        if let Some(ownership) = self
             .upgrade_dials
             .lock()
             .expect("Zakura upgrade dial registry mutex is never poisoned")
-            .remove(peer_id);
-        if let Some(ownership) = ownership {
+            .get(peer_id)
+        {
             ownership.lifetime.cancel();
-            ownership.dial_abort.abort();
-            self.supervisor.forget_retained_native_metadata(peer_id);
         }
     }
 
@@ -1219,6 +1281,7 @@ impl ZakuraEndpoint {
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -1279,6 +1342,7 @@ impl ZakuraEndpoint {
             block_sync_actions: block_sync_actions
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -2158,7 +2222,7 @@ struct ConnectionServeContext {
     conn: ZakuraConnTrace,
     /// Counts an inbound connection against its IP until registration.
     control_handshake: Option<ControlHandshakeGuard>,
-    /// Tells a discovery dial how registration ended. See [`DialReport`].
+    /// Tells a reported dial how registration ended. See [`DialReport`].
     registration_report: Option<oneshot::Sender<DialRegistration>>,
 }
 
@@ -2367,8 +2431,15 @@ impl ServiceSessionIO {
     }
 
     /// A local open failed. The caller decides whether the service retries.
-    fn on_open_failed(&self, kind: u16, attempt: u64) {
+    fn on_open_failed(&mut self, kind: u16, attempt: u64) {
+        self.session(kind).open_failed();
         self.trace(kind, SessionStep::AttemptFailed { attempt });
+    }
+
+    /// Whether `kind`'s local open, whose streams are ready, may install its
+    /// generation. A peer session that took the service meanwhile wins.
+    fn accepts_local_open(&mut self, kind: u16, connection_cancelled: bool) -> bool {
+        self.session(kind).accepts_local_open(connection_cancelled)
     }
 
     /// A session's workers finished. Returns the backoff that its service now
@@ -3332,16 +3403,21 @@ impl ZakuraProtocolHandler {
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
-                let admitted = match self
-                    .open_traced_session(
+                // The peer paces this open through stream credit. Local
+                // shutdown or eviction cancels the connection meanwhile, and
+                // dropping the open resets its streams and returns its permits.
+                let opened = zakura_rt::select! {
+                    biased;
+                    () = connection_token.cancelled() => break,
+                    opened = self.open_traced_session(
                         &open_context,
                         stream,
                         &mut session_io,
                         &mut workers,
                         &mut message_buckets,
-                    )
-                    .await
-                {
+                    ) => opened,
+                };
+                let admitted = match opened {
                     Ok(admitted) => admitted,
                     Err(ZakuraHandlerError::SessionFull) => {
                         // Demand is advisory: another connection can reserve the
@@ -3401,6 +3477,9 @@ impl ZakuraProtocolHandler {
             }
         }
 
+        // Local reopens whose transport IO is in flight, created on the first
+        // reopen.
+        let mut local_opens: Option<FuturesUnordered<BoxFuture<'_, _>>> = None;
         loop {
             let session_deadline = pending_sessions.deadline();
             zakura_rt::select! {
@@ -3451,17 +3530,42 @@ impl ZakuraProtocolHandler {
                         continue;
                     }
 
-                    match self
-                        .open_traced_session(
+                    // The peer paces `open_bi` and the prelude write through
+                    // stream credit, so they run beside this loop. The service
+                    // is reserved only once the streams are ready.
+                    let attempt = session_io.begin_attempt(stream.kind);
+                    let open = &open_context;
+                    local_opens.get_or_insert_with(FuturesUnordered::new).push(
+                        async move { (stream, attempt, self.open_session_streams(open, stream).await) }
+                            .boxed(),
+                    );
+                }
+                Some((stream, attempt, opened)) = async { local_opens.as_mut()?.next().await },
+                    if local_opens.as_ref().is_some_and(|opens| !opens.is_empty()) =>
+                {
+                    let opened = match opened {
+                        Ok(members)
+                            if !session_io
+                                .accepts_local_open(stream.kind, connection_token.is_cancelled()) =>
+                        {
+                            // A peer session took the service while this open
+                            // ran. Dropping the members resets their streams.
+                            drop(members);
+                            session_io.on_open_failed(stream.kind, attempt);
+                            continue;
+                        }
+                        Ok(members) => self.admit_opened_session(
                             &open_context,
                             stream,
-                            &mut session_io,
+                            members,
                             &mut workers,
                             &mut message_buckets,
-                        )
-                        .await
-                    {
+                        ),
+                        Err(error) => Err(error),
+                    };
+                    match opened {
                         Ok(admitted) => {
+                            session_io.on_opened(admitted.kind, admitted.session_id, attempt);
                             #[cfg(any(test, zakura_sim))]
                             let admitted = session_io.with_origin(conn_id, admitted, true);
                             let service_streams = admitted.into_service_streams();
@@ -3480,6 +3584,7 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
+                            session_io.on_open_failed(stream.kind, attempt);
                             let delay = session_io.schedule_transport_backoff(stream.kind);
                             debug!(
                                 ?error,
@@ -3698,6 +3803,8 @@ impl ZakuraProtocolHandler {
         }
 
         connection_token.cancel();
+        // An open still in flight resets its streams and returns its permits.
+        drop(local_opens);
         drop(incoming_setup);
         drop(pending_sessions);
         let drained = drain_stream_workers(&mut workers).await;
@@ -3730,10 +3837,12 @@ impl ZakuraProtocolHandler {
         message_buckets: &mut MessageRateBuckets,
     ) -> Result<AdmittedSession, ZakuraHandlerError> {
         let attempt = session_io.begin_attempt(stream.kind);
-        let opened = self
-            .open_service_session(open, stream, workers, message_buckets)
-            .boxed()
-            .await;
+        let opened = match self.open_session_streams(open, stream).boxed().await {
+            Ok(members) => {
+                self.admit_opened_session(open, stream, members, workers, message_buckets)
+            }
+            Err(error) => Err(error),
+        };
         match &opened {
             Ok(admitted) => session_io.on_opened(admitted.kind, admitted.session_id, attempt),
             Err(_) => session_io.on_open_failed(stream.kind, attempt),
@@ -3741,13 +3850,14 @@ impl ZakuraProtocolHandler {
         opened
     }
 
-    async fn open_service_session(
+    /// Open every member stream of `stream`'s service session and write their
+    /// preludes. This is only transport IO, which the peer paces through
+    /// stream credit; [`Self::admit_opened_session`] reserves the service.
+    async fn open_session_streams(
         &self,
         open: &SessionOpenContext<'_>,
         stream: Stream,
-        workers: &mut JoinSet<()>,
-        message_buckets: &mut MessageRateBuckets,
-    ) -> Result<AdmittedSession, ZakuraHandlerError> {
+    ) -> Result<Vec<OpenedStream>, ZakuraHandlerError> {
         let layout = self
             .registry
             .session_layout(stream)
@@ -3755,34 +3865,55 @@ impl ZakuraProtocolHandler {
         if layout.primary() != stream {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
+        let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
+        let mut opened = Vec::with_capacity(layout.streams().len());
+        for member in layout.streams().iter().copied() {
+            opened.push(
+                self.open_ordered_stream(
+                    open.connection,
+                    member,
+                    wire_id,
+                    open.stream_sem,
+                    open.resources,
+                    open.limits,
+                )
+                .await?,
+            );
+        }
+        Ok(opened)
+    }
+
+    /// Reserve `stream`'s service for the opened `members` and start the
+    /// session's workers. A refused reservation drops the members, which
+    /// resets their streams.
+    fn admit_opened_session(
+        &self,
+        open: &SessionOpenContext<'_>,
+        stream: Stream,
+        members: Vec<OpenedStream>,
+        workers: &mut JoinSet<()>,
+        message_buckets: &mut MessageRateBuckets,
+    ) -> Result<AdmittedSession, ZakuraHandlerError> {
         let reservation = self
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
             .reserve_session(open.direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
-        let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
-        let mut prepared = Vec::with_capacity(layout.streams().len());
-        for member in layout.streams().iter().copied() {
-            let mut member = self
-                .prepare_ordered_stream(
-                    open.connection,
-                    member,
-                    wire_id,
-                    open.stream_sem,
-                    open.resources,
-                    message_buckets,
-                    open.limits,
-                    open.connection_token.clone(),
-                    open.close_cause.clone(),
-                    open.freshness_tx.clone(),
-                    open.conn.clone(),
-                    open.peer_id.clone(),
-                )
-                .await?;
+        let prepared = members.into_iter().map(|member| {
+            let mut member = self.prepare_opened_stream(
+                member,
+                message_buckets,
+                open.limits,
+                open.connection_token.clone(),
+                open.close_cause.clone(),
+                open.freshness_tx.clone(),
+                open.conn.clone(),
+                open.peer_id.clone(),
+            );
             member.set_session_resources(reservation.clone());
-            prepared.push(member);
-        }
+            member
+        });
         Ok(spawn_service_session(
             workers,
             prepared,
@@ -4687,6 +4818,9 @@ async fn spawn_zakura_endpoint_inner(
     let sought_services = sought_services_with_custom(&custom_services);
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
+        Some(discovery::AuthoredSequenceFile::new(
+            config.zakura_discovery_sequence_file(&local_node_id),
+        )),
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),
         &handshake_config,
@@ -4897,6 +5031,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+        upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
     };
     let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
@@ -5007,6 +5142,24 @@ async fn spawn_zakura_endpoint_inner(
     Ok(Some(endpoint))
 }
 
+/// The key of an upgrade dial's ALPN-mismatch floor: the hint's node ID and its
+/// sorted, deduplicated addresses.
+///
+/// zakura-quic DIAL-5 keys the floor by node ID, because a discovery record is
+/// signed by its node. A legacy upgrade hint is not: an ALPN mismatch fails
+/// before TLS authenticates the node ID, so any legacy peer could plant a floor
+/// on another node's ID. Keying the whole hint limits a planted floor to the
+/// hint its own sender gave.
+fn upgrade_hint(node_addr: &NodeAddr) -> NodeAddr {
+    let mut direct = node_addr.direct.clone();
+    direct.sort_unstable();
+    direct.dedup();
+    NodeAddr {
+        id: node_addr.id,
+        direct,
+    }
+}
+
 /// Bounds a whole multi-address dial so the transport's own limits decide it:
 /// the last attempt starts after the stagger and ends at the handshake
 /// deadline (zakura-quic DIAL-3, DIAL-4). `control_timeout` is the floor.
@@ -5046,7 +5199,7 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 }
 
 /// How a dialed connection's registration ended, as the dial reports it to
-/// its discovery attempt.
+/// its discovery attempt or maintained redial.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DialRegistration {
     /// The supervisor registered the peer on this connection.
@@ -5055,7 +5208,7 @@ pub(crate) enum DialRegistration {
     LocalLimit,
 }
 
-/// The channels on which a discovery dial reports its progress.
+/// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
     /// Receives the IP whose handshake TLS authenticated, before the control
     /// handshake starts.
@@ -7897,6 +8050,7 @@ mod tests {
             let (_connected_tx, connected) = watch::channel(Vec::new());
             let discovery = discovery::build_discovery_handle(
                 secret_key.clone(),
+                None,
                 discovery_direct_addrs(config, local_node_id),
                 Vec::new(),
                 &ZakuraHandshakeConfig::for_network_with_dev_cohort(&config.network, None),
@@ -9213,6 +9367,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         let discovery = crate::zakura::discovery::build_discovery_handle(
             NodeSecretKey::generate(),
+            None,
             Vec::new(),
             crate::zakura::discovery::default_advertised_services(),
             &handshake,
@@ -9246,7 +9401,8 @@ mod tests {
     /// `P2pV2UpgradeAccept` (a unique, real iroh node id with a parseable but
     /// unreachable direct address) that never completes native Zakura
     /// registration. After the upgrade hand-off wait times out, no
-    /// maintain-forever native dial task or `upgrade_dials` entry may survive;
+    /// maintain-forever native dial task or `upgrade_dials` entry may survive
+    /// its in-flight attempt;
     /// otherwise repeating the failed upgrade with distinct node ids grows
     /// maintained dials and outbound QUIC traffic without bound.
     ///
@@ -9283,14 +9439,9 @@ mod tests {
             matches!(handoff, crate::zakura::ZakuraNativeHandoff::Failed),
             "an unreachable upgrade peer must not report a completed hand-off",
         );
-        assert!(
-            endpoint
-                .upgrade_dials
-                .lock()
-                .expect("Zakura upgrade dial registry mutex is never poisoned")
-                .is_empty(),
-            "a failed legacy upgrade leaked a maintained native dial / upgrade_dials entry",
-        );
+        // The cancelled dial starts no new attempt, so its in-flight one is
+        // the last.
+        upgrade_dials_end(&endpoint).await;
 
         endpoint.shutdown().await;
         Ok(())
@@ -9322,6 +9473,129 @@ mod tests {
         );
 
         endpoint.cancel_upgrade_native_dial(&peer_id);
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// Spawns a Zakura endpoint, and a loopback QUIC peer that serves an ALPN
+    /// no Zakura node offers. Returns both and the peer's hint.
+    async fn endpoint_and_other_cohort(
+        config: Config,
+        seed: u64,
+    ) -> Result<(ZakuraEndpoint, QuicEndpoint, NodeAddr), BoxError> {
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled in test config");
+        let other_cohort = LocalEndpointFactory::new().endpoint(seed).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        other_cohort.serve(CaptureConnection {
+            alpn: b"/zakura/another-cohort/0",
+            connection_tx,
+            stream_tx,
+        })?;
+        let hint = LocalEndpointFactory::node_addr(&other_cohort).await;
+        Ok((endpoint, other_cohort, hint))
+    }
+
+    /// Waits until `endpoint` owns no upgrade dial. A cancelled dial ends
+    /// within the bound of its in-flight attempt.
+    async fn upgrade_dials_end(endpoint: &ZakuraEndpoint) {
+        timeout(Duration::from_secs(30), async {
+            while endpoint.upgrade_dial_count() > 0 {
+                zakura_rt::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upgrade dial ends within one bounded attempt");
+    }
+
+    /// An upgrade dial to a peer-supplied address that speaks another ALPN
+    /// ends at once, and no upgrade dial to the same hint starts again until
+    /// the ten-minute floor ends (zakura-quic DIAL-5, V12 F-562, F-563). The
+    /// node ID alone is unauthenticated, so the same ID at other addresses
+    /// still dials.
+    #[tokio::test]
+    async fn alpn_mismatched_upgrade_dial_ends_and_holds_the_hint_floor() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let (endpoint, _other_cohort, hint) =
+            endpoint_and_other_cohort(Config::for_test(P2pStack::Dual), 0x0A17_0001).await?;
+        let peer_id = ZakuraPeerId::new(hint.id.as_bytes().to_vec())?;
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+        upgrade_dials_end(&endpoint).await;
+
+        tokio::time::pause();
+        let reordered = NodeAddr::with_addrs(hint.id, hint.direct.iter().rev().copied());
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(reordered),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+        );
+        tokio::time::advance(ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+        );
+        let planted = NodeAddr::with_addrs(
+            hint.id,
+            ["192.0.2.3:1".parse().expect("test direct address parses")],
+        );
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(planted),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+            "a floor from one hint blocked the same node ID at other addresses",
+        );
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        upgrade_dials_end(&endpoint).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// A hand-off cancelled while a silent address delays the dial still
+    /// starts the floor when another address of the hint mismatches.
+    #[tokio::test]
+    async fn cancelled_upgrade_dial_still_holds_a_delayed_alpn_floor() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.quic.handshake_timeout_secs = Some(2);
+        let (endpoint, _other_cohort, hint) =
+            endpoint_and_other_cohort(config, 0x0A17_0002).await?;
+        let peer_id = ZakuraPeerId::new(hint.id.as_bytes().to_vec())?;
+        // A bound socket that never answers holds its attempt to the
+        // handshake deadline.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let hint = NodeAddr::with_addrs(
+            hint.id,
+            std::iter::once(silent.local_addr()?).chain(hint.direct.iter().copied()),
+        );
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+        // The legacy handshake timeout drops the hand-off before the silent
+        // attempt ends.
+        zakura_rt::time::sleep(Duration::from_millis(500)).await;
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        upgrade_dials_end(&endpoint).await;
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+            "cancelling the hand-off discarded the mismatch",
+        );
         endpoint.shutdown().await;
         Ok(())
     }

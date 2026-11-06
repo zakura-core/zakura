@@ -137,7 +137,7 @@ const MINED_RANDOM_INTERVAL: usize = 4;
 /// Allow the kernel send queue to drain after the framed block write completes.
 const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
 /// Peers that already have a block might never request it.
-pub(super) const BLOCK_REQUEST_WAIT: Duration = Duration::from_secs(3);
+pub(super) const BLOCK_REQUEST_WAIT: Duration = Duration::from_secs(2);
 /// Bound both inbound service work and the subsequent block write.
 const BLOCK_UPLOAD_WAIT: Duration = Duration::from_secs(2 * REQUEST_TIMEOUT.as_secs());
 /// The longest a connection waits for an upload slot before writing a gated block body anyway.
@@ -1362,15 +1362,40 @@ mod tests {
         (0..count).map(|_| peer().0).collect()
     }
 
-    /// The default window falls linearly from 64 at 100 KiB to 32 at 1.5 MiB.
+    /// A window of 32 to 64 over the default sizes, below the default fixed window, so tests
+    /// can see a broadcast's waves and its size-based window.
+    fn sized_window_config() -> Config {
+        Config {
+            advert_window_min: 32,
+            advert_window_max: 64,
+            ..Config::default()
+        }
+    }
+
+    /// By default every block is advertised to up to 1000 peers at once, whatever its size.
     #[test]
-    fn default_advert_window_follows_block_size() {
+    fn default_advert_window_is_fixed() {
+        let fanout = AdvertFanout::from_config(&Config::default());
+        for size in [
+            Some(0),
+            Some(102_400),
+            Some(1_513_987),
+            Some(u32::MAX),
+            None,
+        ] {
+            assert_eq!(fanout.window(size), 1000, "{size:?}");
+        }
+    }
+
+    /// The window falls linearly from 64 at 100 KiB to 32 at 1.5 MiB.
+    #[test]
+    fn advert_window_follows_block_size() {
         /// A full NU7 block, just below the reference size.
         const FULL_NU7_BLOCK: u32 = 1_513_987;
         const FULL_SIZE: u32 = 1_572_864;
         const SMALL_SIZE: u32 = 102_400;
         const MID_SIZE: u32 = (SMALL_SIZE + FULL_SIZE) / 2;
-        let fanout = AdvertFanout::from_config(&Config::default());
+        let fanout = AdvertFanout::from_config(&sized_window_config());
 
         assert_eq!(fanout.window(Some(FULL_NU7_BLOCK)), 33);
         assert_eq!(fanout.window(Some(FULL_SIZE)), 32);
@@ -1428,7 +1453,7 @@ mod tests {
     /// A broadcast writes inventory to the window's peers at once, up to the peers it has.
     #[tokio::test(start_paused = true)]
     async fn first_wave_follows_block_size() {
-        let wave = |peers, size| first_wave(Config::default(), plain_peers(peers), size);
+        let wave = |peers, size| first_wave(sized_window_config(), plain_peers(peers), size);
         assert_eq!(wave(100, 1_513_987).await.len(), 33);
         assert_eq!(wave(100, 10_000_000).await.len(), 32);
         assert_eq!(wave(100, 2_000).await.len(), 64);
@@ -1643,7 +1668,7 @@ mod tests {
         for peer in &mut peers[..SIDECARS] {
             peer.sidecar = true;
         }
-        let wave = first_wave(Config::default(), peers, 10_000_000).await;
+        let wave = first_wave(sized_window_config(), peers, 10_000_000).await;
         assert_eq!(
             wave.len(),
             SIDECARS + 32,

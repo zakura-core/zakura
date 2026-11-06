@@ -311,7 +311,12 @@ fn sidecar_peer_always_receives_block_gossip() {
     let _guard = runtime.enter();
     tokio::time::pause();
 
-    let config = Config::default();
+    // A window below the peer count, so the sidecar's place outside it is visible.
+    let config = Config {
+        advert_window_min: 32,
+        advert_window_max: 64,
+        ..Config::default()
+    };
     // The advertisement carries no size, so the broadcast uses the minimum window.
     let window = config.advert_window_min;
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];

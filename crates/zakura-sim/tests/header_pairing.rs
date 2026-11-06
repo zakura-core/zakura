@@ -24,7 +24,8 @@ use zakura_header_chain::{
 };
 use zakura_network::zakura::{
     observe::{
-        as_call, CallEnd, HeaderSyncObserver, PortCall, ReactorEvent, RequestRef, StorageCallKind,
+        as_call, CallEnd, HeaderSyncObserver, PortCall, ReactorEvent, RequestRef, ReservationEnd,
+        ReservationPurpose, StorageCallKind,
     },
     spawn_header_sync_reactor, FullStateFrontiers, HeaderSyncStartup, HeaderTargetPurpose,
     ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
@@ -295,8 +296,9 @@ fn a_drop_with_no_receipt_fails_at_teardown() {
 }
 
 /// The header work a reactor's teardown can leave open: `round 1` of one peer,
-/// its prepare `call 1`, and the headers that call holds.
-fn open_work(byte: u8) -> [ReactorEvent; 3] {
+/// started on reservation 1, which one page spent, its prepare `call 1`, and
+/// the headers that call holds.
+fn open_work(byte: u8) -> [ReactorEvent; 7] {
     let peer = ZakuraPeerId::new(vec![byte; 32]).expect("32 bytes is a valid peer ID");
     let hash = block::Hash([byte; 32]);
     let owner = HeaderSyncWorkOwner::Header(
@@ -309,17 +311,48 @@ fn open_work(byte: u8) -> [ReactorEvent; 3] {
         }
         .bind(1, NonZeroU64::new(1).expect("one is nonzero")),
     );
+    let request = RequestRef {
+        peer: peer.clone(),
+        session_id: 1,
+        request_id: 1,
+        incarnation: 1,
+        owner,
+        target_tip_hash: hash,
+    };
     [
+        ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: peer.clone(),
+            purpose: ReservationPurpose::Ordinary,
+            headers: 5,
+            request: None,
+        },
+        ReactorEvent::ReservationBound {
+            reservation: 1,
+            request: request.clone(),
+            max_headers: 5,
+        },
         ReactorEvent::Started {
-            request: RequestRef {
-                peer: peer.clone(),
-                session_id: 1,
-                request_id: 1,
-                incarnation: 1,
-                owner,
-                target_tip_hash: hash,
-            },
+            request: request.clone(),
             purpose: HeaderTargetPurpose::Normal,
+        },
+        ReactorEvent::PageStaged {
+            from_peer: peer.clone(),
+            from_session: 1,
+            request,
+            reservation: 1,
+            subscription: 1,
+            frame: None,
+            headers: 5,
+            reserved_left: 0,
+            hashes: vec![hash; 5],
+            stored: vec![hash; 5],
+            staged_total: 5,
+        },
+        ReactorEvent::ReservationEnded {
+            reservation: 1,
+            released: 0,
+            cause: ReservationEnd::Staged,
         },
         ReactorEvent::Dispatched {
             call: 1,
@@ -337,7 +370,7 @@ fn open_work(byte: u8) -> [ReactorEvent; 3] {
             peer,
             incarnation: 1,
             headers: 5,
-            leases: Vec::new(),
+            leases: vec![1],
         },
     ]
 }
@@ -393,6 +426,40 @@ fn headers_left_held_fail_at_teardown() {
     let report = teardown_after(events, false, false);
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("OpenOwnership: call 1"), "{detail}");
+}
+
+/// A reservation whose handle leaks past the reactor doesn't keep the tap
+/// reading the reactor as alive, since it reports through the tap's
+/// capacity observer: the stop still finishes, and its teardown check finds
+/// the reservation open.
+#[test]
+fn a_leaked_reservation_fails_at_teardown() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let capacity = observer
+            .capacity_observer()
+            .expect("the tap counts the reactor's lifetime on its own handle");
+        capacity.observe(ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: ZakuraPeerId::new(vec![6; 32]).expect("32 bytes is a valid peer ID"),
+            purpose: ReservationPurpose::Ordinary,
+            headers: 5,
+            request: None,
+        });
+        std::mem::forget(capacity);
+    });
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(
+        detail.starts_with("OpenReservation: reservation 1"),
+        "{detail}"
+    );
 }
 
 /// A reactor that unwound leaves the same work open, and the teardown check

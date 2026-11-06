@@ -20,7 +20,10 @@ fn with_expiry(mut tx: VerifiedUnminedTx, height: Height) -> VerifiedUnminedTx {
 #[test]
 fn expiry_removes_overlapping_roots_and_reports_each_transaction_once() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let parent = with_expiry(factory.tx_with(10_000, 1, 0), Height(1));
     let child = with_expiry(factory.tx_with(10_000, 1, 0), Height(1));
     let survivor = with_expiry(factory.tx(10_000), Height(0));
@@ -55,7 +58,10 @@ fn expiry_removes_overlapping_roots_and_reports_each_transaction_once() {
 #[test]
 fn mined_parent_keeps_unmined_child_and_ignores_unknown_mined_ids() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let parent = factory.tx_with(10_000, 1, 0);
     let child = factory.tx(10_000);
     let parent_id = parent.transaction.id();
@@ -85,7 +91,10 @@ fn mined_parent_keeps_unmined_child_and_ignores_unknown_mined_ids() {
 #[test]
 fn block_conflict_removes_descendants_and_caches_the_conflicting_root() {
     let mut factory = TxFactory::new();
-    let mut storage = Storage::new(&Config::default());
+    let mut storage = Storage::new(
+        &Config::default(),
+        &zakura_chain::parameters::Network::Mainnet,
+    );
     let parent = factory.tx_with(10_000, 1, 0);
     let child = factory.tx(10_000);
     let parent_id = parent.transaction.id();
@@ -126,7 +135,7 @@ fn benchmark_mempool_known_id_cleanup() {
     let mut factory = TxFactory::new();
     for count in [default_count / 8, default_count] {
         for removed_count in [0, 1, count / 8] {
-            let mut storage = Storage::new(&config);
+            let mut storage = Storage::new(&config, &zakura_chain::parameters::Network::Mainnet);
             let mut victims = Vec::new();
             for index in 0..count {
                 let is_victim = index < removed_count;

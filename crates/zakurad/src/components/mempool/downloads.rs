@@ -1608,7 +1608,10 @@ mod tests {
             "{error:?}"
         );
 
-        let mut storage = super::super::storage::Storage::new(&super::super::Config::default());
+        let mut storage = super::super::storage::Storage::new(
+            &super::super::Config::default(),
+            &zakura_chain::parameters::Network::Mainnet,
+        );
         storage.reject_if_needed(tx_id, error);
         assert!(!storage.contains_rejected(&tx_id));
     }

@@ -1352,6 +1352,67 @@ mod tests {
         joined.abort();
     }
 
+    /// A full connection queue holds only that peer's adverts. It can drain a burst before
+    /// expiry, or skip expired adverts and accept later blocks.
+    #[tokio::test(start_paused = true)]
+    async fn block_burst_isolates_full_peer_queue_and_recovers() {
+        for expire in [false, true] {
+            let (slow, mut receiver) = peer();
+            let (mut peers, mut writes) = connected_peers(1);
+            peers.push(slow.clone());
+            let start = Instant::now();
+            let hashes: Vec<_> = (0..6).map(|index| block::Hash([index; 32])).collect();
+            assert!(hashes.len() > BLOCK_ADVERT_QUEUE);
+            let mut broadcasts = Vec::new();
+            for hash in &hashes {
+                broadcasts.push(tokio::spawn(broadcast_block(
+                    peers.clone(),
+                    *hash,
+                    1,
+                    false,
+                    start,
+                )));
+            }
+            let mut healthy = std::collections::HashSet::new();
+            for _ in &hashes {
+                assert!(healthy.insert(writes.recv().await.unwrap().1));
+                assert_eq!(start.elapsed(), Duration::ZERO);
+            }
+            assert_eq!(receiver.len(), BLOCK_ADVERT_QUEUE);
+
+            if expire {
+                tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_millis(1)).await;
+                for broadcast in broadcasts {
+                    assert!(
+                        broadcast.await.unwrap().is_ok(),
+                        "the healthy peer succeeded"
+                    );
+                }
+                for _ in 0..BLOCK_ADVERT_QUEUE {
+                    assert!(receiver.try_recv().unwrap().result.is_closed());
+                }
+                assert!(receiver.try_recv().is_err(), "waiting sends expired too");
+            } else {
+                let mut recovered = std::collections::HashSet::new();
+                for _ in &hashes {
+                    let advert = receiver.recv().await.unwrap();
+                    assert!(recovered.insert(advert.hash));
+                    advert.result.send(Ok(())).unwrap();
+                    assert_eq!(start.elapsed(), Duration::ZERO);
+                }
+                assert_eq!(recovered, healthy);
+                for broadcast in broadcasts {
+                    assert!(broadcast.await.unwrap().is_ok());
+                }
+            }
+
+            let next = block::Hash([6; 32]);
+            let fresh = tokio::spawn(slow.advertise(next));
+            accept(&mut receiver, next).await;
+            assert!(fresh.await.unwrap());
+        }
+    }
+
     /// Custom size boundaries control both plateaus and the interpolation between them.
     #[test]
     fn advert_window_uses_configured_sizes() {

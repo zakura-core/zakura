@@ -3032,12 +3032,12 @@ async fn v5_transaction_with_transparent_transfer_is_accepted() {
     );
 }
 
-/// Full, partial, and empty parent caches request only the outputs they did not retain.
+/// Parent caches request only omitted outputs and preserve input order across cache gaps.
 #[tokio::test]
 async fn block_transaction_with_parent_utxos_skips_state_lookups() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for retained_count in 0..=3 {
+    for retained_indices in [&[][..], &[0][..], &[0, 1][..], &[0, 1, 2][..], &[1][..]] {
         let network = Network::new_default_testnet();
         let network_upgrade = NetworkUpgrade::Nu5;
         let transaction_block_height = (network_upgrade
@@ -3050,12 +3050,22 @@ async fn block_transaction_with_parent_utxos_skips_state_lookups() {
         let mut inputs = Vec::new();
         let mut parent_utxos = HashMap::new();
         for index in 0..3 {
-            let (input, _, utxos) = mock_transparent_transfer(
+            let (mut input, _, mut utxos) = mock_transparent_transfer(
                 source_height,
                 true,
                 index,
                 Amount::try_from(1).expect("valid value"),
             );
+            // Each input must unlock its own output, so reordered outputs fail verification.
+            let value = u8::try_from(index + 1).expect("three input values fit in a byte");
+            let transparent::Input::PrevOut { unlock_script, .. } = &mut input else {
+                unreachable!("the fixture spends a previous output");
+            };
+            *unlock_script = transparent::Script::new(&[1, value]);
+            for utxo in utxos.values_mut() {
+                // Push the matching value, then OP_EQUAL.
+                utxo.utxo.output.lock_script = transparent::Script::new(&[1, value, 0x87]);
+            }
             inputs.push(input);
             parent_utxos.extend(
                 utxos
@@ -3075,7 +3085,10 @@ async fn block_transaction_with_parent_utxos_skips_state_lookups() {
         let transaction_hash = transaction.unmined_id();
 
         let mut uncached = HashMap::new();
-        for input in transaction.inputs().iter().skip(retained_count) {
+        for (index, input) in transaction.inputs().iter().enumerate() {
+            if retained_indices.contains(&index) {
+                continue;
+            }
             let outpoint = input.outpoint().expect("all inputs spend parent outputs");
             uncached.insert(outpoint, parent_utxos.remove(&outpoint).unwrap());
         }
@@ -3114,7 +3127,7 @@ async fn block_transaction_with_parent_utxos_skips_state_lookups() {
             result.expect("the transaction verifies").tx_id(),
             transaction_hash
         );
-        assert_eq!(reads.load(Ordering::Relaxed), 3 - retained_count);
+        assert_eq!(reads.load(Ordering::Relaxed), 3 - retained_indices.len());
     }
 }
 

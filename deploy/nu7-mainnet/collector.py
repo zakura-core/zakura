@@ -68,6 +68,8 @@ PROJECTION_DETAIL_BLOCKS = 300
 PROJECTION_THIN_STEP = 10
 PAYLOAD_CACHE_SECONDS = 5.0
 FRESHNESS_SECONDS = 60
+# The block-time chart shows at least this much history, whatever the series window.
+BLOCK_TIME_MIN_SECONDS = 24 * 3600
 WINDOWS = {"1h": 3600, "6h": 6 * 3600, "24h": 24 * 3600, "7d": 7 * 24 * 3600}
 MAX_CONCURRENT_REQUESTS = 16
 REQUEST_TIMEOUT_SECONDS = 10
@@ -646,6 +648,8 @@ class Collector:
         nu7_upgrade = upgrades.get(chain.NU7_BRANCH_ID) or {}
         base_subsidy = tip.get("subsidy_total_zat") if tip else None
         blocks = store.blocks_in_window(now - window_seconds)
+        block_time_rows = (blocks if window_seconds >= BLOCK_TIME_MIN_SECONDS
+                           else store.blocks_in_window(now - BLOCK_TIME_MIN_SECONDS))
         samples = store.samples_since(now - window_seconds)
         events = store.events_since(now - window_seconds)
         day_ago = now - 86400
@@ -799,6 +803,10 @@ class Collector:
                     "bits": "bits", "expectedBits": "expected_bits", "daaOk": "daa_ok",
                     "minerId": "miner_id", "observedAt": "observed_at",
                     "hashrateSolps": "hashrate_solps", "expectedIntervalSeconds": "expected_interval_s",
+                }),
+                "blockTime": columns(block_time_rows, {
+                    "height": "height", "time": "time", "intervalSeconds": "interval_s",
+                    "expectedIntervalSeconds": "expected_interval_s",
                 }),
                 "minerBuckets": miners.miner_buckets(
                     [row for row in blocks if row.get("miner_id")], bucket_seconds(window_seconds)),

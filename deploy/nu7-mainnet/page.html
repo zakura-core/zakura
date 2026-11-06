@@ -165,7 +165,7 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
         <div class="chart"><h3>Block interval</h3><p>Seconds between header times, with the rolling 10-block median and the target spacing.</p><canvas id="c-interval"></canvas></div>
         <div class="chart"><h3>Difficulty</h3><p>Difficulty (log) and its per-block change. The rule clamps the timespan it adjusts by, not the step itself, so single steps stay within about −24% / +19%.</p><canvas id="c-difficulty"></canvas></div>
         <div class="chart"><h3>Difficulty: live vs expected</h3><p>Live difficulty against what the rule requires from the stored headers (should overlay exactly), the projection frozen before activation at a constant hashrate (expected = Monte Carlo median, with its 10–90% band) and the projection re-run from the current chain and hashrate. The dashed level is where difficulty settles at today's hashrate.</p><canvas id="c-expected"></canvas></div>
-        <div class="chart"><h3>Block time: observed vs expected</h3><p>Rolling 10-block mean and median of the observed intervals, the time each block was expected to take at its difficulty and the hashrate of the previous 120 blocks, and the projections' expected block time ahead of the tip.</p><canvas id="c-blocktime"></canvas></div>
+        <div class="chart"><h3>Block time: observed vs expected</h3><p>Over at least the last 24 hours: rolling 10-block mean and median of the observed intervals, the time each block was expected to take at its difficulty and the hashrate of the previous 120 blocks, and the projections' expected block time ahead of the tip.</p><canvas id="c-blocktime"></canvas></div>
         <div class="chart"><h3>Recent block times</h3><p>Each block's interval at its header time, with the block time the model expected for it.</p><canvas id="c-recent"></canvas></div>
         <div class="chart"><h3>Miners</h3><p>Blocks per miner per bucket, from coinbase tags and payout addresses. Shielded payouts without a tag share one bucket.</p><canvas id="c-miners"></canvas></div>
         <div class="chart"><h3>NSM balance</h3><p>Balance after each block and its per-block change next to the fee share plus reissuance the block should add.</p><canvas id="c-nsm"></canvas></div>
@@ -503,13 +503,16 @@ table.nu7-rules thead th { border-top: 0; color: var(--muted); font-size: .78rem
     chart("c-expected", { type: "line", data: { datasets: datasets },
       options: baseOptions("time (UTC)", { y: { type: "logarithmic" }, marker: markerAxis() }, "time-nearest") });
 
+    // At least the last 24 hours, whatever the series window.
+    var bk = d.series.blockTime || b, bkt = bk.time, bkh = bk.height;
+    var bkMin = bkt.length ? bkt[0] : xMin, bkMax = Math.max(xMax, bkt.length ? bkt[bkt.length - 1] : 0);
     var blockDatasets = [
-      { label: "observed mean (10)", data: pts(bt, rollingMean(b.intervalSeconds, 10), bh), borderColor: accent, borderWidth: 2, spanGaps: true },
-      { label: "observed median (10)", data: pts(bt, rollingMedian(b.intervalSeconds, 10), bh), borderColor: accent, borderDash: [2, 2], spanGaps: true },
-      { label: "expected per block", data: pts(bt, b.expectedIntervalSeconds, bh), borderColor: warn, spanGaps: true } ];
+      { label: "observed mean (10)", data: pts(bkt, rollingMean(bk.intervalSeconds, 10), bkh), borderColor: accent, borderWidth: 2, spanGaps: true },
+      { label: "observed median (10)", data: pts(bkt, rollingMedian(bk.intervalSeconds, 10), bkh), borderColor: accent, borderDash: [2, 2], spanGaps: true },
+      { label: "expected per block", data: pts(bkt, bk.expectedIntervalSeconds, bkh), borderColor: warn, spanGaps: true } ];
     if (fixed) blockDatasets.push({ label: "frozen projection", data: curvePts(fixed.curve, "expectedIntervalSeconds"), borderColor: accent2, borderDash: [6, 3] });
     blockDatasets.push({ label: "from current data", data: curvePts(rolling.curve, "expectedIntervalSeconds"), borderColor: nsmC });
-    if (xMin != null) blockDatasets.push({ label: "target spacing", data: targetLine(xMin, xMax, at), borderColor: muted, borderDash: [3, 3] });
+    if (bkMin != null) blockDatasets.push({ label: "target spacing", data: targetLine(bkMin, bkMax, at), borderColor: muted, borderDash: [3, 3] });
     blockDatasets.push(activationMarker(null, null, at));
     chart("c-blocktime", { type: "line", data: { datasets: blockDatasets },
       options: baseOptions("time (UTC)", { y: { beginAtZero: true, title: { display: true, text: "s", color: muted } }, marker: markerAxis() }, "time-nearest") });

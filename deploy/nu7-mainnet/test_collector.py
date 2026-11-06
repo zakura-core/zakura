@@ -394,6 +394,27 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(payload["rules"]["atTip"]["nsmPercent"], 60)
         self.assertEqual(len(payload["recentBlocks"]), 8)
 
+    def test_block_time_series_covers_at_least_a_day(self):
+        tip_time = self.node.blocks[self.node.tip()]["time"]
+        tmp = tempfile.TemporaryDirectory()
+        collector, store = new_collector(self.node, tmp.name, backfill=120)
+        collector.clock = lambda: tip_time + 1800.0
+        try:
+            collector.ingest_once(store)
+            hour = collector.payload(store, "1h")["series"]
+            stored = [row["height"] for row in store.blocks_in_window(0)]
+            self.assertEqual(hour["blockTime"]["height"], stored)
+            self.assertLess(len(hour["blocks"]["height"]), len(stored))
+            self.assertEqual(hour["blockTime"]["height"][-len(hour["blocks"]["height"]):], hour["blocks"]["height"])
+            week = collector.payload(store, "7d")["series"]
+            self.assertEqual(week["blockTime"]["height"], week["blocks"]["height"])
+            self.assertEqual(week["blockTime"]["expectedIntervalSeconds"], week["blocks"]["expectedIntervalSeconds"])
+        finally:
+            if collector.monte_carlo_thread:
+                collector.monte_carlo_thread.join(timeout=30)
+            store.close()
+            tmp.cleanup()
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):

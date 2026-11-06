@@ -6,7 +6,10 @@ use std::{collections::HashMap, future::Future, time::Duration};
 
 use futures::TryFutureExt;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
@@ -38,6 +41,7 @@ struct MinedBlockBroadcastCompleted {
 enum GossipEvent<T> {
     MinedBlockBroadcastCompleted(MinedBlockBroadcastCompleted),
     MinedBlock(MinedBlockEvent),
+    MinedBlockChannelClosed,
     CommittedTip(T),
 }
 
@@ -54,8 +58,11 @@ async fn next_gossip_event<T>(
                 GossipEvent::MinedBlockBroadcastCompleted(completed)
             },
 
-            Some(tip_change) = mined_block_receiver.recv() => {
-                GossipEvent::MinedBlock(tip_change)
+            tip_change = mined_block_receiver.recv() => {
+                match tip_change {
+                    Some(tip_change) => GossipEvent::MinedBlock(tip_change),
+                    None => GossipEvent::MinedBlockChannelClosed,
+                }
             },
 
             committed_tip = committed_tip_fut => {
@@ -123,8 +130,8 @@ pub enum BlockGossipError {
 ///
 /// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
 ///
-/// `local_submissions` are the blocks `submitblock` is submitting, shared with the RPC. Only a tip
-/// change to one of them waits for its mined-block event.
+/// `local_submissions` are the blocks `submitblock` is submitting, shared with the RPC. A local
+/// tip waits for its mined-block event or reservation release, bounded by [`BLOCK_GOSSIP_TIMEOUT`].
 ///
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN, RS>(
@@ -149,6 +156,9 @@ where
     let (mined_block_completion_sender, mut mined_block_completion_receiver) =
         mpsc::unbounded_channel();
     let mut mined_block_broadcasts = MinedBlockBroadcasts::default();
+    // Keep the deadline outside the cancellable tip future. Other mining events must not extend
+    // how long a stuck submission can suppress this committed tip.
+    let mut submission_deadline = None;
 
     loop {
         // Drain local completion notifications from spawned mined-block
@@ -168,47 +178,16 @@ where
             );
         }
 
-        // TODO: Refactor this into a struct and move the contents of this loop into its own method.
-        let mut sync_status = sync_status.clone();
-        let mut chain_tip = chain_state.clone_for_task();
-
-        let local_submissions = local_submissions.clone();
-        // TODO: Move the contents of this async block to its own method
-        let tip_change_close_to_network_tip_fut = async move {
-            /// A brief duration to wait after a local submission's tip change for its mined-block event.
-            const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
-
-            // Block gossip has no delay between successive blocks: every relay hop that waits
-            // adds its delay to the block's propagation time.
-            //
-            // wait for at least one tip change, to make sure we have a new block hash to broadcast
-            let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
-
-            // A local submission commits, and so changes the tip, before `submitblock` sends its
-            // mined-block event. Wait briefly for that event, so the block is broadcast as a mined
-            // block. A relayed block has no such event, so it does not wait: the timer rounds the
-            // delay up to about a millisecond, which every relay hop would add.
-            if local_submissions.contains(&tip_action.best_tip_hash_and_height().0) {
-                tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
-            }
-
-            // wait until we're close to the tip, because broadcasts are only useful for nodes near the tip
-            // (if they're a long way from the tip, they use the syncer and block locators), unless a mined block
-            // hash is received before `wait_until_close_to_tip()` is ready.
-            sync_status
-                .wait_until_close_to_tip()
-                .map_err(SyncStatus)
-                .await?;
-
-            // get the latest tip change when close to tip - it might be different to the change we awaited,
-            // because the syncer might take a long time to reach the tip
-            let best_tip = chain_tip
-                .last_tip_change()
-                .unwrap_or(tip_action)
-                .best_tip_hash_and_height();
-
-            Ok((best_tip, "sending committed block broadcast", chain_tip))
-        }
+        let has_mined_receiver = mined_block_receiver
+            .as_ref()
+            .is_some_and(|receiver| !receiver.is_closed());
+        let tip_change_close_to_network_tip_fut = wait_for_committed_tip(
+            sync_status.clone(),
+            chain_state.clone_for_task(),
+            &local_submissions,
+            &mut submission_deadline,
+            has_mined_receiver,
+        )
         .in_current_span();
 
         // TODO: Move this logic for selecting the first ready future and updating `chain_state` to its own method.
@@ -225,6 +204,10 @@ where
         let event = prefer_queued_mined_block(event, mined_block_receiver.as_mut());
         let (((hash, height), log_msg, updated_chain_state), is_block_submission, early, size) =
             match event {
+                GossipEvent::MinedBlockChannelClosed => {
+                    mined_block_receiver = None;
+                    continue;
+                }
                 GossipEvent::MinedBlockBroadcastCompleted(completed) => {
                     finish_mined_block_broadcast(
                         completed,
@@ -262,7 +245,13 @@ where
                     Some(size),
                 ),
                 GossipEvent::CommittedTip(tip_change_close_to_network_tip) => {
-                    (tip_change_close_to_network_tip?, false, None, None)
+                    let (best_tip, chain_tip) = tip_change_close_to_network_tip?;
+                    (
+                        (best_tip, "sending committed block broadcast", chain_tip),
+                        false,
+                        None,
+                        None,
+                    )
                 }
             };
 
@@ -335,6 +324,63 @@ where
                 let _ = completion_tx.send(MinedBlockBroadcastCompleted { block, succeeded });
             }
         });
+    }
+}
+
+/// Returns the latest committed tip eligible for ordinary relay and its updated monitor.
+///
+/// A local submission queues its final mining event before releasing its reservation. Wait for
+/// that release instead of sleeping, while following newer tips. The caller still selects mining
+/// events and completions first, and rechecks queued events before accepting this fallback.
+/// `submission_deadline` survives cancellation so unrelated events cannot keep resetting the bound.
+async fn wait_for_committed_tip(
+    mut sync_status: SyncStatus,
+    mut chain_tip: ChainTipChange,
+    local_submissions: &MinedSubmissions,
+    submission_deadline: &mut Option<(block::Hash, Instant)>,
+    has_mined_receiver: bool,
+) -> Result<((block::Hash, block::Height), ChainTipChange), BlockGossipError> {
+    let mut tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
+    loop {
+        sync_status
+            .wait_until_close_to_tip()
+            .map_err(SyncStatus)
+            .await?;
+        tip_action = chain_tip.last_tip_change().unwrap_or(tip_action);
+        let best_tip = tip_action.best_tip_hash_and_height();
+        let hash = best_tip.0;
+
+        if !has_mined_receiver || !local_submissions.contains(&hash) {
+            *submission_deadline = None;
+            return Ok((best_tip, chain_tip));
+        }
+
+        let deadline = match *submission_deadline {
+            Some((pending, deadline)) if pending == hash => deadline,
+            _ => {
+                let deadline = Instant::now() + BLOCK_GOSSIP_TIMEOUT;
+                *submission_deadline = Some((hash, deadline));
+                deadline
+            }
+        };
+        if Instant::now() >= deadline {
+            warn!(
+                ?hash,
+                "local submission stalled; gossiping the committed tip"
+            );
+            return Ok((best_tip, chain_tip));
+        }
+
+        tokio::select! {
+            biased;
+            changed = chain_tip.wait_for_tip_change() => {
+                tip_action = changed.map_err(TipChange)?;
+            }
+            _ = tokio::time::timeout_at(
+                deadline,
+                local_submissions.wait_until_released(hash),
+            ) => {}
+        }
     }
 }
 

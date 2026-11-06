@@ -62,8 +62,14 @@ const MAX_MINED_SUBMISSIONS: usize = 16;
 ///
 /// Block gossip shares it to tell a tip change caused by a local submission, whose
 /// [`MinedBlockEvent`] follows the tip change, from a relayed block.
-#[derive(Clone, Debug, Default)]
-pub struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
+#[derive(Clone, Debug)]
+pub struct MinedSubmissions(watch::Sender<HashSet<block::Hash>>);
+
+impl Default for MinedSubmissions {
+    fn default() -> Self {
+        Self(watch::channel(HashSet::new()).0)
+    }
+}
 
 /// Holds submission capacity until verification and contextual commit finish.
 #[derive(Debug)]
@@ -75,27 +81,41 @@ pub struct MinedSubmission {
 impl MinedSubmissions {
     /// Returns whether this node is submitting `hash` and has not yet sent its final event.
     pub fn contains(&self, hash: &block::Hash) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(hash)
+        self.0.borrow().contains(hash)
+    }
+
+    /// Waits until `hash` is no longer being submitted, returning immediately if it is absent.
+    ///
+    /// Subscribe before checking membership so a concurrent release cannot be missed. Cancelling
+    /// this wait does not release the submission; its guard still owns verification capacity.
+    /// Callers must bound the wait if submission progress is not otherwise guaranteed.
+    pub async fn wait_until_released(&self, hash: block::Hash) {
+        let mut changes = self.0.subscribe();
+        drop(
+            changes
+                .wait_for(|entries| !entries.contains(&hash))
+                .await
+                .expect("this borrowed submission set keeps its watch sender alive"),
+        );
     }
 
     /// Records that this node is submitting `hash` until the returned guard is dropped.
     ///
     /// Fails if `hash` is already being submitted, or too many submissions are in flight.
     pub fn reserve(&self, hash: block::Hash) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
-        let mut entries = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if entries.contains(&hash) {
-            return Err(SubmitBlockErrorResponse::DuplicateInconclusive);
-        }
-        if entries.len() >= MAX_MINED_SUBMISSIONS {
-            return Err(SubmitBlockErrorResponse::Inconclusive);
-        }
-        entries.insert(hash);
+        let mut result = Ok(());
+        self.0.send_if_modified(|entries| {
+            if entries.contains(&hash) {
+                result = Err(SubmitBlockErrorResponse::DuplicateInconclusive);
+                return false;
+            }
+            if entries.len() >= MAX_MINED_SUBMISSIONS {
+                result = Err(SubmitBlockErrorResponse::Inconclusive);
+                return false;
+            }
+            entries.insert(hash)
+        });
+        result?;
         Ok(MinedSubmission {
             submissions: self.clone(),
             hash,
@@ -107,9 +127,7 @@ impl Drop for MinedSubmission {
     fn drop(&mut self) {
         self.submissions
             .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.hash);
+            .send_if_modified(|entries| entries.remove(&self.hash));
     }
 }
 
@@ -500,6 +518,75 @@ mod tests {
         ));
         drop(guards);
         assert!(submissions.reserve(hash).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mined_submission_release_before_wait_is_observed() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([0; 32]);
+        drop(submissions.reserve(hash).unwrap());
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            submissions.wait_until_released(hash),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mined_submission_wait_wakes_only_when_its_guard_is_dropped() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([0; 32]);
+        let guard = submissions.reserve(hash).unwrap();
+        let other = submissions.reserve(block::Hash([1; 32])).unwrap();
+        let wait = submissions.wait_until_released(hash);
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        drop(other);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        assert!(submissions.contains(&hash));
+        drop(guard);
+        assert!(futures::poll!(wait.as_mut()).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_submission_wait_keeps_its_reservation() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([0; 32]);
+        let guard = submissions.reserve(hash).unwrap();
+        {
+            let wait = submissions.wait_until_released(hash);
+            tokio::pin!(wait);
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+        }
+        assert!(matches!(
+            submissions.reserve(hash),
+            Err(SubmitBlockErrorResponse::DuplicateInconclusive)
+        ));
+        drop(guard);
+        assert!(submissions.reserve(hash).is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_a_submission_owner_wakes_release_waiters() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([0; 32]);
+        let guard = submissions.reserve(hash).unwrap();
+        let owner = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let wait = submissions.wait_until_released(hash);
+        tokio::pin!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .unwrap();
+        assert!(!submissions.contains(&hash));
     }
 
     #[test]

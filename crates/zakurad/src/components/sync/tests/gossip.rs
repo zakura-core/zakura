@@ -624,7 +624,12 @@ async fn local_submission_tip_change_waits_for_its_mined_event() {
     ));
 
     // The commit's tip change reaches gossip before the RPC sends the final event.
-    tokio::task::yield_now().await;
+    assert!(
+        timeout(Duration::from_millis(10), peer_set.try_next_request())
+            .await
+            .is_err()
+    );
+    let notified = Instant::now();
     submitblock_sender
         .send(MinedBlockEvent::Committed {
             hash: block_two.hash(),
@@ -638,5 +643,179 @@ async fn local_submission_tip_change_waits_for_its_mined_event() {
         .expect_request(Request::AdvertiseMinedBlock(with_size(&block_two)))
         .await
         .respond(Response::Nil);
+    assert_eq!(notified.elapsed(), Duration::ZERO);
     peer_set.expect_no_requests().await;
+}
+
+/// A reserved local block whose tip is published independently of its RPC lifecycle.
+struct LocalTipTest {
+    block: Arc<Block>,
+    submissions: MinedSubmissions,
+    submission: zakura_rpc::MinedSubmission,
+    chain_tip_sender: ChainTipSender,
+    gossip: GossipTestSetup,
+}
+
+async fn setup_local_tip_test() -> LocalTipTest {
+    let submissions = MinedSubmissions::default();
+    let (mut chain_tip_sender, gossip) =
+        setup_gossip_test_with_submissions(submissions.clone()).await;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let submission = submissions.reserve(block.hash()).unwrap();
+    chain_tip_sender.set_finalized_tip(Some(CheckpointVerifiedBlock::from(block.clone()).into()));
+    LocalTipTest {
+        block,
+        submissions,
+        submission,
+        chain_tip_sender,
+        gossip,
+    }
+}
+
+/// An RPC failure releases the reservation without a mining event. State may already have
+/// accepted the same block from a peer, so its committed tip still needs ordinary gossip.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn released_local_submission_without_a_mining_event_relays_its_committed_tip() {
+    let LocalTipTest {
+        block,
+        submission,
+        chain_tip_sender: _chain_tip_sender,
+        mut gossip,
+        ..
+    } = setup_local_tip_test().await;
+    assert!(timeout(
+        Duration::from_millis(10),
+        gossip.peer_set.try_next_request()
+    )
+    .await
+    .is_err());
+    let released = Instant::now();
+    drop(submission);
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseBlock(without_size(&block), None))
+        .await
+        .respond(Response::Nil);
+    assert_eq!(released.elapsed(), Duration::ZERO);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unfinished_local_submission_does_not_delay_a_newer_relayed_tip() {
+    let LocalTipTest {
+        submission: _submission,
+        mut chain_tip_sender,
+        mut gossip,
+        ..
+    } = setup_local_tip_test().await;
+    assert!(timeout(
+        Duration::from_millis(10),
+        gossip.peer_set.try_next_request()
+    )
+    .await
+    .is_err());
+    let newer: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_3_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let changed = Instant::now();
+    chain_tip_sender.set_finalized_tip(Some(CheckpointVerifiedBlock::from(newer.clone()).into()));
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseBlock(without_size(&newer), None))
+        .await
+        .respond(Response::Nil);
+    assert_eq!(changed.elapsed(), Duration::ZERO);
+}
+
+/// Another mining event cancels and recreates the tip future. Neither that event nor unrelated
+/// reservation changes may reset the original local tip's safety deadline.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn unrelated_events_do_not_extend_a_stuck_submission_deadline() {
+    let LocalTipTest {
+        block,
+        submissions,
+        submission,
+        chain_tip_sender: _chain_tip_sender,
+        mut gossip,
+    } = setup_local_tip_test().await;
+    let started = Instant::now();
+    assert!(timeout(
+        Duration::from_millis(10),
+        gossip.peer_set.try_next_request()
+    )
+    .await
+    .is_err());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let unrelated: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    drop(submissions.reserve(unrelated.hash()).unwrap());
+    gossip
+        .submitblock_sender
+        .send(MinedBlockEvent::Early {
+            hash: unrelated.hash(),
+            height: unrelated.coinbase_height().unwrap(),
+            size: unrelated.zcash_serialized_size(),
+            submitted_at: std::time::Instant::now(),
+            submission: zakura_rpc::MinedBlockSubmission::FullBlock,
+            pending: PendingBlockSignal::valid_for_tests(),
+        })
+        .unwrap();
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseMinedBlock(with_size(&unrelated)))
+        .await
+        .respond(Response::Nil);
+    assert!(timeout(
+        Duration::from_millis(10),
+        gossip.peer_set.try_next_request()
+    )
+    .await
+    .is_err());
+    tokio::time::advance(BLOCK_GOSSIP_TIMEOUT - started.elapsed()).await;
+    gossip
+        .peer_set
+        .expect_request(Request::AdvertiseBlock(without_size(&block), None))
+        .await
+        .respond(Response::Nil);
+    assert_eq!(started.elapsed(), BLOCK_GOSSIP_TIMEOUT);
+    assert!(submissions.contains(&block.hash()));
+    assert!(submissions.reserve(block.hash()).is_err());
+    drop(submission);
+    assert!(timeout(
+        Duration::from_millis(10),
+        gossip.peer_set.try_next_request()
+    )
+    .await
+    .is_err());
+}
+
+/// A closed mining channel cannot produce the event that local-tip coordination awaits.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn closing_the_mining_channel_releases_a_deferred_tip() {
+    let LocalTipTest {
+        block,
+        submission: _submission,
+        chain_tip_sender: _chain_tip_sender,
+        gossip:
+            GossipTestSetup {
+                mut peer_set,
+                submitblock_sender,
+                gossip_task_handle: _gossip_task_handle,
+            },
+        ..
+    } = setup_local_tip_test().await;
+    assert!(
+        timeout(Duration::from_millis(10), peer_set.try_next_request())
+            .await
+            .is_err()
+    );
+    let closed = Instant::now();
+    drop(submitblock_sender);
+    peer_set
+        .expect_request(Request::AdvertiseBlock(without_size(&block), None))
+        .await
+        .respond(Response::Nil);
+    assert_eq!(closed.elapsed(), Duration::ZERO);
 }

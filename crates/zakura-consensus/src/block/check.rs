@@ -22,6 +22,7 @@ use zakura_chain::{
     work::{difficulty::ExpandedDifficulty, equihash},
 };
 use zakura_header_chain::{CompactTargetError, PowPolicy};
+use zakura_state::ValidateContextError;
 
 use crate::{error::*, funding_stream_address};
 
@@ -96,6 +97,30 @@ pub fn coinbase_is_first(block: &BlockRef) -> Result<&transaction::Transaction, 
     }
 
     Ok(first)
+}
+
+/// Rejects transparent outputs spent by different transactions in the same block.
+///
+/// This depends only on transaction IDs, so callers must establish the block's Merkle
+/// binding before attributing a failure to its header. Duplicate inputs within one
+/// transaction remain the transaction verifier's responsibility and retain its error
+/// classification. Coinbase inputs do not reference outputs and are skipped.
+pub(super) fn transparent_spends_are_unique(block: &BlockRef) -> Result<(), ValidateContextError> {
+    let mut spent = HashSet::new();
+    for transaction in block.transactions() {
+        for outpoint in transaction.spent_outpoints() {
+            if spent.contains(&outpoint) {
+                return Err(ValidateContextError::DuplicateTransparentSpend {
+                    outpoint,
+                    location: "the same block",
+                });
+            }
+        }
+        // Insert only after checking this transaction, so an internal duplicate does
+        // not become a cross-transaction failure with a different peer penalty.
+        spent.extend(transaction.spent_outpoints());
+    }
+    Ok(())
 }
 
 /// Returns `Ok(ExpandedDifficulty)` if the`difficulty_threshold` of `header` is at least as difficult as

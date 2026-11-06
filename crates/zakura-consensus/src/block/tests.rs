@@ -474,6 +474,121 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     block
 }
 
+/// Cross-transaction duplicates need no parent or script work, but the body must first
+/// match the transaction Merkle root before its failure can be attributed to the header.
+#[tokio::test]
+async fn duplicate_transparent_spends_reject_before_parent_reads_and_transaction_checks() {
+    use zakura_header_chain::{BodyCommitmentKind, BodyRuleId, BodyVerificationClass};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let outpoint = block.transactions[1].spent_outpoints().next().unwrap();
+    let mut second = block.transactions[1].as_ref().clone();
+    let Transaction::V5 { inputs, .. } = &mut second else {
+        unreachable!("the prepared transaction is V5")
+    };
+    let transparent::Input::PrevOut { sequence, .. } = &mut inputs[0] else {
+        unreachable!("the prepared transaction spends a transparent output")
+    };
+    *sequence = 1;
+    block.transactions.push(Arc::new(second));
+    assert_ne!(block.transactions[1].hash(), block.transactions[2].hash());
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+
+    for matching_root in [false, true] {
+        let mut block = block.clone();
+        if !matching_root {
+            Arc::make_mut(&mut block.header).merkle_root.0[0] ^= 1;
+        }
+        let block = Arc::new(block);
+        for proposal in [false, true] {
+            let state = service_fn(|request: zs::Request| async move {
+                match request {
+                    zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+                    _ => panic!("duplicate spends require no parent or binding read: {request:?}"),
+                }
+            });
+            let transaction =
+                service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+                    panic!("duplicate spends must be rejected before transaction verification");
+                });
+            let request = if proposal {
+                Request::CheckProposal(block.clone().into())
+            } else {
+                Request::Commit(block.clone().into())
+            };
+            let error = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            )
+            .oneshot(request)
+            .await
+            .expect_err("the block has a mismatched root or a duplicate spend");
+            if matching_root {
+                assert!(
+                    matches!(&error, VerifyBlockError::Commit(
+                        zs::CommitBlockError::ValidateContextError(source)
+                    ) if matches!(source.as_ref(), zs::ValidateContextError::DuplicateTransparentSpend {
+                        outpoint: found, ..
+                    } if *found == outpoint)),
+                    "{error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 100);
+                assert_eq!(
+                    error.body_verification_class(),
+                    BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                        "context.duplicate_transparent_spend"
+                    ))
+                );
+                assert!(error.rejects_template());
+            } else {
+                assert_eq!(
+                    error.body_verification_class(),
+                    BodyVerificationClass::PayloadMismatch(
+                        BodyCommitmentKind::TransactionMerkleRoot
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_transparent_spends_keep_internal_duplicates_in_transaction_checks() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let transaction = Arc::make_mut(&mut block.transactions[1]);
+    let Transaction::V5 { inputs, .. } = transaction else {
+        unreachable!("the prepared transaction is V5")
+    };
+    inputs.push(inputs[0].clone());
+    assert!(check::transparent_spends_are_unique(&block).is_ok());
+    let error = tx::check::spend_conflicts(&block.transactions[1]).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionError::DuplicateTransparentSpend(_)
+    ));
+    assert_eq!(error.mempool_misbehavior_score(), 0);
+}
+
+#[test]
+fn duplicate_transparent_spends_distinguish_output_indices() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let mut second = block.transactions[1].as_ref().clone();
+    let Transaction::V5 { inputs, .. } = &mut second else {
+        unreachable!("the prepared transaction is V5")
+    };
+    let transparent::Input::PrevOut { outpoint, .. } = &mut inputs[0] else {
+        unreachable!("the prepared transaction spends a transparent output")
+    };
+    outpoint.index = 1;
+    block.transactions.push(Arc::new(second));
+    assert!(check::transparent_spends_are_unique(&block).is_ok());
+}
+
 /// A future header time is rejected before any transaction is verified. Proposals fail on it at
 /// once; a committed block first checks that the delivered body is the header's, so a tampered
 /// body under a future-timed header is still reported as a payload mismatch.

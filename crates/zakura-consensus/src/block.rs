@@ -590,6 +590,11 @@ where
                 let transaction_hashes = block.view().transaction_hashes();
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
                 let coinbase_tx = quick_checks?;
+                check::transparent_spends_are_unique(&block).map_err(|error| {
+                    VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(Box::new(
+                        error,
+                    )))
+                })?;
 
                 // Hash each transaction's authorizing data once, for the transaction requests
                 // and the state's authorizing-data check.

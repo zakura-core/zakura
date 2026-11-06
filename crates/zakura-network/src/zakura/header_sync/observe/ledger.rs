@@ -835,18 +835,28 @@ impl HeaderWorkLedger {
         }
     }
 
-    /// Every header the queue's accounting claims: live reservations' unstaged
-    /// headers and every round's owned ones.
+    /// Every header the queue's accounting claims: [`Self::reserved`] and
+    /// [`Self::owned`].
     fn claimed(&self) -> usize {
-        let reserved = self
-            .reservations
+        self.reserved() + self.owned()
+    }
+
+    /// The headers the queue's accounting holds reserved: each live
+    /// reservation's unstaged ones.
+    pub fn reserved(&self) -> usize {
+        self.reservations
             .values()
-            .map(|live| live.opened - live.staged);
-        let owned = self
-            .started
+            .map(|live| live.opened - live.staged)
+            .sum()
+    }
+
+    /// The headers the queue's accounting holds owned: each round's staged
+    /// headers that haven't returned.
+    pub fn owned(&self) -> usize {
+        self.started
             .values()
-            .map(|round| round.staged - round.returned);
-        reserved.chain(owned).sum()
+            .map(|round| round.staged - round.returned)
+            .sum()
     }
 
     /// How many headers calls hold now, by round. A handoff's headers count

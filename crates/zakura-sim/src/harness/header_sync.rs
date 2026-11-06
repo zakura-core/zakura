@@ -28,6 +28,7 @@ use super::{
     header_node::StartupFacts,
     header_node::{
         adoption::{AdoptionEvidence, SessionLife},
+        capacity::CapacityEvidence,
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         reservation::ReservationEvidence,
@@ -478,6 +479,9 @@ pub struct Ports {
     /// The node's header capacity accounting, which its tap fills during the
     /// run.
     pub reservations: ReservationEvidence,
+    /// The node's resource probe reads, which its tap checks and keeps
+    /// during the run.
+    pub capacity: CapacityEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -585,6 +589,7 @@ impl Subsystem for Storage {
             mirrors,
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
+            capacity: CapacityEvidence::default(),
         }
     }
 
@@ -608,6 +613,7 @@ impl Subsystem for Storage {
             "node",
             ports.sessions.clone(),
             ports.reservations.clone(),
+            ports.capacity.clone(),
         );
         let adoption = tap.adoption();
         let shutdown = tap.shutdown();
@@ -759,6 +765,9 @@ pub struct WirePorts {
     /// The node's header capacity accounting, which its tap fills during the
     /// run.
     pub reservations: ReservationEvidence,
+    /// The node's resource probe reads, which its tap checks and keeps
+    /// during the run.
+    pub capacity: CapacityEvidence,
 }
 
 impl WirePorts {
@@ -879,6 +888,7 @@ impl Subsystem for HeaderWire {
             sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
             reservations: ReservationEvidence::default(),
+            capacity: CapacityEvidence::default(),
         }
     }
 
@@ -913,6 +923,7 @@ impl Subsystem for HeaderWire {
             "node",
             ports.sessions.clone(),
             ports.reservations.clone(),
+            ports.capacity.clone(),
         );
         let adoption = tap.adoption();
         sim.add_source(Box::new(storage.with_tap(tap)));

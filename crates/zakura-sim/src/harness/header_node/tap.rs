@@ -44,6 +44,14 @@
 //! locator `Dispatched` events, in an [`AdoptionEvidence`] that the harness's
 //! view reads.
 //!
+//! A tap made with a [`CapacityEvidence`] also reads the reactor's resource
+//! probe after each drain, and checks it against the ownership check's
+//! accounting, as [`super::capacity`] describes. The reactor hands the probe
+//! over as it's built, so a tap that has none at its first drain fails as
+//! `ProbeMissing`, and one handed a second fails as `ProbeReplaced`. The
+//! tap's checkpoint covers these reads, so the run fails unless they happen
+//! at every boundary.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -57,17 +65,18 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderSyncObserver, HeaderTargetPhase, HeaderWorkLedger, PortCall, ReactorEvent,
-        RefusalCause, RequestRef, StorageCallKind, WaitCause,
+        CallEnd, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase, HeaderWorkLedger,
+        PortCall, ReactorEvent, RefusalCause, RequestRef, StorageCallKind, WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
-use zakura_scheduler::SimInstant;
+use zakura_scheduler::{SimInstant, TaskId};
 use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
+    capacity::{self, CapacityEvidence, CapacityReading, Expected},
     pair::{PairError, Pairer},
     policy::LinkEffect,
     reservation::ReservationEvidence,
@@ -77,6 +86,7 @@ use crate::{
     draws::Failure,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
+    sim::MidPoll,
     storage::{body_owner, hash, hex, point, scope, work_owner},
     ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
 };
@@ -95,6 +105,8 @@ pub struct ReactorTap {
     pairer: Pairer,
     /// The run's harness failure, set when a call panics.
     failure: Failure,
+    /// The tasks stopped mid-poll at the boundary being observed.
+    mid_poll: MidPoll,
 }
 
 /// What the observer and the reader share.
@@ -124,6 +136,25 @@ struct TapState {
     reservations: ReservationEvidence,
     /// The reactor's adopted state and what it published, for the view.
     adoption: AdoptionEvidence,
+    /// The reactor's resource probe, once it hands it over.
+    probe: Mutex<ProbeSlot>,
+    /// Where the probe's reads go, if this tap reads it.
+    capacity: Option<CapacityEvidence>,
+    /// The first task other than the probe's reactor task that reported
+    /// accounting, if any.
+    off_reactor: Mutex<Option<TaskId>>,
+}
+
+/// The resource probe a tap was handed.
+#[derive(Default)]
+enum ProbeSlot {
+    /// None yet.
+    #[default]
+    Missing,
+    /// One, from the tapped reactor.
+    Held(HeaderResourceProbe),
+    /// More than one, so the tap can't tell which reactor it reads.
+    Replaced,
 }
 
 /// The tap's ownership check, and the first rule a history broke.
@@ -164,6 +195,31 @@ impl TapState {
     fn broken_work_rule(&self) -> Option<String> {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         work.broken.clone()
+    }
+
+    /// Notes the task reporting an accounting fact now, if it isn't the
+    /// reactor task the probe names.
+    fn note_accounting_task(&self) {
+        let Some(task) = zakura_scheduler::hooks::current_task() else {
+            return;
+        };
+        let reactor = match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
+            ProbeSlot::Held(probe) => TaskId::from(probe.task()),
+            ProbeSlot::Missing | ProbeSlot::Replaced => return,
+        };
+        if task != reactor {
+            self.off_reactor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(task);
+        }
+    }
+
+    /// The headers the ownership check's accounting holds reserved and
+    /// owned.
+    fn accounted(&self) -> (usize, usize) {
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        (work.ledger.reserved(), work.ledger.owned())
     }
 
     /// The call or retained headers that a finished reactor left open.
@@ -257,6 +313,20 @@ impl HeaderSyncObserver for TapObserver {
     fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
         Some(Arc::new(TapAccounting(self.0.clone())))
     }
+
+    /// Keeps the reactor's probe, or marks the slot replaced if it holds
+    /// one already. A probe handed over outside the tap's run is refused.
+    fn resource_probe(&self, probe: HeaderResourceProbe) {
+        if zakura_rt::sim::run_id() != Some(self.0.run) {
+            self.0.refused.store(true, Ordering::Relaxed);
+            return;
+        }
+        let mut slot = self.0.probe.lock().unwrap_or_else(PoisonError::into_inner);
+        *slot = match mem::take(&mut *slot) {
+            ProbeSlot::Missing => ProbeSlot::Held(probe),
+            ProbeSlot::Held(_) | ProbeSlot::Replaced => ProbeSlot::Replaced,
+        };
+    }
 }
 
 /// The handle the reactor's work queue reports its accounting through. It
@@ -307,6 +377,7 @@ impl TapState {
         let accounted = ReservationEvidence::keeps(&event);
         if in_run && accounted {
             state.reservations.record(&event);
+            state.note_accounting_task();
         }
         if accounted
             || matches!(
@@ -402,7 +473,8 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
-    /// also kept in `reservations`.
+    /// also kept in `reservations`, and its resource probe read, checked and
+    /// kept in `capacity`.
     ///
     /// # Panics
     ///
@@ -413,8 +485,9 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
+        capacity: CapacityEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
-        ReactorTap::tapped(sim, port, node, sessions, reservations)
+        ReactorTap::tapped(sim, port, node, sessions, reservations, Some(capacity))
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
@@ -430,7 +503,14 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
-        ReactorTap::tapped(sim, port, node, sessions, ReservationEvidence::default())
+        ReactorTap::tapped(
+            sim,
+            port,
+            node,
+            sessions,
+            ReservationEvidence::default(),
+            None,
+        )
     }
 
     /// The tap [`ReactorTap::with_evidence`] makes.
@@ -440,6 +520,7 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
+        capacity: Option<CapacityEvidence>,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
@@ -466,6 +547,9 @@ impl ReactorTap {
                 sessions,
                 reservations,
                 adoption,
+                probe: Mutex::default(),
+                capacity,
+                off_reactor: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -485,6 +569,7 @@ impl ReactorTap {
             delivered: 0,
             pairer: Pairer::default(),
             failure: sim.failure(),
+            mid_poll: sim.mid_poll(),
         };
         (observer, tap)
     }
@@ -513,6 +598,82 @@ impl ReactorTap {
     /// to.
     pub fn sessions(&self) -> SessionEvidence {
         self.state.sessions.clone()
+    }
+
+    /// Reads the reactor's resource probe, if this tap reads one, checks the
+    /// read as [`capacity::check`] says, and keeps it as a reading of `step`.
+    /// While the reactor is alive, a quiet boundary's read is compared with
+    /// the ownership check's accounting. Once a reactor the harness stopped
+    /// is gone, every read is a teardown read. A reactor that unwound, or
+    /// went away unstopped, left its counts mid-change and fails the run on
+    /// its own, so its reads aren't checked.
+    fn read_capacity(&self, step: u64) -> Result<(), String> {
+        let Some(evidence) = &self.state.capacity else {
+            return Ok(());
+        };
+        let probe = match &*self
+            .state
+            .probe
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            ProbeSlot::Missing => {
+                return Err(
+                    "ProbeMissing: the tapped reactor never handed over its resource probe"
+                        .to_owned(),
+                )
+            }
+            ProbeSlot::Replaced => {
+                return Err(
+                    "ProbeReplaced: more than one reactor handed this tap a resource probe"
+                        .to_owned(),
+                )
+            }
+            ProbeSlot::Held(probe) => probe.clone(),
+        };
+        let gone = self.state.observer.strong_count() == 0;
+        if self.state.unwound.load(Ordering::Relaxed) || (gone && !self.state.stopped()) {
+            return Ok(());
+        }
+        if let Some(task) = *self
+            .state
+            .off_reactor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            return Err(format!(
+                "AccountingOffReactor: task {} reported capacity accounting, not the reactor's \
+                 task {}, so no boundary is known quiet",
+                task.index(),
+                TaskId::from(probe.task()).index()
+            ));
+        }
+        let Some(read) = zakura_rt::sim::boundary_read(|| probe.read()) else {
+            return Ok(());
+        };
+        let expected = if gone {
+            Expected::Teardown {
+                storage_permits: self
+                    .state
+                    .port
+                    .upgrade()
+                    .map_or(0, |port| port.owner_state().permits.len()),
+            }
+        } else {
+            let quiet = !self.mid_poll.contains(TaskId::from(probe.task()));
+            Expected::Live {
+                accounted: quiet.then(|| self.state.accounted()),
+            }
+        };
+        evidence.record(CapacityReading {
+            step,
+            reserved: read.reserved,
+            owned: read.owned,
+            locator_permits: read.locator_permits,
+            compared: matches!(expected, Expected::Live { accounted: Some(_) }),
+            teardown: gone,
+        });
+        capacity::check(&probe, read, expected)
     }
 
     /// Takes the reservations and admissions recorded since the last call,
@@ -736,6 +897,8 @@ impl ActionSource for ReactorTap {
     /// harness failure. Once the reactor's teardown is done, a dropped call still
     /// waiting for its drop receipt fails as `UnpairedDrop`, and an open call or
     /// ownership fails as the ledger names it, unless the reactor unwound.
+    /// A clean drain then reads the reactor's resource probe
+    /// ([`ReactorTap::read_capacity`]).
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
         // Only the run holding the checkpoint checks what this delivers.
         // Run IDs depend on the process, and the failure is replayed, so the
@@ -795,7 +958,8 @@ impl ActionSource for ReactorTap {
                     self.state.open_work()
                 }
                 _ => Ok(()),
-            },
+            }
+            .and_then(|()| self.read_capacity(log.step())),
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or

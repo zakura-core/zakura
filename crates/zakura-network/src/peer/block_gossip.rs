@@ -1,22 +1,12 @@
-//! Pace legacy block advertisements using the corresponding block writes.
+//! Schedule legacy block advertisements independently of peer requests and uploads.
 //!
-//! Each broadcast advertises to at most its advert window of peers at a time, and moves on to
-//! the next peer once an earlier one finishes. [`AdvertFanout`] sizes that window from the
-//! block's size. Configured sidecars are advertised first, outside the window. Writing an `inv`
-//! uses only that window. A peer takes one of the [`BLOCK_UPLOAD_CONCURRENCY`] upload slots,
-//! shared by every broadcast, only once it requests the block, and keeps it through the body
-//! write and its drain allowance. A peer waiting for a slot keeps its window entry, so busy
-//! uploads still slow each broadcast's fan-out, but they cannot delay another block's first
-//! `inv`s.
+//! Each broadcast advertises immediately to its size-dependent initial group and sidecars.
+//! Every remaining peer becomes eligible at one absolute deadline. Peer silence, slow writes,
+//! and uploads cannot postpone another peer's announcement.
 //!
-//! The slots pace fan-out. They do not gate the body write: the connection answers a `getdata`
-//! at once, and the advert task can take its slot after the write completes. So the window, not
-//! the slots, bounds one broadcast's concurrent body writes, and overlapping broadcasts and
-//! sidecars add to that.
-//!
-//! A newer block does not stop an older block's broadcast. A peer that has not received the parent
-//! needs it to accept the child, and the newer block might be a side-chain or provisional block
-//! that never becomes the tip.
+//! Upload tracking deduplicates overlapping broadcasts and reports delivery failures. Its
+//! request expiry and write grace do not control announcement timing or limit body writes.
+//! A newer block does not cancel an older broadcast: peers can still need its parent.
 
 use std::{
     collections::HashMap,
@@ -26,7 +16,7 @@ use std::{
 
 use futures::{future::BoxFuture, FutureExt, StreamExt};
 use tokio::{
-    sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, watch},
     time::{sleep_until, timeout, Instant},
 };
 use zakura_chain::{block, chain_tip::ChainTip};
@@ -67,18 +57,15 @@ pub(crate) enum BlockAdvertError {
     Connection(#[from] SharedPeerError),
 }
 
-/// Upload slots shared by every legacy block broadcast.
-///
-/// A slot paces fan-out after a peer requests the block. It does not delay the body write.
-pub(crate) const BLOCK_UPLOAD_CONCURRENCY: usize = 32;
-
-/// Chooses how many peers one block broadcast advertises to at once, from the block's size.
+/// Selects the initial peer count and the remaining peers' delay from the block size.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AdvertFanout {
     min: usize,
     max: usize,
     small_size_bytes: u64,
     full_size_bytes: u64,
+    delay_min: Duration,
+    delay_max: Duration,
 }
 
 impl AdvertFanout {
@@ -89,10 +76,12 @@ impl AdvertFanout {
             max: config.advert_window_max,
             small_size_bytes: config.advert_window_small_size_bytes,
             full_size_bytes: config.advert_window_full_size_bytes,
+            delay_min: config.advert_delay_min,
+            delay_max: config.advert_delay_max,
         }
     }
 
-    /// Returns the advert window of a block of `size` serialized bytes, and records it in metrics.
+    /// Returns the initial peer count for `size` serialized bytes and records it in metrics.
     ///
     /// Blocks at or below `small_size_bytes` use `max`.
     /// Blocks at or above `full_size_bytes`, and blocks of unknown size, use `min`.
@@ -117,15 +106,42 @@ impl AdvertFanout {
         metrics::histogram!("peer.block_gossip.advert_window").record(window as f64);
         window
     }
+
+    /// Returns the delay before announcing to peers outside the initial group.
+    ///
+    /// Unknown sizes use the maximum. Known sizes interpolate between the configured
+    /// thresholds, with nanosecond precision and no floating-point rounding.
+    pub(crate) fn delay(&self, size: Option<u32>) -> Duration {
+        let Some(size) = size else {
+            return self.delay_max;
+        };
+        let range = self
+            .full_size_bytes
+            .saturating_sub(self.small_size_bytes)
+            .max(1);
+        let above_small = u64::from(size)
+            .saturating_sub(self.small_size_bytes)
+            .min(range);
+        let span = self.delay_max.saturating_sub(self.delay_min).as_nanos();
+        // Divide before multiplying: Duration::MAX nanoseconds times u64::MAX can overflow.
+        let range = u128::from(range);
+        let fraction = u128::from(above_small);
+        let nanos = (span / range) * fraction + (span % range) * fraction / range;
+        let seconds =
+            u64::try_from(nanos / 1_000_000_000).expect("the interpolated delay fits in Duration");
+        let subsecond =
+            u32::try_from(nanos % 1_000_000_000).expect("subsecond nanoseconds fit in u32");
+        self.delay_min + Duration::new(seconds, subsecond)
+    }
 }
 
 /// Every this many mined-block advertisements, a random peer replaces the next-lowest RTT.
 ///
-/// Peers with the lowest RTT could otherwise hold every slot without completing uploads.
+/// Random peers keep the initial group from depending entirely on the lowest RTTs.
 const MINED_RANDOM_INTERVAL: usize = 4;
 /// Allow the kernel send queue to drain after the framed block write completes.
 const BLOCK_WRITE_GRACE: Duration = Duration::from_millis(750);
-/// Peers that already have a block might never request it.
+/// Expire request tracking for peers that already have the block. This does not pace gossip.
 pub(super) const BLOCK_REQUEST_WAIT: Duration = Duration::from_secs(2);
 /// Bound both inbound service work and the subsequent block write.
 const BLOCK_UPLOAD_WAIT: Duration = Duration::from_secs(2 * REQUEST_TIMEOUT.as_secs());
@@ -282,21 +298,15 @@ impl BlockGossipPeer {
 
     /// Advertises `broadcast`'s block to this peer, then tracks the upload the peer requests.
     ///
-    /// Writing the `inv` takes no upload slot. The peer takes one only once it requests the
-    /// block, and keeps it through the block write and the drain allowance.
-    ///
     /// Returns false if the `inv` was not written, or if the peer requested the block and the
     /// upload failed or did not finish in time.
     #[cfg(test)]
-    pub(crate) async fn advertise(self, hash: block::Hash, slots: BlockUploadSlots) -> bool {
-        matches!(
-            self.advertise_outcome(hash, slots).await,
-            AdvertOutcome::Sent
-        )
+    pub(crate) async fn advertise(self, hash: block::Hash) -> bool {
+        matches!(self.advertise_outcome(hash).await, AdvertOutcome::Sent)
     }
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
-    async fn advertise_outcome(self, hash: block::Hash, slots: BlockUploadSlots) -> AdvertOutcome {
+    async fn advertise_outcome(self, hash: block::Hash) -> AdvertOutcome {
         let mut retried = false;
         let (mut progress, claim) = loop {
             let (mut progress, claim) = self.uploads.register(hash);
@@ -325,7 +335,7 @@ impl BlockGossipPeer {
         let (result, written) = oneshot::channel();
         let advert = BlockAdvert { hash, result };
         // A sidecar learns the tip only from inventory, so it waits for its busy connection.
-        // Other connections that cannot write inventory promptly must not hold the slot.
+        // Other connections have a shorter inventory-write timeout.
         let inventory_wait = if self.sidecar {
             BLOCK_UPLOAD_WAIT
         } else {
@@ -349,7 +359,6 @@ impl BlockGossipPeer {
         claim.0.send_if_modified(UploadState::start_waiting);
 
         let request_deadline = Instant::now() + BLOCK_REQUEST_WAIT;
-        let mut upload = None;
         let succeeded = loop {
             let state = *progress.borrow_and_update();
             let deadline = match state {
@@ -357,12 +366,6 @@ impl BlockGossipPeer {
                 UploadState::Waiting => request_deadline,
                 UploadState::Requested(started) => started + BLOCK_UPLOAD_WAIT,
                 UploadState::Written(written) => {
-                    // A peer that requested while every slot was held keeps this broadcast's
-                    // window entry until it gets one, so busy uploads pace every broadcast's
-                    // further fan-out.
-                    if upload.is_none() {
-                        upload = Some(slots.acquire().await);
-                    }
                     sleep_until(written + BLOCK_WRITE_GRACE).await;
                     // A disconnect during the grace can discard the body in the send queue.
                     break !matches!(*progress.borrow(), UploadState::Finished(false));
@@ -370,85 +373,20 @@ impl BlockGossipPeer {
                 UploadState::Finished(succeeded) => break succeeded,
                 UploadState::Revoked => return AdvertOutcome::Revoked,
             };
-            let requested = matches!(state, UploadState::Requested(_));
             tokio::select! {
                 biased;
                 changed = progress.changed() => if changed.is_err() { break false; },
-                slot = slots.acquire(), if requested && upload.is_none() => {
-                    upload = Some(slot);
-                }
                 _ = sleep_until(deadline) => {
                     let reason = if matches!(state, UploadState::Waiting) { "no_request" } else { "upload_timeout" };
-                    metrics::counter!("peer.block_gossip.slot_timeout", "reason" => reason).increment(1);
+                    metrics::counter!("peer.block_gossip.tracking_timeout", "reason" => reason).increment(1);
                     // A peer that already has the block never requests it, so the advert still
                     // succeeded. A requested upload that did not finish was not delivered.
                     break matches!(state, UploadState::Waiting);
                 }
             }
         };
-        drop(upload);
         claim.0.send_replace(UploadState::Finished(succeeded));
         AdvertOutcome::from(succeeded)
-    }
-}
-
-/// The upload slots that every legacy block broadcast shares.
-#[derive(Clone, Debug)]
-pub(crate) struct BlockUploadSlots(Arc<UploadSlotsState>);
-
-#[derive(Debug)]
-struct UploadSlotsState {
-    uploads: Arc<Semaphore>,
-    upload_capacity: usize,
-}
-
-impl BlockUploadSlots {
-    /// Returns slots that account for at most `upload_capacity` concurrent uploads.
-    pub(crate) fn new(upload_capacity: usize) -> Self {
-        Self(Arc::new(UploadSlotsState {
-            uploads: Arc::new(Semaphore::new(upload_capacity)),
-            upload_capacity,
-        }))
-    }
-
-    /// Returns the number of upload slots not held by a requested upload.
-    pub(crate) fn available_uploads(&self) -> usize {
-        self.0.uploads.available_permits()
-    }
-
-    /// Waits for an upload slot, which is returned when the slot is dropped.
-    async fn acquire(&self) -> UploadSlot {
-        let permit = self
-            .0
-            .uploads
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("upload slots never close their semaphore");
-        self.record_uploads_in_use();
-        UploadSlot {
-            permit: Some(permit),
-            slots: self.clone(),
-        }
-    }
-
-    fn record_uploads_in_use(&self) {
-        metrics::gauge!("peer.block_gossip.uploads_in_use")
-            // Upload counts are at most `BLOCK_UPLOAD_CONCURRENCY`, so they convert exactly.
-            .set((self.0.upload_capacity - self.available_uploads()) as f64);
-    }
-}
-
-/// One accounted upload, held from the peer's getdata through the drain allowance.
-struct UploadSlot {
-    permit: Option<OwnedSemaphorePermit>,
-    slots: BlockUploadSlots,
-}
-
-impl Drop for UploadSlot {
-    fn drop(&mut self) {
-        drop(self.permit.take());
-        self.slots.record_uploads_in_use();
     }
 }
 
@@ -474,32 +412,34 @@ impl From<bool> for AdvertOutcome {
 #[error("block advertisement candidates lost authorization")]
 struct RevokedCandidates;
 
-/// Advertises `hash` to `peers`, paced through their block uploads.
-///
-/// Configured sidecars are all advertised at once, first. Other peers are advertised to at most
-/// `window` at a time. Succeeds if at least one peer was advertised to.
+/// Announces to sidecars and the initial group immediately, then all remaining peers at
+/// `delayed_at`. Delivery tracking never gates another peer's announcement.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
     window: usize,
     mined: bool,
-    slots: BlockUploadSlots,
+    delayed_at: Instant,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
-    let mut sidecars = order_peers(peers, mined, &mut rand_10::rng());
-    let others = sidecars.split_off(sidecars.iter().take_while(|peer| peer.sidecar).count());
+    let mut initial = order_peers(peers, mined, &mut rand_10::rng());
+    let sidecars = initial.iter().take_while(|peer| peer.sidecar).count();
+    let delayed = initial.split_off(sidecars.saturating_add(window).min(initial.len()));
     async move {
-        let advertise = |peers: Vec<BlockGossipPeer>, window: usize| {
-            let slots = slots.clone();
+        let advertise = |peers: Vec<BlockGossipPeer>| {
             futures::stream::iter(peers)
-                .map(move |peer| peer.advertise_outcome(hash, slots.clone()))
-                .buffer_unordered(window)
+                .map(move |peer| peer.advertise_outcome(hash))
+                .buffer_unordered(usize::MAX)
         };
-        let sidecar_window = sidecars.len().max(1);
-        // `select` polls the sidecars first, so their adverts are queued first.
-        let mut sends = futures::stream::select(
-            advertise(sidecars, sidecar_window),
-            advertise(others, window),
-        );
+        let delayed = futures::stream::once(async move {
+            if !delayed.is_empty() && delayed_at > Instant::now() {
+                sleep_until(delayed_at).await;
+            }
+            advertise(delayed)
+        })
+        .flatten();
+        // Poll the initial group first, including sidecars, without waiting for delivery.
+        let sends = futures::stream::select(advertise(initial), delayed);
+        futures::pin_mut!(sends);
         let mut succeeded = false;
         let mut revoked = false;
         while let Some(outcome) = sends.next().await {
@@ -526,9 +466,7 @@ pub(crate) fn broadcast_block(
 pub(crate) struct BlockAdvertiser<C> {
     /// Every connected peer's block advert queue, as last published by the peer set.
     pub(crate) peers: watch::Receiver<Vec<BlockGossipPeer>>,
-    /// Shared with the peer set's own block broadcasts.
-    pub(crate) slots: BlockUploadSlots,
-    /// Sizes each broadcast's advert window. Shared with the peer set's own block broadcasts.
+    /// Selects each broadcast's initial group and delay. Shared with the peer set.
     pub(crate) fanout: AdvertFanout,
     pub(crate) minimum_peer_version: MinimumPeerVersion<C>,
     pub(crate) bans: BannedIps,
@@ -582,8 +520,8 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
         let bans = self.bans.clone();
         let refresh = self.refresh.clone();
         let mut peers = self.peers.clone();
-        let slots = self.slots.clone();
         let window = self.fanout.window(block.size);
+        let delayed_at = Instant::now() + self.fanout.delay(block.size);
         async move {
             loop {
                 if let Some(refresh) = &refresh {
@@ -603,9 +541,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     .cloned()
                     .collect();
                 if !candidates.is_empty() {
-                    match broadcast_block(candidates, block.hash, window, mined, slots.clone())
-                        .await
-                    {
+                    match broadcast_block(candidates, block.hash, window, mined, delayed_at).await {
                         Err(error) if error.is::<RevokedCandidates>() => {}
                         result => return result,
                     }
@@ -618,7 +554,7 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     }
 }
 
-/// Randomize relays and equal RTTs; prioritize configured sidecars within the cap.
+/// Randomize relays and equal RTTs; put configured sidecars first.
 ///
 /// Mined blocks follow RTT order, except that every [`MINED_RANDOM_INTERVAL`]th non-sidecar
 /// advertisement goes to a random remaining peer.
@@ -708,11 +644,11 @@ mod tests {
     struct BodyWrites {
         current: std::sync::atomic::AtomicUsize,
         max: std::sync::atomic::AtomicUsize,
+        total: std::sync::atomic::AtomicUsize,
     }
 
     /// Like [`connected_peers`], but if `body_write` is set, each peer requests every advertised
-    /// block at once, and its connection writes the body that long afterwards, whether or not
-    /// gossip has an upload slot for it, as the inbound service does.
+    /// block at once, and its connection writes the body that long afterwards.
     fn requesting_peers(
         count: usize,
         body_write: Option<Duration>,
@@ -743,6 +679,7 @@ mod tests {
                             continue;
                         };
                         uploads.requested(hash);
+                        bodies.total.fetch_add(1, SeqCst);
                         let current = bodies.current.fetch_add(1, SeqCst) + 1;
                         bodies.max.fetch_max(current, SeqCst);
                         let (uploads, bodies) = (uploads.clone(), bodies.clone());
@@ -778,14 +715,14 @@ mod tests {
     ) -> Duration {
         let parent = block::Hash([0xa0; 32]);
         let child = block::Hash([0xb0; 32]);
-        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
-        let (peers, mut writes) = connected_peers(BLOCK_UPLOAD_CONCURRENCY);
+
+        let (peers, mut writes) = connected_peers(TEST_WINDOW);
         let mut broadcasts = vec![tokio::spawn(broadcast_block(
             peers.clone(),
             parent,
             TEST_WINDOW,
             true,
-            slots.clone(),
+            Instant::now() + Duration::from_millis(500),
         ))];
         if early_and_committed {
             broadcasts.push(tokio::spawn(broadcast_block(
@@ -793,10 +730,10 @@ mod tests {
                 parent,
                 TEST_WINDOW,
                 true,
-                slots.clone(),
+                Instant::now() + Duration::from_millis(500),
             )));
         }
-        for _ in 0..BLOCK_UPLOAD_CONCURRENCY {
+        for _ in 0..TEST_WINDOW {
             let (index, hash) = writes.recv().await.expect("mock connections stay open");
             assert_eq!(hash, parent, "each peer gets the parent inventory once");
             let uploads = &peers[index].uploads;
@@ -810,11 +747,6 @@ mod tests {
             }
         }
         tokio::task::yield_now().await;
-        let expected_uploads = match older {
-            OlderBroadcastPeers::NeverRequest => BLOCK_UPLOAD_CONCURRENCY,
-            OlderBroadcastPeers::Uploading | OlderBroadcastPeers::InWriteGrace => 0,
-        };
-        assert_eq!(slots.available_uploads(), expected_uploads);
 
         let mined = Instant::now();
         broadcasts.push(tokio::spawn(broadcast_block(
@@ -822,7 +754,7 @@ mod tests {
             child,
             TEST_WINDOW,
             true,
-            slots.clone(),
+            Instant::now() + Duration::from_millis(500),
         )));
         let wait = loop {
             let (_, hash) = writes.recv().await.expect("mock connections stay open");
@@ -836,9 +768,8 @@ mod tests {
 
     /// The fleet's fresh-block wait: an older broadcast's peers that never request, are
     /// uploading, or are inside the write grace must not delay a new block's first inventory.
-    /// Before upload slots were taken only on request, these waits were 3 s, 40 s, 750 ms and 3 s.
     #[tokio::test(start_paused = true)]
-    async fn fresh_block_inventory_does_not_wait_for_older_broadcast_slots() {
+    async fn fresh_block_inventory_does_not_wait_for_older_broadcasts() {
         for (older, early_and_committed) in [
             (OlderBroadcastPeers::NeverRequest, false),
             (OlderBroadcastPeers::Uploading, false),
@@ -855,85 +786,70 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn upload_slot_is_taken_on_request_and_held_through_grace() {
+    async fn requested_upload_is_tracked_through_write_grace() {
         let hash = block::Hash([1; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (first, mut first_rx) = peer();
         let uploads = first.uploads.clone();
         let (second, mut second_rx) = peer();
-        let first_task = tokio::spawn(first.advertise(hash, slots.clone()));
+        let first_task = tokio::spawn(first.advertise(hash));
         accept(&mut first_rx, hash).await;
-        assert_eq!(
-            slots.available_uploads(),
-            1,
-            "written inventory takes no upload slot"
-        );
         uploads.requested(hash);
         tokio::task::yield_now().await;
-        assert_eq!(slots.available_uploads(), 0);
         // Another peer's inventory does not wait for the upload.
-        let second_task = tokio::spawn(second.advertise(hash, slots.clone()));
+        let second_task = tokio::spawn(second.advertise(hash));
         accept(&mut second_rx, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert!(second_task.await.unwrap(), "the unrequested advert ends");
-        assert_eq!(
-            slots.available_uploads(),
-            0,
-            "getdata keeps the slot beyond the no-request timeout"
-        );
         uploads.written(hash);
         tokio::task::yield_now().await;
         tokio::time::advance(BLOCK_WRITE_GRACE - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
-        assert_eq!(slots.available_uploads(), 0);
+        assert!(!first_task.is_finished());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(first_task.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unrequested_inventory_holds_no_upload_slot() {
+    async fn unrequested_inventory_tracking_expires() {
         let hash = block::Hash([2; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (first, mut first_rx) = peer();
-        let task = tokio::spawn(first.advertise(hash, slots.clone()));
+        let task = tokio::spawn(first.advertise(hash));
         accept(&mut first_rx, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT - Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert!(!task.is_finished(), "the advert waits for a request");
-        assert_eq!(slots.available_uploads(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(task.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn duplicate_announcements_share_upload_and_slot() {
+    async fn duplicate_announcements_share_upload_tracking() {
         let hash = block::Hash([3; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let first = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
-        let second = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let second = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
         assert!(receiver.recv().now_or_never().is_none());
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(first.await.unwrap());
         assert!(second.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
         assert!(receiver.recv().now_or_never().is_none());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_wakes_duplicate_and_returns_permit() {
+    async fn cancellation_wakes_duplicate() {
         let hash = block::Hash([4; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let first = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let duplicate = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
@@ -942,17 +858,16 @@ mod tests {
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(duplicate.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn joined_announcement_readvertises_after_unavailable_upload() {
         let hash = block::Hash([7; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let early = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
-        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let committed = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
         peer.uploads.requested(hash);
         peer.uploads.unavailable(hash);
@@ -961,44 +876,40 @@ mod tests {
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(committed.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn joined_announcement_does_not_retry_after_disconnect() {
         let hash = block::Hash([8; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let first = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let first = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
-        let duplicate = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let duplicate = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
         drop(receiver);
         peer.uploads.disconnected();
         assert!(!first.await.unwrap());
         assert!(!duplicate.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn upload_timeout_and_disconnect_release_slots() {
+    async fn upload_timeout_and_disconnect_fail_tracking() {
         for disconnect in [false, true] {
             let hash = block::Hash([5; 32]);
-            let slots = BlockUploadSlots::new(1);
+
             let (peer, mut receiver) = peer();
             let uploads = peer.uploads.clone();
-            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+            let task = tokio::spawn(peer.advertise(hash));
             accept(&mut receiver, hash).await;
             uploads.requested(hash);
             tokio::task::yield_now().await;
-            assert_eq!(slots.available_uploads(), 0, "the upload holds its slot");
             if disconnect {
                 uploads.disconnected();
             } else {
                 tokio::time::advance(BLOCK_UPLOAD_WAIT).await;
             }
             assert!(!task.await.unwrap(), "the upload did not finish");
-            assert_eq!(slots.available_uploads(), 1);
         }
     }
 
@@ -1006,10 +917,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn disconnect_during_write_grace_fails_the_upload() {
         let hash = block::Hash([19; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
         let uploads = peer.uploads.clone();
-        let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+        let task = tokio::spawn(peer.advertise(hash));
         accept(&mut receiver, hash).await;
         uploads.requested(hash);
         uploads.written(hash);
@@ -1017,73 +928,6 @@ mod tests {
         uploads.disconnected();
         tokio::time::advance(BLOCK_WRITE_GRACE).await;
         assert!(!task.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
-    }
-
-    /// Requested uploads of different blocks share the cap, but inventory does not wait for it.
-    #[tokio::test(start_paused = true)]
-    async fn requested_uploads_of_different_blocks_share_the_cap() {
-        let slots = BlockUploadSlots::new(2);
-        let mut tasks = Vec::new();
-        let mut uploads = Vec::new();
-        for i in 0..3 {
-            let hash = block::Hash([20 + i; 32]);
-            let (peer, mut receiver) = peer();
-            let upload = peer.uploads.clone();
-            tasks.push(tokio::spawn(peer.advertise(hash, slots.clone())));
-            accept(&mut receiver, hash).await;
-            upload.requested(hash);
-            uploads.push((hash, upload));
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(slots.available_uploads(), 0);
-        // The third upload waits for a slot, not for the first upload's timers.
-        let (hash, first) = &uploads[0];
-        first.written(*hash);
-        tokio::task::yield_now().await;
-        tokio::time::advance(BLOCK_WRITE_GRACE).await;
-        assert!(tasks.remove(0).await.unwrap());
-        tokio::task::yield_now().await;
-        assert_eq!(
-            slots.available_uploads(),
-            0,
-            "the waiting upload takes the slot"
-        );
-        for (hash, upload) in &uploads[1..] {
-            upload.written(*hash);
-        }
-        tokio::task::yield_now().await;
-        tokio::time::advance(BLOCK_WRITE_GRACE).await;
-        for task in tasks {
-            assert!(task.await.unwrap());
-        }
-        assert_eq!(slots.available_uploads(), 2);
-    }
-
-    /// A peer that requested while every slot was held, then disconnected, holds nothing.
-    #[tokio::test(start_paused = true)]
-    async fn disconnect_while_waiting_for_an_upload_slot_takes_none() {
-        let hash = block::Hash([12; 32]);
-        let slots = BlockUploadSlots::new(1);
-        let (holder, mut holder_rx) = peer();
-        let (waiter, mut waiter_rx) = peer();
-        let holder_uploads = holder.uploads.clone();
-        let waiter_uploads = waiter.uploads.clone();
-        let holder = tokio::spawn(holder.advertise(hash, slots.clone()));
-        let waiter = tokio::spawn(waiter.advertise(hash, slots.clone()));
-        accept(&mut holder_rx, hash).await;
-        accept(&mut waiter_rx, hash).await;
-        holder_uploads.requested(hash);
-        tokio::task::yield_now().await;
-        waiter_uploads.requested(hash);
-        tokio::task::yield_now().await;
-        waiter_uploads.disconnected();
-        assert!(!waiter.await.unwrap());
-        holder_uploads.written(hash);
-        tokio::task::yield_now().await;
-        tokio::time::advance(BLOCK_WRITE_GRACE).await;
-        assert!(holder.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     /// A newer block must not stop an older block's fan-out: the peers still need the parent, and
@@ -1092,11 +936,10 @@ mod tests {
     async fn newer_block_does_not_stop_older_broadcast() {
         let parent = block::Hash([13; 32]);
         let child = block::Hash([14; 32]);
-        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
 
         // A busy connection has not written the parent advert yet.
         let (busy, mut busy_rx) = peer();
-        let queued = tokio::spawn(busy.advertise(parent, slots.clone()));
+        let queued = tokio::spawn(busy.advertise(parent));
         tokio::task::yield_now().await;
 
         // A parent broadcast with more peers than its window, which never request.
@@ -1106,7 +949,7 @@ mod tests {
             parent,
             TEST_WINDOW,
             true,
-            slots.clone(),
+            Instant::now() + Duration::from_millis(500),
         ));
         for _ in 0..TEST_WINDOW {
             assert_eq!(writes.recv().await.unwrap().1, parent);
@@ -1118,7 +961,7 @@ mod tests {
             child,
             TEST_WINDOW,
             true,
-            slots.clone(),
+            Instant::now() + Duration::from_millis(500),
         ));
         for _ in 0..TEST_WINDOW {
             assert_eq!(writes.recv().await.unwrap().1, child);
@@ -1127,12 +970,12 @@ mod tests {
         accept(&mut busy_rx, parent).await;
         assert!(queued.await.unwrap(), "the queued parent advert is written");
 
-        // Every peer also gets the rest of the parent fan-out once its window entries expire.
+        // Both broadcasts reach their remaining peers at their own configured deadlines.
         let (mut parents, mut children) = (TEST_WINDOW, TEST_WINDOW);
         while parents < peers.len() || children < peers.len() {
             let write = timeout(Duration::from_secs(60), writes.recv())
                 .await
-                .expect("each window entry expires, so the fan-out reaches every peer");
+                .expect("each broadcast reaches every peer at its deadline");
             if write.unwrap().1 == parent {
                 parents += 1;
             } else {
@@ -1146,7 +989,6 @@ mod tests {
     /// Starts a broadcast of a block of `size` bytes to `peers` with the fan-out policy in
     /// `config`, and returns the peers it advertised to before any advert finished.
     async fn first_wave(config: Config, peers: Vec<BlockGossipPeer>, size: u32) -> Vec<usize> {
-        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
         let fanout = AdvertFanout::from_config(&config);
         let (peers, mut writes) = peers_writing(peers);
         let block = AdvertisedBlock {
@@ -1158,11 +1000,11 @@ mod tests {
             block.hash,
             fanout.window(block.size),
             false,
-            slots,
+            Instant::now() + Duration::from_millis(500),
         ));
         let mut wave = Vec::new();
-        // These peers never request the block, so no advert finishes before the request wait.
-        while let Ok(Some((index, _))) = timeout(BLOCK_REQUEST_WAIT / 2, writes.recv()).await {
+        // Stop before the delayed group becomes eligible.
+        while let Ok(Some((index, _))) = timeout(Duration::from_millis(250), writes.recv()).await {
             wave.push(index);
         }
         broadcast.abort();
@@ -1192,8 +1034,7 @@ mod tests {
         (0..count).map(|_| peer().0).collect()
     }
 
-    /// A window of 32 to 64 over the default sizes, below the default fixed window, so tests
-    /// can see a broadcast's waves and its size-based window.
+    /// Explicit initial-group bounds for size-dependent scheduling tests.
     fn sized_window_config() -> Config {
         Config {
             advert_window_min: 32,
@@ -1202,18 +1043,14 @@ mod tests {
         }
     }
 
-    /// By default every block is advertised to up to 1000 peers at once, whatever its size.
     #[test]
-    fn default_advert_window_is_fixed() {
+    fn defaults_use_sized_initial_groups_without_delay() {
         let fanout = AdvertFanout::from_config(&Config::default());
-        for size in [
-            Some(0),
-            Some(102_400),
-            Some(1_513_987),
-            Some(u32::MAX),
-            None,
-        ] {
-            assert_eq!(fanout.window(size), 1000, "{size:?}");
+        assert_eq!(fanout.window(Some(102_400)), 64);
+        assert_eq!(fanout.window(Some(1_572_864)), 32);
+        assert_eq!(fanout.window(None), 32);
+        for size in [Some(0), Some(102_401), Some(u32::MAX), None] {
+            assert_eq!(fanout.delay(size), Duration::ZERO);
         }
     }
 
@@ -1257,6 +1094,262 @@ mod tests {
             assert_eq!(fanout(9, 9).window(size), 9);
         }
         assert_eq!(fanout(1, usize::MAX).window(Some(0)), usize::MAX);
+    }
+
+    #[test]
+    fn advert_delay_interpolates_and_clamps() {
+        let fanout = AdvertFanout::from_config(&Config {
+            advert_delay_min: Duration::from_millis(100),
+            advert_delay_max: Duration::from_millis(500),
+            advert_window_small_size_bytes: 100,
+            advert_window_full_size_bytes: 1_000,
+            ..sized_window_config()
+        });
+        for size in [0, 99, 100] {
+            assert_eq!(fanout.delay(Some(size)), Duration::from_millis(100));
+        }
+        assert!(fanout.delay(Some(101)) > Duration::from_millis(100));
+        assert_eq!(fanout.delay(Some(550)), Duration::from_millis(300));
+        for size in [Some(1_000), Some(u32::MAX), None] {
+            assert_eq!(fanout.delay(size), Duration::from_millis(500));
+        }
+        let extreme = AdvertFanout::from_config(&Config {
+            advert_delay_max: Duration::MAX,
+            advert_window_full_size_bytes: u64::MAX,
+            ..sized_window_config()
+        });
+        assert!(extreme.delay(Some(u32::MAX)) < Duration::MAX);
+        assert_eq!(extreme.delay(None), Duration::MAX);
+    }
+
+    /// Silent peers cannot create repeated request-timeout waves, regardless of block size,
+    /// peer count, or whether the block was mined locally.
+    #[tokio::test(start_paused = true)]
+    async fn all_peers_are_announced_by_one_size_dependent_deadline() {
+        for mined in [false, true] {
+            for count in [16, 100, 300, 1_001] {
+                for size in [
+                    Some(102_399),
+                    Some(102_400),
+                    Some(102_401),
+                    Some(837_632),
+                    Some(1_572_864),
+                    Some(u32::MAX),
+                    None,
+                ] {
+                    let fanout = AdvertFanout::from_config(&Config {
+                        advert_delay_min: Duration::from_millis(100),
+                        advert_delay_max: Duration::from_millis(500),
+                        ..sized_window_config()
+                    });
+                    let (peers, mut writes) = connected_peers(count);
+                    let hash = block::Hash([0xd1; 32]);
+                    let start = Instant::now();
+                    let delay = fanout.delay(size);
+                    let task = tokio::spawn(broadcast_block(
+                        peers,
+                        hash,
+                        fanout.window(size),
+                        mined,
+                        start + delay,
+                    ));
+                    let mut seen = std::collections::HashSet::new();
+                    for position in 0..count {
+                        let (index, written) = writes.recv().await.unwrap();
+                        assert_eq!(written, hash);
+                        assert!(seen.insert(index), "peer {index} advertised twice");
+                        let elapsed = start.elapsed();
+                        if position < fanout.window(size) {
+                            assert_eq!(elapsed, Duration::ZERO);
+                        } else {
+                            // Tokio timers have millisecond resolution.
+                            assert!(
+                                elapsed >= delay && elapsed <= delay + Duration::from_millis(1),
+                                "{count} peers, {size:?}, mined={mined}: {elapsed:?} vs {delay:?}"
+                            );
+                        }
+                    }
+                    assert!(task.await.unwrap().is_ok());
+                    assert!(
+                        writes.try_recv().is_err(),
+                        "tracking expiry started another wave"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_delay_announces_every_size_immediately() {
+        for size in [Some(102_400), Some(102_401), Some(1_572_864), None] {
+            let fanout = AdvertFanout::from_config(&sized_window_config());
+            let (peers, mut writes) = connected_peers(300);
+            let start = Instant::now();
+            let task = tokio::spawn(broadcast_block(
+                peers,
+                block::Hash([0xd2; 32]),
+                fanout.window(size),
+                false,
+                start + fanout.delay(size),
+            ));
+            for _ in 0..300 {
+                writes.recv().await.unwrap();
+                assert_eq!(start.elapsed(), Duration::ZERO);
+            }
+            assert!(task.await.unwrap().is_ok());
+        }
+    }
+
+    /// Measure announcement latency and requested payload volume under the worst-case demand:
+    /// every mock peer requests every block and its body write takes two seconds.
+    #[tokio::test(start_paused = true)]
+    #[allow(
+        clippy::print_stderr,
+        reason = "This test emits reproducible load measurements."
+    )]
+    async fn announcement_latency_and_upload_demand() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for count in [64, 300, 1_001] {
+            for size in [102_400, 102_401, 1_572_864] {
+                for (min, max) in [(0, 0), (100, 500)] {
+                    let fanout = AdvertFanout::from_config(&Config {
+                        advert_delay_min: Duration::from_millis(min),
+                        advert_delay_max: Duration::from_millis(max),
+                        ..sized_window_config()
+                    });
+                    let (peers, mut writes, bodies) =
+                        requesting_peers(count, Some(Duration::from_secs(2)));
+                    let start = Instant::now();
+                    let delay = fanout.delay(Some(size));
+                    let initial = fanout.window(Some(size));
+                    let task = tokio::spawn(broadcast_block(
+                        peers,
+                        block::Hash([0xd6; 32]),
+                        initial,
+                        false,
+                        start + delay,
+                    ));
+                    for _ in 0..count {
+                        writes.recv().await.unwrap();
+                    }
+                    let last = start.elapsed();
+                    assert!(last <= delay + Duration::from_millis(1));
+                    if count > initial {
+                        assert!(last >= delay);
+                    } else {
+                        assert_eq!(last, Duration::ZERO);
+                    }
+                    assert!(task.await.unwrap().is_ok());
+                    assert_eq!(bodies.total.load(SeqCst), count);
+                    assert_eq!(bodies.current.load(SeqCst), 0);
+                    assert_eq!(bodies.max.load(SeqCst), count);
+                    // This measures requested payload volume, not socket throughput.
+                    // usize fits in u128 on every supported target.
+                    let payload_bytes = u128::from(size) * count as u128;
+                    eprintln!(
+                        "peers={count} size={size} delays={min}/{max}ms last={last:?} requested_payload={payload_bytes}B peak_bodies={count}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tracking expiry before the configured delay must not release the delayed group early.
+    #[tokio::test(start_paused = true)]
+    async fn tracking_expiry_does_not_change_announcement_deadline() {
+        let (peers, mut writes) = connected_peers(300);
+        let start = Instant::now();
+        let delay = BLOCK_REQUEST_WAIT + Duration::from_secs(1);
+        let task = tokio::spawn(broadcast_block(
+            peers,
+            block::Hash([0xd3; 32]),
+            32,
+            false,
+            start + delay,
+        ));
+        for position in 0..300 {
+            writes.recv().await.unwrap();
+            assert_eq!(
+                start.elapsed(),
+                if position < 32 { Duration::ZERO } else { delay }
+            );
+        }
+        assert!(task.await.unwrap().is_ok());
+        assert!(writes.try_recv().is_err());
+    }
+
+    /// Inventory writes that never complete cannot hold another peer's announcement.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_inventory_writes_do_not_delay_other_peers() {
+        let (queued_tx, mut queued) = mpsc::unbounded_channel();
+        let peers = (0..300)
+            .map(|index| {
+                let (peer, mut receiver) = peer();
+                let queued_tx = queued_tx.clone();
+                tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Some(advert) = receiver.recv().await {
+                        held.push(advert);
+                        queued_tx.send(index).unwrap();
+                    }
+                });
+                peer
+            })
+            .collect();
+        let start = Instant::now();
+        let delay = Duration::from_millis(500);
+        let task = tokio::spawn(broadcast_block(
+            peers,
+            block::Hash([0xd4; 32]),
+            32,
+            false,
+            start + delay,
+        ));
+        let mut seen = std::collections::HashSet::new();
+        for position in 0..300 {
+            assert!(seen.insert(queued.recv().await.unwrap()));
+            assert_eq!(
+                start.elapsed(),
+                if position < 32 { Duration::ZERO } else { delay }
+            );
+        }
+        assert!(
+            task.await.unwrap().is_err(),
+            "no connection wrote its inventory"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_uploads_and_joined_broadcasts_do_not_delay_other_peers() {
+        let (peers, mut writes, bodies) =
+            requesting_peers(300, Some(BLOCK_UPLOAD_WAIT + Duration::from_secs(1)));
+        let hash = block::Hash([0xd5; 32]);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(500);
+        let first = tokio::spawn(broadcast_block(peers.clone(), hash, 32, false, deadline));
+        for _ in 0..32 {
+            writes.recv().await.unwrap();
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+        // All peers enter the joined broadcast immediately. Existing claims must not block
+        // its attempts to announce to other peers.
+        let joined = tokio::spawn(broadcast_block(peers, hash, 32, false, start));
+        for _ in 32..300 {
+            writes.recv().await.unwrap();
+            assert_eq!(start.elapsed(), Duration::ZERO);
+        }
+        assert_eq!(
+            bodies.current.load(std::sync::atomic::Ordering::SeqCst),
+            300
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            writes.try_recv().is_err(),
+            "the original delayed group must join existing claims"
+        );
+        first.abort();
+        joined.abort();
     }
 
     /// Custom size boundaries control both plateaus and the interpolation between them.
@@ -1321,11 +1414,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn committed_broadcast_keeps_early_adverts() {
         let hash = block::Hash([17; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let early = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
-        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let committed = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
         accept(&mut receiver, hash).await;
         assert!(
@@ -1344,14 +1437,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn failed_early_advert_is_sent_by_the_committed_broadcast() {
         let hash = block::Hash([18; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
         let early = tokio::spawn(broadcast_block(
             vec![peer.clone()],
             hash,
             TEST_WINDOW,
             true,
-            slots.clone(),
+            Instant::now() + Duration::from_millis(500),
         ));
         let advert = receiver.recv().await.unwrap();
         advert
@@ -1364,7 +1457,7 @@ mod tests {
             hash,
             TEST_WINDOW,
             true,
-            slots.clone(),
+            Instant::now() + Duration::from_millis(500),
         ));
         accept(&mut receiver, hash).await;
         tokio::time::advance(BLOCK_REQUEST_WAIT).await;
@@ -1372,12 +1465,11 @@ mod tests {
     }
 
     /// Sustained relay: a block every second to peers that request every block, with bodies
-    /// that take two seconds to write. Each block's first inventory is still immediate, upload
-    /// slots never exceed the cap, and busy uploads stop each broadcast's fan-out at its window.
+    /// that take two seconds to write. Every peer receives inventory within the configured delay.
     #[tokio::test(start_paused = true)]
-    async fn sustained_relay_keeps_uploads_bounded() {
+    async fn sustained_relay_does_not_wait_for_uploads() {
         const BLOCKS: u8 = 8;
-        let slots = BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY);
+
         let (peers, mut writes, bodies) =
             requesting_peers(2 * TEST_WINDOW, Some(Duration::from_secs(2)));
         let mut broadcasts = Vec::new();
@@ -1389,7 +1481,7 @@ mod tests {
                 hash,
                 TEST_WINDOW,
                 false,
-                slots.clone(),
+                Instant::now() + Duration::from_millis(500),
             )));
             let next_block = mined + Duration::from_secs(1);
             let mut first = None;
@@ -1401,18 +1493,18 @@ mod tests {
                     first.get_or_insert(mined.elapsed());
                     count += 1;
                 }
-                assert!(slots.available_uploads() <= BLOCK_UPLOAD_CONCURRENCY);
             }
             assert_eq!(first, Some(Duration::ZERO), "block {block} waited");
-            assert!(
-                count <= TEST_WINDOW,
-                "block {block} advertised to {count} peers during busy uploads"
+            assert_eq!(
+                count,
+                peers.len(),
+                "block {block} did not finish announcing"
             );
         }
         let max_bodies = bodies.max.load(std::sync::atomic::Ordering::SeqCst);
-        // A body write lasts two block intervals, so the windows of three broadcasts can overlap.
+        // A body write lasts two block intervals; at most three broadcasts overlap.
         assert!(
-            max_bodies <= BLOCK_UPLOAD_CONCURRENCY + 3 * TEST_WINDOW,
+            max_bodies <= 3 * peers.len(),
             "{max_bodies} concurrent body writes"
         );
         broadcasts.iter().for_each(|broadcast| broadcast.abort());
@@ -1421,27 +1513,26 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unavailable_early_block_can_be_advertised_again_after_commit() {
         let hash = block::Hash([6; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let early = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let early = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.unavailable(hash);
         assert!(!early.await.unwrap());
-        let committed = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let committed = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
         assert!(committed.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn events_before_inventory_do_not_finish_the_advertisement() {
         let hash = block::Hash([9; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let task = tokio::spawn(peer.clone().advertise(hash));
         tokio::task::yield_now().await;
         // A getdata that follows an earlier inventory resolves before this inventory is written.
         peer.uploads.requested(hash);
@@ -1452,31 +1543,29 @@ mod tests {
         assert!(!task.is_finished());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(task.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn unwritten_requested_hash_fails_when_the_request_finishes() {
         let hash = block::Hash([10; 32]);
-        let slots = BlockUploadSlots::new(1);
+
         let (peer, mut receiver) = peer();
-        let task = tokio::spawn(peer.clone().advertise(hash, slots.clone()));
+        let task = tokio::spawn(peer.clone().advertise(hash));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         // The inbound service truncated the request before reaching this hash.
         peer.uploads.request_finished(&[hash]);
         assert!(!task.await.unwrap());
-        assert_eq!(slots.available_uploads(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn only_sidecars_wait_for_busy_connections_to_write_inventory() {
         for sidecar in [false, true] {
             let hash = block::Hash([11; 32]);
-            let slots = BlockUploadSlots::new(1);
+
             let (mut peer, mut receiver) = peer();
             peer.sidecar = sidecar;
-            let task = tokio::spawn(peer.advertise(hash, slots.clone()));
+            let task = tokio::spawn(peer.advertise(hash));
             tokio::task::yield_now().await;
             tokio::time::advance(BLOCK_REQUEST_WAIT + Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
@@ -1488,7 +1577,6 @@ mod tests {
             } else {
                 assert!(!task.await.unwrap());
             }
-            assert_eq!(slots.available_uploads(), 1);
         }
     }
 
@@ -1571,17 +1659,19 @@ mod tests {
         timeout(Duration::from_secs(10), async {
             let (first, mut first_rx) = peer();
             let (published, peers) = watch::channel(vec![first]);
-            let slots = BlockUploadSlots::new(1);
+
             let advertiser = BlockAdvertiser {
                 fanout: AdvertFanout::from_config(&Config {
                     advert_window_min: 1,
                     advert_window_max: 2,
                     advert_window_small_size_bytes: 0,
                     advert_window_full_size_bytes: 100,
+                    advert_delay_min: Duration::from_secs(1),
+                    advert_delay_max: Duration::from_secs(1),
                     ..Config::default()
                 }),
                 peers,
-                slots: slots.clone(),
+
                 minimum_peer_version: MinimumPeerVersion::new(
                     zakura_chain::chain_tip::NoChainTip,
                     &zakura_chain::parameters::Network::Mainnet,
@@ -1600,12 +1690,12 @@ mod tests {
                 .send(Err(BlockAdvertError::AuthorizationRevoked))
                 .unwrap();
             tokio::task::yield_now().await;
-            assert_eq!(slots.available_uploads(), 1);
             assert!((&mut broadcast).now_or_never().is_none());
             assert!(
                 first_rx.try_recv().is_err(),
                 "the rejected snapshot is not retried"
             );
+            tokio::time::advance(Duration::from_millis(750)).await;
             let (later, mut writes) = connected_peers(3);
             published.send_replace(later);
             for _ in 0..2 {
@@ -1616,8 +1706,9 @@ mod tests {
                 writes.try_recv().is_err(),
                 "the refreshed broadcast keeps the size-based window of two"
             );
-            tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+            let refreshed = Instant::now();
             assert_eq!(writes.recv().await.unwrap().1, hash);
+            assert_eq!(refreshed.elapsed(), Duration::from_millis(250));
             assert!(broadcast.await.unwrap().is_ok());
         })
         .await
@@ -1625,14 +1716,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn joined_advertisements_preserve_revocation_and_release_permits() {
+    async fn joined_advertisements_preserve_revocation() {
         timeout(Duration::from_secs(1), async {
             let (peer, mut receiver) = peer();
-            let slots = BlockUploadSlots::new(1);
+
             let hash = block::Hash([62; 32]);
-            let first = tokio::spawn(peer.clone().advertise_outcome(hash, slots.clone()));
+            let first = tokio::spawn(peer.clone().advertise_outcome(hash));
             let advert = receiver.recv().await.unwrap();
-            let second = tokio::spawn(peer.advertise_outcome(hash, slots.clone()));
+            let second = tokio::spawn(peer.advertise_outcome(hash));
             tokio::task::yield_now().await;
             advert
                 .result
@@ -1640,7 +1731,6 @@ mod tests {
                 .unwrap();
             assert!(matches!(first.await.unwrap(), AdvertOutcome::Revoked));
             assert!(matches!(second.await.unwrap(), AdvertOutcome::Revoked));
-            assert_eq!(slots.available_uploads(), 1);
             assert!(receiver.try_recv().is_err());
         })
         .await
@@ -1664,7 +1754,7 @@ mod tests {
             let advertiser = BlockAdvertiser {
                 fanout: AdvertFanout::from_config(&Config::default()),
                 peers,
-                slots: BlockUploadSlots::new(1),
+
                 minimum_peer_version: minimum,
                 bans: BannedIps::with_banned_ip(banned.ip()),
                 refresh: None,
@@ -1697,11 +1787,11 @@ mod tests {
     async fn revoked_wait_obeys_caller_deadline() {
         let (peer, mut receiver) = peer();
         let (_published, peers) = watch::channel(vec![peer]);
-        let slots = BlockUploadSlots::new(1);
+
         let advertiser = BlockAdvertiser {
             fanout: AdvertFanout::from_config(&Config::default()),
             peers,
-            slots: slots.clone(),
+
             minimum_peer_version: MinimumPeerVersion::new(
                 zakura_chain::chain_tip::NoChainTip,
                 &zakura_chain::parameters::Network::Mainnet,
@@ -1723,7 +1813,6 @@ mod tests {
         };
         let (result, ()) = tokio::join!(deadline, reject);
         assert!(result.is_err());
-        assert_eq!(slots.available_uploads(), 1);
         assert!(receiver.try_recv().is_err());
     }
 

@@ -212,6 +212,7 @@ pub fn decode(prefix: &[u8]) -> Result<StorageScenario, Rejection> {
             },
             bound_ms: (header[BOUND] != 0).then(|| u64::from(header[BOUND]) * BOUND_UNIT_MS),
             holds: Vec::new(),
+            reply_holds: Vec::new(),
         },
         controls: Vec::new(),
     };
@@ -271,6 +272,9 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
         return Err(Unencodable(format!(
             "it has {mirrors} mirrors, not 1 to {MAX_MIRRORS}"
         )));
+    }
+    if !scenario.policy.reply_holds.is_empty() {
+        return Err(Unencodable("the grammar has no reply hold".to_owned()));
     }
     let mut writer = LAYOUT.writer();
     let header = writer.header();

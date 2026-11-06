@@ -27,7 +27,7 @@ use crate::header::{
     lease::{
         LeaseEnd, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_RETAINED_PATH_LEASES, RETAINED_PATH_LEASE_IDLE,
     },
-    Outcome, Release,
+    HeaderOp, Outcome, Release,
 };
 
 /// The first way the facts or the state disagreed with the model, in the
@@ -135,6 +135,8 @@ struct ModelOp {
     request: RequestIdentity,
     request_digest: [u8; 32],
     caller_present: bool,
+    /// Whether the run committed it and holds its reply for delivery.
+    committed: bool,
     /// The stored reply's identity, once completed for a waiting caller.
     replied: Option<ResultIdentity>,
 }
@@ -533,6 +535,7 @@ impl OwnerModel {
                         request: request.clone(),
                         request_digest: *request_digest,
                         caller_present: true,
+                        committed: false,
                         replied: None,
                     },
                 );
@@ -558,6 +561,18 @@ impl OwnerModel {
                     .ok_or(HeadError::Unexpected)?;
                 self.ops.remove(id);
                 self.abandon(&result, &mut lease_facts);
+            }
+            FactKind::Committed { id, .. } => {
+                let op = self.op_mut(*id)?;
+                // An apply leaves the registry alone, so its commit holds no
+                // other fact.
+                if op.replied.is_some()
+                    || op.committed
+                    || op.request.op() != HeaderOp::ApplyHeaderTarget
+                {
+                    return Err(HeadError::Unexpected);
+                }
+                op.committed = true;
             }
             FactKind::Completed(completion) => {
                 self.complete(txn, completion, &mut kinds, &mut lease_facts)?;
@@ -610,6 +625,7 @@ impl OwnerModel {
     /// Checks `completion` against its pending operation and applies it:
     /// the permit's drop, the execute group, then for a caller that's gone
     /// the abandoned reply's group. The slot is removed or holds the reply.
+    /// A committed apply's delivery runs nothing, since its commit did.
     fn complete(
         &mut self,
         txn: &Txn<'_>,
@@ -625,6 +641,7 @@ impl OwnerModel {
             || completion.op != op.request.op()
             || completion.request_digest != op.request_digest
             || completion.delivered != op.caller_present
+            || (op.committed && completion.outcome != Outcome::Engine)
         {
             return Err(HeadError::Unexpected);
         }
@@ -635,6 +652,7 @@ impl OwnerModel {
         match completion.outcome {
             Outcome::Fault(fault) if *result == ResultIdentity::Fault(fault) => {}
             Outcome::Rejected if *result == ResultIdentity::Rejected => {}
+            Outcome::Engine if op.committed => {}
             Outcome::Engine => {
                 self.execute(txn, &op.request, result, completion.generation, lease_facts)?
             }
@@ -1079,6 +1097,9 @@ impl OwnerModel {
                     stage: match &op.replied {
                         Some(result) => OperationStage::Replied {
                             result: result.clone(),
+                        },
+                        None if op.committed => OperationStage::Committed {
+                            caller_waiting: op.caller_present,
                         },
                         None => OperationStage::Pending {
                             caller_waiting: op.caller_present,

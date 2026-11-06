@@ -26,7 +26,7 @@ use zakura_rt::sync::Semaphore;
 #[cfg(not(zakura_sim))]
 use zakura_storage::header::controlled::BindError;
 use zakura_storage::header::{
-    controlled::{CompleteError, Completion, ControlledPort, Fact, FactKind, OpId},
+    controlled::{Commit, CompleteError, Completion, ControlledPort, Fact, FactKind, OpId},
     evidence::{
         CallerPresence, CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey,
         LeaseState, OperationStage, OwnerModel, PathPosition, RequestIdentity, ResultIdentity,
@@ -584,6 +584,208 @@ fn a_cancelled_apply_still_commits() {
             FactKind::Completed(completion),
         ] if completion.id == OpId(1) && !completion.delivered
     ));
+}
+
+/// A committed apply's snapshot is published at its commit, while its reply
+/// waits for its delivery, which wakes the caller and publishes `Completed`
+/// with the state at delivery.
+#[test]
+fn a_commit_publishes_before_its_reply_is_delivered() {
+    let (port, chain) = chain(1);
+    let mut watch = port.selected_chain();
+    watch.borrow_and_update();
+    let next = HeaderFixture::regtest().extend(chain[0], 2, 0);
+    let first = prepared(&port, chain[0], &next[..1], 2);
+    let mut apply = port.apply_header_target(first);
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    assert!(poll(&mut apply, &waker).is_pending());
+    port.take_facts();
+
+    let Commit::Held {
+        txn,
+        generation,
+        state_digest,
+    } = port.commit(OpId(1)).expect("the apply commits")
+    else {
+        panic!("an apply that installs a snapshot holds its reply");
+    };
+    assert_eq!(
+        port.engine().snapshot().frontiers.header_best.hash,
+        next[0].hash()
+    );
+    assert!(watch
+        .has_changed()
+        .expect("the engine port holds the sender"));
+    assert_eq!(state_digest, port.engine().state_digest());
+    assert_eq!(wakes.count(), 0, "a commit doesn't wake the caller");
+    assert!(poll(&mut apply, &waker).is_pending());
+    assert!(port.pending().is_empty());
+    let committed = port.committed();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].id, OpId(1));
+    assert!(committed[0].caller_waiting);
+    assert!(matches!(
+        port.owner_state().operations[0].stage,
+        OperationStage::Committed {
+            caller_waiting: true
+        }
+    ));
+    assert_eq!(
+        port.take_facts()
+            .into_iter()
+            .map(|fact| (fact.txn, fact.kind))
+            .collect::<Vec<_>>(),
+        [(
+            txn,
+            FactKind::Committed {
+                id: OpId(1),
+                generation,
+                state_digest,
+            }
+        )]
+    );
+
+    // Another apply completes between the commit and the delivery.
+    let tip = Frontier::new(block::Height(2), next[0].hash());
+    let second = prepared(&port, tip, &next[1..], 3);
+    complete(&port, port.apply_header_target(second));
+    let completion = port.deliver(OpId(1)).expect("the reply is delivered");
+    assert!(completion.delivered);
+    assert_eq!(completion.outcome, ENGINE);
+    assert_eq!(completion.result, ResultIdentity::Applied);
+    assert!(completion.lease_ends.is_empty());
+    assert_eq!(completion.state_digest, port.engine().state_digest());
+    assert_ne!(completion.state_digest, state_digest);
+    assert_eq!(wakes.count(), 1);
+    assert!(port.committed().is_empty());
+    assert_eq!(
+        port.deliver(OpId(1)),
+        Err(CompleteError::NotCommitted(OpId(1)))
+    );
+    assert!(matches!(
+        poll(&mut apply, &waker),
+        Poll::Ready(Ok(ApplyHeaderTargetOutcome::Applied))
+    ));
+    assert!(matches!(
+        kinds(&port).as_slice(),
+        [
+            FactKind::Submitted { id: OpId(2), .. },
+            FactKind::Completed(other),
+            FactKind::ReplyTaken { id: OpId(2) },
+            FactKind::Completed(delivered),
+            FactKind::ReplyTaken { id: OpId(1) },
+        ] if other.id == OpId(2) && **delivered == completion
+    ));
+}
+
+/// A committed apply whose caller drops before its delivery is delivered to
+/// nobody, and the commit stays.
+#[test]
+fn a_reply_delivered_after_its_caller_drops_is_abandoned() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let mut apply = port.apply_header_target(prepared(&port, chain[0], &next, 2));
+    submit(&mut apply);
+    assert!(matches!(port.commit(OpId(1)), Ok(Commit::Held { .. })));
+    drop(apply);
+    assert!(!port.committed()[0].caller_waiting);
+
+    let completion = port.deliver(OpId(1)).expect("the reply is delivered");
+    assert!(!completion.delivered);
+    assert_eq!(
+        port.engine().snapshot().frontiers.header_best.hash,
+        next[0].hash()
+    );
+    assert!(port.owner_state().operations.is_empty());
+    assert!(matches!(
+        kinds(&port).as_slice(),
+        [
+            FactKind::Submitted { id: OpId(1), .. },
+            FactKind::Committed { id: OpId(1), .. },
+            FactKind::CallerDropped { id: OpId(1) },
+            FactKind::Completed(completion),
+        ] if !completion.delivered
+    ));
+}
+
+/// Shutdown between a commit and its delivery drops the held reply, names
+/// the apply among the dropped operations, and keeps the commit. The caller
+/// is never woken.
+#[test]
+fn shutdown_drops_a_committed_reply() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let mut apply = port.apply_header_target(prepared(&port, chain[0], &next, 2));
+    let wakes = Arc::new(Wakes::default());
+    let waker = Waker::from(wakes.clone());
+    assert!(poll(&mut apply, &waker).is_pending());
+    assert!(matches!(port.commit(OpId(1)), Ok(Commit::Held { .. })));
+
+    port.shut_down();
+    assert!(port.committed().is_empty());
+    assert_eq!(
+        port.deliver(OpId(1)),
+        Err(CompleteError::NotCommitted(OpId(1)))
+    );
+    assert_eq!(
+        port.engine().snapshot().frontiers.header_best.hash,
+        next[0].hash()
+    );
+    assert_eq!(wakes.count(), 0);
+    assert!(poll(&mut apply, &waker).is_pending());
+    assert_eq!(
+        kinds(&port).last(),
+        Some(&FactKind::ShutDown {
+            dropped: vec![OpId(1)],
+            callers_alive: vec![OpId(1)],
+        })
+    );
+}
+
+/// A commit holds a reply only when the apply installed a snapshot. A
+/// replayed target changes nothing, so it completes in the same step. Only
+/// an apply commits, and only a committed apply is delivered.
+#[test]
+fn a_commit_that_installs_nothing_completes_at_once() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let target = prepared(&port, chain[0], &next, 2);
+    complete(&port, port.apply_header_target(target));
+    let replay = prepared(&port, chain[0], &next, 3);
+    let mut apply = port.apply_header_target(replay);
+    submit(&mut apply);
+    let digest = port.engine().state_digest();
+    let Commit::Completed(completion) = port.commit(OpId(2)).expect("the replay runs") else {
+        panic!("an apply that installs nothing completes at once");
+    };
+    assert!(completion.delivered);
+    assert_eq!(completion.result, ResultIdentity::Applied);
+    assert_eq!(completion.state_digest, digest);
+    assert!(port.committed().is_empty());
+    assert!(matches!(
+        ready(apply),
+        Ok(ApplyHeaderTargetOutcome::Applied)
+    ));
+
+    let mut membership = port.selected_chain_contains(chain[0].hash);
+    submit(&mut membership);
+    assert_eq!(
+        port.commit(OpId(3)),
+        Err(CompleteError::NotAnApply(OpId(3)))
+    );
+    assert_eq!(
+        port.deliver(OpId(3)),
+        Err(CompleteError::NotCommitted(OpId(3)))
+    );
+    assert_eq!(
+        port.commit(OpId(9)),
+        Err(CompleteError::NotPending(OpId(9)))
+    );
+    assert_eq!(listed(&port).len(), 1, "refusals change nothing");
+    port.complete(OpId(3), ENGINE)
+        .expect("membership completes");
+    drop(membership);
 }
 
 /// ST3.3: a read and a release from an old session, completing after the

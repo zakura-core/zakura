@@ -135,9 +135,14 @@ pub struct Sim {
     holds: Vec<Box<dyn TaskHold>>,
     /// Run once the log freezes, before the scheduler shuts down.
     on_frozen: Vec<Box<dyn FnOnce()>>,
+    /// Run with the run's final end, reports and log, after `on_frozen`.
+    on_end: Vec<EndHook>,
     /// The tasks stopped mid-poll at the boundary the sources observe now.
     mid_poll: MidPoll,
 }
+
+/// A [`Sim::on_end`] hook.
+type EndHook = Box<dyn FnOnce(&RunEnd, &[PropertyReport], &ObservationLog)>;
 
 /// The tasks stopped mid-poll at the boundary a run's sources are
 /// observing: each is partway through synchronous code that yielded at a
@@ -178,6 +183,7 @@ impl Sim {
             config,
             holds: Vec::new(),
             on_frozen: Vec::new(),
+            on_end: Vec::new(),
             mid_poll: MidPoll::default(),
         }
     }
@@ -194,6 +200,17 @@ impl Sim {
     /// reports can't change what the run ended with.
     pub(crate) fn on_frozen(&mut self, hook: impl FnOnce() + 'static) {
         self.on_frozen.push(Box::new(hook));
+    }
+
+    /// Runs `hook` with the run's end, property reports and log once they're
+    /// final, after the [`on_frozen`](Self::on_frozen) hooks and before the
+    /// scheduler shuts down, so it sees what the run ended with and nothing
+    /// shutdown does.
+    pub(crate) fn on_end(
+        &mut self,
+        hook: impl FnOnce(&RunEnd, &[PropertyReport], &ObservationLog) + 'static,
+    ) {
+        self.on_end.push(Box::new(hook));
     }
 
     /// Keeps the ready tasks `hold` names out of each step's enabled set,
@@ -317,6 +334,9 @@ impl Sim {
         state.log.freeze();
         for hook in std::mem::take(&mut self.on_frozen) {
             hook();
+        }
+        for hook in std::mem::take(&mut self.on_end) {
+            hook(&end, &properties, &state.log);
         }
         let cleanup = self.shut_down();
         sink.record(Record::End(end_record(

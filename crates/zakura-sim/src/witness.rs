@@ -15,7 +15,8 @@ use crate::{
     harness::{self, run_reading, HarnessError, Subsystem},
     property::{HasView, Status, TriggerHistory},
     record::Record,
-    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, RecordSink, RunEnd, RunReport,
+    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport, RecordSink,
+    RunEnd, RunReport,
 };
 
 /// What a witness test expects of its property.
@@ -197,29 +198,24 @@ pub fn witness_prepared<S: Subsystem>(
 ) -> Result<(), WitnessError> {
     let registered = Registered::<S>::of(property, expect)?;
     let mut sink = EndSeen { sink, ended: false };
-    // A view trigger is judged before shutdown, which can still change the
-    // view, and only on a view that shows the run's end. A run that failed
-    // fails the test before its trigger counts.
-    let read = |harness: &S, end: &RunEnd, log: &ObservationLog| match registered.trigger_history {
-        Some(TriggerHistory::View(history))
-            if end.outcome != Outcome::Harness && harness.captured().fresh_at(end.steps) =>
-        {
-            Some(history(&harness.view(), log))
-        }
-        _ => None,
-    };
-    let (report, viewed) =
-        match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, read) {
-            Ok(run) => run,
-            Err(HarnessError::Run { failure, .. }) => {
-                return Err(WitnessError::HarnessEnd(failure.to_string()))
-            }
-            Err(error) => return Err(WitnessError::UnsupportedScenario(error.to_string())),
+    // Judged once the run's end is final and before shutdown, which can
+    // still change the view.
+    let id = property.to_owned();
+    let judge =
+        move |harness: &S, end: &RunEnd, reports: &[PropertyReport], log: &ObservationLog| {
+            registered.judge(end, reports, log, Some(harness), &id, expect)
         };
+    let (_, judged) = match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, judge) {
+        Ok(run) => run,
+        Err(HarnessError::Run { failure, .. }) => {
+            return Err(WitnessError::HarnessEnd(failure.to_string()))
+        }
+        Err(error) => return Err(WitnessError::UnsupportedScenario(error.to_string())),
+    };
     if !sink.ended {
         return Err(WitnessError::NoEnd);
     }
-    registered.judge(&report, viewed, property, expect)
+    judged
 }
 
 /// Checks `report`, a complete run of `S`, against `expect` for
@@ -231,7 +227,14 @@ pub fn judge_report<S: Subsystem>(
     property: &str,
     expect: Expect,
 ) -> Result<(), WitnessError> {
-    Registered::<S>::of(property, expect)?.judge(report, None, property, expect)
+    Registered::<S>::of(property, expect)?.judge(
+        &report.end,
+        &report.properties,
+        &report.log,
+        None,
+        property,
+        expect,
+    )
 }
 
 /// What a witness test reads from a property's registration.
@@ -258,21 +261,30 @@ impl<S: Subsystem> Registered<S> {
         })
     }
 
-    /// Checks `report` against `expect`, then the trigger history, if the
-    /// property has one. `viewed` is a view trigger's result at the run's
-    /// end, or `None` if the judge has only the report.
+    /// Checks the run's `end` and `reports` against `expect`, then the
+    /// trigger history, if the property has one, over the final `log` and,
+    /// for a view trigger, the `harness`'s view. The view is read only once
+    /// the report fits, so only on a run a check could read it in, and only
+    /// if it shows the run's last step.
     fn judge(
         &self,
-        report: &RunReport,
-        viewed: Option<bool>,
+        end: &RunEnd,
+        reports: &[PropertyReport],
+        log: &ObservationLog,
+        harness: Option<&S>,
         property: &str,
         expect: Expect,
     ) -> Result<(), WitnessError> {
-        judge(report, property, self.status, expect)?;
+        judge_end(end, reports, property, self.status, expect)?;
         let reached = match self.trigger_history {
             None => true,
-            Some(TriggerHistory::Log(history)) => history(&report.log),
-            Some(TriggerHistory::View(_)) => viewed.ok_or(WitnessError::NoView)?,
+            Some(TriggerHistory::Log(history)) => history(log),
+            Some(TriggerHistory::View(history)) => match harness {
+                Some(harness) if harness.captured().fresh_at(end.steps) => {
+                    history(&harness.view(), log)
+                }
+                _ => return Err(WitnessError::NoView),
+            },
         };
         if reached {
             Ok(())
@@ -308,16 +320,25 @@ pub(crate) fn judge(
     status: Status,
     expect: Expect,
 ) -> Result<(), WitnessError> {
-    if report.end.outcome == Outcome::Harness {
-        let failure = report
-            .end
+    judge_end(&report.end, &report.properties, property, status, expect)
+}
+
+/// [`judge`] on a run's `end` and property `reports`.
+fn judge_end(
+    end: &RunEnd,
+    reports: &[PropertyReport],
+    property: &str,
+    status: Status,
+    expect: Expect,
+) -> Result<(), WitnessError> {
+    if end.outcome == Outcome::Harness {
+        let failure = end
             .harness
             .as_ref()
             .map_or_else(String::new, ToString::to_string);
         return Err(WitnessError::HarnessEnd(failure));
     }
-    let outcome = &report
-        .properties
+    let outcome = &reports
         .iter()
         .find(|r| r.property == property)
         .ok_or(WitnessError::MissingReport)?
@@ -325,13 +346,11 @@ pub(crate) fn judge(
     // Another property's violation is unrelated to this one: one that
     // stopped the run fails every expectation, and one that didn't fails
     // all but `Applicable`.
-    let unrelated = report
-        .properties
+    let unrelated = reports
         .iter()
         .filter(|r| r.property != property)
         .find(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }));
-    let stopped_by = report
-        .end
+    let stopped_by = end
         .violation
         .as_ref()
         .map(|v| v.property.as_str())

@@ -14,12 +14,12 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{run_harness, Subsystem},
     property::{
-        Capture, CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation, ObligationKey,
-        Property, PropertyId, Registry, RegistryError, Source, Sources, Status, Subject,
-        TriggerHistory, Verdict,
+        Assume, Capture, CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation,
+        ObligationKey, Property, PropertyId, Registry, RegistryError, Source, Sources, Status,
+        Subject, TriggerHistory, Verdict,
     },
     witness::{judge_report, witness, Expect, WitnessError, WitnessScenario},
-    MemorySink, ObservationLog, Plan, PropertyOutcome, RunConfig, RunReport, Sim,
+    MemorySink, ObservationLog, Plan, PropertyOutcome, RunConfig, RunEnd, RunReport, Sim,
 };
 
 /// A view-side fact the harness's task records.
@@ -55,27 +55,32 @@ enum Act {
     Break(Broken),
 }
 
-/// How a harness's evidence breaks. Either way, its view panics if read.
+/// How a harness's evidence breaks. Each way, its view panics if read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Broken {
     /// Its stamps go backward.
     Stamps,
     /// It loses its snapshot.
     Snapshot,
+    /// It's released when the run ends, as a harness may in `ended`.
+    Released,
 }
 
-/// The task's acts, the run's live step budget and its drain bound.
+/// The task's acts, the run's live step budget, its drain bound, and
+/// whether its evidence is released when the run ends.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Script {
     acts: Vec<Act>,
     budget: u64,
     drain: u64,
+    release_at_end: bool,
 }
 
 /// One task that records stamped facts, as a tap records owner facts.
 struct Stamped {
     facts: Rc<RefCell<Facts>>,
     broken: Rc<Cell<Option<Broken>>>,
+    release_at_end: bool,
 }
 
 impl HasView for Stamped {
@@ -93,6 +98,13 @@ impl HasView for Stamped {
             "the view is unusable once its evidence broke"
         );
         self.facts.borrow().clone()
+    }
+
+    /// Releases the evidence if the script says to.
+    fn ended(&self, _: &RunEnd) {
+        if self.release_at_end {
+            self.broken.set(Some(Broken::Released));
+        }
     }
 
     /// Live, until the snapshot is lost.
@@ -126,6 +138,8 @@ const SERVED: &str = "test/wait-served";
 const NEXT: &str = "test/wait-next-served";
 /// `wait-observed` opens one whose `discharged_by` matches everything.
 const OBSERVED: &str = "test/wait-observed-served";
+/// [`SERVED`] under an assumption no scenario declares.
+const UNDECLARED: &str = "test/wait-served-if-honest";
 
 impl Subsystem for Stamped {
     const NAME: &'static str = "test/view-facts";
@@ -168,7 +182,11 @@ impl Subsystem for Stamped {
                 }
             }
         });
-        Stamped { facts, broken }
+        Stamped {
+            facts,
+            broken,
+            release_at_end: script.release_at_end,
+        }
     }
 
     fn sources() -> Sources {
@@ -192,6 +210,10 @@ impl Subsystem for Stamped {
             served(SERVED, waits),
             served(NEXT, waits_next),
             served(OBSERVED, waits_observed),
+            Property {
+                assumes: &[Assume::HonestPeer],
+                ..served(UNDECLARED, waits)
+            },
         ]
     }
 
@@ -200,6 +222,7 @@ impl Subsystem for Stamped {
             acts: Vec::new(),
             budget: 50,
             drain: 10,
+            release_at_end: false,
         }
     }
 }
@@ -282,6 +305,7 @@ fn run_for(acts: &[Act], budget: u64) -> RunReport {
         acts: acts.to_vec(),
         budget,
         drain: 10,
+        release_at_end: false,
     };
     match run_harness::<Stamped>(
         &script,
@@ -466,6 +490,7 @@ fn scenario(acts: &[Act]) -> WitnessScenario<Stamped> {
             acts: acts.to_vec(),
             budget: 50,
             drain: 10,
+            release_at_end: false,
         },
         input: Plan::from_fuzz(&[]),
     }
@@ -499,6 +524,7 @@ fn a_trigger_only_shutdown_reaches_is_lost() {
             acts: vec![Point, Fact(Wait)],
             budget: 1,
             drain: 0,
+            release_at_end: false,
         },
         input: Plan::from_fuzz(&[]),
     };
@@ -527,6 +553,38 @@ fn a_failed_run_never_reads_its_view() {
             "{how:?}: {result:?}"
         );
     }
+}
+
+/// The witness reads the view only once the property's report fits, so a
+/// view released at the run's end isn't read for a property that doesn't
+/// apply or whose outcome isn't the expected one.
+#[test]
+fn the_view_is_read_only_for_a_fitting_report() {
+    let released = |acts: &[Act]| WitnessScenario::<Stamped> {
+        scenario: Script {
+            acts: acts.to_vec(),
+            budget: 50,
+            drain: 10,
+            release_at_end: true,
+        },
+        input: Plan::from_fuzz(&[]),
+    };
+    assert_eq!(
+        witness(
+            released(&[Fact(Wait), Fact(Done)]),
+            UNDECLARED,
+            Expect::Holds
+        ),
+        Err(WitnessError::Outcome(PropertyOutcome::NotApplicable))
+    );
+    assert!(matches!(
+        witness(
+            released(&[Fact(Wait), Fact(Done)]),
+            SERVED,
+            Expect::Violated
+        ),
+        Err(WitnessError::Outcome(PropertyOutcome::Held { .. }))
+    ));
 }
 
 /// A report alone can't judge a trigger history that reads the view.

@@ -425,9 +425,13 @@ def watch(helper, thread, state_path):
     """Wake the owning desktop chat on crossover, first report, failures, or a stale collector."""
     events = set(json.loads(state_path.read_text())) if state_path.exists() else set()
     transport_failures = 0
+    fresh_check = False
     while True:
         try:
             command = [sys.executable, str(helper), "--path", "/var/lib/zakura-digest-compare/pr2022/status.json", "root@159.65.183.89", "--", "cat", "/var/lib/zakura-digest-compare/pr2022/status.json"]
+            if fresh_check:
+                command.insert(2, "--fresh")
+                fresh_check = False
             result = subprocess.run(command, capture_output=True, text=True, timeout=100)
             if result.returncode:
                 # Preserve classification without exporting remote output or potentially sensitive errors.
@@ -443,6 +447,16 @@ def watch(helper, thread, state_path):
                     transport_failures += 1
                     if transport_failures <= 3:
                         print(json.dumps({"event": "transport_retry", "attempt": transport_failures, "classification": diagnostic}), flush=True)
+                        time.sleep(min(15 * transport_failures, 30))
+                        continue
+                if diagnostic.get("result") == "check_failed" and diagnostic.get("status") == 255 and transport_failures < 3:
+                    # This command only reads an atomically replaced status file. Its uncertain result
+                    # may be retried after an independent connection check; no node mutation is replayed.
+                    reachability = subprocess.run([sys.executable, str(helper.with_name("ssh-reachable")), "root@159.65.183.89"], capture_output=True, text=True, timeout=20)
+                    if reachability.returncode == 0:
+                        transport_failures += 1
+                        fresh_check = True
+                        print(json.dumps({"event": "status_read_retry", "attempt": transport_failures, "reachability": "passed"}), flush=True)
                         time.sleep(min(15 * transport_failures, 30))
                         continue
                 raise RuntimeError(f"controller status check failed: exit {result.returncode}; classification={json.dumps(diagnostic, sort_keys=True)}")

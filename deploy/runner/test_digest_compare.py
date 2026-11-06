@@ -12,6 +12,17 @@ import digest_probe as probe
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_uncertain_status_read_requires_reachability_before_fresh_retry(self):
+        failure = SimpleNamespace(returncode=1, stdout="", stderr='ssh-check: {"result":"check_failed","status":255}')
+        reached = SimpleNamespace(returncode=0, stdout="reachable", stderr="")
+        status = SimpleNamespace(returncode=0, stdout=json.dumps({"state":"stopped","at":0}), stderr="")
+        queued = SimpleNamespace(returncode=0, stdout="Queued message", stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(comparison.subprocess, "run", side_effect=[failure, reached, status, queued]) as run, patch.object(comparison.time, "sleep"):
+                comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
+        self.assertIn("ssh-reachable", run.call_args_list[1].args[0])
+        self.assertIn("--fresh", run.call_args_list[2].args[0])
+
     def test_remote_reads_require_owned_trust_file_and_strict_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             trust = Path(directory) / "known_hosts"

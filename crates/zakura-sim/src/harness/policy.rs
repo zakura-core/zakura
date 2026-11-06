@@ -160,11 +160,14 @@ pub enum Trigger<K> {
     /// test counts once its engine switches its header tip, before it
     /// commits any new body.
     Grown(String),
-    /// This actor's chain switched to a fork: a `Control` reset committed
-    /// the fork's tip and published it on the actor's watch. A block-sync
-    /// mirror counts once it holds the fork's bodies too. The block-sync
-    /// node under test counts once its engine switches its header tip to
-    /// the fork, before its verified chain resets.
+    /// This actor's chain was reset by a `Control` step. In block sync, a
+    /// reset switches the chain to a fork: it counts once the fork's tip is
+    /// committed and published on the actor's watch, for a mirror once it
+    /// holds the fork's bodies too, and for the node under test once its
+    /// engine switches its header tip, before its verified chain resets.
+    /// In header sync, only the node under test resets, through an operator
+    /// invalidation or reconsideration, and it counts each one that
+    /// committed, whichever way selection moved.
     Reset(String),
     /// This actor prepared a `Control` chain change's headers, which it
     /// applies in a later step. Only the block-sync node under test takes a

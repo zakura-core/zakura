@@ -127,7 +127,7 @@ fn record_with_services(
 // Book model.
 
 /// Who supplied a record.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Supplier {
     /// The record's author, as in its own `Hello`.
     Author,
@@ -137,7 +137,7 @@ enum Supplier {
     Nobody,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum BookOp {
     Import {
         author: usize,
@@ -778,7 +778,7 @@ pub struct BookView {
     pub result: Option<ImportFact>,
 }
 
-/// One decoder-v2 record-book operation.
+/// One decoder-v3 record-book operation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BookStep {
@@ -846,18 +846,18 @@ fn driver_failure(payload: &(dyn Any + Send), property: &str) -> DriverFailure {
     }
 }
 
-/// The causal bytes of 1-based operation `step`.
-fn step_input(input: &[u8], step: usize) -> Vec<u8> {
-    input[(step - 1) * 4..(step * 4).min(input.len())].to_vec()
+/// The causal bytes of 1-based operation `step`, when each operation reads `width` bytes.
+fn step_input(input: &[u8], step: usize, width: usize) -> Vec<u8> {
+    input[(step - 1) * width..(step * width).min(input.len())].to_vec()
 }
 
-/// Runs record-book decoder-v2 operations under a fixed disclosure key and fixture
+/// Runs record-book decoder-v3 operations under a fixed disclosure key and fixture
 /// clock, and captures each operation. The history stops at the first failure.
 pub fn trace_discovery_book_bytes(data: &[u8]) -> Vec<BookStep> {
     let input = &data[..data.len().min(512)];
     let mut driver = BookDriver::new(0);
     let mut steps = Vec::new();
-    for (index, op) in decode_book_v2(input).enumerate() {
+    for (index, op) in decode_book_v3(input).enumerate() {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             driver.apply(op);
             driver.check(&mut |_, _| {});
@@ -868,7 +868,7 @@ pub fn trace_discovery_book_bytes(data: &[u8]) -> Vec<BookStep> {
         let stop = failure.is_some();
         steps.push(BookStep {
             step: index + 1,
-            input: step_input(input, index + 1),
+            input: step_input(input, index + 1, BOOK_OP_BYTES),
             actual: driver.actual_view(),
             expected: driver.expected_view(),
             sample: driver.sample.iter().map(hex::encode).collect(),
@@ -1437,7 +1437,7 @@ pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<DiscoverySessionStep> {
         let stop = failure.is_some();
         steps.push(DiscoverySessionStep {
             step: index + 1,
-            input: step_input(input, index + 1),
+            input: step_input(input, index + 1, STATE_OP_BYTES),
             actual: driver.actual_view(),
             expected: driver.expected_view(),
             failure,
@@ -1449,10 +1449,13 @@ pub fn trace_discovery_state_bytes(data: &[u8]) -> Vec<DiscoverySessionStep> {
     steps
 }
 
+/// The bytes each session-installation operation reads.
+const STATE_OP_BYTES: usize = 4;
+
 /// Decodes four bytes into each session-installation operation. Generator 2 names
 /// this decoder in saved scenarios.
 fn decode_state_v2(data: &[u8]) -> impl Iterator<Item = StateOp> + '_ {
-    data.chunks(4).map(|chunk| {
+    data.chunks(STATE_OP_BYTES).map(|chunk| {
         let b = chunk.get(1).copied().unwrap_or(0);
         let c = chunk.get(2).copied().unwrap_or(0);
         let d = chunk.get(3).copied().unwrap_or(0);
@@ -1494,33 +1497,122 @@ fn decode_state_v2(data: &[u8]) -> impl Iterator<Item = StateOp> + '_ {
     })
 }
 
-/// Decodes four bytes into each record-book operation. Generator 2 names this
+/// The bytes each record-book operation reads.
+const BOOK_OP_BYTES: usize = 2;
+
+/// Decodes two bytes into each record-book operation. Generator 3 names this
 /// decoder in saved scenarios.
-fn decode_book_v2(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
-    data.chunks(4).map(|chunk| {
+///
+/// The first byte's low four bits choose the operation: 11 of 16 values import,
+/// 3 sample, 1 dials and 1 advances the clock. An import's record mostly lives
+/// for 900 or 3,600 seconds, past a typical advance of under a minute. A
+/// quarter of imports carry a record that has already lapsed, so it orders
+/// nothing and its relay's quota can evict it. A few of those expired before
+/// they arrived.
+fn decode_book_v3(data: &[u8]) -> impl Iterator<Item = BookOp> + '_ {
+    data.chunks(BOOK_OP_BYTES).map(|chunk| {
         let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        let d = chunk.get(3).copied().unwrap_or(0);
-        let author = usize::from(b) % AUTHORS;
-        match a % 7 {
-            0..=2 => BookOp::Import {
+        let b = usize::from(chunk.get(1).copied().unwrap_or(0));
+        let author = b % AUTHORS;
+        let relay = b / AUTHORS % RELAYS;
+        // 0..=14, from the bits the author and relay leave.
+        let rest = b / (AUTHORS * RELAYS);
+        match a % 16 {
+            0..=10 => BookOp::Import {
                 author,
-                sequence: u64::from(c % 4),
-                expires_in: i64::from(d) * 2 - 400,
-                supplier: match a % 3 {
-                    0 => Supplier::Author,
-                    1 => Supplier::Relay(usize::from(b) / AUTHORS % RELAYS),
+                sequence: (rest % 4) as u64,
+                expires_in: match a >> 6 {
+                    // Past the clock-skew tolerance, so the record expired before it arrived.
+                    0 if rest == 0 => -400,
+                    // Lapsed, but inside the clock-skew tolerance.
+                    0 => -100,
+                    1 | 2 => 900,
+                    _ => 3_600,
+                },
+                supplier: match a >> 4 & 3 {
+                    0 | 1 => Supplier::Author,
+                    2 => Supplier::Relay(relay),
                     _ => Supplier::Nobody,
                 },
             },
-            3 => BookOp::DialSuccess(author),
-            4 => BookOp::DialFailure(author),
-            5 => BookOp::Advance(u64::from(d) * 3),
-            _ => BookOp::Sample {
-                requester: usize::from(b) % RELAYS,
-                limit: usize::from(c) % 5,
+            11..=13 => BookOp::Sample {
+                requester: b % RELAYS,
+                limit: (b >> 2) % 5,
             },
+            14 if b < 128 => BookOp::DialSuccess(author),
+            14 => BookOp::DialFailure(author),
+            _ => BookOp::Advance(if b < 192 {
+                (b % 64) as u64
+            } else {
+                DISCLOSURE_EPOCH
+            }),
         }
     })
+}
+
+/// The two bytes that [`decode_book_v3`] decodes to `op`.
+///
+/// # Panics
+///
+/// If no two bytes decode to `op`.
+fn encode_book_v3(op: &BookOp) -> [u8; BOOK_OP_BYTES] {
+    (0..=u16::MAX)
+        .map(u16::to_be_bytes)
+        .find(|bytes| decode_book_v3(bytes).next().as_ref() == Some(op))
+        .unwrap_or_else(|| panic!("decoder v3 has no bytes for {op:?}"))
+}
+
+/// The committed record-book witness, `zakura-sim`'s
+/// `tests/fixtures/discovery-record-book.bin`, under the current decoder.
+///
+/// Its steps reach each planted bypass's trigger:
+/// - step 6 evicts at the record limit;
+/// - step 7 samples four confirmed records under a window of three;
+/// - step 13 evicts a relay's lapsed records on its quota;
+/// - step 14 moves a record from one relay to another;
+/// - step 18 overfills a book of confirmed records and one unconfirmed record.
+pub fn discovery_book_witness_bytes() -> Vec<u8> {
+    use BookOp::{Advance, DialSuccess, Import, Sample};
+    let import = |author, sequence, expires_in, supplier| Import {
+        author,
+        sequence,
+        expires_in,
+        supplier,
+    };
+    [
+        // Authors 0..=3 import their own records, and a dial confirms author 0.
+        import(0, 1, 900, Supplier::Author),
+        import(1, 1, 900, Supplier::Author),
+        import(2, 1, 900, Supplier::Author),
+        import(3, 1, 900, Supplier::Author),
+        DialSuccess(0),
+        // Author 4 evicts one of the records no dial confirmed.
+        import(4, 1, 900, Supplier::Author),
+        // Sample four, under a window of three.
+        Sample {
+            requester: 0,
+            limit: 4,
+        },
+        // Author 0 replaces its record with a later sequence.
+        import(0, 3, 900, Supplier::Author),
+        // Two epochs pass, so every record expires.
+        Advance(DISCLOSURE_EPOCH),
+        Advance(DISCLOSURE_EPOCH),
+        // Relay 0 takes authors 0 and 1 with lapsed records.
+        import(0, 2, -100, Supplier::Relay(0)),
+        import(1, 2, -100, Supplier::Relay(0)),
+        // Relay 0's next new record, from author 5, evicts them on its quota.
+        import(5, 2, 3_600, Supplier::Relay(0)),
+        // Relay 1 supplies author 5's later sequence, so the attribution moves.
+        import(5, 3, 3_600, Supplier::Relay(1)),
+        // Authors 0..=2 import their own records, which evicts the lapsed ones.
+        import(0, 3, 3_600, Supplier::Author),
+        import(1, 3, 3_600, Supplier::Author),
+        import(2, 3, 3_600, Supplier::Author),
+        // Author 3 overfills a book of confirmed records and author 5's unconfirmed one.
+        import(3, 3, 3_600, Supplier::Author),
+    ]
+    .iter()
+    .flat_map(encode_book_v3)
+    .collect()
 }

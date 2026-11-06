@@ -30,6 +30,7 @@ use super::{
         adoption::{AdoptionEvidence, SessionLife},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
+        reservation::ReservationEvidence,
         session::SessionEvidence,
         tap::ReactorTap,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
@@ -474,6 +475,9 @@ pub struct Ports {
     pub mirrors: Vec<Arc<EnginePort>>,
     /// The node's session view, which its tap and links fill during the run.
     pub sessions: SessionEvidence,
+    /// The node's header capacity accounting, which its tap fills during the
+    /// run.
+    pub reservations: ReservationEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -580,6 +584,7 @@ impl Subsystem for Storage {
             node,
             mirrors,
             sessions: SessionEvidence::default(),
+            reservations: ReservationEvidence::default(),
         }
     }
 
@@ -597,8 +602,13 @@ impl Subsystem for Storage {
             scenario.policy.clone(),
             effects.clone(),
         );
-        let (observer, tap) =
-            ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
+        let (observer, tap) = ReactorTap::with_evidence(
+            sim,
+            &ports.node,
+            "node",
+            ports.sessions.clone(),
+            ports.reservations.clone(),
+        );
         let adoption = tap.adoption();
         let shutdown = tap.shutdown();
         let storage = storage.with_tap(tap);
@@ -746,6 +756,9 @@ pub struct WirePorts {
     pub sessions: SessionEvidence,
     /// The peers' records the identity map hasn't placed yet.
     records: PeerRecords,
+    /// The node's header capacity accounting, which its tap fills during the
+    /// run.
+    pub reservations: ReservationEvidence,
 }
 
 impl WirePorts {
@@ -865,6 +878,7 @@ impl Subsystem for HeaderWire {
             startup: Rc::default(),
             sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
+            reservations: ReservationEvidence::default(),
         }
     }
 
@@ -893,8 +907,13 @@ impl Subsystem for HeaderWire {
                 .map(|(index, name)| (peer_id(scenario.net.seed, index), name.clone()))
                 .collect(),
         );
-        let (observer, tap) =
-            ReactorTap::with_sessions(sim, &ports.node, "node", ports.sessions.clone());
+        let (observer, tap) = ReactorTap::with_evidence(
+            sim,
+            &ports.node,
+            "node",
+            ports.sessions.clone(),
+            ports.reservations.clone(),
+        );
         let adoption = tap.adoption();
         sim.add_source(Box::new(storage.with_tap(tap)));
         let header = HeaderNode::spawn(

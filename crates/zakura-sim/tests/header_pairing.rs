@@ -327,6 +327,8 @@ fn open_work(byte: u8) -> [ReactorEvent; 3] {
                 peer: peer.clone(),
                 source: SourceId::from_digest([byte; 32]),
                 owner,
+                target: zakura_header_chain::Frontier::new(block::Height(5), hash),
+                hashes: vec![hash; 5],
             },
         },
         ReactorEvent::HeadersHeld {
@@ -335,6 +337,7 @@ fn open_work(byte: u8) -> [ReactorEvent; 3] {
             peer,
             incarnation: 1,
             headers: 5,
+            leases: Vec::new(),
         },
     ]
 }

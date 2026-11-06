@@ -159,6 +159,7 @@ async fn a_prepare_hands_its_headers_to_its_apply_without_a_release() {
         peer: peer.clone(),
         incarnation: round.incarnation().get(),
         headers: 1,
+        leases: Vec::new(),
     }));
 
     gate.add_permits(1);

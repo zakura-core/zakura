@@ -12,11 +12,13 @@
 //! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
 //! A `Shutdown` step stops the node under test on purpose, which its tap
 //! expects. The tap and the topology's links keep the node's
-//! [`session`] view.
+//! [`session`] view, and the tap keeps its header capacity accounting in a
+//! [`reservation::ReservationEvidence`].
 
 pub mod adoption;
 mod pair;
 pub mod policy;
+pub mod reservation;
 pub mod session;
 pub mod tap;
 

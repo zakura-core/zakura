@@ -370,6 +370,8 @@ impl SubscriberState {
             cursor,
             reaches_target: page.reaches_initial_target,
             after_close: live.close_sent,
+            #[cfg(any(test, zakura_sim))]
+            frame: transport_admits.then(|| tools.serving_frame()).flatten(),
             seal: Seal,
         })
     }

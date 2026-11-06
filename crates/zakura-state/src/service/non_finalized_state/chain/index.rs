@@ -16,6 +16,9 @@ use crate::{OutputLocation, TransactionLocation, ValidateContextError};
 
 use super::{counted_set::CountedSet, RevertPosition, SharedMap, UpdateWith};
 
+/// Share historical height groups while bounding the group copied by a write.
+const HEIGHTS_PER_OUTPUT_CHUNK: u32 = 32;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentTransfers {
     /// The partial chain balance for a transparent address.
@@ -36,10 +39,11 @@ pub struct TransparentTransfers {
     /// The `getaddressutxos` RPC doesn't need these transaction IDs to be sorted in chain order,
     /// but it might in future. So Zebra does it anyway.
     ///
-    /// Outputs are grouped by the height of the block that created them. Each group is shared
-    /// between chain snapshots, so committing a block copies one pointer per earlier height
-    /// rather than every earlier output. Groups are never empty.
-    created_utxos: BTreeMap<Height, Arc<CreatedOutputs>>,
+    /// Outputs are grouped by height, then by 32-height chunks. Snapshots share chunks;
+    /// updating a height copies at most 32 height entries, sharing their output payloads.
+    /// Both levels are sparse, so an address with occasional payments stores only its
+    /// occupied heights. Chunks and height groups are never empty.
+    created_utxos: BTreeMap<u32, Arc<CreatedOutputHeights>>,
 
     /// The partial list of UTXOs spent by a transparent address.
     ///
@@ -54,6 +58,9 @@ pub struct TransparentTransfers {
 
 /// The outputs one block created for an address, in chain order.
 type CreatedOutputs = BTreeMap<OutputLocation, transparent::Output>;
+
+/// The occupied heights within one chunk, in chain order.
+type CreatedOutputHeights = BTreeMap<Height, Arc<CreatedOutputs>>;
 
 // A created UTXO
 //
@@ -84,8 +91,11 @@ impl
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
 
-        let height_outputs = self
+        let chunk = self
             .created_utxos
+            .entry(transaction_location.height.0 / HEIGHTS_PER_OUTPUT_CHUNK)
+            .or_default();
+        let height_outputs = Arc::make_mut(chunk)
             .entry(transaction_location.height)
             .or_default();
         let previous_entry =
@@ -117,20 +127,28 @@ impl
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
 
-        let height_outputs = self
+        let chunk_id = transaction_location.height.0 / HEIGHTS_PER_OUTPUT_CHUNK;
+        let chunk = self
             .created_utxos
+            .get_mut(&chunk_id)
+            .expect("created output chunk exists because the block was previously applied");
+        let heights = Arc::make_mut(chunk);
+        let height_outputs = heights
             .get_mut(&transaction_location.height)
             .expect("created output height exists because the block was previously applied");
         // Drop a group that only holds this output instead of copying it to empty it.
         let output_was_removed =
             if height_outputs.len() == 1 && height_outputs.contains_key(&output_location) {
-                self.created_utxos.remove(&transaction_location.height);
+                heights.remove(&transaction_location.height);
                 true
             } else {
                 Arc::make_mut(height_outputs)
                     .remove(&output_location)
                     .is_some()
             };
+        if heights.is_empty() {
+            self.created_utxos.remove(&chunk_id);
+        }
         assert!(
             output_was_removed,
             "unexpected revert of created output: duplicate update or duplicate UTXO",
@@ -299,6 +317,7 @@ impl TransparentTransfers {
     pub fn created_utxos(&self) -> impl Iterator<Item = (&OutputLocation, &transparent::Output)> {
         self.created_utxos
             .values()
+            .flat_map(|heights| heights.values())
             .flat_map(|outputs| outputs.iter())
     }
 

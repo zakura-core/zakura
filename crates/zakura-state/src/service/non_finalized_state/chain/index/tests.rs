@@ -12,7 +12,7 @@ use zakura_chain::{
 
 use super::{
     super::{Chain, RevertPosition, UpdateWith},
-    TransparentTransfers,
+    TransparentTransfers, HEIGHTS_PER_OUTPUT_CHUNK,
 };
 
 #[test]
@@ -77,8 +77,10 @@ fn receive_coinbase(
     transfers: &mut TransparentTransfers,
     height: u32,
 ) -> (transparent::OutPoint, transparent::OrderedUtxo) {
+    let mut hash = [0; 32];
+    hash[..4].copy_from_slice(&height.to_le_bytes());
     let outpoint = transparent::OutPoint {
-        hash: transaction::Hash([u8::try_from(height).expect("test heights fit in u8"); 32]),
+        hash: transaction::Hash(hash),
         index: 0,
     };
     let output = transparent::Output::new(
@@ -105,8 +107,8 @@ fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
 
     for height in 1..=3 {
         assert!(Arc::ptr_eq(
-            &original.created_utxos[&Height(height)],
-            &appended.created_utxos[&Height(height)],
+            &original.created_utxos[&(height / HEIGHTS_PER_OUTPUT_CHUNK)][&Height(height)],
+            &appended.created_utxos[&(height / HEIGHTS_PER_OUTPUT_CHUNK)][&Height(height)],
         ));
     }
     assert_eq!(original.created_utxos().count(), 3);
@@ -123,7 +125,86 @@ fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
     // Reverting the block removes its whole height and leaves no empty group behind.
     appended.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
     assert_eq!(appended, original);
-    assert!(!appended.created_utxos.contains_key(&Height(4)));
+    assert!(!appended.created_utxos[&0].contains_key(&Height(4)));
+}
+
+#[test]
+fn retained_address_history_copies_only_changed_height_chunks() {
+    let mut original = TransparentTransfers::default();
+    let outputs: Vec<_> = (0..256)
+        .map(|height| receive_coinbase(&mut original, height))
+        .collect();
+    let mut candidate = original.clone();
+
+    // Cloning 256 heights copies eight chunk pointers, not 256 height entries.
+    assert_eq!(original.created_utxos.len(), 8);
+    for (id, chunk) in &original.created_utxos {
+        assert!(Arc::ptr_eq(chunk, &candidate.created_utxos[id]));
+        assert!(chunk
+            .values()
+            .all(|outputs| Arc::strong_count(outputs) == 1));
+    }
+
+    // Append into a new chunk, then finalize one block from the oldest chunk.
+    let added = receive_coinbase(&mut candidate, 256);
+    candidate.revert_chain_with(&(&outputs[0].0, &outputs[0].1), RevertPosition::Root);
+    for (id, chunk) in &original.created_utxos {
+        assert_eq!(Arc::ptr_eq(chunk, &candidate.created_utxos[id]), *id != 0);
+        if *id != 0 {
+            assert!(chunk
+                .values()
+                .all(|outputs| Arc::strong_count(outputs) == 1));
+        }
+    }
+    assert_eq!(original.created_utxos().count(), 256);
+    assert_eq!(candidate.created_utxos().count(), 256);
+    assert_eq!(
+        original.created_utxos().next().unwrap().0.height(),
+        Height(0)
+    );
+    assert_eq!(
+        candidate.created_utxos().next().unwrap().0.height(),
+        Height(1)
+    );
+
+    // Reorg across the new chunk boundary, and remove the rest of the oldest chunk.
+    candidate.revert_chain_with(&(&added.0, &added.1), RevertPosition::Tip);
+    assert!(!candidate.created_utxos.contains_key(&8));
+    for (outpoint, utxo) in &outputs[1..32] {
+        candidate.revert_chain_with(&(outpoint, utxo), RevertPosition::Root);
+    }
+    assert!(!candidate.created_utxos.contains_key(&0));
+    assert_eq!(candidate.created_utxos().count(), 224);
+    assert_eq!(candidate.received(), 224_000);
+    assert_eq!(original.received(), 256_000);
+    assert_eq!(candidate.balance(), 224_000_i64);
+    assert_eq!(original.balance(), 256_000_i64);
+    let mut expected = TransparentTransfers::default();
+    for height in 32..256 {
+        receive_coinbase(&mut expected, height);
+    }
+    assert_eq!(candidate, expected);
+}
+
+#[test]
+fn changes_within_a_shared_height_preserve_snapshots_and_transaction_counts() {
+    let mut original = TransparentTransfers::default();
+    let (outpoint, utxo) = receive_coinbase(&mut original, 31);
+    let mut candidate = original.clone();
+    let second = transparent::OutPoint {
+        index: 1,
+        ..outpoint
+    };
+    candidate.update_chain_tip_with(&(&second, &utxo)).unwrap();
+    assert_eq!(original.received(), 1_000);
+    assert_eq!(candidate.received(), 2_000);
+    candidate.revert_chain_with(&(&second, &utxo), RevertPosition::Tip);
+    assert_eq!(candidate, original);
+    assert!(candidate.tx_ids.contains(&outpoint.hash));
+    candidate.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
+    assert!(candidate.is_empty());
+    assert!(candidate.created_utxos.is_empty());
+    assert_eq!(original.received(), 1_000);
 }
 
 #[test]

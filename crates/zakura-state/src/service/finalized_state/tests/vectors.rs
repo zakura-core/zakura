@@ -432,7 +432,9 @@ fn sprout_checks(incremental_tree: SproutNoteCommitmentTree, expected_serialized
     let deserialized_legacy_tree = LegacySproutNoteCommitmentTree::from(deserialized_tree.clone());
 
     // Get a deserialized tree from a legacy deserialized tree.
-    let deserialized_legacy_tree_as_new = deserialized_legacy_tree.into();
+    let deserialized_legacy_tree_as_new = deserialized_legacy_tree
+        .try_into()
+        .expect("a tree converted from a valid tree is consistent");
 
     // Check frontiers are the same.
     incremental_tree.assert_frontier_eq(&deserialized_tree);
@@ -486,7 +488,9 @@ fn sapling_checks(
     let deserialized_legacy_tree = LegacySaplingNoteCommitmentTree::from(deserialized_tree.clone());
 
     // Get a deserialized tree from a legacy deserialized tree.
-    let deserialized_legacy_tree_as_new = deserialized_legacy_tree.into();
+    let deserialized_legacy_tree_as_new = deserialized_legacy_tree
+        .try_into()
+        .expect("a tree converted from a valid tree is consistent");
 
     // Check frontiers are the same.
     incremental_tree.assert_frontier_eq(&deserialized_tree);
@@ -562,7 +566,9 @@ fn orchard_checks(
     let deserialized_legacy_tree = LegacyOrchardNoteCommitmentTree::from(deserialized_tree.clone());
 
     // Get a deserialized tree from a legacy deserialized tree.
-    let deserialized_legacy_tree_as_new = deserialized_legacy_tree.into();
+    let deserialized_legacy_tree_as_new = deserialized_legacy_tree
+        .try_into()
+        .expect("a tree converted from a valid tree is consistent");
 
     // Check frontiers are the same.
     incremental_tree.assert_frontier_eq(&deserialized_tree);

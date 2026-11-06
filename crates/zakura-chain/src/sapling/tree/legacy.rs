@@ -50,12 +50,14 @@ impl From<NoteCommitmentTree> for LegacyNoteCommitmentTree {
     }
 }
 
-impl From<LegacyNoteCommitmentTree> for NoteCommitmentTree {
-    fn from(nct: LegacyNoteCommitmentTree) -> Self {
-        NoteCommitmentTree {
-            inner: nct.inner.into(),
+impl TryFrom<LegacyNoteCommitmentTree> for NoteCommitmentTree {
+    type Error = &'static str;
+
+    fn try_from(nct: LegacyNoteCommitmentTree) -> Result<Self, Self::Error> {
+        Ok(NoteCommitmentTree {
+            inner: nct.inner.try_into()?,
             cached_root: nct.cached_root,
-        }
+        })
     }
 }
 
@@ -66,8 +68,10 @@ pub struct LegacyFrontier<H, const DEPTH: u8> {
     pub frontier: Option<LegacyNonEmptyFrontier<H>>,
 }
 
-impl From<LegacyFrontier<Node, MERKLE_DEPTH>> for Frontier<sapling_crypto::Node, MERKLE_DEPTH> {
-    fn from(legacy_frontier: LegacyFrontier<Node, MERKLE_DEPTH>) -> Self {
+impl TryFrom<LegacyFrontier<Node, MERKLE_DEPTH>> for Frontier<sapling_crypto::Node, MERKLE_DEPTH> {
+    type Error = &'static str;
+
+    fn try_from(legacy_frontier: LegacyFrontier<Node, MERKLE_DEPTH>) -> Result<Self, Self::Error> {
         if let Some(legacy_frontier_data) = legacy_frontier.frontier {
             let mut ommers = legacy_frontier_data
                 .ommers
@@ -76,7 +80,7 @@ impl From<LegacyFrontier<Node, MERKLE_DEPTH>> for Frontier<sapling_crypto::Node,
                 .collect::<Vec<_>>();
             let position = Position::from(
                 u64::try_from(legacy_frontier_data.position.0)
-                    .expect("old `usize` always fits in `u64`"),
+                    .map_err(|_| "legacy frontier position does not fit in a u64")?,
             );
             let leaf = match legacy_frontier_data.leaf {
                 LegacyLeaf::Left(a) => a.0,
@@ -85,14 +89,10 @@ impl From<LegacyFrontier<Node, MERKLE_DEPTH>> for Frontier<sapling_crypto::Node,
                     b.0
                 }
             };
-            Frontier::from_parts(
-                position,
-                leaf,
-                ommers,
-            )
-            .expect("We should be able to construct a frontier from parts given legacy frontier is not empty")
+            Frontier::from_parts(position, leaf, ommers)
+                .map_err(|_| "legacy frontier position, leaf, and ommers are inconsistent")
         } else {
-            Frontier::empty()
+            Ok(Frontier::empty())
         }
     }
 }

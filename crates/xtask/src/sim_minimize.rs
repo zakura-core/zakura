@@ -1771,16 +1771,39 @@ fn signal(_: ExitStatus) -> i32 {
 /// then kills the running child and writes the report.
 #[cfg(unix)]
 pub(super) fn install_interrupt_handler() {
+    catch_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+}
+
+/// Sets [`INTERRUPTED`] on each of `signals` that the process doesn't
+/// ignore. A signal ignored at startup stays ignored, so a run under
+/// `nohup` outlives its terminal.
+#[cfg(unix)]
+fn catch_signals(signals: &[libc::c_int]) {
     extern "C" fn interrupted(_: libc::c_int) {
         INTERRUPTED.store(true, Ordering::SeqCst);
     }
     let handler = interrupted as extern "C" fn(libc::c_int);
-    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+    for &signal in signals {
+        if signal_handler(signal) == libc::SIG_IGN {
+            continue;
+        }
         // SAFETY: the handler only stores to an atomic, which is
         // async-signal-safe.
         unsafe {
             libc::signal(signal, handler as libc::sighandler_t);
         }
+    }
+}
+
+/// The current handler of `signal`, such as `SIG_IGN`.
+#[cfg(unix)]
+fn signal_handler(signal: libc::c_int) -> libc::sighandler_t {
+    // SAFETY: a null new action only reads the current one into `current`,
+    // which is a plain C struct that zeroes validly.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut current);
+        current.sa_sigaction
     }
 }
 

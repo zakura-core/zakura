@@ -43,6 +43,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -51,7 +52,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Verdict,
+    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Run, Verdict,
 };
 use crate::{
     run_command,
@@ -305,6 +306,7 @@ pub(crate) fn run(
     install_interrupt_handler();
     let bytes = fs::read(repo_root.join(CATALOGUE))?;
     let catalogue: Catalogue = serde_json::from_slice(&bytes)?;
+    check_exclusions(&catalogue.cases)?;
     let cases = select(&catalogue.cases, &only)?;
     let work = work.unwrap_or_else(|| {
         repo_root
@@ -327,6 +329,7 @@ pub(crate) fn run(
             fresh_dir(&out)?;
             meta.built_revision = catalogue.source_revision.clone();
             let rows = sensitivity(repo_root, &catalogue, &cases, &out, &work)?;
+            check_interrupt(&INTERRUPTED)?;
             write_report(&out, sensitivity_report(meta, rows)?)?
         }
         "discovery" => {
@@ -335,6 +338,7 @@ pub(crate) fn run(
             fresh_dir(&out)?;
             meta.built_revision = catalogue.fuzz_build_inputs.source_revision.clone();
             let rows = discovery(repo_root, &catalogue, &scored, &seeds, &out, &work)?;
+            check_interrupt(&INTERRUPTED)?;
             write_report(&out, discovery_report(meta, rows, excluded)?)?
         }
         _ => {
@@ -370,6 +374,19 @@ fn select<'a>(cases: &'a [Case], only: &[String]) -> Result<Vec<&'a Case>, Strin
         return Err("zero cases selected: the catalogue holds none".to_owned());
     }
     Ok(selected)
+}
+
+/// Fails if a case sets `discovery_excluded` without a reason, as
+/// `scripts/check_mutation_pilot.py` does.
+fn check_exclusions(cases: &[Case]) -> Result<(), String> {
+    match cases.iter().find(|case| {
+        case.discovery_excluded
+            .as_deref()
+            .is_some_and(|reason| reason.trim().is_empty())
+    }) {
+        Some(case) => Err(format!("{}: discovery exclusion needs a reason", case.id)),
+        None => Ok(()),
+    }
 }
 
 /// Splits the selected `cases` into those discovery runs and those whose
@@ -525,6 +542,7 @@ fn sensitivity_case(
                 false,
                 &dir.join("baseline"),
                 child,
+                &INTERRUPTED,
             )?),
         });
         if classify::sensitivity_baseline(&case.property, &run.baseline).is_none() {
@@ -552,6 +570,7 @@ fn sensitivity_case(
                     true,
                     &dir.join("mutant"),
                     child,
+                    &INTERRUPTED,
                 )?;
                 if matches!(
                     planted_verdict(&case.property, &recorded.run),
@@ -595,7 +614,9 @@ fn sensitivity_case(
 
 /// Records `case`'s witness with `sim` from `tree`, expecting the original
 /// to hold and a mutant to violate, into `out`, and checks the trace's
-/// build and input against the catalogue.
+/// build and input against the catalogue. `interrupt` kills the run and
+/// stops the pilot.
+#[allow(clippy::too_many_arguments)]
 fn witness_run(
     sim: &Path,
     tree: &Path,
@@ -604,20 +625,30 @@ fn witness_run(
     mutated: bool,
     out: &Path,
     child: Duration,
+    interrupt: &AtomicBool,
 ) -> Result<Recorded, BoxError> {
     let expect = if mutated { "violated" } else { "holds" };
-    let run = record(
+    let mut run = record(
         Command::new(sim),
         &case.harness,
         &tree.join(&case.witness),
         &case.property,
         expect,
         out,
-        Some(child),
+        Some((child, interrupt)),
     )?;
     let trace = match fs::read_to_string(out.join("trace.jsonl")) {
-        Ok(text) => Some(parse_trace(&text, &case.property)?),
         Err(_) => None,
+        Ok(text) => match (parse_trace(&text, &case.property), &mut run) {
+            (Ok(trace), _) => Some(trace),
+            // A run that crashed or passed its deadline can leave a trace
+            // with no end record. Its failure classifies it.
+            (Err(why), Run::Failed(failed)) => {
+                failed.push_str(&format!("; its trace is unreadable: {why}"));
+                None
+            }
+            (Err(why), Run::Ended { .. }) => return Err(why),
+        },
     };
     let unpaired = trace.as_ref().and_then(|trace| {
         let mut why: Vec<String> = Vec::new();
@@ -1499,6 +1530,18 @@ fn stop_on_interrupt(end: ChildEnd) -> Result<ChildEnd, BoxError> {
         ChildEnd::Interrupted => Err(INTERRUPTED_ERROR.into()),
         end => Ok(end),
     }
+}
+
+/// The error that stops the pilot if `interrupt` is set. A signal from the
+/// terminal also reaches the children that share the pilot's process
+/// group, such as `git apply` and `git worktree remove`, and can end one as
+/// an invalid mutant or a cleanup failure. So the pilot checks the flag
+/// before it writes a report.
+fn check_interrupt(interrupt: &AtomicBool) -> Result<(), BoxError> {
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(INTERRUPTED_ERROR.into());
+    }
+    Ok(())
 }
 
 /// Checks out `rev` in a new detached worktree at `path`, replacing any

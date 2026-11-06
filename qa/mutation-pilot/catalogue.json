@@ -392,7 +392,7 @@
       "mutation_compilation": "not-run at the re-pin",
       "sensitivity": "not-run at the re-pin",
       "discovery": "excluded",
-      "discovery_excluded": "discovery_record_book applied its property to zero inputs in both cold-start calibrations (5 s and 30 s), so a scored campaign is NotApplicable before it starts. That's a generator gap, not a result, so the case counts for sensitivity only (pilot review, 2026-11-05).",
+      "discovery_excluded": "discovery_record_book applied its property to zero inputs in both cold-start calibrations (5 s and 30 s). That's a generator gap, not a result, so the case counts for sensitivity only (pilot review, 2026-11-05).",
       "required_observations": "Book entries, confirmation status, relay attribution counts, entry changes and time.",
       "independent_check": "The independent book model selects entries and relay accounting from decoded operations, then compares actual book snapshots and outcomes.",
       "oracle_and_generator_files": {
@@ -439,7 +439,7 @@
       "mutation_compilation": "not-run at the re-pin",
       "sensitivity": "not-run at the re-pin",
       "discovery": "excluded",
-      "discovery_excluded": "discovery_record_book applied its property to zero inputs in both cold-start calibrations (5 s and 30 s), so a scored campaign is NotApplicable before it starts. That's a generator gap, not a result, so the case counts for sensitivity only (pilot review, 2026-11-05).",
+      "discovery_excluded": "discovery_record_book applied its property to zero inputs in both cold-start calibrations (5 s and 30 s). That's a generator gap, not a result, so the case counts for sensitivity only (pilot review, 2026-11-05).",
       "required_observations": "Book entries, confirmation status, relay attribution counts, entry changes and time.",
       "independent_check": "The independent book model selects entries and relay accounting from decoded operations, then compares actual book snapshots and outcomes.",
       "oracle_and_generator_files": {

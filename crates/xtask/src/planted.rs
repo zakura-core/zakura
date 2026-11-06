@@ -907,8 +907,9 @@ fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
 /// as a witness test of `property` that expects `expect`, writing the trace
 /// to `out`, and reads its `end` record and the test's result.
 ///
-/// With a `deadline`, the command's output goes to `<out>.log`, and a run
-/// past the deadline is killed and fails.
+/// With a `deadline` and its interrupt flag, the command's output goes to
+/// `<out>.log`. A run past the deadline is killed and fails, and a set flag
+/// kills the run and stops the pilot.
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -916,7 +917,7 @@ fn record(
     property: &str,
     expect: &str,
     out: &Path,
-    deadline: Option<Duration>,
+    deadline: Option<(Duration, &AtomicBool)>,
 ) -> Result<Run, BoxError> {
     if out.exists() {
         fs::remove_dir_all(out)?;
@@ -929,16 +930,9 @@ fn record(
         .args(["--witness", property, "--expect", expect]);
     let ended = match deadline {
         None => format!("exited with {}", zakura_sim.status()?),
-        Some(deadline) => {
+        Some((deadline, interrupt)) => {
             let log = out.with_extension("log");
-            // Only the pilot passes a deadline, and it installs the signal
-            // handler that sets the flag.
-            let end = sim_minimize::run_child(
-                &mut zakura_sim,
-                &log,
-                Some(deadline),
-                &sim_minimize::INTERRUPTED,
-            )?;
+            let end = sim_minimize::run_child(&mut zakura_sim, &log, Some(deadline), interrupt)?;
             if end == sim_minimize::ChildEnd::Interrupted {
                 return Err(pilot::INTERRUPTED_ERROR.into());
             }
@@ -950,7 +944,14 @@ fn record(
         return Ok(Run::Failed(format!("`zakura-sim record` {ended}")));
     };
     let witness: WitnessFile = serde_json::from_str(&witness)?;
-    let trace = fs::read_to_string(out.join("trace.jsonl"))?;
+    let trace = match fs::read_to_string(out.join("trace.jsonl")) {
+        Ok(trace) => trace,
+        Err(error) => {
+            return Ok(Run::Failed(format!(
+                "`zakura-sim record` {ended} and wrote its witness result, but its trace is unreadable: {error}"
+            )))
+        }
+    };
     let end = trace.lines().next_back().ok_or("the trace is empty")?;
     let mut run = end_of(property, end)?;
     if let Run::Ended {

@@ -202,17 +202,17 @@ duration, input count and applicability are in the bundle under
 
 **Record-book applicability remains open.** `discovery_record_book` applied
 to zero of 17,071 cold-start inputs at the re-pin (3,617 in 5 s and 13,454
-in 30 s), and to zero of 27,183 at the first pin. Its `Holds` gate requires an
-installation, replacement, eviction and sample within one input. Zero
+in 30 s), and to zero of 27,183 at the first pin. Its `Holds` gate requires
+an installation, replacement, eviction and sample within one input. Zero
 applicability is not a pass and not coverage. No generator or input repair
-followed. A scored campaign on that target would be `NotApplicable` before
-it starts, which is a generator gap, not a result. So both record-book cases
-count for sensitivity only. Each catalogue entry sets `discovery_excluded`
-with that reason. The paired runner then runs no campaign for them, and its
-report lists them outside its counts. The Python checker requires the
-exclusion for every case whose target never applied in calibration. Their
-committed sensitivity fixture still applies 13 times, and their curated
-target readiness passed in mut-1.3.
+followed. A target that applied to zero inputs in calibration shows a
+generator gap, not a result. So both record-book cases count for sensitivity
+only. Each catalogue entry sets `discovery_excluded` with that reason. The
+paired runner then runs no campaign for them, and its report lists them
+outside its counts. The Python checker requires the exclusion for every case
+whose target never applied in calibration. Their committed sensitivity
+fixture still applies 13 times, and their curated target readiness passed in
+mut-1.3.
 
 The 600-second allocation keeps the plan's initial proposal. It does not
 promise that any target reaches its trigger within that budget.
@@ -220,12 +220,12 @@ promise that any target reaches its trigger within that budget.
 ## Evidence bundle
 
 `2063-mut-3-repin-2026-11-06.tar.zst`, SHA-256
-`c4fc16e6c00f8394e7bb926f57442b4989d559b1626690f1a2948075e0f0935d`.
-It is an [Outline attachment](https://valargroup.getoutline.com/api/attachments.redirect?id=062d5ce9-ce65-4b7e-be4d-b16b10b05c05),
-listed in the mutation plan's evidence table. Extract it and pass
-`2063-mut-3-repin-2026-11-06/` as `--evidence`. `baseline.directory` and
-`calibration.runs[].directory` in the catalogue resolve inside that
-directory. `SHA256SUMS` inside the bundle covers every other file.
+`c4fc16e6c00f8394e7bb926f57442b4989d559b1626690f1a2948075e0f0935d`. It is an
+Outline attachment, listed in the mutation plan's evidence table. Extract it
+and pass `2063-mut-3-repin-2026-11-06/` as `--evidence`.
+`baseline.directory` and `calibration.runs[].directory` in the catalogue
+resolve inside that directory. `SHA256SUMS` inside the bundle covers every
+other file.
 
 ```text
 2063-mut-3-repin-2026-11-06/SHA256SUMS

@@ -1076,6 +1076,13 @@ fn reading_the_source_leaves_the_git_dir_alone() {
 /// the wrapper.
 #[test]
 fn signals_set_the_interrupt_flag() {
+    // A test run under `nohup` starts with SIGHUP ignored.
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: the default action replaces any handler.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
     install_interrupt_handler();
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         INTERRUPTED.store(false, Ordering::SeqCst);
@@ -1086,6 +1093,30 @@ fn signals_set_the_interrupt_flag() {
         }
         assert!(INTERRUPTED.load(Ordering::SeqCst), "signal {signal}");
     }
+}
+
+/// A signal ignored at startup, as `nohup` ignores SIGHUP, stays ignored,
+/// and any other gets the handler. SIGUSR2 stands in for it, since no other
+/// test handles or raises it. No signal is sent.
+#[test]
+fn ignored_signals_stay_ignored() {
+    let start_with = |handler| {
+        // SAFETY: no other test relies on SIGUSR2's handler.
+        unsafe {
+            libc::signal(libc::SIGUSR2, handler);
+        }
+    };
+    start_with(libc::SIG_IGN);
+    catch_signals(&[libc::SIGUSR2]);
+    assert_eq!(signal_handler(libc::SIGUSR2), libc::SIG_IGN);
+    start_with(libc::SIG_DFL);
+    catch_signals(&[libc::SIGUSR2]);
+    let caught = signal_handler(libc::SIGUSR2);
+    assert!(
+        caught != libc::SIG_DFL && caught != libc::SIG_IGN,
+        "SIGUSR2's handler is {caught}"
+    );
+    start_with(libc::SIG_DFL);
 }
 
 /// A child that exits leaves no descendant behind: `run_child` kills the

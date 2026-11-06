@@ -1,5 +1,6 @@
 //! The pilot runner's classification and report tests, on synthetic
-//! observations. None builds or runs a simulator.
+//! observations. None builds or runs a simulator; one runs a shell script
+//! in its place.
 
 use super::*;
 use crate::planted::{end_of, Run};
@@ -819,8 +820,8 @@ fn reports_count_classes_and_rates() {
 
 /// Discovery leaves out exactly the cases the catalogue excludes, the two
 /// record-book cases whose target never applied its property in
-/// calibration. Sensitivity still selects them, and a discovery selection
-/// of only excluded cases fails.
+/// calibration. Sensitivity still selects them, a discovery selection of
+/// only excluded cases fails, and an exclusion needs a reason.
 #[test]
 fn discovery_leaves_out_excluded_cases() {
     let catalogue = committed_catalogue();
@@ -845,6 +846,14 @@ fn discovery_leaves_out_excluded_cases() {
     assert!(discovery_cases(&only)
         .expect_err("only an excluded case")
         .contains("excluded"));
+    assert_eq!(check_exclusions(&catalogue.cases), Ok(()));
+    for blank in ["", " "] {
+        let mut cases = catalogue.cases.clone();
+        cases[0].discovery_excluded = Some(blank.to_owned());
+        assert!(check_exclusions(&cases)
+            .expect_err("an exclusion needs a reason")
+            .contains(&cases[0].id));
+    }
 }
 
 /// The failure kinds a store's paths name.
@@ -906,7 +915,7 @@ fn the_committed_catalogue_pins_its_cases() {
 
 /// An interrupted child stops the pilot with an error, so no result reads
 /// it as an invalid mutant or a harness failure. Every other end passes
-/// through.
+/// through. A set interrupt flag stops the pilot before its report.
 #[test]
 fn an_interrupt_stops_the_pilot() {
     let error = stop_on_interrupt(ChildEnd::Interrupted).expect_err("an interrupt stops the pilot");
@@ -918,5 +927,101 @@ fn an_interrupt_stops_the_pilot() {
         ChildEnd::Signaled(9),
     ] {
         assert_eq!(stop_on_interrupt(end).expect("not an interrupt"), end);
+    }
+    let error = check_interrupt(&AtomicBool::new(true)).expect_err("no report after an interrupt");
+    assert_eq!(error.to_string(), INTERRUPTED_ERROR);
+    check_interrupt(&AtomicBool::new(false)).expect("no interrupt");
+}
+
+/// A witness run that dies mid-trace, from a crash or at its deadline,
+/// leaves a trace with no end record, and a run can write its witness
+/// result without a trace. Each is a baseline failure for the original and
+/// a harness failure for a mutant, naming how the run ended, and the
+/// experiment goes on.
+#[cfg(unix)]
+#[test]
+fn a_witness_run_that_dies_mid_trace_is_classified() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PARTIAL: &str = "printf '%s\\n' '{\"meta\":{}}' '{\"step\":1}' > \"$out/trace.jsonl\"";
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let partial_then = |death: &str| format!("{PARTIAL}\n{death}");
+    for (name, writes, ended, why) in [
+        (
+            "crash",
+            partial_then("exit 1"),
+            "exited with code 1",
+            "no end record",
+        ),
+        (
+            "hang",
+            partial_then("exec sleep 30"),
+            "ran past its deadline",
+            "no end record",
+        ),
+        (
+            "untraced",
+            "echo '{\"passed\":true,\"error\":null}' > \"$out/witness.json\"".to_owned(),
+            "exited with code 0",
+            "trace is unreadable",
+        ),
+    ] {
+        // A stand-in for `zakura-sim record` that writes `writes` into its
+        // `--out` directory.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = record ] || exit 0\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\n\
+                 mkdir -p \"$out\"\n\
+                 {writes}\n"
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = witness_run(
+            &sim,
+            dir.path(),
+            case,
+            &catalogue,
+            false,
+            &dir.path().join(format!("{name}-out")),
+            Duration::from_millis(500),
+            &AtomicBool::new(false),
+        )
+        .expect("the run's output doesn't stop the experiment");
+        let Run::Failed(failed) = &recorded.run else {
+            panic!("{name}: the run didn't fail: {:?}", recorded.run);
+        };
+        assert!(failed.contains(ended), "{name}: {failed}");
+        assert!(failed.contains(why), "{name}: {failed}");
+        assert_eq!(recorded.trace, None, "{name}");
+
+        let baseline = classify::sensitivity_baseline(ID, &Some(Ok(recorded.clone())))
+            .expect("the baseline fails");
+        assert_eq!(baseline.class, Class::BaselineFailure, "{name}");
+        assert!(
+            baseline.reason.contains(ended),
+            "{name}: {}",
+            baseline.reason
+        );
+
+        let mutant = SensitivityRun {
+            mutant: Some(Ok(recorded)),
+            ..sensitivity_run(run(None, &[(ID, HELD)]), None)
+        };
+        let result = classify::sensitivity(ID, &mutant);
+        assert_eq!(result.class, Class::HarnessFailure, "{name}");
+        assert!(result.reason.contains(ended), "{name}: {}", result.reason);
     }
 }

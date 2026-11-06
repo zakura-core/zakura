@@ -102,9 +102,10 @@ pub struct NodeRpcServices {
 
 /// Creates the node's RPC implementation and spawns its transaction queue.
 ///
-/// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`],
-/// [`RpcImpl::with_mined_submissions`] and [`RpcImpl::with_end_of_support_height`] for the
-/// arguments.
+/// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`] and
+/// [`RpcImpl::with_end_of_support_height`] for the arguments.
+/// `mined_submissions` must be the registry shared with block gossip. It is installed before
+/// the implementation can be cloned for node services.
 #[allow(clippy::too_many_arguments)]
 pub fn new_rpc_impl(
     network: Network,

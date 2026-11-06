@@ -1848,7 +1848,7 @@ where
         // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
         // runs only after the reservation rejects duplicate and over-capacity submissions.
         let size = block.zcash_serialized_size();
-        let admission = zakura_state::BlockAdmission::pending();
+        let admission = submission_guard.admission();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone().into(),
             admission: admission.clone(),

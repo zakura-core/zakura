@@ -236,11 +236,10 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
     let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let child = pool.try_admit(child, Admission::WithinLimit).unwrap();
     let probe = Probe::new(&child);
-    drop(
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(
-            BlockHandle::from(child),
-        )),
-    );
+    drop(state.queue_and_commit_to_finalized_state(
+        CheckpointVerifiedBlock::from(BlockHandle::from(child)),
+        None,
+    ));
     assert_eq!(state.finalized_state_queued_blocks.len(), 1);
     assert_decoded_payload_retained(&probe, &pool, bytes);
 
@@ -249,7 +248,7 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
         .unwrap();
     timeout(
         limit,
-        state.queue_and_commit_to_finalized_state(genesis.into()),
+        state.queue_and_commit_to_finalized_state(genesis.into(), None),
     )
     .await
     .unwrap()
@@ -351,7 +350,10 @@ async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
     );
     timeout(
         limit,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+        state.queue_and_commit_to_finalized_state(
+            CheckpointVerifiedBlock::from(genesis.clone()),
+            None,
+        ),
     )
     .await
     .unwrap()
@@ -620,7 +622,7 @@ async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
             .expect("ephemeral state initialization succeeds");
     for block in &chain[0..=1] {
         let result = state
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()), None)
             .await;
         assert!(matches!(result, Ok(Ok(_))), "checkpoint commit: {result:?}");
     }
@@ -1160,7 +1162,7 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
     // parent that `can_fork_chain_at` accepts.
     for block in &chain[0..=1] {
         let result = state_service
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()), None)
             .await;
         assert!(
             matches!(result, Ok(Ok(_))),
@@ -1302,7 +1304,7 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
     for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=1) {
         let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
         state
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None)
             .await
             .unwrap()
             .unwrap();
@@ -1432,7 +1434,7 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
     for block in [genesis, parent.clone()] {
         timeout(
             limit,
-            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None),
         )
         .await
         .unwrap()
@@ -2255,7 +2257,7 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     for (index, block) in blocks[0..=1].iter().enumerate() {
         let checkpoint = CheckpointVerifiedBlock::from(block.clone());
         let result = state_service
-            .queue_and_commit_to_finalized_state(checkpoint)
+            .queue_and_commit_to_finalized_state(checkpoint, None)
             .await;
         assert!(
             matches!(result, Ok(Ok(_))),
@@ -2368,7 +2370,7 @@ async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
             .await
             .expect("ephemeral state opens");
     state
-        .queue_and_commit_to_finalized_state(blocks[0].clone().into())
+        .queue_and_commit_to_finalized_state(blocks[0].clone().into(), None)
         .await??;
     state
         .call(Request::CheckCheckpointHandoff)
@@ -2383,7 +2385,7 @@ async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
     // submits semantic blocks after Canopy; this test only checks their release to the writer.
     let _child = state.queue_and_commit_to_non_finalized_state(blocks[2].clone().prepare(), None);
     state
-        .queue_and_commit_to_finalized_state(blocks[1].clone().into())
+        .queue_and_commit_to_finalized_state(blocks[1].clone().into(), None)
         .await??;
     assert!(state
         .non_finalized_state_queued_blocks
@@ -2439,7 +2441,7 @@ async fn legacy_mode_handoff_keeps_header_runtime_detached() -> Result<()> {
             .await
             .expect("ephemeral state initialization succeeds");
     let result = state
-        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis), None)
         .await;
     assert!(
         matches!(result, Ok(Ok(_))),
@@ -2512,7 +2514,7 @@ async fn handoff_trigger_microbench() -> Result<()> {
     for block in &blocks[0..=1] {
         let checkpoint = CheckpointVerifiedBlock::from(block.clone());
         state_service
-            .queue_and_commit_to_finalized_state(checkpoint)
+            .queue_and_commit_to_finalized_state(checkpoint, None)
             .await
             .expect("commit channel open")
             .expect("checkpoint block commits");
@@ -2722,7 +2724,7 @@ proptest! {
                 expected_finalized_value_pool += *block_value_pool;
             }
 
-            let result_receiver = state_service.queue_and_commit_to_finalized_state(block.clone());
+            let result_receiver = state_service.queue_and_commit_to_finalized_state(block.clone(), None);
             let result = result_receiver.blocking_recv();
 
             prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
@@ -2814,7 +2816,7 @@ proptest! {
                 TipAction::grow_with(expected_block.clone().into())
             };
 
-            let result_receiver = state_service.queue_and_commit_to_finalized_state(block);
+            let result_receiver = state_service.queue_and_commit_to_finalized_state(block, None);
             let result = result_receiver.blocking_recv();
 
             prop_assert!(result.is_ok(), "unexpected failed finalized block commit: {:?}", result);
@@ -3111,7 +3113,7 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
         .zcash_deserialize_into()
         .unwrap();
     state
-        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis), None)
         .await
         .unwrap()
         .unwrap();
@@ -3250,7 +3252,7 @@ async fn known_block_prefers_committed_state_over_sent_cache() {
 
     timeout(
         Duration::from_secs(5),
-        state.queue_and_commit_to_finalized_state(checkpoint),
+        state.queue_and_commit_to_finalized_state(checkpoint, None),
     )
     .await
     .unwrap()
@@ -3311,7 +3313,7 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
 
     for block in &blocks[..2] {
         state
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()), None)
             .await
             .expect("the writer responds")
             .expect("the checkpoint commits");
@@ -3511,7 +3513,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
             .expect("state opens");
     for block in &blocks[..2] {
         state_a
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()), None)
             .await
             .expect("writer responds")
             .expect("checkpoint commits");
@@ -3594,7 +3596,7 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         .expect("state opens");
     for block in &blocks[..3] {
         state_b
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()), None)
             .await
             .expect("writer responds")
             .expect("checkpoint commits");
@@ -3666,7 +3668,7 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     let parent = genesis.hash();
     timeout(
         limit,
-        state.queue_and_commit_to_finalized_state(genesis.into()),
+        state.queue_and_commit_to_finalized_state(genesis.into(), None),
     )
     .await
     .unwrap()
@@ -3680,9 +3682,9 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     let (reset_tx, reset_rx) = tokio::sync::mpsc::unbounded_channel();
     let real_reset_rx = std::mem::replace(&mut state.invalid_block_write_reset_receiver, reset_rx);
 
-    let old_response = state.queue_and_commit_to_finalized_state(child.clone().into());
+    let old_response = state.queue_and_commit_to_finalized_state(child.clone().into(), None);
     let old_write = intercepted.try_recv().unwrap();
-    let replacement = state.queue_and_commit_to_finalized_state(child.clone().into());
+    let replacement = state.queue_and_commit_to_finalized_state(child.clone().into(), None);
     assert_eq!(state.finalized_state_queued_blocks.len(), 1);
     assert!(intercepted.try_recv().is_err());
     reset_tx.send(parent).unwrap();
@@ -4328,7 +4330,7 @@ async fn commit_precious_siblings(state: &mut StateService, limit: Duration) -> 
     for block in [genesis, parent.clone()] {
         timeout(
             limit,
-            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None),
         )
         .await
         .unwrap()
@@ -4793,7 +4795,7 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
         .zcash_deserialize_into()
         .unwrap();
     state
-        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis), None)
         .await
         .unwrap()
         .unwrap();
@@ -4876,4 +4878,49 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
         .get_mut(&orphan_hash)
         .is_some());
     assert!(writer.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_submission_replacement_and_failed_handoff_reject_admission() {
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .unwrap();
+    let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let first = BlockAdmission::pending();
+    let first_result = state.call(Request::CommitCheckpointVerifiedBlockWithAdmission {
+        block: child.clone().into(),
+        admission: first.clone(),
+    });
+    let second = BlockAdmission::pending();
+    let second_result = state.call(Request::CommitCheckpointVerifiedBlockWithAdmission {
+        block: child.into(),
+        admission: second.clone(),
+    });
+    assert!(first_result.await.is_err());
+    assert!(!first.wait().await);
+    assert!(!second.is_admitted());
+    state.clear_finalized_block_queue(CommitBlockError::WriteTaskExited);
+    assert!(second_result.await.is_err());
+    assert!(!second.wait().await);
+
+    let (closed_writer, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    let _real_writer = state.block_write_sender.finalized.replace(closed_writer);
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let failed = BlockAdmission::pending();
+    assert!(state
+        .call(Request::CommitCheckpointVerifiedBlockWithAdmission {
+            block: genesis.into(),
+            admission: failed.clone(),
+        })
+        .await
+        .is_err());
+    assert!(!failed.wait().await);
+    assert!(!failed.is_admitted());
 }

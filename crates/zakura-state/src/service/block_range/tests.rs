@@ -57,7 +57,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
     Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
     for block in [genesis.clone(), parent.clone()] {
         state
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None)
             .await
             .unwrap()
             .unwrap();

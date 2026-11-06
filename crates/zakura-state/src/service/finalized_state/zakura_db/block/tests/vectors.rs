@@ -54,7 +54,10 @@ async fn genesis_read_state(
     );
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
+        state.queue_and_commit_to_finalized_state(
+            CheckpointVerifiedBlock::from(genesis.clone()),
+            None,
+        ),
     )
     .await
     .unwrap()
@@ -222,7 +225,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     );
     timeout(
         deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1)),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1), None),
     )
     .await
     .unwrap()
@@ -369,7 +372,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
         let block: Arc<Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
         timeout(
             deadline,
-            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None),
         )
         .await
         .unwrap()

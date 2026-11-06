@@ -881,6 +881,14 @@ where
         self.pending_blocks = pending_blocks;
     }
 
+    /// Shares the in-flight submissions with block gossip.
+    pub(crate) fn set_mined_submissions(
+        &mut self,
+        mined_submissions: super::submit_block::MinedSubmissions,
+    ) {
+        self.mined_submissions = mined_submissions;
+    }
+
     /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
     pub(crate) async fn run_template_build<T: Send + 'static>(
         &self,

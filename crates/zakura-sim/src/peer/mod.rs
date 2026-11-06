@@ -1661,3 +1661,34 @@ async fn open(conn: &Conn, kind: u16, version: u16) {
     let refused = async { while matches!(recv.read_chunk(64 * 1024).await, Ok(Some(_))) {} };
     let _ = zakura_rt::time::timeout(REFUSAL_WAIT, refused).await;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listening peer's acceptor admits an attempt only while no other is
+    /// in its QUIC handshake or live, so the node's connections reach the
+    /// peer one after another, as `WireEvidence`'s incarnations need.
+    #[test]
+    fn a_listening_peer_admits_one_connection_at_a_time() {
+        let (to_task, _incoming) = mpsc::channel(1);
+        let forward = Forward {
+            to_task,
+            live: Arc::default(),
+        };
+        let attempt = |pending_total| IncomingInfo {
+            remote: NODE_ADDR,
+            validated: true,
+            pending_total,
+            pending_from_ip: pending_total,
+        };
+        assert!(matches!(forward.admit(&attempt(0)), Admit::Accept));
+        assert!(matches!(forward.admit(&attempt(1)), Admit::Refuse));
+        // `handle` counts a connection live until its future ends.
+        forward.live.fetch_add(1, Ordering::SeqCst);
+        let live = Live(forward.live.clone());
+        assert!(matches!(forward.admit(&attempt(0)), Admit::Refuse));
+        drop(live);
+        assert!(matches!(forward.admit(&attempt(0)), Admit::Accept));
+    }
+}

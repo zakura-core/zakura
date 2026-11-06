@@ -16,8 +16,10 @@
 //! has one incarnation. A node that redials a listening peer reaches it at
 //! the same address each time (disc-2.2). The peer holds one connection at
 //! a time and refuses the node's other attempts before their handshake, so
-//! the node's `n`-th handshake outcome from that address, registered or
-//! refused, is the peer's `n`-th connection.
+//! the `n`-th connection whose handshake the node reports from that
+//! address is the peer's `n`-th connection. A connection's `Negotiated`
+//! starts it, so one the node cancels during registration, which reports
+//! only `CloseDecided`, still counts.
 //!
 //! Each `PeerReceived` on a header stream is followed by the frame's
 //! `NodeFrame`, which the [`SenderAdapter`] labels under the sender's rules
@@ -152,6 +154,17 @@ pub(crate) struct InvalidPage {
     pub(crate) subscription: u64,
 }
 
+/// The connections the node reported from one remote address.
+#[derive(Clone, Copy, Debug, Default)]
+struct Incarnations {
+    /// The next connection's incarnation.
+    next: u64,
+    /// The connection whose control handshake succeeded and whose
+    /// registration hasn't ended, and whether a cancellation decided its
+    /// close meanwhile.
+    negotiated: Option<(u64, bool)>,
+}
+
 /// The identity map as the log has it, and the labels logged so far.
 #[derive(Debug, Default)]
 pub(crate) struct WireEvidence {
@@ -160,9 +173,8 @@ pub(crate) struct WireEvidence {
     /// Each registered connection, by its remote address as the log writes
     /// it and its incarnation there.
     connections: BTreeMap<(String, u64), u64>,
-    /// The handshake outcomes, registered or refused, from each remote
-    /// address so far: the next one's incarnation.
-    outcomes: BTreeMap<String, u64>,
+    /// The connections the node reported from each remote address so far.
+    incarnations: BTreeMap<String, Incarnations>,
     /// Each admitted stream's kind and version, by connection and QUIC
     /// stream.
     streams: BTreeMap<(u64, u64), StreamId>,
@@ -231,12 +243,24 @@ impl WireEvidence {
             }
             match &entry.obs {
                 Observation::Transport {
+                    connection: None,
+                    remote,
+                    event: TransportFact::Negotiated { .. },
+                    ..
+                } => self.negotiated(remote),
+                Observation::Transport {
+                    connection: None,
+                    remote,
+                    event: TransportFact::CloseDecided { .. },
+                    ..
+                } => self.cancelled(remote),
+                Observation::Transport {
                     connection: Some(connection),
                     remote,
                     event: TransportFact::Registered,
                     ..
                 } => {
-                    let incarnation = self.outcome(remote);
+                    let incarnation = self.outcome(remote, true);
                     self.connections
                         .insert((remote.clone(), incarnation), *connection);
                 }
@@ -246,7 +270,7 @@ impl WireEvidence {
                     event: TransportFact::HandshakeRefused { .. },
                     ..
                 } => {
-                    let incarnation = self.outcome(remote);
+                    let incarnation = self.outcome(remote, false);
                     self.refused_handshakes
                         .insert((remote.clone(), incarnation));
                 }
@@ -318,15 +342,44 @@ impl WireEvidence {
         Ok(())
     }
 
-    /// The incarnation of `remote`'s next handshake outcome, counted. A
-    /// node that redials a listening peer reaches it at the same address,
-    /// with QUIC stream IDs counting from 0 again, so the incarnation keeps a
-    /// record left from the old connection off the new one's stream.
-    fn outcome(&mut self, remote: &str) -> u64 {
-        let outcomes = self.outcomes.entry(remote.to_owned()).or_default();
-        let incarnation = *outcomes;
-        *outcomes += 1;
-        incarnation
+    /// The control handshake of `remote`'s next connection succeeded: that
+    /// connection takes the next incarnation.
+    fn negotiated(&mut self, remote: &str) {
+        let at = self.incarnations.entry(remote.to_owned()).or_default();
+        at.negotiated = Some((at.next, false));
+        at.next += 1;
+    }
+
+    /// The node cancelled `remote`'s negotiated connection before it
+    /// registered. Its registration may still succeed, but a refusal
+    /// reports nothing more.
+    fn cancelled(&mut self, remote: &str) {
+        if let Some((_, cancelled)) = self
+            .incarnations
+            .get_mut(remote)
+            .and_then(|at| at.negotiated.as_mut())
+        {
+            *cancelled = true;
+        }
+    }
+
+    /// The incarnation of the connection whose handshake outcome from
+    /// `remote` the node reported: `registered`, or refused. A node that
+    /// redials a listening peer reaches it at the same address, with QUIC
+    /// stream IDs counting from 0 again, so the incarnation keeps a record
+    /// left from the old connection off the new one's stream. A refusal
+    /// after a cancellation is the next connection's, refused before its
+    /// handshake succeeded.
+    fn outcome(&mut self, remote: &str, registered: bool) -> u64 {
+        let at = self.incarnations.entry(remote.to_owned()).or_default();
+        match at.negotiated.take() {
+            Some((incarnation, cancelled)) if registered || !cancelled => incarnation,
+            _ => {
+                let incarnation = at.next;
+                at.next += 1;
+                incarnation
+            }
+        }
     }
 
     /// Whether `event` names a QUIC stream of `connection` admitted as the
@@ -1015,6 +1068,103 @@ mod tests {
         let error = evidence
             .observe(&records, &mut log)
             .expect_err("the refused connection's record can never be placed");
+        assert!(error.starts_with("UnplacedRecord"), "{error}");
+    }
+
+    /// A connection the node cancels during registration reports
+    /// `Negotiated` and then only `CloseDecided` if its registration is
+    /// refused, or `CloseDecided` and then `Registered`. Either way it keeps
+    /// its incarnation, so the next connection's records are placed on the
+    /// next connection, not the one after. A refusal after a cancellation is
+    /// the next connection's.
+    #[test]
+    fn a_cancelled_registration_keeps_its_incarnation() {
+        let negotiated = |seq| {
+            transport(
+                seq,
+                None,
+                TransportFact::Negotiated {
+                    local: 0,
+                    offered: 0,
+                    negotiated: 0,
+                },
+            )
+        };
+        let cancelled = |seq| transport(seq, None, TransportFact::CloseDecided { cause: None });
+        let session = |connection| Observation::Session {
+            connection,
+            quic_stream: 4,
+            kind: 5,
+            version: 9,
+            session_id: connection,
+            peer: "peer-0".to_owned(),
+        };
+        let written = |incarnation, seq| PeerRecord {
+            remote: Remote {
+                addr: peer_addr(0, 0),
+                incarnation,
+            },
+            quic_stream: 4,
+            body: RecordBody::Written { seq },
+        };
+        let placed = |log: &ObservationLog| -> Vec<(u64, u64)> {
+            log.entries()
+                .iter()
+                .filter_map(|entry| match entry.obs {
+                    Observation::PeerWritten {
+                        connection, seq, ..
+                    } => Some((connection, seq)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let records = PeerRecords::default();
+        let mut evidence = WireEvidence::default();
+        let mut log = ObservationLog::default();
+        // Incarnation 0 registers as connection 1.
+        log.push(negotiated(1));
+        log.push(transport(2, Some(1), TransportFact::Registered));
+        log.push(transport(3, Some(1), TransportFact::TornDown));
+        // Incarnation 1 is cancelled, and its registration refused.
+        log.push(negotiated(4));
+        log.push(cancelled(5));
+        // Incarnation 2 registers as connection 2.
+        log.push(negotiated(6));
+        log.push(transport(7, Some(2), TransportFact::Registered));
+        log.push(session(2));
+        records.borrow_mut().push_back(written(2, 5));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(placed(&log), [(2, 5)], "incarnation 2 is connection 2");
+        // Incarnation 3 is cancelled, and registers as connection 3.
+        log.push(transport(8, Some(2), TransportFact::TornDown));
+        log.push(negotiated(9));
+        log.push(cancelled(10));
+        log.push(transport(11, Some(3), TransportFact::Registered));
+        log.push(session(3));
+        records.borrow_mut().push_back(written(3, 0));
+        evidence.observe(&records, &mut log).unwrap();
+        assert_eq!(
+            placed(&log),
+            [(2, 5), (3, 0)],
+            "incarnation 3 is connection 3"
+        );
+        // Incarnation 4 is cancelled, and incarnation 5 is refused before
+        // its handshake succeeds.
+        log.push(transport(12, Some(3), TransportFact::TornDown));
+        log.push(negotiated(13));
+        log.push(cancelled(14));
+        log.push(transport(
+            15,
+            None,
+            TransportFact::HandshakeRefused {
+                reason: "Zakura control nonce mismatch".to_owned(),
+            },
+        ));
+        records.borrow_mut().push_back(written(5, 0));
+        let error = evidence
+            .observe(&records, &mut log)
+            .expect_err("incarnation 5's record can never be placed");
         assert!(error.starts_with("UnplacedRecord"), "{error}");
     }
 

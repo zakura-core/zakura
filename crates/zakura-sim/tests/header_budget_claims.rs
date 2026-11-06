@@ -2,10 +2,8 @@
 //! `header-sync/chunk-budget-bound` instead of failing the run.
 //!
 //! No committed input can reach `OverBudget`: the storage grammar's few
-//! short chains never claim near 4,000 headers. So this run reports the
-//! reservations by hand, through a tap's capacity handle, and checks that
-//! the property reports the break at the step whose drain found it, with no
-//! harness failure.
+//! short chains never claim near 4,000 headers. So these runs report the
+//! reservations by hand, through a tap's capacity handle.
 #![cfg(zakura_sim)]
 
 use std::{rc::Rc, sync::Arc};
@@ -26,7 +24,7 @@ use zakura_sim::{
         header_sync::storage_config,
     },
     property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
-    MemorySink, Outcome, PlanInput, PropertyOutcome, Sim,
+    HarnessFailure, MemorySink, Outcome, PlanInput, PropertyOutcome, RunReport, Sim,
 };
 use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
@@ -63,17 +61,21 @@ fn peer(byte: u8) -> ZakuraPeerId {
     ZakuraPeerId::new(vec![byte; 32]).expect("32 bytes is a valid peer ID")
 }
 
-/// An ordinary reservation within the fair share, for a peer with none,
-/// that takes the budget's claims past 4,000 breaks `OverBudget`. The tap
-/// records it, the run goes on, and `chunk-budget-bound` reports it at the
-/// step whose drain found it.
-#[test]
-fn an_over_budget_reservation_violates_chunk_budget_bound() {
+/// Reports two reservations through a tap's capacity handle: a repair of
+/// 3,990 headers, then an ordinary one of 11, within the fair share, for a
+/// peer with none, which takes the claims past 4,000 and breaks
+/// `OverBudget`. Runs it under `chunk-budget-bound`, with the tap's claims
+/// taken for the view if `take`, and returns the report and the view.
+fn over_budget(take: bool) -> (RunReport, Claims) {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
     let view = Claims {
-        claims: tap.claims(),
+        claims: if take {
+            tap.claims()
+        } else {
+            ClaimEvidence::default()
+        },
         ..Claims::default()
     };
     let source =
@@ -109,8 +111,15 @@ fn an_over_budget_reservation_violates_chunk_budget_bound() {
         Assumptions::none(),
         &Sources::observed(&[Source::View]),
     );
-    let report = sim.run(&mut checker, &mut MemorySink::default());
+    (sim.run(&mut checker, &mut MemorySink::default()), view)
+}
 
+/// With the tap's claims taken for the view, the tap records the
+/// `OverBudget` break, the run goes on, and `chunk-budget-bound` reports it
+/// at the step whose drain found it.
+#[test]
+fn an_over_budget_reservation_violates_chunk_budget_bound() {
+    let (report, view) = over_budget(true);
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     assert_eq!(report.end.outcome, Outcome::Violation, "{:?}", report.end);
     let violation = report.end.violation.as_ref().expect("the run violated");
@@ -129,4 +138,19 @@ fn an_over_budget_reservation_violates_chunk_budget_bound() {
         report.properties[0].outcome,
         PropertyOutcome::Violated { .. }
     ));
+}
+
+/// A tap whose claims nobody took has no property to report the break, so
+/// the break fails the run, as it did before claims moved to properties.
+#[test]
+fn an_untaken_claim_fails_the_run() {
+    let (report, view) = over_budget(false);
+    let Some(HarnessFailure::SourceEvidence { detail, .. }) = &report.end.harness else {
+        panic!("expected a source evidence failure, got {:?}", report.end);
+    };
+    assert!(
+        detail.starts_with("OverBudget: reservation 2 holds 11 headers"),
+        "{detail}"
+    );
+    assert!(view.claims.records().is_empty());
 }

@@ -49,9 +49,12 @@
 //! in a [`CooldownEvidence`] that the harness's view reads.
 //!
 //! A broken claim rule, a rule a production bug alone can break and a
-//! property's claim names ([`super::claim`]), doesn't fail the run. The tap
-//! records it in its [`ClaimEvidence`] at the drain that found it, and the
-//! owning property reports it at that step.
+//! property's claim names ([`super::claim`]), is the property's to report
+//! once a harness takes the tap's [`ClaimEvidence`] for its view
+//! ([`ReactorTap::claims`]). The tap then records each break there at the
+//! drain that found it, and the run goes on. A tap whose claims nobody
+//! took fails the run on a break, as on any other rule, so no break goes
+//! unreported.
 //!
 //! A tap made with a [`CapacityEvidence`] also reads the reactor's resource
 //! probe after each drain, and checks it against the ownership check's
@@ -160,6 +163,9 @@ struct TapState {
     cooldowns: CooldownEvidence,
     /// The claim rules its drains found broken, for the view.
     claims: ClaimEvidence,
+    /// Set once a harness took `claims`, so a property reports each break
+    /// instead of the run failing.
+    claims_taken: AtomicBool,
 }
 
 /// The resource probe a tap was handed.
@@ -214,8 +220,8 @@ impl TapState {
     }
 
     /// Records the claim breaks since the last drain as the drain of `step`
-    /// found them.
-    fn drain_claims(&self, step: u64) {
+    /// found them, or returns the first if nobody took the tap's claims.
+    fn drain_claims(&self, step: u64) -> Result<(), String> {
         let claims = mem::take(
             &mut self
                 .work
@@ -224,12 +230,23 @@ impl TapState {
                 .claims,
         );
         for broken in claims {
-            self.claims.record(ClaimRecord {
-                step,
-                claim: Claim::of(broken.rule),
-                detail: broken.detail,
-            });
+            self.claim(step, Claim::of(broken.rule), broken.detail)?;
         }
+        Ok(())
+    }
+
+    /// Records the break of `claim` the drain of `step` found, or returns
+    /// it as the run's failure if nobody took the tap's claims.
+    fn claim(&self, step: u64, claim: Claim, detail: String) -> Result<(), String> {
+        if !self.claims_taken.load(Ordering::Relaxed) {
+            return Err(detail);
+        }
+        self.claims.record(ClaimRecord {
+            step,
+            claim,
+            detail,
+        });
+        Ok(())
     }
 
     /// The first rule this run's history broke.
@@ -619,6 +636,7 @@ impl ReactorTap {
                 off_reactor: Mutex::default(),
                 cooldowns,
                 claims: ClaimEvidence::default(),
+                claims_taken: AtomicBool::new(false),
             }))
         });
         let state = observer.0.clone();
@@ -665,8 +683,10 @@ impl ReactorTap {
     }
 
     /// The claim rules the tap's drains found broken, which it fills as
-    /// they happen.
+    /// they happen. Taking them hands each break to the caller's property
+    /// instead of failing the run, as the module doc says.
     pub fn claims(&self) -> ClaimEvidence {
+        self.state.claims_taken.store(true, Ordering::Relaxed);
         self.state.claims.clone()
     }
 
@@ -689,8 +709,8 @@ impl ReactorTap {
     /// went away unstopped, left its counts mid-change and fails the run on
     /// its own, so its reads aren't checked. A read that finds the budget's
     /// lock held is noted unread, with whether the reactor was stopped
-    /// mid-poll, and a claim break is recorded in the tap's
-    /// [`ClaimEvidence`] instead of failing the run.
+    /// mid-poll, and a claim break goes to the tap's [`ClaimEvidence`] as
+    /// the module doc says.
     fn read_capacity(&self, step: u64) -> Result<(), String> {
         let Some(evidence) = &self.state.capacity else {
             return Ok(());
@@ -767,14 +787,7 @@ impl ReactorTap {
         });
         match capacity::check(&probe, read, expected) {
             Ok(()) => Ok(()),
-            Err(Broken::Claim(claim, detail)) => {
-                self.state.claims.record(ClaimRecord {
-                    step,
-                    claim,
-                    detail,
-                });
-                Ok(())
-            }
+            Err(Broken::Claim(claim, detail)) => self.state.claim(step, claim, detail),
             Err(Broken::Integrity(detail)) => Err(detail),
         }
     }
@@ -1077,7 +1090,7 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
-        self.state.drain_claims(log.step());
+        self.state.drain_claims(log.step())?;
         if let Some(rule) = self
             .state
             .broken_work_rule()

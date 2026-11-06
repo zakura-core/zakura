@@ -573,7 +573,8 @@ struct RevokedCandidates;
 ///
 /// Configured sidecars are all advertised at once, first. Other peers take one of `window`
 /// entries each, in order, and hold it only while their `inv` is written. If `gate_uploads` is
-/// set, each requested body waits for an upload slot before it is written. Succeeds if at least
+/// set, each requested body for a peer other than a sidecar waits for an upload slot before it
+/// is written. Succeeds if at least
 /// one peer was advertised to.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
@@ -590,9 +591,10 @@ pub(crate) fn broadcast_block(
         // the semaphore's limit.
         let entries = Arc::new(Semaphore::new(window.clamp(1, others.len().max(1))));
         let mut adverts = futures::stream::FuturesUnordered::new();
-        // Pushed first, so their adverts are queued first.
+        // Pushed first, so their adverts are queued first. Sidecars are served first, so their
+        // uploads never wait for a slot.
         for sidecar in sidecars {
-            adverts.push(sidecar.advertise_outcome(hash, slots.clone(), None, gate_uploads));
+            adverts.push(sidecar.advertise_outcome(hash, slots.clone(), None, false));
         }
         let mut others = others.into_iter().peekable();
         let mut succeeded = false;
@@ -1503,6 +1505,45 @@ mod tests {
                 assert_eq!(max_bodies, PEERS, "ungated body writes");
             }
         }
+    }
+
+    /// A sidecar's requested body is never gated, even while every upload slot is held.
+    #[tokio::test(start_paused = true)]
+    async fn sidecar_uploads_are_not_gated() {
+        let hash = block::Hash([0xe3; 32]);
+        let slots = BlockUploadSlots::new(1);
+        let _held = slots.acquire().await;
+        let (mut peers, mut writes) = connected_peers(2);
+        peers[0].sidecar = true;
+        let uploads = [peers[0].uploads.clone(), peers[1].uploads.clone()];
+        let broadcast = tokio::spawn(broadcast_block(
+            peers,
+            hash,
+            TEST_WINDOW,
+            true,
+            false,
+            slots,
+        ));
+        for _ in 0..2 {
+            let (index, _) = writes.recv().await.expect("mock connections stay open");
+            uploads[index].requested(hash);
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            uploads[0]
+                .wait_for_upload_slot(hash)
+                .now_or_never()
+                .is_some(),
+            "the sidecar body is written at once"
+        );
+        assert!(
+            uploads[1]
+                .wait_for_upload_slot(hash)
+                .now_or_never()
+                .is_none(),
+            "another peer's gated body waits for a slot"
+        );
+        broadcast.abort();
     }
 
     /// A gated body waits until its upload holds a slot, and no longer than

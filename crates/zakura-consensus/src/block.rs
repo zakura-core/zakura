@@ -27,7 +27,6 @@ use zakura_chain::{
     amount::Amount,
     block,
     parameters::{subsidy::SubsidyError, Network},
-    serialization::ZcashSerialize,
     transaction, transparent,
     work::equihash,
 };

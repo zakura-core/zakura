@@ -159,7 +159,8 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
             .all_previous_outputs
             .get(input_index)
             .filter(|_| self.all_previous_outputs.len() == self.transaction.inputs().len())
-            .ok_or(Error::TxIndex)?;
+            .ok_or(Error::TxIndex)?
+            .clone();
 
         let transparent::Output {
             value: _,
@@ -187,6 +188,8 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
         // interpreter pushes false, which later opcodes such as `OP_NOT` may consume.
         let calculate_sighash =
             |script_code: &script::Code, hash_type: &zcash_script::signature::HashType| {
+                let script_code_vec = script_code.0.clone();
+
                 // For pre-v5 (v4) transactions: zcashd serializes the raw
                 // hash_type byte into the sighash preimage (only masking with
                 // 0x1f for selection logic). Use the raw byte to match.
@@ -197,7 +200,7 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
                         .expect("script signature hash types are one byte");
                     return Some(
                         self.sighasher()
-                            .sighash_v4_raw(raw_byte, Some((input_index, script_code.0.clone())))
+                            .sighash_v4_raw(raw_byte, Some((input_index, script_code_vec)))
                             .0,
                     );
                 }
@@ -213,11 +216,9 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
                     return None;
                 }
 
-                // ZIP-244 uses the spent output's scriptPubKey already in the sighasher,
-                // so the interpreter's script code is unused for V5 and later transactions.
                 Some(
                     self.sighasher()
-                        .sighash(our_hash_type, Some((input_index, Vec::new())))
+                        .sighash(our_hash_type, Some((input_index, script_code_vec)))
                         .0,
                 )
             };

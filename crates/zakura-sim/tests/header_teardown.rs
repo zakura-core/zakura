@@ -4,15 +4,22 @@
 //! the events, and the property reports a break at the step that found it.
 #![cfg(zakura_sim)]
 
+use std::{cell::RefCell, io::Write, path::Path, process::Command};
+
+use serde_json::Value;
+use tempfile::TempDir;
 use zakura_sim::{
     domain::header_sync::{CHUNK_BUDGET_BOUND, TEARDOWN_RETURNS_BASELINE},
     harness::{
         self,
+        header_node::claim::RoundEvidence,
         header_sync::{Storage, StorageScenario},
-        run_prepared, Subsystem,
+        record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
+    record::RecordSink,
+    trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
-    MemorySink, Plan,
+    MemorySink, Plan, PlanInput, RunReport,
 };
 
 /// The committed close-and-relink seed (`tests/header_storage_seeds.rs`),
@@ -83,4 +90,81 @@ fn round_evidence_repeats_a_a_and_a_b_a() {
     assert_eq!(runs[0], runs[1], "plan A, then A");
     assert_eq!(runs[0], runs[3], "plan A, then B, then A");
     assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
+}
+
+/// Set, to a directory holding a recorded trace, in the child process that
+/// [`the_teardown_witness_replays_in_a_fresh_process`] starts.
+const CHILD: &str = "ZAKURA_SIM_TEARDOWN_TRACE";
+
+thread_local! {
+    /// The released rounds of the run [`capture_run`] last prepared.
+    static CAPTURED: RefCell<Option<RoundEvidence>> = const { RefCell::new(None) };
+}
+
+/// `header-sync/storage`'s own run, keeping its released rounds in
+/// [`CAPTURED`] for the replay to read.
+fn capture_run(
+    scenario: &Value,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+) -> Result<RunReport, HarnessError> {
+    let scenario: StorageScenario =
+        serde_json::from_value(scenario.clone()).map_err(HarnessError::Scenario)?;
+    let ports = Storage::prepare(&scenario);
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(ports.rounds.clone()));
+    run_prepared::<Storage>(&scenario, ports, input, sink, None)
+}
+
+/// The rounds [`capture_run`] last kept, which must include a released
+/// round, as text.
+fn captured() -> String {
+    let rounds = CAPTURED
+        .with(|captured| captured.borrow_mut().take())
+        .expect("the run prepared its ports");
+    assert!(rounds.any_released(), "{:?}", rounds.rows());
+    format!("{:?}\n", rounds.rows())
+}
+
+/// The committed close-and-relink witness, recorded in this process and
+/// replayed exactly in a fresh process of the same test binary, gives the
+/// released rounds at each drain its recorded run gave.
+#[test]
+fn the_teardown_witness_replays_in_a_fresh_process() {
+    let entry = HarnessEntry {
+        run: capture_run,
+        ..*harness::find(Storage::NAME).expect("the storage harness is registered")
+    };
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let trace = TraceReader::open(Path::new(&dir)).expect("the trace was recorded");
+        // A replay that leaves the trace's picks, draws or observations, or
+        // fails where the recording didn't, errs.
+        replay_with(&trace, &entry, ReplayOptions::default())
+            .unwrap_or_else(|error| panic!("{error}"));
+        // The parent reads the rounds from the child's stdout.
+        writeln!(std::io::stdout(), "ROUNDS-BEGIN\n{}ROUNDS-END", captured())
+            .expect("the test harness captures stdout");
+        return;
+    }
+    let dir = TempDir::new().expect("a temporary directory");
+    record(&entry, RecordInput::Input(CLOSE_RELINK_INPUT), dir.path())
+        .expect("the witness records");
+    let recorded = captured();
+    let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
+        .args([
+            "--exact",
+            "the_teardown_witness_replays_in_a_fresh_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, dir.path())
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(child.status.success(), "{child:?}");
+    let replayed = stdout
+        .split_once("ROUNDS-BEGIN\n")
+        .and_then(|(_, rest)| rest.split_once("ROUNDS-END"))
+        .map(|(rounds, _)| rounds)
+        .unwrap_or_else(|| panic!("the child prints its rounds: {stdout}"));
+    assert_eq!(replayed, recorded);
 }

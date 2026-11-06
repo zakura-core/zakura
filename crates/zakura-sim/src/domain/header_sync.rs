@@ -186,7 +186,10 @@ where
 /// Any of those breaks the step's drain found violates. It applies once the
 /// queue released a round or the node settled. A run that ends with a
 /// released round unsettled, or with a stop begun and the node unsettled,
-/// is inconclusive.
+/// is inconclusive. A run that never stops the node is judged at round
+/// level alone, so it holds once its released rounds settle: node teardown
+/// didn't happen, and today no committed input can stop the node, so every
+/// planted round-level case would otherwise be inconclusive.
 fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,

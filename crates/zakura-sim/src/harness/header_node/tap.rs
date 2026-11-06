@@ -170,8 +170,9 @@ struct TapState {
     claims: ClaimEvidence,
     /// Set once a drain found the stopped reactor's teardown done.
     settled: AtomicBool,
-    /// Set once a read after the stopped reactor was gone was checked.
-    teardown_read: AtomicBool,
+    /// The teardown claims reads after the stopped reactor was gone found,
+    /// each reported once.
+    teardown_claims: Mutex<Vec<Claim>>,
     /// The released rounds each drain found, for the view.
     rounds: SettlementEvidence,
 }
@@ -379,7 +380,10 @@ impl LiveEvidence for TapState {
     /// inconclusive. Any other end means no task could run, yet the reactor
     /// never let go.
     fn unfinished(&self, end: &RunEnd) -> Option<&'static str> {
-        let cut_off = end.drain.as_ref().is_some_and(|drain| drain.exhausted);
+        // A cut-off stop is the teardown property's to report, if one read
+        // the last drain's settlement.
+        let cut_off = end.drain.as_ref().is_some_and(|drain| drain.exhausted)
+            && self.rounds.read_at(end.steps);
         (!cut_off && self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
             .then_some("ShutdownIncomplete: the run ended before the stopped reactor's task ended")
     }
@@ -683,7 +687,7 @@ impl ReactorTap {
                 cooldowns,
                 claims: ClaimEvidence::default(),
                 settled: AtomicBool::new(false),
-                teardown_read: AtomicBool::new(false),
+                teardown_claims: Mutex::default(),
                 rounds,
             }))
         });
@@ -830,19 +834,6 @@ impl ReactorTap {
             );
             return Ok(());
         };
-        if gone && self.state.teardown_read.swap(true, Ordering::Relaxed) {
-            // The first teardown read checked the baseline. Later ones only
-            // keep their values, so a leak isn't reported again.
-            evidence.record(CapacityReading {
-                step,
-                reserved: read.reserved,
-                owned: read.owned,
-                locator_permits: read.locator_permits,
-                compared: false,
-                teardown: true,
-            });
-            return Ok(());
-        }
         let expected = if gone {
             Expected::Teardown {
                 storage_permits: self
@@ -867,11 +858,24 @@ impl ReactorTap {
         match capacity::check(&probe, read, expected) {
             Ok(()) => Ok(()),
             Err(Broken::Claim(claim, detail)) => {
-                self.state.claims.record(ClaimRecord {
-                    step,
-                    claim,
-                    detail,
-                });
+                // Every teardown read is checked, since storage can still
+                // hold a permit when the reactor goes and return it later,
+                // but each teardown claim is reported once.
+                let mut seen = self
+                    .state
+                    .teardown_claims
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !gone || !seen.contains(&claim) {
+                    if gone {
+                        seen.push(claim);
+                    }
+                    self.state.claims.record(ClaimRecord {
+                        step,
+                        claim,
+                        detail,
+                    });
+                }
                 Ok(())
             }
             Err(Broken::Integrity(detail)) => Err(detail),

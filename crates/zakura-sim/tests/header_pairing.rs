@@ -520,6 +520,34 @@ fn a_run_that_ends_mid_stop_fails() {
     assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
 }
 
+/// A stop cut off at the drain bound is the teardown property's to report,
+/// but a tap with no property reading its settlement still fails it as
+/// `ShutdownIncomplete`, so the unfinished stop never ends silently.
+#[test]
+fn a_cut_off_stop_with_no_property_still_fails() {
+    let config = zakura_sim::RunConfig {
+        drain_bound: 2,
+        ..storage_config()
+    };
+    let mut sim = Sim::new(config, PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::task::yield_now().await;
+        }
+    });
+    // The reactor yields forever, so the drain runs to its bound.
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
 /// A reactor that unwinds during an announced stop crashed rather than
 /// stopped, so the run still fails as `ReactorGone`.
 #[test]

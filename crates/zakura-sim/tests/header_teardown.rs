@@ -253,3 +253,46 @@ fn teardown_waits_for_held_lease() {
         "no plan released the round while its prepare held it"
     );
 }
+
+/// The node's first locator read is held until `mirror-0`'s link closes,
+/// and the node shuts down once that read is submitted, so storage can
+/// still hold the read's permit when the reactor goes and return it after.
+/// Every teardown read is checked against storage's permits at that read,
+/// so an honest run holds throughout.
+fn held_locator_witness() -> StorageScenario {
+    let first_locator = || Select::nth(OpKind::Locator, 1);
+    StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: first_locator(),
+                until: Trigger::Closed("mirror-0".to_owned()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Shutdown,
+            when: Some(Trigger::Submitted(first_locator())),
+        }],
+        ..StorageScenario::default()
+    }
+}
+
+/// [`held_locator_witness`] settles the node and holds under every plan.
+/// With `forgotten-locator-permit` applied, a plan whose locator completes
+/// after the reactor goes finds the leaked permit on a later teardown read.
+#[test]
+fn a_locator_held_across_reactor_exit_holds() {
+    let scenario = held_locator_witness();
+    for input in support::inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let settlement = ports.rounds.clone();
+        let report =
+            run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(settlement.settled(), "{:?}", settlement.rows());
+    }
+}

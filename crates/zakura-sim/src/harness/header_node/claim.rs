@@ -72,37 +72,56 @@ pub struct Settlement {
     pub settled: bool,
 }
 
-/// One reactor's released rounds at each drain, shared by its tap and
-/// whoever reads them. Cloning shares the store.
+/// One reactor's settlement at each drain, each with whether a property
+/// read it, shared by its tap and whoever reads them. Cloning shares the
+/// store.
 #[derive(Clone, Debug, Default)]
-pub struct SettlementEvidence(Arc<Mutex<Vec<Settlement>>>);
+pub struct SettlementEvidence(Arc<Mutex<Vec<(Settlement, bool)>>>);
 
 impl SettlementEvidence {
-    /// Keeps `rounds`. Nothing else is called while the lock is held.
+    /// Keeps `rounds`, unread. Nothing else is called while the lock is
+    /// held.
     pub(crate) fn record(&self, rounds: Settlement) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(rounds);
+            .push((rounds, false));
     }
 
-    /// The rounds the drain of `step` read, if it did.
+    /// The settlement the drain of `step` read, if it did, which this marks
+    /// read. Only the property that reports it reads it this way.
     pub fn at(&self, step: u64) -> Option<Settlement> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter_mut()
+            .rev()
+            .find(|(row, _)| row.step == step)
+            .map(|(row, read)| {
+                *read = true;
+                *row
+            })
+    }
+
+    /// Whether a property read the drain of `step`'s settlement.
+    pub(super) fn read_at(&self, step: u64) -> bool {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .rev()
-            .find(|rounds| rounds.step == step)
-            .copied()
+            .find(|(row, _)| row.step == step)
+            .is_some_and(|(_, read)| *read)
     }
 
-    /// Every drain's rounds so far, in order.
+    /// Every drain's settlement so far, in order.
     pub fn rows(&self) -> Vec<Settlement> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .iter()
+            .map(|(row, _)| *row)
+            .collect()
     }
 
     /// Whether a drain found the stopped reactor's teardown done.
@@ -111,7 +130,7 @@ impl SettlementEvidence {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|row| row.settled)
+            .any(|(row, _)| row.settled)
     }
 
     /// Whether any drain found a released round.
@@ -120,7 +139,7 @@ impl SettlementEvidence {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .any(|rounds| rounds.released > 0)
+            .any(|(row, _)| row.released > 0)
     }
 }
 

@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "12.1.0"
+version = "13.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -1822,7 +1822,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "uint",
  "windows-sys 0.61.2",
  "zakura-address",
  "zakura-equihash",
@@ -1996,7 +1995,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.1.0"
+version = "5.1.1"
 dependencies = [
  "serde",
  "tokio",

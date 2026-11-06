@@ -133,9 +133,9 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, MinedSubmissions, PendingBlockRegistry,
-        SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse,
-        SubmitSolutionErrorResponse, SubmitSolutionParameters, SubmitSolutionResponse,
+        EarlyMinedBlock, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
+        SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
+        SubmitSolutionParameters, SubmitSolutionResponse,
     },
     subsidy::GetBlockSubsidyResponse,
     transaction::TransactionObject,
@@ -1390,7 +1390,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -1848,7 +1848,7 @@ where
         // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
         // runs only after the reservation rejects duplicate and over-capacity submissions.
         let size = block.zcash_serialized_size();
-        let admission = submission_guard.admission();
+        let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone().into(),
             admission: admission.clone(),
@@ -1880,7 +1880,7 @@ where
                         && optimistic_block_inventory
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = MinedBlockEvent::Early {
+                            let event = EarlyMinedBlock {
                                 hash: block_hash,
                                 height,
                                 size,
@@ -1907,24 +1907,7 @@ where
                 );
             }
 
-            if verification_result.is_ok() {
-                if mined_block_sender
-                    .send(MinedBlockEvent::Committed {
-                        hash: block_hash,
-                        height,
-                        size,
-                    })
-                    .is_err()
-                {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
-                    tracing::warn!(
-                        ?block_hash,
-                        ?height,
-                        "could not send the final mined-block event"
-                    );
-                }
-            } else if early_sent {
+            if verification_result.is_err() && early_sent {
                 metrics::counter!("mining.optimistic_inventory.post_admission_failures")
                     .increment(1);
                 tracing::warn!(
@@ -2021,12 +2004,6 @@ where
     /// Shares one pending-block registry with peer serving.
     pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
         self.gbt.set_pending_blocks(pending_blocks);
-        self
-    }
-
-    /// Shares the in-flight `submitblock` set with block gossip.
-    pub fn with_mined_submissions(mut self, mined_submissions: MinedSubmissions) -> Self {
-        self.gbt.set_mined_submissions(mined_submissions);
         self
     }
 

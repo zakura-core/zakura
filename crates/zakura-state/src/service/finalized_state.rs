@@ -637,7 +637,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -681,6 +685,10 @@ impl FinalizedState {
                 Ok(())
             },
         )
+        .map(|(block, trees, response)| {
+            let _ = response.send(Ok(block.hash));
+            (block, trees)
+        })
     }
 
     fn commit_finalized_inner_with<C>(
@@ -691,7 +699,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -729,9 +741,8 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            Ok((_hash, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }

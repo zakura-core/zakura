@@ -27,6 +27,7 @@ use zakura_chain::{
     amount::Amount,
     block,
     parameters::{subsidy::SubsidyError, Network},
+    serialization::ZcashSerialize,
     transaction, transparent,
     work::equihash,
 };
@@ -852,6 +853,7 @@ where
 
                 // Finally, submit the block for contextual verification.
                 let prepared_block = zs::SemanticallyVerifiedBlock {
+                    origin: request.origin(),
                     block,
                     hash,
                     height,
@@ -946,6 +948,9 @@ where
     prepared_block.hash = hash;
     prepared_block.height = height;
     prepared_block.receipt_order = receipt_order;
+    prepared_block.origin = zs::BlockOrigin::LocalSubmission {
+        size: prepared_block.block.zcash_serialized_size(),
+    };
 
     if source == PreparedCandidateSource::ServerTemplate
         && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?

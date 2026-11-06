@@ -31,7 +31,7 @@ use zakura_network::{
     AddressBook, InventoryResponse, PeerSocketAddr, Request, Response,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::EarlyMinedBlockChannel;
 use zakura_state::{ChainTipChange, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -1258,10 +1258,15 @@ async fn caches_getaddr_response() {
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         // UTXO verification doesn't matter for these tests.
-        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
-            zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
-                .await
-                .expect("ephemeral state initialization succeeds");
+        let (
+            state,
+            _read_only_state_service,
+            latest_chain_tip,
+            _chain_tip_change,
+            _block_announcements,
+        ) = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1415,7 +1420,7 @@ async fn refused_block_reads_send_notfound() {
     let unknown = zakura_chain::block::Hash([0x22; 32]);
     let broken = zakura_chain::block::Hash([0x33; 32]);
 
-    let (_state, _read_only_state, latest_chain_tip, _chain_tip_change) =
+    let (_state, _read_only_state, latest_chain_tip, _chain_tip_change, _block_announcements) =
         zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -1593,10 +1598,15 @@ async fn setup_with_misbehavior_receiver(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let (
+        state,
+        read_only_state_service,
+        latest_chain_tip,
+        mut chain_tip_change,
+        block_announcements,
+    ) = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1688,15 +1698,15 @@ async fn setup_with_misbehavior_receiver(
     // Pretend we're close to tip
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
     let sync_gossip_task_handle = tokio::spawn(
         sync::gossip_best_tip_block_hashes(
             sync_status.clone(),
-            chain_tip_change.clone(),
+            latest_chain_tip.clone(),
+            block_announcements,
             peer_set.clone(),
             read_only_state_service,
             Some(submitblock_channel.receiver()),
-            zakura_rpc::MinedSubmissions::default(),
         )
         .in_current_span(),
     );

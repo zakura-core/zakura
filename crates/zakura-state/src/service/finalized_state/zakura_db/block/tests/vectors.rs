@@ -43,7 +43,7 @@ async fn genesis_read_state(
     crate::service::ReadStateService,
     Arc<Block>,
 ) {
-    let (mut state, read, _, _) =
+    let (mut state, read, _, _, _) =
         crate::service::StateService::new(config, &Mainnet, Height::MAX, 0)
             .await
             .unwrap();
@@ -54,10 +54,7 @@ async fn genesis_read_state(
     );
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        state.queue_and_commit_to_finalized_state(
-            CheckpointVerifiedBlock::from(genesis.clone()),
-            None,
-        ),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis.clone())),
     )
     .await
     .unwrap()
@@ -225,7 +222,7 @@ async fn disk_transactions_keep_shared_admission_through_clones_and_database_dro
     );
     timeout(
         deadline,
-        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1), None),
+        state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block_1)),
     )
     .await
     .unwrap()
@@ -361,7 +358,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
 
     let _guard = zakura_test::init();
     let deadline = Duration::from_secs(10);
-    let (mut state, mut read, _, _) =
+    let (mut state, mut read, _, _, _block_announcements) =
         StateService::new(Config::ephemeral(), &Mainnet, Height::MAX, 0)
             .await
             .unwrap();
@@ -372,7 +369,7 @@ async fn find_block_headers_results_keep_their_read_admission() {
         let block: Arc<Block> = Arc::new(bytes.zcash_deserialize_into().unwrap());
         timeout(
             deadline,
-            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None),
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
         )
         .await
         .unwrap()
@@ -650,6 +647,7 @@ fn test_block_db_round_trip_with(
                 new_outputs: Arc::new(new_outputs),
                 transaction_hashes,
                 deferred_pool_balance_change: None,
+                origin: crate::BlockOrigin::Network,
                 auth_data_root: None,
                 receipt_order: None,
             })

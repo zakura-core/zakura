@@ -48,7 +48,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
         enable_zakura_header_seed_from_committed_blocks: header_runtime,
         ..Config::ephemeral()
     };
-    let (mut state, mut read_state, tip, _change) =
+    let (mut state, mut read_state, tip, _change, _block_announcements) =
         StateService::new(config, &network, block::Height::MAX, 0)
             .await
             .unwrap();
@@ -57,7 +57,7 @@ async fn assert_block_range_selection(header_runtime: bool) {
     Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
     for block in [genesis.clone(), parent.clone()] {
         state
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block), None)
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
             .await
             .unwrap()
             .unwrap();
@@ -589,7 +589,7 @@ async fn a_panicking_read_releases_resources_once() {
 async fn the_state_api_returns_an_owned_empty_range() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let (_state, mut read_state, _tip, _change) =
+    let (_state, mut read_state, _tip, _change, _) =
         timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
             .await
             .unwrap();
@@ -718,7 +718,7 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
 
     let _guard = zakura_test::init();
     let (resources, drops, finished) = resources();
-    let (_state, mut read_state, _tip, _change) =
+    let (_state, mut read_state, _tip, _change, _) =
         timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
             .await
             .unwrap();

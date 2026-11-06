@@ -5,7 +5,7 @@ async fn writer_failure_reaches_supervision_while_read_clones_hold_the_join_hand
     use tower::ServiceExt;
 
     let network = Network::new_regtest(Default::default());
-    let (_state, read, _tip, _tip_change) = crate::service::init_test_services(&network).await;
+    let (_state, read, _tip, _tip_change, _) = crate::service::init_test_services(&network).await;
     let mut read_clone = read.clone();
     assert!(read_clone.writer_failure().is_none());
     let observer = read.clone();

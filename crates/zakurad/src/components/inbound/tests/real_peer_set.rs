@@ -37,7 +37,7 @@ use zakura_network::{
     Response, SharedPeerError,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::EarlyMinedBlockChannel;
 use zakura_state::{Config as StateConfig, PruningConfig, StorageMode};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -973,10 +973,15 @@ async fn setup(
 
     // State
     // UTXO verification doesn't matter for these tests.
-    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zakura_state::init(state_config, &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let (
+        state_service,
+        read_only_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+        block_announcements,
+    ) = zakura_state::init(state_config, &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
@@ -1069,7 +1074,7 @@ async fn setup(
         block_verifier: buffered_block_verifier,
         mempool: mempool_service.clone(),
         state: state_service.clone(),
-        latest_chain_tip,
+        latest_chain_tip: latest_chain_tip.clone(),
         network: network.clone(),
         misbehavior_sender,
     };
@@ -1077,15 +1082,15 @@ async fn setup(
     // We can't expect or unwrap because the returned Result does not implement Debug
     assert!(r.is_ok(), "unexpected setup channel send failure");
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
 
     let block_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
         sync_status.clone(),
-        chain_tip_change,
+        latest_chain_tip.clone(),
+        block_announcements,
         peer_set.clone(),
         read_only_state_service,
         Some(submitblock_channel.receiver()),
-        zakura_rpc::MinedSubmissions::default(),
     ));
 
     let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
@@ -1149,7 +1154,7 @@ mod submitblock_test {
 
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
-    use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
+    use zakura_rpc::{EarlyMinedBlock, EarlyMinedBlockChannel};
 
     use super::*;
 
@@ -1178,10 +1183,15 @@ mod submitblock_test {
 
         // State
         let state_config = StateConfig::ephemeral();
-        let (_state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
-                .await
-                .expect("ephemeral state initialization succeeds");
+        let (
+            _state_service,
+            read_only_state_service,
+            latest_chain_tip,
+            _chain_tip_change,
+            block_announcements,
+        ) = zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 
@@ -1216,25 +1226,28 @@ mod submitblock_test {
         )
         .await;
 
-        // Start the block gossip task with a SubmitBlockChannel
-        let submitblock_channel = SubmitBlockChannel::new();
+        // Start the block gossip task with a EarlyMinedBlockChannel
+        let submitblock_channel = EarlyMinedBlockChannel::new();
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send(MinedBlockEvent::Committed {
+            .send(EarlyMinedBlock {
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
                 size: 1_000,
+                submitted_at: std::time::Instant::now(),
+                submission: zakura_rpc::MinedBlockSubmission::FullBlock,
+                pending: zakura_rpc::PendingBlockSignal::valid_for_tests(),
             })
             .unwrap();
         let gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
-                chain_tip_change,
+                latest_chain_tip,
+                block_announcements,
                 peer_set.clone(),
                 read_only_state_service,
                 Some(submitblock_channel.receiver()),
-                zakura_rpc::MinedSubmissions::default(),
             )
             .in_current_span(),
         );

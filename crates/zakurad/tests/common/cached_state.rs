@@ -146,7 +146,8 @@ pub async fn start_state_service_with_cache_dir(
     };
 
     // These tests don't need UTXOs to be verified efficiently, because they use cached states.
-    Ok(zakura_state::init(config, network, Height::MAX, 0).await?)
+    let (state, read, tip, change, _) = zakura_state::init(config, network, Height::MAX, 0).await?;
+    Ok((state, read, tip, change))
 }
 
 /// Loads the finalized tip height from the state stored in a specified directory.

@@ -66,7 +66,7 @@ impl ProductionState {
             enable_zakura_header_seed_from_committed_blocks: true,
             ..Default::default()
         };
-        let (mut state, read_state, _, _, authority) =
+        let (mut state, read_state, _, _, _block_announcements, authority) =
             zakura_state::init_with_header_chain_body_evidence(
                 config,
                 &network,

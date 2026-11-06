@@ -3370,7 +3370,7 @@ async fn pending_commit_retry_waits_for_state_outcome() {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    for (committed, mined) in [(true, false), (false, false), (true, true), (false, true)] {
+    for committed in [true, false] {
         let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
@@ -3402,27 +3402,16 @@ async fn pending_commit_retry_waits_for_state_outcome() {
             crate::transaction::boxed_state(state),
             crate::transaction::boxed_transaction_verifier(transaction),
         );
-        let admission = zs::BlockAdmission::pending();
-        let request = if mined {
-            Request::CommitMined {
-                block: Arc::new(block).into(),
-                admission: admission.clone(),
-            }
-        } else {
-            Request::Commit(Arc::new(block).into())
-        };
         let start = tokio::time::Instant::now();
-        let error =
-            tokio::time::timeout(std::time::Duration::from_secs(5), verifier.oneshot(request))
-                .await
-                .unwrap()
-                .unwrap_err();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verifier.oneshot(Request::Commit(Arc::new(block).into())),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
         assert!(start.elapsed() >= std::time::Duration::from_secs(2));
         assert!(locations.lock().unwrap().is_empty());
-        assert!(
-            !admission.is_admitted(),
-            "waiting on another copy never claims its commit"
-        );
         if committed {
             assert_eq!(error.duplicate_location(), Some(&zs::KnownBlock::BestChain));
         } else {
@@ -3948,6 +3937,12 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                         zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
                             block, ..
                         } => {
+                            assert_eq!(
+                                block.origin,
+                                zs::BlockOrigin::LocalSubmission {
+                                    size: block.block.zcash_serialized_size(),
+                                }
+                            );
                             received.lock().unwrap().push(
                                 block
                                     .receipt_order
@@ -4012,7 +4007,7 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         for cache_hit in [false, true] {
             let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
-            let (state, _, tip, _) = zs::init_test_services(&network).await;
+            let (state, _, tip, _, _block_announcements) = zs::init_test_services(&network).await;
             let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
                 .zcash_deserialize_into()
                 .unwrap();

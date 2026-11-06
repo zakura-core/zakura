@@ -1709,6 +1709,7 @@ fn update_latest_chain_channels(
     chain_tip_sender: &mut ChainTipSender,
     non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
     backup_dir_path: Option<&Path>,
+    committed: Option<crate::CommittedBlockAnnouncement>,
 ) -> block::Height {
     let best_chain = non_finalized_state.best_chain().expect("unexpected empty non-finalized state: must commit at least one block before updating channels");
 
@@ -1726,7 +1727,11 @@ fn update_latest_chain_channels(
 
     non_finalized_state.publish(non_finalized_state_sender);
 
-    chain_tip_sender.set_best_non_finalized_tip(tip_block);
+    if let Some(committed) = committed {
+        chain_tip_sender.publish_non_finalized_commit(tip_block, committed);
+    } else {
+        chain_tip_sender.set_best_non_finalized_tip(tip_block);
+    }
 
     tip_block_height
 }
@@ -1750,6 +1755,7 @@ fn update_channels_after_operator_change(
             chain_tip_sender,
             non_finalized_state_sender,
             backup_dir_path,
+            None,
         );
     }
 }
@@ -2711,6 +2717,11 @@ impl WriteBlockWorkerTask {
             let checkpoint_header_writer = header_chain.as_ref();
             let checkpoint_block = ordered_block.0.clone();
 
+            let committed_announcement = crate::CommittedBlockAnnouncement {
+                hash: ordered_block.0.hash,
+                height: ordered_block.0.height,
+                origin: ordered_block.0.origin,
+            };
             // Try committing the block
             match finalized_state.commit_finalized_with_aux_and(
                 ordered_block,
@@ -2742,7 +2753,7 @@ impl WriteBlockWorkerTask {
                     Ok(())
                 },
             ) {
-                Ok((finalized, note_commitment_trees)) => {
+                Ok((finalized, note_commitment_trees, response)) => {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.
                     if next_block_took_vct_path {
@@ -2768,8 +2779,9 @@ impl WriteBlockWorkerTask {
                     let tip_block = ChainTipBlock::from(finalized);
                     let committed_hash = tip_block.hash;
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
-                    chain_tip_sender.set_finalized_tip(tip_block);
+                    chain_tip_sender.publish_finalized_commit(tip_block, committed_announcement);
                     notify_block_committed(block_commit_sender, committed_hash);
+                    let _ = response.send(Ok(committed_hash));
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
@@ -3247,6 +3259,11 @@ impl WriteBlockWorkerTask {
             let child_hash = queued_child.hash;
             let parent_hash = queued_child.block.header().previous_block_hash;
             let child_height = queued_child.height;
+            let committed_announcement = crate::CommittedBlockAnnouncement {
+                hash: child_hash,
+                height: child_height,
+                origin: queued_child.origin,
+            };
             let rejected_ancestor_hash = rejected_ancestor_map.get(&parent_hash).copied();
 
             // If the parent block was marked as rejected, also reject all its children.
@@ -3401,6 +3418,7 @@ impl WriteBlockWorkerTask {
                 chain_tip_sender,
                 non_finalized_state_sender,
                 backup_dir_path.as_deref(),
+                Some(committed_announcement),
             );
 
             notify_block_committed(block_commit_sender, child_hash);
@@ -3452,6 +3470,7 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender,
                     non_finalized_state_sender,
                     backup_dir_path.as_deref(),
+                    None,
                 );
             }
 

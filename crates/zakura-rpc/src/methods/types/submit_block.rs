@@ -1,7 +1,7 @@
 //! Parameter and response types for the `submitblock` RPC.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -57,107 +57,32 @@ pub struct SubmitSolutionParameters {
 const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_MINED_SUBMISSIONS: usize = 16;
 
-/// Blocks this node is submitting until verification finishes and any final event is sent.
-/// Bounds detached submissions before they reach verification or the writer.
-///
-/// Gossip waits only for admitted submissions whose [`MinedBlockEvent`] follows the tip change.
-/// A reservation alone does not establish that the local copy caused a committed tip.
-#[derive(Clone, Debug)]
-pub struct MinedSubmissions(watch::Sender<HashMap<block::Hash, SubmissionState>>);
-
-/// Capacity and relay coordination live as long as the owning reservation.
-#[derive(Debug)]
-struct SubmissionState {
-    admission: zakura_state::BlockAdmission,
-    gossip_deadline: Option<tokio::time::Instant>,
-}
-
-impl Default for MinedSubmissions {
-    fn default() -> Self {
-        Self(watch::channel(HashMap::new()).0)
-    }
-}
+/// Bounds detached mined submissions before they reach verification or the writer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
 
 /// Holds submission capacity until verification and contextual commit finish.
-#[derive(Debug)]
-pub struct MinedSubmission {
+pub(crate) struct MinedSubmission {
     submissions: MinedSubmissions,
     hash: block::Hash,
 }
 
 impl MinedSubmissions {
-    /// Returns whether `hash` still holds submission capacity, including duplicate verification.
-    pub fn contains(&self, hash: &block::Hash) -> bool {
-        self.0.borrow().contains_key(hash)
-    }
-
-    /// Returns the fixed relay deadline if state admitted this local submission.
-    ///
-    /// Pending or rejected submissions hold capacity but cannot delay a peer's committed tip.
-    /// The first call for an admitted submission starts the bound; tip switches cannot reset it.
-    pub fn gossip_deadline(
+    pub(crate) fn reserve(
         &self,
         hash: block::Hash,
-        max_wait: std::time::Duration,
-    ) -> Option<tokio::time::Instant> {
-        let mut deadline = None;
-        self.0.send_if_modified(|entries| {
-            let Some(entry) = entries.get_mut(&hash) else {
-                return false;
-            };
-            if !entry.admission.is_admitted() {
-                return false;
-            }
-            deadline = Some(
-                *entry
-                    .gossip_deadline
-                    .get_or_insert_with(|| tokio::time::Instant::now() + max_wait),
-            );
-            // Recording a deadline does not change capacity or wake release waiters.
-            false
-        });
-        deadline
-    }
-
-    /// Waits until `hash` is no longer being submitted, returning immediately if it is absent.
-    ///
-    /// Subscribe before checking membership so a concurrent release cannot be missed. Cancelling
-    /// this wait does not release the submission; its guard still owns verification capacity.
-    /// Callers must bound the wait if submission progress is not otherwise guaranteed.
-    pub async fn wait_until_released(&self, hash: block::Hash) {
-        let mut changes = self.0.subscribe();
-        drop(
-            changes
-                .wait_for(|entries| !entries.contains_key(&hash))
-                .await
-                .expect("this borrowed submission set keeps its watch sender alive"),
-        );
-    }
-
-    /// Records that this node is submitting `hash` until the returned guard is dropped.
-    ///
-    /// Fails if `hash` is already being submitted, or too many submissions are in flight.
-    pub fn reserve(&self, hash: block::Hash) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
-        let mut result = Ok(());
-        self.0.send_if_modified(|entries| {
-            if entries.contains_key(&hash) {
-                result = Err(SubmitBlockErrorResponse::DuplicateInconclusive);
-                return false;
-            }
-            if entries.len() >= MAX_MINED_SUBMISSIONS {
-                result = Err(SubmitBlockErrorResponse::Inconclusive);
-                return false;
-            }
-            entries.insert(
-                hash,
-                SubmissionState {
-                    admission: zakura_state::BlockAdmission::pending(),
-                    gossip_deadline: None,
-                },
-            );
-            true
-        });
-        result?;
+    ) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
+        let mut entries = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.contains(&hash) {
+            return Err(SubmitBlockErrorResponse::DuplicateInconclusive);
+        }
+        if entries.len() >= MAX_MINED_SUBMISSIONS {
+            return Err(SubmitBlockErrorResponse::Inconclusive);
+        }
+        entries.insert(hash);
         Ok(MinedSubmission {
             submissions: self.clone(),
             hash,
@@ -165,18 +90,13 @@ impl MinedSubmissions {
     }
 }
 
-impl MinedSubmission {
-    /// Returns this reservation's admission signal to pass to the block verifier.
-    pub fn admission(&self) -> zakura_state::BlockAdmission {
-        self.submissions.0.borrow()[&self.hash].admission.clone()
-    }
-}
-
 impl Drop for MinedSubmission {
     fn drop(&mut self) {
         self.submissions
             .0
-            .send_if_modified(|entries| entries.remove(&self.hash).is_some());
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.hash);
     }
 }
 
@@ -199,33 +119,21 @@ impl MinedBlockSubmission {
     }
 }
 
-/// A mined-block lifecycle event consumed by the block gossip task.
+/// An admitted local block eligible for optimistic announcement before commit.
 #[derive(Debug)]
-pub enum MinedBlockEvent {
-    /// State admitted the block, so peers can receive its inventory before commit completes.
-    Early {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// The block's serialized size in bytes.
-        size: usize,
-        /// When the RPC accepted the submitted bytes.
-        submitted_at: std::time::Instant,
-        /// The RPC method that accepted the submission.
-        submission: MinedBlockSubmission,
-        /// Cancels the advertisement if contextual verification rejects the block.
-        pending: PendingBlockSignal,
-    },
-    /// The contextual commit completed.
-    Committed {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// The block's serialized size in bytes.
-        size: usize,
-    },
+pub struct EarlyMinedBlock {
+    /// Block hash.
+    pub hash: block::Hash,
+    /// Block height.
+    pub height: block::Height,
+    /// Serialized size in bytes.
+    pub size: usize,
+    /// When the RPC accepted the submitted bytes.
+    pub submitted_at: std::time::Instant,
+    /// The RPC method that accepted the submission.
+    pub submission: MinedBlockSubmission,
+    /// Cancels the advertisement if contextual verification rejects the block.
+    pub pending: PendingBlockSignal,
 }
 
 #[derive(Clone, Debug)]
@@ -498,36 +406,35 @@ impl From<SubmitBlockResponse> for SubmitSolutionResponse {
     }
 }
 
-/// A submit block channel, used to inform the gossip task about mined blocks.
-pub struct SubmitBlockChannel {
+/// Carries optional early local-block announcements to gossip.
+pub struct EarlyMinedBlockChannel {
     /// The channel sender
-    sender: mpsc::UnboundedSender<MinedBlockEvent>,
+    sender: mpsc::UnboundedSender<EarlyMinedBlock>,
     /// The channel receiver
-    receiver: mpsc::UnboundedReceiver<MinedBlockEvent>,
+    receiver: mpsc::UnboundedReceiver<EarlyMinedBlock>,
 }
 
-impl SubmitBlockChannel {
+impl EarlyMinedBlockChannel {
     /// Creates a new submit block channel
     pub fn new() -> Self {
-        // Only admitted early events and successful commit events enter this channel. Invalid and
-        // duplicate submissions cannot fill it, and the gossip task does not wait for peer
-        // readiness while consuming it.
+        // Only authorized early events enter this channel. Committed announcements come
+        // from state, and gossip consumes both feeds without waiting for peer readiness.
         let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     /// Get the channel sender
-    pub fn sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
+    pub fn sender(&self) -> mpsc::UnboundedSender<EarlyMinedBlock> {
         self.sender.clone()
     }
 
     /// Get the channel receiver
-    pub fn receiver(self) -> mpsc::UnboundedReceiver<MinedBlockEvent> {
+    pub fn receiver(self) -> mpsc::UnboundedReceiver<EarlyMinedBlock> {
         self.receiver
     }
 }
 
-impl Default for SubmitBlockChannel {
+impl Default for EarlyMinedBlockChannel {
     fn default() -> Self {
         Self::new()
     }
@@ -567,95 +474,6 @@ mod tests {
         ));
         drop(guards);
         assert!(submissions.reserve(hash).is_ok());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mined_submission_release_before_wait_is_observed() {
-        let submissions = MinedSubmissions::default();
-        let hash = block::Hash([0; 32]);
-        drop(submissions.reserve(hash).unwrap());
-        let started = tokio::time::Instant::now();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            submissions.wait_until_released(hash),
-        )
-        .await
-        .unwrap();
-        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mined_submission_wait_wakes_only_when_its_guard_is_dropped() {
-        let submissions = MinedSubmissions::default();
-        let hash = block::Hash([0; 32]);
-        let guard = submissions.reserve(hash).unwrap();
-        let other = submissions.reserve(block::Hash([1; 32])).unwrap();
-        let wait = submissions.wait_until_released(hash);
-        tokio::pin!(wait);
-        assert!(futures::poll!(wait.as_mut()).is_pending());
-        drop(other);
-        assert!(futures::poll!(wait.as_mut()).is_pending());
-        assert!(submissions.contains(&hash));
-        drop(guard);
-        assert!(futures::poll!(wait.as_mut()).is_ready());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancelling_a_submission_wait_keeps_its_reservation() {
-        let submissions = MinedSubmissions::default();
-        let hash = block::Hash([0; 32]);
-        let guard = submissions.reserve(hash).unwrap();
-        {
-            let wait = submissions.wait_until_released(hash);
-            tokio::pin!(wait);
-            assert!(futures::poll!(wait.as_mut()).is_pending());
-        }
-        assert!(matches!(
-            submissions.reserve(hash),
-            Err(SubmitBlockErrorResponse::DuplicateInconclusive)
-        ));
-        drop(guard);
-        assert!(submissions.reserve(hash).is_ok());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn aborting_a_submission_owner_wakes_release_waiters() {
-        let submissions = MinedSubmissions::default();
-        let hash = block::Hash([0; 32]);
-        let guard = submissions.reserve(hash).unwrap();
-        let owner = tokio::spawn(async move {
-            let _guard = guard;
-            std::future::pending::<()>().await;
-        });
-        let wait = submissions.wait_until_released(hash);
-        tokio::pin!(wait);
-        assert!(futures::poll!(wait.as_mut()).is_pending());
-        owner.abort();
-        assert!(owner.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
-            .await
-            .unwrap();
-        assert!(!submissions.contains(&hash));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn only_admitted_submissions_get_a_fixed_gossip_deadline() {
-        let submissions = MinedSubmissions::default();
-        let hash = block::Hash([8; 32]);
-        let wait = std::time::Duration::from_secs(90);
-        assert_eq!(submissions.gossip_deadline(hash, wait), None);
-        let reservation = submissions.reserve(hash).unwrap();
-        assert_eq!(submissions.gossip_deadline(hash, wait), None);
-        reservation.admission().admit_for_test();
-        let first = submissions.gossip_deadline(hash, wait).unwrap();
-        tokio::time::advance(wait).await;
-        assert_eq!(submissions.gossip_deadline(hash, wait), Some(first));
-        assert!(submissions.reserve(hash).is_err());
-        drop(reservation);
-        assert_eq!(submissions.gossip_deadline(hash, wait), None);
-        let replacement = submissions.reserve(hash).unwrap();
-        replacement.admission().admit_for_test();
-        assert_eq!(submissions.gossip_deadline(hash, wait), Some(first + wait));
     }
 
     #[test]

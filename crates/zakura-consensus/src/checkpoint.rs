@@ -1248,7 +1248,7 @@ where
     }
 
     fn call(&mut self, block: BlockHandle) -> Self::Future {
-        self.call_with_admission(block, None)
+        self.call_with_origin(block, zs::BlockOrigin::Network)
     }
 }
 
@@ -1257,12 +1257,12 @@ where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
 {
-    /// Verifies a checkpoint submission, retaining its admission signal through the state handoff.
-    #[instrument(name = "checkpoint", skip(self, block, admission))]
-    pub(crate) fn call_with_admission(
+    /// Verify and commit a block while retaining its source through detached checkpoint work.
+    #[instrument(name = "checkpoint", skip(self, block))]
+    pub fn call_with_origin(
         &mut self,
         block: BlockHandle,
-        admission: Option<zs::BlockAdmission>,
+        origin: zs::BlockOrigin,
     ) -> <Self as Service<BlockHandle>>::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
@@ -1292,6 +1292,7 @@ where
             Err(e) => return async { Err(e) }.boxed(),
         };
 
+        req_block.block = req_block.block.with_origin(origin);
         self.process_checkpoint_range();
 
         metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
@@ -1386,12 +1387,8 @@ where
 
                 // We use a `ServiceExt::oneshot`, so that every state service
                 // `poll_ready` has a corresponding `call`. See #1593.
-                let commit = match admission {
-                    Some(admission) => zs::Request::CommitCheckpointVerifiedBlockWithAdmission { block: req_block.block, admission },
-                    None => zs::Request::CommitCheckpointVerifiedBlock(req_block.block),
-                };
                 match state_service
-                    .oneshot(commit)
+                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
                     .map_err(VerifyCheckpointError::CommitCheckpointVerified)
                     .await?
                 {

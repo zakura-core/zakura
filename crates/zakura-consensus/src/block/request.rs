@@ -38,6 +38,18 @@ pub enum Request {
 }
 
 impl Request {
+    /// Origin carried to state after successful verification.
+    pub fn origin(&self) -> zakura_state::BlockOrigin {
+        use zakura_chain::serialization::ZcashSerialize;
+        if self.is_mined_commit() {
+            zakura_state::BlockOrigin::LocalSubmission {
+                size: self.block().zcash_serialized_size(),
+            }
+        } else {
+            zakura_state::BlockOrigin::Network
+        }
+    }
+
     /// Returns inner block
     pub fn block(&self) -> BlockHandle {
         match self {

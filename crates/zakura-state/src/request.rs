@@ -56,7 +56,7 @@ enum Admission {
         /// Whether consensus authorized optimistic relay for this candidate.
         relay: bool,
     },
-    /// State admitted the block to the active write queue.
+    /// State admitted the block to the active non-finalized write queue.
     Admitted {
         /// Whether optimistic relay was still authorized at admission.
         relay: bool,
@@ -92,13 +92,6 @@ impl BlockAdmission {
             *self.0.borrow(),
             Admission::Pending { relay: true } | Admission::Admitted { relay: true }
         )
-    }
-
-    /// Returns whether state accepted this submission into its active writer channel.
-    ///
-    /// A successful handoff publishes admission before a reader can observe the resulting tip.
-    pub fn is_admitted(&self) -> bool {
-        matches!(*self.0.borrow(), Admission::Admitted { .. })
     }
 
     /// Publishes admission atomically with a nonblocking writer handoff.
@@ -153,7 +146,7 @@ impl BlockAdmission {
     ///
     /// # Correctness
     ///
-    /// This future never resolves when neither a writer handoff nor rejection occurs. The state rejects
+    /// This future never resolves when neither `admit` nor `reject` runs. The state rejects
     /// duplicates, queue replacements, and expired blocks, but a verifier error before the state
     /// receives the block leaves the admission pending. Callers must await this future under a
     /// cancellation path, such as a `select!` arm that also awaits verification.
@@ -385,6 +378,8 @@ impl std::str::FromStr for HashOrHeight {
 /// moving work out of the single-threaded state service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticallyVerifiedBlock {
+    /// Process-local origin of this commit, retained through the write queue.
+    pub origin: crate::BlockOrigin,
     /// The block to commit to the state.
     ///
     /// This struct owns the allocations derived from the block, `new_outputs` and
@@ -718,6 +713,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change,
+            origin: _,
             auth_data_root: _,
             receipt_order,
         } = semantically_verified;
@@ -778,6 +774,7 @@ impl ContextuallyVerifiedBlock {
             // Already folded into the proposal's chain value pool change.
             deferred_pool_balance_change: _,
             // Not part of a contextual verification: the commitment check reads the block.
+            origin: _,
             auth_data_root: _,
         } = solved;
 
@@ -796,6 +793,12 @@ impl ContextuallyVerifiedBlock {
 }
 
 impl CheckpointVerifiedBlock {
+    /// Attach the source of this commit without changing verified block data.
+    pub fn with_origin(mut self, origin: crate::BlockOrigin) -> Self {
+        self.0.origin = origin;
+        self
+    }
+
     /// Creates a [`CheckpointVerifiedBlock`] from [`Block`] with optional deferred balance and
     /// optional pre-computed hash.
     pub fn new(
@@ -832,6 +835,7 @@ impl CheckpointVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: None,
         })
@@ -876,6 +880,7 @@ impl SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
         }
@@ -934,6 +939,7 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
         }
@@ -1058,7 +1064,6 @@ mod tests {
             writer_rx.recv().unwrap();
             received_tx.send(()).unwrap();
             // The writer already received the block, but the enqueue closure has not returned.
-            assert!(reader.is_admitted());
             assert!(reader.optimistic_relay_authorized());
         });
         admission
@@ -1079,7 +1084,6 @@ mod tests {
         admission.authorize_optimistic_relay();
         let result = admission.admit_with(true, || Err::<(), _>("writer closed"));
         assert_eq!(result, Err("writer closed"));
-        assert!(!admission.is_admitted());
         assert!(!admission.optimistic_relay_authorized());
         assert!(!admission.wait().await);
     }
@@ -1118,6 +1122,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
             )),
+            origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: valid.receipt_order,
         }
@@ -1133,6 +1138,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             new_outputs: Arc::new(finalized.new_outputs),
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: None,
         }
@@ -1500,15 +1506,6 @@ pub enum Request {
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
-    /// Commits a locally submitted checkpoint block with writer-admission tracking.
-    /// Uses the same verification and response contract as `CommitCheckpointVerifiedBlock`.
-    CommitCheckpointVerifiedBlockWithAdmission {
-        /// The checkpoint-verified block to commit.
-        block: CheckpointVerifiedBlock,
-        /// The local submission's writer-admission notification.
-        admission: BlockAdmission,
-    },
-
     /// Returns [`Response::Tip(Option<(Height, block::Hash)>)`](Response::Tip)
     /// with the current best chain tip.
     Tip,
@@ -1761,10 +1758,7 @@ impl Request {
             Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
                 "commit_semantically_verified_block_with_admission"
             }
-            Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CommitCheckpointVerifiedBlockWithAdmission { .. } => {
-                "commit_checkpoint_verified_block"
-            }
+            Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Tip => "tip",
             Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
@@ -2482,7 +2476,6 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
-            | Request::CommitCheckpointVerifiedBlockWithAdmission { .. }
             | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_)

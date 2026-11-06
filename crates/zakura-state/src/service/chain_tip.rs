@@ -25,6 +25,8 @@ use crate::{
     CheckpointVerifiedBlock, SemanticallyVerifiedBlock,
 };
 
+use super::block_announcements::BlockAnnouncementSender;
+use crate::{BlockAnnouncements, CommittedBlockAnnouncement};
 use TipAction::*;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -144,6 +146,7 @@ impl From<SemanticallyVerifiedBlock> for ChainTipBlock {
             new_outputs: _,
             transaction_hashes,
             deferred_pool_balance_change: _,
+            origin: _,
             auth_data_root: _,
             receipt_order: _,
         } = prepared;
@@ -176,9 +179,47 @@ pub struct ChainTipSender {
 
     /// The sender channel for chain tip data.
     sender: watch::Sender<ChainTipData>,
+    announcements: Option<BlockAnnouncementSender>,
 }
 
 impl ChainTipSender {
+    /// Connect the single committed-announcement consumer before starting the writer.
+    pub fn with_block_announcements(mut self) -> (Self, BlockAnnouncements) {
+        let (sender, receiver) = BlockAnnouncementSender::new();
+        let tip = self
+            .sender
+            .borrow()
+            .as_ref()
+            .map(|tip| (tip.hash, tip.height));
+        sender.publish(tip, None);
+        self.announcements = Some(sender);
+        (self, receiver)
+    }
+
+    /// Publish a successful non-finalized commit and its selected tip together.
+    pub fn publish_non_finalized_commit(
+        &mut self,
+        tip: ChainTipBlock,
+        committed: CommittedBlockAnnouncement,
+    ) {
+        self.use_non_finalized_tip = true;
+        self.update_with_commit(Some(tip), Some(committed));
+    }
+
+    /// Publish a successful checkpoint commit after the database write is visible.
+    pub fn publish_finalized_commit(
+        &mut self,
+        tip: ChainTipBlock,
+        committed: CommittedBlockAnnouncement,
+    ) {
+        let selected_tip = if self.use_non_finalized_tip {
+            self.sender.borrow().clone()
+        } else {
+            Some(tip)
+        };
+        self.update_with_commit(selected_tip, Some(committed));
+    }
+
     /// Create new linked instances of [`ChainTipSender`], [`LatestChainTip`], and [`ChainTipChange`],
     /// using an `initial_tip` and a [`Network`].
     #[instrument(skip(initial_tip), fields(new_height, new_hash))]
@@ -194,6 +235,7 @@ impl ChainTipSender {
         let mut sender = ChainTipSender {
             use_non_finalized_tip: false,
             sender,
+            announcements: None,
         };
 
         let current = LatestChainTip::new(receiver);
@@ -210,6 +252,7 @@ impl ChainTipSender {
         Self {
             use_non_finalized_tip: false,
             sender: self.sender.clone(),
+            announcements: self.announcements.clone(),
         }
     }
 
@@ -266,6 +309,14 @@ impl ChainTipSender {
     /// An update is only sent if the current best tip is different from the last best tip
     /// that was sent.
     fn update(&mut self, new_tip: Option<ChainTipBlock>) {
+        self.update_with_commit(new_tip, None);
+    }
+
+    fn update_with_commit(
+        &mut self,
+        new_tip: Option<ChainTipBlock>,
+        committed: Option<CommittedBlockAnnouncement>,
+    ) {
         // Correctness: the `self.sender.borrow()` must not be placed in a `let` binding to prevent
         // a read-lock being created and living beyond the `self.sender.send(..)` call. If that
         // happens, the `send` method will attempt to obtain a write-lock and will dead-lock.
@@ -284,8 +335,12 @@ impl ChainTipSender {
             (None, _active_value_hash) => false,
         };
 
+        let tip = new_tip.as_ref().map(|tip| (tip.hash, tip.height));
         if needs_update {
             let _ = self.sender.send(new_tip);
+        }
+        if let Some(announcements) = &self.announcements {
+            announcements.publish(tip, committed);
         }
     }
 

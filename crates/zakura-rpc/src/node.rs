@@ -33,7 +33,7 @@ use crate::{
     config,
     methods::{LoggedLastEvent, RpcImpl},
     server::RpcServer,
-    MinedBlockEvent, MinedSubmissions, PendingBlockRegistry,
+    EarlyMinedBlock, PendingBlockRegistry,
 };
 
 /// The node's buffered mempool service.
@@ -104,8 +104,6 @@ pub struct NodeRpcServices {
 ///
 /// See [`RpcImpl::new`], [`RpcImpl::with_pending_blocks`] and
 /// [`RpcImpl::with_end_of_support_height`] for the arguments.
-/// `mined_submissions` must be the registry shared with block gossip. It is installed before
-/// the implementation can be cloned for node services.
 #[allow(clippy::too_many_arguments)]
 pub fn new_rpc_impl(
     network: Network,
@@ -115,9 +113,8 @@ pub fn new_rpc_impl(
     user_agent: String,
     services: NodeRpcServices,
     last_warn_error_log_rx: LoggedLastEvent,
-    mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+    mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     pending_blocks: PendingBlockRegistry,
-    mined_submissions: MinedSubmissions,
     end_of_support_height: Option<block::Height>,
 ) -> (NodeRpcImpl, JoinHandle<()>) {
     let NodeRpcServices {
@@ -149,7 +146,6 @@ pub fn new_rpc_impl(
 
     let rpc_impl = rpc_impl
         .with_pending_blocks(pending_blocks)
-        .with_mined_submissions(mined_submissions)
         .with_end_of_support_height(end_of_support_height);
 
     (rpc_impl, rpc_tx_queue_handle)

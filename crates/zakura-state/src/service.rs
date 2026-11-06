@@ -76,6 +76,7 @@ use crate::{
     SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
+pub(crate) mod block_announcements;
 pub mod block_iter;
 mod block_range;
 pub mod chain_tip;
@@ -176,8 +177,7 @@ pub(crate) struct StateService {
     /// These blocks are awaiting their parent blocks before they can do contextual verification.
     ///
     /// Indexed by their parent block hash.
-    finalized_state_queued_blocks:
-        HashMap<block::Hash, (QueuedCheckpointVerified, Option<BlockAdmission>)>,
+    finalized_state_queued_blocks: HashMap<block::Hash, QueuedCheckpointVerified>,
 
     /// Channels to send blocks to the block write task.
     block_write_sender: write::BlockWriteSender,
@@ -436,7 +436,16 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+    ) -> Result<
+        (
+            Self,
+            ReadStateService,
+            LatestChainTip,
+            ChainTipChange,
+            crate::BlockAnnouncements,
+        ),
+        StateInitError,
+    > {
         let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -524,6 +533,7 @@ impl StateService {
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
+        let (chain_tip_sender, block_announcements) = chain_tip_sender.with_block_announcements();
 
         let finalized_state_for_writing = finalized_state.clone();
         let should_use_finalized_block_write_sender = non_finalized_state.is_chain_set_empty();
@@ -677,7 +687,13 @@ impl StateService {
             }
         });
 
-        Ok((state, read_service, latest_chain_tip, chain_tip_change))
+        Ok((
+            state,
+            read_service,
+            latest_chain_tip,
+            chain_tip_change,
+            block_announcements,
+        ))
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -691,7 +707,6 @@ impl StateService {
     fn queue_and_commit_to_finalized_state(
         &mut self,
         checkpoint_verified: CheckpointVerifiedBlock,
-        admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitCheckpointVerifiedError>> {
         // # Correctness & Performance
         //
@@ -714,7 +729,7 @@ impl StateService {
         } else {
             0
         };
-        let queued = ((checkpoint_verified, rsp_tx, attempt), admission);
+        let queued = (checkpoint_verified, rsp_tx, attempt);
 
         if self.block_write_sender.finalized.is_some() {
             // We're still committing checkpoint verified blocks
@@ -795,7 +810,7 @@ impl StateService {
             Err(TryRecvError::Empty) => {}
         }
 
-        while let Some((queued_block, admission)) = self
+        while let Some(queued_block) = self
             .finalized_state_queued_blocks
             .remove(&self.finalized_block_write_last_sent_hash)
         {
@@ -806,17 +821,13 @@ impl StateService {
             // If we've finished sending finalized blocks, ignore any repeated blocks.
             // (Blocks can be repeated after a syncer reset.)
             if let Some(finalized_block_write_sender) = &self.block_write_sender.finalized {
-                let send = || finalized_block_write_sender.send(queued_block);
-                let send_result = match &admission {
-                    Some(admission) => admission.admit_with(false, send),
-                    None => send(),
-                };
+                let send_result = finalized_block_write_sender.send(queued_block);
 
                 // If the receiver is closed, we can't send any more blocks.
                 if let Err(SendError(queued)) = send_result {
                     // If Zebra is shutting down, drop blocks and return an error.
                     Self::send_checkpoint_verified_block_error(
-                        (queued, admission),
+                        queued,
                         CommitBlockError::WriteTaskExited,
                     );
 
@@ -933,13 +944,10 @@ impl StateService {
 
     /// Send an error on a `QueuedCheckpointVerified` block's result channel, and drop the block
     fn send_checkpoint_verified_block_error(
-        queued: (QueuedCheckpointVerified, Option<BlockAdmission>),
+        queued: QueuedCheckpointVerified,
         error: impl Into<CommitCheckpointVerifiedError>,
     ) {
-        let ((finalized, rsp_tx, _), admission) = queued;
-        if let Some(admission) = admission {
-            admission.reject();
-        }
+        let (finalized, rsp_tx, _) = queued;
 
         // The block sender might have already given up on this block,
         // so ignore any channel send errors.
@@ -1280,58 +1288,6 @@ impl StateService {
     /// but succeed after a syncer restart.
     fn is_close_to_final_checkpoint(&self, queued_height: block::Height) -> bool {
         queued_height >= self.full_verifier_utxo_lookahead
-    }
-
-    /// Queues a checkpoint-verified block, retaining local submission admission when provided.
-    fn commit_checkpoint_verified(
-        &mut self,
-        finalized: CheckpointVerifiedBlock,
-        checkpoint_admission: Option<BlockAdmission>,
-        span: Span,
-    ) -> Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>> {
-        let timer = CodeTimer::start();
-        // # Consensus
-        //
-        // A semantic block verification could have called AwaitUtxo
-        // before this checkpoint verified block arrived in the state.
-        // So we need to check for pending UTXO requests sent by running
-        // semantic block verifications.
-        //
-        // This check is redundant for most checkpoint verified blocks,
-        // because semantic verification can only succeed near the final
-        // checkpoint, when all the UTXOs are available for the verifying block.
-        //
-        // (Checkpoint block UTXOs are verified using block hash checkpoints
-        // and transaction merkle tree block header commitments.)
-        self.pending_utxos
-            .check_against_ordered(&finalized.new_outputs);
-
-        // # Performance
-        //
-        // This method doesn't block, access the database, or perform CPU-intensive tasks,
-        // so we can run it directly in the tokio executor's Future threads.
-        let rsp_rx = self.queue_and_commit_to_finalized_state(finalized, checkpoint_admission);
-
-        // TODO:
-        //   - check for panics in the block write task here,
-        //     as well as in poll_ready()
-
-        // The work is all done, the future just waits on a channel for the result
-        timer.finish_desc("CommitCheckpointVerifiedBlock");
-
-        // Await the channel response, flatten the result, map receive errors to
-        // `CommitCheckpointVerifiedError::WriteTaskExited`.
-        // Then flatten the nested Result and convert any errors to a BoxError.
-        async move {
-            rsp_rx
-                .await
-                .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
-                .and_then(|result| result)
-                .map_err(BoxError::from)
-                .map(Response::Committed)
-        }
-        .instrument(span)
-        .boxed()
     }
 
     /// Sends `ready`, a child of `new_parent` that was never queued, and then all queued blocks
@@ -2026,10 +1982,49 @@ impl Service<Request> for StateService {
             //
             // The expected error type for this request is `CommitCheckpointVerifiedError`.
             Request::CommitCheckpointVerifiedBlock(finalized) => {
-                self.commit_checkpoint_verified(finalized, None, span)
-            }
-            Request::CommitCheckpointVerifiedBlockWithAdmission { block, admission } => {
-                self.commit_checkpoint_verified(block, Some(admission), span)
+                let timer = CodeTimer::start();
+                // # Consensus
+                //
+                // A semantic block verification could have called AwaitUtxo
+                // before this checkpoint verified block arrived in the state.
+                // So we need to check for pending UTXO requests sent by running
+                // semantic block verifications.
+                //
+                // This check is redundant for most checkpoint verified blocks,
+                // because semantic verification can only succeed near the final
+                // checkpoint, when all the UTXOs are available for the verifying block.
+                //
+                // (Checkpoint block UTXOs are verified using block hash checkpoints
+                // and transaction merkle tree block header commitments.)
+                self.pending_utxos
+                    .check_against_ordered(&finalized.new_outputs);
+
+                // # Performance
+                //
+                // This method doesn't block, access the database, or perform CPU-intensive tasks,
+                // so we can run it directly in the tokio executor's Future threads.
+                let rsp_rx = self.queue_and_commit_to_finalized_state(finalized);
+
+                // TODO:
+                //   - check for panics in the block write task here,
+                //     as well as in poll_ready()
+
+                // The work is all done, the future just waits on a channel for the result
+                timer.finish_desc("CommitCheckpointVerifiedBlock");
+
+                // Await the channel response, flatten the result, map receive errors to
+                // `CommitCheckpointVerifiedError::WriteTaskExited`.
+                // Then flatten the nested Result and convert any errors to a BoxError.
+                async move {
+                    rsp_rx
+                        .await
+                        .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
+                        .and_then(|result| result)
+                        .map_err(BoxError::from)
+                        .map(Response::Committed)
+                }
+                .instrument(span)
+                .boxed()
             }
 
             // Uses pending_utxos and non_finalized_state_queued_blocks in the StateService.
@@ -3862,7 +3857,7 @@ fn check_prepared_mined_relay_eligibility_for_state(
 
 /// Initialize a state service from the provided [`Config`].
 /// Returns a boxed state service, a read-only state service,
-/// and receivers for state chain tip updates.
+/// receivers for state chain tip updates, and the single-consumer committed announcement feed.
 ///
 /// Each `network` has its own separate on-disk database.
 ///
@@ -3891,23 +3886,30 @@ pub async fn init(
         ReadStateService,
         LatestChainTip,
         ChainTipChange,
+        crate::BlockAnnouncements,
     ),
     StateInitError,
 > {
-    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(
-            config,
-            network,
-            max_checkpoint_height,
-            checkpoint_verify_concurrency_limit,
-        )
-        .await?;
+    let (
+        state_service,
+        read_only_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+        block_announcements,
+    ) = StateService::new(
+        config,
+        network,
+        max_checkpoint_height,
+        checkpoint_verify_concurrency_limit,
+    )
+    .await?;
 
     Ok((
         BoxService::new(state_service),
         read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
+        block_announcements,
     ))
 }
 
@@ -3929,11 +3931,12 @@ pub async fn init_with_header_chain_body_evidence(
         ReadStateService,
         LatestChainTip,
         ChainTipChange,
+        crate::BlockAnnouncements,
         crate::HeaderChainBodyEvidenceAuthority,
     ),
     StateInitError,
 > {
-    let (state, read_state, latest_chain_tip, chain_tip_change) = init(
+    let (state, read_state, latest_chain_tip, chain_tip_change, block_announcements) = init(
         config,
         network,
         max_checkpoint_height,
@@ -3945,6 +3948,7 @@ pub async fn init_with_header_chain_body_evidence(
         read_state,
         latest_chain_tip,
         chain_tip_change,
+        block_announcements,
         crate::HeaderChainBodyEvidenceAuthority::new(),
     ))
 }
@@ -4043,7 +4047,7 @@ pub async fn init_test(
 ) -> Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _) =
+    let (state_service, _, _, _, _) =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -4052,7 +4056,7 @@ pub async fn init_test(
 }
 
 /// Initializes a state service with an ephemeral [`Config`] and a buffer with a single slot,
-/// then returns the read-write service, read-only service, and tip watch channels.
+/// then returns the read-write service, read-only service, tip watch channels, and committed announcements.
 ///
 /// This can be used to create a state service for testing. See also [`init`].
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -4063,13 +4067,19 @@ pub async fn init_test_services(
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
+    crate::BlockAnnouncements,
 ) {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let (
+        state_service,
+        read_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+        block_announcements,
+    ) = StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
 
     let state_service = Buffer::new(BoxService::new(state_service), 1);
 
@@ -4078,5 +4088,6 @@ pub async fn init_test_services(
         read_state_service,
         latest_chain_tip,
         chain_tip_change,
+        block_announcements,
     )
 }

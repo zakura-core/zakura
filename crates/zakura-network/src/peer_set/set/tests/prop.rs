@@ -313,12 +313,12 @@ fn sidecar_peer_always_receives_block_gossip() {
 
     // A window below the peer count, so the sidecar's place outside it is visible.
     let config = Config {
-        advert_window_min: 32,
-        advert_window_max: 64,
+        advert_window_full_block: 32,
+        advert_window_small_block: 64,
         ..Config::default()
     };
-    // The advertisement carries no size, so the broadcast uses the minimum window.
-    let window = config.advert_window_min;
+    // The advertisement carries no size, so the broadcast uses the full-block window.
+    let window = config.advert_window_full_block;
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     let mut handles = Vec::with_capacity(TOTAL_PEERS);

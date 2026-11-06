@@ -243,6 +243,7 @@ async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
     gossip
         .early_sender
         .send(EarlyMinedBlock {
+            admission: zakura_state::BlockAdmission::pending(),
             hash: local.hash(),
             height: local.coinbase_height().unwrap(),
             size: local.zcash_serialized_size(),

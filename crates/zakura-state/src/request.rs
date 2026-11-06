@@ -44,7 +44,7 @@ use crate::{
     ReadResponse, Response,
 };
 
-/// Notifies a mined-block submitter when state admits its block to the active write queue.
+/// Notifies a mined-block submitter when state admits and commits its block.
 #[derive(Clone, Debug)]
 pub struct BlockAdmission(watch::Sender<Admission>);
 
@@ -61,6 +61,8 @@ enum Admission {
         /// Whether optimistic relay was still authorized at admission.
         relay: bool,
     },
+    /// State committed the block; its committed announcement now owns relay.
+    Committed,
     /// State rejected the block before admission.
     Rejected,
 }
@@ -92,6 +94,35 @@ impl BlockAdmission {
             *self.0.borrow(),
             Admission::Pending { relay: true } | Admission::Admitted { relay: true }
         )
+    }
+
+    /// Returns true once the writer commits this submission, independently of RPC progress.
+    pub fn is_committed(&self) -> bool {
+        matches!(*self.0.borrow(), Admission::Committed)
+    }
+
+    /// Waits until state commits this submission.
+    ///
+    /// A rejected submission never commits. Callers must also observe verification failure or
+    /// use a timeout, as the early broadcast path does.
+    pub async fn wait_for_commit(&self) {
+        self.0
+            .subscribe()
+            .wait_for(|admission| matches!(admission, Admission::Committed))
+            .await
+            .expect("this admission keeps its sender alive");
+    }
+
+    /// Stops further early broadcasts before the writer publishes the committed announcement.
+    pub(crate) fn commit(&self) {
+        self.0.send_if_modified(|admission| {
+            if matches!(admission, Admission::Admitted { .. }) {
+                *admission = Admission::Committed;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Publishes admission atomically with a nonblocking writer handoff.
@@ -157,7 +188,10 @@ impl BlockAdmission {
             .await
             .expect("the admission holds its own sender");
 
-        matches!(*admission, Admission::Admitted { .. })
+        matches!(
+            *admission,
+            Admission::Admitted { .. } | Admission::Committed
+        )
     }
 
     /// Marks the block as admitted in cross-crate lifecycle tests.
@@ -1109,6 +1143,36 @@ mod tests {
         stale.admit(false);
         assert!(stale.wait().await);
         assert!(!stale.optimistic_relay_authorized());
+    }
+
+    #[tokio::test]
+    async fn committed_admission_stays_accepted_but_disables_early_relay() {
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        admission.admit(true);
+        let observer = admission.clone();
+        assert!(!observer.is_committed());
+        assert!(futures::poll!(Box::pin(observer.wait_for_commit())).is_pending());
+        admission.commit();
+        assert!(observer.is_committed());
+        assert!(observer.wait().await);
+        assert!(!observer.optimistic_relay_authorized());
+        observer.wait_for_commit().await;
+        admission.reject();
+        admission.admit(true);
+        admission.authorize_optimistic_relay();
+        assert!(observer.is_committed());
+        assert!(!observer.optimistic_relay_authorized());
+    }
+
+    #[tokio::test]
+    async fn commit_notification_cannot_accept_a_rejected_submission() {
+        let admission = BlockAdmission::pending();
+        admission.reject();
+        admission.commit();
+        assert!(!admission.wait().await);
+        assert!(!admission.is_committed());
+        assert!(futures::poll!(Box::pin(admission.wait_for_commit())).is_pending());
     }
 }
 

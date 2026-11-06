@@ -1241,6 +1241,7 @@ mod submitblock_test {
         submitblock_channel
             .sender()
             .send(EarlyMinedBlock {
+                admission: zakura_state::BlockAdmission::pending(),
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
                 size: 1_000,

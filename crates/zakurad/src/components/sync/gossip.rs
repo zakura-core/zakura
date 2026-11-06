@@ -116,11 +116,11 @@ where
                     None => std::future::pending().await,
                 }
             } => {
-                let Some(EarlyMinedBlock { hash, height, size, submitted_at, submission, pending }) = early else {
+                let Some(EarlyMinedBlock { hash, height, size, submitted_at, submission, pending, admission }) = early else {
                     mined_block_receiver = None;
                     continue;
                 };
-                (hash, height, true, Some((pending, submitted_at, submission)), Some(size))
+                (hash, height, true, Some((pending, submitted_at, submission, admission)), Some(size))
             }
             committed = announcements.recv(close_to_tip) => {
                 let committed = committed.ok_or(AnnouncementsClosed)?;
@@ -178,16 +178,15 @@ where
             } else {
                 zn::Request::AdvertiseBlock(block, None)
             };
-            let broadcast = broadcast_with_timeout(network, request);
             let succeeded = match early {
-                Some((mut pending, submitted_at, submission)) => {
+                Some((mut pending, submitted_at, submission, admission)) => {
                     if !pending.is_valid() {
                         false
                     } else {
                         let succeeded = tokio::select! {
                             biased;
                             _ = pending.wait_for_failure() => false,
-                            succeeded = broadcast => succeeded,
+                            succeeded = broadcast_early_with_timeout(network, request, admission) => succeeded,
                         };
                         if succeeded {
                             metrics::counter!("mining.optimistic_inventory.early_inventories")
@@ -198,7 +197,7 @@ where
                         succeeded
                     }
                 }
-                None => broadcast.await,
+                None => broadcast_with_timeout(network, request).await,
             };
 
             if let Some(completion_tx) = completion_tx {
@@ -240,6 +239,37 @@ where
     tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, network.oneshot(request))
         .await
         .is_ok_and(|result| result.is_ok())
+}
+
+/// Dispatches early inventory only while the submission has not committed.
+///
+/// A commit cancels readiness waits. Once dispatched, the early broadcast can finish normally
+/// and share active uploads with the committed broadcast; contextual failure still cancels it.
+pub(super) async fn broadcast_early_with_timeout<ZN>(
+    mut network: ZN,
+    request: zn::Request,
+    admission: zs::BlockAdmission,
+) -> bool
+where
+    ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>,
+{
+    tokio::time::timeout(BLOCK_GOSSIP_TIMEOUT, async {
+        let ready = tokio::select! {
+            biased;
+            _ = admission.wait_for_commit() => return false,
+            ready = network.ready() => ready,
+        };
+        let Ok(ready) = ready else {
+            return false;
+        };
+        // Readiness may resolve concurrently with the writer's commit notification.
+        if admission.is_committed() {
+            return false;
+        }
+        ready.call(request).await.is_ok()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Records a completed mined-block broadcast, and advertises the hash through the committed-tip

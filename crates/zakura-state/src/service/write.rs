@@ -3403,6 +3403,12 @@ impl WriteBlockWorkerTask {
             // recorded for a different block body with the same header hash.
             rejected_ancestor_map.shift_remove(&child_hash);
 
+            // The committed feed takes over relay before it can wake gossip. RPC may still be
+            // holding or queueing an early event for this submission.
+            if let Some(admission) = admission {
+                admission.commit();
+            }
+
             let evicted = non_finalized_state_sender
                 .borrow()
                 .evicted_blocks(non_finalized_state);

@@ -1882,6 +1882,7 @@ where
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
                             let event = EarlyMinedBlock {
+                                admission: admission.clone(),
                                 hash: block_hash,
                                 height,
                                 size,

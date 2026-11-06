@@ -122,6 +122,8 @@ impl MinedBlockSubmission {
 /// An admitted local block eligible for optimistic announcement before commit.
 #[derive(Debug)]
 pub struct EarlyMinedBlock {
+    /// State's submission lifecycle, used to suppress early dispatch after commit.
+    pub admission: zakura_state::BlockAdmission,
     /// Block hash.
     pub hash: block::Hash,
     /// Block height.

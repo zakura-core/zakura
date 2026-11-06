@@ -23,6 +23,7 @@ pub use reactor_queries::ReactorQueries;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     rc::Rc,
 };
 
@@ -39,6 +40,13 @@ use crate::{
     },
     storage::BLOCK_SERVICE,
     Observation, ObservationLog,
+};
+
+pub use super::shared::Finding;
+
+use super::shared::{
+    bounds::{bound, Bound, Measured, Reading},
+    report,
 };
 
 /// The node submits only bodies it requested.
@@ -138,21 +146,7 @@ where
             check: check_detached_submission_bounded::<S>,
             witness: Some(reset_or_verdict_while_held),
         },
-        Property {
-            id: PropertyId::new(INPUT_DECODED_BOUND),
-            claim: "a body enters the sequencer input queue holding its decoded block only while \
-                    the queue's decoded bytes, applying's decoded bytes and the body's fit under \
-                    BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, plus at most one body; past it \
-                    the body enters as raw bytes",
-            kind: Kind::Bound {
-                unit: Unit::AttributedHeap,
-            },
-            assumes: &[],
-            needs: NEEDS,
-            status: Status::Active,
-            check: check_input_decoded_bound::<S>,
-            witness: Some(any_decoded_queued),
-        },
+        bound::<S, InputDecodedBound>(),
         Property {
             id: PropertyId::new(REACTOR_QUERY_LIFECYCLE),
             claim: "storage takes only accepted needed-block queries, once, under their \
@@ -169,17 +163,6 @@ where
             witness: Some(query_reached_storage),
         },
     ]
-}
-
-/// A violation the model found, for one property to report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Finding {
-    /// The step whose observations showed it.
-    pub step: u64,
-    /// What the property expected.
-    pub expected: String,
-    /// What the run did instead.
-    pub actual: String,
 }
 
 /// Freed room beside an eligible waiting body: [`CAPACITY_RELEASE_WAKES`]'s
@@ -1081,16 +1064,6 @@ where
     model
 }
 
-/// Reports `findings`: the first as the verdict, the rest recorded.
-fn report<S: HasView>(cx: &mut CheckCtx<'_, S>, findings: Vec<Finding>) -> Option<Verdict> {
-    let mut findings = findings.into_iter();
-    let first = findings.next()?;
-    for finding in findings {
-        cx.record_violation(finding.expected, finding.actual);
-    }
-    Some(cx.violated(first.expected, first.actual))
-}
-
 /// Checks [`SUBMIT_ONLY_REQUESTED`] on each submission storage took.
 fn check_submit_only_requested<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
@@ -1235,33 +1208,50 @@ where
     })
 }
 
-/// Checks [`INPUT_DECODED_BOUND`] on each decoded body that enters the
+/// [`INPUT_DECODED_BOUND`], judged on each decoded body that enters the
 /// input queue. A peer routine reports the queue's retain before its send,
 /// so the report covers a body in a suspended send too. The retain and the
 /// sequencer's snapshots carry the attributed size of each decoded block,
 /// measured from the block, not from the gauges the routine's check reads.
-fn check_input_decoded_bound<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+struct InputDecodedBound;
+
+impl<S> Bound<S> for InputDecodedBound
 where
     S: HasView,
     S::View: SemanticView,
 {
-    let model = caught_up(cx);
-    let (findings, applicable, peak, past_cap) = {
+    const ID: &'static str = INPUT_DECODED_BOUND;
+    const CLAIM: &'static str = "a body enters the sequencer input queue holding its decoded \
+                                 block only while the queue's decoded bytes, applying's \
+                                 decoded bytes and the body's fit under \
+                                 BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES, plus at most one \
+                                 body; past it the body enters as raw bytes";
+    const UNIT: Unit = Unit::AttributedHeap;
+    const NEEDS: &'static [Source] = NEEDS;
+    const WITNESS: fn(&ObservationLog) -> bool = any_decoded_queued;
+    /// The model judges each handoff itself, so the instance gives only
+    /// findings.
+    type Terms = Infallible;
+
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<Infallible> {
+        let model = caught_up(cx);
         let mut model = model.borrow_mut();
-        (
-            std::mem::take(&mut model.input_findings),
-            model.saw_decoded_queued,
-            model.queued_decoded_peak,
-            model.handoff_past_cap_peak,
-        )
-    };
-    cx.peak("queued-decoded-attributed-bytes", peak);
-    cx.peak("handoff-past-cap-attributed-bytes", past_cap);
-    report(cx, findings).unwrap_or(if applicable {
-        Verdict::Holds
-    } else {
-        Verdict::NotApplicable
-    })
+        Reading::Findings {
+            peaks: vec![
+                ("queued-decoded-attributed-bytes", model.queued_decoded_peak),
+                (
+                    "handoff-past-cap-attributed-bytes",
+                    model.handoff_past_cap_peak,
+                ),
+            ],
+            findings: std::mem::take(&mut model.input_findings),
+            applicable: model.saw_decoded_queued,
+        }
+    }
+
+    fn violation(reading: &Measured<Infallible>) -> (String, String) {
+        match reading.terms {}
+    }
 }
 
 /// Checks [`REACTOR_QUERY_LIFECYCLE`] after each reactor transition and

@@ -3032,67 +3032,90 @@ async fn v5_transaction_with_transparent_transfer_is_accepted() {
     );
 }
 
-/// A block transaction whose inputs the block verifier already read at the parent verifies
-/// without asking the state for them.
+/// Full, partial, and empty parent caches request only the outputs they did not retain.
 #[tokio::test]
 async fn block_transaction_with_parent_utxos_skips_state_lookups() {
-    let network = Network::new_default_testnet();
-    let network_upgrade = NetworkUpgrade::Nu5;
-    let transaction_block_height = (network_upgrade
-        .activation_height(&network)
-        .expect("NU5 activation height is specified")
-        + 10)
-        .expect("transaction block height is valid");
-    let source_height = (transaction_block_height - 1).expect("source block height is valid");
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let mut inputs = Vec::new();
-    let mut parent_utxos = HashMap::new();
-    for index in 0..3 {
-        let (input, _, utxos) = mock_transparent_transfer(
-            source_height,
-            true,
-            index,
-            Amount::try_from(1).expect("valid value"),
+    for retained_count in 0..=3 {
+        let network = Network::new_default_testnet();
+        let network_upgrade = NetworkUpgrade::Nu5;
+        let transaction_block_height = (network_upgrade
+            .activation_height(&network)
+            .expect("NU5 activation height is specified")
+            + 10)
+            .expect("transaction block height is valid");
+        let source_height = (transaction_block_height - 1).expect("source block height is valid");
+
+        let mut inputs = Vec::new();
+        let mut parent_utxos = HashMap::new();
+        for index in 0..3 {
+            let (input, _, utxos) = mock_transparent_transfer(
+                source_height,
+                true,
+                index,
+                Amount::try_from(1).expect("valid value"),
+            );
+            inputs.push(input);
+            parent_utxos.extend(
+                utxos
+                    .into_iter()
+                    .map(|(outpoint, utxo)| (outpoint, utxo.utxo)),
+            );
+        }
+        let transaction = Transaction::V5 {
+            inputs,
+            outputs: vec![transparent_output(1)],
+            lock_time: LockTime::Height(block::Height(0)),
+            expiry_height: (transaction_block_height + 1).expect("expiry height is valid"),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            network_upgrade,
+        };
+        let transaction_hash = transaction.unmined_id();
+
+        let mut uncached = HashMap::new();
+        for input in transaction.inputs().iter().skip(retained_count) {
+            let outpoint = input.outpoint().expect("all inputs spend parent outputs");
+            uncached.insert(outpoint, parent_utxos.remove(&outpoint).unwrap());
+        }
+        let uncached = Arc::new(uncached);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let state_reads = reads.clone();
+        let state_service = service_fn(move |request: zakura_state::Request| {
+            let uncached = uncached.clone();
+            let reads = state_reads.clone();
+            async move {
+                let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                    panic!("only uncached inputs require a state lookup: {request:?}");
+                };
+                let utxo = uncached
+                    .get(&outpoint)
+                    .expect("retained inputs must not be reread");
+                reads.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, BoxError>(zakura_state::Response::Utxo(utxo.clone()))
+            }
+        });
+        let verifier = Verifier::new_for_tests(&network, state_service);
+
+        let result = verifier
+            .oneshot(Request::Block {
+                transaction_id: transaction.unmined_id(),
+                transaction: Arc::new(transaction).into(),
+                known_utxos: Arc::new(HashMap::new()),
+                parent_utxos: Arc::new(parent_utxos),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height: transaction_block_height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await;
+
+        assert_eq!(
+            result.expect("the transaction verifies").tx_id(),
+            transaction_hash
         );
-        inputs.push(input);
-        parent_utxos.extend(
-            utxos
-                .into_iter()
-                .map(|(outpoint, utxo)| (outpoint, utxo.utxo)),
-        );
+        assert_eq!(reads.load(Ordering::Relaxed), 3 - retained_count);
     }
-    let transaction = Transaction::V5 {
-        inputs,
-        outputs: vec![transparent_output(1)],
-        lock_time: LockTime::Height(block::Height(0)),
-        expiry_height: (transaction_block_height + 1).expect("expiry height is valid"),
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-        network_upgrade,
-    };
-    let transaction_hash = transaction.unmined_id();
-
-    let state_service = service_fn(|request: zakura_state::Request| async move {
-        unreachable!("parent outputs need no state request, got {request:?}")
-    });
-    let verifier = Verifier::new_for_tests(&network, state_service);
-
-    let result = verifier
-        .oneshot(Request::Block {
-            transaction_id: transaction.unmined_id(),
-            transaction: Arc::new(transaction).into(),
-            known_utxos: Arc::new(HashMap::new()),
-            parent_utxos: Arc::new(parent_utxos),
-            known_outpoint_hashes: Arc::new(HashSet::new()),
-            height: transaction_block_height,
-            time: DateTime::<Utc>::MAX_UTC,
-        })
-        .await;
-
-    assert_eq!(
-        result.expect("the transaction verifies").tx_id(),
-        transaction_hash
-    );
 }
 
 /// Tests if a non-coinbase V5 transaction with the last valid expiry height is

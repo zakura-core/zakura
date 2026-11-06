@@ -1461,7 +1461,7 @@ pub enum Request {
     UnspentBestChainUtxo(transparent::OutPoint),
 
     /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
-    /// their outputs if all are unspent there.
+    /// a bounded subset of their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {
@@ -1862,7 +1862,7 @@ pub enum ReadRequest {
     UnspentBestChainUtxo(transparent::OutPoint),
 
     /// Checks a candidate block's external inputs against the UTXO set at `parent`, and returns
-    /// their outputs if all are unspent there.
+    /// a bounded subset of their outputs if all are unspent there.
     /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
     /// context changes during the read. Callers must omit outputs created within the candidate block.
     CheckParentInputs {

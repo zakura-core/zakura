@@ -626,7 +626,7 @@
     ],
     "decision": "Freeze 512-byte inputs at the existing decoder limit, 10s input timeout and 2048MiB RSS. Retain the planned 600s allocation per seed. Calibration completed without resource failures; it does not prove discovery reachability or bound its probability.",
     "open_gap": "discovery/record-book requires installed, replaced, evicted and sampled in one input for Holds. No calibration attempt at either pin reached that full gate. Both record-book cases count for sensitivity only: each sets discovery_excluded, and discovery scores the other eight cases.",
-    "restrictions": "Calibration used only original builds and seed 11. Its generated corpora are excluded from every scored initial corpus. The runs went one at a time on the otherwise idle campaign host (32 vCPU), after every build; throughput is host-specific."
+    "restrictions": "Calibration used only original builds and seed 11. Its generated corpora are excluded from every scored initial corpus. The runs went one at a time after every build, while another agent's planted run shared the 32-vCPU campaign host; each run.json records the load average at its start. Throughput is host-specific."
   },
   "evidence": {
     "bundle": "2063-mut-3-repin-2026-11-06.tar.zst",

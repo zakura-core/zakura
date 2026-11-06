@@ -18,7 +18,8 @@ impl observe::HeaderSyncObserver for Reservations {
     }
 }
 
-/// The repair request also reports its reservation, once, for its supplier.
+/// The repair request also reports its reservation, once, for its supplier,
+/// as a repair of the bounded count that names no round yet.
 #[tokio::test]
 async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
     let shutdown = CancellationToken::new();
@@ -133,7 +134,11 @@ async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
             .lock()
             .expect("no test panics while holding it"),
         [ReactorEvent::ReservationOpened {
-            peer: large_peer.clone()
+            reservation: 1,
+            peer: large_peer.clone(),
+            purpose: observe::ReservationPurpose::Repair,
+            headers: 2,
+            request: None,
         }]
     );
 

@@ -6583,6 +6583,14 @@ async fn write_outbound_request_frame_inner(
             Ok(frame) => {
                 if let Some(item) = legacy_state.validate_frame(request_id, frame)? {
                     items.push(item);
+                    if legacy_state.singleton_inventory_complete() {
+                        legacy_state.finish()?;
+                        // The response codec checks the requested hash or ID
+                        // immediately after this handoff. Do not let a peer
+                        // retain the decoded item by withholding stream FIN.
+                        let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+                        return Ok(ResponseFrames { items, grant });
+                    }
                 }
             }
             Err(ZakuraHandlerError::Closed) => {
@@ -6981,7 +6989,20 @@ impl LegacyResponseReadState {
         Ok(Some(LegacyResponseItem::Frame(frame)))
     }
 
-    /// Checks the response once its stream has ended.
+    /// A singleton inventory response is complete after its available item or
+    /// missing-item record. Other requests still use stream EOF as their end.
+    fn singleton_inventory_complete(&self) -> bool {
+        matches!(
+            self.budget.kind,
+            LegacyResponseKind::Blocks | LegacyResponseKind::Transactions
+        ) && self.budget.max_items == 1
+            && self.items == 1
+            && !self.inventory_nil
+            && self.active_chunk_type.is_none()
+    }
+
+    /// Checks the response once its stream has ended or its singleton inventory
+    /// item is complete.
     ///
     /// Ending mid-item is `Local`: an honest responder resets the stream when a
     /// frame write times out, and the requester sees that the same way as a

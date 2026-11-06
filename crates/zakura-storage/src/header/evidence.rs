@@ -6,6 +6,8 @@
 //! replay, not for comparison.
 
 use zakura_chain::block;
+#[cfg(any(test, zakura_sim))]
+use zakura_header_chain::Attribution;
 use zakura_header_chain::{
     BodyWorkOwner, ErrorCategory, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
     HeaderWorkAuthority, SourceId,
@@ -266,13 +268,26 @@ pub enum ResultIdentity {
     /// A sealed target.
     Prepared,
     /// A failed preparation.
-    PrepareFailed(ErrorCategory),
+    PrepareFailed {
+        /// The error's category.
+        category: ErrorCategory,
+        /// Whom the error blames. Test and simulator builds only, so a
+        /// release build compares and copies nothing new.
+        #[cfg(any(test, zakura_sim))]
+        attribution: Attribution,
+    },
     /// `Applied`.
     Applied,
     /// `ResourceStalled`.
     ResourceStalled,
     /// A failed apply.
-    ApplyFailed(ErrorCategory),
+    ApplyFailed {
+        /// The error's category.
+        category: ErrorCategory,
+        /// Whom the error blames, as for [`ResultIdentity::PrepareFailed`].
+        #[cfg(any(test, zakura_sim))]
+        attribution: Attribution,
+    },
     /// The header is on the selected chain here.
     Selected(Frontier),
     /// The header is retained but not selected.
@@ -346,18 +361,22 @@ impl ResultIdentity {
             }
             HeaderReply::ReleaseHeaderPath(Ok(())) => ResultIdentity::Released,
             HeaderReply::PrepareHeaderTarget(Ok(_)) => ResultIdentity::Prepared,
-            HeaderReply::PrepareHeaderTarget(Err(error)) => {
-                ResultIdentity::PrepareFailed(error.category)
-            }
+            HeaderReply::PrepareHeaderTarget(Err(error)) => ResultIdentity::PrepareFailed {
+                category: error.category,
+                #[cfg(any(test, zakura_sim))]
+                attribution: error.attribution,
+            },
             HeaderReply::ApplyHeaderTarget(Ok(ApplyHeaderTargetOutcome::Applied)) => {
                 ResultIdentity::Applied
             }
             HeaderReply::ApplyHeaderTarget(Ok(ApplyHeaderTargetOutcome::ResourceStalled(_))) => {
                 ResultIdentity::ResourceStalled
             }
-            HeaderReply::ApplyHeaderTarget(Err(error)) => {
-                ResultIdentity::ApplyFailed(error.category)
-            }
+            HeaderReply::ApplyHeaderTarget(Err(error)) => ResultIdentity::ApplyFailed {
+                category: error.category,
+                #[cfg(any(test, zakura_sim))]
+                attribution: error.attribution,
+            },
             HeaderReply::SelectedChainContains(Ok(membership)) => match membership {
                 SelectedChainMembership::Selected(frontier) => ResultIdentity::Selected(*frontier),
                 SelectedChainMembership::NotSelected => ResultIdentity::NotSelected,

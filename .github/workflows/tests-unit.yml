@@ -510,9 +510,12 @@ jobs:
   # property fail. The runner checks out the commit once in a scratch
   # worktree under target/planted/, so the checkout stays clean, builds the
   # unpatched simulator once, and applies each patch there in turn. Each
-  # case runs a campaign of fuzz inputs, which takes minutes, so the job runs
-  # every case nightly and on manual dispatch, never on pull requests or
-  # pushes.
+  # case rebuilds the patched simulator and runs a campaign of fuzz inputs,
+  # which takes minutes, so the whole catalogue outgrew this job's limit.
+  # The job runs one of seven shards, picked by the UTC weekday, so each
+  # case runs once a week. It runs nightly and on manual dispatch, never on
+  # pull requests or pushes. scripts/sim-long-runs.sh runs the whole
+  # catalogue on a remote host.
   sim-planted:
     name: zakura_sim planted
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -530,8 +533,8 @@ jobs:
           cache-shared-key: zakura-sim-planted
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check the planted bypass patches
-        run: cargo xtask planted
+      - name: Check tonight's shard of the planted bypass patches
+        run: cargo xtask planted --shard "$(date -u +%w)/7"
         env:
           RUSTFLAGS: --cfg zakura_sim
 

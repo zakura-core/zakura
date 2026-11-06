@@ -101,9 +101,18 @@ fn try_main() -> Result<(), BoxError> {
         Some("planted") => {
             let mut changed_since = None;
             let mut property = None;
+            let mut shard = None;
             let mut targets = false;
             while let Some(arg) = args.next() {
-                if arg == "--targets" {
+                if arg == "--shard" {
+                    if shard.is_some() {
+                        return Err(Box::new(UsageError("expected at most one `--shard`")));
+                    }
+                    let text = args
+                        .next()
+                        .ok_or(UsageError("expected `<index>/<count>` after `--shard`"))?;
+                    shard = Some(planted::Shard::parse(&text)?);
+                } else if arg == "--targets" {
                     if targets {
                         return Err(Box::new(UsageError("expected at most one `--targets`")));
                     }
@@ -129,6 +138,7 @@ fn try_main() -> Result<(), BoxError> {
             planted::run(
                 &repo_root()?,
                 property.as_deref(),
+                shard,
                 changed_since.as_deref(),
                 targets,
             )
@@ -358,7 +368,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask check-rt-imports")?;
     writeln!(
         output,
-        "  cargo xtask planted [--changed-since <rev>] [--targets] [<property-id>]"
+        "  cargo xtask planted [--shard <index>/<count>] [--changed-since <rev>] [--targets] [<property-id>]"
     )?;
     writeln!(
         output,
@@ -447,6 +457,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "its committed input holds the property unpatched and violates exactly it patched."
+    )?;
+    writeln!(
+        output,
+        "With --shard, it runs only every <count>th case in path order, from position <index>."
     )?;
     writeln!(
         output,

@@ -21,8 +21,10 @@ a sanitizer must turn the feature off:
 RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s none --no-default-features race_fixtures
 ```
 
-`sim-fuzz.yml` runs each mapped target nightly and for longer on Sunday, or on a
-manual dispatch. It caches `corpus/<target>/` under the target's name and a digest of
+`sim-fuzz.yml` runs each mapped target for two minutes nightly, or on a
+manual dispatch. That run is a smoke: it shows each target still builds and
+runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
+campaigns. It caches `corpus/<target>/` under the target's name and a digest of
 its harness's `cargo xtask sim-versions` output, adds the harness's committed seeds, and replays that corpus in a
 fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
 whose target has no harness or no campaign.
@@ -532,3 +534,30 @@ only from a target with a collector.
 `cargo xtask sim-minimize` minimizes a saved failure, as
 [Minimizing a crash](#minimizing-a-crash) describes, and
 `cargo xtask sim-triage` archives it, as [Triage](#triage) describes.
+
+## Long runs
+
+The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
+each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
+runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
+`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+remote host runs the rest, and its results never block a pull request.
+
+`scripts/sim-long-runs.sh` runs them from a checkout on that host. It runs
+`cargo xtask planted` over the whole catalogue, then
+`cargo xtask planted --targets`. With `--seconds`, it then builds every
+target in [Targets](#targets) and runs one [campaign](#campaigns) per
+target, all at once, each with the suite row's libFuzzer limits. Each
+target's store is `<out>/campaigns/<target>/`. The script fails if a
+planted check fails, or if a campaign fails to build or start. A campaign's
+findings don't fail it; read them with `cargo xtask sim-campaign evidence`.
+
+```console
+# Push the commit to the host's checkout, then start the run detached.
+git push ssh://<host>/<checkout> <branch>
+ssh <host> 'cd <checkout> && git checkout <branch> && nohup scripts/sim-long-runs.sh \
+    --out ~/sim-runs --seconds 14400 --workers 2 > ~/sim-runs.log 2>&1 < /dev/null &'
+
+# Each step logs whether it passed, how long it took, and where its log is.
+ssh <host> 'cat ~/sim-runs.log'
+```

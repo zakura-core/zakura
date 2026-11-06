@@ -4273,7 +4273,6 @@ mod tests {
             .expect("test discovery state constructs")
     }
 
-    /// Imports one peer record through the relayed-batch path and asserts the book accepted it.
     /// Imports `record` as its author's own `Hello` over a connection from the
     /// IP of the record's first address, which the import confirms.
     async fn import_hello_record(handle: &ZakuraDiscoveryHandle, record: ZakuraNodeRecord) {
@@ -4285,6 +4284,7 @@ mod tests {
             .expect("authentic test record imports into the book");
     }
 
+    /// Imports one peer record through the relayed-batch path and asserts the book accepted it.
     async fn import_one_peer_record(
         handle: &ZakuraDiscoveryHandle,
         record: ZakuraNodeRecord,

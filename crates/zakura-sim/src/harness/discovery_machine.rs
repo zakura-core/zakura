@@ -19,10 +19,15 @@ const STATE_BUDGET: u64 = 128;
 ///
 /// A passing run reaches every rule. A violation ends its history at the first
 /// failure, so a failing run needs only its last step to apply a rule. A
-/// replacement bug, for example, stops the history before any eviction.
+/// replacement bug, for example, stops the history before any eviction. A
+/// record-book step also applies a rule when it moves relay attribution: an
+/// equal-sequence copy from another relay changes the entry's relay without
+/// changing its record.
 #[derive(Default)]
 struct Reached {
     last_step_applied_rule: bool,
+    /// Each relay's attributed entries after the last record-book step.
+    relayed: Vec<(String, usize)>,
     installed: bool,
     replaced: bool,
     evicted: bool,
@@ -52,8 +57,10 @@ impl Reached {
                     }
                 }
                 self.sampled |= !book.sample.is_empty();
+                let moved = book.expected.relayed != self.relayed;
+                self.relayed.clone_from(&book.expected.relayed);
                 self.last_step_applied_rule =
-                    !book.expected.changes.is_empty() || !book.sample.is_empty();
+                    !book.expected.changes.is_empty() || !book.sample.is_empty() || moved;
             }
             MachineStep::DiscoveryState(state) => {
                 let installation = state.expected.installation.as_ref();
@@ -123,3 +130,24 @@ pub const BOOK_ENTRY: HarnessEntry = crate::machine_entry!(BOOK);
 /// completed installation rules. `discovery/verification-capacity` runs the real
 /// handle's asynchronous verification.
 pub const STATE_ENTRY: HarnessEntry = crate::machine_entry!(STATE);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mutant that keeps the old relay charged fails on this step, so the
+    /// step must count as applying a rule for the violation's witness.
+    #[test]
+    fn an_equal_sequence_relay_move_applies_a_rule() {
+        // Decoder v3: relay 0, then relay 1, supply author 0's sequence-1 record.
+        let steps: Vec<_> = (BOOK.history)(&[0x60, 0x12, 0x60, 0x18])
+            .into_iter()
+            .map(|(_, step)| step)
+            .collect();
+        let MachineStep::DiscoveryBook(moved) = &steps[1] else {
+            panic!("the record book's history has book steps");
+        };
+        assert!(moved.expected.changes.is_empty(), "{moved:?}");
+        assert!(Reached::of(&steps).last_step_applied_rule);
+    }
+}

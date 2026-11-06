@@ -33,6 +33,11 @@
 //!   completion is handled. A round retires only once the queue released
 //!   it. Every prepare and apply holds its round's headers. At teardown nothing stays reserved or
 //!   owned.
+//!
+//! Most rules say the evidence is inconsistent, and [`HeaderWorkLedger::observe`]
+//! refuses the event. A [`ClaimRule`] is one a production bug alone can
+//! break and a property's claim names. The ledger records its break, still
+//! applies the event, so later valid events don't look unknown, and goes on.
 
 use std::collections::BTreeMap;
 
@@ -74,6 +79,23 @@ impl CallRecord {
     }
 }
 
+/// A rule that a production bug alone can break and a property's claim
+/// names. See the module doc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimRule {
+    /// A reported reservation takes the budget's claims past its capacity.
+    OverBudget,
+}
+
+/// One break of a [`ClaimRule`], with its detail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimBreak {
+    /// The rule.
+    pub rule: ClaimRule,
+    /// What broke it, led by the rule's name.
+    pub detail: String,
+}
+
 /// Folds one reactor's events. See the module doc.
 #[derive(Debug, Default)]
 pub struct HeaderWorkLedger {
@@ -93,6 +115,8 @@ pub struct HeaderWorkLedger {
     /// Each started round, by incarnation, until the queue released it and
     /// its last lease returned.
     started: BTreeMap<u64, Round>,
+    /// The claim breaks not yet taken, in order.
+    claims: Vec<ClaimBreak>,
 }
 
 /// One live reservation.
@@ -161,7 +185,9 @@ struct Handoff {
 }
 
 impl HeaderWorkLedger {
-    /// Checks `event`, and returns the broken rule's name and detail.
+    /// Checks `event`, and returns the broken rule's name and detail. A
+    /// [`ClaimRule`]'s break is kept for [`take_claims`](Self::take_claims)
+    /// instead.
     pub fn observe(&mut self, event: &ReactorEvent) -> Result<(), String> {
         match event {
             ReactorEvent::Dispatched { call, op } => {
@@ -607,11 +633,14 @@ impl HeaderWorkLedger {
             ));
         }
         let claimed = self.claimed();
-        if claimed + headers > HEADER_CHUNK_BUDGET_CAPACITY_V1 {
-            return Err(format!(
-                "OverBudget: reservation {reservation} holds {headers} headers with {claimed} \
-                 already claimed of {HEADER_CHUNK_BUDGET_CAPACITY_V1}"
-            ));
+        if claimed.saturating_add(headers) > HEADER_CHUNK_BUDGET_CAPACITY_V1 {
+            self.claims.push(ClaimBreak {
+                rule: ClaimRule::OverBudget,
+                detail: format!(
+                    "OverBudget: reservation {reservation} holds {headers} headers with \
+                     {claimed} already claimed of {HEADER_CHUNK_BUDGET_CAPACITY_V1}"
+                ),
+            });
         }
         let round = match request {
             Some(request) => {
@@ -839,6 +868,11 @@ impl HeaderWorkLedger {
     /// [`Self::owned`].
     fn claimed(&self) -> usize {
         self.reserved() + self.owned()
+    }
+
+    /// The claim breaks since the last call, in order.
+    pub fn take_claims(&mut self) -> Vec<ClaimBreak> {
+        std::mem::take(&mut self.claims)
     }
 
     /// The headers the queue's accounting holds reserved: each live
@@ -1472,12 +1506,19 @@ mod tests {
             request: None,
         };
         fold(vec![repair(1, 1, 401)]).expect("a repair may exceed the fair share");
-        refused_as(
-            vec![
-                repair(1, 1, HEADER_CHUNK_BUDGET_CAPACITY_V1 - 10),
-                opened(2, 2, 11),
-            ],
-            "OverBudget",
+        let mut over = fold(vec![
+            repair(1, 1, HEADER_CHUNK_BUDGET_CAPACITY_V1 - 10),
+            opened(2, 2, 11),
+        ])
+        .expect("a claim break doesn't refuse the history");
+        let claims = over.take_claims();
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].rule, ClaimRule::OverBudget);
+        assert!(claims[0].detail.starts_with("OverBudget"), "{claims:?}");
+        assert_eq!(
+            over.reserved(),
+            HEADER_CHUNK_BUDGET_CAPACITY_V1 + 1,
+            "the over-budget reservation still counts"
         );
         refused_as(vec![opened(2, 1, 5), opened(1, 2, 5)], "ReservationReused");
     }

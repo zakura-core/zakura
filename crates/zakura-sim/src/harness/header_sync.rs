@@ -29,6 +29,7 @@ use super::{
     header_node::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
+        claim::ClaimEvidence,
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
@@ -44,7 +45,10 @@ use super::{
     NetScenario, Subsystem,
 };
 use crate::{
-    domain::session::{honest_never_punished, HonestPeers},
+    domain::{
+        header_sync::{chunk_budget_bound, BudgetView},
+        session::{honest_never_punished, HonestPeers},
+    },
     observe::StorageFact,
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
@@ -499,6 +503,10 @@ pub struct Storage {
     dispatch: DispatchFlag,
     /// The node's adoption facts, from its tap.
     adoption: AdoptionEvidence,
+    /// The node's probe reads, from its tap.
+    capacity: CapacityEvidence,
+    /// The claim rules the node's tap found broken.
+    claims: ClaimEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -525,6 +533,24 @@ pub struct StorageView {
     /// Whom the node's storage failures blamed, for the penalty rule
     /// ([`FaultEvidence::penalized`]).
     pub faults: FaultEvidence,
+    /// The node's header budget probe reads, and how each boundary's read
+    /// went.
+    pub capacity: CapacityEvidence,
+    /// The claim rules the node's tap found broken, at the step that found
+    /// each.
+    pub claims: ClaimEvidence,
+}
+
+impl BudgetView for StorageView {
+    /// [`StorageView::capacity`].
+    fn capacity(&self) -> &CapacityEvidence {
+        &self.capacity
+    }
+
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
 }
 
 impl HonestPeers for StorageView {
@@ -547,6 +573,8 @@ impl HasView for Storage {
             adoption: self.adoption.clone(),
             sessions: self.topology.sessions(),
             faults: self.faults.clone(),
+            capacity: self.capacity.clone(),
+            claims: self.claims.clone(),
         }
     }
 
@@ -674,6 +702,7 @@ impl Subsystem for Storage {
             ports.capacity.clone(),
         );
         let adoption = tap.adoption();
+        let claims = tap.claims();
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -737,6 +766,8 @@ impl Subsystem for Storage {
             port: ports.node,
             dispatch,
             adoption,
+            capacity: ports.capacity,
+            claims,
             faults,
             topology,
         }
@@ -863,6 +894,10 @@ pub struct HeaderWire {
     honest: Rc<BTreeSet<usize>>,
     /// The node's adoption facts, from its tap.
     adoption: AdoptionEvidence,
+    /// The node's probe reads, from its tap.
+    capacity: CapacityEvidence,
+    /// The claim rules the node's tap found broken.
+    claims: ClaimEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -887,6 +922,8 @@ impl HasView for HeaderWire {
             adoption: self.adoption.clone(),
             sessions: Vec::new(),
             faults: self.faults.clone(),
+            capacity: self.capacity.clone(),
+            claims: self.claims.clone(),
         }
     }
 
@@ -1014,6 +1051,7 @@ impl Subsystem for HeaderWire {
             ports.capacity.clone(),
         );
         let adoption = tap.adoption();
+        let claims = tap.claims();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
         sim.add_source(Box::new(storage.with_tap(tap)));
@@ -1086,6 +1124,8 @@ impl Subsystem for HeaderWire {
             dispatch,
             honest: Rc::new(scenario.honest_peers()),
             adoption,
+            capacity: ports.capacity,
+            claims,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),
@@ -1186,9 +1226,11 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     properties
 }
 
-/// The storage harness's properties, [`OPERATION_IDS`] then
-/// [`DIRECT_DISPATCH`], both active. A test harness that wraps
-/// [`Storage`] with its view registers them too.
+/// The storage harness's properties, [`OPERATION_IDS`],
+/// [`DIRECT_DISPATCH`] and [`CHUNK_BUDGET_BOUND`], all active. A test
+/// harness that wraps [`Storage`] with its view registers them too.
+///
+/// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1212,6 +1254,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             check: check_direct_dispatch::<S>,
             witness: None,
         },
+        chunk_budget_bound(),
     ]
 }
 

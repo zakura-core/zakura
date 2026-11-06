@@ -164,7 +164,8 @@ fn declared_targets_are_the_sim_packages() {
 }
 
 /// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry none.
+/// storage seeds carry the uncapped secondary reservation, whose planted
+/// case names the close-and-relink seed.
 #[test]
 fn bypasses_follow_their_committed_input() {
     let load = |harness| seed::load(&[fixtures()], Some(harness)).unwrap().admitted;
@@ -175,9 +176,13 @@ fn bypasses_follow_their_committed_input() {
         discovery[0].patch,
         Path::new("qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch")
     );
-    assert!(bypasses(&root(), &load("header-sync/storage"))
-        .unwrap()
-        .is_empty());
+    let storage = bypasses(&root(), &load("header-sync/storage")).unwrap();
+    assert_eq!(storage.len(), 1, "{storage:?}");
+    assert_eq!(storage[0].property, "header-sync/chunk-budget-bound");
+    assert_eq!(
+        storage[0].patch,
+        Path::new("qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch")
+    );
 }
 
 /// The harness's own properties leave out the ones every harness checks.

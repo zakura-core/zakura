@@ -7,7 +7,8 @@
 //! checks the read with [`check`]:
 //!
 //! - `BudgetOverCapacity`: the budget never holds more than its capacity
-//!   reserved and owned together. Every read checks it.
+//!   reserved and owned together. Every read checks it. It's a claim rule
+//!   ([`super::claim`]), so the tap records its break and goes on.
 //! - `ReservedMismatch` and `OwnedMismatch`: at a quiet boundary, with the
 //!   reactor alive, the budget holds exactly what the tap's
 //!   [`HeaderWorkLedger`] says the queue holds. A boundary is quiet when the
@@ -28,13 +29,16 @@
 //!
 //! The reads stay out of the observation log, so pinned Plans and traces
 //! keep their format. A [`CapacityEvidence`] keeps each one whose values
-//! differ from the last it kept.
+//! differ from the last it kept, and how the read went at each boundary
+//! ([`BoundaryRead`]), so a check can tell an unchanged read from none.
 //!
 //! [`HeaderWorkLedger`]: zakura_network::zakura::observe::HeaderWorkLedger
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use zakura_network::zakura::observe::{HeaderResourceProbe, HeaderResources};
+
+use super::claim::Claim;
 
 /// One probe read the tap checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,22 +64,56 @@ impl CapacityReading {
     }
 }
 
+/// How the tap's probe read went at one boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryRead {
+    /// The probe was read.
+    Read,
+    /// The budget's lock was held, with the reactor's task stopped mid-poll,
+    /// as it is inside a release.
+    UnreadMidPoll,
+    /// The budget's lock was held, with the reactor's task not stopped
+    /// mid-poll, so no task should have held it.
+    UnreadQuiet,
+}
+
+/// What [`CapacityEvidence`] keeps.
+#[derive(Debug, Default)]
+struct Store {
+    /// The readings, each differing from the one before.
+    readings: Vec<CapacityReading>,
+    /// Each boundary the tap read at, by step, in order.
+    boundaries: Vec<(u64, BoundaryRead)>,
+}
+
 /// One reactor's probe reads, shared by its tap and whoever reads them.
 /// Cloning shares the store.
 #[derive(Clone, Debug, Default)]
-pub struct CapacityEvidence(Arc<Mutex<Vec<CapacityReading>>>);
+pub struct CapacityEvidence(Arc<Mutex<Store>>);
 
 impl CapacityEvidence {
-    /// Keeps `reading` unless it holds the last kept reading's values.
-    /// Nothing else is called while the lock is held.
-    pub(super) fn record(&self, reading: CapacityReading) {
-        let mut readings = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if readings
+    /// Keeps `reading` unless it holds the last kept reading's values, and
+    /// notes its boundary as read. Nothing else is called while the lock is
+    /// held.
+    pub(crate) fn record(&self, reading: CapacityReading) {
+        let mut store = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        store.boundaries.push((reading.step, BoundaryRead::Read));
+        if store
+            .readings
             .last()
             .is_none_or(|last| !last.same_values(&reading))
         {
-            readings.push(reading);
+            store.readings.push(reading);
         }
+    }
+
+    /// Notes that the boundary after `step` went unread, as `read` says.
+    pub(crate) fn unread(&self, step: u64, read: BoundaryRead) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .boundaries
+            .push((step, read));
     }
 
     /// Every reading kept so far, in order.
@@ -83,8 +121,41 @@ impl CapacityEvidence {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .readings
             .clone()
     }
+
+    /// How the read at the boundary after `step` went, or `None` if the tap
+    /// didn't try one there.
+    pub fn boundary(&self, step: u64) -> Option<BoundaryRead> {
+        let store = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        store
+            .boundaries
+            .iter()
+            .rev()
+            .find(|(at, _)| *at == step)
+            .map(|(_, read)| *read)
+    }
+
+    /// The reading kept at the boundary after `step`, if one was.
+    pub fn reading_at(&self, step: u64) -> Option<CapacityReading> {
+        let store = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        store
+            .readings
+            .iter()
+            .rev()
+            .find(|reading| reading.step == step)
+            .copied()
+    }
+}
+
+/// A rule a read breaks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Broken {
+    /// A claim rule, which a property reports.
+    Claim(Claim, String),
+    /// An integrity rule, which fails the run.
+    Integrity(String),
 }
 
 /// What a read is checked against.
@@ -105,22 +176,36 @@ pub(super) enum Expected {
 }
 
 /// Checks `read` from `probe` against `expected`, naming the first rule it
-/// breaks, as the module doc lists them.
+/// breaks, as the module doc lists them. A claim break skips the read's
+/// remaining comparisons.
 pub(super) fn check(
     probe: &HeaderResourceProbe,
     read: HeaderResources,
     expected: Expected,
-) -> Result<(), String> {
+) -> Result<(), Broken> {
     let claimed = read.reserved.saturating_add(read.owned);
     if claimed > probe.capacity() {
-        return Err(format!(
-            "BudgetOverCapacity: the header budget holds {} reserved and {} owned, over its \
-             {} headers",
-            read.reserved,
-            read.owned,
-            probe.capacity()
+        return Err(Broken::Claim(
+            Claim::BudgetOverCapacity,
+            format!(
+                "BudgetOverCapacity: the header budget holds {} reserved and {} owned, over \
+                 its {} headers",
+                read.reserved,
+                read.owned,
+                probe.capacity()
+            ),
         ));
     }
+    check_accounting(probe, read, expected).map_err(Broken::Integrity)
+}
+
+/// The integrity part of [`check`]: the read against the queue's accounting
+/// or the teardown baseline.
+fn check_accounting(
+    probe: &HeaderResourceProbe,
+    read: HeaderResources,
+    expected: Expected,
+) -> Result<(), String> {
     match expected {
         Expected::Live { accounted: None } => Ok(()),
         Expected::Live {

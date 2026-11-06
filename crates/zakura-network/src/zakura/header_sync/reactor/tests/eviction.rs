@@ -463,6 +463,62 @@ async fn a_redial_late_in_the_cooldown_reopens_when_it_ends() {
     );
 }
 
+/// A cooldown that a later fault extends holds until its new end. The
+/// cached end still wakes maintenance at the original deadline, which
+/// refuses the peer, keeps the parked demand waiting, and moves the next
+/// wake to the new end. An unrelated publication doesn't wake the demand.
+#[tokio::test(start_paused = true)]
+async fn an_extended_cooldown_holds_through_its_original_end() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = std::time::Duration::from_secs(15);
+    let extended_after = std::time::Duration::from_secs(5);
+    fixture.reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let first_end = Instant::now() + cooldown;
+    let extended_end = first_end + extended_after;
+    fixture.time_out_one_request(7);
+
+    time::advance(extended_after).await;
+    fixture
+        .reactor
+        .state
+        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = || {
+        service.session_demand(
+            1,
+            &fixture.peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    let SessionDemand::WaitForChange(mut reopen) = demand() else {
+        panic!("the service waits for the reactor to end the cooldown");
+    };
+    assert_eq!(fixture.reactor.next_maintenance_deadline(), first_end);
+
+    time::advance(first_end - Instant::now()).await;
+    fixture.reactor.refresh_statuses();
+    fixture.reactor.publish_peer_state();
+    assert!(fixture
+        .reactor
+        .state
+        .readmission_refused(&fixture.peer, Instant::now()));
+    assert!(
+        futures::poll!(&mut reopen).is_pending(),
+        "the original end and an unrelated publication keep the demand parked"
+    );
+    assert_eq!(
+        fixture.reactor.next_maintenance_deadline(),
+        extended_end,
+        "the original end's wake moves the next one to the extended end"
+    );
+
+    time::advance(extended_after).await;
+    fixture.reactor.refresh_statuses();
+    assert!(futures::poll!(&mut reopen).is_ready());
+    assert!(matches!(demand(), SessionDemand::OpenNow));
+}
+
 /// Fresh identities that each leave with a strike end the earliest holds
 /// instead of growing the held set past its limit.
 #[tokio::test(start_paused = true)]

@@ -59,8 +59,8 @@
 //! fails is its own failure, never a catch.
 //!
 //! `--shard <index>/<count>` runs only every `count`th case in path order,
-//! starting at position `index`, so `count` runs with each index between
-//! them run every case once. The nightly job runs one shard a night, and a
+//! starting at position `index`. The `count` shards of one count together
+//! run every case once. The nightly job runs one shard a night, and a
 //! remote host runs the whole catalogue (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
@@ -1313,8 +1313,6 @@ mod tests {
         );
     }
 
-    /// A case is affected by a change to its patch's files, its checks, its
-    /// own files, or the runner, and not by an unrelated change.
     /// The shards of one count split the cases between them, each case in
     /// exactly one, and keep path order.
     #[test]
@@ -1339,6 +1337,8 @@ mod tests {
         }
     }
 
+    /// A case is affected by a change to its patch's files, its checks, its
+    /// own files, or the runner, and not by an unrelated change.
     #[test]
     fn planted_runs_only_affected_cases() {
         let watched = [

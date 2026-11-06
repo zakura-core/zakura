@@ -53,6 +53,7 @@ use self::trace::ZakuraConnTrace;
 use super::discovery::{
     self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialEnd, RedialPolicy,
 };
+use super::legacy_gossip::LegacyResponseItem;
 use super::peer_memory::{
     budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
     PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
@@ -1598,11 +1599,12 @@ impl ZakuraPeerHandle {
         self.sender.capacity() > 0
     }
 
-    /// Open a request stream, write one frame, then return the response frames from the same stream.
+    /// Open a request stream, write one frame, then return its validated items.
     ///
-    /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned value
-    /// funds its frames until it drops. The node's resource envelope counts the
-    /// compatibility client's requests, so another caller bounds the values it keeps.
+    /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned
+    /// value keeps its serialized-byte grant until it drops. The node's resource
+    /// envelope counts the compatibility client's requests, so another caller
+    /// bounds the values it keeps.
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -1632,27 +1634,27 @@ impl ZakuraPeerHandle {
     }
 }
 
-/// A compatibility response's validated frames and the grant that funds them.
+/// A compatibility response's validated items and their serialized-byte grant.
 ///
-/// The grant funds the frames and their decoder's reassembly copy, so a requester
-/// keeps this value until its decoder returns.
+/// Completed inventory items replace their raw chunks. Decoded payloads, as in
+/// the caller's pipeline, are outside the serialized-byte grant.
 #[derive(Debug)]
 pub struct ResponseFrames {
-    frames: Vec<Frame>,
+    items: Vec<LegacyResponseItem>,
     grant: CompatResponseGrant,
 }
 
 impl ResponseFrames {
-    /// Split the frames from the grant that funds them.
-    pub(crate) fn into_parts(self) -> (Vec<Frame>, CompatResponseGrant) {
-        (self.frames, self.grant)
+    /// Split the response items from their serialized-byte grant.
+    pub(super) fn into_parts(self) -> (Vec<LegacyResponseItem>, CompatResponseGrant) {
+        (self.items, self.grant)
     }
 
     /// A scripted peer's frames under a real zero-byte grant.
     #[cfg(test)]
     pub(crate) async fn with_zero_grant_for_tests(frames: Vec<Frame>) -> Self {
         Self {
-            frames,
+            items: frames.into_iter().map(Into::into).collect(),
             grant: ConnectionResources::unconstrained(&[])
                 .admit_compat_response(0)
                 .await,
@@ -1663,7 +1665,7 @@ impl ResponseFrames {
 /// Request/response outbound work owned by a connection-serving task.
 #[derive(Debug)]
 pub enum ZakuraOutboundFrame {
-    /// Compatibility request stream frame expecting response frames on the same stream.
+    /// Compatibility request frame expecting a response on the same stream.
     Request {
         /// Application stream kind to open.
         stream_kind: u16,
@@ -1681,7 +1683,7 @@ pub enum ZakuraOutboundFrame {
         /// Only legacy gossip sets it, and legacy code stays on tokio, so this
         /// is tokio's sender in both builds.
         started: Option<tokio::sync::oneshot::Sender<()>>,
-        /// Completion sent with validated response frames or an error.
+        /// Completion sent with validated response items or an error.
         completion: oneshot::Sender<Result<ResponseFrames, BoxError>>,
     },
 }
@@ -6544,7 +6546,7 @@ async fn write_outbound_request_frame_inner(
     .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
     let _ = send.finish();
 
-    let mut frames = Vec::new();
+    let mut items = Vec::new();
     loop {
         match read_frame(
             &mut recv,
@@ -6560,12 +6562,13 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                legacy_state.validate_frame(request_id, &frame)?;
-                frames.push(frame);
+                if let Some(item) = legacy_state.validate_frame(request_id, frame)? {
+                    items.push(item);
+                }
             }
             Err(ZakuraHandlerError::Closed) => {
                 legacy_state.finish()?;
-                return Ok(ResponseFrames { frames, grant });
+                return Ok(ResponseFrames { items, grant });
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
                 return Err(OutboundRequestError::Local(Box::new(
@@ -6766,11 +6769,12 @@ impl LegacyResponseBudget {
         }
     }
 
-    /// The serialized bytes one exchange under this budget charges: its frames, plus
-    /// the validator's and the decoder's reassembly copies of one object.
+    /// A conservative serialized-byte charge: the whole wire response plus
+    /// two item-sized working buffers for chunk reassembly.
     ///
-    /// The charge lasts until the requester hands the decoded response to its caller.
-    /// A decoded object larger than its encoding is outside it.
+    /// Completed inventory items replace their chunks. The charge lasts until
+    /// the requester hands the decoded response to its caller; decoded payloads
+    /// are outside it.
     fn retained_bytes(&self) -> u64 {
         let copies = match self.kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
@@ -6888,8 +6892,8 @@ impl LegacyResponseReadState {
     fn validate_frame(
         &mut self,
         request_id: u64,
-        frame: &Frame,
-    ) -> Result<(), OutboundRequestError> {
+        frame: Frame,
+    ) -> Result<Option<LegacyResponseItem>, OutboundRequestError> {
         if frame.flags != 0 {
             return Err(OutboundRequestError::Fatal(
                 format!("unsupported legacy response flags: {}", frame.flags).into(),
@@ -6917,10 +6921,18 @@ impl LegacyResponseReadState {
 
         match frame.message_type {
             LEGACY_RESPONSE_BLOCK => {
-                self.validate_available_chunk(request_id, frame, LegacyResponseKind::Blocks)
+                return self.validate_available_chunk(
+                    request_id,
+                    &frame,
+                    LegacyResponseKind::Blocks,
+                );
             }
             LEGACY_RESPONSE_TRANSACTION => {
-                self.validate_available_chunk(request_id, frame, LegacyResponseKind::Transactions)
+                return self.validate_available_chunk(
+                    request_id,
+                    &frame,
+                    LegacyResponseKind::Transactions,
+                );
             }
             LEGACY_RESPONSE_MISSING_BLOCKS => {
                 self.validate_missing(request_id, &frame.payload, LegacyResponseKind::Blocks)
@@ -6946,7 +6958,8 @@ impl LegacyResponseReadState {
             message_type => Err(OutboundRequestError::Fatal(
                 format!("unknown legacy response message type: {message_type}").into(),
             )),
-        }
+        }?;
+        Ok(Some(LegacyResponseItem::Frame(frame)))
     }
 
     /// Checks the response once its stream has ended.
@@ -6974,7 +6987,7 @@ impl LegacyResponseReadState {
         request_id: u64,
         frame: &Frame,
         kind: LegacyResponseKind,
-    ) -> Result<(), OutboundRequestError> {
+    ) -> Result<Option<LegacyResponseItem>, OutboundRequestError> {
         if self.budget.kind != kind {
             return Err(OutboundRequestError::Fatal(
                 "legacy response kind does not match request".into(),
@@ -7010,26 +7023,27 @@ impl LegacyResponseReadState {
         self.active_chunk.extend_from_slice(bytes);
 
         if is_last {
-            self.validate_completed_item(kind)?;
+            let item = self.decode_completed_item(kind)?;
             self.active_chunk_type = None;
             self.active_chunk.clear();
             self.add_items(1)?;
+            Ok(Some(item))
+        } else {
+            Ok(None)
         }
-
-        Ok(())
     }
 
-    fn validate_completed_item(
+    fn decode_completed_item(
         &self,
         kind: LegacyResponseKind,
-    ) -> Result<(), OutboundRequestError> {
+    ) -> Result<LegacyResponseItem, OutboundRequestError> {
         let mut remaining = self.active_chunk.as_slice();
-        match kind {
-            LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
-            }
+        let item = match kind {
+            LegacyResponseKind::Blocks => Block::zcash_deserialize_from_slice(&mut remaining)
+                .map(|block| LegacyResponseItem::Block(Arc::new(block))),
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
+                Transaction::zcash_deserialize_from_slice(&mut remaining)
+                    .map(|transaction| LegacyResponseItem::Transaction(transaction.into()))
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
@@ -7044,7 +7058,7 @@ impl LegacyResponseReadState {
                 "legacy response item has trailing bytes".into(),
             ));
         }
-        Ok(())
+        Ok(item)
     }
 
     fn validate_missing(
@@ -7722,7 +7736,10 @@ mod tests {
     use crate::{
         protocol::internal::{InventoryResponse, Response},
         zakura::{
-            legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
+            legacy_gossip::{
+                LegacyGossipError, LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec,
+                RequestedInventory,
+            },
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits,
             LOCAL_MAX_CONTROL_FRAME_BYTES, LOCAL_MAX_MESSAGE_BYTES, MAX_BS_FRAME_BYTES,
@@ -11520,7 +11537,7 @@ mod tests {
                 legacy
                     .validate_frame(
                         1,
-                        &Frame {
+                        Frame {
                             message_type: LEGACY_RESPONSE_PONG,
                             flags: 0,
                             payload: 1u64.to_le_bytes().to_vec(),
@@ -12473,6 +12490,137 @@ mod tests {
         Ok(())
     }
 
+    /// Completed chunks hand their decoded allocation to the response codec,
+    /// while requested-inventory binding still runs at response assembly.
+    #[test]
+    fn legacy_transport_reuses_decoded_inventory() -> Result<(), BoxError> {
+        use zakura_node_services::block_memory::BlockHandle;
+
+        let limits = test_connection_limits();
+        let request_id = 99;
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let transaction = transaction::UnminedTx::from(block.transactions[0].clone());
+        let missing_hash = block_hash(99);
+        let missing_id = legacy_tx_id(99);
+        let cases = [
+            (
+                LegacyRequestFrame::BlocksByHash(vec![block.hash(), missing_hash]),
+                LegacyRequestKind::Blocks,
+                Response::Blocks(vec![
+                    InventoryResponse::Available((block.clone().into(), None)),
+                    InventoryResponse::Missing(missing_hash),
+                ]),
+                RequestedInventory::Blocks([block.hash(), missing_hash].into_iter().collect()),
+            ),
+            (
+                LegacyRequestFrame::TransactionsById(vec![transaction.id(), missing_id]),
+                LegacyRequestKind::Transactions,
+                Response::Transactions(vec![
+                    InventoryResponse::Available((transaction.clone(), None)),
+                    InventoryResponse::Missing(missing_id),
+                ]),
+                RequestedInventory::Transactions(
+                    [transaction.id(), missing_id].into_iter().collect(),
+                ),
+            ),
+        ];
+
+        for (request, kind, response, requested) in cases {
+            let request = request.encode_frame()?;
+            let budget =
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let item_bytes = match kind {
+                LegacyRequestKind::Blocks => BLOCK_TESTNET_141042_BYTES.len(),
+                LegacyRequestKind::Transactions => transaction.size(),
+                _ => unreachable!("the cases only fetch inventory"),
+            };
+            let frame_cap = u32::try_from(
+                FRAME_HEADER_BYTES + LEGACY_RESPONSE_CHUNK_HEADER_BYTES + item_bytes.div_ceil(2),
+            )?;
+            let frames = LegacyResponseCodec::encode_response(
+                request_id,
+                response.clone(),
+                frame_cap,
+                limits.max_message_bytes,
+            )?;
+            assert!(frames.len() > 2, "the available item spans multiple chunks");
+            let mut state = LegacyResponseReadState::new(budget);
+            let mut items = Vec::new();
+            for frame in frames {
+                if let Some(item) = state
+                    .validate_frame(request_id, frame)
+                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?
+                {
+                    items.push(item);
+                }
+            }
+            state
+                .finish()
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            assert_eq!(
+                items.len(),
+                2,
+                "raw chunks are replaced by one decoded item"
+            );
+
+            let decoded = match &items[0] {
+                LegacyResponseItem::Block(block) => LegacyResponseItem::Block(block.clone()),
+                LegacyResponseItem::Transaction(transaction) => {
+                    LegacyResponseItem::Transaction(transaction.clone())
+                }
+                LegacyResponseItem::Frame(_) => panic!("the reader decoded the available item"),
+            };
+            let unrelated = match kind {
+                LegacyRequestKind::Blocks => RequestedInventory::Blocks(Default::default()),
+                LegacyRequestKind::Transactions => {
+                    RequestedInventory::Transactions(Default::default())
+                }
+                _ => unreachable!("the cases only fetch inventory"),
+            };
+            assert!(matches!(
+                LegacyResponseCodec::decode_response(request_id, kind, [decoded], Some(&unrelated),),
+                Err(LegacyGossipError::UnsolicitedBlock(_)
+                    | LegacyGossipError::UnsolicitedTransaction(_))
+            ));
+
+            // Keep a handle only to verify that assembly reuses the allocation.
+            let (decoded_block, decoded_transaction) = match &items[0] {
+                LegacyResponseItem::Block(block) => (Some(block.clone()), None),
+                LegacyResponseItem::Transaction(transaction) => {
+                    (None, Some(transaction.transaction().clone()))
+                }
+                LegacyResponseItem::Frame(_) => unreachable!("the item is decoded"),
+            };
+            let assembled =
+                LegacyResponseCodec::decode_response(request_id, kind, items, Some(&requested))?;
+            assert_eq!(assembled, response);
+            match assembled {
+                Response::Blocks(blocks) => {
+                    let InventoryResponse::Available((BlockHandle::Shared(block), None)) =
+                        &blocks[0]
+                    else {
+                        panic!("the available block remains shared");
+                    };
+                    assert!(Arc::ptr_eq(block, &decoded_block.unwrap()));
+                }
+                Response::Transactions(transactions) => {
+                    let InventoryResponse::Available((transaction, None)) = &transactions[0] else {
+                        panic!("the first transaction is available");
+                    };
+                    assert!(Arc::ptr_eq(
+                        transaction.transaction(),
+                        &decoded_transaction.unwrap(),
+                    ));
+                }
+                _ => unreachable!("the cases only fetch inventory"),
+            }
+        }
+        Ok(())
+    }
+
     /// A block response whose stream ends mid-item is request-local, but a list
     /// frame interleaved into the unfinished item stays connection-fatal.
     #[test]
@@ -12498,7 +12646,7 @@ mod tests {
 
         let mut ended = state();
         ended
-            .validate_frame(request_id, &first_chunk)
+            .validate_frame(request_id, first_chunk.clone())
             .expect("a non-final chunk is accepted");
         let finished = ended.finish();
         assert!(
@@ -12508,7 +12656,7 @@ mod tests {
 
         let mut interleaved = state();
         interleaved
-            .validate_frame(request_id, &first_chunk)
+            .validate_frame(request_id, first_chunk.clone())
             .expect("a non-final chunk is accepted");
         let mut missing = request_id.to_le_bytes().to_vec();
         missing.push(0);
@@ -12517,7 +12665,7 @@ mod tests {
             flags: 0,
             payload: missing,
         };
-        let result = interleaved.validate_frame(request_id, &missing);
+        let result = interleaved.validate_frame(request_id, missing.clone());
         assert!(
             matches!(result, Err(OutboundRequestError::Fatal(_))),
             "a frame interleaved into an unfinished item must stay Fatal; got {result:?}"
@@ -12554,47 +12702,57 @@ mod tests {
                 }),
             );
             if remaining != 0 {
-                state.validate_frame(1, &frame).unwrap();
+                state.validate_frame(1, frame.clone()).unwrap();
             }
         }
     }
 
-    /// F-37: the transport-level check rejects a valid transaction padded with
-    /// junk bytes as a fatal peer fault.
+    /// The reader rejects trailing bytes before handing off decoded inventory.
     #[test]
     fn legacy_completed_item_rejects_trailing_bytes() -> Result<(), BoxError> {
         let limits = test_connection_limits();
         let request_id = 99;
         let transaction = transaction::UnminedTx::from(empty_v5_transaction(24));
-        let request_frame =
-            LegacyRequestFrame::TransactionsById(vec![transaction.id()]).encode_frame()?;
-        let budget = LegacyResponseBudget::from_request(
-            request_frame.message_type,
-            &request_frame.payload,
-            limits,
-        )
-        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
-        let mut frames = LegacyResponseCodec::encode_response(
-            request_id,
-            Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
-            limits.max_frame_bytes,
-            limits.max_message_bytes,
-        )?;
-        let [frame] = frames.as_mut_slice() else {
-            panic!("a small transaction encodes as one frame");
-        };
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        )?);
+        let cases = [
+            (
+                LegacyRequestFrame::TransactionsById(vec![transaction.id()]),
+                Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
+            ),
+            (
+                LegacyRequestFrame::BlocksByHash(vec![block.hash()]),
+                Response::Blocks(vec![InventoryResponse::Available((block.into(), None))]),
+            ),
+        ];
+        for (request, response) in cases {
+            let request = request.encode_frame()?;
+            let budget =
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let mut frames = LegacyResponseCodec::encode_response(
+                request_id,
+                response,
+                limits.max_frame_bytes,
+                limits.max_message_bytes,
+            )?;
+            let [frame] = frames.as_mut_slice() else {
+                panic!("a small inventory item encodes as one frame");
+            };
 
-        let mut state = LegacyResponseReadState::new(budget);
-        state
-            .validate_frame(request_id, frame)
-            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let mut state = LegacyResponseReadState::new(budget);
+            state
+                .validate_frame(request_id, frame.clone())
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
 
-        frame.payload.extend_from_slice(&[0; 16]);
-        let mut state = LegacyResponseReadState::new(budget);
-        assert!(matches!(
-            state.validate_frame(request_id, frame),
-            Err(OutboundRequestError::Fatal(_)),
-        ));
+            frame.payload.extend_from_slice(&[0; 16]);
+            let mut state = LegacyResponseReadState::new(budget);
+            assert!(matches!(
+                state.validate_frame(request_id, frame.clone()),
+                Err(OutboundRequestError::Fatal(_)),
+            ));
+        }
 
         Ok(())
     }
@@ -12619,9 +12777,11 @@ mod tests {
             limits.max_frame_bytes,
             limits.max_message_bytes,
         )?;
-        LegacyResponseCodec::decode_response(request_id, request_kind, frames.clone(), None)?;
+        let expected =
+            LegacyResponseCodec::decode_response(request_id, request_kind, frames.clone(), None)?;
 
         let mut state = LegacyResponseReadState::new(budget);
+        let mut items = Vec::new();
         for frame in &frames {
             FrameFilter::new(None, InboundReader::Requester)
                 .with_precheck(Some(&state))
@@ -12631,13 +12791,20 @@ mod tests {
                     frame.payload.len(),
                     usize::MAX,
                 )?;
-            state
-                .validate_frame(request_id, frame)
-                .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            if let Some(item) = state
+                .validate_frame(request_id, frame.clone())
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?
+            {
+                items.push(item);
+            }
         }
         state
             .finish()
             .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        assert_eq!(
+            LegacyResponseCodec::decode_response(request_id, request_kind, items, None)?,
+            expected,
+        );
 
         Ok(())
     }
@@ -12908,7 +13075,7 @@ mod tests {
                     .expect("a FindBlocks request has a known response kind"),
             );
 
-            let result = state.validate_frame(request_id, &frame);
+            let result = state.validate_frame(request_id, frame.clone());
             if fatal {
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
@@ -12934,7 +13101,7 @@ mod tests {
             LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
                 .expect("a FindBlocks request has a known response kind"),
         );
-        let result = state.validate_frame(request_id, &frame);
+        let result = state.validate_frame(request_id, frame.clone());
         assert!(
             matches!(result, Err(OutboundRequestError::Fatal(_))),
             "a repeated hash must be Fatal; got {result:?}"
@@ -12979,8 +13146,8 @@ mod tests {
 
             let mut lone = LegacyResponseReadState::new(budget());
             let result = lone
-                .validate_frame(request_id, &nil(request_id))
-                .and_then(|()| lone.finish());
+                .validate_frame(request_id, nil(request_id))
+                .and_then(|_| lone.finish());
             if fatal {
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
@@ -12994,7 +13161,7 @@ mod tests {
             }
 
             let wrong_id = LegacyResponseReadState::new(budget())
-                .validate_frame(request_id, &nil(request_id + 1));
+                .validate_frame(request_id, nil(request_id + 1));
             assert!(
                 matches!(wrong_id, Err(OutboundRequestError::Fatal(_))),
                 "a wrong-id NIL to {request:?} must stay Fatal; got {wrong_id:?}",
@@ -13015,9 +13182,9 @@ mod tests {
 
                 let mut after_items = LegacyResponseReadState::new(budget());
                 after_items
-                    .validate_frame(request_id, &missing())
+                    .validate_frame(request_id, missing())
                     .expect("a missing entry is accepted");
-                let result = after_items.validate_frame(request_id, &nil(request_id));
+                let result = after_items.validate_frame(request_id, nil(request_id));
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
                     "NIL after inventory frames must stay Fatal; got {result:?}",
@@ -13025,9 +13192,9 @@ mod tests {
 
                 let mut before_items = LegacyResponseReadState::new(budget());
                 before_items
-                    .validate_frame(request_id, &nil(request_id))
+                    .validate_frame(request_id, nil(request_id))
                     .expect("a first NIL is held until the stream ends");
-                let result = before_items.validate_frame(request_id, &missing());
+                let result = before_items.validate_frame(request_id, missing());
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
                     "inventory frames after NIL must stay Fatal; got {result:?}",

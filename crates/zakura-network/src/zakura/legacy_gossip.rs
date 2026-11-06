@@ -2507,8 +2507,8 @@ impl ZakuraRequestClient {
                         error.to_string(),
                     )
                 });
-                // Match the transport's `Fatal` handling, so source-attributed
-                // retries cannot pick the same misbehaving peer again.
+                // Retain the ban so source-attributed retries cannot select
+                // this identity again after it reconnects.
                 if error.is_peer_fault() {
                     self.supervisor.ban_peer(handle.peer_id()).await;
                 }
@@ -3491,11 +3491,11 @@ pub enum LegacyGossipError {
 }
 
 impl LegacyGossipError {
-    /// Returns true if this error, from decoding a peer's response, proves the
-    /// peer violated the protocol, so its connection should be closed.
+    /// Returns true if decoding a peer's message proves a protocol violation
+    /// that warrants banning its authenticated identity.
     ///
-    /// The transport already rejects the structural variants as `Fatal` before
-    /// decoding; the live addition here is requested-item binding
+    /// The response transport rejects structural violations before this check;
+    /// response assembly also checks requested-item binding
     /// (`UnsolicitedBlock`, `UnsolicitedTransaction`). Missing or unexpected
     /// responses are not faults on their own: the caller falls back to another
     /// peer.

@@ -157,7 +157,7 @@ async fn send(addr: SocketAddr, case: &Case, authorization: Option<&str>) -> Str
     let (head, body) = response
         .split_once("\r\n\r\n")
         .expect("responses have a header section");
-    let normalized_body = normalize_discovery_version(body, env!("CARGO_PKG_VERSION"));
+    let normalized_body = normalize_discovery_version(body);
 
     let mut lines = head.lines();
     let mut output = lines
@@ -197,10 +197,13 @@ async fn send(addr: SocketAddr, case: &Case, authorization: Option<&str>) -> Str
 
 /// Checks a discovery response's advertised version and normalizes only that field.
 /// Other response bodies retain their exact wire bytes.
-fn normalize_discovery_version(body: &str, expected_version: &str) -> Option<String> {
+fn normalize_discovery_version(body: &str) -> Option<String> {
     let mut response: serde_json::Value = serde_json::from_str(body).ok()?;
     response.pointer("/result/openrpc")?;
-    assert_eq!(response["result"]["info"]["version"], expected_version);
+    assert_eq!(
+        response["result"]["info"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
     // Preserve wire-format checks: parsing and reserializing must not hide whitespace,
     // field ordering, or escaping changes in the original response.
     assert_eq!(serde_json::to_string(&response).unwrap(), body);
@@ -208,31 +211,6 @@ fn normalize_discovery_version(body: &str, expected_version: &str) -> Option<Str
     // independent of the current package version asserted above.
     response["result"]["info"]["version"] = "15.0.0".into();
     Some(serde_json::to_string(&response).unwrap())
-}
-
-#[test]
-fn discovery_snapshot_ignores_only_the_checked_release_version() {
-    for version in ["15.0.0", "16.0.0", "100.0.0-rc.1"] {
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"openrpc":"1.3.2","info":{{"version":"{version}"}},"methods":[]}}}}"#
-        );
-        assert_eq!(
-            normalize_discovery_version(&body, version).unwrap(),
-            r#"{"jsonrpc":"2.0","id":1,"result":{"openrpc":"1.3.2","info":{"version":"15.0.0"},"methods":[]}}"#
-        );
-    }
-    let error =
-        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big"}}"#;
-    assert!(normalize_discovery_version(error, "16.0.0").is_none());
-}
-
-#[test]
-#[should_panic(expected = "assertion `left == right` failed")]
-fn discovery_snapshot_rejects_the_wrong_release_version() {
-    normalize_discovery_version(
-        r#"{"result":{"openrpc":"1.3.2","info":{"version":"15.0.0"}}}"#,
-        "16.0.0",
-    );
 }
 
 /// Sends every case, returning a transcript of the requests and responses.

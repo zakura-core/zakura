@@ -79,6 +79,14 @@ impl RoundEvidence {
             .copied()
     }
 
+    /// Every drain's rounds so far, in order.
+    pub fn rows(&self) -> Vec<Rounds> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Whether any drain found a released round.
     pub fn any_released(&self) -> bool {
         self.0

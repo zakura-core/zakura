@@ -551,8 +551,9 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
-    /// also kept in `reservations`, and its resource probe read, checked and
-    /// kept in `capacity`.
+    /// also kept in `reservations`, its resource probe read, checked and
+    /// kept in `capacity`, and its released rounds at each drain kept in
+    /// `rounds`.
     ///
     /// # Panics
     ///
@@ -564,8 +565,16 @@ impl ReactorTap {
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
         capacity: CapacityEvidence,
+        rounds: RoundEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
-        ReactorTap::tapped(sim, port, node, sessions, reservations, Some(capacity))
+        ReactorTap::tapped(
+            sim,
+            port,
+            node,
+            sessions,
+            reservations,
+            (Some(capacity), rounds),
+        )
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
@@ -587,7 +596,7 @@ impl ReactorTap {
             node,
             sessions,
             ReservationEvidence::default(),
-            None,
+            (None, RoundEvidence::default()),
         )
     }
 
@@ -598,7 +607,7 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
-        capacity: Option<CapacityEvidence>,
+        (capacity, rounds): (Option<CapacityEvidence>, RoundEvidence),
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
@@ -635,7 +644,7 @@ impl ReactorTap {
                 off_reactor: Mutex::default(),
                 cooldowns,
                 claims: ClaimEvidence::default(),
-                rounds: RoundEvidence::default(),
+                rounds,
             }))
         });
         let state = observer.0.clone();
@@ -705,12 +714,6 @@ impl ReactorTap {
     /// they happen.
     pub fn claims(&self) -> ClaimEvidence {
         self.state.claims.clone()
-    }
-
-    /// The node's released rounds at each drain, which the tap fills as it
-    /// drains.
-    pub fn rounds(&self) -> RoundEvidence {
-        self.state.rounds.clone()
     }
 
     /// The notice the harness gives this tap when it stops the reactor.

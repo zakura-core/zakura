@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 23aa7421dd..056970a386 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -3048,7 +3048,7 @@ impl HeaderSyncReactor {
+                 .into(),
+             );
+         });
+-        if owner.is_some() {
++        if faulted.is_some() {
+             let now = Instant::now();
+             #[cfg(any(test, zakura_sim))]
+             let installed = self.state.cooldowns_installed;

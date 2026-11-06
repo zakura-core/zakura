@@ -1,5 +1,8 @@
 use super::*;
-use crate::zakura::transport::FramedRecv;
+use crate::zakura::{
+    header_sync::HeaderSyncService, transport::FramedRecv, Service, ServicePeerDirection,
+    SessionDemand, ZAKURA_CAP_HEADER_SYNC,
+};
 use tokio::time;
 
 /// One admitted header-sync session with the state needed to drive it unproductive.
@@ -12,7 +15,7 @@ struct EvictionFixture {
     /// Kept alive so the session's outbound queue never fails for want of a reader.
     _outbound: FramedRecv,
     _snapshots_tx: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
-    _handle: HeaderSyncHandle,
+    handle: HeaderSyncHandle,
 }
 
 fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> EvictionFixture {
@@ -42,7 +45,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
         cancel,
         _outbound: outbound,
         _snapshots_tx: snapshots_tx,
-        _handle: handle,
+        handle,
     }
 }
 
@@ -411,6 +414,52 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
         fixture.unproductive_requests(),
         Some(0),
         "a readmitted peer starts from a clean count"
+    );
+}
+
+/// A peer that redials late in its cooldown is re-offered when the cooldown
+/// ends, not one fixed back-off after its redial. Maintenance wakes at the
+/// cooldown's end and republishes it, which wakes the header service's demand.
+#[tokio::test(start_paused = true)]
+async fn a_redial_late_in_the_cooldown_reopens_when_it_ends() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = std::time::Duration::from_secs(15);
+    let second = std::time::Duration::from_secs(1);
+    fixture.reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let ends = Instant::now() + cooldown;
+    fixture.time_out_one_request(7);
+    assert!(!fixture.is_admitted());
+
+    time::advance(cooldown - second).await;
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = || {
+        service.session_demand(
+            1,
+            &fixture.peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    let SessionDemand::WaitForChange(mut reopen) = demand() else {
+        panic!("the service waits for the reactor to end the cooldown");
+    };
+    assert!(futures::poll!(&mut reopen).is_pending());
+    assert_eq!(
+        fixture.reactor.next_maintenance_deadline(),
+        ends,
+        "maintenance wakes when the cooldown ends"
+    );
+
+    time::advance(second).await;
+    fixture.reactor.refresh_statuses();
+    assert!(
+        futures::poll!(&mut reopen).is_ready(),
+        "republishing the cooldown's end wakes the parked demand"
+    );
+    assert!(matches!(demand(), SessionDemand::OpenNow));
+    assert!(
+        fixture.reactor.next_maintenance_deadline() > Instant::now(),
+        "a pruned cooldown doesn't wake maintenance again"
     );
 }
 

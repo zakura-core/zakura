@@ -2,7 +2,11 @@
 //! and trigger histories that read the view.
 #![cfg(zakura_sim)]
 
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use zakura_rt::{sync::Mutex, task, time};
@@ -10,9 +14,9 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{run_harness, Subsystem},
     property::{
-        CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation, ObligationKey, Property,
-        PropertyId, Registry, RegistryError, Source, Sources, Status, Subject, TriggerHistory,
-        Verdict,
+        Capture, CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation, ObligationKey,
+        Property, PropertyId, Registry, RegistryError, Source, Sources, Status, Subject,
+        TriggerHistory, Verdict,
     },
     witness::{judge_report, witness, Expect, WitnessError, WitnessScenario},
     MemorySink, ObservationLog, Plan, PropertyOutcome, RunConfig, RunReport, Sim,
@@ -47,6 +51,17 @@ enum Act {
     Sleep(u64),
     /// Takes a lock, a preemption point inside the poll.
     Point,
+    /// Breaks the harness's evidence in this way.
+    Break(Broken),
+}
+
+/// How a harness's evidence breaks. Either way, its view panics if read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Broken {
+    /// Its stamps go backward.
+    Stamps,
+    /// It loses its snapshot.
+    Snapshot,
 }
 
 /// The task's acts, the run's live step budget and its drain bound.
@@ -60,18 +75,40 @@ struct Script {
 /// One task that records stamped facts, as a tap records owner facts.
 struct Stamped {
     facts: Rc<RefCell<Facts>>,
+    broken: Rc<Cell<Option<Broken>>>,
 }
 
 impl HasView for Stamped {
     type View = Facts;
 
     /// Every fact so far, with its stamp.
+    ///
+    /// # Panics
+    ///
+    /// Once the evidence broke.
     fn view(&self) -> Self::View {
+        assert_eq!(
+            self.broken.get(),
+            None,
+            "the view is unusable once its evidence broke"
+        );
         self.facts.borrow().clone()
     }
 
-    /// The stamps after `after`.
+    /// Live, until the snapshot is lost.
+    fn captured(&self) -> Capture {
+        match self.broken.get() {
+            Some(Broken::Snapshot) => Capture::Missing,
+            _ => Capture::Live,
+        }
+    }
+
+    /// The stamps after `after`, or a stamp that goes backward once the
+    /// stamps broke.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        if self.broken.get() == Some(Broken::Stamps) {
+            return Some(vec![0]);
+        }
         Some(
             self.facts
                 .borrow()
@@ -113,6 +150,8 @@ impl Subsystem for Stamped {
         let task_facts = Rc::clone(&facts);
         let acts = script.acts.clone();
         let lock = Mutex::new(());
+        let broken = Rc::new(Cell::new(None));
+        let task_broken = Rc::clone(&broken);
         sim.scheduler().spawn_root("stamper", async move {
             for act in acts {
                 match act {
@@ -125,10 +164,11 @@ impl Subsystem for Stamped {
                     Act::Yield => task::yield_now().await,
                     Act::Sleep(ms) => time::sleep(Duration::from_millis(ms)).await,
                     Act::Point => drop(lock.lock().expect("no task panics holding it")),
+                    Act::Break(how) => task_broken.set(Some(how)),
                 }
             }
         });
-        Stamped { facts }
+        Stamped { facts, broken }
     }
 
     fn sources() -> Sources {
@@ -466,6 +506,27 @@ fn a_trigger_only_shutdown_reaches_is_lost() {
         witness(cut, SERVED, Expect::Holds),
         Err(WitnessError::LostTriggerHistory)
     );
+}
+
+/// A run that ends at a harness failure fails its witness as `HarnessEnd`
+/// without reading the view, which may be unusable then: after stamps that
+/// go backward, and after the snapshot is lost.
+#[test]
+fn a_failed_run_never_reads_its_view() {
+    for (how, failure) in [
+        (Broken::Stamps, "StampsOutOfOrder"),
+        (Broken::Snapshot, "has no snapshot"),
+    ] {
+        let result = witness(
+            scenario(&[Fact(Wait), Yield, Act::Break(how), Yield]),
+            SERVED,
+            Expect::Holds,
+        );
+        assert!(
+            matches!(&result, Err(WitnessError::HarnessEnd(detail)) if detail.contains(failure)),
+            "{how:?}: {result:?}"
+        );
+    }
 }
 
 /// A report alone can't judge a trigger history that reads the view.

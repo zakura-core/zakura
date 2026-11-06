@@ -15,7 +15,7 @@ use crate::{
     harness::{self, run_reading, HarnessError, Subsystem},
     property::{HasView, Status, TriggerHistory},
     record::Record,
-    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, RecordSink, RunReport,
+    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, RecordSink, RunEnd, RunReport,
 };
 
 /// What a witness test expects of its property.
@@ -93,7 +93,8 @@ pub enum WitnessError {
     /// history.
     LostTriggerHistory,
     /// The property's trigger history reads the harness's view, and the
-    /// judge has only the run's report.
+    /// judge has no view showing the run's end, as when it has only the
+    /// run's report.
     NoView,
     /// A reduction reached a different machine failure.
     ChangedFailure,
@@ -126,7 +127,7 @@ impl fmt::Display for WitnessError {
                 f.write_str("witness test lost its trigger history")
             }
             WitnessError::NoView => {
-                f.write_str("the trigger history reads the view, which a report doesn't keep")
+                f.write_str("the trigger history reads the view, and no view shows the run's end")
             }
             WitnessError::Fixed { issue } => write!(
                 f,
@@ -197,9 +198,14 @@ pub fn witness_prepared<S: Subsystem>(
     let registered = Registered::<S>::of(property, expect)?;
     let mut sink = EndSeen { sink, ended: false };
     // A view trigger is judged before shutdown, which can still change the
-    // view.
-    let read = |harness: &S, log: &ObservationLog| match registered.trigger_history {
-        Some(TriggerHistory::View(history)) => Some(history(&harness.view(), log)),
+    // view, and only on a view that shows the run's end. A run that failed
+    // fails the test before its trigger counts.
+    let read = |harness: &S, end: &RunEnd, log: &ObservationLog| match registered.trigger_history {
+        Some(TriggerHistory::View(history))
+            if end.outcome != Outcome::Harness && harness.captured().fresh_at(end.steps) =>
+        {
+            Some(history(&harness.view(), log))
+        }
         _ => None,
     };
     let (report, viewed) =

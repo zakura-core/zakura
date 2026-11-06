@@ -190,12 +190,12 @@ pub fn run_prepared<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
-    let (report, ()) = run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_, _| ())?;
+    let (report, ()) = run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_, _, _| ())?;
     Ok(report)
 }
 
-/// [`run_prepared`], also returning what `read` takes from the harness and
-/// the final log at the run's end, after the checkers report and before the
+/// [`run_prepared`], also returning what `read` takes from the harness, the
+/// run's end and its final log, after the checkers report and before the
 /// scheduler shuts down, since shutdown can resume suspended tasks.
 pub(crate) fn run_reading<S: Subsystem, T>(
     scenario: &S::Scenario,
@@ -203,7 +203,7 @@ pub(crate) fn run_reading<S: Subsystem, T>(
     input: PlanInput,
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
-    read: impl FnOnce(&S, &ObservationLog) -> T,
+    read: impl FnOnce(&S, &RunEnd, &ObservationLog) -> T,
 ) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
@@ -222,7 +222,7 @@ pub(crate) fn run_reading<S: Subsystem, T>(
     };
     let mut ending = Ending {
         inner,
-        read: Some(|log: &ObservationLog| read(&this, log)),
+        read: Some(|end: &RunEnd, log: &ObservationLog| read(&this, end, log)),
         read_out: None,
     };
     let report = sim.run(&mut ending, sink);
@@ -633,24 +633,24 @@ pub struct LinkEntry {
     pub model: LinkSpec,
 }
 
-/// A borrowed checker that also runs `read` on the final log once it has
-/// reported its end, and keeps the result.
+/// A borrowed checker that also runs `read` on the run's end and final log
+/// once it has reported, and keeps the result.
 struct Ending<'a, F, T> {
     inner: &'a mut dyn Checker,
     read: Option<F>,
     read_out: Option<T>,
 }
 
-impl<F: FnOnce(&ObservationLog) -> T, T> Checker for Ending<'_, F, T> {
+impl<F: FnOnce(&RunEnd, &ObservationLog) -> T, T> Checker for Ending<'_, F, T> {
     /// Forwards to the checker.
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         self.inner.after_step(cx)
     }
 
-    /// Forwards to the checker, then runs `read` on `log`.
+    /// Forwards to the checker, then runs `read`.
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         let reports = self.inner.at_end(end, log);
-        self.read_out = self.read.take().map(|read| read(log));
+        self.read_out = self.read.take().map(|read| read(end, log));
         reports
     }
 

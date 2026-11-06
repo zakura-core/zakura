@@ -11,6 +11,53 @@ independently.
 
 ## [Unreleased]
 
+## [1.8.4] - 2026-11-05
+
+### Changed
+
+- Verifying a block computes each v5 and v6 transaction's ID and authorizing-data
+  digest once, and reuses them for transaction verification and the block's
+  authorizing-data commitment check, instead of recomputing the digests
+  ([#2022](https://github.com/zakura-core/zakura/pull/2022)).
+- Reduced block and transaction-expiry cleanup work by removing known mempool
+  transaction IDs without rescanning the pool
+  ([#2048](https://github.com/zakura-core/zakura/pull/2048)).
+- Raised the minimum fee recommendation from `getstandardfee` to 1,000
+  zatoshis per logical action
+  ([#2060](https://github.com/zakura-core/zakura/pull/2060)).
+- Classify the compatible performance improvements and fee recommendation
+  increase as a patch node release; library crates retain their independent
+  version requirements ([#2074](https://github.com/zakura-core/zakura/pull/2074)).
+
+<!-- release-readiness: allow-patch; reason: The v1.8.4 Changed entries are compatible performance improvements in #2022 and #2048 and a higher getstandardfee recommendation in #2060 that preserves the RPC shape and the mempool acceptance fee. Library crates retain their independently required SemVer bumps. -->
+
+### Fixed
+
+- Fixed header sync re-requesting a VCT repair target from a peer that refused
+  it before that peer advertised a new status, and capped such refusals at
+  three per peer per repair episode. A peer's repair failures now survive its
+  session being replaced, and hold for one readmission cooldown after it
+  disconnects ([#2000](https://github.com/zakura-core/zakura/pull/2000)).
+- Fixed block sync giving a peer a fresh Status allowance each time it reopened
+  the block-sync stream. The connection now keeps its Status pacing across
+  stream replacements
+  ([#2012](https://github.com/zakura-core/zakura/pull/2012)).
+- Fixed block sync advertising free download slots for a peer whose outbound
+  queue was full
+  ([#2012](https://github.com/zakura-core/zakura/pull/2012)).
+- Fixed native discovery authoring an older self-record after a backward clock
+  step across a restart, which left peers dialing the node's previous addresses
+  until the old record expired. The node now stores its last authored sequence
+  beside its identity key, in
+  `<identity_dir>/<network>.<node_id>.zakura-discovery-sequence`
+  ([#2013](https://github.com/zakura-core/zakura/pull/2013)).
+- Fixed a native P2P peer being able to stall its connection for up to 10
+  seconds by withholding stream credit while the node reopened one of its
+  service sessions. The reopen now runs beside the connection's other work and
+  reserves the service only once its streams are open. The connection's first
+  session opens also end at once when the node closes the connection
+  ([#2014](https://github.com/zakura-core/zakura/pull/2014)).
+
 ## [1.8.3] - 2026-11-05
 
 ### Added

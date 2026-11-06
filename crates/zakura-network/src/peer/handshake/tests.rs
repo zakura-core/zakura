@@ -693,7 +693,8 @@ async fn initiator_upgrade_disconnects_on_malformed_prelude() {
 
 /// The legacy handshake runs the initiator upgrade inside `HANDSHAKE_TIMEOUT`,
 /// which is shorter than the native registration wait. When that timeout drops
-/// the upgrade, the maintained native dial the upgrade started must stop too.
+/// the upgrade, the maintained native dial the upgrade started must stop too,
+/// once its in-flight attempt ends.
 /// Otherwise a legacy responder that advertises an unreachable Zakura address
 /// leaks one redialing task per upgrade.
 ///
@@ -764,11 +765,15 @@ async fn timed_out_initiator_upgrade_does_not_leak_upgrade_dial() {
         initiator.is_err(),
         "the upgrade must outlast the handshake timeout, so the timeout drops it",
     );
-    assert_eq!(
-        initiator_endpoint.upgrade_dial_count(),
-        0,
-        "a timed-out legacy upgrade leaked its maintained native dial",
-    );
+    // The cancelled dial starts no new attempt, so it ends with its
+    // in-flight one.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while initiator_endpoint.upgrade_dial_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a timed-out legacy upgrade leaked its maintained native dial");
 
     initiator_endpoint.shutdown().await;
 }

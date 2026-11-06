@@ -39,6 +39,7 @@ use crate::{
         DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
+        LEGACY_DEFAULT_ADVERT_WINDOW_MAX, LEGACY_DEFAULT_ADVERT_WINDOW_MIN,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
@@ -365,6 +366,9 @@ pub struct Config {
     /// to `advert_window_small_size_bytes`.
     /// Concurrent uploads share one uplink, so a large block goes to fewer peers at a time.
     /// Set `advert_window_min` and `advert_window_max` to the same value for a fixed window.
+    ///
+    /// The previous defaults, 32 here and 64 for `advert_window_max`, are read as unset, so config
+    /// files generated before the defaults changed get the current ones.
     ///
     /// Configured block gossip sidecars are always advertised first, outside this window.
     ///
@@ -1380,6 +1384,8 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        let (advert_window_min, advert_window_max) =
+            upgrade_legacy_advert_windows(advert_window_min, advert_window_max);
         validate_advert_fanout(
             advert_window_min,
             advert_window_max,
@@ -1534,6 +1540,30 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_full_size_bytes,
         })
     }
+}
+
+/// Replaces advert windows left at their previous defaults with the current defaults.
+///
+/// Config files written by `zakurad generate` before the defaults changed hold
+/// [`LEGACY_DEFAULT_ADVERT_WINDOW_MIN`] and [`LEGACY_DEFAULT_ADVERT_WINDOW_MAX`], so those values
+/// are read as unset. Any other value is kept. A replaced value is limited by the other bound when
+/// that one was configured, so `advert_window_min <= advert_window_max` still holds. For example,
+/// a legacy minimum with a configured maximum of 200 becomes 200, not the default.
+fn upgrade_legacy_advert_windows(
+    advert_window_min: usize,
+    advert_window_max: usize,
+) -> (usize, usize) {
+    let max = if advert_window_max == LEGACY_DEFAULT_ADVERT_WINDOW_MAX {
+        DEFAULT_ADVERT_WINDOW_MAX.max(advert_window_min)
+    } else {
+        advert_window_max
+    };
+    let min = if advert_window_min == LEGACY_DEFAULT_ADVERT_WINDOW_MIN {
+        DEFAULT_ADVERT_WINDOW_MIN.min(max)
+    } else {
+        advert_window_min
+    };
+    (min, max)
 }
 
 /// Checks the block advert fan-out settings.

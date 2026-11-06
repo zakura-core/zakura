@@ -95,6 +95,16 @@ pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 1000;
 /// This will be used as `Config.advert_window_max` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 1000;
 
+/// The `advert_window_min` default before it became [`DEFAULT_ADVERT_WINDOW_MIN`].
+///
+/// `zakurad generate` wrote it into config files, so a loaded config treats it as unset.
+pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
+
+/// The `advert_window_max` default before it became [`DEFAULT_ADVERT_WINDOW_MAX`].
+///
+/// `zakurad generate` wrote it into config files, so a loaded config treats it as unset.
+pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+
 /// The default block size that gets the maximum advert window, 100 KiB.
 ///
 /// This will be used as `Config.advert_window_small_size_bytes` if it is not configured.

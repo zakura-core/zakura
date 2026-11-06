@@ -37,7 +37,7 @@ const ANNOUNCEMENT_LIFETIME: Duration =
 pub(crate) struct AnnouncedBlocks(Arc<Mutex<IndexMap<block::Hash, Instant>>>);
 
 impl AnnouncedBlocks {
-    /// Records that the peer announced `hashes`, evicting the oldest beyond the limit.
+    /// Records `hashes`, keeping the map bounded even while processing a large message.
     pub(crate) fn record(&self, hashes: impl IntoIterator<Item = block::Hash>) {
         let now = Instant::now();
         let mut announced = self
@@ -47,10 +47,14 @@ impl AnnouncedBlocks {
         for hash in hashes {
             // Re-inserting at the end keeps the map ordered oldest first.
             announced.shift_remove(&hash);
+            // Evict before inserting: an inventory message can contain 50,000 hashes, and
+            // trimming only after the loop would retain that allocation and make duplicate
+            // refreshes shift an entire message's entries while holding the mutex.
+            if announced.len() == ANNOUNCED_BLOCKS_LIMIT {
+                announced.shift_remove_index(0);
+            }
             announced.insert(hash, now);
         }
-        let excess = announced.len().saturating_sub(ANNOUNCED_BLOCKS_LIMIT);
-        announced.drain(..excess);
     }
 
     /// Forgets `hashes`, which the peer told us it does not have after all.
@@ -120,6 +124,47 @@ mod tests {
         }
         assert!(announced.announced(hash(1)));
         assert!(announced.announced(hash(2)));
+    }
+
+    /// A maximum-sized message cannot leave a maximum-sized allocation behind, including
+    /// when hashes repeat within the same message rather than across separate calls.
+    #[tokio::test(start_paused = true)]
+    async fn maximum_inventory_keeps_allocation_bounded() {
+        let limit = usize::try_from(crate::protocol::external::inv::MAX_INV_IN_RECEIVED_MESSAGE)
+            .expect("the inventory limit fits in usize");
+        for distinct in [limit, limit / 2, ANNOUNCED_BLOCKS_LIMIT] {
+            let announced = AnnouncedBlocks::default();
+            announced.record((0..limit).map(|index| hash(index % distinct)));
+            let entries = announced
+                .0
+                .lock()
+                .expect("announced block mutex is never poisoned");
+            assert_eq!(entries.len(), ANNOUNCED_BLOCKS_LIMIT);
+            assert!(
+                entries.capacity() <= 2 * ANNOUNCED_BLOCKS_LIMIT,
+                "a single inventory retained an oversized allocation: {}",
+                entries.capacity()
+            );
+            let newest: Vec<_> = (limit - ANNOUNCED_BLOCKS_LIMIT..limit)
+                .map(|index| hash(index % distinct))
+                .collect();
+            assert_eq!(entries.keys().copied().collect::<Vec<_>>(), newest);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refreshing_a_full_cache_preserves_other_hashes_and_renews_expiry() {
+        let announced = AnnouncedBlocks::default();
+        announced.record((0..ANNOUNCED_BLOCKS_LIMIT).map(hash));
+        tokio::time::advance(ANNOUNCEMENT_LIFETIME / 2).await;
+        announced.record([hash(0)]);
+        assert!((0..ANNOUNCED_BLOCKS_LIMIT).all(|index| announced.announced(hash(index))));
+        announced.record([hash(ANNOUNCED_BLOCKS_LIMIT)]);
+        assert!(announced.announced(hash(0)));
+        assert!(!announced.announced(hash(1)));
+        tokio::time::advance(ANNOUNCEMENT_LIFETIME / 2).await;
+        assert!(announced.announced(hash(0)));
+        assert!(!announced.announced(hash(2)));
     }
 
     #[tokio::test(start_paused = true)]

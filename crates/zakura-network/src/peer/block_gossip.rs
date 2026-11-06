@@ -1202,7 +1202,7 @@ mod tests {
         }
     }
 
-    /// By default every block is advertised to up to 400 peers at once, whatever its size.
+    /// By default every block is advertised to up to 1000 peers at once, whatever its size.
     #[test]
     fn default_advert_window_is_fixed() {
         let fanout = AdvertFanout::from_config(&Config::default());
@@ -1213,7 +1213,7 @@ mod tests {
             Some(u32::MAX),
             None,
         ] {
-            assert_eq!(fanout.window(size), 400, "{size:?}");
+            assert_eq!(fanout.window(size), 1000, "{size:?}");
         }
     }
 

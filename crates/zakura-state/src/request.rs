@@ -1064,6 +1064,7 @@ mod tests {
             writer_rx.recv().unwrap();
             received_tx.send(()).unwrap();
             // The writer already received the block, but the enqueue closure has not returned.
+            assert!(matches!(*reader.0.borrow(), Admission::Admitted { .. }));
             assert!(reader.optimistic_relay_authorized());
         });
         admission

@@ -36,8 +36,8 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, session admissions, refusals and ends, readmission cooldowns,
-    /// or the adopted state and its publications.
+    /// reservations, capacity accounting, session admissions, refusals and ends,
+    /// readmission cooldowns, or the adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -47,6 +47,11 @@ impl Recorder {
                     ReactorEvent::HeadersHeld { .. }
                         | ReactorEvent::HeadersEnded { .. }
                         | ReactorEvent::ReservationOpened { .. }
+                        | ReactorEvent::ReservationBound { .. }
+                        | ReactorEvent::ReservationEnded { .. }
+                        | ReactorEvent::PageStaged { .. }
+                        | ReactorEvent::LeaseReturned { .. }
+                        | ReactorEvent::RoundReleased { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }
@@ -83,6 +88,14 @@ impl Recorder {
     /// Every event recorded since the last call.
     fn take_all(&self) -> Vec<ReactorEvent> {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
+    }
+
+    /// Every event recorded since the last call, left for the next.
+    fn peek_all(&self) -> Vec<ReactorEvent> {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .clone()
     }
 }
 
@@ -408,6 +421,26 @@ fn retired(active: &ActiveHeaderRequest, reason: HeaderRequestTerminal) -> React
     }
 }
 
+/// Asserts that `events` report `active`'s round released, with no lease
+/// left in the queue, before they report it retired.
+fn assert_released_before_retired(events: &[ReactorEvent], active: &ActiveHeaderRequest) {
+    let released = events.iter().position(|event| {
+        *event
+            == ReactorEvent::RoundReleased {
+                peer: active.peer.clone(),
+                incarnation: active.incarnation().get(),
+                queue_owned: 0,
+            }
+    });
+    let retired = events.iter().position(|event| {
+        matches!(event, ReactorEvent::Retired { request, .. } if *request == request_ref(active))
+    });
+    assert!(
+        matches!((released, retired), (Some(released), Some(retired)) if released < retired),
+        "{events:?}"
+    );
+}
+
 /// The apply call for `peer`'s active request, sealed as its own preparation.
 fn apply_operation(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId) -> HeaderPortOperation {
     let active = active(reactor, peer);
@@ -538,7 +571,8 @@ fn reason_index(reason: HeaderRequestTerminal) -> usize {
 }
 
 /// Every reason reaches the observer with the retired request's exact
-/// identity, including the five that the request-terminal trace skips.
+/// identity, including the five that the request-terminal trace skips, once
+/// the queue has released the round.
 #[test]
 fn every_active_retirement_reason_reaches_the_observer() {
     for (index, reason) in EVERY_REASON.into_iter().enumerate() {
@@ -557,6 +591,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
 
         reactor.retire_peer_work(&peer, reason);
 
+        assert_released_before_retired(&recorder.peek_all(), &seeded);
         assert_eq!(
             recorder.take(),
             vec![ReactorEvent::Retired {
@@ -578,7 +613,8 @@ fn every_active_retirement_reason_reaches_the_observer() {
 }
 
 /// A committed snapshot that obsoletes an active request retires it without
-/// going through `retire_peer_work`, and the observer still sees it.
+/// going through `retire_peer_work`, and the observer still sees it, once
+/// the queue has released the round.
 #[test]
 fn snapshot_retirement_is_observed() {
     let recorder = Arc::new(Recorder::default());
@@ -600,6 +636,7 @@ fn snapshot_retirement_is_observed() {
 
     reactor.retire_obsolete_work(&newer);
 
+    assert_released_before_retired(&recorder.peek_all(), &seeded);
     assert_eq!(
         recorder.take(),
         vec![retired(&seeded, HeaderRequestTerminal::SnapshotObsolete)]
@@ -608,7 +645,8 @@ fn snapshot_retirement_is_observed() {
 }
 
 /// A repair retry retires the repair's active request without going through
-/// `retire_peer_work`, and the observer still sees it.
+/// `retire_peer_work`, and the observer still sees it, once the queue has
+/// released the round.
 #[test]
 fn repair_retry_retirement_is_observed() {
     let recorder = Arc::new(Recorder::default());
@@ -636,6 +674,7 @@ fn repair_retry_retirement_is_observed() {
         VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
     );
 
+    assert_released_before_retired(&recorder.peek_all(), &seeded);
     let events = recorder.take();
     assert_eq!(
         events.first(),
@@ -742,17 +781,28 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
             },
         )
     } else {
+        let operation = prepare_operation(
+            &reactor,
+            &peer,
+            HeaderTargetPurpose::Normal,
+            old.entries.clone(),
+        );
+        let HeaderPortOperation::PrepareHeaderTarget { target, .. } = &operation else {
+            unreachable!("`prepare_operation` always builds a prepare")
+        };
+        let target = *target;
         (
-            prepare_operation(
-                &reactor,
-                &peer,
-                HeaderTargetPurpose::Normal,
-                old.entries.clone(),
-            ),
+            operation,
             PortCall::Prepare {
                 peer: peer.clone(),
                 source,
                 owner,
+                target,
+                hashes: old
+                    .entries
+                    .iter()
+                    .map(|entry| entry.header.hash())
+                    .collect(),
             },
         )
     };
@@ -901,6 +951,19 @@ async fn synthetic_prepare_ends_not_submitted() {
     recorder.take();
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
+        let HeaderPortOperation::PrepareHeaderTarget {
+            target, entries, ..
+        } = &operation
+        else {
+            unreachable!("`prepare_operation` always builds a prepare")
+        };
+        let (target, hashes) = (
+            *target,
+            entries
+                .iter()
+                .map(|entry| entry.header.hash())
+                .collect::<Vec<_>>(),
+        );
         assert!(matches!(
             reactor.dispatch_action(operation),
             StorageDispatch::Started(_)
@@ -913,6 +976,8 @@ async fn synthetic_prepare_ends_not_submitted() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    target,
+                    hashes,
                 },
             },
             ReactorEvent::CallEnded {

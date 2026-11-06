@@ -212,16 +212,14 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
     startup
 }
 
-fn seed_applying_request(
-    reactor: &mut HeaderSyncReactor,
+/// An applying ordinary round for `peer`'s session `session_id`, toward the
+/// header after `snapshot`'s finalized tip, with that one header staged, and
+/// the target it pursues. Nothing is reserved or started.
+fn applying_request(
     snapshot: &zakura_header_chain::EngineSnapshot,
     peer: ZakuraPeerId,
     session_id: u64,
-) -> (
-    zakura_header_chain::SourceId,
-    zakura_header_chain::HeaderSyncWorkOwner,
-    zakura_header_chain::BranchId,
-) {
+) -> (AdvertisedHeaderTarget, ActiveHeaderRequest) {
     let source = source_id_from_peer(&peer);
     let anchor = snapshot.frontiers.finalized;
     let mut header = *regtest_genesis_block().header;
@@ -258,34 +256,47 @@ fn seed_applying_request(
             tree_aux_schema_mask: 0,
         },
     };
+    let mut request = ActiveHeaderRequest::new(
+        HeaderTargetPurpose::Normal,
+        peer,
+        source,
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        owner,
+        advertised.clone(),
+        request_id,
+        1,
+        AuxSchema::None,
+    );
+    request.common_ancestor = Some(anchor);
+    request.entries = vec![HeaderEntry {
+        header,
+        body_size: 0,
+        tree_aux: None,
+    }];
+    request.phase = HeaderTargetPhase::Applying;
+    (advertised, request)
+}
+
+fn seed_applying_request(
+    reactor: &mut HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: ZakuraPeerId,
+    session_id: u64,
+) -> (
+    zakura_header_chain::SourceId,
+    zakura_header_chain::HeaderSyncWorkOwner,
+    zakura_header_chain::BranchId,
+) {
+    let (advertised, request) = applying_request(snapshot, peer.clone(), session_id);
+    let (source, owner) = (request.source, request.owner);
     assert_eq!(
         reactor
             .peer_work_queue
-            .stage(peer.clone(), advertised.clone(), PeerWorkPriority::Normal,),
+            .stage(peer.clone(), advertised, PeerWorkPriority::Normal,),
         QueueWorkResult::NeedsLocator
     );
     assert!(reactor.peer_work_queue.reserve_request(&peer, 1));
-    assert!(reactor.peer_work_queue.start({
-        let mut request = ActiveHeaderRequest::new(
-            HeaderTargetPurpose::Normal,
-            peer.clone(),
-            source,
-            zakura_header_chain::HeaderLocator::for_continuation(anchor),
-            owner,
-            advertised,
-            request_id,
-            1,
-            AuxSchema::None,
-        );
-        request.common_ancestor = Some(anchor);
-        request.entries = vec![HeaderEntry {
-            header,
-            body_size: 0,
-            tree_aux: None,
-        }];
-        request.phase = HeaderTargetPhase::Applying;
-        request
-    }));
+    assert!(reactor.peer_work_queue.start(request));
     reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
     (source, owner, owner.header_authority().branch)
 }

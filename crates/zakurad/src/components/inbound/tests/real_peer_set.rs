@@ -1085,6 +1085,7 @@ async fn setup(
         peer_set.clone(),
         read_only_state_service,
         Some(submitblock_channel.receiver()),
+        zakura_rpc::MinedSubmissions::default(),
     ));
 
     let tx_gossip_task_handle = tokio::spawn(run_mempool_transaction_id_gossip(
@@ -1233,6 +1234,7 @@ mod submitblock_test {
                 peer_set.clone(),
                 read_only_state_service,
                 Some(submitblock_channel.receiver()),
+                zakura_rpc::MinedSubmissions::default(),
             )
             .in_current_span(),
         );

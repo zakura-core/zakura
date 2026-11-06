@@ -538,6 +538,16 @@ impl StartCmd {
         // Cancel detached tasks before dropping the state services, whose teardown blocks.
         let _shutdown_on_drop = shutdown.clone().drop_guard();
 
+        if let Some(task) = crate::components::tracing::raw_endpoint::init(
+            config.tracing.raw_endpoint_addr,
+            config.network.zakura.trace_dir.clone(),
+            shutdown.clone(),
+        )
+        .await?
+        {
+            node_tasks.track(&task);
+        }
+
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
         // load_shed middleware ensures that we reduce the size of the peer set
@@ -720,6 +730,7 @@ impl StartCmd {
 
         // Create a channel to send mined blocks to the gossip task
         let submit_block_channel = SubmitBlockChannel::new();
+        let mined_submissions = zakura_rpc::MinedSubmissions::default();
 
         // Launch RPC server
         let (rpc_impl, mut rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
@@ -740,6 +751,7 @@ impl StartCmd {
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
             pending_blocks,
+            mined_submissions.clone(),
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
         node_tasks.track(&rpc_tx_queue_handle);
@@ -846,6 +858,7 @@ impl StartCmd {
                 block_adverts,
                 read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
+                mined_submissions,
             )
             .in_current_span(),
         );

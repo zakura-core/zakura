@@ -146,7 +146,13 @@ pub async fn start_state_service_with_cache_dir(
     };
 
     // These tests don't need UTXOs to be verified efficiently, because they use cached states.
-    let (state, read, tip, change, _) = zakura_state::init(config, network, Height::MAX, 0).await?;
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        latest_chain_tip: tip,
+        chain_tip_change: change,
+        ..
+    } = zakura_state::init(config, network, Height::MAX, 0).await?;
     Ok((state, read, tip, change))
 }
 

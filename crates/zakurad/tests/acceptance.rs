@@ -3154,8 +3154,13 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let mining_conf = default_test_config.mining;
     let miner_params = MinerParams::new(&network, mining_conf.clone())?;
 
-    let (state, read_state, latest_chain_tip, _chain_tip_change, mut block_announcements) =
-        zakura_state::init_test_services(&network).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip,
+        mut block_announcements,
+        ..
+    } = zakura_state::init_test_services(&network).await;
 
     let (
         block_verifier_router,

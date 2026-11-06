@@ -1772,10 +1772,14 @@ async fn pruned_state(
         storage_mode: zakura_state::StorageMode::Pruned(zakura_state::PruningConfig::default()),
         ..zakura_state::Config::ephemeral()
     };
-    let (state, read_state, latest_chain_tip, _, _block_announcements) =
-        zakura_state::init(config, network, max_checkpoint_height, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip,
+        ..
+    } = zakura_state::init(config, network, max_checkpoint_height, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let state = Buffer::new(state, 1);
 
     for block in blocks {
@@ -2968,8 +2972,12 @@ async fn rpc_getblockcount_empty_state() {
     // Get a mempool handle
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     // Create an empty state
-    let (state, read_state, tip, _, _block_announcements) =
-        zakura_state::init_test_services(&Mainnet).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip: tip,
+        ..
+    } = zakura_state::init_test_services(&Mainnet).await;
 
     let (block_verifier_router, _, _, _) = zakura_consensus::router::init_test(
         zakura_consensus::Config::default(),
@@ -3018,8 +3026,12 @@ async fn rpc_getpeerinfo() {
     let network = Mainnet;
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (state, read_state, tip, _, _block_announcements) =
-        zakura_state::init_test_services(&Mainnet).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip: tip,
+        ..
+    } = zakura_state::init_test_services(&Mainnet).await;
 
     let (block_verifier_router, _, _, _) = zakura_consensus::router::init_test(
         zakura_consensus::Config::default(),
@@ -4298,7 +4310,13 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_commit_is_announced_before_verification_returns_to_rpc() {
     let _init = zakura_test::init();
-    let (state, read, tip, _, mut announcements) = zakura_state::init_test_services(&Mainnet).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        latest_chain_tip: tip,
+        block_announcements: mut announcements,
+        ..
+    } = zakura_state::init_test_services(&Mainnet).await;
     let (verifier, _, _, _) = zakura_consensus::router::init_test(
         zakura_consensus::Config::default(),
         &Mainnet,
@@ -5363,8 +5381,12 @@ async fn rpc_addnode() {
     ));
 
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (state, read_state, tip, _, _block_announcements) =
-        zakura_state::init_test_services(&Mainnet).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip: tip,
+        ..
+    } = zakura_state::init_test_services(&Mainnet).await;
 
     let (block_verifier_router, _, _, _) = zakura_consensus::router::init_test(
         zakura_consensus::Config::default(),

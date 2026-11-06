@@ -304,10 +304,15 @@ async fn closing_state_publication_ends_gossip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn real_writer_announces_while_commit_caller_is_suspended() {
     let _init = zakura_test::init();
-    let (state, read, latest, _, announcements) =
-        zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
-            .await
-            .unwrap();
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        latest_chain_tip: latest,
+        block_announcements: announcements,
+        ..
+    } = zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
     let state = tower::util::BoxCloneSyncService::new(tower::buffer::Buffer::new(state, 1));
     state
         .clone()

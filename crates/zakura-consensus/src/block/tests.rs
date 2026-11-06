@@ -4029,7 +4029,11 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         for cache_hit in [false, true] {
             let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
-            let (state, _, tip, _, _block_announcements) = zs::init_test_services(&network).await;
+            let zakura_state::InitializedState {
+                state,
+                latest_chain_tip: tip,
+                ..
+            } = zs::init_test_services(&network).await;
             let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
                 .zcash_deserialize_into()
                 .unwrap();

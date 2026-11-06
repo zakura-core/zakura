@@ -1269,13 +1269,12 @@ async fn caches_getaddr_response() {
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         // UTXO verification doesn't matter for these tests.
-        let (
+        let zakura_state::InitializedState {
             state,
-            _read_only_state_service,
+            read_state: _read_only_state_service,
             latest_chain_tip,
-            _chain_tip_change,
-            _block_announcements,
-        ) = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+            ..
+        } = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
 
@@ -1431,10 +1430,14 @@ async fn refused_block_reads_send_notfound() {
     let unknown = zakura_chain::block::Hash([0x22; 32]);
     let broken = zakura_chain::block::Hash([0x33; 32]);
 
-    let (_state, _read_only_state, latest_chain_tip, _chain_tip_change, _block_announcements) =
-        zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state: _state,
+        read_state: _read_only_state,
+        latest_chain_tip,
+        ..
+    } = zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let state = Buffer::new(
         BoxService::new(tower::service_fn(move |request| async move {
             match request {
@@ -1613,13 +1616,13 @@ async fn setup_with_misbehavior_receiver(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (
+    let zakura_state::InitializedState {
         state,
-        read_only_state_service,
+        read_state: read_only_state_service,
         latest_chain_tip,
         mut chain_tip_change,
         block_announcements,
-    ) = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+    } = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
         .await
         .expect("ephemeral state initialization succeeds");
 

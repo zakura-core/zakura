@@ -424,8 +424,7 @@ impl StateService {
     /// Uses the `max_checkpoint_height` and `checkpoint_verify_concurrency_limit`
     /// to work out when it is near the final checkpoint.
     ///
-    /// Returns the read-write and read-only state services,
-    /// and read-only watch channels for its best chain tip.
+    /// Returns the state services and update receivers in [`InitializedState`].
     ///
     /// # Errors
     ///
@@ -436,16 +435,7 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> Result<
-        (
-            Self,
-            ReadStateService,
-            LatestChainTip,
-            ChainTipChange,
-            crate::BlockAnnouncements,
-        ),
-        StateInitError,
-    > {
+    ) -> Result<InitializedState<Self>, StateInitError> {
         let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -687,13 +677,13 @@ impl StateService {
             }
         });
 
-        Ok((
+        Ok(InitializedState {
             state,
-            read_service,
+            read_state: read_service,
             latest_chain_tip,
             chain_tip_change,
             block_announcements,
-        ))
+        })
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -3855,9 +3845,28 @@ fn check_prepared_mined_relay_eligibility_for_state(
     }
 }
 
+/// State services and update receivers created by initialization.
+///
+/// Select the fields a caller needs with a destructuring pattern and `..`. Keep `state`
+/// alive while using its writer; unused update receivers can be dropped. In particular,
+/// dropping `block_announcements` disables collection of announcements without affecting commits.
+/// This container has no additional shutdown behavior; each field owns its usual lifetime.
+#[derive(Debug)]
+pub struct InitializedState<S> {
+    /// Read-write service, boxed or buffered by the initializer as needed.
+    pub state: S,
+    /// Cloneable read-only access to committed state.
+    pub read_state: ReadStateService,
+    /// Current best chain tip, readable without a service request.
+    pub latest_chain_tip: LatestChainTip,
+    /// Receiver for changes to the best chain tip.
+    pub chain_tip_change: ChainTipChange,
+    /// Single-consumer feed of committed announcements, normally owned by gossip.
+    pub block_announcements: crate::BlockAnnouncements,
+}
+
 /// Initialize a state service from the provided [`Config`].
-/// Returns a boxed state service, a read-only state service,
-/// receivers for state chain tip updates, and the single-consumer committed announcement feed.
+/// Returns [`InitializedState`] with a boxed read-write service.
 ///
 /// Each `network` has its own separate on-disk database.
 ///
@@ -3880,23 +3889,14 @@ pub async fn init(
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> Result<
-    (
-        BoxService<Request, Response, BoxError>,
-        ReadStateService,
-        LatestChainTip,
-        ChainTipChange,
-        crate::BlockAnnouncements,
-    ),
-    StateInitError,
-> {
-    let (
-        state_service,
-        read_only_state_service,
+) -> Result<InitializedState<BoxService<Request, Response, BoxError>>, StateInitError> {
+    let InitializedState {
+        state,
+        read_state,
         latest_chain_tip,
         chain_tip_change,
         block_announcements,
-    ) = StateService::new(
+    } = StateService::new(
         config,
         network,
         max_checkpoint_height,
@@ -3904,13 +3904,13 @@ pub async fn init(
     )
     .await?;
 
-    Ok((
-        BoxService::new(state_service),
-        read_only_state_service,
+    Ok(InitializedState {
+        state: BoxService::new(state),
+        read_state,
         latest_chain_tip,
         chain_tip_change,
         block_announcements,
-    ))
+    })
 }
 
 /// Initialize state and return the separate capability used to seal completion-gated body
@@ -3927,30 +3927,19 @@ pub async fn init_with_header_chain_body_evidence(
     checkpoint_verify_concurrency_limit: usize,
 ) -> Result<
     (
-        BoxService<Request, Response, BoxError>,
-        ReadStateService,
-        LatestChainTip,
-        ChainTipChange,
-        crate::BlockAnnouncements,
+        InitializedState<BoxService<Request, Response, BoxError>>,
         crate::HeaderChainBodyEvidenceAuthority,
     ),
     StateInitError,
 > {
-    let (state, read_state, latest_chain_tip, chain_tip_change, block_announcements) = init(
+    let initialized = init(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
     )
     .await?;
-    Ok((
-        state,
-        read_state,
-        latest_chain_tip,
-        chain_tip_change,
-        block_announcements,
-        crate::HeaderChainBodyEvidenceAuthority::new(),
-    ))
+    Ok((initialized, crate::HeaderChainBodyEvidenceAuthority::new()))
 }
 
 /// Initialize a read state service from the provided [`Config`].
@@ -4047,47 +4036,41 @@ pub async fn init_test(
 ) -> Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _, _) =
+    let InitializedState { state, .. } =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
 
-    Buffer::new(BoxService::new(state_service), 1)
+    Buffer::new(BoxService::new(state), 1)
 }
 
 /// Initializes a state service with an ephemeral [`Config`] and a buffer with a single slot,
-/// then returns the read-write service, read-only service, tip watch channels, and committed announcements.
+/// then returns the services and update receivers in [`InitializedState`].
 ///
 /// This can be used to create a state service for testing. See also [`init`].
 #[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_test_services(
     network: &Network,
-) -> (
+) -> InitializedState<
     Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-    crate::BlockAnnouncements,
-) {
+> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (
-        state_service,
-        read_state_service,
+    let InitializedState {
+        state,
+        read_state,
         latest_chain_tip,
         chain_tip_change,
         block_announcements,
-    ) = StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+    } = StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
         .await
         .expect("ephemeral state initialization succeeds");
 
-    let state_service = Buffer::new(BoxService::new(state_service), 1);
-
-    (
-        state_service,
-        read_state_service,
+    InitializedState {
+        state: Buffer::new(BoxService::new(state), 1),
+        read_state,
         latest_chain_tip,
         chain_tip_change,
         block_announcements,
-    )
+    }
 }

@@ -741,7 +741,7 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((_hash, note_commitment_trees)) => {
+            Ok((_, note_commitment_trees)) => {
                 Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),

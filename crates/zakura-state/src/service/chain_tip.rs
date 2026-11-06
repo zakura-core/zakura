@@ -143,12 +143,8 @@ impl From<SemanticallyVerifiedBlock> for ChainTipBlock {
             block,
             hash,
             height,
-            new_outputs: _,
             transaction_hashes,
-            deferred_pool_balance_change: _,
-            origin: _,
-            auth_data_root: _,
-            receipt_order: _,
+            ..
         } = prepared;
 
         Self {

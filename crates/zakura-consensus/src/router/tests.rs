@@ -515,10 +515,13 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
     for mined in [true, false] {
         let mut state_config = zs::Config::ephemeral();
         state_config.vct_fast_sync = false;
-        let (state, _read, _tip, _change, _block_announcements) =
-            zs::init(state_config, &network, boundary, 0)
-                .await
-                .expect("ephemeral state opens");
+        let zakura_state::InitializedState {
+            state,
+            read_state: _read,
+            ..
+        } = zs::init(state_config, &network, boundary, 0)
+            .await
+            .expect("ephemeral state opens");
         let state = Buffer::new(state, 32);
         let transaction = Buffer::new(
             BoxService::new(transaction::Verifier::new_for_tests(

@@ -162,7 +162,7 @@ async fn measure(blocking_threads: usize, reserved: usize, inputs_per_transactio
         ("admitted-64", 64, true),
     ] {
         // The probe creates a fresh database for each mode, including its first SST read.
-        let (state, _, _, _, _block_announcements) =
+        let crate::InitializedState { state, .. } =
             StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
                 .await
                 .unwrap();

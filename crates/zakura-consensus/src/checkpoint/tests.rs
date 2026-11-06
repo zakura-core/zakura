@@ -2064,7 +2064,12 @@ async fn queued_local_checkpoint_commits_are_announced_after_callers_are_dropped
         .range(0..=3)
         .map(|(_, bytes)| Arc::<Block>::zcash_deserialize(*bytes).unwrap())
         .collect();
-    let (state, read, _, _, mut announcements) = zs::init_test_services(&Mainnet).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        block_announcements: mut announcements,
+        ..
+    } = zs::init_test_services(&Mainnet).await;
     let list: BTreeMap<_, _> = [0usize, 3]
         .into_iter()
         // The only indices are 0 and 3, so both fit in u32.

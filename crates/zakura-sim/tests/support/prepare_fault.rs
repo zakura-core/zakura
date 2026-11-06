@@ -37,6 +37,9 @@ pub const CHAIN: u32 = 120;
 /// The peer's disconnect.
 pub const DISCONNECT: &str = "peer:peer-0:disconnect";
 
+/// The peer's redial after its connection closed.
+pub const REDIAL: &str = "peer:peer-0:redial";
+
 /// How long after its submission the node's first preparation is held,
 /// long enough for a disconnect picked meanwhile to reach the reactor.
 pub const HOLD_MS: u64 = 2_000;
@@ -113,6 +116,23 @@ pub fn disconnect_mid_prepare(cx: &StepCtx<'_>) -> Result<Steer, String> {
             .ok_or_else(|| "only the disconnect is enabled".to_owned());
     }
     Ok(Steer::Fine)
+}
+
+/// [`disconnect_mid_prepare`], then a redial as soon as one is offered. The
+/// peer dials again a settle time after its close, while the cooldown its
+/// fault started still holds.
+pub fn redial_after_disconnect(cx: &StepCtx<'_>) -> Result<Steer, String> {
+    match disconnect_mid_prepare(cx)? {
+        Steer::Fine
+            if cx
+                .enabled
+                .iter()
+                .any(|enabled| enabled.identity.to_string() == REDIAL) =>
+        {
+            Ok(Steer::Pick(REDIAL.to_owned()))
+        }
+        steer => Ok(steer),
+    }
 }
 
 /// The last view a run's checks read.

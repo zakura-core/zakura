@@ -400,6 +400,9 @@ pub struct Config {
     /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
     /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
     /// concurrent body writes.
+    /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
+    /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
+    /// announcements to the remaining peers.
     ///
     /// Experimental.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]

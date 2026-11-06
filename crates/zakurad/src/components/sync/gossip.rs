@@ -20,8 +20,7 @@ use crate::{components::sync::SyncStatus, BoxError};
 
 use BlockGossipError::*;
 
-/// Bounds a full paced broadcast, including several upload waves.
-pub(super) const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
+pub(super) use zn::constants::BLOCK_GOSSIP_TIMEOUT;
 
 /// Bounds the state read of a committed tip's size. A tip block is in memory, so this read is
 /// fast; if it is slow, the broadcast proceeds without the size rather than waiting.

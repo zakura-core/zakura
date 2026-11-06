@@ -124,6 +124,9 @@ pub const PEERSET_BUFFER_SIZE: usize = 3;
 /// and receiving a response from a remote peer.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Bounds a daemon block broadcast, including peer discovery and delivery tracking.
+pub const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// The timeout for connections and handshakes when connecting to new peers.
 ///
 /// Outbound TCP connections must complete within this timeout,

@@ -162,6 +162,55 @@ async fn connection_shutdown_times_out_stalled_peer_tx_close() {
     );
 }
 
+/// A stalled writer close cannot turn a failed connection into a successful advertisement.
+#[tokio::test(start_paused = true)]
+async fn failed_connection_notifies_gossip_before_writer_close() {
+    use crate::peer::block_gossip::{BlockGossipPeer, BLOCK_ADVERT_QUEUE, BLOCK_REQUEST_WAIT};
+
+    let _init_guard = zakura_test::init();
+    for written in [false, true] {
+        let mut active = ActiveConnectionCounter::new_counter();
+        let (mut connection, _client, error) =
+            super::new_never_closing_test_connection::<crate::BoxError>(active.track_connection());
+        let (sender, receiver) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = receiver;
+        let gossip = BlockGossipPeer {
+            sender,
+            address: None,
+            uploads: connection.block_uploads.clone(),
+            registry: None,
+            version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+            sidecar: false,
+        };
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+        let hash = block::Hash([81; 32]);
+        let advert = tokio::spawn(gossip.clone().advertise(hash));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(gossip.sender.capacity(), BLOCK_ADVERT_QUEUE);
+        assert!(!advert.is_finished());
+        if written {
+            gossip.uploads.requested(hash);
+            gossip.uploads.written(hash);
+            tokio::task::yield_now().await;
+        }
+
+        drop(peer_tx);
+        tokio::task::yield_now().await;
+        assert!(error.try_get_error().is_some());
+        tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+        assert!(!advert.await.unwrap(), "shutdown must fail upload tracking");
+        assert!(gossip.sender.is_closed());
+        assert!(
+            !connection_task.is_finished(),
+            "writer close is still pending"
+        );
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        connection_task.await.unwrap();
+    }
+}
+
 /// Test that the connection run loop works as a spawned task with messages in and out
 #[tokio::test]
 async fn connection_run_loop_message_ok() {

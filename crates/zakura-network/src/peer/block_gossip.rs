@@ -22,7 +22,7 @@ use tokio::{
 use zakura_chain::{block, chain_tip::ChainTip};
 
 use crate::{
-    constants::REQUEST_TIMEOUT,
+    constants::{BLOCK_GOSSIP_TIMEOUT, REQUEST_TIMEOUT},
     peer::{MinimumPeerVersion, SharedPeerError},
     peer_registry::PeerRegistryUpdater,
     protocol::external::types::Version,
@@ -167,26 +167,70 @@ impl UploadState {
     }
 }
 
-/// Observers exist only while local broadcasts await this connection's uploads.
+/// Retain successful announcements through a broadcast and its timeout fallback.
+const SUCCESSFUL_ADVERT_RETENTION: Duration = BLOCK_GOSSIP_TIMEOUT.saturating_mul(2);
+/// Bounds duplicate-suppression history, not pending advertisements or uploads.
+const SUCCESSFUL_ADVERT_LIMIT: usize = 128;
+
+#[derive(Debug, Default)]
+struct UploadRegistry {
+    active: HashMap<block::Hash, Weak<watch::Sender<UploadState>>>,
+    successful: indexmap::IndexMap<block::Hash, Instant>,
+}
+
+/// Tracks active uploads and remembers recent successful announcements for this connection.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct BlockUploads(Arc<Mutex<HashMap<block::Hash, Weak<watch::Sender<UploadState>>>>>);
+pub(crate) struct BlockUploads(Arc<Mutex<UploadRegistry>>);
 
 impl BlockUploads {
     fn register(&self, hash: block::Hash) -> (watch::Receiver<UploadState>, Option<UploadClaim>) {
         let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        uploads.retain(|_, upload| upload.strong_count() > 0);
-        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+        uploads.active.retain(|_, upload| upload.strong_count() > 0);
+        uploads
+            .successful
+            .retain(|_, completed| completed.elapsed() < SUCCESSFUL_ADVERT_RETENTION);
+        if let Some(upload) = uploads.active.get(&hash).and_then(Weak::upgrade) {
             return (upload.subscribe(), None);
+        }
+        if uploads.successful.contains_key(&hash) {
+            return (watch::channel(UploadState::Finished(true)).1, None);
         }
         let (sender, receiver) = watch::channel(UploadState::Queued);
         let sender = Arc::new(sender);
-        uploads.insert(hash, Arc::downgrade(&sender));
+        uploads.active.insert(hash, Arc::downgrade(&sender));
         (receiver, Some(UploadClaim(sender)))
     }
 
+    /// Finalize the observer and its history under the same lock used by late failure events.
+    fn finish(&self, hash: block::Hash, claim: &UploadClaim, succeeded: bool) -> bool {
+        let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        // Preserve a failure published after the final state check, including a disconnect
+        // racing the end of the write grace.
+        claim.0.send_if_modified(|state| {
+            if matches!(state, UploadState::Finished(_) | UploadState::Revoked) {
+                false
+            } else {
+                *state = UploadState::Finished(succeeded);
+                true
+            }
+        });
+        let succeeded = matches!(*claim.0.borrow(), UploadState::Finished(true));
+        if succeeded {
+            uploads.successful.shift_remove(&hash);
+            if uploads.successful.len() == SUCCESSFUL_ADVERT_LIMIT {
+                uploads.successful.shift_remove_index(0);
+            }
+            uploads.successful.insert(hash, Instant::now());
+        }
+        succeeded
+    }
+
     fn update(&self, hash: block::Hash, state: UploadState) {
-        let uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+        let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        if matches!(state, UploadState::Finished(false)) {
+            uploads.successful.shift_remove(&hash);
+        }
+        if let Some(upload) = uploads.active.get(&hash).and_then(Weak::upgrade) {
             upload.send_if_modified(|current| {
                 let replace = matches!(*current, UploadState::Waiting)
                     || matches!(
@@ -207,7 +251,7 @@ impl BlockUploads {
     /// Start tracking requests once the connection writes this advertisement's inventory.
     pub(crate) fn advertised(&self, hash: block::Hash) {
         let uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        if let Some(upload) = uploads.get(&hash).and_then(Weak::upgrade) {
+        if let Some(upload) = uploads.active.get(&hash).and_then(Weak::upgrade) {
             upload.send_if_modified(UploadState::start_waiting);
         }
     }
@@ -228,29 +272,27 @@ impl BlockUploads {
     ///
     /// The inbound service can truncate a request or fail it without naming each hash.
     pub(crate) fn request_finished<'a>(&self, hashes: impl IntoIterator<Item = &'a block::Hash>) {
-        let uploads = self.0.lock().expect("block upload mutex is never poisoned");
-        for upload in hashes
-            .into_iter()
-            .filter_map(|hash| uploads.get(hash).and_then(Weak::upgrade))
-        {
-            upload.send_if_modified(|state| {
-                let requested = matches!(state, UploadState::Requested(_));
-                if requested {
-                    *state = UploadState::Finished(false);
-                }
-                requested
-            });
+        let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        for hash in hashes {
+            // A late request can fail after its observer expires. Do not let old success
+            // suppress a committed announcement when the early body was unavailable.
+            uploads.successful.shift_remove(hash);
+            if let Some(upload) = uploads.active.get(hash).and_then(Weak::upgrade) {
+                upload.send_if_modified(|state| {
+                    let requested = matches!(state, UploadState::Requested(_));
+                    if requested {
+                        *state = UploadState::Finished(false);
+                    }
+                    requested
+                });
+            }
         }
     }
 
     pub(crate) fn disconnected(&self) {
-        for upload in self
-            .0
-            .lock()
-            .expect("block upload mutex is never poisoned")
-            .values()
-            .filter_map(Weak::upgrade)
-        {
+        let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        uploads.successful.clear();
+        for upload in uploads.active.values().filter_map(Weak::upgrade) {
             upload.send_if_modified(|state| {
                 if matches!(state, UploadState::Finished(_) | UploadState::Revoked) {
                     false
@@ -385,8 +427,7 @@ impl BlockGossipPeer {
                 }
             }
         };
-        claim.0.send_replace(UploadState::Finished(succeeded));
-        AdvertOutcome::from(succeeded)
+        AdvertOutcome::from(self.uploads.finish(hash, &claim, succeeded))
     }
 }
 
@@ -496,7 +537,7 @@ impl<C: ChainTip + Clone + Send + 'static> tower::Service<Request> for BlockAdve
 impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     /// Advertises the block in `request` to every eligible connected peer.
     ///
-    /// Waits for an authorized connected peer, refreshing candidates after revocation. The
+    /// Waits for an authorized connected peer, refreshing candidates after delivery failure. The
     /// caller owns the overall deadline and cancellation, including any wait for new peers.
     pub(crate) fn advertise(
         &mut self,
@@ -542,8 +583,12 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
                     .collect();
                 if !candidates.is_empty() {
                     match broadcast_block(candidates, block.hash, window, mined, delayed_at).await {
-                        Err(error) if error.is::<RevokedCandidates>() => {}
-                        result => return result,
+                        Ok(response) => return Ok(response),
+                        Err(error) => tracing::debug!(
+                            hash = ?block.hash,
+                            %error,
+                            "waiting for new peers after block advertisement failed"
+                        ),
                     }
                 }
                 // Do not replay the same rejected snapshot or reset the caller's deadline.
@@ -840,6 +885,116 @@ mod tests {
         assert!(first.await.unwrap());
         assert!(second.await.unwrap());
         assert!(receiver.recv().now_or_never().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_fallback_skips_successful_peers_and_retries_unfinished_peer() {
+        let registry = PeerRegistry::default();
+        let mut guards = Vec::new();
+        let measured = measured_peers(&registry, &mut guards, [Some(1), Some(2), Some(3)]);
+        let (mut peers, mut writes) = connected_peers(2);
+        let (slow, mut receiver) = peer();
+        let uploads = slow.uploads.clone();
+        peers.push(slow);
+        for (peer, measured) in peers.iter_mut().zip(measured) {
+            peer.registry = measured.registry;
+        }
+        let hash = block::Hash([83; 32]);
+        let start = Instant::now();
+        let first = tokio::spawn(timeout(
+            BLOCK_GOSSIP_TIMEOUT,
+            broadcast_block(
+                peers.clone(),
+                hash,
+                2,
+                true,
+                start + Duration::from_secs(60),
+            ),
+        ));
+        for _ in 0..2 {
+            assert_eq!(writes.recv().await.unwrap().1, hash);
+        }
+        let advert = receiver.recv().await.unwrap();
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+        uploads.advertised(hash);
+        uploads.requested(hash);
+        advert.result.send(Ok(())).unwrap();
+        assert!(first.await.unwrap().is_err());
+        assert_eq!(start.elapsed(), BLOCK_GOSSIP_TIMEOUT);
+
+        let fallback = tokio::spawn(timeout(
+            BLOCK_GOSSIP_TIMEOUT,
+            broadcast_block(
+                peers,
+                hash,
+                2,
+                true,
+                Instant::now() + Duration::from_secs(60),
+            ),
+        ));
+        let advert = receiver.recv().await.unwrap();
+        assert_eq!(advert.hash, hash);
+        uploads.advertised(hash);
+        uploads.requested(hash);
+        uploads.written(hash);
+        advert.result.send(Ok(())).unwrap();
+        assert!(fallback.await.unwrap().unwrap().is_ok());
+        assert!(
+            writes.try_recv().is_err(),
+            "successful peers must not receive a replay"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_advert_history_is_bounded_and_expires_without_limiting_fanout() {
+        let (peers, mut writes) = connected_peers(1);
+        let peer = &peers[0];
+        let mut last = block::Hash([0; 32]);
+        for index in 0..=SUCCESSFUL_ADVERT_LIMIT {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+            last = block::Hash(bytes);
+            let task = tokio::spawn(peer.clone().advertise(last));
+            assert_eq!(writes.recv().await.unwrap().1, last);
+            // Finish uploads promptly so the burst stays within the retention period.
+            peer.uploads.requested(last);
+            peer.uploads.written(last);
+            assert!(task.await.unwrap());
+        }
+        assert!(peer.clone().advertise(last).await);
+        assert!(
+            writes.try_recv().is_err(),
+            "recent success suppresses a duplicate"
+        );
+        let evicted = block::Hash([0; 32]);
+        let replay = tokio::spawn(peer.clone().advertise(evicted));
+        assert_eq!(writes.recv().await.unwrap().1, evicted);
+        assert!(replay.await.unwrap());
+
+        tokio::time::advance(SUCCESSFUL_ADVERT_RETENTION).await;
+        let expired = tokio::spawn(peer.clone().advertise(last));
+        assert_eq!(writes.recv().await.unwrap().1, last);
+        assert!(expired.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_failed_request_invalidates_successful_advert_history() {
+        for unavailable in [false, true] {
+            let (peer, mut receiver) = peer();
+            let hash = block::Hash([84; 32]);
+            let early = tokio::spawn(peer.clone().advertise(hash));
+            accept(&mut receiver, hash).await;
+            assert!(early.await.unwrap());
+            peer.uploads.requested(hash);
+            if unavailable {
+                peer.uploads.unavailable(hash);
+            } else {
+                peer.uploads.request_finished(&[hash]);
+            }
+            let committed = tokio::spawn(peer.advertise(hash));
+            accept(&mut receiver, hash).await;
+            assert!(committed.await.unwrap());
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1774,6 +1929,53 @@ mod tests {
         })
         .await
         .expect("the pending announcement reaches a later authorized peer");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_snapshot_retries_replacement_without_resetting_deadline() {
+        for replace_before_failure in [false, true] {
+            let (first, mut first_rx) = peer();
+            let (published, peers) = watch::channel(vec![first]);
+            let advertiser = BlockAdvertiser {
+                fanout: AdvertFanout::from_config(&Config {
+                    advert_window_min: 1,
+                    advert_window_max: 1,
+                    advert_delay_min: Duration::from_secs(1),
+                    advert_delay_max: Duration::from_secs(1),
+                    ..Config::default()
+                }),
+                peers,
+                minimum_peer_version: MinimumPeerVersion::new(
+                    zakura_chain::chain_tip::NoChainTip,
+                    &zakura_chain::parameters::Network::Mainnet,
+                ),
+                bans: BannedIps::default(),
+                refresh: None,
+            };
+            let start = Instant::now();
+            let hash = block::Hash([82; 32]);
+            let broadcast = tokio::spawn(tower::ServiceExt::oneshot(
+                advertiser,
+                Request::AdvertiseMinedBlock(hash.into()),
+            ));
+            let advert = first_rx.recv().await.unwrap();
+            let (later, mut writes) = connected_peers(2);
+            if replace_before_failure {
+                published.send_replace(later.clone());
+            }
+            drop(first_rx);
+            drop(advert);
+            tokio::task::yield_now().await;
+            if !replace_before_failure {
+                assert!(!broadcast.is_finished());
+                tokio::time::advance(Duration::from_millis(750)).await;
+                published.send_replace(later);
+            }
+            assert_eq!(writes.recv().await.unwrap().1, hash);
+            assert_eq!(writes.recv().await.unwrap().1, hash);
+            assert_eq!(start.elapsed(), Duration::from_secs(1));
+            assert!(broadcast.await.unwrap().is_ok());
+        }
     }
 
     #[tokio::test(start_paused = true)]

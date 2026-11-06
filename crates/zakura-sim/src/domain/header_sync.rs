@@ -7,7 +7,7 @@
 use crate::{
     harness::header_node::{
         capacity::{BoundaryRead, CapacityEvidence},
-        claim::{Claim, ClaimEvidence, RoundEvidence},
+        claim::{Claim, ClaimEvidence, SettlementEvidence},
     },
     property::{
         CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
@@ -118,24 +118,30 @@ where
 }
 
 /// A released round returns its reservation and leases once its calls are
-/// handled.
+/// handled, and node teardown returns every chunk-budget charge and every
+/// locator permit.
 pub const TEARDOWN_RETURNS_BASELINE: &str = "header-sync/teardown-returns-baseline";
 
-/// The claim rules [`TEARDOWN_RETURNS_BASELINE`] reports.
-const ROUND_SETTLEMENT: [Claim; 3] = [
+/// The claim rules [`TEARDOWN_RETURNS_BASELINE`] reports: round settlement's,
+/// then node settlement's.
+const TEARDOWN_CLAIMS: [Claim; 7] = [
     Claim::LeakedReservation,
     Claim::LeakedLease,
     Claim::OpenOwnership,
+    Claim::OpenReservation,
+    Claim::TeardownReserved,
+    Claim::TeardownOwned,
+    Claim::TeardownLocatorPermits,
 ];
 
 /// What the teardown checks read: one reactor's claim breaks and its
-/// released rounds.
+/// settlement at each drain.
 pub trait TeardownView {
     /// The claim rules the reactor's tap found broken.
     fn claims(&self) -> &ClaimEvidence;
 
-    /// The reactor's released rounds at each drain.
-    fn rounds(&self) -> &RoundEvidence;
+    /// The reactor's released rounds and its own teardown at each drain.
+    fn rounds(&self) -> &SettlementEvidence;
 }
 
 /// [`TEARDOWN_RETURNS_BASELINE`], as a harness whose view is a
@@ -148,26 +154,39 @@ where
     Property {
         id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
         claim: "a released header round returns its reservation and leases once its calls are \
-                handled",
+                handled, and node teardown returns every chunk-budget charge and every locator \
+                permit",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
         status: Status::Active,
         check: check_teardown::<S>,
-        witness: Some(TriggerHistory::View(round_released::<S::View>)),
+        witness: Some(TriggerHistory::View(teardown_reached::<S::View>)),
     }
 }
 
-/// Checks [`TEARDOWN_RETURNS_BASELINE`] at the boundary after a step, as
-/// round settlement: once the queue released a round, its peer holds no
-/// reservation from it, and every lease staged for it returns once no call
+/// Checks [`TEARDOWN_RETURNS_BASELINE`] at the boundary after a step, at two
+/// levels.
+///
+/// Round settlement: once the queue released a round, its peer holds no
+/// reservation from it, every lease staged for it returns once no call
 /// holds it, by its last call's `Handled` at the latest, and every call that
 /// held its headers ended that ownership by its `Handled`. The ledger checks
 /// those at the events, as `LeakedReservation`, `LeakedLease` and
-/// `OpenOwnership`, and any break the step's drain found violates.
+/// `OpenOwnership`.
 ///
-/// It applies once the queue released a round. A run that ends with a
-/// released round unsettled, its leases not all back, is inconclusive.
+/// Node settlement: once a reactor the harness stopped is gone, without
+/// unwinding, and every call it dropped has its drop receipt, it holds no
+/// reservation, ownership or staged lease (`OpenReservation`,
+/// `OpenOwnership`, `LeakedLease` in the ledger's teardown check), and the
+/// budget holds nothing and every locator permit is free but those storage
+/// still holds for pending reads (`TeardownReserved`, `TeardownOwned`,
+/// `TeardownLocatorPermits` on the first probe read).
+///
+/// Any of those breaks the step's drain found violates. It applies once the
+/// queue released a round or the node settled. A run that ends with a
+/// released round unsettled, or with a stop begun and the node unsettled,
+/// is inconclusive.
 fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -175,20 +194,20 @@ where
 {
     let view = cx.view();
     let step = cx.step;
-    let rounds = view.rounds().at(step);
-    if rounds.is_some_and(|rounds| rounds.unsettled > 0) {
+    let row = view.rounds().at(step);
+    if row.is_some_and(|row| row.unsettled > 0 || (row.shutdown && !row.settled)) {
         cx.unsettled(Inconclusive::TeardownOpen);
     }
-    let expected = "a released round keeps no reservation, lease or held headers once its \
-                    calls are handled";
-    let mut breaks = view.claims().at(step, &ROUND_SETTLEMENT).into_iter();
+    let expected = "a released round, and a stopped node, keeps no reservation, lease, held \
+                    headers or locator permit once settled";
+    let mut breaks = view.claims().at(step, &TEARDOWN_CLAIMS).into_iter();
     if let Some(first) = breaks.next() {
         for other in breaks {
             cx.record_violation(expected, other.detail);
         }
         return cx.violated(expected, first.detail);
     }
-    if rounds.is_some_and(|rounds| rounds.released > 0) {
+    if row.is_some_and(|row| row.released > 0 || row.settled) {
         Verdict::Holds
     } else {
         Verdict::NotApplicable
@@ -196,9 +215,9 @@ where
 }
 
 /// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: the queue released a
-/// round.
-fn round_released<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
-    view.rounds().any_released()
+/// round, or a stopped node settled.
+fn teardown_reached<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
+    view.rounds().any_released() || view.rounds().settled()
 }
 
 /// [`CHUNK_BUDGET_BOUND`]'s trigger history: the probe read the budget
@@ -223,7 +242,7 @@ mod tests {
     use crate::{
         harness::header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
-            claim::{Claim, ClaimEvidence, ClaimRecord, RoundEvidence, Rounds},
+            claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
@@ -242,7 +261,7 @@ mod tests {
     struct Probe {
         capacity: CapacityEvidence,
         claims: ClaimEvidence,
-        rounds: RoundEvidence,
+        rounds: SettlementEvidence,
     }
 
     impl TeardownView for Probe {
@@ -250,7 +269,7 @@ mod tests {
             &self.claims
         }
 
-        fn rounds(&self) -> &RoundEvidence {
+        fn rounds(&self) -> &SettlementEvidence {
             &self.rounds
         }
     }
@@ -275,12 +294,14 @@ mod tests {
     }
 
     /// One boundary's scripted evidence: a read of claimed headers, an
-    /// unread boundary, the released rounds, or a claim break.
+    /// unread boundary, the released rounds, a stop and whether the node
+    /// settled, or a claim break.
     #[derive(Clone, Copy)]
     enum Scripted {
         Read(usize),
         Unread(BoundaryRead),
-        Rounds { released: u64, unsettled: usize },
+        Settlement { released: u64, unsettled: usize },
+        Stop { settled: bool },
         Broke(Claim),
     }
 
@@ -316,13 +337,22 @@ mod tests {
                     teardown: false,
                 }),
                 Some(Scripted::Unread(read)) => self.probe.capacity.unread(step, read),
-                Some(Scripted::Rounds {
+                Some(Scripted::Settlement {
                     released,
                     unsettled,
-                }) => self.probe.rounds.record(Rounds {
+                }) => self.probe.rounds.record(Settlement {
                     step,
                     released,
                     unsettled,
+                    shutdown: false,
+                    settled: false,
+                }),
+                Some(Scripted::Stop { settled }) => self.probe.rounds.record(Settlement {
+                    step,
+                    released: 0,
+                    unsettled: 0,
+                    shutdown: true,
+                    settled,
                 }),
                 Some(Scripted::Broke(claim)) => {
                     self.probe.claims.record(ClaimRecord {
@@ -330,10 +360,12 @@ mod tests {
                         claim,
                         detail: format!("{claim:?}"),
                     });
-                    self.probe.rounds.record(Rounds {
+                    self.probe.rounds.record(Settlement {
                         step,
                         released: 1,
                         unsettled: 0,
+                        shutdown: false,
+                        settled: false,
                     });
                 }
                 None => {}
@@ -450,15 +482,15 @@ mod tests {
         let report = run_property(
             teardown_returns_baseline(),
             &[
-                Scripted::Rounds {
+                Scripted::Settlement {
                     released: 0,
                     unsettled: 0,
                 },
-                Scripted::Rounds {
+                Scripted::Settlement {
                     released: 1,
                     unsettled: 1,
                 },
-                Scripted::Rounds {
+                Scripted::Settlement {
                     released: 1,
                     unsettled: 0,
                 },
@@ -475,7 +507,7 @@ mod tests {
     fn a_run_ending_with_an_unsettled_round_is_inconclusive() {
         let report = run_property(
             teardown_returns_baseline(),
-            &[Scripted::Rounds {
+            &[Scripted::Settlement {
                 released: 1,
                 unsettled: 1,
             }],
@@ -504,7 +536,7 @@ mod tests {
             let report = run_property(
                 property,
                 &[
-                    Scripted::Rounds {
+                    Scripted::Settlement {
                         released: 1,
                         unsettled: 0,
                     },
@@ -520,5 +552,55 @@ mod tests {
             &[Scripted::Broke(Claim::OverBudget)],
         );
         assert!(report.properties[0].violations.is_empty());
+    }
+
+    /// A stop holds the property unsettled until the node settles, and then
+    /// it applies and holds. A run cut off before is inconclusive.
+    #[test]
+    fn node_settlement_settles_teardown() {
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[
+                Scripted::Stop { settled: false },
+                Scripted::Stop { settled: true },
+            ],
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Held { applicable: 1 }
+        );
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[Scripted::Stop { settled: false }],
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Inconclusive {
+                reason: "teardown-open".to_owned()
+            }
+        );
+    }
+
+    /// Each node settlement claim violates at the step whose drain found it.
+    #[test]
+    fn node_settlement_claims_violate_teardown() {
+        for claim in [
+            Claim::OpenReservation,
+            Claim::TeardownReserved,
+            Claim::TeardownOwned,
+            Claim::TeardownLocatorPermits,
+        ] {
+            let property = Property {
+                status: Status::Draft,
+                ..teardown_returns_baseline()
+            };
+            let report = run_property(
+                property,
+                &[Scripted::Stop { settled: false }, Scripted::Broke(claim)],
+            );
+            let violations = &report.properties[0].violations;
+            assert_eq!(violations.len(), 1, "{claim:?}: {violations:?}");
+            assert_eq!(violations[0].step, 2, "{claim:?}");
+        }
     }
 }

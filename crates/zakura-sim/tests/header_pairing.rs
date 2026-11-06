@@ -414,8 +414,9 @@ fn a_call_left_unended_fails_at_teardown() {
     assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
 }
 
-/// A call that ended and kept its headers fails the run once the reactor's
-/// teardown is done.
+/// A call that ended and kept its headers fails the run once the stopped
+/// reactor's teardown is done: the ledger finds it as an `OpenOwnership`
+/// claim, and with no property to report it the run fails at its end.
 #[test]
 fn headers_left_held_fail_at_teardown() {
     let mut events = Vec::from(open_work(2));
@@ -423,7 +424,7 @@ fn headers_left_held_fail_at_teardown() {
         call: 1,
         end: CallEnd::NotSubmitted,
     });
-    let report = teardown_after(events, false, false);
+    let report = teardown_after(events, false, true);
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("OpenOwnership: call 1"), "{detail}");
 }

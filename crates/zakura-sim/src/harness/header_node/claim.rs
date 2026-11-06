@@ -26,8 +26,18 @@ pub enum Claim {
     LeakedReservation,
     /// A released round kept a lease past its settlement.
     LeakedLease,
-    /// A call was handled with its round's headers still held.
+    /// A call was handled with its round's headers still held, or still
+    /// held them at teardown.
     OpenOwnership,
+    /// A reservation never ended by teardown.
+    OpenReservation,
+    /// The stopped reactor is gone with headers still reserved.
+    TeardownReserved,
+    /// The stopped reactor is gone with headers still owned.
+    TeardownOwned,
+    /// The stopped reactor is gone with a locator permit missing that no
+    /// pending storage read holds.
+    TeardownLocatorPermits,
 }
 
 impl Claim {
@@ -38,30 +48,38 @@ impl Claim {
             ClaimRule::LeakedReservation => Claim::LeakedReservation,
             ClaimRule::LeakedLease => Claim::LeakedLease,
             ClaimRule::OpenOwnership => Claim::OpenOwnership,
+            ClaimRule::OpenReservation => Claim::OpenReservation,
         }
     }
 }
 
-/// The node's released rounds at one drain.
+/// The node's settlement at one drain: its released rounds, and its own
+/// teardown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rounds {
+pub struct Settlement {
     /// The step whose drain read them.
     pub step: u64,
     /// How many rounds the queue has released so far.
     pub released: u64,
     /// How many of those haven't settled: some of their staged headers
-    /// haven't returned.
+    /// haven't returned, or a call that held their headers hasn't been
+    /// handled.
     pub unsettled: usize,
+    /// Whether the harness began stopping the reactor.
+    pub shutdown: bool,
+    /// Whether the stopped reactor's teardown is done: the reactor is gone
+    /// without unwinding, and every call it dropped has its drop receipt.
+    pub settled: bool,
 }
 
 /// One reactor's released rounds at each drain, shared by its tap and
 /// whoever reads them. Cloning shares the store.
 #[derive(Clone, Debug, Default)]
-pub struct RoundEvidence(Arc<Mutex<Vec<Rounds>>>);
+pub struct SettlementEvidence(Arc<Mutex<Vec<Settlement>>>);
 
-impl RoundEvidence {
+impl SettlementEvidence {
     /// Keeps `rounds`. Nothing else is called while the lock is held.
-    pub(crate) fn record(&self, rounds: Rounds) {
+    pub(crate) fn record(&self, rounds: Settlement) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -69,7 +87,7 @@ impl RoundEvidence {
     }
 
     /// The rounds the drain of `step` read, if it did.
-    pub fn at(&self, step: u64) -> Option<Rounds> {
+    pub fn at(&self, step: u64) -> Option<Settlement> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -80,11 +98,20 @@ impl RoundEvidence {
     }
 
     /// Every drain's rounds so far, in order.
-    pub fn rows(&self) -> Vec<Rounds> {
+    pub fn rows(&self) -> Vec<Settlement> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Whether a drain found the stopped reactor's teardown done.
+    pub fn settled(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|row| row.settled)
     }
 
     /// Whether any drain found a released round.

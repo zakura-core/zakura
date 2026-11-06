@@ -167,6 +167,11 @@ pub fn now() -> Option<SimInstant> {
     with_run(|s| s.now)
 }
 
+/// Whether `task` of the current run has ended, or `None` outside a run.
+pub fn task_ended(task: TaskId) -> Option<bool> {
+    with_run(|s| s.done.contains_key(&task))
+}
+
 /// Registers `waker` to fire when time reaches `deadline`.
 ///
 /// Store the `Waker` the timer's future was polled with, not the task's.

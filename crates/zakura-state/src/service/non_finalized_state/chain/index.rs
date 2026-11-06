@@ -40,7 +40,7 @@ pub struct TransparentTransfers {
     /// but it might in future. So Zebra does it anyway.
     ///
     /// Outputs are grouped by height, then by 32-height chunks. Snapshots share chunks;
-    /// updating a height copies at most 32 height entries, sharing their output payloads.
+    /// copying a chunk copies at most 32 height entries, sharing their output payloads.
     /// A single chunk is stored directly, avoiding a second map allocation for short
     /// histories. Both levels are sparse; occupied chunks and height groups are nonempty.
     created_utxos: CreatedUtxos,

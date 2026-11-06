@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.3"
+version = "1.8.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -2725,9 +2725,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3540211.0"
+version = "0.3541011.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9f6c8108fe16a6debf6f907e914892dbba3549c6e82ec6857103e0f22fec34e"
+checksum = "1c7600e1356336d471224b538709b01342c480a38249fbf59862dc4cd3284396"
 
 [[package]]
 name = "zakura-bellman"
@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "12.0.0"
+version = "13.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -2823,7 +2823,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "uint",
  "windows-sys 0.61.2",
  "zakura-address",
  "zakura-equihash",
@@ -2943,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.0.2"
+version = "5.1.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -3006,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "13.0.0"
+version = "13.1.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -3049,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.1.0"
+version = "5.1.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3361,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.3"
+version = "5.0.4"
 dependencies = [
  "hex",
  "ripemd",
@@ -3465,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "14.0.0"
+version = "14.1.0"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3574,7 +3573,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.10"
+version = "2.2.11"
 dependencies = [
  "clap",
  "eyre",

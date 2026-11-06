@@ -4,8 +4,8 @@ mod service_session;
 mod trace;
 use service_session::{
     may_open_ordered_stream, spawn_service_session, trace_session_step, ConnectionRoles,
-    DemandChange, DemandWait, PendingSessions, PreparedStream, RemoteCompletion, RemoteDemand,
-    ServiceSessionState, SessionExit, SetupIo,
+    DemandChange, DemandWait, OpenedStream, PendingSessions, PreparedStream, RemoteCompletion,
+    RemoteDemand, ServiceSessionState, SessionExit, SetupIo,
 };
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use service_session::{replay_service_session_bytes, ServiceSessionReplaySummary};
@@ -21,7 +21,7 @@ use std::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use bytes::Bytes;
-use futures::{future::BoxFuture, FutureExt as _, StreamExt as _};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt as _, StreamExt as _};
 use rand_10::Rng;
 use thiserror::Error;
 use zakura_chain::{
@@ -45,12 +45,15 @@ use zakura_rt::{
         broadcast, mpsc, oneshot, watch, AsyncMutex, Barrier, CancellationToken, Mutex as StdMutex,
         MutexGuard, OwnedSemaphorePermit, PoisonError, Semaphore,
     },
-    task::{AbortHandle, AbortOnDropHandle, JoinHandle, JoinSet, JoinSetExt},
+    task::{AbortOnDropHandle, JoinHandle, JoinSet, JoinSetExt},
     time::{timeout, Instant},
 };
 
 use self::trace::ZakuraConnTrace;
-use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
+use super::discovery::{
+    self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialEnd, RedialPolicy,
+};
+use super::legacy_gossip::LegacyResponseItem;
 use super::peer_memory::{
     budget_admitted_connections, budgeted_max_connections, budgeted_quic_bytes, ConnectionMemory,
     PeerMemoryBudgetError, DEFAULT_ZAKURA_PEER_MEMORY_BUDGET_BYTES,
@@ -198,8 +201,9 @@ pub const DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The upgrade dial targets a peer-supplied address, so it must not redial
 /// forever. Six attempts back off 1 + 2 + 4 + 8 + 16 = 31 s between dials, and
 /// each dial can wait up to [`DEFAULT_ZAKURA_CONTROL_TIMEOUT`] to connect, so
-/// the dial ends within about 90 s after the peer stops answering. The legacy
-/// crawler then re-upgrades the peer if it is still reachable.
+/// the dial ends within about 90 s after the peer stops answering. An ALPN
+/// mismatch ends it at once. The legacy crawler then re-upgrades the peer if it
+/// is still reachable.
 const ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS: usize = 6;
 const CONTROL_LENGTH_BYTES: usize = 4;
 const STREAM_PRELUDE_FIXED_BYTES: usize = 4 + 2 + 2 + 1;
@@ -894,11 +898,16 @@ pub struct ZakuraEndpoint {
     /// keyed by the advertised peer id. See [`Self::start_upgrade_native_dial`]
     /// and [`Self::cancel_upgrade_native_dial`].
     upgrade_dials: Arc<StdMutex<HashMap<ZakuraPeerId, UpgradeDialOwnership>>>,
+    /// When each upgrade hint's ALPN-mismatch floor ends, for upgrade dials
+    /// that ended on a mismatch. No upgrade dial starts for a hint inside its
+    /// floor (zakura-quic DIAL-5). See [`upgrade_hint`].
+    upgrade_alpn_floors: Arc<StdMutex<HashMap<NodeAddr, Instant>>>,
 }
 
 #[derive(Debug)]
 struct UpgradeDialOwnership {
-    dial_abort: AbortHandle,
+    /// Cancelled when this endpoint stops owning the dial. The dial then
+    /// starts no new attempt and ends once its in-flight one does.
     lifetime: CancellationToken,
 }
 
@@ -1061,10 +1070,16 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
         );
-        spawn_erased_named(
-            "native_dial",
-            native_dial_supervised(endpoint, node_addr, limits, policy),
-        )
+        spawn_erased_named("native_dial", async move {
+            native_dial_supervised(
+                endpoint,
+                node_addr,
+                limits,
+                policy,
+                CancellationToken::new(),
+            )
+            .await;
+        })
     }
 
     /// Start one maintained native dial for a legacy handoff.
@@ -1074,14 +1089,16 @@ impl ZakuraEndpoint {
     /// legacy upgrades do not create a swarm of independent maintained QUIC
     /// dial loops to the same peer. The dial gives up after
     /// [`ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS`] consecutive failures because the
-    /// peer chose the address.
+    /// peer chose the address. A dial that ends on an ALPN mismatch starts the
+    /// hint's [`ZAKURA_ALPN_MISMATCH_BACKOFF`] floor, and no dial starts inside
+    /// it. See [`upgrade_hint`] for why the floor keys the hint, not the node ID.
     pub(crate) fn start_upgrade_native_dial(&self, node_addr: NodeAddr) -> ZakuraUpgradeDialStart {
         let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
             return ZakuraUpgradeDialStart::InvalidPeerId;
         };
 
         // Hold the registry lock across the spawn so the dedup check and the
-        // abort-handle insert are atomic against a concurrent upgrade to the
+        // ownership insert are atomic against a concurrent upgrade to the
         // same peer. `tokio::spawn` does not await, and the spawned task only
         // re-locks after its (non-instant) dial returns, so this cannot
         // deadlock or `.await` under the lock.
@@ -1092,6 +1109,10 @@ impl ZakuraEndpoint {
         if upgrade_dials.contains_key(&peer_id) {
             return ZakuraUpgradeDialStart::AlreadyRunning;
         }
+        let hint = upgrade_hint(&node_addr);
+        if self.in_upgrade_alpn_floor(&hint) {
+            return ZakuraUpgradeDialStart::AlpnBackoff;
+        }
 
         let endpoint = self.clone();
         let limits = self.handler.limits.clone();
@@ -1100,12 +1121,32 @@ impl ZakuraEndpoint {
             DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
             ZAKURA_UPGRADE_REDIAL_MAX_ATTEMPTS,
         );
+        // A cancelled hand-off lets the in-flight attempt run to the bound of a
+        // whole dial (zakura-quic DIAL-4), so an ALPN mismatch that a slower
+        // address delays still starts the floor.
+        let drain = native_dial_timeout(
+            self.quic.config(),
+            node_addr.direct.len(),
+            limits.control_timeout,
+        );
         let lifetime = CancellationToken::new();
         let task_lifetime = lifetime.clone();
         let task_peer_id = peer_id.clone();
-        let dial = spawn_erased_named("upgrade_dial", async move {
+        spawn_erased_named("upgrade_dial", async move {
+            let stop = task_lifetime.clone();
             let _lifetime_guard = task_lifetime.drop_guard();
-            native_dial_supervised(endpoint.clone(), node_addr, limits, policy).await;
+            let supervised =
+                native_dial_supervised(endpoint.clone(), node_addr, limits, policy, stop.clone());
+            let end = zakura_rt::select! {
+                end = supervised => end,
+                () = async {
+                    stop.cancelled().await;
+                    zakura_rt::time::sleep(drain).await;
+                } => RedialEnd::Ended,
+            };
+            if end == RedialEnd::AlpnMismatch {
+                endpoint.hold_upgrade_alpn_floor(hint);
+            }
             endpoint
                 .supervisor
                 .forget_retained_native_metadata(&task_peer_id);
@@ -1115,14 +1156,36 @@ impl ZakuraEndpoint {
                 .expect("Zakura upgrade dial registry mutex is never poisoned")
                 .remove(&task_peer_id);
         });
-        upgrade_dials.insert(
-            peer_id,
-            UpgradeDialOwnership {
-                dial_abort: dial.abort_handle(),
-                lifetime,
-            },
-        );
+        upgrade_dials.insert(peer_id, UpgradeDialOwnership { lifetime });
         ZakuraUpgradeDialStart::Started
+    }
+
+    /// Starts `hint`'s ALPN-mismatch floor, and drops the floors that ended.
+    fn hold_upgrade_alpn_floor(&self, hint: NodeAddr) {
+        let now = Instant::now();
+        let mut floors = self
+            .upgrade_alpn_floors
+            .lock()
+            .expect("Zakura upgrade ALPN floor mutex is never poisoned");
+        floors.retain(|_, until| *until > now);
+        floors.insert(hint, now + ZAKURA_ALPN_MISMATCH_BACKOFF);
+    }
+
+    /// Whether `hint` is inside the ALPN-mismatch floor of an earlier upgrade
+    /// dial.
+    fn in_upgrade_alpn_floor(&self, hint: &NodeAddr) -> bool {
+        let mut floors = self
+            .upgrade_alpn_floors
+            .lock()
+            .expect("Zakura upgrade ALPN floor mutex is never poisoned");
+        match floors.get(hint) {
+            Some(until) if *until > Instant::now() => true,
+            Some(_) => {
+                floors.remove(hint);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Returns how many maintained upgrade dials this endpoint owns.
@@ -1147,25 +1210,25 @@ impl ZakuraEndpoint {
             .map(|ownership| ownership.lifetime.clone())
     }
 
-    /// Cancel and forget the maintained native dial started by the legacy
-    /// upgrade hand-off for `peer_id`, if this node still owns one.
+    /// Stop the maintained native dial started by the legacy upgrade hand-off
+    /// for `peer_id`, if this node still owns one.
     ///
     /// Called when the upgrade hand-off ends without the peer registering,
     /// including when the outer handshake timeout drops the hand-off. The
     /// maintained dial would otherwise keep redialing a peer-supplied, possibly
     /// unreachable address until its attempt limit, and repeating the failed
     /// upgrade with distinct node ids would grow dial tasks and outbound QUIC
-    /// traffic. A no-op if the dial already ended.
+    /// traffic. The dial starts no new attempt, and its in-flight attempt ends
+    /// within the bound of one whole dial. The dial then forgets the peer. A
+    /// no-op if the dial already ended.
     pub(crate) fn cancel_upgrade_native_dial(&self, peer_id: &ZakuraPeerId) {
-        let ownership = self
+        if let Some(ownership) = self
             .upgrade_dials
             .lock()
             .expect("Zakura upgrade dial registry mutex is never poisoned")
-            .remove(peer_id);
-        if let Some(ownership) = ownership {
+            .get(peer_id)
+        {
             ownership.lifetime.cancel();
-            ownership.dial_abort.abort();
-            self.supervisor.forget_retained_native_metadata(peer_id);
         }
     }
 
@@ -1219,6 +1282,7 @@ impl ZakuraEndpoint {
             header_sync_actions: None,
             block_sync_actions: None,
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -1279,6 +1343,7 @@ impl ZakuraEndpoint {
             block_sync_actions: block_sync_actions
                 .map(|actions| Arc::new(AsyncMutex::new(Some(actions)))),
             upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+            upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -1534,11 +1599,12 @@ impl ZakuraPeerHandle {
         self.sender.capacity() > 0
     }
 
-    /// Open a request stream, write one frame, then return the response frames from the same stream.
+    /// Open a request stream, write one frame, then return its validated items.
     ///
-    /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned value
-    /// funds its frames until it drops. The node's resource envelope counts the
-    /// compatibility client's requests, so another caller bounds the values it keeps.
+    /// `started` is described on [`ZakuraOutboundFrame::Request`]. The returned
+    /// value keeps its serialized-byte grant until it drops. The node's resource
+    /// envelope counts the compatibility client's requests, so another caller
+    /// bounds the values it keeps.
     pub async fn request(
         &self,
         stream_kind: u16,
@@ -1568,27 +1634,27 @@ impl ZakuraPeerHandle {
     }
 }
 
-/// A compatibility response's validated frames and the grant that funds them.
+/// A compatibility response's validated items and their serialized-byte grant.
 ///
-/// The grant funds the frames and their decoder's reassembly copy, so a requester
-/// keeps this value until its decoder returns.
+/// Completed inventory items replace their raw chunks. Decoded payloads, as in
+/// the caller's pipeline, are outside the serialized-byte grant.
 #[derive(Debug)]
 pub struct ResponseFrames {
-    frames: Vec<Frame>,
+    items: Vec<LegacyResponseItem>,
     grant: CompatResponseGrant,
 }
 
 impl ResponseFrames {
-    /// Split the frames from the grant that funds them.
-    pub(crate) fn into_parts(self) -> (Vec<Frame>, CompatResponseGrant) {
-        (self.frames, self.grant)
+    /// Split the response items from their serialized-byte grant.
+    pub(super) fn into_parts(self) -> (Vec<LegacyResponseItem>, CompatResponseGrant) {
+        (self.items, self.grant)
     }
 
     /// A scripted peer's frames under a real zero-byte grant.
     #[cfg(test)]
     pub(crate) async fn with_zero_grant_for_tests(frames: Vec<Frame>) -> Self {
         Self {
-            frames,
+            items: frames.into_iter().map(Into::into).collect(),
             grant: ConnectionResources::unconstrained(&[])
                 .admit_compat_response(0)
                 .await,
@@ -1599,7 +1665,7 @@ impl ResponseFrames {
 /// Request/response outbound work owned by a connection-serving task.
 #[derive(Debug)]
 pub enum ZakuraOutboundFrame {
-    /// Compatibility request stream frame expecting response frames on the same stream.
+    /// Compatibility request frame expecting a response on the same stream.
     Request {
         /// Application stream kind to open.
         stream_kind: u16,
@@ -1617,7 +1683,7 @@ pub enum ZakuraOutboundFrame {
         /// Only legacy gossip sets it, and legacy code stays on tokio, so this
         /// is tokio's sender in both builds.
         started: Option<tokio::sync::oneshot::Sender<()>>,
-        /// Completion sent with validated response frames or an error.
+        /// Completion sent with validated response items or an error.
         completion: oneshot::Sender<Result<ResponseFrames, BoxError>>,
     },
 }
@@ -2158,7 +2224,7 @@ struct ConnectionServeContext {
     conn: ZakuraConnTrace,
     /// Counts an inbound connection against its IP until registration.
     control_handshake: Option<ControlHandshakeGuard>,
-    /// Tells a discovery dial how registration ended. See [`DialReport`].
+    /// Tells a reported dial how registration ended. See [`DialReport`].
     registration_report: Option<oneshot::Sender<DialRegistration>>,
 }
 
@@ -2225,6 +2291,13 @@ struct AdmittedSession {
     session_id: u64,
     cancel_token: CancellationToken,
     streams: Vec<ServiceStreamRole>,
+    /// The primary stream's QUIC stream ID, if it has one.
+    #[cfg(any(test, zakura_sim))]
+    quic_stream: Option<u64>,
+    /// Where the session came from, once [`ServiceSessionIO::with_origin`]
+    /// says. Every member stream reports it.
+    #[cfg(any(test, zakura_sim))]
+    origin: Option<crate::zakura::SessionOrigin>,
 }
 
 struct ServiceStreamRole {
@@ -2239,16 +2312,19 @@ impl AdmittedSession {
         self.streams
             .into_iter()
             .map(|role| {
-                (
-                    role.kind,
-                    ServiceStream::new(
-                        self.session_id,
-                        role.version,
-                        role.recv,
-                        role.send,
-                        self.cancel_token.clone(),
-                    ),
-                )
+                let stream = ServiceStream::new(
+                    self.session_id,
+                    role.version,
+                    role.recv,
+                    role.send,
+                    self.cancel_token.clone(),
+                );
+                #[cfg(any(test, zakura_sim))]
+                let stream = ServiceStream {
+                    origin: self.origin,
+                    ..stream
+                };
+                (role.kind, stream)
             })
             .collect()
     }
@@ -2283,6 +2359,33 @@ impl ServiceSessionIO {
             conn,
             close_cause,
         }
+    }
+
+    /// `admitted`, reporting where its session came from: connection
+    /// `conn_id`, its primary QUIC stream, and the generation this state
+    /// installed for it, which is kept apart from the session ID the
+    /// service is handed. A session with no QUIC stream or no installed
+    /// generation reports none.
+    #[cfg(any(test, zakura_sim))]
+    fn with_origin(
+        &self,
+        conn_id: ZakuraConnId,
+        mut admitted: AdmittedSession,
+        opened_locally: bool,
+    ) -> AdmittedSession {
+        let generation = self
+            .sessions
+            .get(&admitted.kind)
+            .and_then(|session| session.installed(opened_locally));
+        admitted.origin = admitted
+            .quic_stream
+            .zip(generation)
+            .map(|(quic_stream, generation)| crate::zakura::SessionOrigin {
+                connection: conn_id,
+                quic_stream: Some(quic_stream),
+                generation,
+            });
+        admitted
     }
 
     fn session(&mut self, kind: u16) -> &mut ServiceSessionState {
@@ -2330,8 +2433,15 @@ impl ServiceSessionIO {
     }
 
     /// A local open failed. The caller decides whether the service retries.
-    fn on_open_failed(&self, kind: u16, attempt: u64) {
+    fn on_open_failed(&mut self, kind: u16, attempt: u64) {
+        self.session(kind).open_failed();
         self.trace(kind, SessionStep::AttemptFailed { attempt });
+    }
+
+    /// Whether `kind`'s local open, whose streams are ready, may install its
+    /// generation. A peer session that took the service meanwhile wins.
+    fn accepts_local_open(&mut self, kind: u16, connection_cancelled: bool) -> bool {
+        self.session(kind).accepts_local_open(connection_cancelled)
     }
 
     /// A session's workers finished. Returns the backoff that its service now
@@ -3295,16 +3405,21 @@ impl ZakuraProtocolHandler {
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
-                let admitted = match self
-                    .open_traced_session(
+                // The peer paces this open through stream credit. Local
+                // shutdown or eviction cancels the connection meanwhile, and
+                // dropping the open resets its streams and returns its permits.
+                let opened = zakura_rt::select! {
+                    biased;
+                    () = connection_token.cancelled() => break,
+                    opened = self.open_traced_session(
                         &open_context,
                         stream,
                         &mut session_io,
                         &mut workers,
                         &mut message_buckets,
-                    )
-                    .await
-                {
+                    ) => opened,
+                };
+                let admitted = match opened {
                     Ok(admitted) => admitted,
                     Err(ZakuraHandlerError::SessionFull) => {
                         // Demand is advisory: another connection can reserve the
@@ -3328,6 +3443,8 @@ impl ZakuraProtocolHandler {
                     }
                 };
                 opened_capabilities |= stream.capability;
+                #[cfg(any(test, zakura_sim))]
+                let admitted = session_io.with_origin(conn_id, admitted, true);
                 service_streams.extend(admitted.into_service_streams());
             }
             if !connection_token.is_cancelled() {
@@ -3362,6 +3479,9 @@ impl ZakuraProtocolHandler {
             }
         }
 
+        // Local reopens whose transport IO is in flight, created on the first
+        // reopen.
+        let mut local_opens: Option<FuturesUnordered<BoxFuture<'_, _>>> = None;
         loop {
             let session_deadline = pending_sessions.deadline();
             zakura_rt::select! {
@@ -3412,17 +3532,44 @@ impl ZakuraProtocolHandler {
                         continue;
                     }
 
-                    match self
-                        .open_traced_session(
+                    // The peer paces `open_bi` and the prelude write through
+                    // stream credit, so they run beside this loop. The service
+                    // is reserved only once the streams are ready.
+                    let attempt = session_io.begin_attempt(stream.kind);
+                    let open = &open_context;
+                    local_opens.get_or_insert_with(FuturesUnordered::new).push(
+                        async move { (stream, attempt, self.open_session_streams(open, stream).await) }
+                            .boxed(),
+                    );
+                }
+                Some((stream, attempt, opened)) = async { local_opens.as_mut()?.next().await },
+                    if local_opens.as_ref().is_some_and(|opens| !opens.is_empty()) =>
+                {
+                    let opened = match opened {
+                        Ok(members)
+                            if !session_io
+                                .accepts_local_open(stream.kind, connection_token.is_cancelled()) =>
+                        {
+                            // A peer session took the service while this open
+                            // ran. Dropping the members resets their streams.
+                            drop(members);
+                            session_io.on_open_failed(stream.kind, attempt);
+                            continue;
+                        }
+                        Ok(members) => self.admit_opened_session(
                             &open_context,
                             stream,
-                            &mut session_io,
+                            members,
                             &mut workers,
                             &mut message_buckets,
-                        )
-                        .await
-                    {
+                        ),
+                        Err(error) => Err(error),
+                    };
+                    match opened {
                         Ok(admitted) => {
+                            session_io.on_opened(admitted.kind, admitted.session_id, attempt);
+                            #[cfg(any(test, zakura_sim))]
+                            let admitted = session_io.with_origin(conn_id, admitted, true);
                             let service_streams = admitted.into_service_streams();
                             let admitted_capabilities = self.registry.add_escalated_peer(
                                 Peer::new_with_service_streams(
@@ -3439,6 +3586,7 @@ impl ZakuraProtocolHandler {
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
                         }
                         Err(error) => {
+                            session_io.on_open_failed(stream.kind, attempt);
                             let delay = session_io.schedule_transport_backoff(stream.kind);
                             debug!(
                                 ?error,
@@ -3537,6 +3685,8 @@ impl ZakuraProtocolHandler {
                             continue;
                         }
 
+                        #[cfg(any(test, zakura_sim))]
+                        let admitted = session_io.with_origin(conn_id, admitted, false);
                         let service_streams = admitted.into_service_streams();
                         // We keep the full accepted capability context so
                         // discovery can make cross-service ownership
@@ -3655,6 +3805,8 @@ impl ZakuraProtocolHandler {
         }
 
         connection_token.cancel();
+        // An open still in flight resets its streams and returns its permits.
+        drop(local_opens);
         drop(incoming_setup);
         drop(pending_sessions);
         let drained = drain_stream_workers(&mut workers).await;
@@ -3687,10 +3839,12 @@ impl ZakuraProtocolHandler {
         message_buckets: &mut MessageRateBuckets,
     ) -> Result<AdmittedSession, ZakuraHandlerError> {
         let attempt = session_io.begin_attempt(stream.kind);
-        let opened = self
-            .open_service_session(open, stream, workers, message_buckets)
-            .boxed()
-            .await;
+        let opened = match self.open_session_streams(open, stream).boxed().await {
+            Ok(members) => {
+                self.admit_opened_session(open, stream, members, workers, message_buckets)
+            }
+            Err(error) => Err(error),
+        };
         match &opened {
             Ok(admitted) => session_io.on_opened(admitted.kind, admitted.session_id, attempt),
             Err(_) => session_io.on_open_failed(stream.kind, attempt),
@@ -3698,13 +3852,14 @@ impl ZakuraProtocolHandler {
         opened
     }
 
-    async fn open_service_session(
+    /// Open every member stream of `stream`'s service session and write their
+    /// preludes. This is only transport IO, which the peer paces through
+    /// stream credit; [`Self::admit_opened_session`] reserves the service.
+    async fn open_session_streams(
         &self,
         open: &SessionOpenContext<'_>,
         stream: Stream,
-        workers: &mut JoinSet<()>,
-        message_buckets: &mut MessageRateBuckets,
-    ) -> Result<AdmittedSession, ZakuraHandlerError> {
+    ) -> Result<Vec<OpenedStream>, ZakuraHandlerError> {
         let layout = self
             .registry
             .session_layout(stream)
@@ -3712,34 +3867,55 @@ impl ZakuraProtocolHandler {
         if layout.primary() != stream {
             return Err(ZakuraHandlerError::InvalidServiceSession);
         }
+        let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
+        let mut opened = Vec::with_capacity(layout.streams().len());
+        for member in layout.streams().iter().copied() {
+            opened.push(
+                self.open_ordered_stream(
+                    open.connection,
+                    member,
+                    wire_id,
+                    open.stream_sem,
+                    open.resources,
+                    open.limits,
+                )
+                .await?,
+            );
+        }
+        Ok(opened)
+    }
+
+    /// Reserve `stream`'s service for the opened `members` and start the
+    /// session's workers. A refused reservation drops the members, which
+    /// resets their streams.
+    fn admit_opened_session(
+        &self,
+        open: &SessionOpenContext<'_>,
+        stream: Stream,
+        members: Vec<OpenedStream>,
+        workers: &mut JoinSet<()>,
+        message_buckets: &mut MessageRateBuckets,
+    ) -> Result<AdmittedSession, ZakuraHandlerError> {
         let reservation = self
             .registry
             .service_for_kind(stream.kind)
             .expect("a selected stream has an owning service")
             .reserve_session(open.direction)
             .map_err(|_| ZakuraHandlerError::SessionFull)?;
-        let wire_id = layout.is_multi_stream().then(random_stream_session_seed);
-        let mut prepared = Vec::with_capacity(layout.streams().len());
-        for member in layout.streams().iter().copied() {
-            let mut member = self
-                .prepare_ordered_stream(
-                    open.connection,
-                    member,
-                    wire_id,
-                    open.stream_sem,
-                    open.resources,
-                    message_buckets,
-                    open.limits,
-                    open.connection_token.clone(),
-                    open.close_cause.clone(),
-                    open.freshness_tx.clone(),
-                    open.conn.clone(),
-                    open.peer_id.clone(),
-                )
-                .await?;
+        let prepared = members.into_iter().map(|member| {
+            let mut member = self.prepare_opened_stream(
+                member,
+                message_buckets,
+                open.limits,
+                open.connection_token.clone(),
+                open.close_cause.clone(),
+                open.freshness_tx.clone(),
+                open.conn.clone(),
+                open.peer_id.clone(),
+            );
             member.set_session_resources(reservation.clone());
-            prepared.push(member);
-        }
+            member
+        });
         Ok(spawn_service_session(
             workers,
             prepared,
@@ -4644,6 +4820,9 @@ async fn spawn_zakura_endpoint_inner(
     let sought_services = sought_services_with_custom(&custom_services);
     let discovery = discovery::build_discovery_handle(
         discovery_secret_key,
+        Some(discovery::AuthoredSequenceFile::new(
+            config.zakura_discovery_sequence_file(&local_node_id),
+        )),
         discovery_direct_addrs(config, local_node_id),
         provided_services_with_custom(&custom_services),
         &handshake_config,
@@ -4854,6 +5033,7 @@ async fn spawn_zakura_endpoint_inner(
         header_sync_actions,
         block_sync_actions,
         upgrade_dials: Arc::new(StdMutex::new(HashMap::new())),
+        upgrade_alpn_floors: Arc::new(StdMutex::new(HashMap::new())),
     };
     let startup_shutdown = endpoint.background_shutdown_token().drop_guard();
 
@@ -4964,6 +5144,24 @@ async fn spawn_zakura_endpoint_inner(
     Ok(Some(endpoint))
 }
 
+/// The key of an upgrade dial's ALPN-mismatch floor: the hint's node ID and its
+/// sorted, deduplicated addresses.
+///
+/// zakura-quic DIAL-5 keys the floor by node ID, because a discovery record is
+/// signed by its node. A legacy upgrade hint is not: an ALPN mismatch fails
+/// before TLS authenticates the node ID, so any legacy peer could plant a floor
+/// on another node's ID. Keying the whole hint limits a planted floor to the
+/// hint its own sender gave.
+fn upgrade_hint(node_addr: &NodeAddr) -> NodeAddr {
+    let mut direct = node_addr.direct.clone();
+    direct.sort_unstable();
+    direct.dedup();
+    NodeAddr {
+        id: node_addr.id,
+        direct,
+    }
+}
+
 /// Bounds a whole multi-address dial so the transport's own limits decide it:
 /// the last attempt starts after the stagger and ends at the handshake
 /// deadline (zakura-quic DIAL-3, DIAL-4). `control_timeout` is the floor.
@@ -5003,7 +5201,7 @@ fn trace_conn_id(connection: &Connection) -> u64 {
 }
 
 /// How a dialed connection's registration ended, as the dial reports it to
-/// its discovery attempt.
+/// its discovery attempt or maintained redial.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DialRegistration {
     /// The supervisor registered the peer on this connection.
@@ -5012,7 +5210,7 @@ pub(crate) enum DialRegistration {
     LocalLimit,
 }
 
-/// The channels on which a discovery dial reports its progress.
+/// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
     /// Receives the IP whose handshake TLS authenticated, before the control
     /// handshake starts.
@@ -6358,7 +6556,7 @@ async fn write_outbound_request_frame_inner(
     .map_err(|error| OutboundRequestError::Local(Box::new(error)))?;
     let _ = send.finish();
 
-    let mut frames = Vec::new();
+    let mut items = Vec::new();
     loop {
         match read_frame(
             &mut recv,
@@ -6374,12 +6572,13 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                legacy_state.validate_frame(request_id, &frame)?;
-                frames.push(frame);
+                if let Some(item) = legacy_state.validate_frame(request_id, frame)? {
+                    items.push(item);
+                }
             }
             Err(ZakuraHandlerError::Closed) => {
                 legacy_state.finish()?;
-                return Ok(ResponseFrames { frames, grant });
+                return Ok(ResponseFrames { items, grant });
             }
             Err(ZakuraHandlerError::Timeout(_)) => {
                 return Err(OutboundRequestError::Local(Box::new(
@@ -6580,11 +6779,12 @@ impl LegacyResponseBudget {
         }
     }
 
-    /// The serialized bytes one exchange under this budget charges: its frames, plus
-    /// the validator's and the decoder's reassembly copies of one object.
+    /// A conservative serialized-byte charge: the whole wire response plus
+    /// two item-sized working buffers for chunk reassembly.
     ///
-    /// The charge lasts until the requester hands the decoded response to its caller.
-    /// A decoded object larger than its encoding is outside it.
+    /// Completed inventory items replace their chunks. The charge lasts until
+    /// the requester hands the decoded response to its caller; decoded payloads
+    /// are outside it.
     fn retained_bytes(&self) -> u64 {
         let copies = match self.kind {
             LegacyResponseKind::Blocks | LegacyResponseKind::Transactions => {
@@ -6702,8 +6902,8 @@ impl LegacyResponseReadState {
     fn validate_frame(
         &mut self,
         request_id: u64,
-        frame: &Frame,
-    ) -> Result<(), OutboundRequestError> {
+        frame: Frame,
+    ) -> Result<Option<LegacyResponseItem>, OutboundRequestError> {
         if frame.flags != 0 {
             return Err(OutboundRequestError::Fatal(
                 format!("unsupported legacy response flags: {}", frame.flags).into(),
@@ -6731,10 +6931,18 @@ impl LegacyResponseReadState {
 
         match frame.message_type {
             LEGACY_RESPONSE_BLOCK => {
-                self.validate_available_chunk(request_id, frame, LegacyResponseKind::Blocks)
+                return self.validate_available_chunk(
+                    request_id,
+                    &frame,
+                    LegacyResponseKind::Blocks,
+                );
             }
             LEGACY_RESPONSE_TRANSACTION => {
-                self.validate_available_chunk(request_id, frame, LegacyResponseKind::Transactions)
+                return self.validate_available_chunk(
+                    request_id,
+                    &frame,
+                    LegacyResponseKind::Transactions,
+                );
             }
             LEGACY_RESPONSE_MISSING_BLOCKS => {
                 self.validate_missing(request_id, &frame.payload, LegacyResponseKind::Blocks)
@@ -6760,7 +6968,8 @@ impl LegacyResponseReadState {
             message_type => Err(OutboundRequestError::Fatal(
                 format!("unknown legacy response message type: {message_type}").into(),
             )),
-        }
+        }?;
+        Ok(Some(LegacyResponseItem::Frame(frame)))
     }
 
     /// Checks the response once its stream has ended.
@@ -6788,7 +6997,7 @@ impl LegacyResponseReadState {
         request_id: u64,
         frame: &Frame,
         kind: LegacyResponseKind,
-    ) -> Result<(), OutboundRequestError> {
+    ) -> Result<Option<LegacyResponseItem>, OutboundRequestError> {
         if self.budget.kind != kind {
             return Err(OutboundRequestError::Fatal(
                 "legacy response kind does not match request".into(),
@@ -6824,26 +7033,27 @@ impl LegacyResponseReadState {
         self.active_chunk.extend_from_slice(bytes);
 
         if is_last {
-            self.validate_completed_item(kind)?;
+            let item = self.decode_completed_item(kind)?;
             self.active_chunk_type = None;
             self.active_chunk.clear();
             self.add_items(1)?;
+            Ok(Some(item))
+        } else {
+            Ok(None)
         }
-
-        Ok(())
     }
 
-    fn validate_completed_item(
+    fn decode_completed_item(
         &self,
         kind: LegacyResponseKind,
-    ) -> Result<(), OutboundRequestError> {
+    ) -> Result<LegacyResponseItem, OutboundRequestError> {
         let mut remaining = self.active_chunk.as_slice();
-        match kind {
-            LegacyResponseKind::Blocks => {
-                Block::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
-            }
+        let item = match kind {
+            LegacyResponseKind::Blocks => Block::zcash_deserialize_from_slice(&mut remaining)
+                .map(|block| LegacyResponseItem::Block(Arc::new(block))),
             LegacyResponseKind::Transactions => {
-                Transaction::zcash_deserialize_from_slice(&mut remaining).map(|_| ())
+                Transaction::zcash_deserialize_from_slice(&mut remaining)
+                    .map(|transaction| LegacyResponseItem::Transaction(transaction.into()))
             }
             LegacyResponseKind::BlockHashes
             | LegacyResponseKind::BlockHeaders
@@ -6858,7 +7068,7 @@ impl LegacyResponseReadState {
                 "legacy response item has trailing bytes".into(),
             ));
         }
-        Ok(())
+        Ok(item)
     }
 
     fn validate_missing(
@@ -7536,7 +7746,10 @@ mod tests {
     use crate::{
         protocol::internal::{InventoryResponse, Response},
         zakura::{
-            legacy_gossip::{LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec},
+            legacy_gossip::{
+                LegacyGossipError, LegacyRequestFrame, LegacyRequestKind, LegacyResponseCodec,
+                RequestedInventory,
+            },
             testkit::{await_until, LocalEndpointFactory, ZakuraTestNode},
             Event, HeaderSyncMisbehavior, PeerSession, ServicePeerLimits,
             LOCAL_MAX_CONTROL_FRAME_BYTES, LOCAL_MAX_MESSAGE_BYTES, MAX_BS_FRAME_BYTES,
@@ -7864,6 +8077,7 @@ mod tests {
             let (_connected_tx, connected) = watch::channel(Vec::new());
             let discovery = discovery::build_discovery_handle(
                 secret_key.clone(),
+                None,
                 discovery_direct_addrs(config, local_node_id),
                 Vec::new(),
                 &ZakuraHandshakeConfig::for_network_with_dev_cohort(&config.network, None),
@@ -9180,6 +9394,7 @@ mod tests {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         let discovery = crate::zakura::discovery::build_discovery_handle(
             NodeSecretKey::generate(),
+            None,
             Vec::new(),
             crate::zakura::discovery::default_advertised_services(),
             &handshake,
@@ -9213,7 +9428,8 @@ mod tests {
     /// `P2pV2UpgradeAccept` (a unique, real iroh node id with a parseable but
     /// unreachable direct address) that never completes native Zakura
     /// registration. After the upgrade hand-off wait times out, no
-    /// maintain-forever native dial task or `upgrade_dials` entry may survive;
+    /// maintain-forever native dial task or `upgrade_dials` entry may survive
+    /// its in-flight attempt;
     /// otherwise repeating the failed upgrade with distinct node ids grows
     /// maintained dials and outbound QUIC traffic without bound.
     ///
@@ -9250,14 +9466,9 @@ mod tests {
             matches!(handoff, crate::zakura::ZakuraNativeHandoff::Failed),
             "an unreachable upgrade peer must not report a completed hand-off",
         );
-        assert!(
-            endpoint
-                .upgrade_dials
-                .lock()
-                .expect("Zakura upgrade dial registry mutex is never poisoned")
-                .is_empty(),
-            "a failed legacy upgrade leaked a maintained native dial / upgrade_dials entry",
-        );
+        // The cancelled dial starts no new attempt, so its in-flight one is
+        // the last.
+        upgrade_dials_end(&endpoint).await;
 
         endpoint.shutdown().await;
         Ok(())
@@ -9289,6 +9500,129 @@ mod tests {
         );
 
         endpoint.cancel_upgrade_native_dial(&peer_id);
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// Spawns a Zakura endpoint, and a loopback QUIC peer that serves an ALPN
+    /// no Zakura node offers. Returns both and the peer's hint.
+    async fn endpoint_and_other_cohort(
+        config: Config,
+        seed: u64,
+    ) -> Result<(ZakuraEndpoint, QuicEndpoint, NodeAddr), BoxError> {
+        let endpoint = spawn_zakura_endpoint(&config, |_supervisor, _trace| {
+            Arc::new(NoopService) as Arc<dyn Service>
+        })
+        .await?
+        .expect("v2_p2p is enabled in test config");
+        let other_cohort = LocalEndpointFactory::new().endpoint(seed).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(1);
+        let (stream_tx, _stream_rx) = mpsc::channel(1);
+        other_cohort.serve(CaptureConnection {
+            alpn: b"/zakura/another-cohort/0",
+            connection_tx,
+            stream_tx,
+        })?;
+        let hint = LocalEndpointFactory::node_addr(&other_cohort).await;
+        Ok((endpoint, other_cohort, hint))
+    }
+
+    /// Waits until `endpoint` owns no upgrade dial. A cancelled dial ends
+    /// within the bound of its in-flight attempt.
+    async fn upgrade_dials_end(endpoint: &ZakuraEndpoint) {
+        timeout(Duration::from_secs(30), async {
+            while endpoint.upgrade_dial_count() > 0 {
+                zakura_rt::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upgrade dial ends within one bounded attempt");
+    }
+
+    /// An upgrade dial to a peer-supplied address that speaks another ALPN
+    /// ends at once, and no upgrade dial to the same hint starts again until
+    /// the ten-minute floor ends (zakura-quic DIAL-5, V12 F-562, F-563). The
+    /// node ID alone is unauthenticated, so the same ID at other addresses
+    /// still dials.
+    #[tokio::test]
+    async fn alpn_mismatched_upgrade_dial_ends_and_holds_the_hint_floor() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let (endpoint, _other_cohort, hint) =
+            endpoint_and_other_cohort(Config::for_test(P2pStack::Dual), 0x0A17_0001).await?;
+        let peer_id = ZakuraPeerId::new(hint.id.as_bytes().to_vec())?;
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+        upgrade_dials_end(&endpoint).await;
+
+        tokio::time::pause();
+        let reordered = NodeAddr::with_addrs(hint.id, hint.direct.iter().rev().copied());
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(reordered),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+        );
+        tokio::time::advance(ZAKURA_ALPN_MISMATCH_BACKOFF - Duration::from_secs(1)).await;
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+        );
+        let planted = NodeAddr::with_addrs(
+            hint.id,
+            ["192.0.2.3:1".parse().expect("test direct address parses")],
+        );
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(planted),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+            "a floor from one hint blocked the same node ID at other addresses",
+        );
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        upgrade_dials_end(&endpoint).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        endpoint.shutdown().await;
+        Ok(())
+    }
+
+    /// A hand-off cancelled while a silent address delays the dial still
+    /// starts the floor when another address of the hint mismatches.
+    #[tokio::test]
+    async fn cancelled_upgrade_dial_still_holds_a_delayed_alpn_floor() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut config = Config::for_test(P2pStack::Dual);
+        config.zakura.quic.handshake_timeout_secs = Some(2);
+        let (endpoint, _other_cohort, hint) =
+            endpoint_and_other_cohort(config, 0x0A17_0002).await?;
+        let peer_id = ZakuraPeerId::new(hint.id.as_bytes().to_vec())?;
+        // A bound socket that never answers holds its attempt to the
+        // handshake deadline.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let hint = NodeAddr::with_addrs(
+            hint.id,
+            std::iter::once(silent.local_addr()?).chain(hint.direct.iter().copied()),
+        );
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint.clone()),
+            crate::zakura::ZakuraUpgradeDialStart::Started,
+        );
+        // The legacy handshake timeout drops the hand-off before the silent
+        // attempt ends.
+        zakura_rt::time::sleep(Duration::from_millis(500)).await;
+        endpoint.cancel_upgrade_native_dial(&peer_id);
+        upgrade_dials_end(&endpoint).await;
+
+        assert_eq!(
+            endpoint.start_upgrade_native_dial(hint),
+            crate::zakura::ZakuraUpgradeDialStart::AlpnBackoff,
+            "cancelling the hand-off discarded the mismatch",
+        );
         endpoint.shutdown().await;
         Ok(())
     }
@@ -11213,7 +11547,7 @@ mod tests {
                 legacy
                     .validate_frame(
                         1,
-                        &Frame {
+                        Frame {
                             message_type: LEGACY_RESPONSE_PONG,
                             flags: 0,
                             payload: 1u64.to_le_bytes().to_vec(),
@@ -12166,6 +12500,137 @@ mod tests {
         Ok(())
     }
 
+    /// Completed chunks hand their decoded allocation to the response codec,
+    /// while requested-inventory binding still runs at response assembly.
+    #[test]
+    fn legacy_transport_reuses_decoded_inventory() -> Result<(), BoxError> {
+        use zakura_node_services::block_memory::BlockHandle;
+
+        let limits = test_connection_limits();
+        let request_id = 99;
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let transaction = transaction::UnminedTx::from(block.transactions[0].clone());
+        let missing_hash = block_hash(99);
+        let missing_id = legacy_tx_id(99);
+        let cases = [
+            (
+                LegacyRequestFrame::BlocksByHash(vec![block.hash(), missing_hash]),
+                LegacyRequestKind::Blocks,
+                Response::Blocks(vec![
+                    InventoryResponse::Available((block.clone().into(), None)),
+                    InventoryResponse::Missing(missing_hash),
+                ]),
+                RequestedInventory::Blocks([block.hash(), missing_hash].into_iter().collect()),
+            ),
+            (
+                LegacyRequestFrame::TransactionsById(vec![transaction.id(), missing_id]),
+                LegacyRequestKind::Transactions,
+                Response::Transactions(vec![
+                    InventoryResponse::Available((transaction.clone(), None)),
+                    InventoryResponse::Missing(missing_id),
+                ]),
+                RequestedInventory::Transactions(
+                    [transaction.id(), missing_id].into_iter().collect(),
+                ),
+            ),
+        ];
+
+        for (request, kind, response, requested) in cases {
+            let request = request.encode_frame()?;
+            let budget =
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let item_bytes = match kind {
+                LegacyRequestKind::Blocks => BLOCK_TESTNET_141042_BYTES.len(),
+                LegacyRequestKind::Transactions => transaction.size(),
+                _ => unreachable!("the cases only fetch inventory"),
+            };
+            let frame_cap = u32::try_from(
+                FRAME_HEADER_BYTES + LEGACY_RESPONSE_CHUNK_HEADER_BYTES + item_bytes.div_ceil(2),
+            )?;
+            let frames = LegacyResponseCodec::encode_response(
+                request_id,
+                response.clone(),
+                frame_cap,
+                limits.max_message_bytes,
+            )?;
+            assert!(frames.len() > 2, "the available item spans multiple chunks");
+            let mut state = LegacyResponseReadState::new(budget);
+            let mut items = Vec::new();
+            for frame in frames {
+                if let Some(item) = state
+                    .validate_frame(request_id, frame)
+                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?
+                {
+                    items.push(item);
+                }
+            }
+            state
+                .finish()
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            assert_eq!(
+                items.len(),
+                2,
+                "raw chunks are replaced by one decoded item"
+            );
+
+            let decoded = match &items[0] {
+                LegacyResponseItem::Block(block) => LegacyResponseItem::Block(block.clone()),
+                LegacyResponseItem::Transaction(transaction) => {
+                    LegacyResponseItem::Transaction(transaction.clone())
+                }
+                LegacyResponseItem::Frame(_) => panic!("the reader decoded the available item"),
+            };
+            let unrelated = match kind {
+                LegacyRequestKind::Blocks => RequestedInventory::Blocks(Default::default()),
+                LegacyRequestKind::Transactions => {
+                    RequestedInventory::Transactions(Default::default())
+                }
+                _ => unreachable!("the cases only fetch inventory"),
+            };
+            assert!(matches!(
+                LegacyResponseCodec::decode_response(request_id, kind, [decoded], Some(&unrelated),),
+                Err(LegacyGossipError::UnsolicitedBlock(_)
+                    | LegacyGossipError::UnsolicitedTransaction(_))
+            ));
+
+            // Keep a handle only to verify that assembly reuses the allocation.
+            let (decoded_block, decoded_transaction) = match &items[0] {
+                LegacyResponseItem::Block(block) => (Some(block.clone()), None),
+                LegacyResponseItem::Transaction(transaction) => {
+                    (None, Some(transaction.transaction().clone()))
+                }
+                LegacyResponseItem::Frame(_) => unreachable!("the item is decoded"),
+            };
+            let assembled =
+                LegacyResponseCodec::decode_response(request_id, kind, items, Some(&requested))?;
+            assert_eq!(assembled, response);
+            match assembled {
+                Response::Blocks(blocks) => {
+                    let InventoryResponse::Available((BlockHandle::Shared(block), None)) =
+                        &blocks[0]
+                    else {
+                        panic!("the available block remains shared");
+                    };
+                    assert!(Arc::ptr_eq(block, &decoded_block.unwrap()));
+                }
+                Response::Transactions(transactions) => {
+                    let InventoryResponse::Available((transaction, None)) = &transactions[0] else {
+                        panic!("the first transaction is available");
+                    };
+                    assert!(Arc::ptr_eq(
+                        transaction.transaction(),
+                        &decoded_transaction.unwrap(),
+                    ));
+                }
+                _ => unreachable!("the cases only fetch inventory"),
+            }
+        }
+        Ok(())
+    }
+
     /// A block response whose stream ends mid-item is request-local, but a list
     /// frame interleaved into the unfinished item stays connection-fatal.
     #[test]
@@ -12191,7 +12656,7 @@ mod tests {
 
         let mut ended = state();
         ended
-            .validate_frame(request_id, &first_chunk)
+            .validate_frame(request_id, first_chunk.clone())
             .expect("a non-final chunk is accepted");
         let finished = ended.finish();
         assert!(
@@ -12201,7 +12666,7 @@ mod tests {
 
         let mut interleaved = state();
         interleaved
-            .validate_frame(request_id, &first_chunk)
+            .validate_frame(request_id, first_chunk.clone())
             .expect("a non-final chunk is accepted");
         let mut missing = request_id.to_le_bytes().to_vec();
         missing.push(0);
@@ -12210,7 +12675,7 @@ mod tests {
             flags: 0,
             payload: missing,
         };
-        let result = interleaved.validate_frame(request_id, &missing);
+        let result = interleaved.validate_frame(request_id, missing.clone());
         assert!(
             matches!(result, Err(OutboundRequestError::Fatal(_))),
             "a frame interleaved into an unfinished item must stay Fatal; got {result:?}"
@@ -12247,47 +12712,57 @@ mod tests {
                 }),
             );
             if remaining != 0 {
-                state.validate_frame(1, &frame).unwrap();
+                state.validate_frame(1, frame.clone()).unwrap();
             }
         }
     }
 
-    /// F-37: the transport-level check rejects a valid transaction padded with
-    /// junk bytes as a fatal peer fault.
+    /// The reader rejects trailing bytes before handing off decoded inventory.
     #[test]
     fn legacy_completed_item_rejects_trailing_bytes() -> Result<(), BoxError> {
         let limits = test_connection_limits();
         let request_id = 99;
         let transaction = transaction::UnminedTx::from(empty_v5_transaction(24));
-        let request_frame =
-            LegacyRequestFrame::TransactionsById(vec![transaction.id()]).encode_frame()?;
-        let budget = LegacyResponseBudget::from_request(
-            request_frame.message_type,
-            &request_frame.payload,
-            limits,
-        )
-        .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
-        let mut frames = LegacyResponseCodec::encode_response(
-            request_id,
-            Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
-            limits.max_frame_bytes,
-            limits.max_message_bytes,
-        )?;
-        let [frame] = frames.as_mut_slice() else {
-            panic!("a small transaction encodes as one frame");
-        };
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        )?);
+        let cases = [
+            (
+                LegacyRequestFrame::TransactionsById(vec![transaction.id()]),
+                Response::Transactions(vec![InventoryResponse::Available((transaction, None))]),
+            ),
+            (
+                LegacyRequestFrame::BlocksByHash(vec![block.hash()]),
+                Response::Blocks(vec![InventoryResponse::Available((block.into(), None))]),
+            ),
+        ];
+        for (request, response) in cases {
+            let request = request.encode_frame()?;
+            let budget =
+                LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
+                    .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let mut frames = LegacyResponseCodec::encode_response(
+                request_id,
+                response,
+                limits.max_frame_bytes,
+                limits.max_message_bytes,
+            )?;
+            let [frame] = frames.as_mut_slice() else {
+                panic!("a small inventory item encodes as one frame");
+            };
 
-        let mut state = LegacyResponseReadState::new(budget);
-        state
-            .validate_frame(request_id, frame)
-            .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            let mut state = LegacyResponseReadState::new(budget);
+            state
+                .validate_frame(request_id, frame.clone())
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
 
-        frame.payload.extend_from_slice(&[0; 16]);
-        let mut state = LegacyResponseReadState::new(budget);
-        assert!(matches!(
-            state.validate_frame(request_id, frame),
-            Err(OutboundRequestError::Fatal(_)),
-        ));
+            frame.payload.extend_from_slice(&[0; 16]);
+            let mut state = LegacyResponseReadState::new(budget);
+            assert!(matches!(
+                state.validate_frame(request_id, frame.clone()),
+                Err(OutboundRequestError::Fatal(_)),
+            ));
+        }
 
         Ok(())
     }
@@ -12312,9 +12787,11 @@ mod tests {
             limits.max_frame_bytes,
             limits.max_message_bytes,
         )?;
-        LegacyResponseCodec::decode_response(request_id, request_kind, frames.clone(), None)?;
+        let expected =
+            LegacyResponseCodec::decode_response(request_id, request_kind, frames.clone(), None)?;
 
         let mut state = LegacyResponseReadState::new(budget);
+        let mut items = Vec::new();
         for frame in &frames {
             FrameFilter::new(None, InboundReader::Requester)
                 .with_precheck(Some(&state))
@@ -12324,13 +12801,20 @@ mod tests {
                     frame.payload.len(),
                     usize::MAX,
                 )?;
-            state
-                .validate_frame(request_id, frame)
-                .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+            if let Some(item) = state
+                .validate_frame(request_id, frame.clone())
+                .map_err(|error| -> BoxError { format!("{error:?}").into() })?
+            {
+                items.push(item);
+            }
         }
         state
             .finish()
             .map_err(|error| -> BoxError { format!("{error:?}").into() })?;
+        assert_eq!(
+            LegacyResponseCodec::decode_response(request_id, request_kind, items, None)?,
+            expected,
+        );
 
         Ok(())
     }
@@ -12601,7 +13085,7 @@ mod tests {
                     .expect("a FindBlocks request has a known response kind"),
             );
 
-            let result = state.validate_frame(request_id, &frame);
+            let result = state.validate_frame(request_id, frame.clone());
             if fatal {
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
@@ -12627,7 +13111,7 @@ mod tests {
             LegacyResponseBudget::from_request(request.message_type, &request.payload, limits)
                 .expect("a FindBlocks request has a known response kind"),
         );
-        let result = state.validate_frame(request_id, &frame);
+        let result = state.validate_frame(request_id, frame.clone());
         assert!(
             matches!(result, Err(OutboundRequestError::Fatal(_))),
             "a repeated hash must be Fatal; got {result:?}"
@@ -12672,8 +13156,8 @@ mod tests {
 
             let mut lone = LegacyResponseReadState::new(budget());
             let result = lone
-                .validate_frame(request_id, &nil(request_id))
-                .and_then(|()| lone.finish());
+                .validate_frame(request_id, nil(request_id))
+                .and_then(|_| lone.finish());
             if fatal {
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
@@ -12687,7 +13171,7 @@ mod tests {
             }
 
             let wrong_id = LegacyResponseReadState::new(budget())
-                .validate_frame(request_id, &nil(request_id + 1));
+                .validate_frame(request_id, nil(request_id + 1));
             assert!(
                 matches!(wrong_id, Err(OutboundRequestError::Fatal(_))),
                 "a wrong-id NIL to {request:?} must stay Fatal; got {wrong_id:?}",
@@ -12708,9 +13192,9 @@ mod tests {
 
                 let mut after_items = LegacyResponseReadState::new(budget());
                 after_items
-                    .validate_frame(request_id, &missing())
+                    .validate_frame(request_id, missing())
                     .expect("a missing entry is accepted");
-                let result = after_items.validate_frame(request_id, &nil(request_id));
+                let result = after_items.validate_frame(request_id, nil(request_id));
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
                     "NIL after inventory frames must stay Fatal; got {result:?}",
@@ -12718,9 +13202,9 @@ mod tests {
 
                 let mut before_items = LegacyResponseReadState::new(budget());
                 before_items
-                    .validate_frame(request_id, &nil(request_id))
+                    .validate_frame(request_id, nil(request_id))
                     .expect("a first NIL is held until the stream ends");
-                let result = before_items.validate_frame(request_id, &missing());
+                let result = before_items.validate_frame(request_id, missing());
                 assert!(
                     matches!(result, Err(OutboundRequestError::Fatal(_))),
                     "inventory frames after NIL must stay Fatal; got {result:?}",

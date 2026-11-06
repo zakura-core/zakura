@@ -552,7 +552,9 @@ work. Stage 2 runs after TLS proves the `NodeId` and is today's Zakura logic.
   node doesn't redial another cohort in a loop. The backoff applies to the
   node ID, whatever addresses its later records advertise. Each address keeps
   the ordinary dial backoff, because the dial error doesn't say which address
-  mismatched.
+  mismatched. A legacy upgrade hint isn't signed, and the mismatch fails before
+  TLS authenticates the node ID, so a hint's backoff applies to that node ID
+  and address set only.
 - **DIAL-6.** The dialer's admitted IP is the address of the winning attempt.
 - **DIAL-7.** A connection uses one path. `quinn-proto` has no multipath.
 

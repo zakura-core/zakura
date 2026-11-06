@@ -838,6 +838,9 @@ impl ZakuraDiscoveryEntry {
     ///
     /// An entry with a confirmed address is eligible for peer samples. A
     /// replacement record keeps only the confirmed addresses it still lists.
+    /// A record that replaces an expired one without a higher sequence keeps
+    /// none, and only the replacing import's own authenticated addresses are
+    /// confirmed.
     pub fn confirmed_addrs(&self) -> &[SocketAddr] {
         &self.confirmed_addrs
     }
@@ -3130,7 +3133,7 @@ impl DialCandidateRef<'_> {
         match self {
             Self::SignedRecord(entry) => ZakuraDiscoveryDialCandidate {
                 node_id: entry.record.body.node_id,
-                direct_addrs: entry.record.body.direct_addrs.clone(),
+                direct_addrs: confirmed_first(entry),
                 is_static: entry.is_static,
             },
             Self::StaticConfigured(candidate) => ZakuraDiscoveryDialCandidate {
@@ -3228,6 +3231,18 @@ fn import_metadata(
     }
 }
 
+/// `entry`'s record addresses with the confirmed ones first, each group in
+/// record order.
+///
+/// The candidate dialer dials only the first address of each IP, so on an IP
+/// with a confirmed address it dials that address rather than another port
+/// the record lists there.
+fn confirmed_first(entry: &ZakuraDiscoveryEntry) -> Vec<SocketAddr> {
+    let mut addrs = entry.record.body.direct_addrs.clone();
+    addrs.sort_by_key(|addr| !entry.confirmed_addrs.contains(&canonical_addr(*addr)));
+    addrs
+}
+
 /// `addr` with an IPv4-mapped IPv6 address in its IPv4 form, so a connection's
 /// remote address matches the record address it reached.
 fn canonical_addr(addr: SocketAddr) -> SocketAddr {
@@ -3285,7 +3300,13 @@ fn update_existing_entry(
 
     // Confirmation attaches to addresses, not to the node identity: a later
     // record keeps the confirmed addresses it still lists, and an import adds
-    // only the addresses it authenticated.
+    // only the addresses it authenticated. A record that replaces an expired
+    // one without a higher sequence is a reset or a replay, not a newer
+    // version of the confirmed record, so it keeps only what this import
+    // authenticates.
+    if !stored_orders && incoming_sequence <= stored_sequence {
+        entry.confirmed_addrs.clear();
+    }
     let outcome = if same_sequence {
         ImportOutcome::MetadataUpdated
     } else {
@@ -8122,6 +8143,118 @@ mod tests {
                 .expect("entry is stored")
                 .confirmed_addrs(),
             &[reached]
+        );
+    }
+
+    /// V12 F-571: a lower-sequence record that replaces an expired one, here
+    /// from a relay, doesn't inherit the expired record's confirmations. A
+    /// newer record keeps the confirmed addresses it still lists.
+    #[test]
+    fn an_expired_record_takes_its_confirmations_with_it() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let secret = secret_key();
+        let node_id = secret.public();
+        let (authenticated, other) = (test_addr(1), test_addr(2));
+        let record_at = |sequence, expires| {
+            let mut record_body = body(&secret);
+            record_body.sequence = sequence;
+            record_body.expires_at_unix_secs = expires;
+            record_body.direct_addrs = vec![authenticated, other];
+            ZakuraNodeRecord::sign(record_body, &secret).expect("test record signs")
+        };
+
+        // A live record's newer replacement, here from a relay, keeps the
+        // confirmed address it still lists.
+        import_hello(&mut book, record_at(5, NOW + 60), NOW).expect("the hello imports");
+        assert_eq!(
+            book.import_record(
+                record_at(6, NOW + 60),
+                Some(test_requester()),
+                NOW,
+                &context()
+            )
+            .expect("the newer record imports"),
+            ImportOutcome::Updated
+        );
+        assert_eq!(
+            book.get(&node_id)
+                .expect("entry is stored")
+                .confirmed_addrs(),
+            &[authenticated]
+        );
+
+        // Once that record expires, a relayed lower-sequence record replaces
+        // it and confirms nothing.
+        let later = NOW + 61;
+        let later_context = DiscoveryRecordValidationContext {
+            current_unix_secs: later,
+            ..context()
+        };
+        assert_eq!(
+            book.import_record(
+                record_at(1, later + 60),
+                Some(test_requester()),
+                later,
+                &later_context
+            )
+            .expect("the reset record imports"),
+            ImportOutcome::Updated
+        );
+        let entry = book.get(&node_id).expect("entry is stored");
+        assert_eq!(entry.record().body.sequence, 1);
+        assert!(!entry.is_confirmed());
+        assert!(book
+            .sample_peers(10, &[], &[], later, test_requester())
+            .is_empty());
+
+        // A `Hello` from the other address's IP confirms only that address.
+        import_hello_from(&mut book, record_at(1, later + 60), Some(other.ip()), later)
+            .expect("the hello imports");
+        assert_eq!(
+            book.get(&node_id)
+                .expect("entry is stored")
+                .confirmed_addrs(),
+            &[other]
+        );
+    }
+
+    /// The dial candidate lists an entry's confirmed addresses first, so the
+    /// candidate dialer, which dials the first address of each IP, picks the
+    /// confirmed port on a shared IP.
+    #[test]
+    fn dial_candidates_list_confirmed_addresses_first() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let secret = secret_key();
+        let node_id = secret.public();
+        let (unconfirmed, confirmed) = (test_addr(1), SocketAddr::new(test_addr(1).ip(), 18233));
+        let other_ip = test_addr(2);
+        let record = record_listing(&secret, 1, vec![unconfirmed, confirmed, other_ip]);
+        book.import_record(record, Some(test_requester()), NOW, &context())
+            .expect("the gossiped record imports");
+        book.mark_dial_success(&node_id, Some(confirmed), NOW);
+
+        let candidates = book.dial_candidates(
+            10,
+            &[],
+            &[],
+            DialCandidateExclusions {
+                connected_node_ids: &[],
+                in_flight_node_ids: &[],
+            },
+            NOW,
+            (
+                DEFAULT_DISCOVERY_DIAL_BACKOFF_BASE,
+                DEFAULT_DISCOVERY_DIAL_BACKOFF_MAX,
+            ),
+            &mut StdRng::seed_from_u64(7),
+        );
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.node_id == node_id)
+            .expect("the entry is a dial candidate");
+        assert_eq!(
+            candidate.direct_addrs,
+            vec![confirmed, unconfirmed, other_ip]
         );
     }
 

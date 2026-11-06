@@ -277,6 +277,11 @@ impl BookModel {
                 entry.source = incoming;
             }
             entry.last_seen = now;
+            // A reset or replayed record over an expired one inherits no
+            // confirmation.
+            if !stored_orders && sequence <= entry.sequence {
+                entry.confirmed = false;
+            }
             entry.confirmed |= first_party;
             if same_sequence {
                 return ImportFact::MetadataUpdated;

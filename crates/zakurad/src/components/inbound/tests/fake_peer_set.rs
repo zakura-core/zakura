@@ -1696,6 +1696,7 @@ async fn setup_with_misbehavior_receiver(
             peer_set.clone(),
             read_only_state_service,
             Some(submitblock_channel.receiver()),
+            zakura_rpc::MinedSubmissions::default(),
         )
         .in_current_span(),
     );

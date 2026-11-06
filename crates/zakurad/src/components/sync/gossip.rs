@@ -13,7 +13,7 @@ use tracing::Instrument;
 use zakura_chain::{block, chain_tip::ChainTip};
 use zakura_network as zn;
 use zakura_node_services::task::spawn_erased;
-use zakura_rpc::MinedBlockEvent;
+use zakura_rpc::{MinedBlockEvent, MinedSubmissions};
 use zakura_state::{self as zs, ChainTipChange};
 
 use crate::{components::sync::SyncStatus, BoxError};
@@ -77,6 +77,28 @@ async fn next_gossip_event<T>(
     }
 }
 
+/// Returns a mined-block event queued after the selector polled its channel, instead of a
+/// committed tip that resolved in the same poll.
+///
+/// A local submission's final event can arrive, and its reservation be released, between those
+/// two polls, so the tip path no longer waits for it. Preferring the queued event keeps the block
+/// on the mined path. The committed tip is not lost: the gossip state only records a tip taken
+/// from the committed path, so the next iteration observes it again.
+fn prefer_queued_mined_block<T, E>(
+    event: GossipEvent<Result<T, E>>,
+    mined_block_receiver: Option<&mut mpsc::UnboundedReceiver<MinedBlockEvent>>,
+) -> GossipEvent<Result<T, E>> {
+    match event {
+        GossipEvent::CommittedTip(Ok(tip)) => {
+            match mined_block_receiver.and_then(|receiver| receiver.try_recv().ok()) {
+                Some(mined) => GossipEvent::MinedBlock(mined),
+                None => GossipEvent::CommittedTip(Ok(tip)),
+            }
+        }
+        other => other,
+    }
+}
+
 /// Errors that can occur when gossiping committed blocks
 #[derive(Error, Debug)]
 pub enum BlockGossipError {
@@ -101,6 +123,9 @@ pub enum BlockGossipError {
 ///
 /// Each advertisement carries the block's serialized size, which sizes the legacy broadcast. Mined-block events carry the size; committed tips read it from `read_state`.
 ///
+/// `local_submissions` are the blocks `submitblock` is submitting, shared with the RPC. Only a tip
+/// change to one of them waits for its mined-block event.
+///
 /// [`block::Hash`]: zakura_chain::block::Hash
 pub async fn gossip_best_tip_block_hashes<ZN, RS>(
     sync_status: SyncStatus,
@@ -108,6 +133,7 @@ pub async fn gossip_best_tip_block_hashes<ZN, RS>(
     broadcast_network: ZN,
     read_state: RS,
     mut mined_block_receiver: Option<mpsc::UnboundedReceiver<MinedBlockEvent>>,
+    local_submissions: MinedSubmissions,
 ) -> Result<(), BlockGossipError>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Clone + 'static,
@@ -146,9 +172,10 @@ where
         let mut sync_status = sync_status.clone();
         let mut chain_tip = chain_state.clone_for_task();
 
+        let local_submissions = local_submissions.clone();
         // TODO: Move the contents of this async block to its own method
         let tip_change_close_to_network_tip_fut = async move {
-            /// A brief duration to wait after a tip change for a new message in the mined block channel.
+            /// A brief duration to wait after a local submission's tip change for its mined-block event.
             const WAIT_FOR_BLOCK_SUBMISSION_DELAY: Duration = Duration::from_micros(100);
 
             // Block gossip has no delay between successive blocks: every relay hop that waits
@@ -157,9 +184,13 @@ where
             // wait for at least one tip change, to make sure we have a new block hash to broadcast
             let tip_action = chain_tip.wait_for_tip_change().await.map_err(TipChange)?;
 
-            // wait for block submissions to be received through the `mined_block_receiver` if the tip
-            // change is from a block submission.
-            tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
+            // A local submission commits, and so changes the tip, before `submitblock` sends its
+            // mined-block event. Wait briefly for that event, so the block is broadcast as a mined
+            // block. A relayed block has no such event, so it does not wait: the timer rounds the
+            // delay up to about a millisecond, which every relay hop would add.
+            if local_submissions.contains(&tip_action.best_tip_hash_and_height().0) {
+                tokio::time::sleep(WAIT_FOR_BLOCK_SUBMISSION_DELAY).await;
+            }
 
             // wait until we're close to the tip, because broadcasts are only useful for nodes near the tip
             // (if they're a long way from the tip, they use the syncer and block locators), unless a mined block
@@ -185,14 +216,15 @@ where
         // Prefer mined-block completions and submissions when multiple
         // branches are ready. The committed-tip path is a fallback, so
         // selecting it first can duplicate a mined-block broadcast.
+        let event = next_gossip_event(
+            mined_block_receiver.as_mut(),
+            &mut mined_block_completion_receiver,
+            tip_change_close_to_network_tip_fut,
+        )
+        .await;
+        let event = prefer_queued_mined_block(event, mined_block_receiver.as_mut());
         let (((hash, height), log_msg, updated_chain_state), is_block_submission, early, size) =
-            match next_gossip_event(
-                mined_block_receiver.as_mut(),
-                &mut mined_block_completion_receiver,
-                tip_change_close_to_network_tip_fut,
-            )
-            .await
-            {
+            match event {
                 GossipEvent::MinedBlockBroadcastCompleted(completed) => {
                     finish_mined_block_broadcast(
                         completed,
@@ -422,7 +454,8 @@ impl MinedBlockBroadcasts {
 #[cfg(test)]
 mod tests {
     use super::{
-        next_gossip_event, GossipEvent, MinedBlockBroadcastCompleted, MinedBlockBroadcasts,
+        next_gossip_event, prefer_queued_mined_block, GossipEvent, MinedBlockBroadcastCompleted,
+        MinedBlockBroadcasts,
     };
 
     use std::future;
@@ -493,6 +526,79 @@ mod tests {
 
             assert!(matches!(event, GossipEvent::CommittedTip("committed tip")));
         }
+    }
+
+    /// A local submission's final event can be queued after the selector polled the mined-block
+    /// channel and before the committed tip resolved in the same poll. The queued event still
+    /// wins, so the block stays on the mined path.
+    #[tokio::test]
+    async fn mined_block_queued_while_the_tip_resolves_is_preferred() {
+        let submitted_hash = block::Hash([3; 32]);
+        let (mined_block_sender, mut mined_block_receiver) = mpsc::unbounded_channel();
+        let (_mark_sender, mut mark_receiver) = mpsc::unbounded_channel();
+
+        // The RPC sends its final event while the tip future is polled, after the selector found
+        // the mined-block channel empty.
+        let tip = async {
+            mined_block_sender
+                .send(MinedBlockEvent::Committed {
+                    hash: submitted_hash,
+                    height: block::Height(3),
+                    size: 1_000,
+                })
+                .unwrap();
+            Ok::<_, ()>("committed tip")
+        };
+        let event =
+            next_gossip_event(Some(&mut mined_block_receiver), &mut mark_receiver, tip).await;
+        assert!(
+            matches!(event, GossipEvent::CommittedTip(Ok("committed tip"))),
+            "the selector polled the empty channel first"
+        );
+
+        let event = prefer_queued_mined_block(event, Some(&mut mined_block_receiver));
+        assert!(matches!(
+            event,
+            GossipEvent::MinedBlock(MinedBlockEvent::Committed { hash, .. }) if hash == submitted_hash
+        ));
+    }
+
+    /// Without a queued mined-block event, a committed tip is used, and a failed tip is not
+    /// replaced.
+    #[test]
+    fn committed_tip_is_kept_without_a_queued_mined_block() {
+        let (mined_block_sender, mut mined_block_receiver) = mpsc::unbounded_channel();
+
+        let event = prefer_queued_mined_block(
+            GossipEvent::CommittedTip(Ok::<_, ()>("committed tip")),
+            Some(&mut mined_block_receiver),
+        );
+        assert!(matches!(
+            event,
+            GossipEvent::CommittedTip(Ok("committed tip"))
+        ));
+
+        mined_block_sender
+            .send(MinedBlockEvent::Committed {
+                hash: block::Hash([4; 32]),
+                height: block::Height(4),
+                size: 1_000,
+            })
+            .unwrap();
+        let event = prefer_queued_mined_block(
+            GossipEvent::CommittedTip(Err::<&str, _>("tip error")),
+            Some(&mut mined_block_receiver),
+        );
+        assert!(matches!(event, GossipEvent::CommittedTip(Err("tip error"))));
+
+        let event = prefer_queued_mined_block(
+            GossipEvent::CommittedTip(Ok::<_, ()>("committed tip")),
+            None,
+        );
+        assert!(matches!(
+            event,
+            GossipEvent::CommittedTip(Ok("committed tip"))
+        ));
     }
 
     #[test]

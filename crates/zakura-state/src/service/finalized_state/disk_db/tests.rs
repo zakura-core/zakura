@@ -5,8 +5,11 @@
 
 use std::{cell::Cell, io, ops::Deref, sync::atomic::Ordering};
 
+use rocksdb::ErrorKind;
 use semver::Version;
 use zakura_chain::parameters::Network;
+
+use super::{prefix_end, MAX_SKIPPED_KEYS_PER_PREFIX_SEEK};
 
 use crate::{
     service::finalized_state::disk_db::{format_bytes, DiskDb, DB},
@@ -208,4 +211,118 @@ fn file_limit_query_errors_cannot_fabricate_capacity() {
         |_| Err(io::ErrorKind::PermissionDenied.into()),
         || Err(io::ErrorKind::PermissionDenied.into()),
     );
+}
+
+/// Multi-prefix scans return exactly the rows of one bounded range scan per prefix, both on the
+/// one-iterator path and on the bounded fallback taken after many deleted keys.
+#[test]
+fn raw_prefixes_match_one_range_scan_per_prefix() {
+    let _init_guard = zakura_test::init();
+    let db = DiskDb::new(
+        &Config::ephemeral(),
+        "raw-prefixes-test",
+        &Version::new(1, 0, 0),
+        &Network::Mainnet,
+        ["raw_prefixes".to_owned()],
+        false,
+    )
+    .expect("the ephemeral database configuration is valid");
+    let cf = db
+        .cf_handle("raw_prefixes")
+        .expect("the test column family was configured");
+
+    let keys: [&[u8]; 9] = [
+        b"\x00",
+        b"\x00a",
+        b"\x00a\xff",
+        b"\x00b",
+        b"\x01a",
+        b"\x01a\x00",
+        b"\x02",
+        b"\xff",
+        b"\xff\xff",
+    ];
+    for (index, key) in keys.iter().enumerate() {
+        db.put_cf(cf, key, [u8::try_from(index).expect("few keys")])
+            .expect("writing a test row should succeed");
+    }
+    // A deleted row must stay invisible, like in a bounded range scan.
+    db.delete_cf(cf, b"\x01a")
+        .expect("deleting a test row should succeed");
+
+    let prefixes: [&[u8]; 9] = [
+        b"\x00a",
+        b"\x01",
+        b"\x01b",
+        b"\x00",
+        b"\x01c",
+        b"\xff",
+        b"\xff\xff",
+        b"",
+        b"\x03",
+    ];
+    let expected = || {
+        prefixes
+            .iter()
+            .flat_map(|prefix| {
+                db.raw_range_cf(&cf, prefix, prefix_end(prefix).as_deref())
+                    .expect("range scans of the test family succeed")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        db.raw_prefixes_cf_with_one_iterator(&cf, &prefixes)
+            .expect("few deleted keys keep the one-iterator path"),
+        expected()
+    );
+    assert_eq!(
+        db.raw_prefixes_cf(&cf, &prefixes)
+            .expect("prefix scans of the test family succeed"),
+        expected()
+    );
+
+    // A run of deleted keys shorter than the limit keeps the one-iterator path, in memory and on disk.
+    for index in 0..MAX_SKIPPED_KEYS_PER_PREFIX_SEEK / 2 {
+        let key = [b"\x01b".as_slice(), &index.to_be_bytes()].concat();
+        db.put_cf(cf, &key, [0])
+            .expect("writing a test row should succeed");
+        db.delete_cf(cf, &key)
+            .expect("deleting a test row should succeed");
+    }
+    db.flush_cf(cf)
+        .expect("flushing the test column family should succeed");
+    db.put_cf(cf, b"\x01b", [0xb])
+        .expect("writing a test row should succeed");
+    assert_eq!(
+        db.raw_prefixes_cf_with_one_iterator(&cf, &prefixes)
+            .expect("a short run of deleted keys keeps the one-iterator path"),
+        expected()
+    );
+
+    // A longer run of deleted keys under `\x01d` makes one seek or step skip more than the limit,
+    // so the scan falls back to bounded per-prefix iterators.
+    for index in 0..=MAX_SKIPPED_KEYS_PER_PREFIX_SEEK {
+        let key = [b"\x01d".as_slice(), &index.to_be_bytes()].concat();
+        db.put_cf(cf, &key, [0])
+            .expect("writing a test row should succeed");
+        db.delete_cf(cf, &key)
+            .expect("deleting a test row should succeed");
+    }
+    for flush in [false, true] {
+        if flush {
+            db.flush_cf(cf)
+                .expect("flushing the test column family should succeed");
+        }
+        assert_eq!(
+            db.raw_prefixes_cf_with_one_iterator(&cf, &prefixes)
+                .expect_err("the unbounded seek skips too many deleted keys")
+                .kind(),
+            ErrorKind::Incomplete
+        );
+        assert_eq!(
+            db.raw_prefixes_cf(&cf, &prefixes)
+                .expect("the bounded fallback succeeds"),
+            expected()
+        );
+    }
 }

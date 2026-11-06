@@ -110,10 +110,9 @@ pub(super) fn transparent_spends_are_unique(block: &BlockRef) -> Result<(), Vali
     for transaction in block.transactions() {
         for outpoint in transaction.spent_outpoints() {
             if spent.contains(&outpoint) {
-                return Err(ValidateContextError::DuplicateTransparentSpend {
+                return Err(ValidateContextError::duplicate_transparent_spend_in_block(
                     outpoint,
-                    location: "the same block",
-                });
+                ));
             }
         }
         // Insert only after checking this transaction, so an internal duplicate does

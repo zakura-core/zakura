@@ -139,28 +139,41 @@ impl SendStream {
     /// stream, or with the close reason once the connection closes.
     ///
     /// The future doesn't borrow the handle, so a caller can make it once and
-    /// keep it across writes. It costs no task and no allocation. A stop that
-    /// arrives after [`finish`](Self::finish), [`reset`](Self::reset) or a
-    /// drop never resolves it.
+    /// keep it across writes. It costs no task, and a stop wakes only this
+    /// stream's waiters. A stop that arrives after [`finish`](Self::finish),
+    /// [`reset`](Self::reset) or a drop never resolves it.
     pub fn stopped(
         &self,
     ) -> impl Future<Output = Result<VarInt, ConnectionError>> + Send + 'static {
         let shared = self.conn.shared.clone();
-        let id = self.id;
+        // Subscribe now, so the slot exists only while the handle can write.
+        // The connection task drops it when the handle finishes, resets or
+        // drops.
+        let mut stop = (self.state == SendState::Open).then(|| shared.watch_stop(self.id));
         async move {
-            let mut stopped = shared.stopped.subscribe();
             let mut closed = shared.closed.subscribe();
             loop {
-                if let Some(&code) = stopped.borrow_and_update().get(&id) {
+                if let Some(code) = stop.as_mut().and_then(|stop| *stop.borrow_and_update()) {
                     return Ok(code);
                 }
                 if let Some(error) = closed.borrow_and_update().clone() {
                     return Err(error);
                 }
-                // `shared` keeps both senders alive, so neither wait fails.
+                // `shared` keeps the close sender alive, so its wait can't
+                // fail. A failed stop wait means the slot dropped, and only
+                // the close can resolve this future from then on.
                 zakura_rt::select! {
                     biased;
-                    _ = stopped.changed() => {}
+                    changed = async {
+                        match stop.as_mut() {
+                            Some(stop) => stop.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if changed.is_err() {
+                            stop = None;
+                        }
+                    }
                     _ = closed.changed() => {}
                 }
             }

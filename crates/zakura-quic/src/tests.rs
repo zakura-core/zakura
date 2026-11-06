@@ -1537,8 +1537,9 @@ async fn blocked_write_fails_when_the_peer_stops() {
 }
 
 /// API-5, DRV-9: `stopped` resolves with the peer's code while the writer
-/// writes nothing, a stop before accept resolves it at once, and a closed
-/// connection resolves it with the close reason.
+/// writes nothing, a stop before accept resolves it at once, a dropped
+/// handle's waiter stays pending, and a closed connection resolves every
+/// waiter with the close reason.
 #[tokio::test]
 async fn stopped_resolves_on_the_peer_stop_and_on_close() {
     tokio::time::timeout(TEST_TIMEOUT, async {
@@ -1559,10 +1560,18 @@ async fn stopped_resolves_on_the_peer_stop_and_on_close() {
         let (accepted, _accepted_recv) = conn.accept_bi().await.unwrap();
         assert_eq!(accepted.stopped().await, Ok(VarInt::from_u32(11)));
 
+        // A dropped handle's waiter resolves only at the close.
+        let (dropped, _dropped_recv) = conn.open_bi().await.unwrap();
+        let mut orphaned = Box::pin(dropped.stopped());
+        drop(dropped);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(futures::poll!(&mut orphaned).is_pending());
+
         let (live, _live_recv) = conn.open_bi().await.unwrap();
         let stopped = live.stopped();
         conn.close(VarInt::from_u32(0), b"done");
         assert_eq!(stopped.await, Err(crate::ConnectionError::LocallyClosed));
+        assert_eq!(orphaned.await, Err(crate::ConnectionError::LocallyClosed));
     })
     .await
     .unwrap();

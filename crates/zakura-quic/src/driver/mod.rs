@@ -24,7 +24,7 @@ use zakura_rt::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        counter, mpsc, oneshot, watch, Notify,
+        counter, mpsc, oneshot, watch, Mutex, MutexGuard, Notify, PoisonError,
     },
 };
 
@@ -130,16 +130,18 @@ pub(crate) type ReadReply = Result<Option<Vec<Bytes>>, ReadError>;
 pub(crate) struct ConnShared {
     /// Set once, when the connection closes.
     pub(crate) closed: watch::Sender<Option<ConnectionError>>,
-    /// The peer's STOP_SENDING code for each stream this node reset in
-    /// answer, or will reset once it is accepted, until the handle finishes,
-    /// resets or drops it. A later write gets `Stopped(code)` instead of the
-    /// reset stream's `ClosedStream`, and [`SendStream::stopped`] resolves.
+    /// One slot per stream that a [`SendStream::stopped`] waits on or that
+    /// the peer stopped. A slot holds the peer's STOP_SENDING code once this
+    /// node reset the stream in answer, or will reset it once it is accepted.
+    /// A later write gets `Stopped(code)` instead of the reset stream's
+    /// `ClosedStream`, and [`SendStream::stopped`] resolves.
     ///
-    /// Only the connection task changes it. It notifies receivers only when
-    /// it adds a code, because only an added code resolves a waiter.
+    /// The connection task drops a stream's slot once the handle finishes,
+    /// resets or drops it. Each stream has its own slot, so a stop wakes
+    /// only that stream's waiters, not every waiter on the connection.
     ///
     /// [`SendStream::stopped`]: crate::SendStream::stopped
-    pub(crate) stopped: watch::Sender<HashMap<StreamId, VarInt>>,
+    stopped: Mutex<HashMap<StreamId, watch::Sender<Option<VarInt>>>>,
     pub(crate) stable_id: usize,
     /// The connection task's latest load snapshot (API-9).
     pub(crate) load: watch::Sender<crate::conn::ConnLoad>,
@@ -163,7 +165,7 @@ impl ConnShared {
         static NEXT_ID: counter::AtomicUsize = counter::AtomicUsize::new(0);
         Arc::new(Self {
             closed: watch::Sender::new(None),
-            stopped: watch::Sender::new(HashMap::new()),
+            stopped: Mutex::new(HashMap::new()),
             stable_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             load: watch::Sender::new(crate::conn::ConnLoad::new(remote)),
             queued_datagram_bytes: AtomicUsize::new(0),
@@ -172,6 +174,46 @@ impl ConnShared {
             released_credit: AtomicU64::new(0),
             credit_released: Notify::new(),
         })
+    }
+
+    /// The peer's STOP_SENDING code for `id`, while its handle can write.
+    pub(crate) fn stop_code(&self, id: StreamId) -> Option<VarInt> {
+        *self.stop_slots().get(&id)?.borrow()
+    }
+
+    /// Keeps the peer's STOP_SENDING code for `id` and wakes that stream's
+    /// [`SendStream::stopped`](crate::SendStream::stopped) waiters.
+    pub(crate) fn record_stop(&self, id: StreamId, code: VarInt) {
+        self.stop_slots()
+            .entry(id)
+            .or_insert_with(|| watch::Sender::new(None))
+            .send_replace(Some(code));
+    }
+
+    /// Drops the slot for `id` once its handle can't write, and returns the
+    /// peer's code if the peer stopped the stream. A waiter whose slot drops
+    /// waits only for the connection's close.
+    pub(crate) fn forget_stop(&self, id: StreamId) -> Option<VarInt> {
+        let slot = self.stop_slots().remove(&id)?;
+        let code = *slot.borrow();
+        code
+    }
+
+    /// Subscribes to the slot for `id`, adding the slot if it's missing.
+    pub(crate) fn watch_stop(&self, id: StreamId) -> watch::Receiver<Option<VarInt>> {
+        self.stop_slots()
+            .entry(id)
+            .or_insert_with(|| watch::Sender::new(None))
+            .subscribe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_slot_count(&self) -> usize {
+        self.stop_slots().len()
+    }
+
+    fn stop_slots(&self) -> MutexGuard<'_, HashMap<StreamId, watch::Sender<Option<VarInt>>>> {
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Returns `bytes` of a dropped hold to the connection's window. Only the

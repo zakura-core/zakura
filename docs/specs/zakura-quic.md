@@ -356,8 +356,10 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   the code and send the reset on accept, because `quinn-proto` counts a
   remote send stream only from acceptance. A later write on the accepted
   stream gets `Stopped(code)`, and `SendStream::stopped` resolves with the
-  code. The task keeps the code only while the stream's handle can still
-  write, so the codes it holds are bounded by the open streams.
+  code. Each stream has its own slot for the code, so a stop wakes only that
+  stream's waiters. A short lock guards the slot map, never a `quinn-proto`
+  object. The task drops a stream's slot once its handle finishes, resets or
+  drops, so the slots are bounded by the open streams.
 - **DRV-10.** `open_bi` and `accept_bi` are cancel safe. If the caller drops
   the call after the connection task replied, the stream goes to the next
   caller. A lost stream ID would hold its stream open, and its credit, for the
@@ -818,8 +820,9 @@ The public surface of `zakura-quic`. Changing it is a semver change of the crate
     stream priority (higher first) and is ordered with the stream's writes.
     `stopped` returns a future that doesn't borrow the handle. It resolves
     with the peer's STOP_SENDING code (DRV-9), or with the close reason once
-    the connection closes. It costs no task and no allocation, so an
-    application can race it against per-request work;
+    the connection closes. It costs no task, and a stop wakes only that
+    stream's waiters, so an application can race it against per-request
+    work;
   - `RecvStream`: `read`, `read_chunk`, `read_exact`, `read_to_end`, `stop`
     and `hold_credit` (API-10).
   The crate defines `WriteError`, `ReadError`, `ReadExactError`,
@@ -1366,4 +1369,7 @@ Changed:
 
 - **API-5.** Adds `SendStream::stopped`.
 - **DRV-9.** `SendStream::stopped` resolves with the code the task keeps.
+  Each stream keeps its code in its own slot, so a stop wakes only that
+  stream's waiters. With one shared map, each stop would wake every request
+  worker on the connection, up to 1,024 of them.
 - **§16.** Adds the `stopped` test.

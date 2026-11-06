@@ -730,7 +730,7 @@ impl<S: UdpIo> ConnTask<S> {
                 self.serve_acceptors();
             }
             ConnCmd::Write { id, data, reply } => {
-                if let Some(code) = self.stop_code(id) {
+                if let Some(code) = self.shared.stop_code(id) {
                     let _ = reply.send(Err(WriteError::Stopped(code)));
                     return;
                 }
@@ -746,7 +746,7 @@ impl<S: UdpIo> ConnTask<S> {
             }
             ConnCmd::Finish { id } | ConnCmd::DropSend { id } => {
                 self.writable_handles.remove(&id);
-                if self.forget_stop(id).is_none() {
+                if self.shared.forget_stop(id).is_none() {
                     match self.sends.get_mut(&id) {
                         Some(state) if !state.writes.is_empty() => state.finish_after = true,
                         _ => {
@@ -757,7 +757,7 @@ impl<S: UdpIo> ConnTask<S> {
             }
             ConnCmd::Reset { id, code } => {
                 self.writable_handles.remove(&id);
-                self.forget_stop(id);
+                self.shared.forget_stop(id);
                 self.fail_writes(id, WriteError::ClosedStream);
                 self.send_payload.remove(&id);
                 let _ = self.conn.send_stream(id).reset(code);
@@ -897,7 +897,7 @@ impl<S: UdpIo> ConnTask<S> {
                     self.accepted_bidi = id.index() + 1;
                     self.recv_payload.insert(id);
                     // The reset `on_stopped` deferred until this accept.
-                    if let Some(code) = self.stop_code(id) {
+                    if let Some(code) = self.shared.stop_code(id) {
                         let _ = self.conn.send_stream(id).reset(code);
                     } else {
                         self.send_payload.insert(id);
@@ -968,11 +968,11 @@ impl<S: UdpIo> ConnTask<S> {
             // quinn-proto counts a remote send stream only once it is
             // accepted, so a reset acked before then underflows that count.
             // `serve_acceptors` sends the reset on accept.
-            self.record_stop(id, error_code);
+            self.shared.record_stop(id, error_code);
             return;
         }
         if self.writable_handles.contains(&id) {
-            self.record_stop(id, error_code);
+            self.shared.record_stop(id, error_code);
         }
         // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM. quinn-proto
         // leaves this to the application, and without it the peer never
@@ -980,30 +980,6 @@ impl<S: UdpIo> ConnTask<S> {
         // stream credit.
         self.send_payload.remove(&id);
         let _ = self.conn.send_stream(id).reset(error_code);
-    }
-
-    /// The peer's STOP_SENDING code for `id`, while its handle can write.
-    fn stop_code(&self, id: StreamId) -> Option<VarInt> {
-        self.shared.stopped.borrow().get(&id).copied()
-    }
-
-    /// Keeps the peer's STOP_SENDING code for `id` and wakes the handle's
-    /// [`SendStream::stopped`](crate::SendStream::stopped).
-    fn record_stop(&self, id: StreamId, code: VarInt) {
-        self.shared.stopped.send_modify(|stopped| {
-            stopped.insert(id, code);
-        });
-    }
-
-    /// Drops the code for `id` once its handle can't write. Wakes no one,
-    /// since no waiter resolves on a removal.
-    fn forget_stop(&self, id: StreamId) -> Option<VarInt> {
-        let mut code = None;
-        self.shared.stopped.send_if_modified(|stopped| {
-            code = stopped.remove(&id);
-            false
-        });
-        code
     }
 
     fn fail_writes(&mut self, id: StreamId, error: WriteError) {
@@ -1785,12 +1761,43 @@ mod tests {
             };
             task.handle_cmd(close);
             assert!(!task.writable_handles.contains(&id));
-            assert!(task.shared.stopped.borrow().is_empty());
+            assert_eq!(task.shared.stop_slot_count(), 0);
             task.on_stopped(id, code);
-            assert!(
-                task.shared.stopped.borrow().is_empty(),
+            assert_eq!(
+                task.shared.stop_slot_count(),
+                0,
                 "late STOP_SENDING must not retain a code"
             );
         }
+    }
+
+    /// A stop wakes only its own stream's waiter, and a waiter's slot drops
+    /// with its handle even when the peer never stopped the stream.
+    #[tokio::test]
+    async fn a_stop_wakes_only_its_own_stream() {
+        let mut task = task();
+        let stopped_id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let other_id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        task.writable_handles.extend([stopped_id, other_id]);
+        let mut stopped = task.shared.watch_stop(stopped_id);
+        let mut other = task.shared.watch_stop(other_id);
+        assert_eq!(task.shared.stop_slot_count(), 2);
+
+        task.on_stopped(stopped_id, VarInt::from_u32(9));
+        assert!(stopped.has_changed().unwrap());
+        assert_eq!(*stopped.borrow_and_update(), Some(VarInt::from_u32(9)));
+        assert!(
+            !other.has_changed().unwrap(),
+            "another stream's stop woke this one"
+        );
+
+        for id in [stopped_id, other_id] {
+            task.handle_cmd(ConnCmd::DropSend { id });
+        }
+        assert_eq!(task.shared.stop_slot_count(), 0);
+        assert!(
+            other.changed().await.is_err(),
+            "the slot dropped with its handle"
+        );
     }
 }

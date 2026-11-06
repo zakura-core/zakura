@@ -122,7 +122,7 @@ impl AdvertFanout {
     }
 }
 
-/// Every this many advertisements, a random peer replaces the next-lowest RTT.
+/// Every this many selected recipients, a random peer replaces the next-lowest RTT.
 ///
 /// Peers with the lowest RTT could otherwise hold every slot without completing uploads.
 const ADVERT_RANDOM_INTERVAL: usize = 4;
@@ -493,19 +493,15 @@ struct RevokedCandidates;
 ///
 /// Peers that announced `hash` to us already have it, so they are skipped without taking a
 /// window entry. Configured sidecars are all advertised at once, first. Other peers are
-/// advertised to at most `window` at a time. Succeeds if at least one peer was advertised to,
-/// or if every peer was skipped.
+/// advertised to at most `window` at a time. Succeeds if at least one peer's advertisement
+/// succeeds or is skipped because that peer already announced the block.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
     window: usize,
     slots: BlockUploadSlots,
 ) -> BoxFuture<'static, Result<Response, BoxError>> {
-    let mut sidecars = order_peers(peers, &mut rand_10::rng());
-    // A peer that announced the block to us has it, so it takes no window entry.
-    let skipped = sidecars
-        .extract_if(.., |peer| peer.announced.announced(hash))
-        .count();
+    let (mut sidecars, skipped) = select_peers(peers, hash, &mut rand_10::rng());
     if skipped > 0 {
         metrics::counter!("peer.block_gossip.advert_skipped", "when" => "selection")
             // Skips are at most the peer count, so the conversion cannot saturate in practice.
@@ -525,8 +521,8 @@ pub(crate) fn broadcast_block(
             advertise(sidecars, sidecar_window),
             advertise(others, window),
         );
-        // Every peer skipped is a success: they all have the block already. An empty peer list
-        // still fails, so the advertiser keeps waiting for a connected peer.
+        // A skipped peer already claimed the block, so it counts as a success even if the
+        // remaining sends fail. An empty peer list still fails.
         let mut succeeded = skipped > 0;
         let mut revoked = false;
         while let Some(outcome) = sends.next().await {
@@ -642,18 +638,24 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
     }
 }
 
-/// Orders peers by measured RTT, prioritizing configured sidecars within the cap.
+/// Selects peers that have not announced `hash`, orders them by measured RTT, and returns
+/// the number skipped. Configured sidecars come first.
 ///
-/// The fastest peers are the likeliest to relay onward, so they hear first, whether the block
-/// was mined locally or relayed. Every [`ADVERT_RANDOM_INTERVAL`]th non-sidecar advertisement
-/// goes to a random remaining peer instead. An unmeasured RTT sorts last by design: a
-/// connection younger than one heartbeat has no measurement, and the random slot is what
+/// Low RTT is a heuristic for reaching peers sooner, whether the block was mined locally or
+/// relayed. Every [`ADVERT_RANDOM_INTERVAL`]th selected non-sidecar goes to a random remaining
+/// peer instead. Filter known announcers first so they cannot consume these random positions;
+/// later announcements can still remove a selected peer during fan-out. An unmeasured RTT
+/// sorts last: a connection younger than one heartbeat has no measurement, and the random slot is what
 /// reaches those peers. Equal RTTs are randomized.
-pub(crate) fn order_peers(
-    peers: Vec<BlockGossipPeer>,
+fn select_peers(
+    mut peers: Vec<BlockGossipPeer>,
+    hash: block::Hash,
     rng: &mut impl rand_10::Rng,
-) -> Vec<BlockGossipPeer> {
+) -> (Vec<BlockGossipPeer>, usize) {
     use rand_10::{seq::SliceRandom, RngExt};
+    let skipped = peers
+        .extract_if(.., |peer| peer.announced.announced(hash))
+        .count();
     // Snapshot RTT once: heartbeat updates must not change comparisons during sorting.
     let mut peers: Vec<_> = peers
         .into_iter()
@@ -672,7 +674,7 @@ pub(crate) fn order_peers(
         };
         ordered.push(remaining.remove(index).2);
     }
-    ordered
+    (ordered, skipped)
 }
 
 #[cfg(test)]
@@ -1573,7 +1575,9 @@ mod tests {
             &mut guards,
             [Some(80), Some(10), None, Some(30), Some(10)],
         );
-        let ordered = order_peers(peers, &mut StdRng::seed_from_u64(9));
+        let (ordered, skipped) =
+            select_peers(peers, block::Hash([0; 32]), &mut StdRng::seed_from_u64(9));
+        assert_eq!(skipped, 0);
         let measured: Vec<_> = ordered.iter().map(BlockGossipPeer::rtt).collect();
         assert_eq!(
             measured[..3],
@@ -1590,7 +1594,10 @@ mod tests {
         let registry = PeerRegistry::default();
         let mut guards = Vec::new();
         let peers = measured_peers(&registry, &mut guards, (1..=100).map(Some));
-        let ordered: Vec<_> = order_peers(peers, &mut StdRng::seed_from_u64(3))
+        let (ordered, skipped) =
+            select_peers(peers, block::Hash([0; 32]), &mut StdRng::seed_from_u64(3));
+        assert_eq!(skipped, 0);
+        let ordered: Vec<_> = ordered
             .iter()
             .map(|peer| peer.rtt().unwrap().as_millis())
             .collect();
@@ -1605,6 +1612,39 @@ mod tests {
         assert!(
             first_wave.iter().any(|rtt| *rtt > TEST_WINDOW as u128),
             "a random slot reaches beyond the lowest-RTT peers: {first_wave:?}"
+        );
+    }
+
+    /// Known announcers must not change the order, including random positions, of the
+    /// remaining recipients when given the same random choices.
+    #[test]
+    fn announcers_do_not_consume_random_positions() {
+        let registry = PeerRegistry::default();
+        let mut guards = Vec::new();
+        let hash = block::Hash([36; 32]);
+        let peers = measured_peers(&registry, &mut guards, (1..=100).map(Some));
+        for peer in peers.iter().step_by(4) {
+            peer.announced.record([hash]);
+        }
+        let remaining = peers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 0)
+            .map(|(_, peer)| peer.clone())
+            .collect();
+        let (expected, _) = select_peers(remaining, hash, &mut StdRng::seed_from_u64(3));
+        let (selected, skipped) = select_peers(peers, hash, &mut StdRng::seed_from_u64(3));
+        assert_eq!(skipped, 25);
+        assert_eq!(selected.len(), 75);
+        assert_eq!(
+            selected
+                .iter()
+                .map(BlockGossipPeer::rtt)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(BlockGossipPeer::rtt)
+                .collect::<Vec<_>>()
         );
     }
     #[tokio::test(start_paused = true)]
@@ -1870,6 +1910,78 @@ mod tests {
         assert!(committed.is_ok());
         assert!(writes.try_recv().is_err());
         assert_eq!(slots.available_uploads(), 1);
+    }
+
+    /// Both broadcasts are already running when the second peer announces the block.
+    /// Once the first peer releases their windows, neither broadcast creates an upload
+    /// claim or writes inventory to the second peer.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_broadcasts_skip_an_announcement_while_the_window_is_full() {
+        timeout(Duration::from_secs(10), async {
+            let registry = PeerRegistry::default();
+            let mut guards = Vec::new();
+            let mut peers = measured_peers(&registry, &mut guards, [Some(1), Some(2)]);
+            let (first_tx, mut first_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+            let (later_tx, mut later_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+            peers[0].sender = first_tx;
+            peers[1].sender = later_tx;
+            let later = peers[1].clone();
+            let hash = block::Hash([37; 32]);
+            let slots = BlockUploadSlots::new(1);
+            let mut early = broadcast_block(peers.clone(), hash, 1, slots.clone());
+            let mut committed = broadcast_block(peers, hash, 1, slots.clone());
+            assert!((&mut early).now_or_never().is_none());
+            assert!((&mut committed).now_or_never().is_none());
+            let first = first_rx
+                .try_recv()
+                .expect("the first peer holds both windows");
+            assert_eq!(first.hash, hash);
+            assert!(later_rx.try_recv().is_err());
+
+            later.announced.record([hash]);
+            first.result.send(Ok(())).unwrap();
+            assert!((&mut early).now_or_never().is_none());
+            assert!((&mut committed).now_or_never().is_none());
+            tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+            let (early, committed) = tokio::join!(early, committed);
+            assert!(early.is_ok());
+            assert!(committed.is_ok());
+            assert!(
+                first_rx.try_recv().is_err(),
+                "the joined broadcast wrote a duplicate"
+            );
+            assert!(
+                later_rx.try_recv().is_err(),
+                "the late announcer received inventory"
+            );
+            assert!(
+                later
+                    .uploads
+                    .0
+                    .lock()
+                    .expect("block upload mutex is never poisoned")
+                    .is_empty(),
+                "skipping a peer must not create an upload claim"
+            );
+            assert_eq!(slots.available_uploads(), 1);
+        })
+        .await
+        .expect("overlapping broadcasts finish within their request wait");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_announcer_counts_as_success_when_other_sends_fail() {
+        let hash = block::Hash([38; 32]);
+        let (announcer, mut receiver) = peer();
+        announcer.announced.record([hash]);
+        let (failed, failed_receiver) = peer();
+        drop(failed_receiver);
+        assert!(
+            broadcast_block(vec![announcer, failed], hash, 1, BlockUploadSlots::new(1))
+                .await
+                .is_ok()
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

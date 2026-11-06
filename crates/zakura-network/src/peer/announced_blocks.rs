@@ -130,7 +130,10 @@ mod tests {
     /// when hashes repeat within the same message rather than across separate calls.
     #[tokio::test(start_paused = true)]
     async fn maximum_inventory_keeps_allocation_bounded() {
-        let limit = usize::try_from(crate::protocol::external::inv::MAX_INV_IN_RECEIVED_MESSAGE)
+        use crate::protocol::external::InventoryHash;
+        use zakura_chain::serialization::TrustedPreallocate;
+
+        let limit = usize::try_from(InventoryHash::max_allocation())
             .expect("the inventory limit fits in usize");
         for distinct in [limit, limit / 2, ANNOUNCED_BLOCKS_LIMIT] {
             let announced = AnnouncedBlocks::default();

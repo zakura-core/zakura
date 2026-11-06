@@ -28,6 +28,17 @@ use crate::zakura::{
 
 const PROPERTY: &str = "header/work-ownership";
 
+/// A page from `peer` on session 1, subscription 1, with no transport frame.
+/// The queue under test has no observer, so nothing reads it.
+fn arrival(peer: &ZakuraPeerId) -> crate::zakura::header_sync::observe::PageArrival {
+    crate::zakura::header_sync::observe::PageArrival {
+        from_peer: peer.clone(),
+        from_session: 1,
+        subscription: 1,
+        frame: None,
+    }
+}
+
 /// One more peer than the queue has target slots, so the queue can fill.
 const PEERS: usize = MAX_STAGED_TARGETS_V1 + 1;
 
@@ -555,6 +566,7 @@ impl Harness {
                         headers: 0,
                         bytes: 0,
                     },
+                    arrival(&id),
                 );
                 let receiving = match self.work.get(&peer) {
                     Some(ModelWork::Active {
@@ -1276,6 +1288,7 @@ mod tests {
                     headers: 0,
                     bytes: 0,
                 },
+                arrival(&peer_id(0)),
             ),
             "a preparing round stages no page"
         );

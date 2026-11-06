@@ -188,6 +188,22 @@ impl AdoptionFact {
     }
 }
 
+/// Whether a run that ended as `end` settled: it ended with no task ready,
+/// idle with every task finished or waiting outside the scheduler, or after
+/// a drain that ran out of ready tasks. Any other end, such as a drain cut
+/// off at its bound, a violation or a harness failure, can stop a task
+/// partway through a synchronous call.
+pub fn settled(end: &RunEnd) -> bool {
+    match end.outcome {
+        Outcome::Idle { status } => matches!(
+            status,
+            IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
+        ),
+        Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
+        Outcome::Violation | Outcome::Harness => false,
+    }
+}
+
 /// An [`AdoptionFact`] and the virtual time since the run's start that the
 /// reactor reported it at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,21 +272,9 @@ impl AdoptionEvidence {
         store.horizon = store.horizon.max(at);
     }
 
-    /// Records how the run ended. It settled if it ended with no task
-    /// ready: idle with every task finished or waiting outside the scheduler,
-    /// or after a drain that ran out of ready tasks. Any other end, such as a
-    /// drain cut off at its bound, a violation or a harness failure, can stop
-    /// a task partway through a synchronous call.
+    /// Records how the run ended, and whether it [`settled`].
     pub fn end(&self, end: &RunEnd) {
-        let settled = match end.outcome {
-            Outcome::Idle { status } => matches!(
-                status,
-                IdleStatus::Quiescent | IdleStatus::WaitingOnExternal
-            ),
-            Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
-            Outcome::Violation | Outcome::Harness => false,
-        };
-        self.store().settled = Some(settled);
+        self.store().settled = Some(settled(end));
     }
 
     /// Every fact so far, in the order the reactor reported them.

@@ -337,6 +337,17 @@ pub static COVERAGE: &[Coverage] = &[
         )),
     },
     Coverage {
+        property: super::header_sync::HEADER_FAULT_PENALIZED,
+        passing: passes(
+            "tests/header_wire_prepare_fault.rs",
+            "a_disconnect_mid_prepare_is_still_penalized",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/header_wire_prepare_fault.rs",
+            "hidden_cooldowns_violate_the_penalty_rule",
+        )),
+    },
+    Coverage {
         property: super::block_sync::OPERATION_IDS,
         passing: passes("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
         bypass: Bypass::Test(sim_test(

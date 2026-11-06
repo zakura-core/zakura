@@ -6,7 +6,9 @@ use super::{
     Cardinality, Inconclusive, Kind, LivenessBound, Obligation, ObligationKey, Property,
     PropertyId, Subject, Verdict,
 };
-use crate::{check::Violation, end::RunEnd, model::LabelledFrame, Observation, StepCtx};
+use crate::{
+    check::Violation, end::RunEnd, model::LabelledFrame, Observation, ObservationLog, StepCtx,
+};
 
 /// A harness's read-only view of the code under test. Checks read it through
 /// [`CheckCtx::view`].
@@ -37,6 +39,26 @@ pub trait HasView {
     /// Checks see only steps, so a view that needs the end to judge what was
     /// still owed when the run stopped keeps it from here.
     fn ended(&self, _end: &RunEnd) {}
+
+    /// The violations only the run's end shows, judged over its whole `log`
+    /// after [`ended`](HasView::ended), such as an obligation still open
+    /// when a settled run stopped. The registry records each against its
+    /// property, unless that property was already violated. None by
+    /// default.
+    fn end_violations(&self, _log: &ObservationLog) -> Vec<EndViolation> {
+        Vec::new()
+    }
+}
+
+/// A violation [`HasView::end_violations`] found at the run's end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndViolation {
+    /// The violated property.
+    pub property: PropertyId,
+    /// What the property expected.
+    pub expected: String,
+    /// What the run did.
+    pub actual: String,
 }
 
 /// When a view's state was captured.

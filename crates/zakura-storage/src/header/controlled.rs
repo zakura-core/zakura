@@ -1081,6 +1081,14 @@ impl ControlledPort {
     /// reconsideration with no invalidation in force, or a port that shut
     /// down. Those publish nothing.
     ///
+    /// The reset is engine-level. Its event is the one zakura-state's
+    /// `commit_operator_change` builds, but production's operator command
+    /// first invalidates the block in non-finalized full state, and refuses
+    /// a header whose block that state lacks with `BlockNotFound`. Header
+    /// runs commit no bodies, so this reset reaches header histories the
+    /// production command can't. It stands in for any reset that advances
+    /// the header generation, which finality moves would otherwise give.
+    ///
     /// Only the run resets, outside any task, as only the run completes.
     ///
     /// # Errors

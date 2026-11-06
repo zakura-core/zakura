@@ -192,7 +192,9 @@ impl EnginePort {
     /// its reconsideration, as zakura-state's `commit_operator_change` does:
     /// the event binds full state's best path, and full state itself doesn't
     /// change. The engine decides whether it commits, changes nothing or is
-    /// stale.
+    /// stale. It skips production's full-state invalidation, as
+    /// [`ControlledPort::reset`](super::super::controlled::ControlledPort::reset)
+    /// says.
     ///
     /// # Errors
     ///

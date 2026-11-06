@@ -913,7 +913,9 @@ pub enum ControlAction {
     /// is gone fails the run.
     Shutdown,
     /// Make an operator invalidation or reconsideration on the node under
-    /// test's engine, which the step must name. See [`Reset`].
+    /// test's engine, which the step must name. See [`Reset`]. It's
+    /// engine-level, so it can name a header production's operator command
+    /// would refuse, as `ControlledPort::reset` says.
     Reset(Reset),
     /// Open the policy's hold number `hold`, from 0, whatever its trigger
     /// says. The step must name the node under test. Releasing an open hold

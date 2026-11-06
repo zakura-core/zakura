@@ -1752,7 +1752,8 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
 }
 
 /// Advert windows left at the previous defaults by a generated config load as the current
-/// defaults. Other values are kept, and a replaced value stays within the configured bound.
+/// defaults. Other values are kept, and a bound that is left out or at its previous default
+/// stays within the configured one.
 #[test]
 fn legacy_default_advert_windows_load_as_current_defaults() {
     let _init_guard = zakura_test::init();
@@ -1781,6 +1782,11 @@ fn legacy_default_advert_windows_load_as_current_defaults() {
             "advert_window_min = 32\nadvert_window_max = 200",
             (200, 200),
         ),
+        // Neither does a minimum that is left out, so a config that loaded before still loads.
+        ("advert_window_max = 128", (128, 128)),
+        ("advert_window_max = 999", (999, 999)),
+        ("advert_window_min = 1", (1, 1000)),
+        ("advert_window_min = 1001", (1001, 1001)),
     ] {
         assert_eq!(windows(toml), expected, "{toml:?}");
     }
@@ -1796,9 +1802,6 @@ fn invalid_advert_fanout_config_is_rejected() {
             "advert_window_min = 10\nadvert_window_max = 9",
             "advert_window_min",
         ),
-        // The default maximum of 1000 is below this minimum, and the reverse.
-        ("advert_window_min = 1001", "advert_window_min"),
-        ("advert_window_max = 999", "advert_window_max"),
         (
             "advert_window_full_size_bytes = 0",
             "advert_window_full_size_bytes",

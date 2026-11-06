@@ -9,7 +9,7 @@ use std::{
 use zakura_scheduler::{Op, SimInstant};
 
 use super::{
-    Assume, Assumptions, Capture, Cardinality, CheckCtx, HasView, Inconclusive, Kind,
+    Assume, Assumptions, Capture, Cardinality, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
     LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
 };
 use crate::{
@@ -391,6 +391,26 @@ impl<S: HasView> RegistryChecker<S> {
             .and_then(|(_, state)| state.holds_since)
             .map(|(step, _)| step)
     }
+
+    /// Records `found` as the registered property's with its ID, at the
+    /// run's last step, `last`, unless that property was already violated.
+    fn end_violation(&mut self, found: EndViolation, last: u64) {
+        let state = self
+            .properties
+            .iter()
+            .zip(&mut self.state)
+            .find(|(property, _)| property.id == found.property)
+            .map(|(_, state)| state);
+        if let Some(state) = state.filter(|state| state.violations.is_empty()) {
+            state.violations.push(Violation {
+                property: found.property.to_string(),
+                step: last,
+                witness: vec![last],
+                expected: found.expected,
+                actual: found.actual,
+            });
+        }
+    }
 }
 
 impl<S: HasView> Checker for RegistryChecker<S> {
@@ -438,11 +458,15 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// outcome. An obligation still open now leaves
     /// the property `Inconclusive`, never `Held`. A violation that ended the
     /// run outside the registry, such as the step loop's `sim/no-livelock`,
-    /// belongs to the registered property with its ID.
-    fn at_end(&mut self, end: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+    /// belongs to the registered property with its ID, and so does each of
+    /// the harness's [`HasView::end_violations`].
+    fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         self.handle.ended(end);
         if let Some(violation) = &end.violation {
             self.step_loop_violation(violation);
+        }
+        for found in self.handle.end_violations(log) {
+            self.end_violation(found, end.steps);
         }
         self.properties
             .iter()

@@ -14,17 +14,19 @@ use std::process::Command;
 
 use support::{
     inputs,
-    prepare_fault::{disconnect_mid_prepare, scenario, LastView, Watched, CHAIN},
+    prepare_fault::{disconnect_mid_prepare, scenario, LastView, Uncooled, Watched, CHAIN},
     steer::steer,
 };
 use zakura_sim::{
     harness::{
-        header_node::adoption::Acceptance, header_sync::StorageView, run_prepared, HarnessError,
-        Subsystem,
+        header_node::adoption::Acceptance,
+        header_sync::{StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
+        run_prepared, HarnessError, Subsystem,
     },
     model::Label,
     observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
     peer::{honest::HonestChain, PeerAction},
+    property::HasView,
     Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, RunReport,
 };
 use zakura_storage::header::fixture::HeaderFixture;
@@ -37,9 +39,22 @@ fn run(
     plan: PlanInput,
     extra: &mut dyn Checker,
 ) -> ((RunReport, Vec<String>), StorageView) {
-    let (ports, last): (_, LastView) = Watched::prepare(scenario);
+    run_as::<Watched>(scenario, plan, extra)
+}
+
+/// [`run`] under the harness `W`, [`Watched`] or [`Uncooled`].
+fn run_as<W>(
+    scenario: &zakura_sim::harness::header_sync::WireScenario,
+    plan: PlanInput,
+    extra: &mut dyn Checker,
+) -> ((RunReport, Vec<String>), StorageView)
+where
+    W: Subsystem<Scenario = WireScenario, Prepared = (WirePorts, LastView)>
+        + HasView<View = StorageView>,
+{
+    let (ports, last): (_, LastView) = W::prepare(scenario);
     let mut sink = MemorySink::default();
-    let report = match run_prepared::<Watched>(
+    let report = match run_prepared::<W>(
         scenario,
         (ports, last.clone()),
         plan,
@@ -219,6 +234,31 @@ fn a_disconnect_mid_prepare_is_still_penalized() {
             "plan {index}: the penalty came after the session ended: {shape:?}"
         );
     }
+}
+
+/// The penalty rule's planted bypass: the same disconnect, judged by a view
+/// that never sees the node's cooldowns, as a node that installs none would
+/// show. `header-sync/header-fault-penalized` ends the run as
+/// `UncooledFault` once the reactor has handled the failed preparation.
+#[test]
+fn hidden_cooldowns_violate_the_penalty_rule() {
+    let scenario = scenario(vec![PeerAction::Disconnect], true);
+    let (report, _, _) = steer(
+        plans().swap_remove(0),
+        &disconnect_mid_prepare,
+        &mut |plan, checker| run_as::<Uncooled>(&scenario, plan, checker).0,
+    );
+    let violation = report
+        .end
+        .violation
+        .as_ref()
+        .unwrap_or_else(|| panic!("the hidden cooldown is a violation: {:?}", report.end));
+    assert_eq!(violation.property, HEADER_FAULT_PENALIZED);
+    assert!(
+        violation.actual.starts_with("UncooledFault"),
+        "{violation:?}"
+    );
+    assert!(report.end.harness.is_none(), "{:?}", report.end);
 }
 
 /// The witness's evidence under `plan`: whom each storage failure blamed and

@@ -41,6 +41,11 @@ pub(super) struct ReactorState {
     /// request timeouts, or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
+    /// How many cooldown entries [`Self::start_readmission_cooldown`] has
+    /// installed, so the reactor reports `CooldownStarted` only for an
+    /// actual install. Test and simulator builds only.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) cooldowns_installed: u64,
     /// Unproductive-request strikes of peers whose last session ended, with the
     /// deadline until which a reconnect resumes them.
     ///
@@ -89,6 +94,8 @@ impl ReactorState {
             cached_pass_budget: CachedPassBudget::new(now),
             cached_pass_deferred: false,
             unproductive_peer_cooldowns: HashMap::new(),
+            #[cfg(any(test, zakura_sim))]
+            cooldowns_installed: 0,
             departed_strikes: HashMap::new(),
             request_deadlines: HashMap::new(),
             close_deadlines: HashMap::new(),
@@ -306,6 +313,10 @@ impl ReactorState {
             let _ = self.prune_readmission_cooldowns(now);
             self.unproductive_peer_cooldowns
                 .insert(peer.clone(), now + cooldown);
+            #[cfg(any(test, zakura_sim))]
+            {
+                self.cooldowns_installed += 1;
+            }
         }
     }
 

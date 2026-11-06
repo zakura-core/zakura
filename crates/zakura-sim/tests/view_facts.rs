@@ -9,7 +9,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use zakura_rt::{sync::Mutex, task, time};
+use zakura_rt::{collections::HashMap, sync::Mutex, task, time};
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{run_harness, Subsystem},
@@ -117,7 +117,16 @@ impl HasView for Stamped {
 
     /// The stamps after `after`, or a stamp that goes backward once the
     /// stamps broke.
+    ///
+    /// # Panics
+    ///
+    /// Once the snapshot is lost, which the stamps come from.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        assert_ne!(
+            self.broken.get(),
+            Some(Broken::Snapshot),
+            "the stamps need the snapshot"
+        );
         if self.broken.get() == Some(Broken::Stamps) {
             return Some(vec![0]);
         }
@@ -140,6 +149,8 @@ const NEXT: &str = "test/wait-next-served";
 const OBSERVED: &str = "test/wait-observed-served";
 /// [`SERVED`] under an assumption no scenario declares.
 const UNDECLARED: &str = "test/wait-served-if-honest";
+/// Always holds, with a trigger history that draws.
+const DRAWING: &str = "test/wait-served-drawing";
 
 impl Subsystem for Stamped {
     const NAME: &'static str = "test/view-facts";
@@ -213,6 +224,10 @@ impl Subsystem for Stamped {
             Property {
                 assumes: &[Assume::HonestPeer],
                 ..served(UNDECLARED, waits)
+            },
+            Property {
+                witness: Some(TriggerHistory::View(drew_and_waited)),
+                ..served(DRAWING, |_| Verdict::Holds)
             },
         ]
     }
@@ -297,6 +312,13 @@ fn answer(_: &ObligationKey, view: &Facts, stamp: u64) -> FactAnswer {
 fn waited(view: &Facts, _: &ObservationLog) -> bool {
     view.iter()
         .any(|(_, name)| matches!(name, Name::Wait | Name::WaitNext))
+}
+
+/// [`waited`], after building the run's first hashed map, which draws its
+/// hash seed.
+fn drew_and_waited(view: &Facts, log: &ObservationLog) -> bool {
+    let seen: HashMap<u64, ()> = view.iter().map(|(stamp, _)| (*stamp, ())).collect();
+    !seen.is_empty() && waited(view, log)
 }
 
 /// Runs `acts` under a budget of `budget` live steps.
@@ -585,6 +607,17 @@ fn the_view_is_read_only_for_a_fitting_report() {
         ),
         Err(WitnessError::Outcome(PropertyOutcome::Held { .. }))
     ));
+}
+
+/// A harness failure the trigger history raises, such as a draw outside a
+/// step, fails the run, so the witness can't pass.
+#[test]
+fn a_trigger_that_draws_fails_the_run() {
+    let result = witness(scenario(&[Fact(Wait), Fact(Done)]), DRAWING, Expect::Holds);
+    assert!(
+        matches!(&result, Err(WitnessError::HarnessEnd(detail)) if detail.contains("drew between steps")),
+        "{result:?}"
+    );
 }
 
 /// A report alone can't judge a trigger history that reads the view.

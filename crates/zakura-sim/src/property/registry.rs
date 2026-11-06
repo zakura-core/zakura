@@ -493,8 +493,13 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// Evaluates every property after a step, as the type's docs describe.
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
         let mut first = None;
-        let mut capture = None;
-        let facts = self.handle.stamps_after(self.offered);
+        // Stamps are read only from a fresh view. A stale one reads none, and
+        // the properties that need the view fail the run below.
+        let captured = self.handle.captured();
+        let facts = captured
+            .fresh_at(cx.step)
+            .then(|| self.handle.stamps_after(self.offered))
+            .flatten();
         if let Some(stamps) = &facts {
             let ordered = std::iter::once(self.offered)
                 .chain(stamps.iter().copied().map(Some))
@@ -519,20 +524,17 @@ impl<S: HasView> Checker for RegistryChecker<S> {
             if !state.declared || state.excluded.is_some() {
                 continue;
             }
-            if property.needs.contains(&Source::View) {
-                let captured = *capture.get_or_insert_with(|| self.handle.captured());
-                if !captured.fresh_at(cx.step) {
-                    self.failure
-                        .get_or_insert_with(|| HarnessFailure::StaleView {
-                            property: property.id.to_string(),
-                            step: cx.step,
-                            captured: match captured {
-                                Capture::AfterStep(step) => Some(step),
-                                Capture::Live | Capture::Missing => None,
-                            },
-                        });
-                    continue;
-                }
+            if property.needs.contains(&Source::View) && !captured.fresh_at(cx.step) {
+                self.failure
+                    .get_or_insert_with(|| HarnessFailure::StaleView {
+                        property: property.id.to_string(),
+                        step: cx.step,
+                        captured: match captured {
+                            Capture::AfterStep(step) => Some(step),
+                            Capture::Live | Capture::Missing => None,
+                        },
+                    });
+                continue;
             }
             let violations = step_property(
                 (&self.properties, at),

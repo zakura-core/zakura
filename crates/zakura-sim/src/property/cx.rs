@@ -55,8 +55,9 @@ pub trait HasView {
     ///
     /// A stamp orders the facts the harness records: each fact gets one,
     /// larger than every earlier fact's. The registry reads the new ones
-    /// after each step and offers them to the obligations that view-side
-    /// facts answer ([`CheckCtx::fact_obligation`]).
+    /// after each step whose view is fresh ([`captured`](HasView::captured))
+    /// and offers them to the obligations that view-side facts answer
+    /// ([`CheckCtx::fact_obligation`]).
     fn stamps_after(&self, _after: Option<u64>) -> Option<Vec<u64>> {
         None
     }

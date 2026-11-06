@@ -296,6 +296,7 @@ impl HasView for Planted {
             honest_peers: Default::default(),
             adoption: Default::default(),
             sessions: Default::default(),
+            faults: Default::default(),
         }
     }
 }

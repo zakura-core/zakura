@@ -29,6 +29,7 @@ use super::{
     header_node::{
         adoption::{AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
+        fault::FaultEvidence,
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         reservation::ReservationEvidence,
@@ -491,6 +492,8 @@ pub struct Storage {
     dispatch: DispatchFlag,
     /// The node's adoption facts, from its tap.
     adoption: AdoptionEvidence,
+    /// Whom the node's storage failures blamed.
+    faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
     topology: Rc<Topology>,
@@ -512,6 +515,9 @@ pub struct StorageView {
     /// rule ([`AdoptionEvidence::status`]) judges. Only `header-sync/storage`
     /// knows them, from its links.
     pub sessions: Vec<SessionLife>,
+    /// Whom the node's storage failures blamed, for the penalty rule
+    /// ([`FaultEvidence::penalized`]).
+    pub faults: FaultEvidence,
 }
 
 impl HonestPeers for StorageView {
@@ -533,13 +539,15 @@ impl HasView for Storage {
             honest_peers: Rc::default(),
             adoption: self.adoption.clone(),
             sessions: self.topology.sessions(),
+            faults: self.faults.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption evidence, for its tip
-    /// rule.
+    /// Records the run's end in the node's adoption and fault evidence, for
+    /// the tip and penalty rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
+        self.faults.end(end);
     }
 }
 
@@ -617,6 +625,7 @@ impl Subsystem for Storage {
         );
         let adoption = tap.adoption();
         let shutdown = tap.shutdown();
+        let faults = FaultEvidence::new(storage.attributions());
         let storage = storage.with_tap(tap);
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
@@ -671,6 +680,7 @@ impl Subsystem for Storage {
             port: ports.node,
             dispatch,
             adoption,
+            faults,
             topology,
         }
     }
@@ -796,6 +806,8 @@ pub struct HeaderWire {
     honest: Rc<BTreeSet<usize>>,
     /// The node's adoption facts, from its tap.
     adoption: AdoptionEvidence,
+    /// Whom the node's storage failures blamed.
+    faults: FaultEvidence,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -815,13 +827,15 @@ impl HasView for HeaderWire {
             honest_peers: self.honest.clone(),
             adoption: self.adoption.clone(),
             sessions: Vec::new(),
+            faults: self.faults.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption evidence, for its tip
-    /// rule.
+    /// Records the run's end in the node's adoption and fault evidence, for
+    /// the tip and penalty rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
+        self.faults.end(end);
     }
 }
 
@@ -926,6 +940,7 @@ impl Subsystem for HeaderWire {
             ports.capacity.clone(),
         );
         let adoption = tap.adoption();
+        let faults = FaultEvidence::new(storage.attributions());
         sim.add_source(Box::new(storage.with_tap(tap)));
         let header = HeaderNode::spawn(
             sim,
@@ -991,6 +1006,7 @@ impl Subsystem for HeaderWire {
             dispatch,
             honest: Rc::new(scenario.honest_peers()),
             adoption,
+            faults,
             _keep: Box::new(node),
         }
     }

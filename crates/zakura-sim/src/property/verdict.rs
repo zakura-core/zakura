@@ -42,8 +42,9 @@ pub struct Obligation<V> {
     pub cardinality: Cardinality,
     /// The steps a violation would depend on, in order.
     pub witness: Vec<u64>,
-    /// The view-side facts that answer it, or `None` if only observations
-    /// do.
+    /// The view-side facts that answer it, or `None` if observations do.
+    /// With `Some`, `discharged_by` and `trigger` are unused, since facts
+    /// and observations share no order.
     pub facts: Option<FactDischarge<V>>,
 }
 

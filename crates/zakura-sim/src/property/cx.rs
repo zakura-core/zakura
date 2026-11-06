@@ -229,11 +229,9 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     }
 
     /// An obligation on `subject` that view-side facts answer through
-    /// `answer`. `after` is the trigger fact's stamp, as
-    /// [`FactDischarge::after`] describes. Its other fields are
-    /// [`obligation`](Self::obligation)'s with no trigger position, so
-    /// observations discharge it only if the check also sets
-    /// `discharged_by`, and only from later steps.
+    /// `answer`, and observations never do. `after` is the trigger fact's
+    /// stamp, as [`FactDischarge::after`] describes. Its other fields are
+    /// [`obligation`](Self::obligation)'s.
     ///
     /// # Panics
     ///

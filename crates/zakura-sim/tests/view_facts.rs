@@ -10,8 +10,9 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{run_harness, Subsystem},
     property::{
-        CheckCtx, FactAnswer, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId,
-        Source, Sources, Status, Subject, TriggerHistory, Verdict,
+        CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation, ObligationKey, Property,
+        PropertyId, Registry, RegistryError, Source, Sources, Status, Subject, TriggerHistory,
+        Verdict,
     },
     witness::{judge_report, witness, Expect, WitnessError, WitnessScenario},
     MemorySink, ObservationLog, Plan, PropertyOutcome, RunConfig, RunReport, Sim,
@@ -24,6 +25,8 @@ enum Name {
     Wait,
     /// Opens [`NEXT`]'s obligation, for later steps' facts.
     WaitNext,
+    /// Opens [`OBSERVED`]'s obligation, which every observation matches.
+    WaitObserved,
     /// Discharges an open obligation.
     Done,
     /// Defers an open obligation to this many milliseconds after the start.
@@ -84,6 +87,8 @@ impl HasView for Stamped {
 const SERVED: &str = "test/wait-served";
 /// `wait-next` opens one that only facts from later steps answer.
 const NEXT: &str = "test/wait-next-served";
+/// `wait-observed` opens one whose `discharged_by` matches everything.
+const OBSERVED: &str = "test/wait-observed-served";
 
 impl Subsystem for Stamped {
     const NAME: &'static str = "test/view-facts";
@@ -143,7 +148,11 @@ impl Subsystem for Stamped {
             check,
             witness: Some(TriggerHistory::View(waited)),
         };
-        vec![served(SERVED, waits), served(NEXT, waits_next)]
+        vec![
+            served(SERVED, waits),
+            served(NEXT, waits_next),
+            served(OBSERVED, waits_observed),
+        ]
     }
 
     fn draw(_: &[u8]) -> Script {
@@ -181,6 +190,26 @@ fn waits(cx: &mut CheckCtx<'_, Stamped>) -> Verdict {
 /// [`NEXT`]'s check.
 fn waits_next(cx: &mut CheckCtx<'_, Stamped>) -> Verdict {
     oblige_after(cx, Name::WaitNext, false)
+}
+
+/// [`OBSERVED`]'s check: a fact obligation whose `discharged_by` matches
+/// every observation.
+fn waits_observed(cx: &mut CheckCtx<'_, Stamped>) -> Verdict {
+    let view = cx.view();
+    let triggers: Vec<u64> = cx
+        .new_stamps()
+        .iter()
+        .copied()
+        .filter(|stamp| fact(&view, *stamp) == Some(Name::WaitObserved))
+        .collect();
+    for stamp in triggers {
+        let obligation = Obligation {
+            discharged_by: |_, _| true,
+            ..cx.fact_obligation(Some(stamp), Subject::Owner("w".into()), answer)
+        };
+        cx.oblige(obligation);
+    }
+    Verdict::Holds
 }
 
 /// The fact with `stamp`.
@@ -251,7 +280,7 @@ fn violated(report: &RunReport, id: &str) -> bool {
 }
 
 use Act::{Fact, Point, Sleep, Yield};
-use Name::{Defer, Done, Wait, WaitNext};
+use Name::{Defer, Done, Wait, WaitNext, WaitObserved};
 
 /// A fact after the trigger's stamp in its own step discharges, and so does
 /// one in a later step.
@@ -297,6 +326,34 @@ fn one_fact_discharges_the_oldest_only() {
 fn an_unstamped_trigger_waits_for_a_later_step() {
     assert!(violated(&run(&[Fact(WaitNext), Fact(Done)]), NEXT));
     assert!(held(&run(&[Fact(WaitNext), Yield, Fact(Done)]), NEXT));
+}
+
+/// Observations never discharge a fact obligation, even one whose
+/// `discharged_by` matches them, since facts and observations share no
+/// order. Later steps' observations leave it open until quiescence.
+#[test]
+fn observations_never_discharge_a_fact_obligation() {
+    assert!(violated(
+        &run(&[Fact(WaitObserved), Yield, Yield]),
+        OBSERVED
+    ));
+}
+
+/// A registry rejects a trigger history that reads the view of a property
+/// that doesn't need it, since only those get the registry's freshness
+/// check.
+#[test]
+fn a_view_trigger_needs_the_view() {
+    let blind = Property {
+        needs: &[Source::Schedule],
+        ..Stamped::properties().remove(0)
+    };
+    assert_eq!(
+        Registry::new(vec![blind]).err(),
+        Some(RegistryError::ViewTriggerWithoutView {
+            id: PropertyId::new(SERVED)
+        })
+    );
 }
 
 /// A deferred obligation survives the wait on its timer, and work that

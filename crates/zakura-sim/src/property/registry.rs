@@ -10,7 +10,8 @@ use zakura_scheduler::{Op, SimInstant};
 
 use super::{
     Assume, Assumptions, Capture, Cardinality, CheckCtx, EndViolation, FactAnswer, HasView,
-    Inconclusive, Kind, LivenessBound, Obligation, Property, PropertyId, Source, Status, Verdict,
+    Inconclusive, Kind, LivenessBound, Obligation, Property, PropertyId, Source, Status,
+    TriggerHistory, Verdict,
 };
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
@@ -113,8 +114,9 @@ pub struct Registry<S: HasView> {
 }
 
 impl<S: HasView> Registry<S> {
-    /// A registry of `properties`, in order. Fails on a duplicate ID, or on
-    /// an `Ops` bound that names an object or counts polls.
+    /// A registry of `properties`, in order. Fails on a duplicate ID, on an
+    /// `Ops` bound that names an object or counts polls, or on a trigger
+    /// history that reads the view of a property that doesn't need it.
     pub fn new(properties: Vec<Property<S>>) -> Result<Self, RegistryError> {
         let mut ids = BTreeSet::new();
         for property in &properties {
@@ -137,6 +139,15 @@ impl<S: HasView> Registry<S> {
                         id: property.id.clone(),
                     });
                 }
+            }
+            // The registry checks the view's freshness only for a property
+            // that needs it, and the witness judge trusts that check.
+            if matches!(property.witness, Some(TriggerHistory::View(_)))
+                && !property.needs.contains(&Source::View)
+            {
+                return Err(RegistryError::ViewTriggerWithoutView {
+                    id: property.id.clone(),
+                });
             }
         }
         Ok(Registry { properties })
@@ -166,6 +177,12 @@ pub enum RegistryError {
         /// The property.
         id: PropertyId,
     },
+    /// A trigger history reads the view of a property that doesn't need
+    /// `Source::View`.
+    ViewTriggerWithoutView {
+        /// The property.
+        id: PropertyId,
+    },
 }
 
 impl fmt::Display for RegistryError {
@@ -179,6 +196,12 @@ impl fmt::Display for RegistryError {
             ),
             RegistryError::OpsPoll { id } => {
                 write!(f, "{id} has an Ops bound on polls, which nothing observes")
+            }
+            RegistryError::ViewTriggerWithoutView { id } => {
+                write!(
+                    f,
+                    "{id}'s trigger history reads the view, so it needs the view"
+                )
             }
         }
     }
@@ -703,7 +726,12 @@ fn step_property<S: HasView>(
         let mut one_discharged = false;
         state.open.retain(|open| {
             let obligation = &open.obligation;
-            if !open.follows(cx.step, at) || !(obligation.discharged_by)(&obligation.key, obs) {
+            // Facts and observations share no order, so facts alone answer
+            // an obligation that facts answer.
+            if obligation.facts.is_some()
+                || !open.follows(cx.step, at)
+                || !(obligation.discharged_by)(&obligation.key, obs)
+            {
                 return true;
             }
             let discharge = match obligation.cardinality {

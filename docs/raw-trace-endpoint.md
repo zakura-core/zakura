@@ -84,7 +84,8 @@ curl -H 'Range: bytes=<bytes read>-' -H 'If-Range: <etag>' \
 One request per poll is enough. A collector that follows many tables can poll
 `GET /traces` and request only the tables whose length or `ETag` changed. A
 replacement can be the same size as the old file or shorter, so a length check
-alone misses it.
+alone misses it. `deploy/trace-query/trace_query.py` follows tables with these
+requests and mirrors their rows into SQLite for arbitrary queries.
 
 ## Status codes
 

@@ -90,7 +90,7 @@ use zakura_storage::header::controlled::ControlledPort;
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
-    claim::{Claim, ClaimEvidence, ClaimRecord},
+    claim::{Claim, ClaimEvidence, ClaimRecord, RoundEvidence, Rounds},
     fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
     policy::LinkEffect,
@@ -162,6 +162,8 @@ struct TapState {
     cooldowns: CooldownEvidence,
     /// The claim rules its drains found broken, for the view.
     claims: ClaimEvidence,
+    /// The released rounds each drain found, for the view.
+    rounds: RoundEvidence,
 }
 
 /// The resource probe a tap was handed.
@@ -217,7 +219,8 @@ impl TapState {
 
     /// Fails with the first claim break an earlier drain found that no
     /// property reported, then records the claim breaks since the last drain
-    /// as the drain of `step` found them.
+    /// as the drain of `step` found them, and the released rounds the ledger
+    /// holds now.
     fn drain_claims(&self, step: u64) -> Result<(), String> {
         if let Some(record) = self.claims.unreported(Some(step)) {
             return Err(record.detail);
@@ -236,6 +239,12 @@ impl TapState {
                 detail: broken.detail,
             });
         }
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        self.rounds.record(Rounds {
+            step,
+            released: work.ledger.released_rounds(),
+            unsettled: work.ledger.unsettled_rounds(),
+        });
         Ok(())
     }
 
@@ -626,6 +635,7 @@ impl ReactorTap {
                 off_reactor: Mutex::default(),
                 cooldowns,
                 claims: ClaimEvidence::default(),
+                rounds: RoundEvidence::default(),
             }))
         });
         let state = observer.0.clone();
@@ -695,6 +705,12 @@ impl ReactorTap {
     /// they happen.
     pub fn claims(&self) -> ClaimEvidence {
         self.state.claims.clone()
+    }
+
+    /// The node's released rounds at each drain, which the tap fills as it
+    /// drains.
+    pub fn rounds(&self) -> RoundEvidence {
+        self.state.rounds.clone()
     }
 
     /// The notice the harness gives this tap when it stops the reactor.

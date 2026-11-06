@@ -85,6 +85,15 @@ impl CallRecord {
 pub enum ClaimRule {
     /// A reported reservation takes the budget's claims past its capacity.
     OverBudget,
+    /// The queue released a round with its peer still holding a
+    /// reservation.
+    LeakedReservation,
+    /// A released round kept a lease: the queue kept one when it released
+    /// the round, or one no call holds hadn't returned when the round was
+    /// released or a call holding it was handled.
+    LeakedLease,
+    /// A call was handled with its round's headers still held.
+    OpenOwnership,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -117,6 +126,8 @@ pub struct HeaderWorkLedger {
     started: BTreeMap<u64, Round>,
     /// The claim breaks not yet taken, in order.
     claims: Vec<ClaimBreak>,
+    /// How many rounds the queue has released.
+    released_rounds: u64,
 }
 
 /// One live reservation.
@@ -229,12 +240,16 @@ impl HeaderWorkLedger {
                     }
                     Some(_) => {}
                 }
-                if record.held.as_ref().is_some_and(|held| !held.ended) {
-                    return Err(format!(
-                        "OpenOwnership: call {call} was handled with its headers still held"
-                    ));
-                }
+                let open = record.held.as_ref().is_some_and(|held| !held.ended);
                 let held_round = record.held.as_ref().map(|held| held.incarnation);
+                if open {
+                    self.claims.push(ClaimBreak {
+                        rule: ClaimRule::OpenOwnership,
+                        detail: format!(
+                            "OpenOwnership: call {call} was handled with its headers still held"
+                        ),
+                    });
+                }
                 if let Some(handoff) = self.handoff.as_ref().filter(|h| h.apply == *call) {
                     return Err(format!(
                         "UnresolvedHandoff: call {call} was handled before it took the headers \
@@ -243,7 +258,7 @@ impl HeaderWorkLedger {
                     ));
                 }
                 if let Some(incarnation) = held_round {
-                    self.check_returned(incarnation, &format!("call {call} was handled"))?;
+                    self.check_returned(incarnation, &format!("call {call} was handled"));
                 }
             }
             ReactorEvent::Started { request, purpose } => self.start(request, purpose)?,
@@ -361,16 +376,22 @@ impl HeaderWorkLedger {
                     .iter()
                     .find(|(_, live)| live.peer == *peer)
                 {
-                    return Err(format!(
-                        "LeakedReservation: the queue released round {incarnation} with its \
-                         peer still holding reservation {reservation}"
-                    ));
+                    self.claims.push(ClaimBreak {
+                        rule: ClaimRule::LeakedReservation,
+                        detail: format!(
+                            "LeakedReservation: the queue released round {incarnation} with \
+                             its peer still holding reservation {reservation}"
+                        ),
+                    });
                 }
                 if *queue_owned != 0 {
-                    return Err(format!(
-                        "LeakedLease: the queue released round {incarnation} still holding \
-                         leases of {queue_owned} headers for its peer"
-                    ));
+                    self.claims.push(ClaimBreak {
+                        rule: ClaimRule::LeakedLease,
+                        detail: format!(
+                            "LeakedLease: the queue released round {incarnation} still holding \
+                             leases of {queue_owned} headers for its peer"
+                        ),
+                    });
                 }
                 let Some(round) = self
                     .started
@@ -383,10 +404,11 @@ impl HeaderWorkLedger {
                     ));
                 };
                 round.released = true;
+                self.released_rounds = self.released_rounds.saturating_add(1);
                 self.check_returned(
                     *incarnation,
                     &format!("the queue released round {incarnation}"),
-                )?;
+                );
             }
             ReactorEvent::HeadersHeld {
                 call,
@@ -828,13 +850,16 @@ impl HeaderWorkLedger {
     }
 
     /// Requires every lease of `incarnation`, if the queue released it and
-    /// no call holds it, to have returned by `when`.
-    fn check_returned(&mut self, incarnation: u64, when: &str) -> Result<(), String> {
-        if let Some(error) = self.unreturned(incarnation, when) {
-            return Err(error);
+    /// no call holds it, to have returned by `when`, as a `LeakedLease`
+    /// claim, and forgets the round once it settled.
+    fn check_returned(&mut self, incarnation: u64, when: &str) {
+        if let Some(detail) = self.unreturned(incarnation, when) {
+            self.claims.push(ClaimBreak {
+                rule: ClaimRule::LeakedLease,
+                detail,
+            });
         }
         self.prune(incarnation);
-        Ok(())
     }
 
     /// The `LeakedLease` break if the queue released `incarnation` and, with
@@ -868,6 +893,17 @@ impl HeaderWorkLedger {
     /// [`Self::owned`].
     fn claimed(&self) -> usize {
         self.reserved() + self.owned()
+    }
+
+    /// How many rounds the queue has released.
+    pub fn released_rounds(&self) -> u64 {
+        self.released_rounds
+    }
+
+    /// How many rounds the queue released that haven't settled: some of
+    /// their staged headers haven't returned.
+    pub fn unsettled_rounds(&self) -> usize {
+        self.started.values().filter(|round| round.released).count()
     }
 
     /// The claim breaks since the last call, in order.
@@ -1225,6 +1261,19 @@ mod tests {
     fn refused_as(events: Vec<ReactorEvent>, rule: &str) {
         let error = fold(events).expect_err("the ledger refuses this history");
         assert!(error.starts_with(rule), "{error}");
+    }
+
+    /// Folds `events`, which the ledger accepts, and requires its first
+    /// claim break to be `rule`'s.
+    fn claimed_as(events: Vec<ReactorEvent>, rule: ClaimRule) -> HeaderWorkLedger {
+        let mut ledger = fold(events).expect("a claim break doesn't refuse the history");
+        let claims = ledger.take_claims();
+        assert_eq!(
+            claims.first().map(|claim| claim.rule),
+            Some(rule),
+            "{claims:?}"
+        );
+        ledger
     }
 
     #[test]
@@ -1605,7 +1654,8 @@ mod tests {
 
     /// When the queue releases a round, its peer holds no reservation, the
     /// queue holds none of its leases, and its unheld leases have returned. A
-    /// held lease waits for its call, but no longer than its `Handled`.
+    /// held lease waits for its call, but no longer than its `Handled`. Each
+    /// is a claim rule, so the ledger records the break and goes on.
     #[test]
     fn a_released_round_keeps_nothing_no_call_holds() {
         let base = vec![
@@ -1627,13 +1677,14 @@ mod tests {
             .expect("nothing stays reserved or owned");
         let mut leaked = base.clone();
         leaked.push(released(1, 1));
-        refused_as(leaked, "LeakedReservation");
+        let leaked = claimed_as(leaked, ClaimRule::LeakedReservation);
+        assert_eq!(leaked.unsettled_rounds(), 1, "the round is still released");
         let mut kept_lease = base.clone();
         kept_lease.extend([
             reservation_ended(1, 2, ReservationEnd::Released),
             released(1, 1),
         ]);
-        refused_as(kept_lease, "LeakedLease");
+        claimed_as(kept_lease, ClaimRule::LeakedLease);
         let mut twice = base.clone();
         twice.extend([
             reservation_ended(1, 2, ReservationEnd::Released),
@@ -1651,7 +1702,7 @@ mod tests {
                 queue_owned: 3,
             },
         ]);
-        refused_as(queue_kept, "LeakedLease");
+        claimed_as(queue_kept, ClaimRule::LeakedLease);
 
         let mut held = base;
         held.extend([
@@ -1688,7 +1739,14 @@ mod tests {
             call: 1,
             panicked: false,
         });
-        refused_as(unreturned, "LeakedLease");
+        claimed_as(unreturned, ClaimRule::LeakedLease);
+        // Handled without `HeadersEnded`: the call still holds the headers.
+        let mut still_held = held[..held.len() - 1].to_vec();
+        still_held.push(ReactorEvent::Handled {
+            call: 1,
+            panicked: false,
+        });
+        claimed_as(still_held, ClaimRule::OpenOwnership);
         held.extend([
             returned(1, 1, 3),
             ReactorEvent::Handled {

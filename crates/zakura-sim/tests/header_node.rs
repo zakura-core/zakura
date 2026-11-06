@@ -299,6 +299,7 @@ impl HasView for Planted {
             faults: Default::default(),
             capacity: Default::default(),
             claims: Default::default(),
+            rounds: Default::default(),
         }
     }
 }

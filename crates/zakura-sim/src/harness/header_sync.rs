@@ -29,7 +29,7 @@ use super::{
     header_node::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
-        claim::ClaimEvidence,
+        claim::{ClaimEvidence, RoundEvidence},
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
@@ -46,7 +46,7 @@ use super::{
 };
 use crate::{
     domain::{
-        header_sync::{chunk_budget_bound, BudgetView},
+        header_sync::{chunk_budget_bound, teardown_returns_baseline, BudgetView, TeardownView},
         session::{honest_never_punished, HonestPeers},
     },
     observe::StorageFact,
@@ -549,6 +549,8 @@ pub struct Storage {
     capacity: CapacityEvidence,
     /// The claim rules the node's tap found broken.
     claims: ClaimEvidence,
+    /// The node's released rounds, from its tap.
+    rounds: RoundEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -581,6 +583,8 @@ pub struct StorageView {
     /// The claim rules the node's tap found broken, at the step that found
     /// each.
     pub claims: ClaimEvidence,
+    /// The node's released rounds at each drain.
+    pub rounds: RoundEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -592,6 +596,18 @@ impl BudgetView for StorageView {
     /// [`StorageView::claims`].
     fn claims(&self) -> &ClaimEvidence {
         &self.claims
+    }
+}
+
+impl TeardownView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::rounds`].
+    fn rounds(&self) -> &RoundEvidence {
+        &self.rounds
     }
 }
 
@@ -617,6 +633,7 @@ impl HasView for Storage {
             faults: self.faults.clone(),
             capacity: self.capacity.clone(),
             claims: self.claims.clone(),
+            rounds: self.rounds.clone(),
         }
     }
 
@@ -745,6 +762,7 @@ impl Subsystem for Storage {
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
+        let rounds = tap.rounds();
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -810,6 +828,7 @@ impl Subsystem for Storage {
             adoption,
             capacity: ports.capacity,
             claims,
+            rounds,
             faults,
             topology,
         }
@@ -940,6 +959,8 @@ pub struct HeaderWire {
     capacity: CapacityEvidence,
     /// The claim rules the node's tap found broken.
     claims: ClaimEvidence,
+    /// The node's released rounds, from its tap.
+    rounds: RoundEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -966,6 +987,7 @@ impl HasView for HeaderWire {
             faults: self.faults.clone(),
             capacity: self.capacity.clone(),
             claims: self.claims.clone(),
+            rounds: self.rounds.clone(),
         }
     }
 
@@ -1094,6 +1116,7 @@ impl Subsystem for HeaderWire {
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
+        let rounds = tap.rounds();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
         sim.add_source(Box::new(storage.with_tap(tap)));
@@ -1168,6 +1191,7 @@ impl Subsystem for HeaderWire {
             adoption,
             capacity: ports.capacity,
             claims,
+            rounds,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),
@@ -1269,10 +1293,12 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 }
 
 /// The storage harness's properties, [`OPERATION_IDS`],
-/// [`DIRECT_DISPATCH`] and [`CHUNK_BUDGET_BOUND`], all active. A test
-/// harness that wraps [`Storage`] with its view registers them too.
+/// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`] and
+/// [`TEARDOWN_RETURNS_BASELINE`], all active. A test harness that wraps
+/// [`Storage`] with its view registers them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
+/// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1297,6 +1323,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             witness: None,
         },
         chunk_budget_bound(),
+        teardown_returns_baseline(),
     ]
 }
 

@@ -21,6 +21,13 @@ pub enum Claim {
     BudgetOverCapacity,
     /// A reported reservation takes the budget's claims past its capacity.
     OverBudget,
+    /// The queue released a round with its peer still holding a
+    /// reservation.
+    LeakedReservation,
+    /// A released round kept a lease past its settlement.
+    LeakedLease,
+    /// A call was handled with its round's headers still held.
+    OpenOwnership,
 }
 
 impl Claim {
@@ -28,7 +35,57 @@ impl Claim {
     pub(super) fn of(rule: ClaimRule) -> Claim {
         match rule {
             ClaimRule::OverBudget => Claim::OverBudget,
+            ClaimRule::LeakedReservation => Claim::LeakedReservation,
+            ClaimRule::LeakedLease => Claim::LeakedLease,
+            ClaimRule::OpenOwnership => Claim::OpenOwnership,
         }
+    }
+}
+
+/// The node's released rounds at one drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rounds {
+    /// The step whose drain read them.
+    pub step: u64,
+    /// How many rounds the queue has released so far.
+    pub released: u64,
+    /// How many of those haven't settled: some of their staged headers
+    /// haven't returned.
+    pub unsettled: usize,
+}
+
+/// One reactor's released rounds at each drain, shared by its tap and
+/// whoever reads them. Cloning shares the store.
+#[derive(Clone, Debug, Default)]
+pub struct RoundEvidence(Arc<Mutex<Vec<Rounds>>>);
+
+impl RoundEvidence {
+    /// Keeps `rounds`. Nothing else is called while the lock is held.
+    pub(crate) fn record(&self, rounds: Rounds) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(rounds);
+    }
+
+    /// The rounds the drain of `step` read, if it did.
+    pub fn at(&self, step: u64) -> Option<Rounds> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|rounds| rounds.step == step)
+            .copied()
+    }
+
+    /// Whether any drain found a released round.
+    pub fn any_released(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|rounds| rounds.released > 0)
     }
 }
 
@@ -51,7 +108,7 @@ pub struct ClaimEvidence(Arc<Mutex<Vec<(ClaimRecord, bool)>>>);
 impl ClaimEvidence {
     /// Keeps `record`, unreported. Nothing else is called while the lock is
     /// held.
-    pub(super) fn record(&self, record: ClaimRecord) {
+    pub(crate) fn record(&self, record: ClaimRecord) {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

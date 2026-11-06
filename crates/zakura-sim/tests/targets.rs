@@ -164,8 +164,8 @@ fn declared_targets_are_the_sim_packages() {
 }
 
 /// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the uncapped secondary reservation, whose planted
-/// case names the close-and-relink seed.
+/// storage seeds carry the planted cases that name the close-and-relink
+/// seed.
 #[test]
 fn bypasses_follow_their_committed_input() {
     let load = |harness| seed::load(&[fixtures()], Some(harness)).unwrap().admitted;
@@ -177,11 +177,22 @@ fn bypasses_follow_their_committed_input() {
         Path::new("qa/planted/discovery/wait-complete-wakes/lost-wakeup.patch")
     );
     let storage = bypasses(&root(), &load("header-sync/storage")).unwrap();
-    assert_eq!(storage.len(), 1, "{storage:?}");
-    assert_eq!(storage[0].property, "header-sync/chunk-budget-bound");
+    let patches: Vec<&Path> = storage
+        .iter()
+        .map(|bypass| bypass.patch.as_path())
+        .collect();
     assert_eq!(
-        storage[0].patch,
-        Path::new("qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch")
+        patches,
+        [
+            "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/leaked-reservation-entry.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/skipped-round-release.patch",
+        ]
+        .map(Path::new),
+        "{storage:?}"
     );
 }
 

@@ -5663,6 +5663,7 @@ mod zakura_header_sync_driver_tests {
         let zakura_state::InitializedState {
             state: write_state,
             read_state,
+            latest_chain_tip,
             ..
         } = zakura_state::init_test_services(&network).await;
 
@@ -5723,7 +5724,7 @@ mod zakura_header_sync_driver_tests {
         .spawn(
             action_rx,
             block_sync,
-            _latest_tip,
+            latest_chain_tip,
             read_state.clone(),
             verifier,
         );

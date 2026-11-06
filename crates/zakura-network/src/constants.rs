@@ -85,13 +85,15 @@ pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
 /// The default advert window of a block at or above the full size.
 ///
-/// This will be used as `Config.advert_window_min` if it is not configured.
-pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
+/// This will be used as `Config.advert_window_min` if it is not configured. It equals
+/// [`DEFAULT_ADVERT_WINDOW_MAX`], so by default every block is advertised to up to 400 peers at
+/// once, whatever its size.
+pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 400;
 
 /// The default advert window of a block at or below the small size.
 ///
 /// This will be used as `Config.advert_window_max` if it is not configured.
-pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 400;
 
 /// The default block size that gets the maximum advert window, 100 KiB.
 ///

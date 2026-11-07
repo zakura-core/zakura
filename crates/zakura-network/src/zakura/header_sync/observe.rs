@@ -30,7 +30,12 @@ use crate::zakura::{ServicePeerDirection, SessionOrigin, ZakuraPeerId};
 
 mod ledger;
 
-pub use ledger::HeaderWorkLedger;
+pub use ledger::{ClaimBreak, ClaimRule, HeaderWorkLedger};
+
+/// The header chunk budget's capacity, so a model can pin its own constant
+/// to it.
+pub const HEADER_CHUNK_BUDGET_CAPACITY: usize =
+    super::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1;
 
 /// Receives reactor events as they happen.
 ///

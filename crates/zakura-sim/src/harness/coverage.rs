@@ -337,6 +337,14 @@ pub static COVERAGE: &[Coverage] = &[
         )),
     },
     Coverage {
+        property: super::super::domain::header_sync::CHUNK_BUDGET_BOUND,
+        passing: passes(
+            "tests/header_node_capacity.rs",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
+        bypass: Bypass::Planted("uncapped-secondary-reservation"),
+    },
+    Coverage {
         property: super::header_sync::HEADER_FAULT_PENALIZED,
         passing: passes(
             "tests/header_wire_prepare_fault.rs",

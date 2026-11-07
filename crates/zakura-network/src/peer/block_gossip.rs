@@ -1362,13 +1362,7 @@ mod tests {
         let hash = block::Hash([19; 32]);
         let slots = BlockUploadSlots::new(1);
         let (peer, mut receiver) = peer();
-        let committed = tokio::spawn(broadcast_block(
-            vec![peer.clone()],
-            hash,
-            1,
-            true,
-            slots.clone(),
-        ));
+        let committed = tokio::spawn(broadcast_block(vec![peer.clone()], hash, 1, slots.clone()));
         accept(&mut receiver, hash).await;
         peer.uploads.requested(hash);
         peer.uploads.written(hash);
@@ -1376,7 +1370,7 @@ mod tests {
 
         // Awaiting completion releases the upload claim: this is not the overlapping case.
         assert!(receiver.try_recv().is_err());
-        let delayed_early = tokio::spawn(broadcast_block(vec![peer.clone()], hash, 1, true, slots));
+        let delayed_early = tokio::spawn(broadcast_block(vec![peer.clone()], hash, 1, slots));
         let duplicate = timeout(BLOCK_REQUEST_WAIT, receiver.recv())
             .await
             .expect("a late early event currently sends another inventory")

@@ -212,7 +212,8 @@ enum Run {
         /// Why the witness test failed, or `None` if it passed.
         witness: Option<String>,
     },
-    /// The build or the `zakura-sim` command failed before writing a trace.
+    /// The build or the `zakura-sim` command failed before writing a trace,
+    /// or the pilot's run passed its deadline or died from a signal.
     Failed(String),
 }
 
@@ -908,8 +909,9 @@ fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
 /// to `out`, and reads its `end` record and the test's result.
 ///
 /// With a `deadline` and its interrupt flag, the command's output goes to
-/// `<out>.log`. A run past the deadline is killed and fails, and a set flag
-/// kills the run and stops the pilot.
+/// `<out>.log`. A run past the deadline is killed and fails, as does a run
+/// that a signal killed, whatever files it already wrote. A set flag kills
+/// the run and stops the pilot.
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -933,10 +935,16 @@ fn record(
         Some((deadline, interrupt)) => {
             let log = out.with_extension("log");
             let end = sim_minimize::run_child(&mut zakura_sim, &log, Some(deadline), interrupt)?;
-            if end == sim_minimize::ChildEnd::Interrupted {
-                return Err(pilot::INTERRUPTED_ERROR.into());
+            let ended = format!("{end}; see {}", log.display());
+            match end {
+                sim_minimize::ChildEnd::Interrupted => return Err(pilot::INTERRUPTED_ERROR.into()),
+                // Its trace and witness result may look whole, but the
+                // run didn't finish.
+                sim_minimize::ChildEnd::TimedOut | sim_minimize::ChildEnd::Signaled(_) => {
+                    return Ok(Run::Failed(format!("`zakura-sim record` {ended}")))
+                }
+                sim_minimize::ChildEnd::Exited(_) => ended,
             }
-            format!("{end}; see {}", log.display())
         }
     };
     // A failed witness test exits 1 too, but only after writing its result.

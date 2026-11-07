@@ -293,8 +293,8 @@ pub(super) struct DiscoveryRun {
 
 /// What a seed's paired campaigns show about `property`: the original's
 /// campaign must complete from an empty corpus with no failure, and the
-/// mutant's equal-budget campaign must find exactly `property`, which a
-/// fresh process confirms. A completed campaign that never applies the
+/// mutant's equal-budget campaign must find exactly `property`, with no
+/// other failure, and a fresh process must confirm it. A completed campaign that never applies the
 /// property is [`Class::NotApplicable`], never a survivor.
 pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
     let harness = |why: String| result(Class::HarnessFailure, why);
@@ -321,6 +321,14 @@ pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
         return harness(format!(
             "the mutant campaign started from {} inputs, not the frozen empty corpus",
             mutant.initial_inputs
+        ));
+    }
+    // A timeout, OOM or unexplained crash never counts as detection, even
+    // beside a finding.
+    if !mutant.failures.is_empty() {
+        return harness(format!(
+            "the mutant campaign left failures: {}",
+            mutant.failures.join(", ")
         ));
     }
     let others: Vec<&String> = mutant.violated.iter().filter(|p| *p != property).collect();

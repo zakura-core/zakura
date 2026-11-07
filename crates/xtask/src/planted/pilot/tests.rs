@@ -1043,3 +1043,131 @@ fn relative_flags_become_absolute() {
     assert_eq!(absolute.work, None);
     assert!(parse_flags(["--work", "w"].into_iter().map(str::to_owned)).is_err());
 }
+
+/// A campaign that left a libFuzzer timeout beside a confirmed finding of
+/// the intended ID is a harness failure: a timeout never counts as
+/// detection.
+#[test]
+fn a_timeout_beside_a_finding_is_a_harness_failure() {
+    let worker = "runs/m/workers/0";
+    let intended = format!("{worker}/sim/inputs/active/block/reactor-policy/aa.bin");
+    let crash = format!("{worker}/artifacts/crash-bb");
+    let timeout = format!("{worker}/artifacts/timeout-dd");
+    let failures: Vec<Value> = [&intended, &crash, &timeout]
+        .iter()
+        .map(|path| serde_json::json!({"path": path, "sha256": "00"}))
+        .collect();
+    let end = serde_json::json!({
+        "failures": failures,
+        "workers": [{"index": 0, "millis": 1500}],
+    });
+    let evidence = serde_json::json!({
+        "status": "worker-stopped",
+        "totals": {"runs": 42},
+        "unapplied": [],
+        "incomplete": [{"reason": "restart-limit", "worker": 0}],
+    });
+    let facts = campaign_facts(ID, Some(&end), &evidence, 0);
+    assert_eq!(facts.violated, [ID]);
+    assert_eq!(facts.failures, [timeout.clone()]);
+    let result = classify::discovery(ID, &discovery_run(facts, Some(Ok(()))));
+    assert_eq!(result.class, Class::HarnessFailure, "{}", result.reason);
+    assert!(result.reason.contains(&timeout), "{}", result.reason);
+    // Another ID's finding beside a timeout doesn't count either.
+    let mut other = found(OTHER);
+    other.failures = vec![timeout];
+    assert_eq!(
+        discovered(&discovery_run(other, Some(Ok(())))),
+        Class::HarnessFailure
+    );
+}
+
+/// A witness run that passes its deadline, or that a signal kills, fails
+/// though it already wrote a whole trace and its witness result. Its trace
+/// isn't scored: the original's run is a baseline failure, and a mutant's
+/// a harness failure even beside a confirmed violation.
+#[cfg(unix)]
+#[test]
+fn a_witness_run_that_times_out_or_is_killed_is_not_scored() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let property = &case.property;
+    // A whole trace of the intended violation on a paired mutant build.
+    let mut build = catalogue.baseline_build.clone();
+    build["dirty"] = Value::Bool(true);
+    build["source"] = Value::String("mutated".to_owned());
+    let meta = serde_json::json!({"meta": {
+        "sim": case.harness,
+        "input": {"sha256": case.witness_sha256},
+        "build": build,
+    }});
+    let end = serde_json::json!({"end": {
+        "outcome": "idle",
+        "violation": {"property": property},
+        "status": "quiescent",
+        "steps": 4,
+        "cleanup": {},
+        "properties": [{"property": property, "outcome": {"violated": {"witness": [3]}}}],
+    }});
+    let trace = dir.path().join("trace.jsonl");
+    fs::write(&trace, format!("{meta}\n{{\"step\":1}}\n{end}\n")).expect("the trace is written");
+    for (name, death, ended) in [
+        ("hang", "exec sleep 30", "ran past its deadline"),
+        ("killed", "kill -KILL $$", "died from signal 9"),
+    ] {
+        // A stand-in for `zakura-sim record` that writes the whole trace and
+        // a passing witness result, then dies by `death`.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = record ] || exit 0\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\n\
+                 mkdir -p \"$out\"\n\
+                 cp '{}' \"$out/trace.jsonl\"\n\
+                 echo '{{\"passed\":true,\"error\":null}}' > \"$out/witness.json\"\n\
+                 {death}\n",
+                trace.display()
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = witness_run(
+            &sim,
+            dir.path(),
+            case,
+            &catalogue,
+            true,
+            &dir.path().join(format!("{name}-out")),
+            Duration::from_millis(500),
+            &AtomicBool::new(false),
+        )
+        .expect("the run's end doesn't stop the experiment");
+        let Run::Failed(failed) = &recorded.run else {
+            panic!("{name}: a run that {ended} was scored: {:?}", recorded.run);
+        };
+        assert!(failed.contains(ended), "{name}: {failed}");
+
+        let baseline = classify::sensitivity_baseline(property, &Some(Ok(recorded.clone())))
+            .expect("the baseline fails");
+        assert_eq!(baseline.class, Class::BaselineFailure, "{name}");
+
+        let mutant = SensitivityRun {
+            mutant: Some(Ok(recorded)),
+            ..sensitivity_run(run(None, &[(ID, HELD)]), Some(Ok(())))
+        };
+        let result = classify::sensitivity(property, &mutant);
+        assert_eq!(result.class, Class::HarnessFailure, "{name}");
+        assert!(result.reason.contains(ended), "{name}: {}", result.reason);
+    }
+}

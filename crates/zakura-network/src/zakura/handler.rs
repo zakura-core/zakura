@@ -32,6 +32,7 @@ use zakura_chain::{
     },
     transaction::Transaction,
 };
+use zakura_jsonl_trace::{JsonlTraceTables, JsonlTracer};
 use zakura_node_services::task::{erased, spawn_erased_named};
 use zakura_quic::{
     Acceptor, Admit, Conn as Connection, IncomingInfo, NodeAddr, NodeId, NodeSecretKey,
@@ -369,11 +370,22 @@ pub struct ZakuraConfig {
     pub message_rate_per_second: u32,
     /// Optional directory for structured Zakura CSV trace tables.
     ///
-    /// When unset, Zakura trace emission is disabled. When set, the native Zakura endpoint writes
-    /// the production trace schema and the legacy sync pipeline writes `legacy_sync.csv` into
-    /// this directory. Legacy peer fields in `legacy_sync.csv` follow
+    /// When unset, Zakura trace emission is disabled. When set, the node writes each table
+    /// selected by [`trace_tables`](Self::trace_tables) to `<table>.csv` in this directory:
+    /// the native Zakura endpoint, the legacy peer set and sync pipeline, and the mining RPCs all
+    /// write here. Legacy peer fields in `legacy_sync.csv` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     pub trace_dir: Option<PathBuf>,
+    /// Master switch for every CSV trace table.
+    ///
+    /// Set to `false` to stop all trace output while keeping `trace_dir` and `trace_tables`
+    /// configured. Has no effect when `trace_dir` is unset.
+    pub trace_enabled: bool,
+    /// CSV trace tables written to [`trace_dir`](Self::trace_dir).
+    ///
+    /// Defaults to every table. Unknown table names are a config error. For example,
+    /// `trace_tables = ["mining"]` writes only `mining.csv`.
+    pub trace_tables: JsonlTraceTables,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -410,6 +422,8 @@ impl Default for ZakuraConfig {
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
+            trace_enabled: true,
+            trace_tables: JsonlTraceTables::default(),
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,
@@ -418,6 +432,19 @@ impl Default for ZakuraConfig {
 }
 
 impl ZakuraConfig {
+    /// Spawns a CSV tracer that writes the configured trace tables.
+    ///
+    /// Returns a no-op tracer when `trace_dir` is unset, `trace_enabled` is `false`, or
+    /// `trace_tables` is empty.
+    pub fn spawn_tracer(&self) -> JsonlTracer {
+        match &self.trace_dir {
+            Some(trace_dir) if self.trace_enabled && !self.trace_tables.is_empty() => {
+                JsonlTracer::spawn(trace_dir.clone()).with_tables(self.trace_tables.clone())
+            }
+            _ => JsonlTracer::noop(),
+        }
+    }
+
     /// Refuses a stream receive window that can't hold the largest native
     /// frame, a block-sync frame of `MAX_BS_FRAME_BYTES`.
     ///
@@ -4825,13 +4852,7 @@ async fn spawn_zakura_endpoint_inner(
         ),
         None => ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip()),
     };
-    let tracer = config
-        .zakura
-        .trace_dir
-        .clone()
-        .map(zakura_jsonl_trace::JsonlTracer::spawn)
-        .unwrap_or_else(zakura_jsonl_trace::JsonlTracer::noop);
-    let trace = ZakuraTrace::new(tracer, zakura_jsonl_trace::node_id());
+    let trace = ZakuraTrace::new(config.zakura.spawn_tracer(), zakura_jsonl_trace::node_id());
     let handshake_config = ZakuraHandshakeConfig::for_network_with_dev_cohort(
         &config.network,
         config.zakura.dev_network.as_deref(),

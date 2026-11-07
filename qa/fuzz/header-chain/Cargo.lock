@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "13.1.0"
+version = "14.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "14.1.0"
+version = "15.0.0"
 dependencies = [
  "chrono",
  "derive-new",

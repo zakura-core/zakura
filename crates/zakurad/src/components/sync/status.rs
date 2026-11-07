@@ -20,6 +20,11 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
+    /// Wake consumers whenever the synchronizer's distance estimate changes.
+    pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.latest_sync_length.changed().await
+    }
+
     /// The threshold that determines if the synchronization is at the chain
     /// tip.
     ///

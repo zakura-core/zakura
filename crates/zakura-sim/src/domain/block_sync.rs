@@ -41,6 +41,8 @@
 //! The retained, reserved and look-ahead bounds are instances of the
 //! shared resource bound ([`super::shared::bounds`]). Each instance gives
 //! its reading, and the shared check judges it.
+//! [`TEARDOWN_RETURNS_BASELINE`] is an instance of the shared teardown
+//! ([`super::shared::teardown`]) in the same way.
 //!
 //! # The look-ahead bound's coefficients
 //!
@@ -72,13 +74,14 @@ use crate::{
     observe::{
         BlockSyncFact, BlockSyncHolder, BlockSyncPayload, BlockSyncRetained, StorageFact, WorkOwner,
     },
-    property::{
-        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status, Unit, Verdict,
-    },
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Unit, Verdict},
     Observation, ObservationLog,
 };
 
-use super::shared::bounds::{bound, Bound, Measured, Reading};
+use super::shared::{
+    bounds::{bound, Bound, Measured, Reading},
+    teardown::{self, teardown, Teardown},
+};
 
 /// Runtime payload identities and decoded sizes match policy at each captured sequencer boundary.
 ///
@@ -1034,17 +1037,7 @@ where
             witness: Some(body_handed_off),
         },
         bound::<S, LookaheadBound>(),
-        Property {
-            id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
-            claim: "once every peer has left, every routine has ended and the input \
-                    queue is empty, at rest, no block-sync charge remains",
-            kind: Kind::Safety,
-            assumes: &[],
-            needs: &[Source::View, Source::Schedule],
-            status: Status::Active,
-            check: check_teardown::<S>,
-            witness: Some(routine_ended_owing),
-        },
+        teardown::<S, BlockTeardown>(),
     ]
 }
 
@@ -1334,7 +1327,7 @@ where
     }
 }
 
-/// Checks [`TEARDOWN_RETURNS_BASELINE`] after a step.
+/// [`TEARDOWN_RETURNS_BASELINE`], checked after every step.
 ///
 /// The trigger is every link the harness made having closed. Settlement is
 /// established apart from the charges: every admitted session's routine,
@@ -1348,48 +1341,50 @@ where
 /// unsettled, so a run that ends there, including one with a leaked
 /// routine or queued body, is `Inconclusive { TeardownOpen }`, not a
 /// violation.
-fn check_teardown<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+struct BlockTeardown;
+
+impl<S: HasView> Teardown<S> for BlockTeardown
 where
     S::View: OwnerView,
 {
-    let status = cx.status;
-    let (left, unended, queued, charges, gap) = cx.view().read_owners(|owners| {
-        (
-            owners.peers_left(),
-            owners.unended(),
-            owners.queued(),
-            [
-                ("the byte budget", owners.reserved()),
-                ("the work queue's tally", owners.queue_reserved()),
-                (
-                    "the routines' unreceived estimates",
-                    owners.unreceived_estimates(),
-                ),
-                (
-                    "open handoffs",
-                    u64::try_from(owners.handoffs().len()).unwrap_or(u64::MAX),
-                ),
-            ],
-            owners.gap(),
-        )
-    });
-    if !left {
-        return Verdict::NotApplicable;
-    }
-    if let Some(gap) = gap {
-        cx.missing_evidence(gap);
-        return Verdict::NotApplicable;
-    }
-    if unended > 0 || queued > 0 || !at_rest(status) {
-        cx.unsettled(Inconclusive::TeardownOpen);
-        return Verdict::NotApplicable;
-    }
-    match charges.iter().find(|(_, value)| *value > 0) {
-        None => Verdict::Holds,
-        Some((owner, value)) => cx.violated(
-            format!("{owner} is zero once teardown settles"),
-            format!("it counts {value}"),
-        ),
+    const ID: &'static str = TEARDOWN_RETURNS_BASELINE;
+    const CLAIM: &'static str = "once every peer has left, every routine has ended and the input \
+                                 queue is empty, at rest, no block-sync charge remains";
+    const NEEDS: &'static [Source] = &[Source::View, Source::Schedule];
+    const WITNESS: fn(&ObservationLog) -> bool = routine_ended_owing;
+
+    fn read(cx: &CheckCtx<'_, S>) -> teardown::Reading {
+        let status = cx.status;
+        let (left, unended, queued, charges, gap) = cx.view().read_owners(|owners| {
+            (
+                owners.peers_left(),
+                owners.unended(),
+                owners.queued(),
+                [
+                    ("the byte budget", owners.reserved()),
+                    ("the work queue's tally", owners.queue_reserved()),
+                    (
+                        "the routines' unreceived estimates",
+                        owners.unreceived_estimates(),
+                    ),
+                    (
+                        "open handoffs",
+                        u64::try_from(owners.handoffs().len()).unwrap_or(u64::MAX),
+                    ),
+                ],
+                owners.gap(),
+            )
+        });
+        if !left {
+            return teardown::Reading::Untriggered;
+        }
+        if let Some(gap) = gap {
+            return teardown::Reading::MissingEvidence(gap);
+        }
+        if unended > 0 || queued > 0 || !at_rest(status) {
+            return teardown::Reading::Unsettled;
+        }
+        teardown::Reading::Settled(charges.to_vec())
     }
 }
 

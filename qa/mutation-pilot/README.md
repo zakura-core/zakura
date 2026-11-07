@@ -16,16 +16,22 @@ defines the broader acceptance criteria.
 
 | Build | Revision | Toolchain |
 | --- | --- | --- |
-| Dev/test witness simulator | `870678be1739ea799e59b4e0bdfe6cf512792710` | Rust 1.99.0, `--cfg zakura_sim`, no debug information or incremental compilation |
-| Fuzz targets | `b2e0456474e47e6264c912b2f6b50d09c8603115` | `nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, `--sanitizer none` |
+| Dev/test witness simulator | `debba4e31dde0c2d5a01b7988fcf07902bd1a538` | Rust 1.99.0, `--cfg zakura_sim`, no debug information or incremental compilation |
+| Fuzz targets | `debba4e31dde0c2d5a01b7988fcf07902bd1a538` | `nightly-2026-07-15`, cargo-fuzz 0.13.2, libfuzzer-sys 0.4.13, `--sanitizer none` |
 
-The fuzz revision keeps the production source of the witness revision.
-It adds only the refreshed `qa/fuzz/sim/Cargo.lock` from mut-1.3.
-`scripts/check_mutation_pilot.py` checks the pilot's own inputs under `qa/`
-on any tree. `--at-pin` also requires the tree's production, oracle and lock
-files to equal both revisions, which a pilot run needs. `crates/xtask` holds
-the pilot tooling, so it stays outside the pin. Run the pilot from a tree
-where `--at-pin` passes, or re-pin the catalogue first.
+Both builds use one `main` commit. #2083 refreshed `qa/fuzz/sim/Cargo.lock`
+on `main`, so the fuzz build needs no commit of its own.
+
+Pilot inputs come from the pinned revision. The runner reads each case's
+patch, witness input and production files, and the empty corpus, at the pin,
+never from the tree it runs from. `scripts/check_mutation_pilot.py` reads
+those inputs, the sidecars and the target manifest there too. So a later
+change on `main`, such as #2066's refresh of `wrong-eviction-victim.patch`,
+leaves the pilot alone. A case whose patch exists in the tree but not at the
+pin fails. The checker needs a clone that holds both revisions. `--at-pin`
+also requires the tree's production, oracle and lock files to equal both
+revisions. `crates/xtask` holds the pilot tooling, so it stays outside the
+pin. The runner reads only the catalogue from the tree it runs from.
 
 ## Case matrix
 
@@ -95,21 +101,74 @@ python3 scripts/check_mutation_pilot.py --evidence "$BUNDLE_DIR"
 python3 -m unittest discover -s scripts/tests -p test_check_mutation_pilot.py -v
 ```
 
-By default, the checker verifies the repository inputs under `qa/`. It checks
-the case count and fault classes, patch, sidecar and witness hashes, patch
-bindings, target bindings and the `holds` witness for each intended property.
-It checks the empty discovery corpus.
-With `--at-pin`, it also checks the production and checker hashes and the lock
-hashes, and it rejects a tree whose build inputs differ from either pinned
-revision. A pilot run needs `--at-pin`; later commits on `main` fail it.
-With `--evidence`, it also checks the extracted bundle against the
-catalogue. Each baseline must have nonzero intended applicability, a passing
-witness, no other property outcome than held or not applicable, a quiescent
-end and zero cleanup failures. Its record and replay exit codes come from the
-bundle's `baseline/results.json`, whose hash the catalogue pins. Each calibration run must be complete and
-clean, with matching build identity and applicability label.
-The checker reruns no replay, proves no causal trigger semantics and runs no
-mutation. The tests build a small synthetic checkout and bundle.
+By default, the checker verifies the pilot's inputs under `qa/` at the
+pinned revisions. It checks the case count and fault classes, patch, sidecar
+and witness hashes, patch bindings, target bindings and the `holds` witness
+for each intended property. It checks the empty discovery corpus at the fuzz
+revision. With `--at-pin`, it also checks the production and checker hashes
+and the lock hashes, and it rejects a tree whose build inputs differ from
+either pinned revision. A pilot run needs `--at-pin`; later commits on
+`main` fail it. With `--evidence`, it also checks the extracted bundle
+against the catalogue. Each baseline must have nonzero intended
+applicability, a passing witness, no other property outcome than held or not
+applicable, a quiescent end and zero cleanup failures. Its record and replay
+exit codes come from the bundle's `baseline/results.json`, whose hash the
+catalogue pins. Each calibration run must be complete and clean, with
+matching build identity and applicability label. The checker reruns no
+replay, proves no causal trigger semantics and runs no mutation. The tests
+build a small synthetic checkout and bundle.
+
+## Paired runner
+
+`cargo xtask planted pilot` runs the paired experiments from this catalogue
+(mut-3). It checks out each pinned revision in fresh worktrees, so it runs
+from a later tree such as `main`. There the Python checker's `--at-pin`
+check fails, so the runner checks the pins itself. It reads each patch,
+witness input and production file, and the empty corpus, from its pinned
+worktree. Each file must match its catalogue hash, and the corpus must be
+empty. A patch missing at the pin fails the run before anything builds. Each
+trace or fuzz build must pair with the catalogue's build identity. The
+runner builds the original and every mutant in separate worktrees and target
+directories under `--work`. `--out` must be missing or empty, so a run never
+replaces an earlier result.
+
+```sh
+cargo xtask planted pilot sensitivity --out "$OUT" [--only <case-id>]...
+cargo xtask planted pilot discovery --out "$OUT" [--only <case-id>]... [--seed <n>]...
+```
+
+`sensitivity` builds the witness revision with Rust 1.99.0 and the dev
+profile without debug information or incremental compilation. It writes
+`sensitivity.json`. `discovery` builds the fuzz revision and runs each
+original and mutant campaign with the bounds above. It writes
+`discovery.json`. Run `discovery` only on the remote campaign host. It runs
+one 600-second original campaign per target and seed, and one 600-second
+mutant campaign per case and seed. `--only` and `--seed` split the work
+across hosts.
+
+Each result is exactly one class of the plan's table: intended violation,
+other violation, survived budget, not applicable, baseline failure, invalid
+mutant, harness failure or equivalent. A process that runs past its deadline
+or dies from a signal is a harness failure, for the original as for the
+mutant: a witness run, a `campaign start` or `campaign evidence` process, or
+a campaign worker's libFuzzer timeout or unexplained crash. Only review
+metadata marks a case equivalent, through an `equivalent` argument on its
+catalogue entry. An intended violation also needs a fresh `zakura-sim
+confirm` and an Exact replay of the confirmed trace. Each report counts
+results by class and fault class. The rate's denominator leaves out baseline
+failures, invalid mutants and equivalent mutants, and keeps not-applicable
+results. `discovery` skips each case whose catalogue entry sets
+`discovery_excluded`, and lists it with its reason outside the counts.
+`sensitivity` still runs it.
+
+The catalogue first pinned production at `870678be1` and the fuzz inputs
+at `b2e0456474`, which existed only on the stack branches that merged as
+squashes. The re-pin moved both onto `main` at `debba4e31` and recorded
+fresh baselines and calibration on the campaign host. Between the two pins,
+`main` changed three pinned files: `discovery/protocol.rs`,
+`header_sync/reactor/state.rs` and `header_sync/reactor/machine_tests.rs`.
+Every patch still applies. Every baseline trace matches the first pin's
+record for record after its `meta` record, which names the new build.
 
 ## Reproduce the baselines and calibration
 
@@ -125,9 +184,11 @@ timeout 60 "$SIM" replay "$OUT"
   --fixtures qa/mutation-pilot/discovery-empty --report "$OUT/empty-seeds.json"
 ```
 
-Calibration builds each target with the fuzz toolchain above and starts a
-new empty corpus with seed 11. Each run record in the bundle holds its exact
-command and environment. Remove `ZAKURA_SIM_EXPECT` and the sanitizer
+Calibration builds each target as a discovery lane does, with
+`"$SIM" campaign build --store "$STORE" --target "$TARGET" --sanitizer none`,
+and runs the store's fuzzer from a new empty corpus with seed 11. Each run
+record in the bundle holds its exact command, environment and build
+identity. Remove `ZAKURA_SIM_EXPECT` and the sanitizer
 option variables, as the record lists. Never reuse a calibration corpus for
 scoring.
 
@@ -153,35 +214,41 @@ duration, input count and applicability are in the bundle under
 `calibration/<target>/`. Throughput is host-specific.
 
 **Record-book applicability remains open.** `discovery_record_book` applied
-to zero of 27,183 cold-start inputs. Its `Holds` gate requires an
-installation, replacement, eviction and sample within one input. Zero
+to zero of 17,071 cold-start inputs at the re-pin (3,617 in 5 s and 13,454
+in 30 s), and to zero of 27,183 at the first pin. Its `Holds` gate requires
+an installation, replacement, eviction and sample within one input. Zero
 applicability is not a pass and not coverage. No generator or input repair
-followed. Both record-book cases stay in the discovery denominator. A scored
-run with zero applicability must report `NotApplicable`, not intended
-detection. Their committed sensitivity fixture still applies 13 times, and
-their curated target readiness passed in mut-1.3.
+followed. A target that applied to zero inputs in calibration shows a
+generator gap, not a result. So both record-book cases count for sensitivity
+only. Each catalogue entry sets `discovery_excluded` with that reason. The
+paired runner then runs no campaign for them, and its report lists them
+outside its counts. The Python checker requires the exclusion for every case
+whose target never applied in calibration. Their committed sensitivity
+fixture still applies 13 times, and their curated target readiness passed in
+mut-1.3.
 
 The 600-second allocation keeps the plan's initial proposal. It does not
 promise that any target reaches its trigger within that budget.
 
 ## Evidence bundle
 
-`2043-mut-2-2026-11-05.tar.zst`, SHA-256
-`fbf6210f4be815c2e47cfb43859c41f89335b9149eb1ee65495fc753f2255df2`.
-The mutation plan in Outline holds it as an attachment. Extract it and pass
-`2043-mut-2-2026-11-05/` as `--evidence`. `baseline.directory` and
-`calibration.runs[].directory` in the catalogue resolve inside that
-directory. `SHA256SUMS` inside the bundle covers every other file.
+`2063-mut-3-repin-2026-11-06.tar.zst`, SHA-256
+`c4fc16e6c00f8394e7bb926f57442b4989d559b1626690f1a2948075e0f0935d`. It is an
+Outline attachment, listed in the mutation plan's evidence table. Extract it
+and pass `2063-mut-3-repin-2026-11-06/` as `--evidence`.
+`baseline.directory` and `calibration.runs[].directory` in the catalogue
+resolve inside that directory. `SHA256SUMS` inside the bundle covers every
+other file.
 
 ```text
-2043-mut-2-2026-11-05/SHA256SUMS
-2043-mut-2-2026-11-05/baseline/results.json
-2043-mut-2-2026-11-05/baseline/{block-decoded-retention,block-reactor-identity,block-reactor-policy}/{input.bin,trace.jsonl,witness.json}
-2043-mut-2-2026-11-05/baseline/{discovery-record-book,header-publisher-policy,header-reactor-policy}/{input.bin,trace.jsonl,witness.json}
-2043-mut-2-2026-11-05/baseline/<stem>.log, one per input stem above
-2043-mut-2-2026-11-05/baseline/<stem>-discovery-seeds.json for block-decoded-retention, block-reactor-policy, discovery-record-book, header-publisher-policy, header-reactor-policy
-2043-mut-2-2026-11-05/calibration/{block_decoded_retention,block_reactor_policy,discovery_record_book,header_publisher_policy,header_reactor_policy}/{run.json,run.log,stats/stats-3.json}
-2043-mut-2-2026-11-05/calibration/discovery_record_book-30s/{run.json,run.log,stats/stats-4121690.json}
+2063-mut-3-repin-2026-11-06/SHA256SUMS
+2063-mut-3-repin-2026-11-06/baseline/results.json
+2063-mut-3-repin-2026-11-06/baseline/{block-decoded-retention,block-reactor-identity,block-reactor-policy}/{input.bin,trace.jsonl,witness.json}
+2063-mut-3-repin-2026-11-06/baseline/{discovery-record-book,header-publisher-policy,header-reactor-policy}/{input.bin,trace.jsonl,witness.json}
+2063-mut-3-repin-2026-11-06/baseline/<stem>.log, one per input stem above
+2063-mut-3-repin-2026-11-06/baseline/<stem>-discovery-seeds.json for block-decoded-retention, block-reactor-policy, discovery-record-book, header-publisher-policy, header-reactor-policy
+2063-mut-3-repin-2026-11-06/calibration/{block_decoded_retention,block_reactor_policy,discovery_record_book,header_publisher_policy,header_reactor_policy}/{run.json,run.log,stats/stats-<pid>.json}
+2063-mut-3-repin-2026-11-06/calibration/discovery_record_book-30s/{run.json,run.log,stats/stats-<pid>.json}
 ```
 
 ## Exclusions and remaining work

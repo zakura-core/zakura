@@ -21,8 +21,10 @@ a sanitizer must turn the feature off:
 RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s none --no-default-features race_fixtures
 ```
 
-`sim-fuzz.yml` runs each mapped target nightly and for longer on Sunday, or on a
-manual dispatch. It caches `corpus/<target>/` under the target's name and a digest of
+`sim-fuzz.yml` runs each mapped target for two minutes nightly, or on a
+manual dispatch. That run is a smoke: it shows each target still builds and
+runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
+campaigns. It caches `corpus/<target>/` under the target's name and a digest of
 its harness's `cargo xtask sim-versions` output, adds the harness's committed seeds, and replays that corpus in a
 fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
 whose target has no harness or no campaign.
@@ -367,8 +369,11 @@ replay must match Exact. It builds the patched `zakura-sim` and target in
 runs reuse the builds, and both binaries must embed the patched checkout's
 source digest. It prints each target's bypasses, or that it has none.
 
-The nightly `zakura_sim targets` job in `tests-unit.yml` runs both
-commands. It also runs on manual dispatch, never on pull requests.
+The nightly `zakura_sim targets` job in `tests-unit.yml` runs
+`cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
+requests. `planted --targets` rebuilds the patched `zakura-sim` and target
+for each case, which takes hours over the whole catalogue, so it runs on a
+remote host, as [Long runs](#long-runs) says.
 
 ## Seeds
 
@@ -532,3 +537,41 @@ only from a target with a collector.
 `cargo xtask sim-minimize` minimizes a saved failure, as
 [Minimizing a crash](#minimizing-a-crash) describes, and
 `cargo xtask sim-triage` archives it, as [Triage](#triage) describes.
+
+## Long runs
+
+The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
+each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
+runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
+`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+case's shard follows from its position in path order. Adding or removing a
+case moves every later case to another shard, so across that change a case
+can run on two nights in a row or wait up to 13 nights. A shard that holds no
+case fails the run. Each shard has its own failure issue,
+`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing run
+of that shard closes it, so a pass of another shard can't close it. A remote
+host runs the rest, including `cargo xtask planted --targets`, and its results
+never block a pull request. No CI job runs `planted --targets`.
+
+`scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
+writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs
+`cargo xtask planted` over the whole catalogue, then
+`cargo xtask planted --targets`. With `--seconds`, it then builds every
+target in [Targets](#targets), and then runs one [campaign](#campaigns) per
+target, all at once, each with the suite row's libFuzzer limits. Each
+target's store is `campaigns/<target>/` in the run's directory, and each
+campaign starts from the harness's curated seeds. A failed step doesn't stop
+the later ones. The script fails if a planted check fails, if a campaign
+fails to build or start, or if a campaign doesn't end `complete`. Findings
+alone don't change a campaign's status; read them with
+`cargo xtask sim-campaign evidence`.
+
+```console
+# Push the commit to the host's checkout, then start the run detached.
+git push ssh://<host>/<checkout> <branch>
+ssh <host> 'cd <checkout> && git checkout <branch> && nohup scripts/sim-long-runs.sh \
+    --out ~/sim-runs --seconds 14400 --workers 2 > ~/sim-runs.log 2>&1 < /dev/null &'
+
+# Each step logs whether it passed, how long it took, and where its log is.
+ssh <host> 'cat ~/sim-runs.log'
+```

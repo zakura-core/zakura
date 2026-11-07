@@ -1,6 +1,9 @@
 //! Discovery's shared logical state, owned under the discovery handle's mutex.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use thiserror::Error;
 use zakura_quic::NodeId;
@@ -477,7 +480,7 @@ impl DiscoveryState {
             outcome.attempted += 1;
             match self
                 .book
-                .import_verified_record(record, source, now, &context, changes)
+                .import_verified_record(record, source, None, now, &context, changes)
             {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
@@ -494,6 +497,7 @@ impl DiscoveryState {
         &mut self,
         session: &DiscoverySessionKey,
         record: VerifiedRecord,
+        remote_ip: Option<IpAddr>,
         connected: &[NodeId],
         now: u64,
         changes: &mut Vec<BookChange>,
@@ -501,7 +505,7 @@ impl DiscoveryState {
         if !self.is_current_session(session) {
             return Err(SessionRecordError::Superseded);
         }
-        Ok(self.install_connected_peer_record(record, connected, now, changes)?)
+        Ok(self.install_connected_peer_record(record, remote_ip, connected, now, changes)?)
     }
 
     /// Installs a connected peer's own record and updates its service hints.
@@ -512,9 +516,13 @@ impl DiscoveryState {
     ///
     /// The install first drops hints of peers no longer `connected`, so
     /// connection churn cannot grow the hints past the connection limit.
+    ///
+    /// The book confirms the record addresses on `remote_ip`, the
+    /// connection's authenticated remote IP, and no other address.
     pub(super) fn install_connected_peer_record(
         &mut self,
         record: VerifiedRecord,
+        remote_ip: Option<IpAddr>,
         connected: &[NodeId],
         now: u64,
         changes: &mut Vec<BookChange>,
@@ -535,6 +543,7 @@ impl DiscoveryState {
         let import_result = self.book.import_verified_record(
             record.clone(),
             Some(peer_node_id),
+            remote_ip,
             now,
             &context,
             changes,

@@ -5231,9 +5231,9 @@ pub(crate) enum DialRegistration {
 
 /// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
-    /// Receives the IP whose handshake TLS authenticated, before the control
-    /// handshake starts.
-    pub(crate) admitted_ip: oneshot::Sender<IpAddr>,
+    /// Receives the address whose handshake TLS authenticated, before the
+    /// control handshake starts.
+    pub(crate) admitted_addr: oneshot::Sender<SocketAddr>,
     /// Receives how registration ended. The dial drops it unsent when it ends
     /// before registration, or when this node refuses the peer for a reason
     /// other than a local limit.
@@ -5311,7 +5311,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     };
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
-        let _ = report.admitted_ip.send(connection.admitted_ip());
+        let _ = report.admitted_addr.send(connection.admitted_addr());
         report.registration
     });
     let remote_node_id = connection.remote_id();

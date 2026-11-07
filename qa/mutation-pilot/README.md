@@ -21,11 +21,17 @@ defines the broader acceptance criteria.
 
 Both builds use one `main` commit. #2083 refreshed `qa/fuzz/sim/Cargo.lock`
 on `main`, so the fuzz build needs no commit of its own.
-`scripts/check_mutation_pilot.py` checks the pilot's own inputs under `qa/`
-on any tree. `--at-pin` also requires the tree's production, oracle and lock
-files to equal both revisions, which a pilot run needs. `crates/xtask` holds
-the pilot tooling, so it stays outside the pin. Run the pilot from a tree
-where `--at-pin` passes, or re-pin the catalogue first.
+
+Pilot inputs come from the pinned revision. The runner reads each case's
+patch, witness input and production files, and the empty corpus, at the pin,
+never from the tree it runs from. `scripts/check_mutation_pilot.py` reads
+those inputs, the sidecars and the target manifest there too. So a later
+change on `main`, such as #2066's refresh of `wrong-eviction-victim.patch`,
+leaves the pilot alone. A case whose patch exists in the tree but not at the
+pin fails. The checker needs a clone that holds both revisions. `--at-pin`
+also requires the tree's production, oracle and lock files to equal both
+revisions. `crates/xtask` holds the pilot tooling, so it stays outside the
+pin. The runner reads only the catalogue from the tree it runs from.
 
 ## Case matrix
 
@@ -95,33 +101,36 @@ python3 scripts/check_mutation_pilot.py --evidence "$BUNDLE_DIR"
 python3 -m unittest discover -s scripts/tests -p test_check_mutation_pilot.py -v
 ```
 
-By default, the checker verifies the repository inputs under `qa/`. It checks
-the case count and fault classes, patch, sidecar and witness hashes, patch
-bindings, target bindings and the `holds` witness for each intended property.
-It checks the empty discovery corpus.
-With `--at-pin`, it also checks the production and checker hashes and the lock
-hashes, and it rejects a tree whose build inputs differ from either pinned
-revision. A pilot run needs `--at-pin`; later commits on `main` fail it.
-With `--evidence`, it also checks the extracted bundle against the
-catalogue. Each baseline must have nonzero intended applicability, a passing
-witness, no other property outcome than held or not applicable, a quiescent
-end and zero cleanup failures. Its record and replay exit codes come from the
-bundle's `baseline/results.json`, whose hash the catalogue pins. Each calibration run must be complete and
-clean, with matching build identity and applicability label.
-The checker reruns no replay, proves no causal trigger semantics and runs no
-mutation. The tests build a small synthetic checkout and bundle.
+By default, the checker verifies the pilot's inputs under `qa/` at the
+pinned revisions. It checks the case count and fault classes, patch, sidecar
+and witness hashes, patch bindings, target bindings and the `holds` witness
+for each intended property. It checks the empty discovery corpus at the fuzz
+revision. With `--at-pin`, it also checks the production and checker hashes
+and the lock hashes, and it rejects a tree whose build inputs differ from
+either pinned revision. A pilot run needs `--at-pin`; later commits on
+`main` fail it. With `--evidence`, it also checks the extracted bundle
+against the catalogue. Each baseline must have nonzero intended
+applicability, a passing witness, no other property outcome than held or not
+applicable, a quiescent end and zero cleanup failures. Its record and replay
+exit codes come from the bundle's `baseline/results.json`, whose hash the
+catalogue pins. Each calibration run must be complete and clean, with
+matching build identity and applicability label. The checker reruns no
+replay, proves no causal trigger semantics and runs no mutation. The tests
+build a small synthetic checkout and bundle.
 
 ## Paired runner
 
-`cargo xtask planted pilot` runs the paired experiments from this
-catalogue (mut-3). It checks out each pinned revision in fresh worktrees,
-so it runs from a later tree such as `main`. There the Python checker's
-`--at-pin` check fails, so the runner checks the pins itself: each patch, witness
-input and production file must match its catalogue hash, and each trace or
-fuzz build must pair with the catalogue's build identity. The runner builds
-the original and every mutant in separate worktrees and target directories
-under `--work`. `--out` must be missing or empty, so a run never replaces an
-earlier result.
+`cargo xtask planted pilot` runs the paired experiments from this catalogue
+(mut-3). It checks out each pinned revision in fresh worktrees, so it runs
+from a later tree such as `main`. There the Python checker's `--at-pin`
+check fails, so the runner checks the pins itself. It reads each patch,
+witness input and production file, and the empty corpus, from its pinned
+worktree. Each file must match its catalogue hash, and the corpus must be
+empty. A patch missing at the pin fails the run before anything builds. Each
+trace or fuzz build must pair with the catalogue's build identity. The
+runner builds the original and every mutant in separate worktrees and target
+directories under `--work`. `--out` must be missing or empty, so a run never
+replaces an earlier result.
 
 ```sh
 cargo xtask planted pilot sensitivity --out "$OUT" [--only <case-id>]...

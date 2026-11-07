@@ -121,6 +121,19 @@ class PilotCatalogueTests(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
 
+    def repin(self):
+        """Commit the tree and pin the catalogue to the new commit."""
+        for command in [
+            ["git", "add", "-A"],
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "repin"],
+        ]:
+            subprocess.run(command, cwd=self.root, check=True, capture_output=True)
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.root, text=True).strip()
+        self.catalogue["source_revision"] = revision
+        self.catalogue["baseline_build"]["git"] = revision
+        self.catalogue["fuzz_build_inputs"]["source_revision"] = revision
+        self.save()
+
     def write_evidence(self, path, text):
         target = self.evidence / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -187,11 +200,35 @@ class PilotCatalogueTests(unittest.TestCase):
 
     def test_discovery_rejects_a_copied_sensitivity_input(self):
         shutil.copyfile(self.root / WITNESS, self.root / "qa/mutation-pilot/discovery-empty/leaked.bin")
+        self.repin()
         self.assertIn("discovery corpus contains seed files", pilot.validate(self.root))
 
     def test_missing_discovery_directory_fails(self):
         shutil.rmtree(self.root / "qa/mutation-pilot/discovery-empty")
+        self.repin()
         self.assertIn("discovery corpus directory is missing", pilot.validate(self.root))
+
+    def test_a_later_tree_copy_of_an_input_leaves_the_pin(self):
+        later = "--- a/crates/node/src/lib.rs\n+++ b/crates/node/src/lib.rs\n@@ -1 +1 @@\n-pub fn release() { used -= 1; }\n+pub fn release() { used -= 3; }\n"
+        self.write("qa/planted/h/case-0.patch", later)
+        shutil.copyfile(self.root / WITNESS, self.root / "qa/mutation-pilot/discovery-empty/leaked.bin")
+        self.assertEqual(pilot.validate(self.root), [])
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "later"], cwd=self.root, check=True)
+        self.assertEqual(pilot.validate(self.root), [])
+
+    def test_a_patch_missing_at_the_pin_fails(self):
+        self.write("qa/planted/h/later.patch", (self.root / "qa/planted/h/case-0.patch").read_text())
+        self.write("qa/planted/h/later.toml", (self.root / "qa/planted/h/case-0.toml").read_text())
+        self.catalogue["cases"][0]["patch"] = "qa/planted/h/later.patch"
+        self.save()
+        revision = self.catalogue["source_revision"]
+        self.assertIn(f"qa/planted/h/later.patch is missing at the pinned revision {revision}", pilot.validate(self.root))
+
+    def test_a_pin_missing_from_the_clone_fails(self):
+        self.catalogue["source_revision"] = "0" * 40
+        self.save()
+        self.assertIn(f"pinned revision {'0' * 40} is missing from this clone", pilot.validate(self.root))
 
     def test_untracked_build_input_fails(self):
         self.write("crates/node/src/extra.rs", "// untracked\n")

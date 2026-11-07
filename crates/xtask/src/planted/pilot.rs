@@ -4,7 +4,10 @@
 //! Both experiments read the reviewed catalogue,
 //! `qa/mutation-pilot/catalogue.json`, and check its pins before anything
 //! runs: each selected case's patch, witness input and production files
-//! must match the catalogue's hashes at the pinned revision. Each builds the
+//! must match the catalogue's hashes at the pinned revision. Every pilot
+//! input comes from the pinned revision's checkout, never from the tree the
+//! pilot runs from: the patches, witnesses, production files and the empty
+//! corpus. Only the catalogue itself comes from that tree. Each builds the
 //! original and each mutant in its own worktree and target directory under
 //! `--work`, applies the patch there, and requires that it change exactly
 //! the case's declared production files. A case's worktree and build go
@@ -516,7 +519,7 @@ fn sensitivity(
     let tree = work.join("baseline").join("worktree");
     add_worktree(repo_root, &tree, &catalogue.source_revision)?;
     let rows = (|| {
-        check_pins(repo_root, &tree, cases)?;
+        check_pins(&tree, &catalogue.source_revision, cases)?;
         let built = build_sim(
             &tree,
             &work.join("baseline").join("target"),
@@ -588,7 +591,7 @@ fn sensitivity_case(
             let target = work.join("cases").join(&case.id).join("target");
             add_worktree(repo_root, &tree, &catalogue.source_revision)?;
             let mutant = (|| {
-                if let Err(why) = prepare_patch(repo_root, &tree, case)? {
+                if let Err(why) = prepare_patch(&tree, case)? {
                     run.patch = Some(Err(why));
                     return Ok(());
                 }
@@ -752,14 +755,14 @@ fn discovery(
         )
         .into());
     }
-    let corpus = repo_root.join(&catalogue.discovery.corpus);
-    check_empty_corpus(&corpus)?;
     let toolchain = toolchain(&catalogue.baseline_build)?;
     let child = Duration::from_secs(catalogue.confirmation.child_seconds);
     let tree = work.join("baseline").join("worktree");
     add_worktree(repo_root, &tree, &fuzz.source_revision)?;
     let rows = (|| {
-        check_pins(repo_root, &tree, cases)?;
+        check_pins(&tree, &fuzz.source_revision, cases)?;
+        let corpus = tree.join(&catalogue.discovery.corpus);
+        check_empty_corpus(&corpus)?;
         let built = build_sim(
             &tree,
             &work.join("baseline").join("sim-target"),
@@ -877,7 +880,7 @@ fn discovery_case(
             fs::create_dir_all(&dir)?;
             // The mutant simulator, or why no seed can run: an invalid
             // mutant, or a build that broke.
-            let mut mutant = match prepare_patch(repo_root, &tree, case)? {
+            let mut mutant = match prepare_patch(&tree, case)? {
                 Err(why) => Err(BuildFailure::Rejected(why)),
                 Ok(()) => build_sim(
                     &tree,
@@ -1521,15 +1524,11 @@ fn parse_trace(text: &str, property: &str) -> Result<TraceFacts, BoxError> {
     })
 }
 
-/// Applies `case`'s patch, from `repo_root`, in `tree`, and checks that it
-/// changed exactly the case's declared production files. `Err` says why
-/// the mutant isn't valid.
-fn prepare_patch(
-    repo_root: &Path,
-    tree: &Path,
-    case: &Case,
-) -> Result<Result<(), String>, BoxError> {
-    if let Err(why) = apply(tree, &repo_root.join(&case.patch)) {
+/// Applies `case`'s patch in `tree`, a checkout of the pinned revision,
+/// from that checkout, and checks that it changed exactly the case's
+/// declared production files. `Err` says why the mutant isn't valid.
+fn prepare_patch(tree: &Path, case: &Case) -> Result<Result<(), String>, BoxError> {
+    if let Err(why) = apply(tree, &tree.join(&case.patch)) {
         return Ok(Err(format!("the patch doesn't apply: {why}")));
     }
     let mut changed = BTreeSet::new();
@@ -1576,14 +1575,28 @@ fn undeclared(changed: &BTreeSet<String>, declared: &BTreeMap<String, String>) -
     }
 }
 
-/// Checks each case's frozen inputs: its patch in `repo_root`, and its
-/// witness input and production files in `tree` before any patch, against
-/// the catalogue's hashes.
-fn check_pins(repo_root: &Path, tree: &Path, cases: &[&Case]) -> Result<(), BoxError> {
+/// Checks each case's frozen inputs, its patch, witness input and
+/// production files, in `tree`, a checkout of the pinned `revision`, before
+/// any patch, against the catalogue's hashes. The pilot reads every input
+/// at the pin, never from the tree it runs from, so a later change there
+/// leaves the run alone. A patch missing at the pin fails.
+fn check_pins(tree: &Path, revision: &str, cases: &[&Case]) -> Result<(), BoxError> {
+    let missing: Vec<String> = cases
+        .iter()
+        .filter(|case| !tree.join(&case.patch).is_file())
+        .map(|case| format!("{}: {}", case.id, case.patch.display()))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the pinned revision {revision} has no patch for {}",
+            missing.join(", ")
+        )
+        .into());
+    }
     let mut differ = Vec::new();
     for case in cases {
         let mut pins = vec![
-            (repo_root.join(&case.patch), &case.patch_sha256),
+            (tree.join(&case.patch), &case.patch_sha256),
             (tree.join(&case.witness), &case.witness_sha256),
         ];
         pins.extend(

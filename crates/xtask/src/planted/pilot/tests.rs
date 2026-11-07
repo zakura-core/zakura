@@ -705,13 +705,13 @@ fn broken_patches_are_invalid_mutants() {
     };
 
     patch("--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn z() {}\n+fn c() {}\n");
-    let why = prepare_patch(root, root, &case)
+    let why = prepare_patch(root, &case)
         .expect("git runs")
         .expect_err("the context isn't in a.rs");
     assert!(why.starts_with("the patch doesn't apply"), "{why}");
 
     patch("--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-fn b() {}\n+fn c() {}\n");
-    let why = prepare_patch(root, root, &case)
+    let why = prepare_patch(root, &case)
         .expect("git runs")
         .expect_err("b.rs isn't declared");
     assert!(why.contains("undeclared files [b.rs"), "{why}");
@@ -721,7 +721,73 @@ fn broken_patches_are_invalid_mutants() {
     // The patch file itself is untracked, so declare it for this check.
     case.production_files
         .insert("p.patch".to_owned(), String::new());
-    assert_eq!(prepare_patch(root, root, &case).expect("git runs"), Ok(()));
+    assert_eq!(prepare_patch(root, &case).expect("git runs"), Ok(()));
+}
+
+/// The pilot reads each case's patch at the pinned revision. A later
+/// change to the patch in the tree the pilot runs from leaves the run
+/// alone, and a patch that exists in that tree but not at the pin fails
+/// the pin check, naming the case.
+#[test]
+fn patches_come_from_the_pinned_revision() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path().join("repo");
+    fs::create_dir(&root).expect("the repository directory is made");
+    let git_ok = |args: &[&str]| {
+        let status = git(&root)
+            .args(["-c", "user.name=pilot", "-c", "user.email=pilot@test"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    let pinned = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn pinned() {}\n";
+    fs::write(root.join("a.rs"), "fn a() {}\n").expect("a.rs is written");
+    fs::write(root.join("w.bin"), "witness").expect("the witness is written");
+    fs::write(root.join("p.patch"), pinned).expect("the patch is written");
+    git_ok(&["init", "-q"]);
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-q", "-m", "pin"]);
+    let pin = head(&root).expect("the pin has a commit");
+    let mut case = committed_catalogue().cases[0].clone();
+    case.patch = PathBuf::from("p.patch");
+    case.patch_sha256 = file_sha256(&root.join("p.patch")).expect("the patch hashes");
+    case.witness = PathBuf::from("w.bin");
+    case.witness_sha256 = file_sha256(&root.join("w.bin")).expect("the witness hashes");
+    case.production_files = BTreeMap::from([(
+        "a.rs".to_owned(),
+        file_sha256(&root.join("a.rs")).expect("a.rs hashes"),
+    )]);
+    // After the pin, the tree's patch changes another line, and a new
+    // case's patch appears only in the tree.
+    fs::write(
+        root.join("p.patch"),
+        "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn later() {}\n",
+    )
+    .expect("the patch is rewritten");
+    fs::write(root.join("q.patch"), pinned).expect("the new patch is written");
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-q", "-m", "later"]);
+
+    let tree = dir.path().join("pinned");
+    add_worktree(&root, &tree, &pin).expect("the pin checks out");
+    check_pins(&tree, &pin, &[&case]).expect("the pin-era patch matches its hash");
+    assert_eq!(prepare_patch(&tree, &case).expect("git runs"), Ok(()));
+    assert_eq!(
+        fs::read_to_string(tree.join("a.rs")).expect("a.rs is read"),
+        "fn pinned() {}\n"
+    );
+
+    let mut unpinned = case.clone();
+    unpinned.id = "later/case".to_owned();
+    unpinned.patch = PathBuf::from("q.patch");
+    let why = check_pins(&tree, &pin, &[&case, &unpinned])
+        .expect_err("q.patch isn't at the pin")
+        .to_string();
+    assert!(why.contains(&pin), "{why}");
+    assert!(why.contains("later/case: q.patch"), "{why}");
+    assert!(!why.contains(&case.id), "{why}");
+    remove_worktree(&root, &tree).expect("the worktree is removed");
 }
 
 /// The committed catalogue.
@@ -943,20 +1009,15 @@ fn failure_paths_name_their_kind() {
     );
 }
 
-/// Every committed case's patch and production pins exist, and its
-/// toolchain parses from the catalogue.
+/// Every committed case pins production files, and its toolchain parses
+/// from the catalogue. The patch hashes pin the patches at the pinned
+/// revision, which a shallow checkout lacks, so `check_pins` checks them
+/// when a run starts.
 #[test]
 fn the_committed_catalogue_pins_its_cases() {
     let catalogue = committed_catalogue();
     assert_eq!(toolchain(&catalogue.baseline_build), Ok("1.99.0"));
-    let root = crate::repo_root().expect("xtask lives in the workspace");
     for case in &catalogue.cases {
-        assert_eq!(
-            file_sha256(&root.join(&case.patch)).expect("the patch exists"),
-            case.patch_sha256,
-            "{}",
-            case.id
-        );
         assert!(!case.production_files.is_empty(), "{}", case.id);
         assert!(
             case.equivalent.is_none(),

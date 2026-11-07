@@ -3005,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-network"
-version = "13.1.0"
+version = "14.0.0"
 dependencies = [
  "bitflags",
  "blake2b_simd",

@@ -932,14 +932,11 @@ impl HeaderSyncReactor {
                 reason,
             }
         );
-        let limits = self.startup.config.peer_limits;
         self.state.remove_session(
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
-            limits
-                .max_inbound_peers
-                .saturating_add(limits.max_outbound_peers),
+            self.admitted_peer_limit(),
         );
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
@@ -2654,6 +2651,15 @@ impl HeaderSyncReactor {
             .count()
     }
 
+    /// How many header-sync peers this node admits at once, inbound plus
+    /// outbound. It bounds the per-identity state that outlives a session.
+    fn admitted_peer_limit(&self) -> usize {
+        let limits = self.startup.config.peer_limits;
+        limits
+            .max_inbound_peers
+            .saturating_add(limits.max_outbound_peers)
+    }
+
     fn publish_peer_state(&self) {
         let snapshot = ServicePeerSnapshot::new(
             self.admitted_count(ServicePeerDirection::Inbound),
@@ -2829,6 +2835,7 @@ impl HeaderSyncReactor {
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
+            self.admitted_peer_limit(),
         );
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         let _ = self.dispatch_action(HeaderPortOperation::DropPeer {
@@ -3105,6 +3112,7 @@ impl HeaderSyncReactor {
                 &peer,
                 now,
                 self.startup.config.unproductive_peer_cooldown,
+                self.admitted_peer_limit(),
             );
             #[cfg(any(test, zakura_sim))]
             if let Some(owner) = owner.filter(|_| self.state.cooldowns_installed != installed) {

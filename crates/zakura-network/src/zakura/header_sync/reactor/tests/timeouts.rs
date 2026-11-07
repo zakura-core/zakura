@@ -690,11 +690,14 @@ async fn a_cooldown_still_ends_after_a_fatal_local_operation() {
         .reactor
         .report_fatal_vct_local_operation(Instant::now()));
 
+    let limit = fixture.reactor.admitted_peer_limit();
     let cooldown = std::time::Duration::from_secs(15);
-    fixture
-        .reactor
-        .state
-        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    fixture.reactor.state.start_readmission_cooldown(
+        &fixture.peer,
+        Instant::now(),
+        cooldown,
+        limit,
+    );
     fixture.reactor.publish_peer_state();
     assert!(!fixture
         .reactor

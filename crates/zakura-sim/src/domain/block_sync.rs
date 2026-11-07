@@ -38,6 +38,10 @@
 //! Each check records its quantities' peaks in the run's report, since
 //! properties.md asks the report for each allowance's largest value.
 //!
+//! The retained, reserved and look-ahead bounds are instances of the
+//! shared resource bound ([`super::shared::bounds`]). Each instance gives
+//! its reading, and the shared check judges it.
+//!
 //! # The look-ahead bound's coefficients
 //!
 //! A height is above the window when it exceeds the verified tip plus 401.
@@ -74,6 +78,8 @@ use crate::{
     },
     Observation, ObservationLog,
 };
+
+use super::shared::bounds::{bound, Bound, Measured, Reading};
 
 /// Runtime payload identities and decoded sizes match policy at each captured sequencer boundary.
 ///
@@ -1015,30 +1021,8 @@ where
             check: check_payload_inventory::<S>,
             witness: Some(TriggerHistory::Log(payload_retained)),
         },
-        Property {
-            id: PropertyId::new(RETAINED_BYTE_BOUND),
-            claim: "retained wire bytes stay within L + 401·B + Q·B",
-            kind: Kind::Bound {
-                unit: Unit::WireBytes,
-            },
-            assumes: &[],
-            needs: &[Source::View],
-            status: Status::Active,
-            check: check_retained::<S>,
-            witness: Some(TriggerHistory::Log(commit_window_filled)),
-        },
-        Property {
-            id: PropertyId::new(RESERVED_BYTE_BOUND),
-            claim: "reserved request bytes stay within M + 2·B + h·B",
-            kind: Kind::Bound {
-                unit: Unit::EstimateBytes,
-            },
-            assumes: &[],
-            needs: &[Source::View],
-            status: Status::Active,
-            check: check_reserved::<S>,
-            witness: Some(TriggerHistory::Log(budget_charged)),
-        },
+        bound::<S, RetainedBound>(),
+        bound::<S, ReservedBound>(),
         Property {
             id: PropertyId::new(BUDGET_LEDGERS_AGREE),
             claim: "at rest, no handoff is open, and the byte budget equals the work queue's \
@@ -1050,19 +1034,7 @@ where
             check: check_ledgers::<S>,
             witness: Some(TriggerHistory::Log(body_handed_off)),
         },
-        Property {
-            id: PropertyId::new(LOOKAHEAD_OVERSHOOT_BOUND),
-            claim: "at rest, above-window retained bytes plus outstanding above-window \
-                    estimates stay within L + H + (W + 1)·B",
-            kind: Kind::Bound {
-                unit: Unit::WireBytes,
-            },
-            assumes: &[],
-            needs: &[Source::View, Source::Schedule],
-            status: Status::Active,
-            check: check_lookahead::<S>,
-            witness: Some(TriggerHistory::Log(above_window_requested)),
-        },
+        bound::<S, LookaheadBound>(),
         Property {
             id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
             claim: "once every peer has left, every routine has ended and the input \
@@ -1112,76 +1084,132 @@ fn at_rest(status: SchedulerStatus) -> bool {
     )
 }
 
-/// Checks [`RETAINED_BYTE_BOUND`] after a step. A holder gap, such as a
-/// sequencer snapshot that disagrees with the holder events, leaves the
-/// retained bytes unknown, so the check reports missing evidence.
-fn check_retained<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+/// [`RETAINED_BYTE_BOUND`], checked after every step. A holder gap, such
+/// as a sequencer snapshot that disagrees with the holder events, leaves
+/// the retained bytes unknown, so the reading is missing evidence.
+struct RetainedBound;
+
+impl<S: HasView> Bound<S> for RetainedBound
 where
     S::View: OwnerView,
 {
-    let (retained, bound, peaks, gap) = cx.view().read_owners(|owners| {
+    const ID: &'static str = RETAINED_BYTE_BOUND;
+    const CLAIM: &'static str = "retained wire bytes stay within L + 401·B + Q·B";
+    const UNIT: Unit = Unit::WireBytes;
+    const NEEDS: &'static [Source] = &[Source::View];
+    const WITNESS: fn(&ObservationLog) -> bool = commit_window_filled;
+    type Terms = ();
+    type Peaks = [(&'static str, u64); 2];
+
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<(), Self::Peaks> {
+        let (retained, limit, peaks, gap) = cx.view().read_owners(|owners| {
+            (
+                owners.retained(),
+                owners.limits.retained_bound(),
+                owners.peaks(),
+                owners.holder_gap().map(str::to_owned),
+            )
+        });
+        if let Some(gap) = gap {
+            return Reading::MissingEvidence(gap);
+        }
+        Reading::Measured(Measured {
+            quantity: retained,
+            limit,
+            peaks: [
+                ("retained-wire-bytes", peaks.retained),
+                ("input-queue-wire-bytes", peaks.queued),
+            ],
+            terms: (),
+        })
+    }
+
+    fn violation(measured: &Measured<(), Self::Peaks>) -> (String, String) {
         (
-            owners.retained(),
-            owners.limits.retained_bound(),
-            owners.peaks(),
-            owners.holder_gap().map(str::to_owned),
+            format!(
+                "the sequencer retains at most L + 401·b + Q·b = {} wire bytes",
+                measured.limit
+            ),
+            format!("it retains {}", measured.quantity),
         )
-    });
-    if let Some(gap) = gap {
-        cx.missing_evidence(gap);
-        return Verdict::NotApplicable;
     }
-    cx.peak("retained-wire-bytes", peaks.retained);
-    cx.peak("input-queue-wire-bytes", peaks.queued);
-    if retained <= bound {
-        return Verdict::Holds;
-    }
-    cx.violated(
-        format!("the sequencer retains at most L + 401·b + Q·b = {bound} wire bytes"),
-        format!("it retains {retained}"),
-    )
 }
 
-/// Checks [`RESERVED_BYTE_BOUND`] after a step, with `h` from
+/// [`RESERVED_BYTE_BOUND`], checked after every step, with `h` from
 /// [`OwnerModel::counted_handoffs`]. A handoff that never ends, such as a
 /// leaked charge, counts only while its routine could still be in it.
-fn check_reserved<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+struct ReservedBound;
+
+/// What [`ReservedBound`]'s violation text names.
+struct ReservedTerms {
+    limits: Limits,
+    /// `h`, the handoffs the limit counts.
+    handoffs: u64,
+    /// The handoffs open.
+    open: usize,
+}
+
+impl<S: HasView> Bound<S> for ReservedBound
 where
     S::View: OwnerView,
 {
-    let status = cx.status;
-    let (reserved, handoffs, open, peaks, limits, gap) = cx.view().read_owners(|owners| {
+    const ID: &'static str = RESERVED_BYTE_BOUND;
+    const CLAIM: &'static str = "reserved request bytes stay within M + 2·B + h·B";
+    const UNIT: Unit = Unit::EstimateBytes;
+    const NEEDS: &'static [Source] = &[Source::View];
+    const WITNESS: fn(&ObservationLog) -> bool = budget_charged;
+    type Terms = ReservedTerms;
+    type Peaks = [(&'static str, u64); 3];
+
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<ReservedTerms, Self::Peaks> {
+        let status = cx.status;
+        let (reserved, handoffs, open, peaks, limits, gap) = cx.view().read_owners(|owners| {
+            (
+                owners.reserved(),
+                owners.counted_handoffs(status),
+                owners.handoffs().len(),
+                owners.peaks(),
+                owners.limits,
+                owners.gap(),
+            )
+        });
+        if let Some(gap) = gap {
+            return Reading::MissingEvidence(gap);
+        }
+        Reading::Measured(Measured {
+            quantity: reserved,
+            limit: limits.reserved_bound(handoffs),
+            peaks: [
+                ("reserved-estimate-bytes", peaks.reserved),
+                (
+                    "past-budget-estimate-bytes",
+                    peaks.reserved.saturating_sub(limits.budget),
+                ),
+                ("open-handoffs", peaks.handoffs),
+            ],
+            terms: ReservedTerms {
+                limits,
+                handoffs,
+                open,
+            },
+        })
+    }
+
+    fn violation(measured: &Measured<ReservedTerms, Self::Peaks>) -> (String, String) {
+        let ReservedTerms {
+            limits,
+            handoffs,
+            open,
+        } = &measured.terms;
         (
-            owners.reserved(),
-            owners.counted_handoffs(status),
-            owners.handoffs().len(),
-            owners.peaks(),
-            owners.limits,
-            owners.gap(),
+            format!(
+                "the byte budget counts at most M + 2·k·B + h·B = {} bytes, with M = {}, \
+                 k = {} and h = {handoffs}",
+                measured.limit, limits.budget, limits.per_request
+            ),
+            format!("it counts {}, with {open} handoffs open", measured.quantity),
         )
-    });
-    if let Some(gap) = gap {
-        cx.missing_evidence(gap);
-        return Verdict::NotApplicable;
     }
-    cx.peak("reserved-estimate-bytes", peaks.reserved);
-    cx.peak(
-        "past-budget-estimate-bytes",
-        peaks.reserved.saturating_sub(limits.budget),
-    );
-    cx.peak("open-handoffs", peaks.handoffs);
-    let bound = limits.reserved_bound(handoffs);
-    if reserved <= bound {
-        return Verdict::Holds;
-    }
-    cx.violated(
-        format!(
-            "the byte budget counts at most M + 2·k·B + h·B = {bound} bytes, with M = {}, \
-             k = {} and h = {handoffs}",
-            limits.budget, limits.per_request
-        ),
-        format!("it counts {reserved}, with {open} handoffs open"),
-    )
 }
 
 /// Checks [`BUDGET_LEDGERS_AGREE`] after a step that left the run at rest.
@@ -1235,47 +1263,79 @@ where
     Verdict::Holds
 }
 
-/// Checks [`LOOKAHEAD_OVERSHOOT_BOUND`] after a step that left the run at
-/// rest, the boundary at which every routine's snapshot is current.
-fn check_lookahead<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict
+/// [`LOOKAHEAD_OVERSHOOT_BOUND`], checked after each step that left the
+/// run at rest, the boundary at which every routine's snapshot is current.
+struct LookaheadBound;
+
+/// What [`LookaheadBound`]'s violation text names.
+struct LookaheadTerms {
+    limits: Limits,
+    quantities: Lookahead,
+}
+
+impl<S: HasView> Bound<S> for LookaheadBound
 where
     S::View: OwnerView,
 {
-    if !at_rest(cx.status) {
-        return Verdict::NotApplicable;
+    const ID: &'static str = LOOKAHEAD_OVERSHOOT_BOUND;
+    const CLAIM: &'static str = "at rest, above-window retained bytes plus outstanding \
+                                 above-window estimates stay within L + H + (W + 1)·B";
+    const UNIT: Unit = Unit::WireBytes;
+    const NEEDS: &'static [Source] = &[Source::View, Source::Schedule];
+    const WITNESS: fn(&ObservationLog) -> bool = above_window_requested;
+    type Terms = LookaheadTerms;
+    type Peaks = [(&'static str, u64); 4];
+
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<LookaheadTerms, Self::Peaks> {
+        if !at_rest(cx.status) {
+            return Reading::Unjudged;
+        }
+        let (quantities, limits, gap) = cx
+            .view()
+            .read_owners(|owners| (owners.lookahead(), owners.limits, owners.gap()));
+        if let Some(gap) = gap {
+            return Reading::MissingEvidence(gap);
+        }
+        let Lookahead {
+            retained,
+            estimated,
+            hint_error,
+        } = quantities;
+        let total = retained.saturating_add(estimated);
+        Reading::Measured(Measured {
+            quantity: total,
+            limit: limits.lookahead_bound(hint_error),
+            peaks: [
+                ("above-window-wire-bytes", retained),
+                ("above-window-estimate-bytes", estimated),
+                ("hint-error-bytes", hint_error),
+                (
+                    "past-lookahead-bytes",
+                    total.saturating_sub(limits.lookahead),
+                ),
+            ],
+            terms: LookaheadTerms { limits, quantities },
+        })
     }
-    let (quantities, limits, gap) = cx
-        .view()
-        .read_owners(|owners| (owners.lookahead(), owners.limits, owners.gap()));
-    if let Some(gap) = gap {
-        cx.missing_evidence(gap);
-        return Verdict::NotApplicable;
+
+    fn violation(measured: &Measured<LookaheadTerms, Self::Peaks>) -> (String, String) {
+        let LookaheadTerms { limits, quantities } = &measured.terms;
+        (
+            format!(
+                "above-window bytes R + E stay within L + H + (W + 1)·k·B = {}, with \
+                 L = {}, H = {}, W = {} and k = {}",
+                measured.limit,
+                limits.lookahead,
+                quantities.hint_error,
+                limits.workers,
+                limits.per_request
+            ),
+            format!(
+                "R = {} and E = {}",
+                quantities.retained, quantities.estimated
+            ),
+        )
     }
-    let Lookahead {
-        retained,
-        estimated,
-        hint_error,
-    } = quantities;
-    let total = retained.saturating_add(estimated);
-    cx.peak("above-window-wire-bytes", retained);
-    cx.peak("above-window-estimate-bytes", estimated);
-    cx.peak("hint-error-bytes", hint_error);
-    cx.peak(
-        "past-lookahead-bytes",
-        total.saturating_sub(limits.lookahead),
-    );
-    let bound = limits.lookahead_bound(hint_error);
-    if total <= bound {
-        return Verdict::Holds;
-    }
-    cx.violated(
-        format!(
-            "above-window bytes R + E stay within L + H + (W + 1)·k·B = {bound}, with \
-             L = {}, H = {hint_error}, W = {} and k = {}",
-            limits.lookahead, limits.workers, limits.per_request
-        ),
-        format!("R = {retained} and E = {estimated}"),
-    )
 }
 
 /// Checks [`TEARDOWN_RETURNS_BASELINE`] after a step.

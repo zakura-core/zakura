@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Verify the pilot catalogue against this tree, and optionally an evidence bundle.
+"""Verify the pilot catalogue against its pinned revisions, and optionally an evidence bundle.
 
-By default, check the catalogue's inputs under `qa/`: patches, sidecars,
-witness inputs and the empty discovery corpus. With `--at-pin`, also check the
-production and checker sources, the lock files and the build-input revisions.
+By default, check the catalogue's inputs under `qa/` at the pinned revisions,
+where the pilot reads them: patches, sidecars, witness inputs, the target
+manifest and the empty discovery corpus. Their copies in this tree don't
+matter. With `--at-pin`, also check this tree's production and checker
+sources, its lock files and its build-input revisions against the pins.
 With `--evidence DIR`, also check the extracted evidence bundle: baseline
 traces, record and replay results, witness results and calibration runs. No
 mode runs a mutant, a replay or a discovery campaign.
@@ -28,6 +30,24 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def has_commit(root, revision):
+    """Return whether this clone holds `revision`."""
+    found = subprocess.run(["git", "cat-file", "-e", f"{revision}^{{commit}}"], cwd=root, capture_output=True, check=False)
+    return found.returncode == 0
+
+
+def pinned(root, revision, path):
+    """Return `path`'s bytes at `revision`, or None if `revision` has no such file."""
+    shown = subprocess.run(["git", "show", f"{revision}:{path}"], cwd=root, capture_output=True, check=False)
+    return shown.stdout if shown.returncode == 0 else None
+
+
+def pinned_files(root, revision, path):
+    """Return the files under `path` at `revision`."""
+    listed = subprocess.run(["git", "ls-tree", "-r", "--name-only", revision, "--", path], cwd=root, capture_output=True, text=True, check=True)
+    return listed.stdout.splitlines()
+
+
 def git_unchanged(root, revision, paths):
     """Return whether tracked `paths` equal `revision` and nothing untracked hides there."""
     compared = subprocess.run(["git", "diff", "--quiet", revision, "--", *paths], cwd=root, check=False)
@@ -39,11 +59,12 @@ def git_unchanged(root, revision, paths):
 
 
 def validate(root, evidence=None, at_pin=False):
-    """Return every inconsistency between the catalogue, this tree and `evidence`.
+    """Return every inconsistency between the catalogue, its pins, this tree and `evidence`.
 
-    The default checks the pilot's own inputs, which live under `qa/`. With
+    The default checks the pilot's own inputs, which live under `qa/`, at the
+    pinned revisions: the pilot reads them there, never from this tree. With
     `at_pin`, it also requires this tree's production, oracle and lock files to
-    equal the pinned revisions, which a pilot run needs.
+    equal the pinned revisions.
     """
     catalogue = json.loads((root / CATALOGUE).read_text())
     cases = catalogue["cases"]
@@ -56,28 +77,44 @@ def validate(root, evidence=None, at_pin=False):
     def check_hash(base, path, expected):
         require(digest(base / path) == expected, f"hash differs: {path}")
 
+    witness_revision = catalogue["source_revision"]
+    fuzz_revision = catalogue["fuzz_build_inputs"]["source_revision"]
+    # Sensitivity applies each patch at the witness revision, and discovery
+    # at the fuzz revision.
+    patch_revisions = sorted({witness_revision, fuzz_revision})
+    for revision in patch_revisions:
+        require(has_commit(root, revision), f"pinned revision {revision} is missing from this clone")
+    if errors:
+        return errors
+
+    def check_pinned(revision, path, expected):
+        """Return `path`'s bytes at `revision`, requiring it to exist and hash to `expected`."""
+        data = pinned(root, revision, path)
+        require(data is not None, f"{path} is missing at the pinned revision {revision}")
+        require(data is None or hashlib.sha256(data).hexdigest() == expected, f"hash differs at {revision}: {path}")
+        return data or b""
+
     require(8 <= len(cases) <= 12, "pilot must contain 8–12 cases")
     require(len({case["id"] for case in cases}) == len(cases), "duplicate case ID")
     require(len({case["fault_class"] for case in cases}) >= 4, "fewer than four fault classes")
-    targets = tomllib.loads((root / "qa/fuzz/sim/Cargo.toml").read_text())["package"]["metadata"]["zakura-sim"]["targets"]
+    manifest = pinned(root, fuzz_revision, "qa/fuzz/sim/Cargo.toml") or b""
+    targets = tomllib.loads(manifest.decode())["package"]["metadata"]["zakura-sim"]["targets"]
     for case in cases:
         ident = case["id"]
-        patch = root / case["patch"]
-        check_hash(root, case["patch"], case["patch_sha256"])
-        patch_sidecar = patch.with_suffix(".toml")
-        check_hash(root, patch_sidecar.relative_to(root), case["patch_sidecar_sha256"])
-        binding = tomllib.loads(patch_sidecar.read_text())
-        require(binding["input"] == case["witness"] and binding["checks"] == case["producer_check_dependencies"], f"{ident}: retained patch binding differs")
-        changed = {line[6:] for line in patch.read_text().splitlines() if line.startswith("+++ b/")}
+        patch_sidecar = str(Path(case["patch"]).with_suffix(".toml"))
+        for revision in patch_revisions:
+            patch = check_pinned(revision, case["patch"], case["patch_sha256"]).decode()
+            binding = tomllib.loads(check_pinned(revision, patch_sidecar, case["patch_sidecar_sha256"]).decode())
+        require(binding.get("input") == case["witness"] and binding.get("checks") == case["producer_check_dependencies"], f"{ident}: retained patch binding differs")
+        changed = {line[6:] for line in patch.splitlines() if line.startswith("+++ b/")}
         require(changed == set(case["production_files"]), f"{ident}: changed files differ")
         if at_pin:
             for path, expected in [*case["production_files"].items(), *case["oracle_and_generator_files"].items()]:
                 check_hash(root, path, expected)
         require(bool(case["required_observations"] and case["independent_check"]), f"{ident}: checker evidence missing")
-        check_hash(root, case["witness"], case["witness_sha256"])
-        sidecar = (root / case["witness"]).with_suffix(".toml")
-        check_hash(root, sidecar.relative_to(root), case["witness_sidecar_sha256"])
-        seed = tomllib.loads(sidecar.read_text())
+        check_pinned(witness_revision, case["witness"], case["witness_sha256"])
+        sidecar = str(Path(case["witness"]).with_suffix(".toml"))
+        seed = tomllib.loads(check_pinned(witness_revision, sidecar, case["witness_sidecar_sha256"]).decode())
         require(seed["sha256"] == case["witness_sha256"], f"{ident}: seed input hash differs")
         require(seed["harness"] == case["harness"] and seed["generator"] == case["generator"], f"{ident}: generator binding differs")
         require(targets.get(case["target"]) == case["harness"], f"{ident}: target binding differs")
@@ -86,9 +123,9 @@ def validate(root, evidence=None, at_pin=False):
 
     # The seed loader reads top-level `.bin` inputs and `.toml` sidecars.
     discovery = catalogue["discovery"]
-    corpus = root / discovery["corpus"]
-    require(corpus.is_dir(), "discovery corpus directory is missing")
-    require(not list(corpus.rglob("*.bin")) and not list(corpus.rglob("*.toml")), "discovery corpus contains seed files")
+    corpus = pinned_files(root, fuzz_revision, discovery["corpus"])
+    require(bool(corpus), "discovery corpus directory is missing")
+    require(not any(Path(path).suffix in (".bin", ".toml") for path in corpus), "discovery corpus contains seed files")
     require(discovery["corpus_inputs"] == [], "cold-start corpus must be empty")
 
     build = catalogue["baseline_build"]
@@ -103,6 +140,14 @@ def validate(root, evidence=None, at_pin=False):
 
     calibrations = catalogue["calibration"]["runs"]
     require({run["target"] for run in calibrations} == {case["target"] for case in cases}, "calibration target set differs")
+    # A target that never applied its property in calibration can't score a
+    # discovery campaign, so review must exclude its cases from discovery.
+    unapplied = {run["target"] for run in calibrations} - {run["target"] for run in calibrations if run["applicability"] == "observed"}
+    for case in cases:
+        excluded = case.get("discovery_excluded")
+        require(excluded is None or (isinstance(excluded, str) and excluded.strip() != ""), f"{case['id']}: discovery exclusion needs a reason")
+        if case["target"] in unapplied:
+            require(excluded is not None, f"{case['id']}: target never applied in calibration, so discovery must exclude it")
     if evidence is not None:
         validate_evidence(evidence, catalogue, targets, require, check_hash)
     return errors

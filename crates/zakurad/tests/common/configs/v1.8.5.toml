@@ -64,9 +64,14 @@ internal_miner = false
 optimistic_block_inventory = true
 
 [network]
+# Announce to the initial group immediately, then everyone else after one delay.
+# The delay grows from min to max between the block-size thresholds below.
+# Zero delays announce to all peers immediately, regardless of block size.
+advert_delay_min = "0s"
+advert_delay_max = "0s"
 advert_window_full_size_bytes = 1572864
-advert_window_max = 1000
-advert_window_min = 1000
+advert_window_max = 64
+advert_window_min = 32
 advert_window_small_size_bytes = 102400
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
@@ -93,6 +98,7 @@ network = "Mainnet"
 #   releases. Currently "legacy" on Mainnet, and "dual" everywhere else.
 p2p_stack = "default"
 peerset_initial_target_size = 100
+unconditional_peers = []
 
 [network.zakura]
 bootstrap_peers = [

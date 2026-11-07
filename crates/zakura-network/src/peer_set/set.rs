@@ -1434,11 +1434,10 @@ where
 
     /// Schedule legacy inventory by block size, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (block, mined) = match req {
-            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
-                (block, false)
-            }
-            Request::AdvertiseMinedBlock(block) => (block, true),
+        let block = match req {
+            Request::AdvertiseBlock(block, _)
+            | Request::AdvertiseBlockToAll(block)
+            | Request::AdvertiseMinedBlock(block) => block,
             _ => unreachable!("block routing only accepts block advertisements"),
         };
         self.prune_block_gossip_peers();
@@ -1454,7 +1453,6 @@ where
             peers,
             block.hash,
             self.block_gossip_fanout.window(block.size),
-            mined,
             tokio::time::Instant::now() + self.block_gossip_fanout.delay(block.size),
         )
     }

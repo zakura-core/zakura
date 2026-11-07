@@ -236,6 +236,28 @@ const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass
     }
 }
 
+/// A row for a generated discovery ID that no witness can reach, for
+/// `reason`. `witness` shows the act's other IDs apply. No planted case
+/// reaches it on this node yet; disc-3.2 adds a scripted bypass, as header
+/// sync's unreachable IDs have.
+const fn discovery_unreachable(
+    property: &'static str,
+    reason: &'static str,
+    witness: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test(DISCOVERY_WITNESSES, witness),
+        },
+        bypass: Bypass::Pending(
+            "no planted case reaches it on this node; disc-3.2 adds a scripted bypass, as \
+             header sync's unreachable IDs have",
+        ),
+    }
+}
+
 /// The honest exchange, with the node's own sender IDs, and the check that
 /// the witnesses list every ID.
 const DISCOVERY_EVERY: &str = "every_discovery_property_applies_in_its_witness";
@@ -772,18 +794,12 @@ pub static COVERAGE: &[Coverage] = &[
         GET_SERVICES_ACTS,
         DISCOVERY_GUARD,
     ),
-    Coverage {
-        property: "discovery/s4v2/services/over-owed-closes",
-        passing: Passing::Unreachable {
-            reason: "the node asks for every service, so its GetServices owes the row's largest \
-                     Services, and a larger one is long-payload",
-            witness: sim_test(DISCOVERY_WITNESSES, SERVICES_ACTS),
-        },
-        bypass: Bypass::Pending(
-            "no planted case reaches it on this node; disc-3.2 adds a scripted bypass, as \
-             header sync's unreachable IDs have",
-        ),
-    },
+    discovery_unreachable(
+        "discovery/s4v2/services/over-owed-closes",
+        "the node asks for every service, so its GetServices owes the row's largest Services, \
+         and a larger one is long-payload",
+        SERVICES_ACTS,
+    ),
     // Any production change that punishes an honest header-sync peer also
     // violates `conformant-never-closes`, and a planted case's input must
     // violate its property alone. The scripted bypass punishes an honest

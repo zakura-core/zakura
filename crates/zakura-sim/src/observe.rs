@@ -1425,6 +1425,16 @@ pub enum BlockSyncFact {
         /// `retained` or `released`.
         change: String,
     },
+    /// The sequencer refused a body it took from its input as stale: the
+    /// body's owner names a body work epoch other than the one the
+    /// sequencer applied.
+    StaleScope {
+        /// The refused body.
+        body: BlockSyncBody,
+        /// The body work epoch the sequencer applied when it judged the
+        /// body, or `None` before it had one.
+        scope_epoch: Option<u64>,
+    },
     /// A serving response took its execution lease, or released it.
     ServingLease {
         /// The requesting peer.

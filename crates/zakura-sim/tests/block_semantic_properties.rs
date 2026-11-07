@@ -152,9 +152,9 @@ fn each_committed_input_draws_its_scenario() {
 /// through first-completion-wins, and each names the request that fetched
 /// it. With `height-only.patch`, the sequencer adopts an old-epoch body
 /// into the new epoch's work, and the same input violates the property.
-/// The test counts each kind of submission and checks that an old-epoch
-/// body reaches the sequencer after the reset, so a change that drops one
-/// fails here instead of weakening the planted case.
+/// The test counts each kind of submission and checks that the sequencer
+/// refuses an old-epoch body after it applies the reset, so a change that
+/// drops one fails here instead of weakening the planted case.
 #[test]
 fn the_reset_mid_flight_input_holds_submit_only_requested() {
     if let Err(shortfall) = reset_mid_flight_shortfall(RESET_MID_FLIGHT_INPUT) {
@@ -166,8 +166,8 @@ fn the_reset_mid_flight_input_holds_submit_only_requested() {
 /// why it falls short. Its run must be a witness that holds
 /// `submit-only-requested` and pairs every block storage operation. It must
 /// submit bodies of an old and a new epoch, and credit a submission through
-/// first-completion-wins. And an old epoch's body must reach the sequencer
-/// after the reactor's authority moved to a newer epoch: that is the body
+/// first-completion-wins. And the sequencer must refuse an old epoch's body
+/// as stale after it applied a newer epoch: that is the body
 /// `height-only.patch` adopts.
 fn reset_mid_flight_shortfall(input: &[u8]) -> Result<(), String> {
     let ports = witnessed(committed(input), SUBMIT_ONLY_REQUESTED, Expect::Holds)?;
@@ -183,8 +183,8 @@ fn reset_mid_flight_shortfall(input: &[u8]) -> Result<(), String> {
     if model.credited_elsewhere == 0 {
         return Err("no first-completion-wins credit".to_owned());
     }
-    if !model.saw_old_epoch_body_dequeued {
-        return Err("no old-epoch body left the input queue after a newer epoch began".to_owned());
+    if !model.saw_old_epoch_body_refused {
+        return Err("the sequencer refused no old-epoch body under a newer epoch".to_owned());
     }
     Ok(())
 }

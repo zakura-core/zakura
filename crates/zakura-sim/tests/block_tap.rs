@@ -606,6 +606,7 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 BlockSyncFact::HandoffStarted { .. } => "handoff-started",
                 BlockSyncFact::HandoffEnded { .. } => "handoff-ended",
                 BlockSyncFact::Holder { .. } => "holder",
+                BlockSyncFact::StaleScope { .. } => "stale-scope",
                 BlockSyncFact::ServingLease { .. } => "serving-lease",
                 BlockSyncFact::ServingAdmission { .. } => "serving-admission",
                 BlockSyncFact::ServingFrame { .. } => "serving-frame",

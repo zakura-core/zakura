@@ -386,7 +386,7 @@ fn a_repeated_proposal_preserves_the_cached_result_when_its_spend_check_fails() 
         .expect("the parent is present")
         .as_ref()
         .clone();
-    proposal_chain.created_utxos.remove(&outpoint);
+    proposal_chain.tx_loc_by_hash.remove(&outpoint.hash);
     let result = proposal_state.validate_and_commit(
         Arc::new(proposal_chain),
         child.clone().prepare(),
@@ -526,7 +526,7 @@ fn modern_authorization_changes_match_but_spend_effect_changes_do_not() {
         assert_eq!(
             check::utxo::transparent_spend(
                 &proposal.clone().prepare(),
-                &chain.created_utxos,
+                |outpoint| chain.created_ordered_utxo(outpoint),
                 &chain.spent_utxos,
                 &finalized,
             )
@@ -552,7 +552,7 @@ fn modern_authorization_changes_match_but_spend_effect_changes_do_not() {
         assert_eq!(
             check::utxo::transparent_spend(
                 &authorized.clone().prepare(),
-                &chain.created_utxos,
+                |outpoint| chain.created_ordered_utxo(outpoint),
                 &chain.spent_utxos,
                 &finalized,
             )

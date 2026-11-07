@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use zakura_rt::{collections::HashMap, sync::Mutex, task, time};
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
+    fake::FakeStorage,
     harness::{run_harness, Subsystem},
     property::{
         Assume, Capture, CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation,
@@ -19,7 +20,7 @@ use zakura_sim::{
         Subject, TriggerHistory, Verdict,
     },
     witness::{judge_report, witness, Expect, WitnessError, WitnessScenario},
-    MemorySink, ObservationLog, Plan, PropertyOutcome, RunConfig, RunEnd, RunReport, Sim,
+    MemorySink, ObservationLog, Outcome, Plan, PropertyOutcome, RunConfig, RunEnd, RunReport, Sim,
 };
 
 /// A view-side fact the harness's task records.
@@ -51,6 +52,9 @@ enum Act {
     Sleep(u64),
     /// Takes a lock, a preemption point inside the poll.
     Point,
+    /// Waits for a fake storage operation, which completes within 1 ms.
+    /// The scheduler alone looks deadlocked meanwhile.
+    Store,
     /// Breaks the harness's evidence in this way.
     Break(Broken),
 }
@@ -177,6 +181,8 @@ impl Subsystem for Stamped {
         let lock = Mutex::new(());
         let broken = Rc::new(Cell::new(None));
         let task_broken = Rc::clone(&broken);
+        let storage = FakeStorage::new("store", Duration::from_millis(1));
+        sim.add_source(Box::new(storage.clone()));
         sim.scheduler().spawn_root("stamper", async move {
             for act in acts {
                 match act {
@@ -189,6 +195,7 @@ impl Subsystem for Stamped {
                     Act::Yield => task::yield_now().await,
                     Act::Sleep(ms) => time::sleep(Duration::from_millis(ms)).await,
                     Act::Point => drop(lock.lock().expect("no task panics holding it")),
+                    Act::Store => drop(storage.submit().await),
                     Act::Break(how) => task_broken.set(Some(how)),
                 }
             }
@@ -365,7 +372,7 @@ fn violated(report: &RunReport, id: &str) -> bool {
     matches!(outcome(report, id), PropertyOutcome::Violated { .. })
 }
 
-use Act::{Fact, Point, Sleep, Yield};
+use Act::{Fact, Point, Sleep, Store, Yield};
 use Name::{Defer, Done, Wait, WaitNext, WaitObserved};
 
 /// A fact after the trigger's stamp in its own step discharges, and so does
@@ -467,18 +474,41 @@ fn a_lost_deferred_timer_violates_at_the_next_timer() {
     assert_eq!(violation.witness, [1, violation.step]);
 }
 
-/// If the deferred timer is lost and no other timer is armed, the run goes
+/// If the deferred timer is lost and nothing else is armed, the run ends
 /// idle before the deferred instant. Time can't reach it then, so the
-/// obligation violates there instead of staying open.
+/// obligation violates at the run's end instead of staying open.
 #[test]
 fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
     let report = run(&[Fact(Wait), Fact(Defer(1))]);
-    let violation = report.end.violation.as_ref().expect("the run went idle");
-    assert_eq!(violation.property, SERVED);
+    assert!(
+        matches!(report.end.outcome, Outcome::Idle { .. }),
+        "{:?}",
+        report.end
+    );
+    assert!(violated(&report, SERVED), "{:?}", report.properties);
+    let served = report
+        .properties
+        .iter()
+        .find(|property| property.property == SERVED)
+        .expect("the property reports");
     assert_eq!(
-        violation.expected,
+        served.violations[0].expected,
         r#"Owner("w") discharged by its deferred deadline, 1000000 ns"#
     );
+    assert_eq!(
+        served.violations[0].actual,
+        "the run went idle at 0 ns with it still open"
+    );
+}
+
+/// While the task waits on storage, the scheduler alone looks deadlocked,
+/// but the storage source still completes the operation. A deferred
+/// obligation survives that, and the work after the completion discharges
+/// it.
+#[test]
+fn a_deferral_survives_a_wait_only_a_source_can_end() {
+    let report = run(&[Fact(Wait), Fact(Defer(1)), Store, Fact(Done)]);
+    assert!(held(&report, SERVED), "{:?}", report.properties);
 }
 
 /// A deferral to an instant already behind the clock expires at once, so a

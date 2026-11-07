@@ -75,7 +75,9 @@ pub enum FactAnswer {
     /// From then on, the obligation no longer expires at quiescence, but at
     /// the first step whose time is past the instant, before that step's
     /// observations or facts count. An instant already behind the clock
-    /// expires it at once. Every matching obligation defers, and a later
+    /// expires it at once. If the run ends idle first, the instant can't
+    /// come, so it expires at the run's end. A run cut off by its budget
+    /// leaves it open. Every matching obligation defers, and a later
     /// deferral replaces an earlier one.
     DefersTo(SimInstant),
 }

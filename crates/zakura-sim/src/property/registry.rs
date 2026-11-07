@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     check::{Checker, PropertyOutcome, PropertyReport, StepCtx, Violation},
-    end::{HarnessFailure, RunEnd},
+    end::{HarnessFailure, Outcome, RunEnd},
     model::LabelledFrame,
     Observation, ObservationLog,
 };
@@ -284,10 +284,13 @@ impl Sources {
 ///    to an instant already behind the clock expires there, before the
 ///    step's later facts.
 /// 6. When no task can run after the step, it expires every
-///    `BeforeQuiescence` obligation still open that isn't deferred. A
-///    deferred one waits while a timer can still advance the clock, and
-///    expires once the run goes idle with nothing armed, since its instant
-///    can't come then. Only a run cut off while it waits leaves it open.
+///    `BeforeQuiescence` obligation still open that isn't deferred.
+///
+/// At the run's end, a run that ended idle expires every obligation still
+/// deferred, since nothing is left to bring the clock to its instant. The
+/// scheduler's status alone can't tell that during a step, because a
+/// source can still offer an action or a time boundary. A run cut off by
+/// its budget leaves a deferred obligation open.
 ///
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
@@ -305,6 +308,8 @@ pub struct RegistryChecker<S: HasView> {
     bounded: bool,
     /// The stamp of the last view-side fact the registry offered.
     offered: Option<u64>,
+    /// Virtual time after the last step.
+    last_now: SimInstant,
 }
 
 /// One property's progress through a run.
@@ -445,6 +450,7 @@ impl<S: HasView> RegistryChecker<S> {
             failure,
             bounded: assumptions.declares(Assume::BoundedAdversary),
             offered: None,
+            last_now: SimInstant::default(),
         }
     }
 
@@ -490,11 +496,28 @@ impl<S: HasView> RegistryChecker<S> {
             });
         }
     }
+
+    /// Expires every obligation still deferred when the run went idle after
+    /// step `last`, as the type's docs describe.
+    fn expire_deferred(&mut self, last: u64) {
+        for (property, state) in self.properties.iter().zip(&mut self.state) {
+            let (expired, open) = std::mem::take(&mut state.open)
+                .into_iter()
+                .partition(|open| open.deferred.is_some());
+            state.open = open;
+            for open in expired {
+                state
+                    .violations
+                    .push(idle_expiry(property, &open, last, self.last_now));
+            }
+        }
+    }
 }
 
 impl<S: HasView> Checker for RegistryChecker<S> {
     /// Evaluates every property after a step, as the type's docs describe.
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        self.last_now = cx.now;
         let mut first = None;
         // Stamps are read only from a fresh view. A stale one reads none, and
         // the properties that need the view fail the run below.
@@ -564,6 +587,9 @@ impl<S: HasView> Checker for RegistryChecker<S> {
     /// the harness's [`HasView::end_violations`].
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         self.handle.ended(end);
+        if matches!(end.outcome, Outcome::Idle { .. }) {
+            self.expire_deferred(end.steps);
+        }
         if let Some(violation) = &end.violation {
             self.step_loop_violation(violation);
         }
@@ -795,16 +821,9 @@ fn step_property<S: HasView>(
     }
 
     state.open.retain(|open| {
-        // A deferred obligation waits only while time can still reach its
-        // instant.
         let gone = open.obligation.bound == LivenessBound::BeforeQuiescence
-            && match open.deferred {
-                None => cx.status != zakura_scheduler::Status::Running,
-                Some(_) => !matches!(
-                    cx.status,
-                    zakura_scheduler::Status::Running | zakura_scheduler::Status::WaitingOnTime
-                ),
-            };
+            && open.deferred.is_none()
+            && cx.status != zakura_scheduler::Status::Running;
         if gone {
             events.push(event(Lifecycle::Expired));
             violations.push(expiry(property, open, floor, cx));
@@ -832,6 +851,38 @@ fn deadline<V>(
 ) -> Option<SimInstant> {
     let origin = holds_since.map_or(obligation.opened_time, |at| at.max(obligation.opened_time));
     origin.checked_add(within)
+}
+
+/// The violation a deferred obligation reports when the run went idle after
+/// step `last`, at `now`.
+fn idle_expiry<S: HasView>(
+    property: &Property<S>,
+    open: &Open<S::View>,
+    last: u64,
+    now: SimInstant,
+) -> Violation {
+    let obligation = &open.obligation;
+    let at = open
+        .deferred
+        .expect("only a deferred obligation expires at an idle end");
+    let mut witness = obligation.witness.clone();
+    witness.push(last);
+    witness.sort_unstable();
+    witness.dedup();
+    Violation {
+        property: property.id.to_string(),
+        step: last,
+        witness,
+        expected: format!(
+            "{:?} discharged by its deferred deadline, {} ns",
+            obligation.key.subject,
+            at.since_start().as_nanos()
+        ),
+        actual: format!(
+            "the run went idle at {} ns with it still open",
+            now.since_start().as_nanos()
+        ),
+    }
 }
 
 /// The violation an expired obligation reports.

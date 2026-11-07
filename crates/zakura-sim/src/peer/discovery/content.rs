@@ -9,9 +9,9 @@
 //!
 //! - `hello`: a forged signature, the wrong network or chain, a protocol
 //!   range that doesn't overlap the node's, or a record whose node ID isn't
-//!   the authenticated peer's. An expired or far-future record, a private or
-//!   missing address, the node's own record and a book limit are local
-//!   policy, so they stay `Conformant`.
+//!   the authenticated peer's, the node's own record among them. An expired
+//!   or far-future record, a private or missing address and a book limit
+//!   are local policy, so they stay `Conformant`.
 //! - `peers`: a relayed record with a forged signature or the wrong network
 //!   or chain, two records of one node, or more records than the node's
 //!   `GetPeers` asked for. Expiry and a protocol range that doesn't overlap
@@ -217,7 +217,14 @@ mod tests {
         let other =
             DiscoveryMessage::Services(services(NodeSecretKey::from_bytes(&[8; 32]).public()));
         assert_eq!(plain(&content, &other), Label::BadContent);
+        let mut twice = services(peer.public());
+        twice.summaries.push(twice.summaries[0].clone());
+        assert_eq!(
+            plain(&content, &DiscoveryMessage::Services(twice)),
+            Label::BadContent
+        );
 
+        let discovery = ZakuraServiceId::discovery();
         let get_peers = |limit, exclude_node_ids| {
             DiscoveryMessage::GetPeers(GetPeers {
                 limit,
@@ -241,9 +248,14 @@ mod tests {
             plain(&content, &get_peers(1, vec![[2; 32], [1; 32]])),
             Label::BadContent
         );
+        let wanting = DiscoveryMessage::GetPeers(GetPeers {
+            limit: 1,
+            wanted_services: vec![discovery.clone(), discovery.clone()],
+            exclude_node_ids: Vec::new(),
+        });
+        assert_eq!(plain(&content, &wanting), Label::BadContent);
         let get_services =
             |wanted_services| DiscoveryMessage::GetServices(GetServices { wanted_services });
-        let discovery = ZakuraServiceId::discovery();
         assert_eq!(
             plain(&content, &get_services(vec![discovery.clone()])),
             Label::Conformant

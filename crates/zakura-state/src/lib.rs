@@ -75,6 +75,7 @@ pub use response::{
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use service::{
+    block_announcements::{BlockAnnouncements, BlockOrigin, CommittedBlockAnnouncement},
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
     finalized_state::FinalizedState,
@@ -82,7 +83,7 @@ pub use service::{
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
-    OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
+    InitializedState, OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
 
 // Allow use in the scanner and external tests

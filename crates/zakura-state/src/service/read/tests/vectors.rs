@@ -60,8 +60,12 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
     let transcript = Transcript::from(empty_state_test_cases());
 
     let network = Mainnet;
-    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
-        init_test_services(&network).await;
+    // Keep the writer alive while exercising the read-only service.
+    let crate::InitializedState {
+        state: _state,
+        read_state,
+        ..
+    } = init_test_services(&network).await;
 
     transcript.check(read_state).await?;
 
@@ -1469,8 +1473,12 @@ fn newer_artifact_fills_only_the_skipped_band() {
 #[tokio::test]
 async fn historical_subtrees_accept_a_newer_artifact_for_an_older_fast_sync_marker() {
     let _init_guard = zakura_test::init();
-    let (_state, mut read_state, _latest_chain_tip, _chain_tip_change) =
-        init_test_services(&Network::new_default_testnet()).await;
+    // Keep the writer alive while exercising the read-only service.
+    let crate::InitializedState {
+        state: _state,
+        mut read_state,
+        ..
+    } = init_test_services(&Network::new_default_testnet()).await;
     let artifact_checkpoint = Height(10);
 
     read_state.historical_subtrees = Some(Arc::new(SubtreeArtifact {

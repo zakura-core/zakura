@@ -48,10 +48,14 @@ async fn assert_block_range_selection(header_runtime: bool) {
         enable_zakura_header_seed_from_committed_blocks: header_runtime,
         ..Config::ephemeral()
     };
-    let (mut state, mut read_state, tip, _change) =
-        StateService::new(config, &network, block::Height::MAX, 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        mut read_state,
+        latest_chain_tip: tip,
+        ..
+    } = StateService::new(config, &network, block::Height::MAX, 0)
+        .await
+        .unwrap();
     let genesis = block::genesis::regtest_genesis_block();
     let mut parent = genesis.make_fake_child();
     Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
@@ -589,10 +593,13 @@ async fn a_panicking_read_releases_resources_once() {
 async fn the_state_api_returns_an_owned_empty_range() {
     let _guard = zakura_test::init();
     let (resources, drops, _finished) = resources();
-    let (_state, mut read_state, _tip, _change) =
-        timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        state: _state,
+        mut read_state,
+        ..
+    } = timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
+        .await
+        .unwrap();
     let result = timeout(
         DEADLINE,
         read_state.read_owned_block_range(block::Height(1), 1, 10, resources, |_| false),
@@ -718,10 +725,13 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
 
     let _guard = zakura_test::init();
     let (resources, drops, finished) = resources();
-    let (_state, mut read_state, _tip, _change) =
-        timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        state: _state,
+        mut read_state,
+        ..
+    } = timeout(DEADLINE, crate::init_test_services(&Network::Mainnet))
+        .await
+        .unwrap();
     let failure = BlockWriteTaskFailure::from(&HeaderChainAttachmentError::MissingGenesis);
     read_state.block_write_failure.set(failure.clone());
     let error = timeout(

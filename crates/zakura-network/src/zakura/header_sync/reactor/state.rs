@@ -41,6 +41,11 @@ pub(super) struct ReactorState {
     /// request timeouts, or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
+    /// No later than the earliest end in [`Self::unproductive_peer_cooldowns`],
+    /// so maintenance wakes to republish it without scanning the map each turn.
+    /// A replaced entry can leave it early; the prune that wake runs makes it
+    /// exact again.
+    cooldowns_end: Option<Instant>,
     /// How many cooldown entries [`Self::start_readmission_cooldown`] has
     /// installed, so the reactor reports `CooldownStarted` only for an
     /// actual install. Test and simulator builds only.
@@ -94,6 +99,7 @@ impl ReactorState {
             cached_pass_budget: CachedPassBudget::new(now),
             cached_pass_deferred: false,
             unproductive_peer_cooldowns: HashMap::new(),
+            cooldowns_end: None,
             #[cfg(any(test, zakura_sim))]
             cooldowns_installed: 0,
             departed_strikes: HashMap::new(),
@@ -311,8 +317,9 @@ impl ReactorState {
     ) {
         if !cooldown.is_zero() {
             let _ = self.prune_readmission_cooldowns(now);
-            self.unproductive_peer_cooldowns
-                .insert(peer.clone(), now + cooldown);
+            let until = now + cooldown;
+            self.unproductive_peer_cooldowns.insert(peer.clone(), until);
+            self.cooldowns_end = Some(self.cooldowns_end.map_or(until, |end| end.min(until)));
             #[cfg(any(test, zakura_sim))]
             {
                 self.cooldowns_installed += 1;
@@ -325,8 +332,15 @@ impl ReactorState {
     pub(super) fn prune_readmission_cooldowns(&mut self, now: Instant) -> bool {
         self.departed_strikes.retain(|_, (_, until)| *until > now);
         let before = self.unproductive_peer_cooldowns.len();
-        self.unproductive_peer_cooldowns
-            .retain(|_, until| *until > now);
+        let mut end: Option<Instant> = None;
+        self.unproductive_peer_cooldowns.retain(|_, until| {
+            let holds = *until > now;
+            if holds {
+                end = Some(end.map_or(*until, |end| end.min(*until)));
+            }
+            holds
+        });
+        self.cooldowns_end = end;
         self.unproductive_peer_cooldowns.len() != before
     }
 
@@ -776,6 +790,9 @@ impl ReactorState {
             .copied()
             .chain(self.close_deadlines.values().map(|(_, deadline)| *deadline))
             .chain(self.pending_closes.values().map(|(_, retry_at)| *retry_at))
+            // Maintenance republishes a cooldown's end, which the header
+            // service waits for before it re-offers that peer.
+            .chain(self.cooldowns_end)
             .chain(
                 self.vct_repair
                     .current()

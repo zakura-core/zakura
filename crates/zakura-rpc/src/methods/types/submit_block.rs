@@ -57,34 +57,21 @@ pub struct SubmitSolutionParameters {
 const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_MINED_SUBMISSIONS: usize = 16;
 
-/// Blocks this node is submitting, from `submitblock` until their final mined-block event is
-/// sent. Bounds detached submissions before they reach verification or the writer.
-///
-/// Block gossip shares it to tell a tip change caused by a local submission, whose
-/// [`MinedBlockEvent`] follows the tip change, from a relayed block.
+/// Bounds detached mined submissions before they reach verification or the writer.
 #[derive(Clone, Debug, Default)]
-pub struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
+pub(crate) struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
 
 /// Holds submission capacity until verification and contextual commit finish.
-#[derive(Debug)]
-pub struct MinedSubmission {
+pub(crate) struct MinedSubmission {
     submissions: MinedSubmissions,
     hash: block::Hash,
 }
 
 impl MinedSubmissions {
-    /// Returns whether this node is submitting `hash` and has not yet sent its final event.
-    pub fn contains(&self, hash: &block::Hash) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(hash)
-    }
-
-    /// Records that this node is submitting `hash` until the returned guard is dropped.
-    ///
-    /// Fails if `hash` is already being submitted, or too many submissions are in flight.
-    pub fn reserve(&self, hash: block::Hash) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
+    pub(crate) fn reserve(
+        &self,
+        hash: block::Hash,
+    ) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
         let mut entries = self
             .0
             .lock()
@@ -132,33 +119,23 @@ impl MinedBlockSubmission {
     }
 }
 
-/// A mined-block lifecycle event consumed by the block gossip task.
+/// An admitted local block eligible for optimistic announcement before commit.
 #[derive(Debug)]
-pub enum MinedBlockEvent {
-    /// State admitted the block, so peers can receive its inventory before commit completes.
-    Early {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// The block's serialized size in bytes.
-        size: usize,
-        /// When the RPC accepted the submitted bytes.
-        submitted_at: std::time::Instant,
-        /// The RPC method that accepted the submission.
-        submission: MinedBlockSubmission,
-        /// Cancels the advertisement if contextual verification rejects the block.
-        pending: PendingBlockSignal,
-    },
-    /// The contextual commit completed.
-    Committed {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// The block's serialized size in bytes.
-        size: usize,
-    },
+pub struct EarlyMinedBlock {
+    /// State's submission lifecycle, used to suppress early dispatch after commit.
+    pub admission: zakura_state::BlockAdmission,
+    /// Block hash.
+    pub hash: block::Hash,
+    /// Block height.
+    pub height: block::Height,
+    /// Serialized size in bytes.
+    pub size: usize,
+    /// When the RPC accepted the submitted bytes.
+    pub submitted_at: std::time::Instant,
+    /// The RPC method that accepted the submission.
+    pub submission: MinedBlockSubmission,
+    /// Cancels the advertisement if contextual verification rejects the block.
+    pub pending: PendingBlockSignal,
 }
 
 #[derive(Clone, Debug)]
@@ -431,36 +408,35 @@ impl From<SubmitBlockResponse> for SubmitSolutionResponse {
     }
 }
 
-/// A submit block channel, used to inform the gossip task about mined blocks.
-pub struct SubmitBlockChannel {
+/// Carries optional early local-block announcements to gossip.
+pub struct EarlyMinedBlockChannel {
     /// The channel sender
-    sender: mpsc::UnboundedSender<MinedBlockEvent>,
+    sender: mpsc::UnboundedSender<EarlyMinedBlock>,
     /// The channel receiver
-    receiver: mpsc::UnboundedReceiver<MinedBlockEvent>,
+    receiver: mpsc::UnboundedReceiver<EarlyMinedBlock>,
 }
 
-impl SubmitBlockChannel {
+impl EarlyMinedBlockChannel {
     /// Creates a new submit block channel
     pub fn new() -> Self {
-        // Only admitted early events and successful commit events enter this channel. Invalid and
-        // duplicate submissions cannot fill it, and the gossip task does not wait for peer
-        // readiness while consuming it.
+        // Only authorized early events enter this channel. Committed announcements come
+        // from state, and gossip consumes both feeds without waiting for peer readiness.
         let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     /// Get the channel sender
-    pub fn sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
+    pub fn sender(&self) -> mpsc::UnboundedSender<EarlyMinedBlock> {
         self.sender.clone()
     }
 
     /// Get the channel receiver
-    pub fn receiver(self) -> mpsc::UnboundedReceiver<MinedBlockEvent> {
+    pub fn receiver(self) -> mpsc::UnboundedReceiver<EarlyMinedBlock> {
         self.receiver
     }
 }
 
-impl Default for SubmitBlockChannel {
+impl Default for EarlyMinedBlockChannel {
     fn default() -> Self {
         Self::new()
     }

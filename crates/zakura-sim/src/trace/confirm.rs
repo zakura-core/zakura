@@ -373,7 +373,7 @@ fn judge(
 
     if let Err(error) = witness(entry, input, want, &confirmation.scenario, run) {
         let status = match error {
-            WitnessError::Unregistered | WitnessError::NoTriggerHistory => {
+            WitnessError::Unregistered | WitnessError::NoTriggerHistory | WitnessError::NoView => {
                 ConfirmStatus::WitnessUnsupported
             }
             WitnessError::LostTriggerHistory => ConfirmStatus::WitnessLost,

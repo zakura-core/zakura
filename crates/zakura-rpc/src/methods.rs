@@ -111,7 +111,9 @@ pub(crate) mod trees;
 pub(crate) mod types;
 
 use hex_data::HexData;
-use mining_trace::{submit_result, BlockSubmission, MiningTrace};
+use mining_trace::{
+    reservation_refused_reason, submit_result, BlockSubmission, MiningTrace, TracedWorkId,
+};
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::get_block_template::prepared_candidates::ResolvePreparedCandidateError;
 
@@ -1850,13 +1852,14 @@ where
         let submission_guard = match self.gbt.reserve_mined_submission(block_hash) {
             Ok(submission) => submission,
             Err(response) => {
+                let reason = reservation_refused_reason(&response);
                 let response = response.into();
                 self.mining_trace.block_submitted(BlockSubmission {
                     submission,
                     hash: Some(block_hash),
                     height: Some(height),
                     result: submit_result(&response),
-                    reason: Some(&"the same block is already being submitted"),
+                    reason: Some(&reason),
                     elapsed: submitted_at.elapsed(),
                 });
                 return Ok(response);
@@ -4006,7 +4009,10 @@ where
                 self.trace_unresolved_solution(
                     Some(header.hash()),
                     "stale_work",
-                    &format_args!("no prepared candidate for work ID {work_id:?}"),
+                    &format_args!(
+                        "no prepared candidate for work ID {}",
+                        TracedWorkId(&work_id)
+                    ),
                     submitted_at,
                 );
                 return Ok(SubmitSolutionErrorResponse::StaleWork.into());

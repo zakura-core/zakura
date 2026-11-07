@@ -118,6 +118,41 @@ pub(crate) fn submit_result(response: &SubmitBlockResponse) -> &'static str {
     }
 }
 
+/// Why the node refused to reserve a mined-submission slot, for the `reason` field.
+///
+/// `MinedSubmissions::reserve` answers `DuplicateInconclusive` when the same block is already
+/// being submitted, and `Inconclusive` when every submission slot is taken.
+pub(crate) fn reservation_refused_reason(response: &SubmitBlockErrorResponse) -> &'static str {
+    match response {
+        SubmitBlockErrorResponse::DuplicateInconclusive => {
+            "the same block is already being submitted"
+        }
+        _ => "too many blocks are being submitted",
+    }
+}
+
+/// The most work ID bytes a trace row records. The node's own work IDs are 32 hex characters.
+const MAX_TRACED_WORK_ID_BYTES: usize = 64;
+
+/// Formats a caller-supplied work ID, truncated to [`MAX_TRACED_WORK_ID_BYTES`].
+///
+/// An unknown work ID comes from the RPC caller and can be almost as long as the request.
+pub(crate) struct TracedWorkId<'a>(pub(crate) &'a str);
+
+impl fmt::Display for TracedWorkId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let work_id = self.0;
+        if work_id.len() <= MAX_TRACED_WORK_ID_BYTES {
+            return write!(f, "{work_id:?}");
+        }
+        let mut end = MAX_TRACED_WORK_ID_BYTES;
+        while !work_id.is_char_boundary(end) {
+            end -= 1;
+        }
+        write!(f, "{:?}... ({} bytes)", &work_id[..end], work_id.len())
+    }
+}
+
 #[derive(Serialize)]
 struct TemplateFields<'a> {
     height: u32,
@@ -247,6 +282,36 @@ mod tests {
         assert_eq!(row["result"], "rejected");
         assert_eq!(row["reason"], "bad coinbase");
         assert_eq!(row["elapsed_us"], "1500");
+    }
+
+    #[test]
+    fn reservation_reasons_tell_duplicates_from_full_slots() {
+        assert_eq!(
+            reservation_refused_reason(&SubmitBlockErrorResponse::DuplicateInconclusive),
+            "the same block is already being submitted"
+        );
+        assert_eq!(
+            reservation_refused_reason(&SubmitBlockErrorResponse::Inconclusive),
+            "too many blocks are being submitted"
+        );
+    }
+
+    #[test]
+    fn traced_work_ids_are_bounded() {
+        let node_work_id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            TracedWorkId(node_work_id).to_string(),
+            format!("{node_work_id:?}")
+        );
+
+        let oversized = "é".repeat(1 << 20);
+        let traced = TracedWorkId(&oversized).to_string();
+        assert!(
+            traced.len() < 2 * MAX_TRACED_WORK_ID_BYTES,
+            "{}",
+            traced.len()
+        );
+        assert!(traced.ends_with(&format!("... ({} bytes)", oversized.len())));
     }
 
     #[test]

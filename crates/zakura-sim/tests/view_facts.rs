@@ -15,12 +15,13 @@ use zakura_sim::{
     fake::FakeStorage,
     harness::{run_harness, Subsystem},
     property::{
-        Assume, Capture, CheckCtx, FactAnswer, HasView, Kind, LivenessBound, Obligation,
-        ObligationKey, Property, PropertyId, Registry, RegistryError, Source, Sources, Status,
-        Subject, TriggerHistory, Verdict,
+        Assume, Capture, CheckCtx, CheckEvent, FactAnswer, HasView, Kind, Lifecycle, LivenessBound,
+        Obligation, ObligationKey, Property, PropertyId, Registry, RegistryError, Source, Sources,
+        Status, Subject, TriggerHistory, Verdict,
     },
     witness::{judge_report, witness, Expect, WitnessError, WitnessScenario},
-    MemorySink, ObservationLog, Outcome, Plan, PropertyOutcome, RunConfig, RunEnd, RunReport, Sim,
+    Checker, MemorySink, ObservationLog, Outcome, Plan, PropertyOutcome, PropertyReport, RunConfig,
+    RunEnd, RunReport, Sim, StepCtx, Violation,
 };
 
 /// A view-side fact the harness's task records.
@@ -330,6 +331,11 @@ fn drew_and_waited(view: &Facts, log: &ObservationLog) -> bool {
 
 /// Runs `acts` under a budget of `budget` live steps.
 fn run_for(acts: &[Act], budget: u64) -> RunReport {
+    run_checked(acts, budget, None)
+}
+
+/// [`run_for`], with `extra` after the harness's own checker.
+fn run_checked(acts: &[Act], budget: u64, extra: Option<&mut dyn Checker>) -> RunReport {
     let script = Script {
         acts: acts.to_vec(),
         budget,
@@ -340,7 +346,7 @@ fn run_for(acts: &[Act], budget: u64) -> RunReport {
         &script,
         Plan::from_fuzz(&[]),
         &mut MemorySink::default(),
-        None,
+        extra,
     ) {
         Ok(report) => report,
         Err(error) => panic!("the run ends without a harness failure: {error}"),
@@ -474,12 +480,39 @@ fn a_lost_deferred_timer_violates_at_the_next_timer() {
     assert_eq!(violation.witness, [1, violation.step]);
 }
 
+/// Keeps the lifecycle points it's handed.
+#[derive(Default)]
+struct Points(Vec<Lifecycle>);
+
+impl Checker for Points {
+    /// Checks nothing.
+    fn after_step(&mut self, _: &StepCtx<'_>) -> Option<Violation> {
+        None
+    }
+
+    /// Reports nothing.
+    fn at_end(&mut self, _: &RunEnd, _: &ObservationLog) -> Vec<PropertyReport> {
+        Vec::new()
+    }
+
+    /// Keeps each lifecycle point.
+    fn observe_events(&mut self, events: &[CheckEvent]) {
+        self.0.extend(events.iter().filter_map(|event| match event {
+            CheckEvent::Lifecycle { to, .. } => Some(*to),
+            _ => None,
+        }));
+    }
+}
+
 /// If the deferred timer is lost and nothing else is armed, the run ends
 /// idle before the deferred instant. Time can't reach it then, so the
-/// obligation violates at the run's end instead of staying open.
+/// obligation violates at the run's end instead of staying open, and its
+/// expiry reaches the checkers after the registry.
 #[test]
 fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
-    let report = run(&[Fact(Wait), Fact(Defer(1))]);
+    let mut points = Points::default();
+    let report = run_checked(&[Fact(Wait), Fact(Defer(1))], 50, Some(&mut points));
+    assert_eq!(points.0.last(), Some(&Lifecycle::Expired), "{:?}", points.0);
     assert!(
         matches!(report.end.outcome, Outcome::Idle { .. }),
         "{:?}",

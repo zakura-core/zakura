@@ -498,7 +498,8 @@ impl<S: HasView> RegistryChecker<S> {
     }
 
     /// Expires every obligation still deferred when the run went idle after
-    /// step `last`, as the type's docs describe.
+    /// step `last`, as the type's docs describe, emitting each expiry as the
+    /// other expiry paths do.
     fn expire_deferred(&mut self, last: u64) {
         for (property, state) in self.properties.iter().zip(&mut self.state) {
             let (expired, open) = std::mem::take(&mut state.open)
@@ -506,6 +507,10 @@ impl<S: HasView> RegistryChecker<S> {
                 .partition(|open| open.deferred.is_some());
             state.open = open;
             for open in expired {
+                self.events.push(CheckEvent::Lifecycle {
+                    property: property.id.clone(),
+                    to: Lifecycle::Expired,
+                });
                 state
                     .violations
                     .push(idle_expiry(property, &open, last, self.last_now));

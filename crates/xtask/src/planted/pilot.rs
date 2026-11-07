@@ -548,7 +548,7 @@ fn sensitivity_case(
     catalogue: &Catalogue,
     case: &Case,
     baseline_tree: &Path,
-    built: &Result<PathBuf, String>,
+    built: &Result<PathBuf, BuildFailure>,
     out: &Path,
     work: &Path,
     child: Duration,
@@ -562,36 +562,53 @@ fn sensitivity_case(
     };
     let mut cleanup = None;
     if run.equivalent.is_none() {
-        run.baseline = Some(match built {
-            Err(why) => Err(format!("the original build fails: {why}")),
-            Ok(sim) => Ok(witness_run(
-                sim,
-                baseline_tree,
-                case,
-                catalogue,
-                false,
-                &dir.join("baseline"),
-                child,
-                &INTERRUPTED,
-            )?),
-        });
+        match built {
+            Err(BuildFailure::Broken(why)) => {
+                run.broken_build = Some(format!("the original build broke: {why}"));
+            }
+            Err(BuildFailure::Rejected(why)) => {
+                run.baseline = Some(Err(format!("the original doesn't compile: {why}")));
+            }
+            Ok(sim) => {
+                run.baseline = Some(Ok(witness_run(
+                    sim,
+                    baseline_tree,
+                    case,
+                    catalogue,
+                    false,
+                    &dir.join("baseline"),
+                    child,
+                    &INTERRUPTED,
+                )?));
+            }
+        }
         if classify::sensitivity_baseline(&case.property, &run.baseline).is_none() {
             let tree = work.join("cases").join(&case.id).join("worktree");
             let target = work.join("cases").join(&case.id).join("target");
             add_worktree(repo_root, &tree, &catalogue.source_revision)?;
             let mutant = (|| {
-                let sim = match prepare_patch(repo_root, &tree, case)? {
-                    Err(why) => Err(why),
-                    Ok(()) => build_sim(
-                        &tree,
-                        &target,
-                        toolchain(&catalogue.baseline_build)?,
-                        &dir.join("mutant-build.log"),
-                    )?
-                    .map_err(|why| format!("the mutant doesn't compile: {why}")),
+                if let Err(why) = prepare_patch(repo_root, &tree, case)? {
+                    run.patch = Some(Err(why));
+                    return Ok(());
+                }
+                let built = build_sim(
+                    &tree,
+                    &target,
+                    toolchain(&catalogue.baseline_build)?,
+                    &dir.join("mutant-build.log"),
+                )?;
+                let sim = match built {
+                    Err(BuildFailure::Rejected(why)) => {
+                        run.patch = Some(Err(format!("the mutant doesn't compile: {why}")));
+                        return Ok(());
+                    }
+                    Err(BuildFailure::Broken(why)) => {
+                        run.broken_build = Some(format!("the mutant build broke: {why}"));
+                        return Ok(());
+                    }
+                    Ok(sim) => sim,
                 };
-                run.patch = Some(sim.as_ref().map(|_| ()).map_err(Clone::clone));
-                let Ok(sim) = sim else { return Ok(()) };
+                run.patch = Some(Ok(()));
                 let recorded = witness_run(
                     &sim,
                     &tree,
@@ -760,7 +777,7 @@ fn discovery(
                     .join(&case.target)
                     .join(format!("seed-{seed}"));
                 let facts = match &built {
-                    Err(why) => Err(format!("the original simulator fails to build: {why}")),
+                    Err(failure) => Err(LaneError::Build(failure.of("the original simulator"))),
                     Ok(sim) => campaign_lane(
                         sim,
                         &lane_dir,
@@ -771,7 +788,12 @@ fn discovery(
                         &corpus,
                         false,
                     )?
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| match error {
+                        LaneError::Build(failure) => {
+                            LaneError::Build(failure.of("the original fuzz target"))
+                        }
+                        error => error,
+                    }),
                 };
                 baselines.insert(key, facts);
             }
@@ -806,7 +828,7 @@ fn discovery_case(
     catalogue: &Catalogue,
     case: &Case,
     seeds: &[u32],
-    baselines: &BTreeMap<(String, u32), Result<CampaignFacts, String>>,
+    baselines: &BTreeMap<(String, u32), Result<CampaignFacts, LaneError>>,
     corpus: &Path,
     out: &Path,
     work: &Path,
@@ -815,12 +837,18 @@ fn discovery_case(
     let mut runs: Vec<(u32, DiscoveryRun, Option<PathBuf>)> = seeds
         .iter()
         .map(|seed| {
-            let baseline = baselines.get(&(case.target.clone(), *seed)).cloned();
-            let run = DiscoveryRun {
+            let mut run = DiscoveryRun {
                 equivalent: case.equivalent.clone(),
-                baseline,
                 ..DiscoveryRun::default()
             };
+            match baselines.get(&(case.target.clone(), *seed)) {
+                None => {}
+                Some(Ok(facts)) => run.baseline = Some(Ok(facts.clone())),
+                Some(Err(LaneError::Build(BuildFailure::Broken(why)))) => {
+                    run.broken_build = Some(why.clone());
+                }
+                Some(Err(error)) => run.baseline = Some(Err(error.to_string())),
+            }
             (*seed, run, None)
         })
         .collect();
@@ -843,20 +871,26 @@ fn discovery_case(
         let ran = (|| {
             let dir = out.join("cases").join(&case.id);
             fs::create_dir_all(&dir)?;
-            let mut patch = match prepare_patch(repo_root, &tree, case)? {
-                Err(why) => Err(why),
+            // The mutant simulator, or why no seed can run: an invalid
+            // mutant, or a build that broke.
+            let mut mutant = match prepare_patch(repo_root, &tree, case)? {
+                Err(why) => Err(BuildFailure::Rejected(why)),
                 Ok(()) => build_sim(
                     &tree,
                     &sim_target,
                     toolchain(&catalogue.baseline_build)?,
                     &dir.join("mutant-build.log"),
                 )?
-                .map_err(|why| format!("the mutant simulator doesn't compile: {why}")),
+                .map_err(|failure| failure.of("the mutant simulator")),
             };
             for (seed, run, store) in runs.iter_mut().filter(|(_, run, _)| runnable(run)) {
-                let sim = match &patch {
-                    Err(why) => {
+                let sim = match &mutant {
+                    Err(BuildFailure::Rejected(why)) => {
                         run.patch = Some(Err(why.clone()));
+                        continue;
+                    }
+                    Err(BuildFailure::Broken(why)) => {
+                        run.broken_build = Some(why.clone());
                         continue;
                     }
                     Ok(sim) => sim.clone(),
@@ -872,10 +906,8 @@ fn discovery_case(
                     corpus,
                     true,
                 )? {
-                    Err(LaneError::Build(why)) => {
-                        let why = format!("the mutant fuzz target doesn't compile: {why}");
-                        run.patch = Some(Err(why.clone()));
-                        patch = Err(why);
+                    Err(LaneError::Build(failure)) => {
+                        fuzz_build_failed(run, &mut mutant, failure.of("the mutant fuzz target"));
                     }
                     Err(LaneError::Run(why)) => {
                         run.patch = Some(Ok(()));
@@ -929,11 +961,63 @@ fn discovery_case(
     })
 }
 
+/// Records a mutant fuzz target's build `failure` in its seed's `run`. A
+/// rejected build makes the mutant invalid for this seed and, through
+/// `mutant`, for every later seed, since they build the same source. A
+/// broken build fails only this seed, and the next seed builds again.
+fn fuzz_build_failed(
+    run: &mut DiscoveryRun,
+    mutant: &mut Result<PathBuf, BuildFailure>,
+    failure: BuildFailure,
+) {
+    match failure {
+        BuildFailure::Rejected(why) => {
+            run.patch = Some(Err(why.clone()));
+            *mutant = Err(BuildFailure::Rejected(why));
+        }
+        BuildFailure::Broken(why) => run.broken_build = Some(why),
+    }
+}
+
+/// Why a build failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BuildFailure {
+    /// The source is invalid: the compiler rejected it with an error at a
+    /// source location, or a mutant's patch doesn't apply or changes files
+    /// it doesn't declare. For a mutant, it's an invalid mutant.
+    Rejected(String),
+    /// The build failed without a compile error, such as a compiler killed
+    /// for memory, a full disk or a failed link. It's a harness failure.
+    Broken(String),
+}
+
+impl BuildFailure {
+    /// The failure of `what`'s build, said in words.
+    fn of(&self, what: &str) -> BuildFailure {
+        match self {
+            BuildFailure::Rejected(why) => {
+                BuildFailure::Rejected(format!("{what} doesn't compile: {why}"))
+            }
+            BuildFailure::Broken(why) => {
+                BuildFailure::Broken(format!("{what}'s build broke: {why}"))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for BuildFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildFailure::Rejected(why) | BuildFailure::Broken(why) => f.write_str(why),
+        }
+    }
+}
+
 /// Why a campaign lane has no facts.
 #[derive(Debug)]
 enum LaneError {
     /// The fuzz target didn't build.
-    Build(String),
+    Build(BuildFailure),
     /// The campaign didn't leave the records the runner reads.
     Run(String),
 }
@@ -941,7 +1025,7 @@ enum LaneError {
 impl std::fmt::Display for LaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LaneError::Build(why) => write!(f, "the fuzz target fails to build: {why}"),
+            LaneError::Build(failure) => failure.fmt(f),
             LaneError::Run(why) => f.write_str(why),
         }
     }
@@ -978,15 +1062,20 @@ fn campaign_lane(
             &bounds.sanitizer,
             "--target-dir",
         ])
-        .arg(fuzz_target);
+        .arg(fuzz_target)
+        // Uncolored diagnostics, which `fuzz_build_failure` reads.
+        .env("CARGO_TERM_COLOR", "never");
     let log = dir.join("build.log");
     match run_pilot_child(&mut build, &log, None)? {
         ChildEnd::Exited(0) => {}
         end => {
-            return Ok(Err(LaneError::Build(format!(
-                "`zakura-sim campaign build` {end}; see {}",
-                log.display()
-            ))))
+            let why = format!("`zakura-sim campaign build` {end}; see {}", log.display());
+            let text = fs::read(&log).unwrap_or_default();
+            return Ok(Err(LaneError::Build(fuzz_build_failure(
+                end,
+                &String::from_utf8_lossy(&text),
+                why,
+            ))));
         }
     }
     let Some(build_digest) = only_entry(&store.join("builds"))? else {
@@ -1516,16 +1605,18 @@ fn toolchain(build: &Value) -> Result<&str, String> {
 /// Builds `tree`'s `zakura-sim` binary in `target` with `toolchain` and the
 /// catalogue's witness build flags: the dev profile without debug
 /// information or incremental compilation, and the simulator's flag. The
-/// binary's path, or why the build failed.
+/// binary's path, or why the build failed. Cargo writes its messages as
+/// JSON, which [`sim_build_failure`] reads.
 fn build_sim(
     tree: &Path,
     target: &Path,
     toolchain: &str,
     log: &Path,
-) -> Result<Result<PathBuf, String>, BoxError> {
+) -> Result<Result<PathBuf, BuildFailure>, BoxError> {
     let mut cargo = Command::new("rustup");
     cargo
         .args(["run", toolchain, "cargo", "build", "--locked"])
+        .arg("--message-format=json")
         .args(["-p", "zakura-sim", "--bin", "zakura-sim"])
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
         .env("CARGO_TARGET_DIR", target)
@@ -1540,8 +1631,97 @@ fn build_sim(
     );
     Ok(match run_pilot_child(&mut cargo, log, None)? {
         ChildEnd::Exited(0) => Ok(target.join("debug").join("zakura-sim")),
-        end => Err(format!("`cargo build` {end}; see {}", log.display())),
+        end => {
+            let why = format!("`cargo build` {end}; see {}", log.display());
+            let text = fs::read(log).unwrap_or_default();
+            Err(sim_build_failure(end, &String::from_utf8_lossy(&text), why))
+        }
     })
+}
+
+/// What a failed `cargo build --message-format=json` that ended `end` and
+/// wrote `log` shows, with `why` as its reason. It's a compile error only if
+/// cargo exited with a code, rather than a signal, and rustc reported an
+/// error at a source location in a path package. A full disk, a killed
+/// compiler or a failed link reports no source location.
+fn sim_build_failure(end: ChildEnd, log: &str, why: String) -> BuildFailure {
+    let located = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|message| {
+            message.get("reason").and_then(Value::as_str) == Some("compiler-message")
+                && message
+                    .get("package_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.contains("path+file://"))
+        })
+        .filter_map(|message| message.get("message").cloned())
+        .find(|message| {
+            message.get("level").and_then(Value::as_str) == Some("error")
+                && message
+                    .get("spans")
+                    .and_then(Value::as_array)
+                    .is_some_and(|spans| !spans.is_empty())
+        })
+        .map(|message| {
+            let text = message.get("message").and_then(Value::as_str);
+            let at = message
+                .pointer("/spans/0/file_name")
+                .and_then(Value::as_str);
+            let line = message
+                .pointer("/spans/0/line_start")
+                .and_then(Value::as_u64);
+            format!(
+                "{} at {}:{}",
+                text.unwrap_or("an error"),
+                at.unwrap_or("?"),
+                line.unwrap_or(0)
+            )
+        });
+    compile_error_or_broken(end, located, why)
+}
+
+/// What a failed `zakura-sim campaign build` that ended `end` and wrote
+/// `log` shows, with `why` as its reason. The pinned simulator runs `cargo
+/// fuzz build`, which writes no JSON messages, so the signal is rustc's
+/// rendered diagnostic: an `error` line whose next line gives its `-->`
+/// source location. A full disk, a killed compiler, a failed link or an
+/// internal compiler error renders none.
+fn fuzz_build_failure(end: ChildEnd, log: &str, why: String) -> BuildFailure {
+    let lines: Vec<&str> = log.lines().collect();
+    let located = lines.windows(2).find_map(|pair| {
+        let at = pair[1].trim_start().strip_prefix("--> ")?;
+        is_rustc_error(pair[0]).then(|| format!("{} at {at}", pair[0].trim_end()))
+    });
+    compile_error_or_broken(end, located, why)
+}
+
+/// True if `line` heads a rustc error, such as `error[E0308]: mismatched
+/// types` or `error: cannot find value`, but not an internal compiler
+/// error.
+fn is_rustc_error(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("error") else {
+        return false;
+    };
+    let rest = match rest.strip_prefix("[E") {
+        Some(code) => match code.split_once(']') {
+            Some((digits, rest)) if digits.bytes().all(|b| b.is_ascii_digit()) => rest,
+            _ => return false,
+        },
+        None => rest,
+    };
+    rest.starts_with(": ") && !rest.starts_with(": internal compiler error")
+}
+
+/// A rejected build if the build exited with a nonzero code and the
+/// compiler `located` an error, otherwise a broken one.
+fn compile_error_or_broken(end: ChildEnd, located: Option<String>, why: String) -> BuildFailure {
+    match (end, located) {
+        (ChildEnd::Exited(code), Some(error)) if code != 0 => {
+            BuildFailure::Rejected(format!("{error}; {why}"))
+        }
+        _ => BuildFailure::Broken(why),
+    }
 }
 
 /// Runs `command` with [`run_child`] and the flag that the pilot's signal

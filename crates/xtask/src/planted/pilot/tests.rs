@@ -74,6 +74,7 @@ fn recorded(run: Run, trace: Option<TraceFacts>) -> Recorded {
 fn sensitivity_run(mutant: Run, confirmation: Option<Result<(), String>>) -> SensitivityRun {
     SensitivityRun {
         equivalent: None,
+        broken_build: None,
         baseline: Some(Ok(recorded(run(None, &[(ID, HELD)]), Some(trace(Some(4)))))),
         patch: Some(Ok(())),
         mutant: Some(Ok(recorded(mutant, Some(trace(None))))),
@@ -286,6 +287,7 @@ fn found(property: &str) -> CampaignFacts {
 fn discovery_run(mutant: CampaignFacts, confirmation: Option<Result<(), String>>) -> DiscoveryRun {
     DiscoveryRun {
         equivalent: None,
+        broken_build: None,
         baseline: Some(Ok(campaign())),
         patch: Some(Ok(())),
         mutant: Some(Ok(mutant)),
@@ -1069,7 +1071,7 @@ fn a_timeout_beside_a_finding_is_a_harness_failure() {
     });
     let facts = campaign_facts(ID, Some(&end), &evidence, 0);
     assert_eq!(facts.violated, [ID]);
-    assert_eq!(facts.failures, [timeout.clone()]);
+    assert_eq!(facts.failures, std::slice::from_ref(&timeout));
     let result = classify::discovery(ID, &discovery_run(facts, Some(Ok(()))));
     assert_eq!(result.class, Class::HarnessFailure, "{}", result.reason);
     assert!(result.reason.contains(&timeout), "{}", result.reason);
@@ -1169,5 +1171,256 @@ fn a_witness_run_that_times_out_or_is_killed_is_not_scored() {
         let result = classify::sensitivity(property, &mutant);
         assert_eq!(result.class, Class::HarnessFailure, "{name}");
         assert!(result.reason.contains(ended), "{name}: {}", result.reason);
+    }
+}
+
+/// A cargo JSON message from package `package` at `level`, with a source
+/// span if `located`.
+fn cargo_message(package: &str, level: &str, text: &str, located: bool) -> String {
+    let spans = if located {
+        serde_json::json!([{"file_name": "crates/zakura-network/src/a.rs", "line_start": 12}])
+    } else {
+        serde_json::json!([])
+    };
+    serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": package,
+        "message": {"level": level, "message": text, "spans": spans, "rendered": text},
+    })
+    .to_string()
+}
+
+/// Only a build that exits with a code after rustc reports an error at a
+/// source location is rejected. A killed compiler, a full disk, a failed
+/// link or an internal compiler error is a broken build.
+#[test]
+fn only_a_located_compile_error_rejects_a_build() {
+    const WORKSPACE: &str = "path+file:///w/crates/zakura-network#13.0.0";
+    const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0";
+    let rejected = |failure: BuildFailure| matches!(failure, BuildFailure::Rejected(_));
+    let sim = |end: ChildEnd, log: &[String]| {
+        rejected(sim_build_failure(end, &log.join("\n"), "why".to_owned()))
+    };
+    let mismatched = cargo_message(WORKSPACE, "error", "mismatched types", true);
+    let progress = "   Compiling zakura-network v13.0.0 (/w/crates/zakura-network)".to_owned();
+    assert!(sim(
+        ChildEnd::Exited(101),
+        &[progress.clone(), mismatched.clone()]
+    ));
+    let BuildFailure::Rejected(why) =
+        sim_build_failure(ChildEnd::Exited(101), &mismatched, "see log".to_owned())
+    else {
+        panic!("a located error rejects the build");
+    };
+    assert!(
+        why.contains("mismatched types at crates/zakura-network/src/a.rs:12"),
+        "{why}"
+    );
+    for (end, log) in [
+        // The compiler was killed for memory after an error.
+        (ChildEnd::Signaled(9), vec![mismatched.clone()]),
+        (ChildEnd::TimedOut, vec![mismatched.clone()]),
+        // A full disk and a failed link have no source location.
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(
+                WORKSPACE,
+                "error",
+                "failed to write: No space left on device (os error 28)",
+                false,
+            )],
+        ),
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(
+                WORKSPACE,
+                "error",
+                "linking with `cc` failed",
+                false,
+            )],
+        ),
+        // Cargo reports a compiler that a signal killed only in its text.
+        (
+            ChildEnd::Exited(101),
+            vec![
+                progress.clone(),
+                "error: could not compile `zakura-network` (lib)".to_owned(),
+                "process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)".to_owned(),
+            ],
+        ),
+        // A warning, an internal compiler error and a dependency's error.
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(WORKSPACE, "warning", "unused", true)],
+        ),
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(
+                WORKSPACE,
+                "error: internal compiler error",
+                "unexpected panic",
+                true,
+            )],
+        ),
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(REGISTRY, "error", "mismatched types", true)],
+        ),
+    ] {
+        assert!(!sim(end, &log), "{end}: {log:?}");
+    }
+
+    let fuzz = |end: ChildEnd, log: &str| rejected(fuzz_build_failure(end, log, "why".to_owned()));
+    let located = "   Compiling zakura-network v13.0.0\n\
+                   error[E0425]: cannot find value `x` in this scope\n  \
+                   --> /w/crates/zakura-network/src/a.rs:12:5\n   |\n\
+                   error: could not compile `zakura-network` (lib) due to 1 previous error\n\
+                   Error: cargo fuzz build of block_reactor_policy failed with exit status: 1\n";
+    assert!(fuzz(ChildEnd::Exited(1), located));
+    assert!(fuzz(
+        ChildEnd::Exited(1),
+        "error: unused variable: `y`\n --> crates/a.rs:3:9\n"
+    ));
+    for (end, log) in [
+        (ChildEnd::Signaled(9), located),
+        (
+            ChildEnd::Exited(1),
+            "error: could not compile `zakura-network` (lib)\n\nCaused by:\n  \
+             process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)\n",
+        ),
+        (
+            ChildEnd::Exited(1),
+            "error: failed to write /w/target/a.rlib: No space left on device (os error 28)\n\n\
+             error: could not compile `zakura-network` (lib) due to 1 previous error\n",
+        ),
+        (
+            ChildEnd::Exited(1),
+            "error: linking with `cc` failed: exit status: 1\n  |\n  = note: ld: out of memory\n",
+        ),
+        (
+            ChildEnd::Exited(101),
+            "error: internal compiler error: unexpected panic\n --> crates/a.rs:3:9\n",
+        ),
+        (
+            ChildEnd::Exited(1),
+            "warning: unused import\n --> crates/a.rs:1:5\n",
+        ),
+    ] {
+        assert!(!fuzz(end, log), "{end}: {log}");
+    }
+}
+
+/// A broken build is a harness failure, not an invalid mutant or a
+/// baseline failure, whichever build broke. A mutant fuzz target that
+/// doesn't compile makes every later seed invalid, and one whose build
+/// broke fails only its own seed.
+#[test]
+fn a_broken_build_is_a_harness_failure() {
+    let broke = "the mutant build broke: `cargo build` died from signal 9".to_owned();
+    let mut sensitivity = SensitivityRun {
+        broken_build: Some(broke.clone()),
+        ..SensitivityRun::default()
+    };
+    let result = classify::sensitivity(ID, &sensitivity);
+    assert_eq!(result.class, Class::HarnessFailure);
+    assert_eq!(result.reason, broke);
+    // A mutant build that broke after a passing baseline.
+    sensitivity = SensitivityRun {
+        broken_build: Some(broke.clone()),
+        patch: None,
+        mutant: None,
+        confirmation: None,
+        ..sensitivity_run(run(None, &[(ID, HELD)]), None)
+    };
+    assert_eq!(class(&sensitivity), Class::HarnessFailure);
+
+    let mut discovery = discovery_run(campaign(), None);
+    discovery.patch = None;
+    discovery.mutant = None;
+    discovery.broken_build = Some(broke.clone());
+    assert_eq!(discovered(&discovery), Class::HarnessFailure);
+    // An original whose build broke.
+    discovery = DiscoveryRun {
+        broken_build: Some(broke),
+        ..DiscoveryRun::default()
+    };
+    assert_eq!(discovered(&discovery), Class::HarnessFailure);
+
+    let sim = PathBuf::from("zakura-sim");
+    let mut mutant = Ok(sim.clone());
+    let mut first = discovery_run(campaign(), None);
+    first.mutant = None;
+    fuzz_build_failed(
+        &mut first,
+        &mut mutant,
+        BuildFailure::Broken("the mutant fuzz target's build broke".to_owned()),
+    );
+    assert_eq!(discovered(&first), Class::HarnessFailure);
+    assert_eq!(mutant, Ok(sim), "a broken build fails only its seed");
+    fuzz_build_failed(
+        &mut first,
+        &mut mutant,
+        BuildFailure::Rejected("the mutant fuzz target doesn't compile".to_owned()),
+    );
+    assert!(
+        matches!(mutant, Err(BuildFailure::Rejected(_))),
+        "a compile error holds for every later seed"
+    );
+}
+
+/// `campaign_lane` reads a failed `zakura-sim campaign build`: a located
+/// rustc error rejects the build, and a build that a signal killed, or
+/// that reports no location, broke.
+#[cfg(unix)]
+#[test]
+fn a_campaign_build_is_rejected_only_for_a_compile_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let located = "printf '%s\\n' 'error[E0425]: cannot find value `x`' \
+                   '  --> crates/a.rs:12:5' >&2";
+    let full = "echo 'error: failed to write: No space left on device (os error 28)' >&2";
+    for (name, body, compile_error) in [
+        ("located", format!("{located}\nexit 1"), true),
+        ("killed", format!("{located}\nkill -KILL $$"), false),
+        ("full", format!("{full}\nexit 1"), false),
+    ] {
+        // A stand-in for `zakura-sim` whose `campaign build` runs `body`.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!("#!/bin/sh\n[ \"$1 $2\" = 'campaign build' ] || exit 0\n{body}\n"),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lane = campaign_lane(
+            &sim,
+            &dir.path().join(format!("{name}-lane")),
+            &dir.path().join("fuzz-target"),
+            case,
+            11,
+            &catalogue,
+            dir.path(),
+            true,
+        )
+        .expect("the lane's build failure doesn't stop the experiment");
+        match lane {
+            Err(LaneError::Build(BuildFailure::Rejected(why))) => {
+                assert!(compile_error, "{name}: rejected: {why}");
+                assert!(why.contains("crates/a.rs:12:5"), "{name}: {why}");
+            }
+            Err(LaneError::Build(BuildFailure::Broken(why))) => {
+                assert!(!compile_error, "{name}: broken: {why}");
+            }
+            lane => panic!("{name}: {lane:?}"),
+        }
     }
 }

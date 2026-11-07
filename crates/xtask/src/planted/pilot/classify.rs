@@ -128,10 +128,14 @@ pub(super) struct SensitivityRun {
     /// The review's argument that the mutation can't change behavior, from
     /// the catalogue.
     pub(super) equivalent: Option<String>,
+    /// Why the original or mutant build broke without a compile error, such
+    /// as a compiler killed for memory or a full disk.
+    pub(super) broken_build: Option<String>,
     /// The original build's witness run, or why it couldn't run.
     pub(super) baseline: Option<Result<Recorded, String>>,
     /// Whether the patch applied, changed only its declared files, and
-    /// compiled.
+    /// compiled. A build that broke without a compile error leaves it
+    /// `None`.
     pub(super) patch: Option<Result<(), String>>,
     /// The mutant's witness run, or why it couldn't run.
     pub(super) mutant: Option<Result<Recorded, String>>,
@@ -185,6 +189,9 @@ pub(super) fn sensitivity(property: &str, run: &SensitivityRun) -> Classified {
     let harness = |why: String| result(Class::HarnessFailure, why);
     if let Some(argument) = &run.equivalent {
         return result(Class::Equivalent, argument.clone());
+    }
+    if let Some(why) = &run.broken_build {
+        return harness(why.clone());
     }
     if let Some(failed) = sensitivity_baseline(property, &run.baseline) {
         return failed;
@@ -279,10 +286,14 @@ pub(super) struct CampaignFacts {
 pub(super) struct DiscoveryRun {
     /// The review's argument that the mutation can't change behavior.
     pub(super) equivalent: Option<String>,
+    /// Why one of this seed's original or mutant builds broke without a
+    /// compile error, such as a compiler killed for memory or a full disk.
+    pub(super) broken_build: Option<String>,
     /// The original build's campaign, or why it couldn't run.
     pub(super) baseline: Option<Result<CampaignFacts, String>>,
     /// Whether the patch applied, changed only its declared files, and
-    /// compiled.
+    /// compiled. A build that broke without a compile error leaves it
+    /// `None`.
     pub(super) patch: Option<Result<(), String>>,
     /// The mutant's campaign, or why it couldn't run.
     pub(super) mutant: Option<Result<CampaignFacts, String>>,
@@ -300,6 +311,9 @@ pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
     let harness = |why: String| result(Class::HarnessFailure, why);
     if let Some(argument) = &run.equivalent {
         return result(Class::Equivalent, argument.clone());
+    }
+    if let Some(why) = &run.broken_build {
+        return harness(why.clone());
     }
     if let Some(failed) = discovery_baseline(&run.baseline) {
         return failed;

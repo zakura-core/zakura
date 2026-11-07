@@ -29,7 +29,7 @@ use super::{
     header_node::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
-        claim::{ClaimEvidence, RoundEvidence},
+        claim::{ClaimEvidence, SettlementEvidence},
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
@@ -541,7 +541,7 @@ pub struct Ports {
     pub capacity: CapacityEvidence,
     /// The node's released rounds at each drain, which its tap keeps during
     /// the run.
-    pub rounds: RoundEvidence,
+    pub rounds: SettlementEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -556,7 +556,7 @@ pub struct Storage {
     /// The claim rules the node's tap found broken.
     claims: ClaimEvidence,
     /// The node's released rounds, from its tap.
-    rounds: RoundEvidence,
+    rounds: SettlementEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -590,7 +590,7 @@ pub struct StorageView {
     /// each.
     pub claims: ClaimEvidence,
     /// The node's released rounds at each drain.
-    pub rounds: RoundEvidence,
+    pub rounds: SettlementEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -612,7 +612,7 @@ impl TeardownView for StorageView {
     }
 
     /// [`StorageView::rounds`].
-    fn rounds(&self) -> &RoundEvidence {
+    fn rounds(&self) -> &SettlementEvidence {
         &self.rounds
     }
 }
@@ -744,7 +744,7 @@ impl Subsystem for Storage {
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
-            rounds: RoundEvidence::default(),
+            rounds: SettlementEvidence::default(),
         }
     }
 
@@ -940,7 +940,7 @@ pub struct WirePorts {
     pub capacity: CapacityEvidence,
     /// The node's released rounds at each drain, which its tap keeps during
     /// the run.
-    pub rounds: RoundEvidence,
+    pub rounds: SettlementEvidence,
 }
 
 impl WirePorts {
@@ -974,7 +974,7 @@ pub struct HeaderWire {
     /// The claim rules the node's tap found broken.
     claims: ClaimEvidence,
     /// The node's released rounds, from its tap.
-    rounds: RoundEvidence,
+    rounds: SettlementEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -1095,7 +1095,7 @@ impl Subsystem for HeaderWire {
             records: PeerRecords::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
-            rounds: RoundEvidence::default(),
+            rounds: SettlementEvidence::default(),
         }
     }
 

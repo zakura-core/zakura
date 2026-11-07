@@ -20,7 +20,9 @@
 //! - `TeardownReserved`, `TeardownOwned` and `TeardownLocatorPermits`: once
 //!   a reactor the harness stopped is gone, nothing stays reserved or owned,
 //!   and every locator permit is free except one for each locator read
-//!   storage still holds pending. The probe holds the locator semaphore, so
+//!   storage still holds pending. They're claim rules too, checked on every
+//!   read after the reactor is gone against what storage holds then, and
+//!   each reported once. The probe holds the locator semaphore, so
 //!   a permit forgotten without returning still counts.
 //!
 //! These read counters that no owner event reports, so they catch a stray
@@ -196,33 +198,34 @@ pub(super) fn check(
             ),
         ));
     }
-    check_accounting(probe, read, expected).map_err(Broken::Integrity)
+    check_accounting(probe, read, expected)
 }
 
-/// The integrity part of [`check`]: the read against the queue's accounting
-/// or the teardown baseline.
+/// The rest of [`check`]: the read against the queue's accounting, which
+/// integrity rules check, or the teardown baseline, which claim rules
+/// check.
 fn check_accounting(
     probe: &HeaderResourceProbe,
     read: HeaderResources,
     expected: Expected,
-) -> Result<(), String> {
+) -> Result<(), Broken> {
     match expected {
         Expected::Live { accounted: None } => Ok(()),
         Expected::Live {
             accounted: Some((reserved, owned)),
         } => {
             if read.reserved != reserved {
-                Err(format!(
+                Err(Broken::Integrity(format!(
                     "ReservedMismatch: at a quiet boundary the header budget holds {} \
                      reserved, and the queue's accounting {reserved}",
                     read.reserved
-                ))
+                )))
             } else if read.owned != owned {
-                Err(format!(
+                Err(Broken::Integrity(format!(
                     "OwnedMismatch: at a quiet boundary the header budget holds {} owned, \
                      and the queue's accounting {owned}",
                     read.owned
-                ))
+                )))
             } else {
                 Ok(())
             }
@@ -230,22 +233,31 @@ fn check_accounting(
         Expected::Teardown { storage_permits } => {
             let free = probe.locator_capacity().saturating_sub(storage_permits);
             if read.reserved != 0 {
-                Err(format!(
-                    "TeardownReserved: the stopped reactor is gone with {} headers still \
-                     reserved",
-                    read.reserved
+                Err(Broken::Claim(
+                    Claim::TeardownReserved,
+                    format!(
+                        "TeardownReserved: the stopped reactor is gone with {} headers still \
+                         reserved",
+                        read.reserved
+                    ),
                 ))
             } else if read.owned != 0 {
-                Err(format!(
-                    "TeardownOwned: the stopped reactor is gone with {} headers still owned",
-                    read.owned
+                Err(Broken::Claim(
+                    Claim::TeardownOwned,
+                    format!(
+                        "TeardownOwned: the stopped reactor is gone with {} headers still owned",
+                        read.owned
+                    ),
                 ))
             } else if read.locator_permits != free {
-                Err(format!(
-                    "TeardownLocatorPermits: the stopped reactor is gone with {} of {} \
-                     locator permits free, and storage holds {storage_permits}",
-                    read.locator_permits,
-                    probe.locator_capacity()
+                Err(Broken::Claim(
+                    Claim::TeardownLocatorPermits,
+                    format!(
+                        "TeardownLocatorPermits: the stopped reactor is gone with {} of {} \
+                         locator permits free, and storage holds {storage_permits}",
+                        read.locator_permits,
+                        probe.locator_capacity()
+                    ),
                 ))
             } else {
                 Ok(())

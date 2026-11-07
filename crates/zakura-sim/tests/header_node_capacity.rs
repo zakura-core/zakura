@@ -22,7 +22,7 @@ use zakura_sim::{
         self,
         header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
-            claim::RoundEvidence,
+            claim::SettlementEvidence,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             reservation::ReservationEvidence,
             session::SessionEvidence,
@@ -250,7 +250,7 @@ const CHILD: &str = "ZAKURA_SIM_CAPACITY_TRACE";
 thread_local! {
     /// The probe readings and released rounds of the run [`capture_run`]
     /// last prepared.
-    static CAPTURED: RefCell<Option<(CapacityEvidence, RoundEvidence)>> =
+    static CAPTURED: RefCell<Option<(CapacityEvidence, SettlementEvidence)>> =
         const { RefCell::new(None) };
 }
 
@@ -350,7 +350,7 @@ fn probe_failure(
         SessionEvidence::default(),
         ReservationEvidence::default(),
         CapacityEvidence::default(),
-        RoundEvidence::default(),
+        SettlementEvidence::default(),
     );
     sim.add_source(Box::new(tap));
     let nodes = spawn(&mut sim, &fixture, &observer);

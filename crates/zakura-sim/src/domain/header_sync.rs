@@ -509,8 +509,8 @@ where
 }
 
 /// The watch property for the flooded `queue`'s violation at the run's end:
-/// a publication still unread ([`WatchRead::Open`]) when the run settled
-/// ([`AdoptionEvidence::run_settled`]), unless the harness had started to
+/// a publication still unread when the run settled
+/// ([`AdoptionEvidence::unread_at_settled_end`]), unless the harness had started to
 /// stop the node (`stopping`). A correct loop with an unread publication
 /// always has its watch arm ready, so it can't settle with one. Only a
 /// shutdown, which wins the loop's biased `select!`, may leave one unread
@@ -522,8 +522,7 @@ pub fn watch_end_violations(
     queue: EventQueue,
     stopping: bool,
 ) -> Vec<EndViolation> {
-    let open = adoption.watch_read(queue) == WatchRead::Open;
-    if !open || stopping || adoption.run_settled() != Some(true) {
+    if stopping || !adoption.unread_at_settled_end(queue) {
         return Vec::new();
     }
     let property = match queue {
@@ -545,15 +544,21 @@ pub fn watch_end_violations(
 
 /// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state
 /// whose wire queue competed with its watch read
-/// ([`AdoptionEvidence::published_into_flood`]).
+/// ([`AdoptionEvidence::published_into_flood`]), or that the run settled
+/// with unread ([`AdoptionEvidence::unread_at_settled_end`]).
 fn published_under_wire_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
-    view.adoption().published_into_flood(EventQueue::Wire)
+    let adoption = view.adoption();
+    adoption.published_into_flood(EventQueue::Wire)
+        || adoption.unread_at_settled_end(EventQueue::Wire)
 }
 
 /// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
-/// state whose lifecycle queue competed with its watch read.
+/// state whose lifecycle queue competed with its watch read, or that the
+/// run settled with unread.
 fn published_under_lifecycle_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
-    view.adoption().published_into_flood(EventQueue::Lifecycle)
+    let adoption = view.adoption();
+    adoption.published_into_flood(EventQueue::Lifecycle)
+        || adoption.unread_at_settled_end(EventQueue::Lifecycle)
 }
 
 /// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended

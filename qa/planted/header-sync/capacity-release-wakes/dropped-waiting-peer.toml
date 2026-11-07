@@ -1,9 +1,9 @@
 # The cached pass drops each waiting peer's session instead of offering its
 # target. The input's release opens the waiting mirror's wake, and the next
 # cached pass ends its session from the reactor's side, so its locator never
-# reaches storage. The harness neither closed nor relinked that mirror, so
-# the end is the node's and answers nothing, and the wake expires at the
-# next quiescence.
+# reaches storage. The harness neither closed nor relinked the waiting
+# session after the wake opened, so the end is the node's and answers
+# nothing, and the wake expires at the next quiescence.
 input = "crates/zakura-sim/tests/fixtures/header-release-wake.bin"
 # Besides reactor.rs, which the patch changes, the queue and the offer
 # policy decide when the offer waits for room and which pass takes it back.

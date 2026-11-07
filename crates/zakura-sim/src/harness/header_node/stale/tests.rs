@@ -4,12 +4,14 @@ use std::num::NonZeroU64;
 
 use zakura_chain::block;
 use zakura_header_chain::{
-    BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner, HeaderWorkAuthority, SourceId,
+    BodyWorkAuthority, BodyWorkEpoch, BranchId, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
+    HeaderWorkAuthority, SourceId, VerifiedGeneration,
 };
 use zakura_network::zakura::observe::{
     CreditKind, HeaderRequestTerminal, HeaderTargetPhase, RequestRef, ReservationPurpose,
     StorageCallKind,
 };
+use zakura_network::zakura::HeaderTargetPurpose;
 
 use super::*;
 
@@ -43,16 +45,37 @@ fn round(session_id: u64, incarnation: u64) -> RequestRef {
     }
 }
 
+/// A body repair of session `session_id`.
+fn repair_owner(session_id: u64) -> HeaderSyncWorkOwner {
+    let hash = block::Hash([1; 32]);
+    HeaderSyncWorkOwner::BodyRepair(
+        BodyWorkAuthority {
+            header: HeaderWorkAuthority {
+                header_generation: HeaderGeneration::new(1),
+                branch: BranchId::new(hash, hash),
+            },
+            verified_generation: VerifiedGeneration::new(1),
+            body_work_epoch: BodyWorkEpoch::default(),
+        }
+        .bind(session_id, NonZeroU64::MIN),
+    )
+}
+
 /// Session `session_id`'s prepare as call `call`, holding round
 /// `incarnation`'s headers.
 fn prepare(call: u64, session_id: u64, incarnation: u64) -> [ReactorEvent; 2] {
+    prepare_for(call, owner(session_id), incarnation)
+}
+
+/// `owner`'s prepare as call `call`, holding round `incarnation`'s headers.
+fn prepare_for(call: u64, owner: HeaderSyncWorkOwner, incarnation: u64) -> [ReactorEvent; 2] {
     [
         ReactorEvent::Dispatched {
             call,
             op: PortCall::Prepare {
                 peer: mirror(),
                 source: SourceId::from_digest([2; 32]),
-                owner: owner(session_id),
+                owner,
                 target: Frontier {
                     height: block::Height(1),
                     hash: block::Hash([1; 32]),
@@ -277,22 +300,12 @@ fn a_return_joins_its_round_through_its_reservation() {
 }
 
 /// A session's end or replacement before the call's end makes it stale,
-/// unless its round is a repair, which only its retirement makes stale.
+/// unless its owner is a body repair's, which only its round's retirement
+/// makes stale.
 #[test]
 fn a_departed_session_makes_its_call_stale_unless_the_round_is_a_repair() {
-    let repair = HeaderTargetPurpose::SelectedAuxiliaryRepair {
-        selected_target: Frontier {
-            height: block::Height(1),
-            hash: block::Hash([1; 32]),
-        },
-        repair_generation: 1,
-    };
-    let mut events = vec![ReactorEvent::Started {
-        request: round(1, 2),
-        purpose: repair,
-    }];
-    events.extend(prepare(1, 1, 1));
-    events.extend(prepare(2, 1, 2));
+    let mut events = prepare(1, 1, 1).to_vec();
+    events.extend(prepare_for(2, repair_owner(1), 2));
     events.extend(prepare(3, 4, 3));
     events.extend([
         ReactorEvent::SessionAdmitted {
@@ -310,7 +323,11 @@ fn a_departed_session_makes_its_call_stale_unless_the_round_is_a_repair() {
         ended(1),
         ended(2),
         ended(3),
+        // A repair's retirement still makes it stale.
+        retired(round(1, 4)),
     ]);
+    events.extend(prepare_for(4, repair_owner(1), 4));
+    events.push(ended(4));
     let (mut check, evidence) = fed(events);
     check.drain(1);
     let why: Vec<_> = evidence
@@ -322,7 +339,8 @@ fn a_departed_session_makes_its_call_stale_unless_the_round_is_a_repair() {
         why,
         [
             (1, Staleness::SessionReplaced),
-            (3, Staleness::SessionEnded)
+            (3, Staleness::SessionEnded),
+            (4, Staleness::RoundRetired),
         ]
     );
 }

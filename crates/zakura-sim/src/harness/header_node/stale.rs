@@ -5,9 +5,10 @@
 //! its last `CauseSet` named. A fact from another task belongs to none.
 //!
 //! A prepare or apply call is stale when its round retired, or its owner's
-//! session ended or was replaced, before its `CallEnded`. A round whose
-//! `Started` names a repair is stale only by its retirement, since the
-//! reactor keeps such a round when its peer departs. A call that ended
+//! session ended or was replaced, before its `CallEnded`. A call whose
+//! owner is a body repair's is stale only by its retirement, since the
+//! reactor keeps a repair round when its peer departs. The call's own
+//! `Dispatched` names that owner. A call that ended
 //! `Dropped` runs no handler, so it's never stale.
 //!
 //! A stale call's handler, the facts under its `Completion` cause, may only
@@ -25,9 +26,10 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
+use zakura_header_chain::HeaderSyncWorkOwner;
 use zakura_network::zakura::{
     observe::{BudgetOwner, CallEnd, PortCall, ReactorCause, ReactorEvent},
-    HeaderTargetPurpose, ZakuraPeerId,
+    ZakuraPeerId,
 };
 
 /// A round, by its peer and incarnation.
@@ -97,6 +99,8 @@ struct Call {
     peer: ZakuraPeerId,
     /// Its owner's session.
     session: u64,
+    /// Whether its owner is a body repair's.
+    repair: bool,
     /// The round whose headers it holds, once it holds them.
     round: Option<Round>,
     /// Why it's stale, once it ended stale.
@@ -110,7 +114,6 @@ pub(super) struct StaleCheck {
     cause: ReactorCause,
     calls: HashMap<u64, Call>,
     retired: HashSet<Round>,
-    repairs: HashSet<Round>,
     ended: HashMap<(ZakuraPeerId, u64), Staleness>,
     /// Each reservation's round, once a fact names it.
     bound: HashMap<u64, Round>,
@@ -125,7 +128,6 @@ impl StaleCheck {
             cause: ReactorCause::Idle,
             calls: HashMap::new(),
             retired: HashSet::new(),
-            repairs: HashSet::new(),
             ended: HashMap::new(),
             bound: HashMap::new(),
             breaks: Vec::new(),
@@ -252,6 +254,7 @@ impl StaleCheck {
                         apply,
                         peer: peer.clone(),
                         session: owner.session_id(),
+                        repair: matches!(owner, HeaderSyncWorkOwner::BodyRepair(_)),
                         round: None,
                         stale: None,
                     },
@@ -275,12 +278,6 @@ impl StaleCheck {
                     window.handled = true;
                 }
             }),
-            ReactorEvent::Started { request, purpose } => {
-                if matches!(purpose, HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }) {
-                    self.repairs
-                        .insert((request.peer.clone(), request.incarnation));
-                }
-            }
             ReactorEvent::Retired { request, .. } => {
                 self.retired
                     .insert((request.peer.clone(), request.incarnation));
@@ -327,7 +324,7 @@ impl StaleCheck {
         };
         ended.stale = if self.retired.contains(round) {
             Some(Staleness::RoundRetired)
-        } else if self.repairs.contains(round) {
+        } else if ended.repair {
             None
         } else {
             self.ended

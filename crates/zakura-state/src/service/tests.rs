@@ -4184,38 +4184,43 @@ async fn early_contextual_failures_defer_to_the_auth_data_commitment() {
     );
 }
 
-/// The commit check uses the authorizing-data root the verifier computed from the committed body,
-/// so a body its header does not commit to is still rejected, and the committed body is accepted.
+/// State recomputes the submitted body's commitment even when preparation supplied a stale root.
 #[tokio::test(flavor = "multi_thread")]
-async fn commit_with_precomputed_auth_data_root_checks_the_committed_body() {
+async fn commit_recomputes_auth_data_root_after_coinbase_changes() {
     let _init_guard = zakura_test::init();
     let (mut state, network, genesis) = nu5_state_with_genesis().await;
     let matching = nu5_child_of_genesis(&network, &genesis, Vec::new());
     let mismatched = with_altered_auth_data(&matching);
-    assert_eq!(
-        mismatched.clone().prepare().auth_data_root,
-        Some(mismatched.auth_data_root()),
-        "the prepared block carries a root computed from its own body"
-    );
 
-    let error = commit_failing_semantic_block(&mut state, mismatched).await;
-    assert!(
-        matches!(
-            error,
-            ValidateContextError::InvalidBlockCommitment(
-                block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
-            )
-        ),
-        "{error:?}"
-    );
-
-    timeout(
+    let mut prepared = mismatched.clone().prepare();
+    prepared.auth_data_root = Some(matching.auth_data_root());
+    let error = timeout(
         Duration::from_secs(10),
-        (&mut state).oneshot(Request::CommitSemanticallyVerifiedBlock(matching.prepare())),
+        (&mut state).oneshot(Request::CommitSemanticallyVerifiedBlock(prepared)),
     )
     .await
     .expect("the commit completes")
-    .expect("the committed body commits");
+    .expect_err("the header does not commit to the changed coinbase");
+    let error = error
+        .downcast_ref::<crate::CommitSemanticallyVerifiedError>()
+        .expect("semantic commits return a semantic commit error");
+    assert!(
+        matches!(error.inner(), CommitBlockError::ValidateContextError(error)
+        if matches!(error.as_ref(), ValidateContextError::InvalidBlockCommitment(
+            block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+        ))),
+        "{error:?}"
+    );
+
+    let mut prepared = matching.prepare();
+    prepared.auth_data_root = Some(mismatched.auth_data_root());
+    timeout(
+        Duration::from_secs(10),
+        (&mut state).oneshot(Request::CommitSemanticallyVerifiedBlock(prepared)),
+    )
+    .await
+    .expect("the commit completes")
+    .expect("state accepts the matching body despite the stale root");
 }
 
 /// A v6 anchor is authorizing data, and state checks anchors before `hashBlockCommitments`. When

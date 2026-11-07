@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod prop;
+mod upload_progress;
 mod vectors;
 
 /// Test that dropping a peer sender does not require a Tokio timer context.

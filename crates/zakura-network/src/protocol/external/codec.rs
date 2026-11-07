@@ -40,7 +40,7 @@ use super::{
 mod tests;
 
 /// The length of a Bitcoin message header.
-const HEADER_LEN: usize = 24usize;
+pub(crate) const HEADER_LEN: usize = 24usize;
 
 /// Bloom filter commands accepted and discarded for peer compatibility.
 const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =

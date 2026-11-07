@@ -14,8 +14,8 @@
 //! the slots, bounds one broadcast's concurrent body writes, and overlapping broadcasts and
 //! sidecars add to that.
 //!
-//! Peers that announced the block to us are skipped: they have it, so they would never request
-//! it, and their window entries would be held until the request wait expired.
+//! Peers that announced the block to us are skipped unless they request its body or a broadcast
+//! is still tracking their upload. An announcement cannot replace that upload's outcome.
 //!
 //! A newer block does not stop an older block's broadcast. A peer that has not received the parent
 //! needs it to accept the child, and the newer block might be a side-chain or provisional block
@@ -159,6 +159,15 @@ impl UploadState {
 pub(crate) struct BlockUploads(Arc<Mutex<HashMap<block::Hash, Weak<watch::Sender<UploadState>>>>>);
 
 impl BlockUploads {
+    /// Whether a broadcast still owns this peer's upload outcome for `hash`.
+    fn is_tracked(&self, hash: block::Hash) -> bool {
+        self.0
+            .lock()
+            .expect("block upload mutex is never poisoned")
+            .get(&hash)
+            .is_some_and(|upload| upload.strong_count() > 0)
+    }
+
     fn register(&self, hash: block::Hash) -> (watch::Receiver<UploadState>, Option<UploadClaim>) {
         let mut uploads = self.0.lock().expect("block upload mutex is never poisoned");
         uploads.retain(|_, upload| upload.strong_count() > 0);
@@ -281,6 +290,11 @@ pub(crate) struct BlockGossipPeer {
 }
 
 impl BlockGossipPeer {
+    /// An announcement can suppress a new advert, but cannot replace an upload's outcome.
+    fn can_skip_advert(&self, hash: block::Hash) -> bool {
+        self.announced.announced(hash) && !self.uploads.is_tracked(hash)
+    }
+
     pub(crate) fn rtt(&self) -> Option<Duration> {
         self.registry.as_ref().and_then(PeerRegistryUpdater::rtt)
     }
@@ -304,9 +318,10 @@ impl BlockGossipPeer {
     ///
     /// Rechecks the peer's announcements before registering an upload: a peer that announced
     /// the block while this broadcast was fanning out still does not need it, and a skip taken
-    /// after the claim would make a joined duplicate announcement report failure.
+    /// after the claim would make a joined duplicate announcement report failure. An existing
+    /// upload must still be joined: an echoed inventory does not prove that upload succeeded.
     async fn advertise_outcome(self, hash: block::Hash, slots: BlockUploadSlots) -> AdvertOutcome {
-        if self.announced.announced(hash) {
+        if self.can_skip_advert(hash) {
             metrics::counter!("peer.block_gossip.advert_skipped", "when" => "fan_out").increment(1);
             return AdvertOutcome::Skipped;
         }
@@ -491,9 +506,9 @@ struct RevokedCandidates;
 
 /// Advertises `hash` to `peers`, paced through their block uploads.
 ///
-/// Peers that announced `hash` to us already have it, so they are skipped without taking a
-/// window entry. Configured sidecars are all advertised at once, first. Other peers are
-/// advertised to at most `window` at a time. Succeeds if at least one peer's advertisement
+/// Peers that announced `hash` to us are skipped without taking a window entry, unless a
+/// broadcast still tracks their upload. Configured sidecars are all advertised at once, first.
+/// Other peers are advertised to at most `window` at a time. Succeeds if at least one peer's advertisement
 /// succeeds or is skipped because that peer already announced the block.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
@@ -639,7 +654,8 @@ impl<C: ChainTip + Clone + Send + 'static> BlockAdvertiser<C> {
 }
 
 /// Selects peers that have not announced `hash`, orders them by measured RTT, and returns
-/// the number skipped. Configured sidecars come first.
+/// the number skipped. Peers with tracked uploads remain eligible so a duplicate broadcast
+/// observes their outcome. Configured sidecars come first.
 ///
 /// Low RTT is a heuristic for reaching peers sooner, whether the block was mined locally or
 /// relayed. Every [`ADVERT_RANDOM_INTERVAL`]th selected non-sidecar goes to a random remaining
@@ -654,7 +670,7 @@ fn select_peers(
 ) -> (Vec<BlockGossipPeer>, usize) {
     use rand_10::{seq::SliceRandom, RngExt};
     let skipped = peers
-        .extract_if(.., |peer| peer.announced.announced(hash))
+        .extract_if(.., |peer| peer.can_skip_advert(hash))
         .count();
     // Snapshot RTT once: heartbeat updates must not change comparisons during sorting.
     let mut peers: Vec<_> = peers
@@ -996,6 +1012,72 @@ mod tests {
         peer.uploads.disconnected();
         assert!(!first.await.unwrap());
         assert!(!duplicate.await.unwrap());
+        assert_eq!(slots.available_uploads(), 1);
+    }
+
+    /// An echoed inventory cannot replace the outcome of an unfinished early upload,
+    /// whether it arrives before selection or before the selected peer is polled.
+    #[tokio::test(start_paused = true)]
+    async fn committed_broadcast_observes_upload_despite_echoed_inventory() {
+        for announce_after_selection in [false, true] {
+            for delivered in [false, true] {
+                let hash = block::Hash([39; 32]);
+                let slots = BlockUploadSlots::new(1);
+                let (peer, mut receiver) = peer();
+                let mut early = broadcast_block(vec![peer.clone()], hash, 1, slots.clone());
+                assert!((&mut early).now_or_never().is_none());
+                accept(&mut receiver, hash).await;
+                assert!((&mut early).now_or_never().is_none());
+                peer.uploads.requested(hash);
+                if !announce_after_selection {
+                    peer.announced.record([hash]);
+                }
+                let mut committed = broadcast_block(vec![peer.clone()], hash, 1, slots.clone());
+                if announce_after_selection {
+                    peer.announced.record([hash]);
+                }
+                assert!(
+                    (&mut committed).now_or_never().is_none(),
+                    "the committed broadcast must await the early upload"
+                );
+                assert!(receiver.try_recv().is_err(), "joining writes no duplicate");
+                if delivered {
+                    peer.uploads.written(hash);
+                } else {
+                    drop(receiver);
+                    peer.uploads.disconnected();
+                }
+                let (early, committed) = tokio::join!(early, committed);
+                assert_eq!(early.is_ok(), delivered);
+                assert_eq!(committed.is_ok(), delivered);
+                assert_eq!(slots.available_uploads(), 1);
+            }
+        }
+    }
+
+    /// A joined upload that fails without disconnecting is retried even after an echo.
+    #[tokio::test(start_paused = true)]
+    async fn echoed_inventory_does_not_prevent_retry_of_unavailable_upload() {
+        let hash = block::Hash([40; 32]);
+        let slots = BlockUploadSlots::new(1);
+        let (peer, mut receiver) = peer();
+        let mut early = broadcast_block(vec![peer.clone()], hash, 1, slots.clone());
+        assert!((&mut early).now_or_never().is_none());
+        accept(&mut receiver, hash).await;
+        assert!((&mut early).now_or_never().is_none());
+        peer.uploads.requested(hash);
+        peer.announced.record([hash]);
+        let mut committed = broadcast_block(vec![peer.clone()], hash, 1, slots.clone());
+        assert!((&mut committed).now_or_never().is_none());
+        peer.uploads.unavailable(hash);
+        assert!(early.await.is_err());
+        assert!((&mut committed).now_or_never().is_none());
+        accept(&mut receiver, hash).await;
+        assert!((&mut committed).now_or_never().is_none());
+        peer.uploads.requested(hash);
+        peer.uploads.written(hash);
+        assert!(committed.await.is_ok());
+        assert!(receiver.try_recv().is_err());
         assert_eq!(slots.available_uploads(), 1);
     }
 

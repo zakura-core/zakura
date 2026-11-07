@@ -57,7 +57,7 @@ impl AnnouncedBlocks {
         }
     }
 
-    /// Forgets `hashes`, which the peer told us it does not have after all.
+    /// Forgets `hashes` when the peer requests them or tells us it does not have them.
     pub(crate) fn forget(&self, hashes: impl IntoIterator<Item = block::Hash>) {
         let mut announced = self
             .0

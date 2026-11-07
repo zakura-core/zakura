@@ -1191,3 +1191,42 @@ async fn inbound_invs_record_announced_blocks() {
     assert!(!announced.announced(blocks[0]));
     assert!(blocks[1..].iter().all(|block| announced.announced(*block)));
 }
+
+/// A body request contradicts only the requested blocks' earlier announcements.
+#[tokio::test]
+async fn body_requests_withdraw_only_requested_block_announcements() {
+    let blocks = [block::Hash([41; 32]), block::Hash([42; 32])];
+    let transaction = InventoryHash::Tx(zakura_chain::transaction::Hash([9; 32]));
+    for connected_addr in [
+        ConnectedAddr::new_inbound_direct(peer_addr(38233)),
+        ConnectedAddr::new_isolated(),
+    ] {
+        for items in [
+            vec![],
+            vec![transaction],
+            vec![InventoryHash::Block(blocks[0])],
+            vec![InventoryHash::Block(blocks[0]), transaction],
+            blocks.iter().copied().map(InventoryHash::Block).collect(),
+        ] {
+            let announced = AnnouncedBlocks::default();
+            announced.record(blocks);
+            let message = Message::GetData(items.clone());
+            let returned = register_inventory_status(
+                Ok(message.clone()),
+                connected_addr,
+                broadcast::channel(16).0,
+                announced.clone(),
+            )
+            .await
+            .expect("the filter passes the request through");
+            assert_eq!(returned, message);
+            for hash in blocks {
+                assert_eq!(
+                    announced.announced(hash),
+                    !items.contains(&InventoryHash::Block(hash)),
+                    "a body request withdraws only the requested block: {message:?}"
+                );
+            }
+        }
+    }
+}

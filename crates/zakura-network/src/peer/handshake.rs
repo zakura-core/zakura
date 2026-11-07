@@ -1961,7 +1961,8 @@ where
 ///
 /// Also records the blocks this peer announces in `announced_blocks`, so block gossip can skip
 /// a peer that already has the block. Unlike the inventory registry, this covers every block
-/// `inv`, solicited or not, and connections without a transient address.
+/// `inv`, solicited or not, and connections without a transient address. Requests for block
+/// bodies withdraw the peer's earlier claim to have those blocks.
 pub(crate) async fn register_inventory_status(
     msg: Result<Message, SerializationError>,
     connected_addr: ConnectedAddr,
@@ -1972,8 +1973,8 @@ pub(crate) async fn register_inventory_status(
         Ok(Message::Inv(items)) => {
             announced_blocks.record(items.iter().filter_map(InventoryHash::block_hash));
         }
-        // The peer claimed to have these blocks, but does not serve them.
-        Ok(Message::NotFound(items)) => {
+        // A request for the body or a missing response contradicts an earlier announcement.
+        Ok(Message::GetData(items) | Message::NotFound(items)) => {
             announced_blocks.forget(items.iter().filter_map(InventoryHash::block_hash));
         }
         _ => {}

@@ -8,7 +8,6 @@ use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
     task::JoinHandle,
-    time::Instant,
 };
 
 use super::{
@@ -41,9 +40,6 @@ use crate::zakura::{
 };
 #[cfg(any(test, zakura_sim))]
 use crate::zakura::{RegulationTap, SessionOrigin};
-
-/// Conservative re-offer delay when header sync publishes no peer backoff deadline.
-const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(test)]
 mod stream_tests {
@@ -641,15 +637,30 @@ impl Service for HeaderSyncService {
         let Some(node_id) = header_peer_node_id(peer) else {
             return SessionDemand::Retire;
         };
-        if self
-            .header_sync
-            .candidate_state()
+        let mut candidates = self.header_sync.subscribe_candidate_state();
+        if candidates
+            .borrow_and_update()
             .backed_off_node_ids
-            .contains(&node_id)
+            .binary_search(&node_id)
+            .is_ok()
         {
-            // The reactor publishes the backed-off set without per-node deadlines.
-            // The service re-offers each target after one conservative backoff window.
-            return SessionDemand::RetryAt(Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF);
+            // The reactor republishes the set when a cooldown ends, so re-check
+            // then rather than after a fixed delay from this check.
+            return SessionDemand::WaitForChange(Box::pin(async move {
+                loop {
+                    if candidates.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    if candidates
+                        .borrow_and_update()
+                        .backed_off_node_ids
+                        .binary_search(&node_id)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }));
         }
 
         SessionDemand::OpenNow

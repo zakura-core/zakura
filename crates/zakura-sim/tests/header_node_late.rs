@@ -1355,6 +1355,7 @@ fn stale_publisher_release_never_frees_a_replacement_lease() {
                     Trigger::Closed("mirror-0".to_owned()),
                 ),
             ],
+            weights: Default::default(),
         },
         budget: 4_000,
         workers: storage_config().scheduler.workers,
@@ -1469,6 +1470,7 @@ fn locator_permits_wait_for_accepted_work() {
                 ..Policy::converging()
             },
             controls: Vec::new(),
+            weights: Default::default(),
         },
         // Two 30 s waves of held locators.
         budget: 10_000,

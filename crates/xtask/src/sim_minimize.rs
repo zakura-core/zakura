@@ -82,8 +82,9 @@ const NON_UNWINDING: &str = "panic in a function that cannot unwind";
 /// How often the wrapper checks a child, the deadline and the interrupt.
 const POLL: Duration = Duration::from_millis(20);
 
-/// Set by SIGINT, SIGTERM or SIGHUP.
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+/// Set by SIGINT, SIGTERM or SIGHUP once [`install_interrupt_handler`]
+/// runs. `planted pilot` shares it.
+pub(super) static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// What the caller asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1662,7 +1663,9 @@ impl fmt::Display for ChildEnd {
 
 /// Runs `command` in a process group of its own, with stdin closed and its
 /// stdout and stderr in `log`. It's killed with its whole group when
-/// `deadline` passes or `interrupt` is set.
+/// `deadline` passes or `interrupt` is set. The group is also killed when
+/// the child exits, or when waiting for it fails, so no descendant outlives
+/// the call.
 pub(super) fn run_child(
     command: &mut Command,
     log: &Path,
@@ -1683,8 +1686,19 @@ pub(super) fn run_child(
         .map_err(|error| format!("starting {:?}: {error}", command.get_program()))?;
     let started = Instant::now();
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(exit(status));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The child is reaped, but its group lives on while any
+                // descendant does, so its ID still names only that group.
+                kill_group(&mut child);
+                return Ok(exit(status));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                kill_group(&mut child);
+                let _ = child.wait();
+                return Err(error.into());
+            }
         }
         let end = if interrupt.load(Ordering::SeqCst) {
             ChildEnd::Interrupted
@@ -1756,12 +1770,23 @@ fn signal(_: ExitStatus) -> i32 {
 /// process groups, so a terminal's Ctrl-C reaches only the wrapper, which
 /// then kills the running child and writes the report.
 #[cfg(unix)]
-fn install_interrupt_handler() {
+pub(super) fn install_interrupt_handler() {
+    catch_signals(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+}
+
+/// Sets [`INTERRUPTED`] on each of `signals` that the process doesn't
+/// ignore. A signal ignored at startup stays ignored, so a run under
+/// `nohup` outlives its terminal.
+#[cfg(unix)]
+fn catch_signals(signals: &[libc::c_int]) {
     extern "C" fn interrupted(_: libc::c_int) {
         INTERRUPTED.store(true, Ordering::SeqCst);
     }
     let handler = interrupted as extern "C" fn(libc::c_int);
-    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+    for &signal in signals {
+        if signal_handler(signal) == libc::SIG_IGN {
+            continue;
+        }
         // SAFETY: the handler only stores to an atomic, which is
         // async-signal-safe.
         unsafe {
@@ -1770,9 +1795,21 @@ fn install_interrupt_handler() {
     }
 }
 
+/// The current handler of `signal`, such as `SIG_IGN`.
+#[cfg(unix)]
+fn signal_handler(signal: libc::c_int) -> libc::sighandler_t {
+    // SAFETY: a null new action only reads the current one into `current`,
+    // which is a plain C struct that zeroes validly.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut current);
+        current.sa_sigaction
+    }
+}
+
 /// Outside Unix, an interrupt kills the wrapper as usual.
 #[cfg(not(unix))]
-fn install_interrupt_handler() {}
+pub(super) fn install_interrupt_handler() {}
 
 /// A log's text, lossily, at most its last 64 KiB.
 fn read_log(path: &Path) -> io::Result<String> {
@@ -1839,4 +1876,4 @@ fn millis<S: serde::Serializer>(duration: &Duration, serializer: S) -> Result<S:
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

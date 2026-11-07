@@ -12,7 +12,7 @@ use zakura_chain::{
 
 use super::{
     super::{Chain, RevertPosition, UpdateWith},
-    TransparentTransfers,
+    CreatedOutputs, CreatedUtxos, TransparentTransfers,
 };
 
 #[test]
@@ -77,8 +77,10 @@ fn receive_coinbase(
     transfers: &mut TransparentTransfers,
     height: u32,
 ) -> (transparent::OutPoint, transparent::OrderedUtxo) {
+    let mut hash = [0; 32];
+    hash[..4].copy_from_slice(&height.to_le_bytes());
     let outpoint = transparent::OutPoint {
-        hash: transaction::Hash([u8::try_from(height).expect("test heights fit in u8"); 32]),
+        hash: transaction::Hash(hash),
         index: 0,
     };
     let output = transparent::Output::new(
@@ -90,6 +92,15 @@ fn receive_coinbase(
         .update_chain_tip_with(&(&outpoint, &utxo))
         .expect("a new output is accepted");
     (outpoint, utxo)
+}
+
+fn height_outputs(transfers: &TransparentTransfers, height: u32) -> &Arc<CreatedOutputs> {
+    transfers
+        .created_utxos
+        .heights()
+        .find(|(existing, _)| existing.0 == height)
+        .unwrap()
+        .1
 }
 
 #[test]
@@ -105,8 +116,8 @@ fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
 
     for height in 1..=3 {
         assert!(Arc::ptr_eq(
-            &original.created_utxos[&Height(height)],
-            &appended.created_utxos[&Height(height)],
+            height_outputs(&original, height),
+            height_outputs(&appended, height),
         ));
     }
     assert_eq!(original.created_utxos().count(), 3);
@@ -123,7 +134,175 @@ fn appending_an_output_shares_earlier_heights_and_reverts_cleanly() {
     // Reverting the block removes its whole height and leaves no empty group behind.
     appended.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
     assert_eq!(appended, original);
-    assert!(!appended.created_utxos.contains_key(&Height(4)));
+    assert!(appended
+        .created_utxos
+        .heights()
+        .all(|(height, _)| *height != Height(4)));
+}
+
+#[test]
+fn retained_address_history_copies_only_changed_height_chunks() {
+    let mut original = TransparentTransfers::default();
+    let outputs: Vec<_> = (0..256)
+        .map(|height| receive_coinbase(&mut original, height))
+        .collect();
+    let mut candidate = original.clone();
+
+    // Cloning 256 heights copies eight chunk pointers, not 256 height entries.
+    let CreatedUtxos::Chunked(original_chunks) = &original.created_utxos else {
+        panic!("256 retained heights must span multiple chunks");
+    };
+    let CreatedUtxos::Chunked(candidate_chunks) = &candidate.created_utxos else {
+        panic!("the clone preserves the chunked representation");
+    };
+    assert_eq!(original_chunks.len(), 8);
+    for (id, chunk) in original_chunks {
+        assert!(Arc::ptr_eq(chunk, &candidate_chunks[id]));
+        assert!(chunk
+            .values()
+            .all(|outputs| Arc::strong_count(outputs) == 1));
+    }
+
+    // Append into a new chunk, then finalize one block from the oldest chunk.
+    let added = receive_coinbase(&mut candidate, 256);
+    candidate.revert_chain_with(&(&outputs[0].0, &outputs[0].1), RevertPosition::Root);
+    let CreatedUtxos::Chunked(candidate_chunks) = &candidate.created_utxos else {
+        panic!("appending a chunk preserves the chunked representation");
+    };
+    for (id, chunk) in original_chunks {
+        assert_eq!(Arc::ptr_eq(chunk, &candidate_chunks[id]), *id != 0);
+        if *id != 0 {
+            assert!(chunk
+                .values()
+                .all(|outputs| Arc::strong_count(outputs) == 1));
+        }
+    }
+    assert_eq!(original.created_utxos().count(), 256);
+    assert_eq!(candidate.created_utxos().count(), 256);
+    assert_eq!(
+        original.created_utxos().next().unwrap().0.height(),
+        Height(0)
+    );
+    assert_eq!(
+        candidate.created_utxos().next().unwrap().0.height(),
+        Height(1)
+    );
+
+    // Reorg across the new chunk boundary, and remove the rest of the oldest chunk.
+    candidate.revert_chain_with(&(&added.0, &added.1), RevertPosition::Tip);
+    assert!(candidate
+        .created_utxos
+        .heights()
+        .all(|(height, _)| height.0 < 256));
+    for (outpoint, utxo) in &outputs[1..32] {
+        candidate.revert_chain_with(&(outpoint, utxo), RevertPosition::Root);
+    }
+    assert!(candidate
+        .created_utxos
+        .heights()
+        .all(|(height, _)| height.0 >= 32));
+    assert_eq!(candidate.created_utxos().count(), 224);
+    assert_eq!(candidate.received(), 224_000);
+    assert_eq!(original.received(), 256_000);
+    assert_eq!(candidate.balance(), 224_000_i64);
+    assert_eq!(original.balance(), 256_000_i64);
+    let mut expected = TransparentTransfers::default();
+    for height in 32..256 {
+        receive_coinbase(&mut expected, height);
+    }
+    assert_eq!(candidate, expected);
+}
+
+#[test]
+fn short_histories_promote_and_collapse_without_changing_snapshots() {
+    // Exercise both tip rollback and removal of the oldest chunk, including sparse heights.
+    for (first, second, position) in [
+        (31, 32, RevertPosition::Tip),
+        (32, 31, RevertPosition::Root),
+        (32, 4096, RevertPosition::Tip),
+    ] {
+        let mut original = TransparentTransfers::default();
+        let first_output = receive_coinbase(&mut original, first);
+        assert!(matches!(original.created_utxos, CreatedUtxos::Single(_)));
+        let mut candidate = original.clone();
+        let added = receive_coinbase(&mut candidate, second);
+        assert!(matches!(candidate.created_utxos, CreatedUtxos::Chunked(_)));
+        assert!(Arc::ptr_eq(
+            height_outputs(&original, first),
+            height_outputs(&candidate, first)
+        ));
+
+        // Keep the promoted snapshot alive while removing a chunk from another snapshot.
+        let promoted = candidate.clone();
+        candidate.revert_chain_with(&(&added.0, &added.1), position);
+        assert_eq!(candidate, original);
+        assert!(matches!(candidate.created_utxos, CreatedUtxos::Single(_)));
+        assert_eq!(promoted.received(), 2_000);
+        assert!(Arc::ptr_eq(
+            height_outputs(&promoted, first),
+            height_outputs(&candidate, first)
+        ));
+
+        candidate.revert_chain_with(&(&first_output.0, &first_output.1), RevertPosition::Tip);
+        assert!(candidate.is_empty());
+        receive_coinbase(&mut candidate, second + 1);
+        assert!(matches!(candidate.created_utxos, CreatedUtxos::Single(_)));
+        assert_eq!(
+            candidate.created_utxos().next().unwrap().0.height(),
+            Height(second + 1)
+        );
+        assert_eq!(original.received(), 1_000);
+        assert_eq!(promoted.received(), 2_000);
+    }
+}
+
+#[test]
+fn changes_within_a_shared_height_preserve_snapshots_and_transaction_counts() {
+    let mut original = TransparentTransfers::default();
+    let (outpoint, utxo) = receive_coinbase(&mut original, 31);
+    let mut candidate = original.clone();
+    let second = transparent::OutPoint {
+        index: 1,
+        ..outpoint
+    };
+    candidate.update_chain_tip_with(&(&second, &utxo)).unwrap();
+    assert_eq!(original.received(), 1_000);
+    assert_eq!(candidate.received(), 2_000);
+    candidate.revert_chain_with(&(&second, &utxo), RevertPosition::Tip);
+    assert_eq!(candidate, original);
+    assert!(candidate.tx_ids.contains(&outpoint.hash));
+    candidate.revert_chain_with(&(&outpoint, &utxo), RevertPosition::Tip);
+    assert!(candidate.is_empty());
+    assert!(candidate.created_utxos.is_empty());
+    assert_eq!(original.received(), 1_000);
+}
+
+#[test]
+fn changing_outputs_in_a_shared_chunk_preserves_earlier_snapshots() {
+    let mut original = TransparentTransfers::default();
+    let (outpoint, utxo) = receive_coinbase(&mut original, 31);
+    receive_coinbase(&mut original, 32);
+    let mut candidate = original.clone();
+    let second = transparent::OutPoint {
+        index: 1,
+        ..outpoint
+    };
+    candidate.update_chain_tip_with(&(&second, &utxo)).unwrap();
+    assert_eq!(original.received(), 2_000);
+    assert_eq!(candidate.received(), 3_000);
+    assert!(!Arc::ptr_eq(
+        height_outputs(&original, 31),
+        height_outputs(&candidate, 31)
+    ));
+    assert!(Arc::ptr_eq(
+        height_outputs(&original, 32),
+        height_outputs(&candidate, 32)
+    ));
+    let appended = candidate.clone();
+    candidate.revert_chain_with(&(&second, &utxo), RevertPosition::Tip);
+    assert_eq!(candidate, original);
+    assert_eq!(appended.received(), 3_000);
+    assert!(candidate.tx_ids.contains(&outpoint.hash));
 }
 
 #[test]

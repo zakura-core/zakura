@@ -21,7 +21,10 @@ use std::{
 
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion};
-use zakura_network::zakura::{observe::ReactorEvent, Status, ZakuraPeerId};
+use zakura_network::zakura::{
+    observe::{ReactorCause, ReactorEvent},
+    Status, ZakuraPeerId,
+};
 
 use crate::{IdleStatus, Outcome, RunEnd};
 
@@ -117,6 +120,21 @@ pub enum AdoptionFact {
         /// The generation the read was made under.
         generation: HeaderGeneration,
     },
+    /// A `Commit` step put this state in the node's engine, outside header
+    /// sync. The harness records it, not the reactor, before any task runs
+    /// again, so it comes before every reactor fact that could read it.
+    Published {
+        /// The engine's state version after the commit.
+        state_version: StateVersion,
+        /// Its header generation.
+        header_generation: HeaderGeneration,
+    },
+    /// The reactor took a lifecycle or wire event: a `CauseSet` to
+    /// `Event`.
+    EventTaken,
+    /// The reactor reached its turn's cached pass: a `CauseSet` to `Pass`,
+    /// once per turn of its run loop.
+    Pass,
 }
 
 impl AdoptionFact {
@@ -173,6 +191,15 @@ impl AdoptionFact {
             },
             _ => return None,
         })
+    }
+
+    /// The fact a `CauseSet` to `cause` gives this store, if any.
+    pub(super) fn of_cause(cause: &ReactorCause) -> Option<Self> {
+        match cause {
+            ReactorCause::Event => Some(AdoptionFact::EventTaken),
+            ReactorCause::Pass => Some(AdoptionFact::Pass),
+            _ => None,
+        }
     }
 
     /// Whether only this store keeps the fact. `Started` and `Dispatched`
@@ -255,6 +282,21 @@ impl AdoptionEvidence {
         if !store.frozen {
             store.facts.push(Stamped { at, fact });
         }
+    }
+
+    /// Records that a `Commit` step left the node's engine at
+    /// `state_version` and `header_generation`, at the run's current time.
+    pub(super) fn publish(&self, state_version: StateVersion, header_generation: HeaderGeneration) {
+        let at = zakura_scheduler::hooks::now()
+            .map(|now| now.since_start())
+            .unwrap_or_default();
+        self.record(
+            at,
+            AdoptionFact::Published {
+                state_version,
+                header_generation,
+            },
+        );
     }
 
     /// Stops recording facts. The tap calls it when the run's log freezes,

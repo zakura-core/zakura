@@ -43,10 +43,15 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::block;
 use zakura_header_chain::{Frontier, VctRootRepairStatus};
 use zakura_network::zakura::{
-    framed_channel, observe::HeaderSyncObserver, spawn_header_sync_reactor, FullStateFrontiers,
-    HeaderSyncHandle, HeaderSyncService, HeaderSyncStartup, Peer, Service, ServicePeerDirection,
-    SessionOrigin, ZakuraHeaderSyncConfig, ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES,
-    ZAKURA_CAP_HEADER_SYNC, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    framed_channel,
+    observe::HeaderSyncObserver,
+    spawn_header_sync_reactor,
+    v9::{self, RegtestMessage},
+    wire_codec::decode_frame,
+    FramedRecv, FramedSend, FullStateFrontiers, HeaderSyncHandle, HeaderSyncService,
+    HeaderSyncStartup, Peer, Service, ServicePeerDirection, SessionOrigin, ZakuraHeaderSyncConfig,
+    ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
+    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
 use zakura_quic::NodeSecretKey;
@@ -60,7 +65,7 @@ use zakura_storage::header::{
 };
 
 use self::{
-    adoption::SessionLife,
+    adoption::{AdoptionEvidence, SessionLife},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
@@ -618,6 +623,84 @@ pub struct Topology {
     tap: Option<TapShutdown>,
     /// The node under test's session view, told of each link.
     sessions: Option<SessionEvidence>,
+    /// Set once a `Shutdown` step was picked, which stops any churn.
+    stopping: Cell<bool>,
+}
+
+/// The far end of a flooding link: the dialer's streams and its connection
+/// token, held by a harness task instead of a service.
+struct FarEnd {
+    from_node: FramedRecv,
+    to_node: FramedSend,
+    cancel: CancellationToken,
+}
+
+/// Floods the node under test over `far`. It waits for the node's first
+/// `Status` on the session, then sends that frame back as fast as the node
+/// takes it, reading whatever the node sends meanwhile, until the link
+/// closes or either stream ends. The node's receiver awaits room in its
+/// events queue for each `Status` it forwards, so the session stays open
+/// while the queue is full.
+async fn flood(far: FarEnd) {
+    let FarEnd {
+        mut from_node,
+        to_node,
+        cancel,
+    } = far;
+    let status = loop {
+        let frame = zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            frame = from_node.recv() => frame,
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        if matches!(
+            decode_frame::<RegtestMessage>(&frame),
+            Ok(v9::Message::Status(_))
+        ) {
+            break frame;
+        }
+    };
+    loop {
+        zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            frame = from_node.recv() => if frame.is_none() {
+                return;
+            },
+            sent = to_node.send(status.clone()) => if sent.is_err() {
+                return;
+            },
+        }
+    }
+}
+
+/// Relinks each mirror whose index `starts` delivers to the node under test
+/// as its dialer, all of them once per scheduling step, until the node's
+/// shutdown. Each relink replaces the mirror's session, so the node's
+/// lifecycle queue takes a disconnect and a connect for it every time.
+async fn churn(topology: Rc<Topology>, mut starts: mpsc::Receiver<usize>) {
+    let mut churning = Vec::new();
+    loop {
+        if churning.is_empty() {
+            match starts.recv().await {
+                Some(index) => churning.push(index),
+                None => return,
+            }
+        }
+        while let Ok(index) = starts.try_recv() {
+            churning.push(index);
+        }
+        if topology.stopping() {
+            return;
+        }
+        for &index in &churning {
+            topology.link(index, 0);
+        }
+        zakura_rt::task::yield_now().await;
+    }
 }
 
 impl Topology {
@@ -635,6 +718,7 @@ impl Topology {
             last_id: Cell::new(0),
             tap: None,
             sessions: None,
+            stopping: Cell::new(false),
         }
     }
 
@@ -667,6 +751,7 @@ impl Topology {
     /// a run that ends before the step takes effect fails as an unfinished
     /// stop.
     fn expect_shutdown(&self) {
+        self.stopping.set(true);
         if let Some(tap) = &self.tap {
             tap.begin();
         }
@@ -750,6 +835,13 @@ impl Topology {
     /// Each side's peer carries the link's counter as its origin's
     /// connection and generation. The session view hears of the link first.
     pub fn link(&self, dialer: usize, listener: usize) -> Link {
+        self.open(dialer, listener, false).0
+    }
+
+    /// [`Topology::link`], with the dialer's side handed back as its
+    /// streams, from the node and to it, instead of joining the dialer's
+    /// service, when `far_end` is set.
+    fn open(&self, dialer: usize, listener: usize, far_end: bool) -> (Link, Option<FarEnd>) {
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
@@ -810,7 +902,16 @@ impl Topology {
         for token in &tokens {
             ended(token);
         }
+        let mut far = None;
         for ((local, remote, direction, streams), token) in sides.into_iter().zip(&tokens) {
+            if far_end && local == dialer {
+                far = Some(FarEnd {
+                    from_node: streams.0,
+                    to_node: streams.1,
+                    cancel: token.clone(),
+                });
+                continue;
+            }
             let peer = Peer::new_versioned(
                 id,
                 self.nodes[remote].id.clone(),
@@ -841,7 +942,30 @@ impl Topology {
             sessions: self.sessions.clone(),
         };
         self.effects.links.borrow_mut().push(link.clone());
-        link
+        (link, far)
+    }
+
+    /// The index of the node named `peer`.
+    fn index(&self, peer: &str) -> usize {
+        self.nodes
+            .iter()
+            .position(|node| node.name == peer)
+            .unwrap_or_else(|| panic!("the scenario has a `{peer}`"))
+    }
+
+    /// Links the mirror named `peer` to the node under test again, as its
+    /// dialer, with a flooding task at the mirror's end in place of its
+    /// service ([`flood`]). The node replaces the mirror's earlier session.
+    fn flood(&self, peer: &str) {
+        let (_, far) = self.open(self.index(peer), 0, true);
+        let far = far.expect("an open with a far end hands it back");
+        zakura_rt::task::spawn_named("flood", flood(far));
+    }
+
+    /// Whether the node under test's shutdown has begun: a `Shutdown` step
+    /// was picked, or its reactor is cancelled.
+    fn stopping(&self) -> bool {
+        self.stopping.get() || self.nodes[0].shutdown.is_cancelled()
     }
 
     /// Each link's session and how long it lasted, in link order. A session
@@ -931,6 +1055,25 @@ pub enum ControlAction {
     /// so its `shut-down` fact is logged in the run. Offered only once a
     /// `Shutdown` step's stop is done.
     StopStorage,
+    /// Commit `len` fixture headers past the node under test's selected tip
+    /// straight into its engine, which the step must name, as a writer
+    /// other than header sync would. No reactor call takes part, so the
+    /// reactor hears of it only through its watches. The node's adoption
+    /// evidence records it as `Published` once the engine returns, before
+    /// any task runs again.
+    Commit {
+        /// The new headers.
+        len: u32,
+    },
+    /// Replace the named mirror's link to the node under test with a
+    /// flooding one. A harness task at the far end sends the node's own
+    /// first `Status` back to it as fast as the node's queue takes it, and
+    /// reads whatever the node sends.
+    Flood,
+    /// Start relinking the named mirror to the node under test, once per
+    /// scheduling step until the node's shutdown, so lifecycle events stay
+    /// queued.
+    Churn,
 }
 
 /// What a [`ControlAction::Reset`] does, judged at its pick, since only
@@ -962,6 +1105,9 @@ impl ControlAction {
             ControlAction::Reset(_) => "reset",
             ControlAction::Release { .. } => "release",
             ControlAction::StopStorage => "stop-storage",
+            ControlAction::Commit { .. } => "commit",
+            ControlAction::Flood => "flood",
+            ControlAction::Churn => "churn",
         }
     }
 
@@ -971,7 +1117,10 @@ impl ControlAction {
     fn run_only(self) -> bool {
         matches!(
             self,
-            ControlAction::Reset(_) | ControlAction::Release { .. } | ControlAction::StopStorage
+            ControlAction::Reset(_)
+                | ControlAction::Release { .. }
+                | ControlAction::StopStorage
+                | ControlAction::Commit { .. }
         )
     }
 }
@@ -998,10 +1147,12 @@ pub struct ControlStep {
 /// count the effect. Every check on a step runs at its pick, so a run cut
 /// off before the task takes the step still fails an invalid one.
 ///
-/// A reset, release or storage stop changes only storage or the harness's
-/// own state, so the step loop carries it out at its pick, outside any
-/// task, as storage completions are. It's offered only once the task has
-/// carried out every earlier step, so the script keeps its order.
+/// A reset, release, commit or storage stop changes only storage or the
+/// harness's own state, so the step loop carries it out at its pick,
+/// outside any task, as storage completions are. It's offered only once the
+/// task has carried out every earlier step, so the script keeps its order.
+/// A churn step hands its mirror to a churn task, which relinks it from
+/// then on.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
@@ -1015,6 +1166,10 @@ pub struct Control {
     queued: Rc<Cell<usize>>,
     /// The node under test's port, for the steps the step loop carries out.
     port: Option<Arc<ControlledPort>>,
+    /// The chains' fixture, which a commit extends the node's chain from.
+    fixture: HeaderFixture,
+    /// The node under test's adoption evidence, which records each commit.
+    adoption: Option<AdoptionEvidence>,
 }
 
 impl Control {
@@ -1031,7 +1186,19 @@ impl Control {
         let task_topology = topology.clone();
         let queued = Rc::new(Cell::new(0));
         let task_queued = queued.clone();
+        let churns = script
+            .iter()
+            .filter(|step| step.action == ControlAction::Churn)
+            .count();
+        let to_churn = (churns > 0).then(|| {
+            let (to_churn, churning) = mpsc::channel::<usize>(churns);
+            sim.scheduler()
+                .spawn_root("churn", churn(topology.clone(), churning));
+            to_churn
+        });
+        let task_fixture = fixture.clone();
         sim.scheduler().spawn_root("control", async move {
+            let fixture = task_fixture;
             let topology = task_topology;
             while let Some(step) = steps.recv().await {
                 let link = || {
@@ -1047,9 +1214,20 @@ impl Control {
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
+                    ControlAction::Flood => topology.flood(&step.peer),
+                    ControlAction::Churn => {
+                        let index = topology.index(&step.peer);
+                        to_churn
+                            .as_ref()
+                            .expect("a script with a churn step spawns the churn task")
+                            .send(index)
+                            .await
+                            .expect("the churn task outlives the run");
+                    }
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
-                    | ControlAction::StopStorage => {
+                    | ControlAction::StopStorage
+                    | ControlAction::Commit { .. } => {
                         unreachable!("the step loop carries out run-only steps")
                     }
                 }
@@ -1065,14 +1243,26 @@ impl Control {
             to_task,
             queued,
             port: None,
+            fixture,
+            adoption: None,
         }
     }
 
-    /// This source, resetting and stopping `port`, the node under test's.
-    /// Without it, a reset or storage stop fails the run.
+    /// This source, resetting, committing to and stopping `port`, the node
+    /// under test's. Without it, a reset, commit or storage stop fails the
+    /// run.
     pub fn with_port(self, port: Arc<ControlledPort>) -> Self {
         Control {
             port: Some(port),
+            ..self
+        }
+    }
+
+    /// This source, recording each commit in `adoption`, the node under
+    /// test's adoption evidence.
+    pub fn with_adoption(self, adoption: AdoptionEvidence) -> Self {
+        Control {
+            adoption: Some(adoption),
             ..self
         }
     }
@@ -1119,8 +1309,37 @@ impl Control {
                 self.topology.effects.released.borrow_mut().push(hold);
             }
             ControlAction::StopStorage => port()?.shut_down(),
+            ControlAction::Commit { len } => self.commit(&*port()?, len)?,
             _ => unreachable!("only run-only steps run at their pick"),
         }
+        Ok(())
+    }
+}
+
+impl Control {
+    /// Commits `len` fixture headers past `port`'s selected tip straight
+    /// into its engine, then records the engine's new state as `Published`.
+    /// The step loop calls it outside any task, so the engine's watch sends
+    /// wake no task before the record.
+    fn commit(&self, port: &ControlledPort, len: u32) -> Result<(), String> {
+        let engine = port.engine();
+        let snapshot = engine.snapshot();
+        let tip = snapshot.frontiers.header_best;
+        let headers = self.fixture.extend(tip, len, 0);
+        let request = self.fixture.target_request(&snapshot, tip, &headers, 1);
+        let applied = ready(engine.prepare_header_target(request))
+            .and_then(|prepared| ready(engine.apply_header_target(prepared)))
+            .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
+        if !matches!(applied, ApplyHeaderTargetOutcome::Applied) {
+            return Err(format!(
+                "committing {len} headers on {tip:?} gave {applied:?}"
+            ));
+        }
+        let published = engine.snapshot();
+        self.adoption
+            .as_ref()
+            .ok_or_else(|| "a commit needs the node's adoption evidence".to_owned())?
+            .publish(published.state_version, published.header_generation);
         Ok(())
     }
 }
@@ -1168,6 +1387,7 @@ impl ActionSource for Control {
             | ControlAction::Reset(_)
             | ControlAction::Release { .. }
             | ControlAction::StopStorage
+            | ControlAction::Commit { .. }
                 if step.peer != *node =>
             {
                 Some(format!(
@@ -1179,10 +1399,23 @@ impl ActionSource for Control {
             ControlAction::Shutdown if self.shut_down => {
                 Some("the node is already shut down".to_owned())
             }
+            ControlAction::Flood | ControlAction::Churn if step.peer == *node => Some(format!(
+                "a {} names a mirror, not the node under test",
+                step.action.name()
+            )),
             ControlAction::Relink if self.shut_down => {
                 Some(format!("relinking {} after the shutdown", step.peer))
             }
-            ControlAction::Reset(_) | ControlAction::Release { .. } if self.shut_down => {
+            ControlAction::Flood | ControlAction::Churn if self.shut_down => Some(format!(
+                "a {} of {} after the shutdown",
+                step.action.name(),
+                step.peer
+            )),
+            ControlAction::Reset(_)
+            | ControlAction::Release { .. }
+            | ControlAction::Commit { .. }
+                if self.shut_down =>
+            {
                 Some(format!(
                     "a {} of {} after the shutdown",
                     step.action.name(),

@@ -519,6 +519,51 @@ async fn an_extended_cooldown_holds_through_its_original_end() {
     assert!(matches!(demand(), SessionDemand::OpenNow));
 }
 
+/// The published backed-off set is sorted, which the header service's binary
+/// search relies on. Every cooled peer is found and parked, and a peer that
+/// sorts between them is not.
+#[tokio::test(start_paused = true)]
+async fn the_backed_off_set_is_sorted_for_the_services_search() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let mut peers: Vec<_> = (0x60_u8..0x90)
+        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has 32 bytes"))
+        .filter(|peer| node_id_from_peer(peer).is_some())
+        .take(5)
+        .collect();
+    assert_eq!(peers.len(), 5, "enough test bytes decode as node IDs");
+    let open = peers.remove(2);
+    for peer in peers.iter().rev() {
+        fixture
+            .reactor
+            .state
+            .start_readmission_cooldown(peer, Instant::now(), cooldown);
+    }
+    fixture.reactor.publish_peer_state();
+
+    let published = fixture
+        .reactor
+        .candidates
+        .borrow()
+        .backed_off_node_ids
+        .clone();
+    assert_eq!(published.len(), peers.len());
+    assert!(published.windows(2).all(|pair| pair[0] < pair[1]));
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = |peer: &ZakuraPeerId| {
+        service.session_demand(
+            1,
+            peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    for peer in &peers {
+        assert!(matches!(demand(peer), SessionDemand::WaitForChange(_)));
+    }
+    assert!(matches!(demand(&open), SessionDemand::OpenNow));
+}
+
 /// Fresh identities that each leave with a strike end the earliest holds
 /// instead of growing the held set past its limit.
 #[tokio::test(start_paused = true)]

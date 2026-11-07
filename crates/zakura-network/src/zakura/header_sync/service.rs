@@ -641,7 +641,8 @@ impl Service for HeaderSyncService {
         if candidates
             .borrow_and_update()
             .backed_off_node_ids
-            .contains(&node_id)
+            .binary_search(&node_id)
+            .is_ok()
         {
             // The reactor republishes the set when a cooldown ends, so re-check
             // then rather than after a fixed delay from this check.
@@ -650,10 +651,11 @@ impl Service for HeaderSyncService {
                     if candidates.changed().await.is_err() {
                         std::future::pending::<()>().await;
                     }
-                    if !candidates
+                    if candidates
                         .borrow_and_update()
                         .backed_off_node_ids
-                        .contains(&node_id)
+                        .binary_search(&node_id)
+                        .is_err()
                     {
                         return;
                     }

@@ -336,7 +336,8 @@ mod tests {
 
     /// A request past `max_in_flight` before the node read the answer is
     /// `OverMargin`, an answer to no request is `Unsolicited`, and each
-    /// conformant frame of a row with a cadence spends a token.
+    /// conformant frame of a row with a cadence spends a token, which the
+    /// bucket regains over time.
     #[test]
     fn the_node_frames_take_the_sender_rules() {
         let at = Duration::ZERO;
@@ -368,5 +369,23 @@ mod tests {
         let exhausted: Vec<bool> = (0..64).map(|_| node.writes(&hello, at).1).collect();
         let first = exhausted.iter().position(|empty| *empty);
         assert!(first.is_some_and(|first| first > 0), "{exhausted:?}");
+
+        // Hellos at the row's send interval, past its capacity, never find
+        // the bucket empty: it refills between them.
+        let MessageRole::Announcement { cadence } = FrameModel::new(
+            <DiscoveryMessage as WireMessage>::RULES,
+            ReaderEnd::Persistent,
+        )
+        .row(hello.message_type())
+        .expect("discovery tables Hello")
+        .role
+        else {
+            unreachable!("Hello is an announcement")
+        };
+        let mut node = Node::new();
+        let spaced: Vec<bool> = (0..cadence.capacity + 2)
+            .map(|sent| node.writes(&hello, cadence.send_interval * sent).1)
+            .collect();
+        assert!(!spaced.contains(&true), "{spaced:?}");
     }
 }

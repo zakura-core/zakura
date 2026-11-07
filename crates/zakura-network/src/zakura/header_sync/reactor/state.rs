@@ -40,11 +40,20 @@ pub(super) struct ReactorState {
     /// [`ZakuraHeaderSyncConfig::max_unproductive_header_requests`](super::ZakuraHeaderSyncConfig::max_unproductive_header_requests)
     /// request timeouts, or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
+    ///
+    /// The admitted peer limits bound the count, as for
+    /// [`Self::departed_strikes`], so the insert prune, the eviction scan and
+    /// the per-publish sort stay bounded however many identities fault in one
+    /// cooldown. Past the limit the cooldown that ends first ends now. Evicting
+    /// one takes more faulting identities in one cooldown than the limits admit
+    /// at once, and it gains the evicted identity little: a cooldown only
+    /// refuses the exact identity, so a fresh one already gets back in for the
+    /// cost of one handshake.
     pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     /// No later than the earliest end in [`Self::unproductive_peer_cooldowns`],
     /// so maintenance wakes to republish it without scanning the map each turn.
-    /// A replaced entry can leave it early; the prune that wake runs makes it
-    /// exact again.
+    /// A replaced or evicted entry can leave it early; the prune that wake runs
+    /// makes it exact again.
     cooldowns_end: Option<Instant>,
     /// How many cooldown entries [`Self::start_readmission_cooldown`] has
     /// installed, so the reactor reports `CooldownStarted` only for an
@@ -309,16 +318,30 @@ impl ReactorState {
 
     /// Refuse `peer`'s readmission for `cooldown` from `now`. A zero cooldown
     /// refuses nothing.
+    ///
+    /// At most `max_cooldowns` peers hold a cooldown; past that, the other
+    /// peer's cooldown that ends first ends now. See
+    /// [`Self::unproductive_peer_cooldowns`] for why that's safe.
     pub(super) fn start_readmission_cooldown(
         &mut self,
         peer: &ZakuraPeerId,
         now: Instant,
         cooldown: Duration,
+        max_cooldowns: usize,
     ) {
         if !cooldown.is_zero() {
             let _ = self.prune_readmission_cooldowns(now);
             let until = now + cooldown;
             self.unproductive_peer_cooldowns.insert(peer.clone(), until);
+            while self.unproductive_peer_cooldowns.len() > max_cooldowns {
+                let earliest = self
+                    .unproductive_peer_cooldowns
+                    .iter()
+                    .filter(|(held, _)| *held != peer)
+                    .min_by_key(|(_, until)| **until)
+                    .map_or_else(|| peer.clone(), |(held, _)| held.clone());
+                self.unproductive_peer_cooldowns.remove(&earliest);
+            }
             self.cooldowns_end = Some(self.cooldowns_end.map_or(until, |end| end.min(until)));
             #[cfg(any(test, zakura_sim))]
             {

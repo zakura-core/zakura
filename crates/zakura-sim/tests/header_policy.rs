@@ -617,3 +617,40 @@ fn a_reply_holds_virtual_time_counts_from_the_commit() {
     predicates.reply_boundaries(&open, now, &mut out);
     assert_eq!(out, []);
 }
+
+/// A release opens its hold whatever the hold's trigger says, so a hold on
+/// `released` opens only through it, and a released hold stops time at none
+/// of its trigger's times. Releasing again does nothing, and another hold
+/// stays shut.
+#[test]
+fn a_release_opens_only_its_own_hold() {
+    let mut predicates = Predicates::new(vec![
+        hold(Select::nth(OpKind::Locator, 1), Trigger::Released),
+        hold(
+            Select::nth(OpKind::Prepare, 1),
+            Trigger::VirtualTime(60_000),
+        ),
+    ]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    predicates.record(&submitted(2, OpKind::Prepare, 1));
+    let locator = pending(1, OpKind::Locator, Duration::from_secs(1));
+    let prepare = pending(2, OpKind::Prepare, Duration::from_secs(1));
+    let now = SimInstant::from_start(Duration::from_secs(1));
+    assert_eq!(offered(&predicates, Base::Any, &locator), []);
+    assert_eq!(offered(&predicates, Base::Any, &prepare), []);
+    assert_eq!(
+        boundaries(&predicates, &prepare, now),
+        [Boundary::Opens(SimInstant::from_start(
+            Duration::from_secs(60)
+        ))]
+    );
+
+    predicates.release(1);
+    predicates.release(1);
+    assert_eq!(offered(&predicates, Base::Any, &locator), []);
+    assert_eq!(offered(&predicates, Base::Any, &prepare), [Outcome::Engine]);
+    assert_eq!(boundaries(&predicates, &prepare, now), []);
+
+    predicates.release(0);
+    assert_eq!(offered(&predicates, Base::Any, &locator), [Outcome::Engine]);
+}

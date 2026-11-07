@@ -14,6 +14,10 @@
 //! the engine and keeps the reply, and [`ControlledPort::deliver`] hands the
 //! reply over in a later step.
 //!
+//! [`ControlledPort::reset`] makes an operator invalidation or
+//! reconsideration on the engine, which moves header selection without an
+//! apply.
+//!
 //! Dropping a call's future cancels only the caller. The operation stays
 //! pending with its inputs, so a locator's permit stays held, and its reply is
 //! dropped when it completes. A reply nobody takes, at completion or because
@@ -22,14 +26,14 @@
 //!
 //! Every change is published as a transaction: a submission, a caller
 //! dropping its call, a caller taking or dropping its reply, a completion,
-//! a commit or delivery, or shutdown. A transaction's [`Fact`]s carry one
+//! a commit or delivery, a reset, or shutdown. A transaction's [`Fact`]s carry one
 //! transaction number and consecutive sequence numbers, in the order the
 //! changes happened, and end with one head fact that names the transaction.
 //! [`ControlledPort::take_facts`] drains them.
 //!
 //! A change a task makes, such as dropping its call, is published in the
 //! critical section that makes it. A change the run makes, a completion,
-//! commit, delivery or shutdown, is published at its end: the run makes it
+//! commit, delivery, reset or shutdown, is published at its end: the run makes it
 //! outside any task, so no task can run in between and see the change
 //! before its facts.
 
@@ -117,6 +121,52 @@ pub enum Commit {
     /// [`ControlledPort::complete`] would have.
     Completed(Box<Completion>),
 }
+
+/// A reset [`ControlledPort::reset`] makes.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResetRequest {
+    /// Invalidate the selected header `depth` below the selected tip, or
+    /// the lowest header above the finalized anchor if the chain is
+    /// shorter. Nothing to do while the tip is the anchor.
+    Invalidate {
+        /// How far below the tip.
+        depth: u32,
+    },
+    /// Reconsider the newest invalidation this port made that's still in
+    /// force. Nothing to do if there's none.
+    Reconsider,
+}
+
+/// Which operator event a reset ran.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResetKind {
+    /// An invalidation.
+    Invalidate,
+    /// A reconsideration.
+    Reconsider,
+}
+
+/// Why [`ControlledPort::reset`] failed. A failure changes nothing the
+/// port's facts would miss.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResetError {
+    /// The port is bound to another run.
+    OutsideRun,
+    /// The engine refused the operator event or committed nothing, which a
+    /// header on the selected chain or an invalidation in force rules out.
+    NotCommitted(String),
+}
+
+impl fmt::Display for ResetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResetError::OutsideRun => f.write_str("the port is bound to another run"),
+            ResetError::NotCommitted(why) => write!(f, "the operator event didn't commit: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ResetError {}
 
 /// What [`ControlledPort::complete`] or [`ControlledPort::deliver`] did.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +268,16 @@ pub enum FactKind {
         generation: HeaderGeneration,
         /// [`EnginePort::state_digest`] once the commit finished.
         state_digest: [u8; 32],
+    },
+    /// Head: the run reset the engine's header selection with an operator
+    /// event.
+    Reset {
+        /// Which event.
+        kind: ResetKind,
+        /// The header it named.
+        target: block::Hash,
+        /// The engine's header generation once it committed.
+        generation: HeaderGeneration,
     },
     /// Head: the run completed an operation, or delivered a committed
     /// apply's reply.
@@ -337,6 +397,9 @@ struct Ops {
     facts: Vec<Fact>,
     /// Set by shutdown, after which nothing is submitted.
     shut_down: bool,
+    /// The targets of this port's invalidations, oldest first. Some may
+    /// have ended with an eviction, which `reset` checks.
+    invalidations: Vec<block::Hash>,
     /// Set once the port is bound to a run.
     bound: bool,
     /// The run it's bound to.
@@ -1008,6 +1071,97 @@ impl ControlledPort {
             generation,
             state_digest,
         }
+    }
+
+    /// Makes `request` on the engine: an operator invalidation or
+    /// reconsideration in its own transaction, as zakura-state's operator
+    /// commands do, which publishes its snapshot and a [`FactKind::Reset`].
+    /// Returns what it did, or `None` if there was nothing to do: an
+    /// invalidation while the selected tip is the finalized anchor, a
+    /// reconsideration with no invalidation in force, or a port that shut
+    /// down. Those publish nothing.
+    ///
+    /// The reset is engine-level. Its event is the one zakura-state's
+    /// `commit_operator_change` builds, but production's operator commands
+    /// first change non-finalized full state. An invalidation removes the
+    /// block there, and fails with `BlockNotFound` for a header whose block
+    /// that state lacks. A reconsideration restores blocks that state
+    /// invalidated, and fails with `MissingInvalidatedBlock` otherwise.
+    /// Header runs commit no bodies, so this reset reaches header histories
+    /// the production commands can't. It stands in for any reset that advances
+    /// the header generation, which finality moves would otherwise give.
+    ///
+    /// Only the run resets, outside any task, as only the run completes.
+    ///
+    /// # Errors
+    ///
+    /// If the port is bound to another run, or the engine doesn't commit
+    /// the event.
+    pub fn reset(&self, request: ResetRequest) -> Result<Option<FactKind>, ResetError> {
+        #[cfg(zakura_sim)]
+        debug_assert!(
+            zakura_rt::sim::executor()
+                .and_then(|executor| executor.current_task())
+                .is_none(),
+            "only the run resets a controlled port's engine"
+        );
+        let now = Instant::now();
+        let (kind, target) = {
+            let mut ops = self.ops();
+            if ops.refuse_outside_run() {
+                return Err(ResetError::OutsideRun);
+            }
+            if ops.shut_down {
+                return Ok(None);
+            }
+            match request {
+                ResetRequest::Invalidate { depth } => {
+                    drop(ops);
+                    let Some(target) = self.engine.selected_below_tip(depth) else {
+                        return Ok(None);
+                    };
+                    (ResetKind::Invalidate, target.hash)
+                }
+                ResetRequest::Reconsider => {
+                    let remembered = ops.invalidations.clone();
+                    drop(ops);
+                    // Retention may have evicted an invalidated header, which
+                    // ends its invalidation, so only those still in force
+                    // count.
+                    let newest = remembered
+                        .iter()
+                        .rposition(|target| self.engine.invalidation_in_force(*target));
+                    self.ops()
+                        .invalidations
+                        .truncate(newest.map_or(0, |index| index + 1));
+                    match newest {
+                        Some(index) => (ResetKind::Reconsider, remembered[index]),
+                        None => return Ok(None),
+                    }
+                }
+            }
+        };
+        let applied = self
+            .engine
+            .operator(target, kind == ResetKind::Invalidate)
+            .map_err(|error| ResetError::NotCommitted(format!("{error:?}")))?;
+        if !matches!(applied.result, zakura_header_chain::ApplyResult::Committed) {
+            return Err(ResetError::NotCommitted(format!("{:?}", applied.result)));
+        }
+        let fact = FactKind::Reset {
+            kind,
+            target,
+            generation: self.engine.snapshot().header_generation,
+        };
+        let mut ops = self.ops();
+        match kind {
+            ResetKind::Invalidate => ops.invalidations.push(target),
+            ResetKind::Reconsider => {
+                ops.invalidations.pop();
+            }
+        }
+        ops.publish(now, vec![fact.clone()]);
+        Ok(Some(fact))
     }
 
     /// Ends the lease an `Acquired` reply carries, since nobody will take

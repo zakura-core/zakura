@@ -16,7 +16,7 @@
 //! [`HeaderOp`] lists the eight asynchronous [`Port`] methods. `selected_chain`
 //! isn't one of them. It returns a watch receiver synchronously, so it has no
 //! pending state and no faults. In header scenarios only an apply's
-//! completion or commit sends a new snapshot on it, and receivers may see several
+//! completion or commit, or a run's reset, sends a new snapshot on it, and receivers may see several
 //! commits coalesced into one change. The reactor's `Misbehavior` and `DropPeer` actions aren't storage
 //! calls either. The direct dispatch path logs them and returns.
 //!

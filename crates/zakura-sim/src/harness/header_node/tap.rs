@@ -255,6 +255,12 @@ impl TapShutdown {
     pub fn begin(&self) {
         self.0.shutdown.store(true, Ordering::Relaxed);
     }
+
+    /// Whether the stop is done: it began, and the reactor dropped its
+    /// observer without unwinding.
+    pub fn stopped(&self) -> bool {
+        self.0.stopped()
+    }
 }
 
 /// A tap publishes reactor events.

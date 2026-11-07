@@ -479,6 +479,15 @@ pub enum StorageFact {
         /// A digest of the service's state after the commit.
         state: String,
     },
+    /// The run reset the node's header selection with an operator event.
+    Reset {
+        /// `invalidate` or `reconsider`.
+        kind: String,
+        /// The header it named.
+        target: String,
+        /// The engine's header generation after it.
+        generation: u64,
+    },
     /// The run completed the operation, or delivered a committed apply's
     /// reply.
     Completed {

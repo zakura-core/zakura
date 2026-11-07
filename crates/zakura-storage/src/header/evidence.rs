@@ -5,7 +5,7 @@
 //! owner and every identity the request or result names. Digests remain for
 //! replay, not for comparison.
 
-use zakura_chain::block;
+use zakura_chain::{block, work::difficulty::PartialCumulativeWork};
 #[cfg(any(test, zakura_sim))]
 use zakura_header_chain::Attribution;
 use zakura_header_chain::{
@@ -106,6 +106,14 @@ pub enum RequestIdentity {
         target: Frontier,
         /// How many headers.
         headers: u32,
+        /// The sum of the headers' block work, read from each header's
+        /// compact target: the target's work above `common_ancestor`.
+        /// `None` if a header's target has no work, which preparation
+        /// refuses.
+        work: Option<PartialCumulativeWork>,
+        /// The first header, `common_ancestor`'s child on the target's
+        /// branch. `None` for a request with no headers.
+        first: Option<Frontier>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {
@@ -167,6 +175,17 @@ impl RequestIdentity {
                 target: prepare.target,
                 // A request holds at most the transition cap, far below u32.
                 headers: u32::try_from(prepare.entries.len()).unwrap_or(u32::MAX),
+                work: prepare
+                    .entries
+                    .as_slice()
+                    .iter()
+                    .try_fold(PartialCumulativeWork::zero(), |sum, entry| {
+                        sum.checked_add(entry.header.difficulty_threshold.to_work()?)
+                    }),
+                first: prepare.entries.as_slice().first().and_then(|entry| {
+                    let height = prepare.common_ancestor.height.next().ok()?;
+                    Some(Frontier::new(height, entry.header.hash()))
+                }),
             },
             HeaderRequest::ApplyHeaderTarget { target } => RequestIdentity::ApplyHeaderTarget {
                 owner: target.owner(),
@@ -555,6 +574,11 @@ pub enum OperationStage {
     },
     /// Being completed by the run. Never seen at a step boundary.
     Running,
+    /// Committed by the run, with a reply it hasn't delivered yet.
+    Committed {
+        /// Whether the port still holds the caller's waker.
+        caller_waiting: bool,
+    },
     /// Completed, with a reply its caller hasn't taken, and that reply's
     /// identity as captured when it was made.
     Replied {

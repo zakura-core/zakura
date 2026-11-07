@@ -1206,6 +1206,8 @@ mod tests {
                     hash: invalid.clone(),
                 },
                 headers: 1,
+                work: None,
+                first: None,
             },
             digest: String::new(),
             call: None,

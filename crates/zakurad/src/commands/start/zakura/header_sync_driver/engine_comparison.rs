@@ -66,15 +66,21 @@ impl ProductionState {
             enable_zakura_header_seed_from_committed_blocks: true,
             ..Default::default()
         };
-        let (mut state, read_state, _, _, authority) =
-            zakura_state::init_with_header_chain_body_evidence(
-                config,
-                &network,
-                block::Height(0),
-                2,
-            )
-            .await
-            .expect("the ephemeral state starts");
+        let (
+            zakura_state::InitializedState {
+                mut state,
+                read_state,
+                ..
+            },
+            authority,
+        ) = zakura_state::init_with_header_chain_body_evidence(
+            config,
+            &network,
+            block::Height(0),
+            2,
+        )
+        .await
+        .expect("the ephemeral state starts");
         state
             .ready()
             .await

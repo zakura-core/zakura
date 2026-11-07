@@ -384,7 +384,7 @@ fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
 #[test]
 #[ignore = "rewrites the committed input"]
 fn regenerate_capacity_frontier_first_input() {
-    // Under `--profile planted`, a capacity-release run takes about 2 minutes
+    // Under `--profile planted`, a capacity-release run takes a few minutes
     // and peaks near 1.5 GB, so four candidates at once stay near 6 GB.
     regenerate(
         "block-sync-capacity-frontier-first",

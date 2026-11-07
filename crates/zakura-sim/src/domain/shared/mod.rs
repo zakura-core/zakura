@@ -9,3 +9,4 @@
 //! serves every instance's ID.
 
 pub mod bounds;
+pub mod teardown;

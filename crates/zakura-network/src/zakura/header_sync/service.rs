@@ -759,6 +759,10 @@ impl Service for HeaderSyncService {
         // The reader checks each page and outcome header against the
         // subscription before it reads the payload.
         let subscriber = Subscriber::new(header_bytes, fence, &recv);
+        // The subscriber takes its credit tap before its lock exists, since
+        // a simulated lock is a scheduling point release builds don't have.
+        #[cfg(any(test, zakura_sim))]
+        let subscriber = subscriber.observed_by(self.header_sync.credit_tap(&peer_id, session_id));
         let session = PeerSession::new(
             peer_id.clone(),
             session_id,

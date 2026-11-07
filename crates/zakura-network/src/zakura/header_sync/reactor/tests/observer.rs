@@ -36,8 +36,9 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, capacity accounting, session admissions, refusals and ends,
-    /// readmission cooldowns, or the adopted state and its publications.
+    /// reservations, capacity accounting, budget changes, credit, causes,
+    /// session admissions, refusals and ends, readmission cooldowns, or the
+    /// adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -52,6 +53,9 @@ impl Recorder {
                         | ReactorEvent::PageStaged { .. }
                         | ReactorEvent::LeaseReturned { .. }
                         | ReactorEvent::RoundReleased { .. }
+                        | ReactorEvent::BudgetChanged { .. }
+                        | ReactorEvent::CreditIssued { .. }
+                        | ReactorEvent::CauseSet { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }
@@ -686,6 +690,91 @@ fn repair_retry_retirement_is_observed() {
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
         ),
         "the seeded request is a repair"
+    );
+}
+
+/// A completion's handler runs under its call's `Completion` cause and the
+/// refresh after it under `Refresh`, each restoring the cause before it, so
+/// the handler's effects and only those carry `Completion`.
+#[tokio::test]
+async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (..) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let seeded = active(&reactor, &peer);
+    recorder.take_all();
+
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
+    complete_next(&mut reactor).await;
+
+    let cause = |cause| ReactorEvent::CauseSet { cause };
+    let events: Vec<_> = recorder
+        .take_all()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReactorEvent::CauseSet { .. }
+                    | ReactorEvent::CallEnded { .. }
+                    | ReactorEvent::Retired { .. }
+                    | ReactorEvent::Handled { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ReactorEvent::CallEnded {
+                call: 1,
+                end: CallEnd::Replied,
+            },
+            cause(ReactorCause::Completion { call: 1 }),
+            retired(&seeded, HeaderRequestTerminal::TargetRejected),
+            cause(ReactorCause::Idle),
+            cause(ReactorCause::Refresh { call: 1 }),
+            cause(ReactorCause::Idle),
+            ReactorEvent::Handled {
+                call: 1,
+                panicked: false,
+            },
+        ]
+    );
+}
+
+/// A nested unit of work reports its cause, then restores the outer one,
+/// which restores the reactor's own.
+#[test]
+fn a_nested_cause_restores_the_outer_one() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    recorder.take_all();
+    caused!(
+        reactor,
+        ReactorCause::Startup,
+        caused!(reactor, ReactorCause::Watch, ())
+    );
+    let cause = |cause| ReactorEvent::CauseSet { cause };
+    assert_eq!(
+        recorder.take_all(),
+        [
+            cause(ReactorCause::Startup),
+            cause(ReactorCause::Watch),
+            cause(ReactorCause::Startup),
+            cause(ReactorCause::Idle),
+        ]
     );
 }
 

@@ -184,6 +184,10 @@ pub enum Trigger<K> {
     /// peer, as its tap reports: once per admission, the setup link's
     /// included, so a replacement is the second. Never holds without a tap.
     SessionAdmitted(String),
+    /// The header node under test's reactor kept this peer's offer waiting
+    /// for header room, as its tap reports: once per refusal. Never holds
+    /// without a tap.
+    HeadroomWait(String),
     /// A `Release` control step named the hold whose trigger this is.
     /// Holds only in a hold's own `until`, and a release opens its hold
     /// whatever the trigger says, so `until: released` opens only through
@@ -267,7 +271,8 @@ pub(crate) enum Event {
 /// A link effect a task made, or a reactor fact about one peer, as
 /// [`Trigger::Closed`], [`Trigger::Linked`], [`Trigger::Grown`],
 /// [`Trigger::Reset`], [`Trigger::Prepared`],
-/// [`Trigger::ReservationOpened`] and [`Trigger::SessionAdmitted`] count it.
+/// [`Trigger::ReservationOpened`], [`Trigger::SessionAdmitted`] and
+/// [`Trigger::HeadroomWait`] count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkEffect {
     /// A link was made.
@@ -284,6 +289,8 @@ pub enum LinkEffect {
     ReservationOpened,
     /// The node under test's reactor admitted a session from a peer.
     SessionAdmitted,
+    /// The node under test's reactor kept a peer's offer waiting for room.
+    HeadroomWait,
 }
 
 /// What [`Predicates`] knows about one stage of an operation from that
@@ -544,6 +551,7 @@ impl<F: Family> Predicates<F> {
             Trigger::Prepared(peer) => links(LinkEffect::Prepared, peer),
             Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
             Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
+            Trigger::HeadroomWait(peer) => links(LinkEffect::HeadroomWait, peer),
             Trigger::Released | Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }

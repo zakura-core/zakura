@@ -102,6 +102,7 @@ use super::{
     reservation::ReservationEvidence,
     session::SessionEvidence,
     stale::{StaleCheck, StaleEvidence},
+    wake::{WakeCheck, WakeEvidence},
 };
 use crate::{
     draws::Failure,
@@ -179,6 +180,9 @@ struct TapState {
     /// Checks each stale call's handler as its facts arrive, keeping the
     /// stale calls it finds for the view.
     stale: Mutex<StaleCheck>,
+    /// Checks for offers a budget return should wake, keeping its facts for
+    /// the view. Inert until [`ReactorTap::watch_wakes`].
+    wake: Mutex<WakeCheck>,
 }
 
 /// The resource probe a tap was handed.
@@ -520,6 +524,14 @@ impl TapState {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .observe(&event, on_reactor);
+            if on_reactor {
+                let now = zakura_scheduler::hooks::now().unwrap_or_default();
+                state
+                    .wake
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .observe(&event, now);
+            }
         }
         // Budget changes, credit, causes, headroom waits and deferred passes
         // stay out of the log, whose format pinned Plans fix, and a
@@ -532,6 +544,12 @@ impl TapState {
                 | ReactorEvent::HeadroomWait { .. }
                 | ReactorEvent::CachedPassDeferred { .. }
         ) {
+            if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
+                state
+                    .buffer()
+                    .effects
+                    .push((LinkEffect::HeadroomWait, peer.clone()));
+            }
             return;
         }
         let at = zakura_scheduler::hooks::now()
@@ -772,6 +790,7 @@ impl ReactorTap {
                 teardown_claims: Mutex::default(),
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
+                wake: Mutex::new(WakeCheck::new(WakeEvidence::default())),
             }))
         });
         let state = observer.0.clone();
@@ -823,7 +842,27 @@ impl ReactorTap {
         &mut self,
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
+        let facts: Vec<_> = facts.into_iter().collect();
+        let mut wake = self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (_, fact) in &facts {
+            wake.storage(fact);
+        }
+        drop(wake);
         self.pairer.facts(facts);
+    }
+
+    /// Checks this reactor's wakes against `wake`'s fixture from now on,
+    /// keeping the facts in `wake`. Call it before the run starts.
+    pub fn watch_wakes(&self, wake: WakeEvidence) {
+        *self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
     }
 
     /// The reactor's adoption facts, which the tap fills as they happen.
@@ -936,6 +975,11 @@ impl ReactorTap {
                 accounted: (!mid_poll).then(|| self.state.accounted()),
             }
         };
+        self.state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .permits(read.locator_permits);
         evidence.record(CapacityReading {
             step,
             reserved: read.reserved,

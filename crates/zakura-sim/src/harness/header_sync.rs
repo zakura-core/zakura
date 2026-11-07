@@ -4,9 +4,13 @@
 //! tapped. `header-sync/wire` runs the same node behind its real transport
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1), checked by header sync's generated table properties
-//! and `session/honest-never-punished` (P3d).
+//! and `session/honest-never-punished` (P3d). `header-sync/release-wake`
+//! runs `header-sync/storage` on the wake fixture alone.
 
 pub mod grammar;
+mod release_wake;
+
+pub use release_wake::{ReleaseWake, WakeScenario};
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
@@ -37,6 +41,7 @@ use super::{
         session::SessionEvidence,
         stale::StaleEvidence,
         tap::ReactorTap,
+        wake::WakeEvidence,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
         Policy, PolicySource, Topology,
     },
@@ -49,7 +54,7 @@ use crate::{
     domain::{
         header_sync::{
             chunk_budget_bound, stale_completion_inert, teardown_end_violations,
-            teardown_returns_baseline, BudgetView, StaleView, TeardownView,
+            teardown_returns_baseline, BudgetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -504,6 +509,10 @@ pub struct Ports {
     /// The node's stale prepare and apply calls, which its tap finds during
     /// the run.
     pub stale_calls: StaleEvidence,
+    /// The node's wake facts, which its tap finds during the run. Inert
+    /// unless whoever prepared the ports declared a wake fixture
+    /// ([`WakeEvidence::new`]).
+    pub wake: WakeEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -521,6 +530,8 @@ pub struct Storage {
     rounds: SettlementEvidence,
     /// The node's stale prepare and apply calls, from its tap.
     stale_calls: StaleEvidence,
+    /// The node's wake facts, from its tap.
+    wake: WakeEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -557,6 +568,8 @@ pub struct StorageView {
     pub rounds: SettlementEvidence,
     /// The node's stale prepare and apply calls.
     pub stale_calls: StaleEvidence,
+    /// The node's wake facts, which its tap finds during the run.
+    pub wake: WakeEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -595,6 +608,13 @@ impl StaleView for StorageView {
     }
 }
 
+impl WakeView for StorageView {
+    /// [`StorageView::wake`].
+    fn wake(&self) -> &WakeEvidence {
+        &self.wake
+    }
+}
+
 impl HonestPeers for StorageView {
     /// True if `index` is in [`StorageView::honest_peers`].
     fn is_honest(&self, index: usize) -> bool {
@@ -619,6 +639,7 @@ impl HasView for Storage {
             claims: self.claims.clone(),
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
+            wake: self.wake.clone(),
         }
     }
 
@@ -635,6 +656,11 @@ impl HasView for Storage {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
         found
+    }
+
+    /// The node's wake facts' stamps ([`WakeEvidence::stamps_after`]).
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        Some(self.wake.stamps_after(after))
     }
 }
 
@@ -725,6 +751,7 @@ impl Subsystem for Storage {
             capacity: CapacityEvidence::default(),
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
+            wake: WakeEvidence::default(),
         }
     }
 
@@ -752,6 +779,7 @@ impl Subsystem for Storage {
             ports.rounds.clone(),
             ports.stale_calls.clone(),
         );
+        tap.watch_wakes(ports.wake.clone());
         let adoption = tap.adoption();
         let claims = tap.claims();
 
@@ -822,6 +850,7 @@ impl Subsystem for Storage {
             claims,
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
+            wake: ports.wake,
             faults,
             topology,
         }
@@ -926,6 +955,8 @@ pub struct WirePorts {
     /// The node's stale prepare and apply calls, which its tap finds during
     /// the run.
     pub stale_calls: StaleEvidence,
+    /// The node's wake facts, which its tap finds during the run.
+    pub wake: WakeEvidence,
 }
 
 impl WirePorts {
@@ -962,6 +993,8 @@ pub struct HeaderWire {
     rounds: SettlementEvidence,
     /// The node's stale prepare and apply calls, from its tap.
     stale_calls: StaleEvidence,
+    /// The node's wake facts, from its tap.
+    wake: WakeEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -990,6 +1023,7 @@ impl HasView for HeaderWire {
             claims: self.claims.clone(),
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
+            wake: self.wake.clone(),
         }
     }
 
@@ -1085,6 +1119,7 @@ impl Subsystem for HeaderWire {
             capacity: CapacityEvidence::default(),
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
+            wake: WakeEvidence::default(),
         }
     }
 
@@ -1202,6 +1237,7 @@ impl Subsystem for HeaderWire {
             claims,
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
+            wake: ports.wake,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),

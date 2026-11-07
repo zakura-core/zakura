@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 67286e7e533211f84265f5c2b826a675750f5f6bf5abf7451533454553b0a9a8 # shrinks to inputs = [View(ViewStep { version: false, epoch: false, header_generation: false, verified_generation: false, finalized: 0, verified: 0, header: 0, header_branch: None, hints: 0, alarm: None }), Refill { accept: true }, View(ViewStep { version: false, epoch: false, header_generation: false, verified_generation: false, finalized: 0, verified: 1, header: 0, header_branch: None, hints: 0, alarm: None })]

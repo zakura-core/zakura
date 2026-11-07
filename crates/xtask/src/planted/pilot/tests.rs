@@ -1025,3 +1025,21 @@ fn a_witness_run_that_dies_mid_trace_is_classified() {
         assert!(result.reason.contains(ended), "{name}: {}", result.reason);
     }
 }
+
+/// `--work` and `--out` come back absolute, against the current
+/// directory: the builds run cargo from their worktree, which would read a
+/// relative `CARGO_TARGET_DIR` under the worktree.
+#[test]
+fn relative_flags_become_absolute() {
+    let args = ["--work", "pilot-work", "--out", "pilot-out", "--seed", "11"];
+    let flags = parse_flags(args.into_iter().map(str::to_owned)).expect("the flags parse");
+    let cwd = std::env::current_dir().expect("a current directory");
+    assert_eq!(flags.work, Some(cwd.join("pilot-work")));
+    assert_eq!(flags.out, cwd.join("pilot-out"));
+    assert_eq!(flags.seeds, [11]);
+    let absolute =
+        parse_flags(["--out", "/a/b"].into_iter().map(str::to_owned)).expect("the flags parse");
+    assert_eq!(absolute.out, Path::new("/a/b"));
+    assert_eq!(absolute.work, None);
+    assert!(parse_flags(["--work", "w"].into_iter().map(str::to_owned)).is_err());
+}

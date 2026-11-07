@@ -289,18 +289,12 @@ pub(crate) fn run(
     let experiment = args.next().ok_or(UsageError(
         "expected `sensitivity` or `discovery` after `planted pilot`",
     ))?;
-    let (mut out, mut work, mut only, mut seeds) = (None, None, Vec::new(), Vec::new());
-    while let Some(flag) = args.next() {
-        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
-        match flag.as_str() {
-            "--out" if out.is_none() => out = Some(PathBuf::from(value)),
-            "--work" if work.is_none() => work = Some(PathBuf::from(value)),
-            "--only" => only.push(value),
-            "--seed" => seeds.push(value.parse::<u32>().map_err(|e| format!("--seed: {e}"))?),
-            _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
-        }
-    }
-    let out = out.ok_or(UsageError("`planted pilot` needs --out <dir>"))?;
+    let Flags {
+        out,
+        work,
+        only,
+        seeds,
+    } = parse_flags(args)?;
     // Each child runs in its own process group, which a terminal's signal
     // doesn't reach. The handler lets the running child's group be killed.
     install_interrupt_handler();
@@ -355,6 +349,42 @@ pub(crate) fn run(
         out.join(format!("{experiment}.json")).display()
     );
     Ok(())
+}
+
+/// The flags after the experiment's name.
+#[derive(Debug, PartialEq, Eq)]
+struct Flags {
+    /// `--out`, absolute.
+    out: PathBuf,
+    /// `--work`, absolute, if given.
+    work: Option<PathBuf>,
+    /// Each `--only` case ID.
+    only: Vec<String>,
+    /// Each `--seed`.
+    seeds: Vec<u32>,
+}
+
+/// Reads the flags in `args`. It makes `--out` and `--work` absolute
+/// against the current directory, since the builds run cargo from their
+/// worktree, and cargo would read a relative `CARGO_TARGET_DIR` there.
+fn parse_flags(mut args: impl Iterator<Item = String>) -> Result<Flags, BoxError> {
+    let (mut out, mut work, mut only, mut seeds) = (None, None, Vec::new(), Vec::new());
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag.as_str() {
+            "--out" if out.is_none() => out = Some(std::path::absolute(value)?),
+            "--work" if work.is_none() => work = Some(std::path::absolute(value)?),
+            "--only" => only.push(value),
+            "--seed" => seeds.push(value.parse::<u32>().map_err(|e| format!("--seed: {e}"))?),
+            _ => return Err(format!("unknown or repeated flag `{flag}`").into()),
+        }
+    }
+    Ok(Flags {
+        out: out.ok_or(UsageError("`planted pilot` needs --out <dir>"))?,
+        work,
+        only,
+        seeds,
+    })
 }
 
 /// The cases `only` names, or every case without `only`. Fails on an ID

@@ -57,7 +57,8 @@ use crate::{
 /// block count.
 /// Version 32 adds the header storage's `committed` fact and operation stage.
 /// Version 33 adds the header storage's `reset` fact.
-pub const FORMAT_VERSION: u32 = 33;
+/// Version 34 adds a header prepare's `work` and `first` header.
+pub const FORMAT_VERSION: u32 = 34;
 
 /// What records mean: the identity grammar, the default-pick and default-draw
 /// rules, when `AdvanceTime` is enabled, and what `kind#n` counts.
@@ -613,7 +614,6 @@ mod tests {
             r#"{"fact":"committed","id":3,"generation":2,"state":"ab"}"#,
             "the `committed` fact's encoding changed, so bump FORMAT_VERSION and update this test"
         );
-        assert_eq!(FORMAT_VERSION, 33);
     }
 
     /// A header reset, logged when a `Reset` control step acts.
@@ -629,6 +629,45 @@ mod tests {
             r#"{"fact":"reset","kind":"invalidate","target":"cc","generation":3}"#,
             "the `reset` fact's encoding changed, so bump FORMAT_VERSION and update this test"
         );
+    }
+
+    /// A header prepare's request, with its summed `work` and `first`
+    /// header, and the format version that added them.
+    #[test]
+    fn prepare_storage_request_encoding_is_pinned() {
+        use crate::observe::{StorageBranch, StoragePoint, StorageRequest, WorkOwner, WorkScope};
+        let point = |height, hash: &str| StoragePoint {
+            height,
+            hash: hash.into(),
+        };
+        let request = StorageRequest::PrepareHeaderTarget {
+            owner: WorkOwner {
+                kind: "header".into(),
+                scope: WorkScope {
+                    header_generation: 2,
+                    branch: StorageBranch {
+                        anchor: "aa".into(),
+                        target: "bb".into(),
+                    },
+                },
+                verified_generation: None,
+                body_work_epoch: None,
+                session_id: 1,
+                request_id: 4,
+            },
+            source: "02".into(),
+            common_ancestor: point(0, "aa"),
+            target: point(3, "bb"),
+            headers: 3,
+            work: Some("12".into()),
+            first: Some(point(1, "cc")),
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"op":"prepare_header_target","owner":{"kind":"header","header_generation":2,"branch":{"anchor":"aa","target":"bb"},"session_id":1,"request_id":4},"source":"02","common_ancestor":{"height":0,"hash":"aa"},"target":{"height":3,"hash":"bb"},"headers":3,"work":"12","first":{"height":1,"hash":"cc"}}"#,
+            "a prepare's encoding changed, so bump FORMAT_VERSION and update this test"
+        );
+        assert_eq!(FORMAT_VERSION, 34);
     }
 
     /// Pins the block storage observations, one of each fact, request,

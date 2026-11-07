@@ -1534,6 +1534,12 @@ fn completions_carry_typed_identities() {
             common_ancestor: chain[2],
             target: Frontier::new(block::Height(4), next[0].hash()),
             headers: 1,
+            work: HeaderFixture::regtest()
+                .genesis_header()
+                .difficulty_threshold
+                .to_work()
+                .map(Into::into),
+            first: Some(Frontier::new(block::Height(4), next[0].hash())),
         }
     );
     assert_eq!(prepare.result, ResultIdentity::Prepared);
@@ -1578,6 +1584,44 @@ fn completions_carry_typed_identities() {
 /// B2: a `CapacityBusy` refusal names the signal it handed out, read from
 /// the registry: the peer's own lease, the ordinary class for a path
 /// beyond the reserve slot, and the reserve class when every slot is taken.
+/// A prepare's identity sums its headers' work from their targets, so a
+/// weighted branch logs more work per header, and a header whose target
+/// has no work leaves the sum unknown.
+#[test]
+fn a_prepares_work_is_summed_from_its_targets() {
+    let (port, chain) = chain(1);
+    let fixture = HeaderFixture::regtest().with_weight(1, 2);
+    let prepare = |headers: &[Arc<block::Header>], request_id| {
+        let request =
+            fixture.target_request(&port.engine().snapshot(), chain[0], headers, request_id);
+        run(&port, port.prepare_header_target(request)).1.request
+    };
+    let weighted = fixture.extend(chain[0], 3, 1);
+    let RequestIdentity::PrepareHeaderTarget { work, first, .. } = prepare(&weighted, 2) else {
+        panic!("a prepare has a prepare identity");
+    };
+    let per_header = fixture
+        .target(1)
+        .to_work()
+        .expect("fixture targets have work");
+    assert_eq!(
+        work.map(|work| work.as_u256()),
+        Some(per_header.as_u256() * 3)
+    );
+    assert_eq!(
+        first,
+        Some(Frontier::new(block::Height(2), weighted[0].hash()))
+    );
+
+    let mut workless = *fixture.extend(chain[0], 1, 2)[0];
+    workless.difficulty_threshold = zakura_chain::work::difficulty::INVALID_COMPACT_DIFFICULTY;
+    let RequestIdentity::PrepareHeaderTarget { work, .. } = prepare(&[Arc::new(workless)], 3)
+    else {
+        panic!("a prepare has a prepare identity");
+    };
+    assert_eq!(work, None);
+}
+
 #[test]
 fn refusals_name_the_signal_they_hand_out() {
     let (port, chain) = long_chain(4_001);

@@ -11,16 +11,11 @@
 //! - Missing evidence calls `missing_evidence` and is `NotApplicable`.
 //! - A reading records every peak. It holds while its quantity is within
 //!   its limit, and is violated past it.
-//! - An instance that judges events instead of steps gives findings. The
-//!   check records every peak, and reports the first finding as the verdict
-//!   and the rest as recorded violations.
 
 use crate::{
     property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Unit, Verdict},
     ObservationLog,
 };
-
-use super::{report, Finding};
 
 /// One reactor's instance of a resource bound.
 pub trait Bound<S: HasView> {
@@ -54,16 +49,6 @@ pub enum Reading<T> {
     MissingEvidence(String),
     /// The quantity at this boundary.
     Measured(Measured<T>),
-    /// The findings of an instance that judges events, since its last
-    /// check.
-    Findings {
-        /// Each named quantity's value by this step.
-        peaks: Vec<(&'static str, u64)>,
-        /// The violations found, in order.
-        findings: Vec<Finding>,
-        /// Whether the run reached an event the instance judges.
-        applicable: bool,
-    },
 }
 
 /// A bound's quantity at one boundary.
@@ -111,20 +96,6 @@ fn check<S: HasView, B: Bound<S>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             let (expected, actual) = B::violation(&reading);
             cx.violated(expected, actual)
         }
-        Reading::Findings {
-            peaks,
-            findings,
-            applicable,
-        } => {
-            for (name, value) in peaks {
-                cx.peak(name, value);
-            }
-            report(cx, findings).unwrap_or(if applicable {
-                Verdict::Holds
-            } else {
-                Verdict::NotApplicable
-            })
-        }
     }
 }
 
@@ -136,7 +107,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        check::{Phase, StepCtx, Violation},
+        check::{Phase, StepCtx},
         Identity,
     };
 
@@ -184,7 +155,6 @@ mod tests {
         verdict: Verdict,
         peaks: Vec<(&'static str, u64)>,
         missing: Option<String>,
-        recorded: Vec<Violation>,
     }
 
     /// The shared check's verdict on `reading`, and what it left behind.
@@ -209,7 +179,6 @@ mod tests {
             verdict,
             peaks: parts.peaks,
             missing: parts.missing,
-            recorded: parts.recorded,
         }
     }
 
@@ -220,14 +189,6 @@ mod tests {
             peaks: vec![("quantity", quantity)],
             terms: "terms",
         })
-    }
-
-    fn finding(expected: &str) -> Finding {
-        Finding {
-            step: 7,
-            expected: expected.to_owned(),
-            actual: "actual".to_owned(),
-        }
     }
 
     /// The expected and actual texts of a violated verdict.
@@ -263,38 +224,5 @@ mod tests {
         let judged = judge(measured(11, 10));
         assert_eq!(texts(&judged.verdict), ("at most 10 (terms)", "11"));
         assert_eq!(judged.peaks, [("quantity", 11)]);
-    }
-
-    #[test]
-    fn findings_record_their_peaks_and_report_the_first() {
-        let peaks = vec![("peak", 3)];
-        for applicable in [false, true] {
-            let judged = judge(Reading::Findings {
-                peaks: peaks.clone(),
-                findings: Vec::new(),
-                applicable,
-            });
-            let expected = if applicable {
-                Verdict::Holds
-            } else {
-                Verdict::NotApplicable
-            };
-            assert_eq!(judged.verdict, expected, "applicable: {applicable}");
-            assert_eq!(judged.peaks, peaks, "applicable: {applicable}");
-        }
-
-        let judged = judge(Reading::Findings {
-            peaks: peaks.clone(),
-            findings: vec![finding("first"), finding("second")],
-            applicable: false,
-        });
-        assert_eq!(texts(&judged.verdict), ("first", "actual"));
-        let recorded: Vec<&str> = judged
-            .recorded
-            .iter()
-            .map(|violation| violation.expected.as_str())
-            .collect();
-        assert_eq!(recorded, ["second"]);
-        assert_eq!(judged.peaks, peaks);
     }
 }

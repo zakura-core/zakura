@@ -9,26 +9,3 @@
 //! serves every instance's ID.
 
 pub mod bounds;
-
-use crate::property::{CheckCtx, HasView, Verdict};
-
-/// A violation a model found, for one property to report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Finding {
-    /// The step whose observations showed it.
-    pub step: u64,
-    /// What the property expected.
-    pub expected: String,
-    /// What the run did instead.
-    pub actual: String,
-}
-
-/// Reports `findings`: the first as the verdict, the rest recorded.
-pub fn report<S: HasView>(cx: &mut CheckCtx<'_, S>, findings: Vec<Finding>) -> Option<Verdict> {
-    let mut findings = findings.into_iter();
-    let first = findings.next()?;
-    for finding in findings {
-        cx.record_violation(finding.expected, finding.actual);
-    }
-    Some(cx.violated(first.expected, first.actual))
-}

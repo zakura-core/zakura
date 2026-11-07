@@ -37,6 +37,7 @@ use crate::{
         CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId, Source,
         Status, Subject, Unit, Verdict,
     },
+    record::machine::ReactorAction,
     storage::BLOCK_SERVICE,
     Observation, ObservationLog,
 };
@@ -292,6 +293,8 @@ pub struct SemanticModel {
     largest_queued_decoded: u64,
     /// The latest committed view's body work epoch.
     epoch: Option<u64>,
+    /// The newest body work epoch the reactor's authority reached.
+    authority_epoch: Option<u64>,
     /// The latest committed view's verified tip.
     verified_tip: u32,
     /// Whether the sequencer closed.
@@ -337,6 +340,10 @@ pub struct SemanticModel {
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
+    /// Whether a body left the sequencer's input queue after the reactor's
+    /// authority reached a newer body work epoch than the body's owner: a
+    /// body the sequencer must refuse as stale.
+    pub saw_old_epoch_body_dequeued: bool,
     /// Whether a verdict reached block sync while a submission holder still
     /// held its token.
     pub saw_verdict_while_held: bool,
@@ -673,6 +680,11 @@ impl SemanticModel {
                                 self.queued_decoded_peak.max(self.queued_decoded());
                         } else {
                             self.queued.remove(allocation);
+                            self.saw_old_epoch_body_dequeued |= body
+                                .owner
+                                .body_work_epoch
+                                .zip(self.authority_epoch)
+                                .is_some_and(|(owned, current)| owned < current);
                         }
                     }
                     BlockSyncHolder::Applying { allocation } => {
@@ -743,6 +755,10 @@ impl SemanticModel {
                 self.applying_decoded = applying.chain(detached).fold(0, u64::saturating_add);
             }
             BlockSyncFact::Reactor { transition, state } => {
+                if let ReactorAction::AuthorityChanged { authority, .. } = transition {
+                    self.authority_epoch =
+                        self.authority_epoch.max(Some(authority.body_work_epoch));
+                }
                 self.reactor_queries
                     .transition(self.step.unwrap_or_default(), transition, state);
             }

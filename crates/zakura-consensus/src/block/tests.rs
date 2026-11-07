@@ -23,7 +23,7 @@ use zakura_chain::{
         NetworkUpgrade,
     },
     primitives::Halo2Proof,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction::{
         arbitrary::{transaction_to_fake_v5, v5_transactions},
         LockTime, Transaction, UnminedTxId,
@@ -474,6 +474,191 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     block
 }
 
+/// A historical shielded spend for tests of blocks without transparent inputs.
+fn shielded_spend_without_transparent_inputs() -> Arc<Transaction> {
+    zakura_test::vectors::BLOCKS
+        .iter()
+        .find_map(|bytes| {
+            bytes
+                .zcash_deserialize_into::<Block>()
+                .expect("historical blocks deserialize")
+                .transactions
+                .into_iter()
+                .find(|tx| tx.has_shielded_inputs() && !tx.has_transparent_inputs())
+        })
+        .expect("historical fixtures include a shielded spend without transparent inputs")
+}
+
+#[test]
+fn coinbase_summary_ignores_coinbase_and_transparent_outputs() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, None);
+    assert!(block.transactions[0].has_transparent_outputs());
+    assert!(
+        !check::coinbase_is_first(&block)
+            .unwrap()
+            .has_transparent_spends
+    );
+
+    let shielded = shielded_spend_without_transparent_inputs();
+    for transparent_outputs in [false, true] {
+        // Only input presence is checked here; changing outputs does not preserve signatures.
+        let mut shielded = shielded.as_ref().clone();
+        *shielded.outputs_mut() = if transparent_outputs {
+            block.transactions[0].outputs().to_vec()
+        } else {
+            vec![]
+        };
+        block.transactions.truncate(1);
+        block.transactions.push(Arc::new(shielded));
+        let summary = check::coinbase_is_first(&block).unwrap();
+        assert!(!summary.has_transparent_spends);
+        assert!(std::ptr::eq(
+            summary.coinbase_tx,
+            block.transactions[0].as_ref()
+        ));
+    }
+}
+
+#[test]
+fn coinbase_summary_finds_late_transparent_inputs_and_still_checks_later_transactions() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    block
+        .transactions
+        .insert(1, shielded_spend_without_transparent_inputs());
+    assert!(
+        check::coinbase_is_first(&block)
+            .unwrap()
+            .has_transparent_spends
+    );
+
+    block.transactions.push(block.transactions[0].clone());
+    assert_eq!(
+        check::coinbase_is_first(&block).unwrap_err(),
+        BlockError::Transaction(TransactionError::CoinbaseAfterFirst),
+        "finding a transparent spend must not skip later coinbase validation"
+    );
+}
+
+/// Cross-transaction duplicates need no parent or script work, but the body must first
+/// match the transaction Merkle root before its failure can be attributed to the header.
+#[tokio::test]
+async fn duplicate_transparent_spends_reject_before_parent_reads_and_transaction_checks() {
+    use zakura_header_chain::{BodyCommitmentKind, BodyRuleId, BodyVerificationClass};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let outpoint = block.transactions[1].spent_outpoints().next().unwrap();
+    let mut second = block.transactions[1].as_ref().clone();
+    let Transaction::V5 { inputs, .. } = &mut second else {
+        unreachable!("the prepared transaction is V5")
+    };
+    let transparent::Input::PrevOut { sequence, .. } = &mut inputs[0] else {
+        unreachable!("the prepared transaction spends a transparent output")
+    };
+    *sequence = 1;
+    block.transactions.push(Arc::new(second));
+    assert_ne!(block.transactions[1].hash(), block.transactions[2].hash());
+    block
+        .transactions
+        .insert(1, shielded_spend_without_transparent_inputs());
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+
+    for matching_root in [false, true] {
+        let mut block = block.clone();
+        if !matching_root {
+            Arc::make_mut(&mut block.header).merkle_root.0[0] ^= 1;
+        }
+        let block = Arc::new(block);
+        for proposal in [false, true] {
+            let state = service_fn(|request: zs::Request| async move {
+                match request {
+                    zs::Request::KnownBlock(_) => Ok::<_, BoxError>(zs::Response::KnownBlock(None)),
+                    _ => panic!("duplicate spends require no parent or binding read: {request:?}"),
+                }
+            });
+            let transaction =
+                service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+                    panic!("duplicate spends must be rejected before transaction verification");
+                });
+            let request = if proposal {
+                Request::CheckProposal(block.clone().into())
+            } else {
+                Request::Commit(block.clone().into())
+            };
+            let error = SemanticBlockVerifier::new(
+                &network,
+                crate::transaction::boxed_state(state),
+                crate::transaction::boxed_transaction_verifier(transaction),
+            )
+            .oneshot(request)
+            .await
+            .expect_err("the block has a mismatched root or a duplicate spend");
+            if matching_root {
+                assert!(
+                    matches!(&error, VerifyBlockError::Commit(
+                        zs::CommitBlockError::ValidateContextError(source)
+                    ) if matches!(source.as_ref(), zs::ValidateContextError::DuplicateTransparentSpend {
+                        outpoint: found, ..
+                    } if *found == outpoint)),
+                    "{error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 100);
+                assert_eq!(
+                    error.body_verification_class(),
+                    BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                        "context.duplicate_transparent_spend"
+                    ))
+                );
+                assert!(error.rejects_template());
+            } else {
+                assert_eq!(
+                    error.body_verification_class(),
+                    BodyVerificationClass::PayloadMismatch(
+                        BodyCommitmentKind::TransactionMerkleRoot
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_transparent_spends_keep_internal_duplicates_in_transaction_checks() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let transaction = Arc::make_mut(&mut block.transactions[1]);
+    let Transaction::V5 { inputs, .. } = transaction else {
+        unreachable!("the prepared transaction is V5")
+    };
+    inputs.push(inputs[0].clone());
+    assert!(check::transparent_spends_are_unique(&block).is_ok());
+    let error = tx::check::spend_conflicts(&block.transactions[1]).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionError::DuplicateTransparentSpend(_)
+    ));
+    assert_eq!(error.mempool_misbehavior_score(), 0);
+}
+
+#[test]
+fn duplicate_transparent_spends_distinguish_output_indices() {
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let mut block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let mut second = block.transactions[1].as_ref().clone();
+    let Transaction::V5 { inputs, .. } = &mut second else {
+        unreachable!("the prepared transaction is V5")
+    };
+    let transparent::Input::PrevOut { outpoint, .. } = &mut inputs[0] else {
+        unreachable!("the prepared transaction spends a transparent output")
+    };
+    outpoint.index = 1;
+    block.transactions.push(Arc::new(second));
+    assert!(check::transparent_spends_are_unique(&block).is_ok());
+}
+
 /// A future header time is rejected before any transaction is verified. Proposals fail on it at
 /// once; a committed block first checks that the delivered body is the header's, so a tampered
 /// body under a future-timed header is still reported as a payload mismatch.
@@ -789,6 +974,7 @@ async fn mined_orphan_replays_skip_transaction_verification() {
         .await
         .unwrap()
         .call(Request::CommitMined {
+            size: candidate.zcash_serialized_size(),
             block: candidate.into(),
             admission: zs::BlockAdmission::pending(),
         })
@@ -822,6 +1008,7 @@ async fn assert_prepared_commit_rejects(
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: solved.zcash_serialized_size(),
             block: Arc::new(solved).into(),
             admission: zs::BlockAdmission::pending(),
         })
@@ -883,6 +1070,7 @@ async fn prepared_mined_commit_rechecks_difficulty() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: solved.zcash_serialized_size(),
             block: Arc::new(solved).into(),
 
             admission: zs::BlockAdmission::pending(),
@@ -1015,6 +1203,7 @@ async fn preparation_rejects_invalid_merkle_content_before_caching() {
                     source,
                 },
                 Request::CommitMined {
+                    size: candidate.zcash_serialized_size(),
                     block: candidate.clone().into(),
                     admission: zs::BlockAdmission::pending(),
                 },
@@ -1105,6 +1294,7 @@ async fn failed_preparation_does_not_populate_the_cache() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: candidate.zcash_serialized_size(),
             block: candidate.into(),
             admission: zs::BlockAdmission::pending(),
         })
@@ -1317,6 +1507,7 @@ async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: tampered.zcash_serialized_size(),
             block: Arc::new(tampered).into(),
 
             admission: zs::BlockAdmission::pending(),
@@ -1391,6 +1582,7 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         .await
         .expect("the verifier is ready")
         .call(Request::CommitMined {
+            size: conflicting_proposal.zcash_serialized_size(),
             block: conflicting_proposal.into(),
             admission: admission.clone(),
         })
@@ -1474,6 +1666,7 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         .await
         .expect("the prepared verifier is ready")
         .call(Request::CommitMined {
+            size: block.zcash_serialized_size(),
             block: block.into(),
 
             admission: zs::BlockAdmission::pending(),
@@ -1493,7 +1686,18 @@ async fn prepared_and_full_commits_produce_the_same_state_input() {
         assert!(block.receipt_order.take().is_some());
         block
     };
-    assert_eq!(take_commit(&prepared_commit), take_commit(&full_commit));
+    let mut prepared = take_commit(&prepared_commit);
+    let full = take_commit(&full_commit);
+    assert_eq!(full.origin, zs::BlockOrigin::Network);
+    assert_eq!(
+        prepared.origin,
+        zs::BlockOrigin::LocalSubmission {
+            size: prepared.block.zcash_serialized_size(),
+        }
+    );
+    // Origin selects relay ordering; it does not change the verified block's state effects.
+    prepared.origin = full.origin;
+    assert_eq!(prepared, full);
 }
 
 /// Outputs read at the parent go to the transaction checks but never join the block's own
@@ -1733,7 +1937,7 @@ fn owned_block_view_preserves_consensus_checks_and_charge() -> Result<(), Report
     let pool = DecodedBlockPool::for_pipeline(std::num::NonZeroU64::MAX, bytes);
     let owner = pool.try_admit(block, Admission::WithinLimit).unwrap();
     let view: &BlockRef = &owner;
-    let coinbase = check::coinbase_is_first(&owner)?;
+    let coinbase = check::coinbase_is_first(&owner)?.coinbase_tx;
     let retained = owner.transaction(0).unwrap();
     assert!(std::ptr::eq(coinbase, &*retained));
     assert!(std::ptr::eq(
@@ -1765,8 +1969,16 @@ fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
             .zcash_deserialize_into::<Block>()
             .expect("block is structurally valid");
 
-        check::coinbase_is_first(&block)
+        let summary = check::coinbase_is_first(&block)
             .expect("the coinbase in a historical block should be valid");
+        assert_eq!(
+            summary.has_transparent_spends,
+            block
+                .transactions
+                .iter()
+                .any(|tx| tx.spent_outpoints().next().is_some()),
+            "the summary must agree with transparent outpoints across transaction versions"
+        );
     }
 
     Ok(())
@@ -2176,7 +2388,7 @@ fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
         let height = Height(height);
         if height > network.slow_start_shift() {
             let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
-            let coinbase_tx = check::coinbase_is_first(&block)?;
+            let coinbase_tx = check::coinbase_is_first(&block)?.coinbase_tx;
 
             let expected_block_subsidy = block_subsidy(height, &network, None)?;
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
@@ -2222,7 +2434,7 @@ fn miner_fees_validation_failure() -> Result<(), Report> {
 
     assert_eq!(
         check::miner_fees_are_valid(
-            check::coinbase_is_first(&block)?,
+            check::coinbase_is_first(&block)?.coinbase_tx,
             height,
             // Set the miner fee to an invalid amount.
             Amount::zero(),
@@ -3872,6 +4084,8 @@ async fn malformed_headers_do_not_stop_buffered_verification() {
         for request in [
             Request::Commit(malformed.clone().into()),
             Request::CommitMined {
+                // An invalid header must be rejected before its body or size is used.
+                size: 0,
                 block: malformed.into(),
                 admission: zs::BlockAdmission::pending(),
             },
@@ -3937,6 +4151,12 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                         zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
                             block, ..
                         } => {
+                            assert_eq!(
+                                block.origin,
+                                zs::BlockOrigin::LocalSubmission {
+                                    size: block.block.zcash_serialized_size(),
+                                }
+                            );
                             received.lock().unwrap().push(
                                 block
                                     .receipt_order
@@ -3973,6 +4193,7 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
                 .unwrap();
         }
         let request = || Request::CommitMined {
+            size: candidate.zcash_serialized_size(),
             block: candidate.clone().into(),
             admission: zs::BlockAdmission::pending(),
         };
@@ -4001,7 +4222,11 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         for cache_hit in [false, true] {
             let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
-            let (state, _, tip, _) = zs::init_test_services(&network).await;
+            let zakura_state::InitializedState {
+                state,
+                latest_chain_tip: tip,
+                ..
+            } = zs::init_test_services(&network).await;
             let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
                 .zcash_deserialize_into()
                 .unwrap();
@@ -4049,10 +4274,12 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
             // duplicate A finish before it, using the real state's deduplication.
             let early_a = verifier.call(Request::Commit(a.clone().into()));
             let later_b = verifier.call(Request::CommitMined {
+                size: b.zcash_serialized_size(),
                 block: b.clone().into(),
                 admission: zs::BlockAdmission::pending(),
             });
             let duplicate_a = verifier.call(Request::CommitMined {
+                size: a.zcash_serialized_size(),
                 block: Arc::new(a.as_ref().clone()).into(),
                 admission: zs::BlockAdmission::pending(),
             });

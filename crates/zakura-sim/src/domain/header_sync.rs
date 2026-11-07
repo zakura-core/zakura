@@ -9,10 +9,12 @@ use crate::{
         capacity::{BoundaryRead, CapacityEvidence},
         claim::{Claim, ClaimEvidence, SettlementEvidence},
         stale::StaleEvidence,
+        wake::{WakeEvidence, WakeFact},
     },
     property::{
-        CheckCtx, EndViolation, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
-        TriggerHistory, Unit, Verdict,
+        CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind, LivenessBound,
+        ObligationKey, Property, PropertyId, Source, Status, Subject, TriggerHistory, Unit,
+        Verdict,
     },
     ObservationLog,
 };
@@ -292,6 +294,102 @@ where
     } else {
         Verdict::NotApplicable
     }
+}
+
+/// In the wake fixture, a budget return that leaves room for an offer
+/// waiting for header room gets that offer's locator read to storage
+/// before the reactor goes quiet.
+pub const CAPACITY_RELEASE_WAKES: &str = "header-sync/capacity-release-wakes";
+
+/// What the release-wake check reads: one reactor's wake facts.
+pub trait WakeView {
+    /// The reactor's wake facts.
+    fn wake(&self) -> &WakeEvidence;
+}
+
+/// [`CAPACITY_RELEASE_WAKES`], as a harness whose view is a [`WakeView`]
+/// registers it. It applies only where the harness declared the wake
+/// fixture ([`crate::harness::header_node::wake`]).
+pub fn capacity_release_wakes<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: WakeView,
+{
+    Property {
+        id: PropertyId::new(CAPACITY_RELEASE_WAKES),
+        claim: "in the wake fixture, a header budget return that leaves room for an offer \
+                waiting for it gets that offer's locator read to storage before quiescence, \
+                unless its session ends",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_release_wake::<S>,
+        witness: Some(TriggerHistory::View(wake_opened::<S::View>)),
+    }
+}
+
+/// Checks [`CAPACITY_RELEASE_WAKES`] at the boundary after a step.
+///
+/// Each wake the step's facts opened ([`WakeFact::Opened`]) obliges the
+/// waiting peer's locator read to reach storage before quiescence. The
+/// read's submission or the waiting session's end answers it, and a
+/// deferred cached pass moves its deadline to the pass's refill. It applies
+/// once a release opened a wake.
+fn check_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: WakeView,
+{
+    let view = cx.view();
+    for stamp in cx.new_stamps().to_vec() {
+        if let Some(WakeFact::Opened { peer, session_id }) = view.wake().fact(stamp) {
+            let subject = Subject::Session(wake_subject(&peer, session_id));
+            let obligation = cx.fact_obligation(Some(stamp), subject, wake_answer::<S::View>);
+            cx.oblige(obligation);
+        }
+    }
+    if view.wake().any_opened() {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// The obligation subject of `peer`'s session `session_id`'s wake.
+fn wake_subject(peer: &zakura_network::zakura::ZakuraPeerId, session_id: u64) -> String {
+    format!("{}#{session_id}", crate::storage::hex(&peer.digest()))
+}
+
+/// What the wake fact with `stamp` means for the wake `key` names, as
+/// [`check_release_wake`] describes.
+fn wake_answer<V: WakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let Subject::Session(subject) = &key.subject else {
+        return FactAnswer::Unrelated;
+    };
+    match view.wake().fact(stamp) {
+        Some(WakeFact::Submitted { peer })
+            if subject
+                .strip_prefix(&crate::storage::hex(&peer.digest()))
+                .is_some_and(|rest| rest.starts_with('#')) =>
+        {
+            FactAnswer::Discharges
+        }
+        Some(WakeFact::Ended { peer, session_id })
+            if *subject == wake_subject(&peer, session_id) =>
+        {
+            FactAnswer::Discharges
+        }
+        Some(WakeFact::Deferred { until }) => FactAnswer::DefersTo(until),
+        _ => FactAnswer::Unrelated,
+    }
+}
+
+/// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a release opened a wake.
+fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
+    view.wake().any_opened()
 }
 
 /// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended

@@ -141,6 +141,7 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-triggers" | "header-storage-stale-prepare" => {
             value(StorageScenario::triggers())
         }
+        "header-release-wake" => value(StorageScenario::release_wake()),
         _ => None,
     }
 }

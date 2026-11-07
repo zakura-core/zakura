@@ -29,7 +29,7 @@ use super::{
     header_node::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
-        claim::ClaimEvidence,
+        claim::{ClaimEvidence, RoundEvidence},
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
@@ -46,7 +46,10 @@ use super::{
 };
 use crate::{
     domain::{
-        header_sync::{chunk_budget_bound, BudgetView},
+        header_sync::{
+            chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
+            TeardownView,
+        },
         session::{honest_never_punished, HonestPeers},
     },
     observe::StorageFact,
@@ -536,6 +539,9 @@ pub struct Ports {
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
+    /// The node's released rounds at each drain, which its tap keeps during
+    /// the run.
+    pub rounds: RoundEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -549,6 +555,8 @@ pub struct Storage {
     capacity: CapacityEvidence,
     /// The claim rules the node's tap found broken.
     claims: ClaimEvidence,
+    /// The node's released rounds, from its tap.
+    rounds: RoundEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -581,6 +589,8 @@ pub struct StorageView {
     /// The claim rules the node's tap found broken, at the step that found
     /// each.
     pub claims: ClaimEvidence,
+    /// The node's released rounds at each drain.
+    pub rounds: RoundEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -592,6 +602,18 @@ impl BudgetView for StorageView {
     /// [`StorageView::claims`].
     fn claims(&self) -> &ClaimEvidence {
         &self.claims
+    }
+}
+
+impl TeardownView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::rounds`].
+    fn rounds(&self) -> &RoundEvidence {
+        &self.rounds
     }
 }
 
@@ -617,19 +639,23 @@ impl HasView for Storage {
             faults: self.faults.clone(),
             capacity: self.capacity.clone(),
             claims: self.claims.clone(),
+            rounds: self.rounds.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence, for
-    /// the tip and penalty rules.
+    /// Records the run's end in the node's adoption, fault and round
+    /// evidence, for the tip, penalty and teardown rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
+        self.rounds.end(end);
     }
 
-    /// [`fault_end_violations`].
+    /// [`fault_end_violations`] and [`teardown_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        fault_end_violations(&self.faults, log)
+        let mut found = fault_end_violations(&self.faults, log);
+        found.extend(teardown_end_violations(&self.rounds));
+        found
     }
 }
 
@@ -718,6 +744,7 @@ impl Subsystem for Storage {
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
+            rounds: RoundEvidence::default(),
         }
     }
 
@@ -742,9 +769,11 @@ impl Subsystem for Storage {
             ports.sessions.clone(),
             ports.reservations.clone(),
             ports.capacity.clone(),
+            ports.rounds.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
+
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -810,6 +839,7 @@ impl Subsystem for Storage {
             adoption,
             capacity: ports.capacity,
             claims,
+            rounds: ports.rounds,
             faults,
             topology,
         }
@@ -908,6 +938,9 @@ pub struct WirePorts {
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
+    /// The node's released rounds at each drain, which its tap keeps during
+    /// the run.
+    pub rounds: RoundEvidence,
 }
 
 impl WirePorts {
@@ -940,6 +973,8 @@ pub struct HeaderWire {
     capacity: CapacityEvidence,
     /// The claim rules the node's tap found broken.
     claims: ClaimEvidence,
+    /// The node's released rounds, from its tap.
+    rounds: RoundEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -966,21 +1001,25 @@ impl HasView for HeaderWire {
             faults: self.faults.clone(),
             capacity: self.capacity.clone(),
             claims: self.claims.clone(),
+            rounds: self.rounds.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence and
-    /// its session view, for the tip and penalty rules and the own-9 end
-    /// check.
+    /// Records the run's end in the node's adoption, fault and round
+    /// evidence and its session view, for the tip, penalty and teardown
+    /// rules and the own-9 end check.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
         self.sessions.end(end);
+        self.rounds.end(end);
     }
 
-    /// [`fault_end_violations`].
+    /// [`fault_end_violations`] and [`teardown_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        fault_end_violations(&self.faults, log)
+        let mut found = fault_end_violations(&self.faults, log);
+        found.extend(teardown_end_violations(&self.rounds));
+        found
     }
 }
 
@@ -1056,6 +1095,7 @@ impl Subsystem for HeaderWire {
             records: PeerRecords::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
+            rounds: RoundEvidence::default(),
         }
     }
 
@@ -1091,9 +1131,11 @@ impl Subsystem for HeaderWire {
             ports.sessions.clone(),
             ports.reservations.clone(),
             ports.capacity.clone(),
+            ports.rounds.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
+
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
         sim.add_source(Box::new(storage.with_tap(tap)));
@@ -1168,6 +1210,7 @@ impl Subsystem for HeaderWire {
             adoption,
             capacity: ports.capacity,
             claims,
+            rounds: ports.rounds,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),
@@ -1269,10 +1312,12 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 }
 
 /// The storage harness's properties, [`OPERATION_IDS`],
-/// [`DIRECT_DISPATCH`] and [`CHUNK_BUDGET_BOUND`], all active. A test
-/// harness that wraps [`Storage`] with its view registers them too.
+/// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`] and
+/// [`TEARDOWN_RETURNS_BASELINE`], all active. A test harness that wraps
+/// [`Storage`] with its view registers them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
+/// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1297,6 +1342,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             witness: None,
         },
         chunk_budget_bound(),
+        teardown_returns_baseline(),
     ]
 }
 

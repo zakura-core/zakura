@@ -27,10 +27,16 @@ type Seed = (&'static str, fn() -> StorageScenario);
 
 /// The witness each seed carries, by stem: a property its run holds, which a
 /// planted case's patch on the same input violates.
-const WITNESSES: [(&str, &str); 1] = [(
-    "header-storage-close-relink",
-    "header-sync/chunk-budget-bound",
-)];
+const WITNESSES: [(&str, &str); 2] = [
+    (
+        "header-storage-close-relink",
+        "header-sync/chunk-budget-bound",
+    ),
+    (
+        "header-storage-close-relink",
+        "header-sync/teardown-returns-baseline",
+    ),
+];
 
 /// Every seed.
 const SEEDS: [Seed; 5] = [

@@ -10,3 +10,7 @@ source = "crates/zakura-sim/tests/header_storage_seeds.rs"
 [[witness]]
 property = "header-sync/chunk-budget-bound"
 expect = "holds"
+
+[[witness]]
+property = "header-sync/teardown-returns-baseline"
+expect = "holds"

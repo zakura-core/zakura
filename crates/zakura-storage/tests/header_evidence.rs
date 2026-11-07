@@ -17,7 +17,10 @@ use zakura_node_services::header_chain::{
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
     controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
-    evidence::{LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, OwnerState, StateField},
+    evidence::{
+        LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, OwnerState, ResultIdentity,
+        StateField,
+    },
     fixture::HeaderFixture,
     Fault, Outcome,
 };
@@ -505,7 +508,7 @@ fn a_commit_of_a_read_is_unexpected() {
 }
 
 /// A committed apply ran its engine outcome at the commit, so its delivery
-/// can't report a fault.
+/// can't report a fault, even one whose result matches it.
 #[test]
 fn a_committed_apply_delivered_as_a_fault_is_unexpected() {
     let (port, chain) = chain(1);
@@ -526,6 +529,7 @@ fn a_committed_apply_delivered_as_a_fault_is_unexpected() {
         panic!("a delivery publishes its completion");
     };
     completion.outcome = Outcome::Fault(Fault::LocalResource);
+    completion.result = ResultIdentity::Fault(Fault::LocalResource);
     let forged = facts[0].kind.clone();
     assert_eq!(
         model.apply(&facts),

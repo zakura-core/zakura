@@ -127,3 +127,174 @@ fn check<S: HasView, B: Bound<S>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
+
+    use super::*;
+    use crate::{
+        check::{Phase, StepCtx, Violation},
+        Identity,
+    };
+
+    /// A harness whose view is the next reading, which the test sets.
+    #[derive(Default)]
+    struct Scripted(RefCell<Option<Reading<&'static str>>>);
+
+    impl HasView for Scripted {
+        type View = Option<Reading<&'static str>>;
+
+        fn view(&self) -> Self::View {
+            self.0.borrow_mut().take()
+        }
+    }
+
+    /// A bound that gives the scripted reading.
+    struct ScriptedBound;
+
+    fn no_witness(_: &ObservationLog) -> bool {
+        false
+    }
+
+    impl Bound<Scripted> for ScriptedBound {
+        const ID: &'static str = "test/scripted-bound";
+        const CLAIM: &'static str = "the scripted quantity stays within its limit";
+        const UNIT: Unit = Unit::WireBytes;
+        const NEEDS: &'static [Source] = &[Source::View];
+        const WITNESS: fn(&ObservationLog) -> bool = no_witness;
+        type Terms = &'static str;
+
+        fn read(cx: &CheckCtx<'_, Scripted>) -> Reading<&'static str> {
+            cx.view().expect("each check reads one scripted reading")
+        }
+
+        fn violation(reading: &Measured<&'static str>) -> (String, String) {
+            (
+                format!("at most {} ({})", reading.limit, reading.terms),
+                format!("{}", reading.quantity),
+            )
+        }
+    }
+
+    /// What the shared check left after one reading.
+    struct Judged {
+        verdict: Verdict,
+        peaks: Vec<(&'static str, u64)>,
+        missing: Option<String>,
+        recorded: Vec<Violation>,
+    }
+
+    /// The shared check's verdict on `reading`, and what it left behind.
+    fn judge(reading: Reading<&'static str>) -> Judged {
+        let harness = Scripted(RefCell::new(Some(reading)));
+        let registered = [bound::<Scripted, ScriptedBound>()];
+        let log = ObservationLog::default();
+        let pick = Identity::advance_time(SimInstant::ZERO);
+        let step = StepCtx {
+            step: 7,
+            pick: &pick,
+            enabled: &[],
+            phase: Phase::Live,
+            now: SimInstant::ZERO,
+            status: SchedulerStatus::Quiescent,
+            log: &log,
+        };
+        let mut cx = CheckCtx::new(&step, &harness, &registered[0], &registered);
+        let verdict = (registered[0].check)(&mut cx);
+        let parts = cx.into_parts();
+        Judged {
+            verdict,
+            peaks: parts.peaks,
+            missing: parts.missing,
+            recorded: parts.recorded,
+        }
+    }
+
+    fn measured(quantity: u64, limit: u64) -> Reading<&'static str> {
+        Reading::Measured(Measured {
+            quantity,
+            limit,
+            peaks: vec![("quantity", quantity)],
+            terms: "terms",
+        })
+    }
+
+    fn finding(expected: &str) -> Finding {
+        Finding {
+            step: 7,
+            expected: expected.to_owned(),
+            actual: "actual".to_owned(),
+        }
+    }
+
+    /// The expected and actual texts of a violated verdict.
+    fn texts(verdict: &Verdict) -> (&str, &str) {
+        match verdict {
+            Verdict::Violated(violation) => (&violation.expected, &violation.actual),
+            other => panic!("expected a violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_step_off_the_boundary_is_not_applicable_and_records_nothing() {
+        let judged = judge(Reading::Unjudged);
+        assert_eq!(judged.verdict, Verdict::NotApplicable);
+        assert!(judged.peaks.is_empty());
+        assert_eq!(judged.missing, None);
+    }
+
+    #[test]
+    fn missing_evidence_is_reported_and_not_applicable() {
+        let judged = judge(Reading::MissingEvidence("holder gap".to_owned()));
+        assert_eq!(judged.verdict, Verdict::NotApplicable);
+        assert_eq!(judged.missing.as_deref(), Some("holder gap"));
+        assert!(judged.peaks.is_empty());
+    }
+
+    #[test]
+    fn a_quantity_at_its_limit_holds_and_one_past_it_violates() {
+        let judged = judge(measured(10, 10));
+        assert_eq!(judged.verdict, Verdict::Holds);
+        assert_eq!(judged.peaks, [("quantity", 10)]);
+
+        let judged = judge(measured(11, 10));
+        assert_eq!(texts(&judged.verdict), ("at most 10 (terms)", "11"));
+        assert_eq!(judged.peaks, [("quantity", 11)]);
+    }
+
+    #[test]
+    fn findings_record_their_peaks_and_report_the_first() {
+        let peaks = vec![("peak", 3)];
+        for applicable in [false, true] {
+            let judged = judge(Reading::Findings {
+                peaks: peaks.clone(),
+                findings: Vec::new(),
+                applicable,
+            });
+            let expected = if applicable {
+                Verdict::Holds
+            } else {
+                Verdict::NotApplicable
+            };
+            assert_eq!(judged.verdict, expected, "applicable: {applicable}");
+            assert_eq!(judged.peaks, peaks, "applicable: {applicable}");
+        }
+
+        let judged = judge(Reading::Findings {
+            peaks: peaks.clone(),
+            findings: vec![finding("first"), finding("second")],
+            applicable: false,
+        });
+        assert_eq!(texts(&judged.verdict), ("first", "actual"));
+        let recorded: Vec<&str> = judged
+            .recorded
+            .iter()
+            .map(|violation| violation.expected.as_str())
+            .collect();
+        assert_eq!(recorded, ["second"]);
+        assert_eq!(judged.peaks, peaks);
+    }
+}

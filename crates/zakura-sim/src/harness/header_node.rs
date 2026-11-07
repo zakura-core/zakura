@@ -30,7 +30,7 @@ pub mod wake;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     pin::pin,
     rc::Rc,
@@ -677,37 +677,29 @@ async fn flood(far: FarEnd) {
     }
 }
 
-/// Relinks each mirror whose index `starts` delivers to the node under test
-/// as its dialer, all of them once per scheduling step, until the node's
-/// shutdown. Each relink replaces the mirror's session, so the node's
-/// lifecycle queue takes a disconnect and a connect for it every time.
+/// Relinks the mirror whose index `start` delivers to the node under test
+/// as its dialer, once per scheduling step, until the node's shutdown. Each
+/// relink replaces the mirror's session, so the node's lifecycle queue
+/// takes a disconnect and a connect every time.
 ///
 /// Opening a link has scheduling points, so a `Shutdown` can be picked and
 /// sweep the node's links while one is half open. The sweep then misses
 /// it, so a relink that returns after the pick closes its own link and
 /// stops. The pick sets [`Topology::stopping`] before the sweep runs, so a
 /// link the check passes is already in the sweep's copy.
-async fn churn(topology: Rc<Topology>, mut starts: mpsc::Receiver<usize>) {
-    let mut churning = Vec::new();
+async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
+    let Some(index) = start.recv().await else {
+        return;
+    };
+    drop(start);
     loop {
-        if churning.is_empty() {
-            match starts.recv().await {
-                Some(index) => churning.push(index),
-                None => return,
-            }
+        if topology.stopping() {
+            return;
         }
-        while let Ok(index) = starts.try_recv() {
-            churning.push(index);
-        }
-        for &index in &churning {
-            if topology.stopping() {
-                return;
-            }
-            let link = topology.link(index, 0);
-            if topology.stopping() {
-                link.close();
-                return;
-            }
+        let (link, _far) = topology.open(index, 0, true);
+        link.close();
+        if topology.stopping() {
+            return;
         }
         zakura_rt::task::yield_now().await;
     }
@@ -1161,8 +1153,8 @@ pub struct ControlStep {
 /// harness's own state, so the step loop carries it out at its pick,
 /// outside any task, as storage completions are. It's offered only once the
 /// task has carried out every earlier step, so the script keeps its order.
-/// A churn step hands its mirror to a churn task, which relinks it from
-/// then on.
+/// A churn step hands its mirror to its own churn task, which relinks it
+/// from then on.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
@@ -1196,16 +1188,18 @@ impl Control {
         let task_topology = topology.clone();
         let queued = Rc::new(Cell::new(0));
         let task_queued = queued.clone();
-        let churns = script
+        // One task per churn step, so each churned mirror competes for
+        // steps on its own. The control task starts them in script order.
+        let mut to_churn: VecDeque<mpsc::Sender<usize>> = script
             .iter()
             .filter(|step| step.action == ControlAction::Churn)
-            .count();
-        let to_churn = (churns > 0).then(|| {
-            let (to_churn, churning) = mpsc::channel::<usize>(churns);
-            sim.scheduler()
-                .spawn_root("churn", churn(topology.clone(), churning));
-            to_churn
-        });
+            .map(|_| {
+                let (start, started) = mpsc::channel::<usize>(1);
+                sim.scheduler()
+                    .spawn_root("churn", churn(topology.clone(), started));
+                start
+            })
+            .collect();
         let task_fixture = fixture.clone();
         sim.scheduler().spawn_root("control", async move {
             let fixture = task_fixture;
@@ -1227,14 +1221,13 @@ impl Control {
                     ControlAction::Flood => topology.flood(&step.peer),
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
-                        // The churn task stops at a shutdown, which can be
+                        let start = to_churn
+                            .pop_front()
+                            .expect("each churn step has its own task");
+                        // The churn task gives up at a shutdown, which can be
                         // picked while this step waits in the queue. Its
                         // mirror then has nothing left to churn.
-                        let _ = to_churn
-                            .as_ref()
-                            .expect("a script with a churn step spawns the churn task")
-                            .send(index)
-                            .await;
+                        let _ = start.send(index).await;
                     }
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }

@@ -22,7 +22,7 @@ use std::{
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion};
 use zakura_network::zakura::{
-    observe::{ReactorCause, ReactorEvent},
+    observe::{EventQueue, ReactorCause, ReactorEvent, TakePoint},
     Status, ZakuraPeerId,
 };
 
@@ -129,9 +129,16 @@ pub enum AdoptionFact {
         /// Its header generation.
         header_generation: HeaderGeneration,
     },
-    /// The reactor took a lifecycle or wire event: a `CauseSet` to
-    /// `Event`.
-    EventTaken,
+    /// `EventTaken`: the reactor took an event from `queue` at `point`,
+    /// leaving `queued` more there.
+    EventTaken {
+        /// The queue.
+        queue: EventQueue,
+        /// Where in the turn.
+        point: TakePoint,
+        /// The events left in the queue.
+        queued: usize,
+    },
     /// The reactor reached its turn's cached pass: a `CauseSet` to `Pass`,
     /// once per turn of its run loop.
     Pass,
@@ -193,11 +200,22 @@ impl AdoptionFact {
         })
     }
 
-    /// The fact a `CauseSet` to `cause` gives this store, if any.
-    pub(super) fn of_cause(cause: &ReactorCause) -> Option<Self> {
-        match cause {
-            ReactorCause::Event => Some(AdoptionFact::EventTaken),
-            ReactorCause::Pass => Some(AdoptionFact::Pass),
+    /// The turn fact `event` gives this store, if any: an `EventTaken`, or
+    /// a `CauseSet` to `Pass`. Both stay out of the log.
+    pub(super) fn of_turn(event: &ReactorEvent) -> Option<Self> {
+        match event {
+            ReactorEvent::EventTaken {
+                queue,
+                point,
+                queued,
+            } => Some(AdoptionFact::EventTaken {
+                queue: *queue,
+                point: *point,
+                queued: *queued,
+            }),
+            ReactorEvent::CauseSet {
+                cause: ReactorCause::Pass,
+            } => Some(AdoptionFact::Pass),
             _ => None,
         }
     }

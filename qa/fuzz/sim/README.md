@@ -544,17 +544,24 @@ The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
 each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
 runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
 `cargo xtask planted --shard <index>/7`, so each case runs once a week. A
-remote host runs the rest, including `cargo xtask planted --targets`, and its
-results never block a pull request.
+case's shard follows from its position in path order. Adding or removing a
+case moves every later case to another shard, so across that change a case
+can run on two nights in a row or wait up to 13 nights. A remote host runs
+the rest, including `cargo xtask planted --targets`, and its results never
+block a pull request. No CI job runs `planted --targets`.
 
-`scripts/sim-long-runs.sh` runs them from a checkout on that host. It runs
+`scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
+writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs
 `cargo xtask planted` over the whole catalogue, then
 `cargo xtask planted --targets`. With `--seconds`, it then builds every
-target in [Targets](#targets) and runs one [campaign](#campaigns) per
+target in [Targets](#targets), and then runs one [campaign](#campaigns) per
 target, all at once, each with the suite row's libFuzzer limits. Each
-target's store is `<out>/campaigns/<target>/`. The script fails if a
-planted check fails, or if a campaign fails to build or start. A campaign's
-findings don't fail it; read them with `cargo xtask sim-campaign evidence`.
+target's store is `campaigns/<target>/` in the run's directory, and each
+campaign starts from the harness's curated seeds. A failed step doesn't stop
+the later ones. The script fails if a planted check fails, if a campaign
+fails to build or start, or if a campaign doesn't end `complete`. Findings
+alone don't change a campaign's status; read them with
+`cargo xtask sim-campaign evidence`.
 
 ```console
 # Push the commit to the host's checkout, then start the run detached.

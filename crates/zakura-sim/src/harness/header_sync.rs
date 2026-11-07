@@ -823,6 +823,9 @@ pub struct WirePorts {
     pub chains: Vec<Option<Arc<HonestChain>>>,
     /// What the node's reactor was started with, once the run builds it.
     pub startup: Rc<RefCell<Option<StartupFacts>>>,
+    /// The node's adoption facts, which its tap fills during the run, once
+    /// the run builds it.
+    pub adoption: Rc<RefCell<Option<AdoptionEvidence>>>,
     /// The node's session view, which its reactor and transport taps fill
     /// during the run, joined to own-9's facts. One prepared `WirePorts`
     /// serves one run.
@@ -981,6 +984,7 @@ impl Subsystem for HeaderWire {
             node,
             chains,
             startup: Rc::default(),
+            adoption: Rc::default(),
             sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
             reservations: ReservationEvidence::default(),
@@ -1036,6 +1040,7 @@ impl Subsystem for HeaderWire {
             Some(observer),
         );
         *ports.startup.borrow_mut() = Some(header.startup.clone());
+        *ports.adoption.borrow_mut() = Some(adoption.clone());
         let faults = FaultEvidence::new(
             attributions,
             cooldowns,

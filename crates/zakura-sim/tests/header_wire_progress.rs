@@ -13,8 +13,16 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+use std::{
+    cell::RefCell,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
+use serde_json::Value;
 use support::inputs;
 use tempfile::TempDir;
 use zakura_sim::{
@@ -25,19 +33,21 @@ use zakura_sim::{
     harness::{
         self,
         header_node::{
+            adoption::{AdoptionFact, Stamped},
             policy::{Allow, Hold, Select, Trigger},
             Chain, Fork, Policy,
         },
         header_sync::{progress_fixture, HeaderWire, WirePorts, WireScenario},
-        record_witness, run_prepared,
+        record, run_prepared,
         wire_plans::{progress_scenario, SavedPlan},
-        LinkEntry, LinkSpec, RecordInput, Subsystem,
+        HarnessEntry, HarnessError, LinkEntry, LinkSpec, RecordInput, Subsystem,
     },
     observe::{StorageFact, StorageResult, TransportFact},
     peer::{
         honest::{CreditSpec, GrantPolicy, SubscribeSpec},
         PeerAction, PeerSpec, NODE_ADDR,
     },
+    record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::{check_witness, Expect, WitnessScenario},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
@@ -114,43 +124,68 @@ fn violated(report: &RunReport) -> Vec<&str> {
         .collect()
 }
 
-/// The virtual time from the node's first `FrameRead` to the first apply
-/// storage completed as `Applied`, from the log's `TimeAdvanced` facts, or
-/// `None` without both. The first read is at or before the honest `Status`
-/// read that triggers the property, so this bounds the property's elapsed
-/// time from above.
-fn read_to_applied(report: &RunReport) -> Option<Duration> {
+/// The virtual time of the node's first `FrameRead`, from the log's
+/// `TimeAdvanced` facts. It's at or before the honest `Status` read that
+/// triggers the property.
+fn first_read(report: &RunReport) -> Option<Duration> {
     let mut now = 0;
-    let mut first_read = None;
     for entry in report.log.entries() {
         match &entry.obs {
             Observation::TimeAdvanced { to_ns, .. } => now = *to_ns,
             Observation::Transport {
                 event: TransportFact::FrameRead { .. },
                 ..
-            } => {
-                first_read.get_or_insert(now);
-            }
-            Observation::Storage {
-                fact:
-                    StorageFact::Completed {
-                        result: StorageResult::Applied,
-                        ..
-                    },
-                ..
-            } => return first_read.map(|read| Duration::from_nanos(now - read)),
+            } => return Some(Duration::from_nanos(now)),
             _ => {}
         }
     }
     None
 }
 
+/// The node's adoption facts in `ports`, in the order its reactor reported
+/// them, each with its virtual time.
+fn adoption(ports: &WirePorts) -> Vec<Stamped> {
+    ports
+        .adoption
+        .borrow()
+        .as_ref()
+        .expect("the run built the node")
+        .facts()
+}
+
+/// When the reactor adopted a snapshot whose selected tip is at `height`,
+/// if it did.
+fn adopted_at(facts: &[Stamped], height: u32) -> Option<Duration> {
+    facts.iter().find_map(|stamped| match &stamped.fact {
+        AdoptionFact::Adopted(adoption) if adoption.header_best.height.0 == height => {
+            Some(stamped.at)
+        }
+        _ => None,
+    })
+}
+
+/// Whether storage completed any apply as `Applied`.
+fn applied(report: &RunReport) -> bool {
+    report.log.entries().iter().any(|entry| {
+        matches!(
+            entry.obs,
+            Observation::Storage {
+                fact: StorageFact::Completed {
+                    result: StorageResult::Applied,
+                    ..
+                },
+                ..
+            }
+        )
+    })
+}
+
 /// On the committed input, the witness holds `header-sync/honest-progress`
 /// with its trigger history: the node read the honest peer's `Status`, and
 /// no property is violated. On every Plan here, the property holds at its
 /// one trigger, the node's tip reaches the successor, the honest peer is
-/// never punished, and the apply lands well inside the 30 s bound, within
-/// one virtual second of the node's first read.
+/// never punished, and the reactor adopts the successor well inside the
+/// 30 s bound, within one virtual second of the node's first read.
 ///
 /// This fails if the reactor never adopts the successor, as the planted
 /// skipped apply shows, or adopts it only after the bound.
@@ -181,10 +216,14 @@ fn the_progress_fixture_holds_honest_progress() {
         );
         assert_eq!(violated(&report), Vec::<&str>::new());
         assert_eq!(ports.selected_tip(), Chain::main(51).tip(&ports.fixture));
-        let elapsed = read_to_applied(&report).expect("the node read a frame and applied");
+        let read = first_read(&report).expect("the node read a frame");
+        let adopted = adopted_at(&adoption(&ports), 51).expect("the reactor adopted 51");
+        let elapsed = adopted
+            .checked_sub(read)
+            .expect("the adoption follows the read");
         assert!(
             elapsed <= Duration::from_secs(1) && elapsed < PROGRESS_BOUND,
-            "the successor applied {elapsed:?} after the node's first read"
+            "the reactor adopted the successor {elapsed:?} after the node's first read"
         );
     }
 }
@@ -211,7 +250,8 @@ fn a_peer_that_leaves_before_the_apply_makes_honest_progress_inconclusive() {
     );
     assert_eq!(violated(&report), Vec::<&str>::new());
     assert_eq!(ports.selected_tip(), Chain::main(50).tip(&ports.fixture));
-    assert_eq!(read_to_applied(&report), None, "nothing applied");
+    assert!(!applied(&report), "nothing applied");
+    assert_eq!(adopted_at(&adoption(&ports), 51), None);
 }
 
 /// A named change to a scenario.
@@ -293,42 +333,75 @@ fn honest_progress_applies_only_in_its_fixture() {
     );
 }
 
-/// A run's evidence depends only on its scenario and Plan: Plan A twice,
-/// with Plan B between, gives A's log, property reports and session facts
-/// both times. B's log differs, so the comparison can fail.
+/// A run's evidence depends only on its scenario and Plan: Plan A twice in
+/// a row, then Plan B, then A again, gives A's log, property reports,
+/// session facts and adoption facts, with their times, every time. B's log
+/// differs, so the comparison can fail.
 #[test]
 fn the_progress_witness_repeats_a_a_and_a_b_a() {
     let scenario = progress_scenario();
     let mut evidence = Vec::new();
     for plan in [
         committed_plan(),
+        committed_plan(),
         inputs(1, 16_384).remove(0),
         committed_plan(),
     ] {
         let (report, ports) = run(&scenario, plan);
-        evidence.push((report.log, report.properties, ports.sessions.facts()));
+        evidence.push((
+            report.log.entries().to_vec(),
+            report.properties,
+            ports.sessions.facts(),
+            adoption(&ports),
+        ));
     }
-    assert_eq!(evidence[0].0.entries(), evidence[2].0.entries());
-    assert_eq!(evidence[0].1, evidence[2].1);
-    assert_eq!(evidence[0].2, evidence[2].2);
-    assert_ne!(
-        evidence[0].0.entries(),
-        evidence[1].0.entries(),
-        "plan B differs"
-    );
+    assert!(adopted_at(&evidence[0].3, 51).is_some());
+    assert_eq!(evidence[0], evidence[1], "plan A, then A");
+    assert_eq!(evidence[0], evidence[3], "plan A, then B, then A");
+    assert_ne!(evidence[0].0, evidence[2].0, "plan B differs");
 }
 
-/// The committed input, recorded as a witness test that expects a hold,
-/// then replayed exactly in a fresh process of the same test binary,
-/// gives the same end record and holds the property there too.
+thread_local! {
+    /// The ports of the run [`capture_run`] last prepared.
+    static CAPTURED: RefCell<Option<WirePorts>> = const { RefCell::new(None) };
+}
+
+/// `header-sync/wire`'s own run, keeping its ports in [`CAPTURED`] so the
+/// test can read the run's adoption facts after it.
+fn capture_run(
+    scenario: &Value,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+) -> Result<RunReport, HarnessError> {
+    let scenario: WireScenario =
+        serde_json::from_value(scenario.clone()).map_err(HarnessError::Scenario)?;
+    let ports = HeaderWire::prepare(&scenario);
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(ports.clone()));
+    run_prepared::<HeaderWire>(&scenario, ports, input, sink, None)
+}
+
+/// The adoption facts of the run [`capture_run`] last kept, as text.
+fn captured() -> String {
+    let ports = CAPTURED
+        .with(|captured| captured.borrow_mut().take())
+        .expect("the run prepared its ports");
+    format!("{:?}\n", adoption(&ports))
+}
+
+/// The committed input, recorded, then replayed exactly in a fresh process
+/// of the same test binary, gives the adoption facts and end record its
+/// recorded run gave, and holds the property there too.
 #[test]
 fn the_progress_witness_replays_in_a_fresh_process() {
-    let entry = harness::find(HeaderWire::NAME).expect("the wire harness is registered");
+    let entry = HarnessEntry {
+        run: capture_run,
+        ..*harness::find(HeaderWire::NAME).expect("the wire harness is registered")
+    };
     if let Some(dir) = std::env::var_os(CHILD) {
-        let trace = TraceReader::open(std::path::Path::new(&dir)).expect("the trace was recorded");
+        let trace = TraceReader::open(Path::new(&dir)).expect("the trace was recorded");
         // A replay that leaves the trace's picks, draws, observations or end
         // record errs.
-        let replay = replay_with(&trace, entry, ReplayOptions::default())
+        let replay = replay_with(&trace, &entry, ReplayOptions::default())
             .unwrap_or_else(|error| panic!("{error}"));
         let progress = replay
             .properties
@@ -336,19 +409,20 @@ fn the_progress_witness_replays_in_a_fresh_process() {
             .find(|report| report.property == HONEST_PROGRESS)
             .map(|report| &report.outcome);
         assert_eq!(progress, Some(&PropertyOutcome::Held { applicable: 1 }));
+        // The parent reads the facts from the child's stdout.
+        writeln!(
+            std::io::stdout(),
+            "ADOPTION-BEGIN\n{}ADOPTION-END",
+            captured()
+        )
+        .expect("the test harness captures stdout");
         return;
     }
     let dir = TempDir::new().expect("a temporary directory");
     let input = committed();
-    let (_, judged) = record_witness(
-        entry,
-        RecordInput::Input(&input),
-        dir.path(),
-        HONEST_PROGRESS,
-        Expect::Holds,
-    )
-    .unwrap_or_else(|error| panic!("{error:?}"));
-    judged.unwrap_or_else(|error| panic!("{error}"));
+    record(&entry, RecordInput::Input(&input), dir.path()).expect("the witness records");
+    let recorded = captured();
+    assert!(recorded.contains("Height(51)"), "{recorded}");
     let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
         .args([
             "--exact",
@@ -359,5 +433,12 @@ fn the_progress_witness_replays_in_a_fresh_process() {
         .env(CHILD, dir.path())
         .output()
         .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&child.stdout);
     assert!(child.status.success(), "{child:?}");
+    let replayed = stdout
+        .split_once("ADOPTION-BEGIN\n")
+        .and_then(|(_, rest)| rest.split_once("ADOPTION-END"))
+        .map(|(facts, _)| facts)
+        .unwrap_or_else(|| panic!("the child prints its adoption facts: {stdout}"));
+    assert_eq!(replayed, recorded);
 }

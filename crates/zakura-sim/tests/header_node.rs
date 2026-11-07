@@ -297,6 +297,8 @@ impl HasView for Planted {
             adoption: Default::default(),
             sessions: Default::default(),
             faults: Default::default(),
+            capacity: Default::default(),
+            claims: Default::default(),
         }
     }
 }

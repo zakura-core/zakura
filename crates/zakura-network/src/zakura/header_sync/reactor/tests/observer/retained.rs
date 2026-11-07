@@ -148,6 +148,8 @@ fn ledger_accepts(events: &[ReactorEvent]) -> HeaderWorkLedger {
             .observe(event)
             .unwrap_or_else(|broken| panic!("{broken}\n{events:#?}"));
     }
+    let claims = ledger.take_claims();
+    assert!(claims.is_empty(), "{claims:?}\n{events:#?}");
     ledger
 }
 

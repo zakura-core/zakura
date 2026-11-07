@@ -17,10 +17,11 @@ use support::{config, inputs};
 use tempfile::TempDir;
 use zakura_network::zakura::observe::HeaderSyncObserver;
 use zakura_sim::{
+    domain::header_sync::CHUNK_BUDGET_BOUND,
     harness::{
         self,
         header_node::{
-            capacity::{CapacityEvidence, CapacityReading},
+            capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             policy::{Allow, Hold, OpKind, Select, Trigger},
             reservation::ReservationEvidence,
             session::SessionEvidence,
@@ -33,7 +34,9 @@ use zakura_sim::{
     observe::{ReactorFact, StorageFact, StorageRequest},
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
-    HarnessFailure, MemorySink, NoChecks, Observation, PlanInput, RunReport, Sim,
+    witness::Expect,
+    HarnessFailure, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    Sim,
 };
 use zakura_storage::header::{adapter::EnginePort, fixture::HeaderFixture};
 
@@ -179,6 +182,28 @@ fn the_probe_matches_the_accounting_through_close_relink_and_shutdown() {
             "{readings:#?}"
         );
     }
+}
+
+/// The committed close-and-relink seed (`tests/header_storage_seeds.rs`),
+/// whose node reserves headers from both mirrors.
+const CLOSE_RELINK_INPUT: &[u8] = include_bytes!("fixtures/header-storage-close-relink.bin");
+
+/// `header-sync/chunk-budget-bound` holds on the committed close-and-relink
+/// seed, and the run reaches its trigger history: the probe reads the budget
+/// holding headers. `cargo xtask planted header-sync/chunk-budget-bound`
+/// checks that the same input violates it under each planted patch.
+#[test]
+fn the_close_relink_input_holds_chunk_budget_bound() {
+    let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
+    let (prefix, plan) = CLOSE_RELINK_INPUT.split_at(Storage::SCENARIO_BYTES);
+    let result = (entry.witness)(
+        &entry.scenario(prefix),
+        Plan::from_fuzz(plan),
+        CHUNK_BUDGET_BOUND,
+        Expect::Holds,
+        &mut MemorySink::default(),
+    );
+    assert_eq!(result, Ok(()));
 }
 
 /// The witness's probe readings and full log depend only on scenario and
@@ -348,4 +373,43 @@ fn a_tap_handed_a_second_probe_fails() {
             .collect()
     });
     assert!(detail.starts_with("ProbeReplaced"), "{detail}");
+}
+
+/// The capacity witness's close removes a round whose leases go back one
+/// at a time, each a release that holds the budget's lock across its wake,
+/// so the reactor stops mid-poll at several boundaries in a row with the
+/// lock held. `header-sync/chunk-budget-bound` judges none of those
+/// boundaries, never finds one unread with the reactor not mid-poll, and
+/// holds.
+#[test]
+fn unread_boundaries_in_a_row_hold_chunk_budget_bound() {
+    for input in inputs(16, 256) {
+        let ports = Storage::prepare(&witness());
+        let capacity = ports.capacity.clone();
+        let report =
+            run_prepared::<Storage>(&witness(), ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        let reads: Vec<Option<BoundaryRead>> = (1..=report.end.steps)
+            .map(|step| capacity.boundary(step))
+            .collect();
+        assert!(
+            reads.windows(2).any(|pair| pair
+                .iter()
+                .all(|read| *read == Some(BoundaryRead::UnreadMidPoll))),
+            "two unread boundaries in a row: {reads:?}"
+        );
+        assert!(
+            !reads.contains(&Some(BoundaryRead::UnreadQuiet)),
+            "{reads:?}"
+        );
+        let outcome = report
+            .properties
+            .iter()
+            .find(|property| property.property == CHUNK_BUDGET_BOUND)
+            .map(|property| property.outcome.clone());
+        assert!(
+            matches!(outcome, Some(PropertyOutcome::Held { .. })),
+            "{outcome:?}"
+        );
+    }
 }

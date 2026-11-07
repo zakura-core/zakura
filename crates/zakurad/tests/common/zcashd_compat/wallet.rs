@@ -1,6 +1,6 @@
 //! Wallet RPC test bodies for the zcashd-compat integration test suite.
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 
 use super::{launch::ZcashdCompatSetup, setup_zcashd_compat, wait_for_zcashd_height};
 use crate::common::regtest::MiningRpcMethods;

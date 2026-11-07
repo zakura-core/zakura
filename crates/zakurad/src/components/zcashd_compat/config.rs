@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Source selector for supervised `zcashd` execution.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, Default)]
@@ -83,27 +83,27 @@ pub struct Config {
     pub block_gossip_peer_ips: Vec<IpAddr>,
 
     /// Delay before the first `zcashd` spawn attempt.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub startup_delay: Duration,
 
     /// Delay between supervisor restart attempts.
     ///
     /// This is the base delay for exponential restart backoff.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub restart_backoff: Duration,
 
     /// Maximum delay between supervisor restart attempts.
     ///
     /// This caps exponential restart backoff while retries continue indefinitely.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub restart_backoff_max: Duration,
 
     /// Child uptime that resets the supervisor's consecutive restart count.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub restart_reset_after: Duration,
 
     /// Grace period for a clean shutdown after sending SIGTERM.
-    #[serde(with = "humantime_serde")]
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
     pub shutdown_grace_period: Duration,
 }
 
@@ -137,23 +137,30 @@ fn deserialize_zcashd_extra_args<'de, D>(deserializer: D) -> Result<Vec<String>,
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum ExtraArgsField {
-        Sequence(Vec<String>),
-        JsonString(String),
-    }
+    // Dispatch on the value's type instead of buffering it like `#[serde(untagged)]`.
+    struct ExtraArgsVisitor;
 
-    match ExtraArgsField::deserialize(deserializer)? {
-        ExtraArgsField::Sequence(args) => Ok(args),
-        ExtraArgsField::JsonString(args) => {
-            serde_json::from_str(&args).map_err(|error| {
-                D::Error::custom(format!(
+    impl<'de> serde::de::Visitor<'de> for ExtraArgsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence or a JSON string array")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<Vec<String>, A::Error> {
+            Vec::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, args: &str) -> Result<Vec<String>, E> {
+            serde_json::from_str(args).map_err(|error| {
+                E::custom(format!(
                     "zcashd_extra_args must be a sequence or a JSON string array, got: {args:?}. parse error: {error}"
                 ))
             })
         }
     }
+
+    deserializer.deserialize_any(ExtraArgsVisitor)
 }
 
 #[cfg(test)]

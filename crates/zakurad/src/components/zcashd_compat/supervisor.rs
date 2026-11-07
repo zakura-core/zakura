@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
@@ -17,6 +17,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use zakura_chain::parameters::NetworkKind;
+use zakura_node_services::task::spawn_erased;
 
 use super::{effective_zcashd_datadir, ensure_zcashd_datadir, resolve_zcashd_datadir_path, Config};
 
@@ -417,7 +418,7 @@ fn spawn_log_task<T>(stream: T, stream_name: &'static str) -> JoinHandle<()>
 where
     T: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_erased(async move {
         let mut reader = BufReader::new(stream).lines();
 
         while let Ok(Some(line)) = reader.next_line().await {
@@ -570,18 +571,13 @@ async fn terminate_child(
 
     #[cfg(unix)]
     {
-        use nix::{
-            sys::signal::{kill, Signal::SIGTERM},
-            unistd::Pid,
-        };
-
         if let Some(id) = pid {
             info!(
                 pid = id,
                 grace_period = ?shutdown_grace_period,
                 "sending SIGTERM to zcashd-compat zcashd child"
             );
-            if let Err(error) = kill(Pid::from_raw(id as i32), SIGTERM) {
+            if let Err(error) = super::unix::signal_process(id, libc::SIGTERM) {
                 warn!(
                     pid = id,
                     ?error,

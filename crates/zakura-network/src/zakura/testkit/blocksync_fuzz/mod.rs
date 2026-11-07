@@ -104,12 +104,16 @@ pub(crate) async fn run_scenario(
         },
         (initial_header, initial_header_hash),
         committed_views,
+        (scenario.config.clone())
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         scenario.config.clone(),
     );
     startup.trace = trace.clone();
     startup.shutdown = shutdown.clone();
 
-    let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
+    let (handle, actions, reactor_task) =
+        crate::zakura::spawn_block_sync_reactor(startup).expect("valid block-sync config");
 
     let (committed_tx, mut committed_rx) = watch::channel(initial_verified);
 
@@ -137,7 +141,6 @@ pub(crate) async fn run_scenario(
     // Attach synthetic peers through the real add_peer path; each owns its own
     // connect/serve/disconnect lifecycle (peer churn).
     let peers = Arc::new(SyntheticBlockSyncPeers::new(
-        scenario.config.clone(),
         handle.clone(),
         scenario.transport_queue_depth.unwrap_or(1024),
     ));
@@ -284,21 +287,6 @@ fn spawn_action_driver(
                         break;
                     }
                 }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                    let blocks = corpus.blocks_in_range(start, count, target);
-                    if handle
-                        .send(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
                 BlockSyncAction::SubmitBlock {
                     owner,
                     source,
@@ -317,7 +305,7 @@ fn spawn_action_driver(
                     let height = block
                         .coinbase_height()
                         .expect("synthetic submitted block has height");
-                    let outcome = apply.apply(block.as_ref());
+                    let outcome = apply.apply(block.view());
                     if outcome.result == BlockApplyResult::Committed {
                         let _ = committed_tx.send(outcome.frontiers.verified_block_tip);
                     }

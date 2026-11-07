@@ -20,6 +20,7 @@ use std::{
     sync::{mpsc, Arc},
     task::{Context, Poll},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{Future, FutureExt, TryFutureExt};
 use thiserror::Error;
@@ -29,7 +30,7 @@ use tracing::instrument;
 
 use zakura_chain::{
     amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
-    block::{self, Block},
+    block::{self},
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{
@@ -58,6 +59,7 @@ mod types;
 mod tests;
 
 pub use zakura_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
+use zakura_node_services::task::spawn_erased;
 
 /// An unverified block, which is in the queue for checkpoint verification.
 #[derive(Debug)]
@@ -202,14 +204,6 @@ where
     reset_sender: mpsc::Sender<CheckpointReset>,
     /// The generation assigned to new checkpoint commits.
     reset_generation: u64,
-
-    /// Queued block height progress transmitter.
-    #[cfg(feature = "progress-bar")]
-    queued_blocks_bar: howudoin::Tx,
-
-    /// Verified checkpoint progress transmitter.
-    #[cfg(feature = "progress-bar")]
-    verified_checkpoint_bar: howudoin::Tx,
 }
 
 impl<S> std::fmt::Debug for CheckpointVerifier<S>
@@ -249,7 +243,7 @@ where
     /// than constructing multiple verification services for the same network. To
     /// clone a CheckpointVerifier, you might need to wrap it in a
     /// `tower::Buffer` service.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(
         network: &Network,
         initial_tip: Option<(block::Height, block::Hash)>,
@@ -333,13 +327,6 @@ where
 
         let (sender, receiver) = mpsc::channel();
 
-        #[cfg(feature = "progress-bar")]
-        let queued_blocks_bar = howudoin::new_root().label("Checkpoint Queue Height");
-
-        #[cfg(feature = "progress-bar")]
-        let verified_checkpoint_bar =
-            howudoin::new_with_parent(queued_blocks_bar.id()).label("Verified Checkpoints");
-
         let verifier = CheckpointVerifier {
             checkpoint_list,
             max_checkpoint_height,
@@ -351,15 +338,9 @@ where
             reset_receiver: receiver,
             reset_sender: sender,
             reset_generation: 0,
-            #[cfg(feature = "progress-bar")]
-            queued_blocks_bar,
-            #[cfg(feature = "progress-bar")]
-            verified_checkpoint_bar,
         };
 
-        if verifier_progress.is_final_checkpoint() {
-            verifier.finish_diagnostics();
-        } else {
+        if !verifier_progress.is_final_checkpoint() {
             verifier.verified_checkpoint_diagnostics(verifier_progress.height());
         }
 
@@ -378,15 +359,6 @@ where
 
         let is_checkpoint = self.checkpoint_list.contains(height);
         tracing::debug!(?height, ?hash, ?is_checkpoint, "queued block");
-
-        #[cfg(feature = "progress-bar")]
-        if matches!(howudoin::cancelled(), Some(true)) {
-            self.finish_diagnostics();
-        } else {
-            self.queued_blocks_bar
-                .set_pos(max_queued_height.0)
-                .set_len(u64::from(self.checkpoint_list.max_height().0));
-        }
     }
 
     /// Update diagnostics for verified checkpoints.
@@ -410,24 +382,6 @@ where
             ?checkpoint_count,
             "verified checkpoint",
         );
-
-        #[cfg(feature = "progress-bar")]
-        if matches!(howudoin::cancelled(), Some(true)) {
-            self.finish_diagnostics();
-        } else {
-            self.verified_checkpoint_bar
-                .set_pos(u64::try_from(checkpoint_index).expect("fits in u64"))
-                .set_len(u64::try_from(checkpoint_count).expect("fits in u64"));
-        }
-    }
-
-    /// Finish checkpoint verifier diagnostics.
-    fn finish_diagnostics(&self) {
-        #[cfg(feature = "progress-bar")]
-        {
-            self.queued_blocks_bar.close();
-            self.verified_checkpoint_bar.close();
-        }
     }
 
     /// Reset the verifier progress back to given tip.
@@ -670,7 +624,6 @@ where
             );
 
             self.verified_checkpoint_diagnostics(verified_height);
-            self.finish_diagnostics();
         } else if self.checkpoint_list.contains(verified_height) {
             self.verifier_progress = PreviousCheckpoint(verified_height);
             // We're done with the initial tip hash now
@@ -694,9 +647,9 @@ where
     /// whether the transaction hashes are unique.
     fn check_block(
         &self,
-        block: Arc<Block>,
+        block: BlockHandle,
     ) -> Result<CheckpointVerifiedBlock, VerifyCheckpointError> {
-        let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
+        let hash = zakura_header_chain::validate_encoding_version_hash(block.header())
             .map_err(BlockError::from)?;
         let height = block
             .coinbase_height()
@@ -707,14 +660,19 @@ where
             .map_err(VerifyBlockError::from)?;
         if pow_policy.is_authenticated_custom_waiver() {
             crate::block::check::difficulty_threshold_is_valid(
-                &block.header,
+                block.header(),
                 &self.network,
                 &height,
                 &hash,
             )?;
         } else {
-            crate::block::check::difficulty_is_valid(&block.header, &self.network, &height, &hash)?;
-            crate::block::check::equihash_solution_is_valid(&block.header, &self.network)?;
+            crate::block::check::difficulty_is_valid(
+                block.header(),
+                &self.network,
+                &height,
+                &hash,
+            )?;
+            crate::block::check::equihash_solution_is_valid(block.header(), &self.network)?;
         }
 
         // The commit task calculates this value after the parent commits at ZIP 234 heights.
@@ -747,7 +705,7 @@ where
     /// If the block does not pass basic validity checks,
     /// returns an error immediately.
     #[allow(clippy::unwrap_in_result)]
-    fn queue_block(&mut self, block: Arc<Block>) -> Result<RequestBlock, VerifyCheckpointError> {
+    fn queue_block(&mut self, block: BlockHandle) -> Result<RequestBlock, VerifyCheckpointError> {
         // Set up a oneshot channel to send results
         let (tx, rx) = oneshot::channel();
 
@@ -763,9 +721,7 @@ where
         };
         let req_block = RequestBlock { block, rx };
 
-        // Since we're using Arc<Block>, each entry is a single pointer to the
-        // Arc. But there are a lot of QueuedBlockLists in the queue, so we keep
-        // allocations as small as possible.
+        // Most heights have one queued block, so start with one slot.
         let qblocks = self
             .queued
             .entry(height)
@@ -941,7 +897,7 @@ where
         for current_height in range_heights {
             let valid_qblock = self.process_height(current_height, expected_hash);
             if let Some(qblock) = valid_qblock {
-                expected_hash = qblock.block.block.header.previous_block_hash;
+                expected_hash = qblock.block.block.header().previous_block_hash;
                 // Add the block to the end of the pending block list
                 // (since we're walking the chain backwards, the list is
                 // in reverse chain order)
@@ -1056,8 +1012,6 @@ where
     /// We can't implement `Drop` on QueuedBlock, because `send()` consumes
     /// `tx`. And `tx` doesn't implement `Copy` or `Default` (for `take()`).
     fn drop(&mut self) {
-        self.finish_diagnostics();
-
         let drop_keys: Vec<_> = self.queued.keys().cloned().collect();
         for key in drop_keys {
             let mut qblocks = self
@@ -1213,6 +1167,39 @@ impl VerifyCheckpointError {
         }
     }
 
+    /// Returns `true` if the state rejected the delivered body because it does not match its
+    /// header's authorizing data commitment.
+    ///
+    /// Checkpoint verification checks only the block hash and the transaction Merkle root, which
+    /// do not commit to authorizing data from NU5 (ZIP 244). So a peer can serve a canonical
+    /// header with an altered body that fails only at commit. See
+    /// [`zs::ValidateContextError::is_auth_commitment_mismatch`].
+    pub fn is_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(zs::CommitCheckpointVerifiedError::is_auth_commitment_mismatch),
+            VerifyCheckpointError::VerifyBlock(error) => error.is_auth_commitment_mismatch(),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if the state dropped this block because an ancestor's delivered body
+    /// failed its authorizing data commitment.
+    pub fn is_descendant_of_auth_commitment_mismatch(&self) -> bool {
+        match self {
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(
+                    zs::CommitCheckpointVerifiedError::is_descendant_of_auth_commitment_mismatch,
+                ),
+            VerifyCheckpointError::VerifyBlock(error) => {
+                error.is_descendant_of_auth_commitment_mismatch()
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
@@ -1235,6 +1222,9 @@ impl VerifyCheckpointError {
             | VerifyCheckpointError::CoinbaseHeight { .. }
             | VerifyCheckpointError::DuplicateTransaction
             | VerifyCheckpointError::AmountError(_) => 100,
+            // Other commit failures stay unscored: they can come from local state, from a root
+            // another peer supplied, or from an ancestor's failure.
+            error if error.is_auth_commitment_mismatch() => 100,
             _other => 0,
         }
     }
@@ -1243,7 +1233,7 @@ impl VerifyCheckpointError {
 /// The CheckpointVerifier service implementation.
 ///
 /// After verification, the block futures resolve to their hashes.
-impl<S> Service<Arc<Block>> for CheckpointVerifier<S>
+impl<S> Service<BlockHandle> for CheckpointVerifier<S>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
@@ -1257,8 +1247,23 @@ where
         Poll::Ready(Ok(()))
     }
 
+    fn call(&mut self, block: BlockHandle) -> Self::Future {
+        self.call_with_origin(block, zs::BlockOrigin::Network)
+    }
+}
+
+impl<S> CheckpointVerifier<S>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    /// Verify and commit a block while retaining its source through detached checkpoint work.
     #[instrument(name = "checkpoint", skip(self, block))]
-    fn call(&mut self, block: Arc<Block>) -> Self::Future {
+    pub fn call_with_origin(
+        &mut self,
+        block: BlockHandle,
+        origin: zs::BlockOrigin,
+    ) -> <Self as Service<BlockHandle>>::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();
@@ -1268,8 +1273,8 @@ where
             // A peer can rewrite the coinbase input and expiry heights without changing the header hash.
             // Reject the changed transaction IDs before returning the unscored Finished error.
             let transaction_hashes = block
-                .transactions
-                .iter()
+                .view()
+                .transactions()
                 .map(|tx| tx.hash())
                 .collect::<Vec<_>>();
             if let Err(error) = crate::block::check::merkle_root_validity(
@@ -1287,6 +1292,7 @@ where
             Err(e) => return async { Err(e) }.boxed(),
         };
 
+        req_block.block = req_block.block.with_origin(origin);
         self.process_checkpoint_range();
 
         metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
@@ -1334,7 +1340,7 @@ where
                 let hash = queued_result.result?;
 
                 if is_zip234_active(&network, req_block.block.height) {
-                    let parent_hash = req_block.block.block.header.previous_block_hash;
+                    let parent_hash = req_block.block.block.header().previous_block_hash;
                     let response = state_service
                         .clone()
                         .oneshot(zs::Request::AwaitBlockInfo(parent_hash))
@@ -1391,7 +1397,7 @@ where
                         if let Some(state) = handoff_state {
                             // Retain the notification even if its response times out. A delayed
                             // buffer worker must still reconcile the already-durable checkpoint.
-                            let handoff = tokio::spawn(async move {
+                            let handoff = spawn_erased(async move {
                                 match state.oneshot(zs::Request::CheckCheckpointHandoff).await {
                                     Ok(zs::Response::CheckpointHandoffChecked) => {
                                         metrics::counter!("checkpoint.handoff.checked").increment(1);

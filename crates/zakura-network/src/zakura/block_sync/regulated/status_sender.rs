@@ -1,0 +1,280 @@
+//! Status cadence and the latest received advertisement live with the connection.
+
+use zakura_rt::{
+    sync::{Mutex, PoisonError},
+    time::Instant,
+};
+
+use super::wire::Message;
+use crate::zakura::{
+    block_sync::{state::RateMeter, BlockSyncStatus, MSG_BS_STATUS},
+    regulation::{CadenceSendError, CadenceSender, RowSend},
+    FramedSend, OrderedSendError,
+};
+use std::time::Duration;
+
+/// What one attempt did with the latest local Status.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StatusSend {
+    Queued,
+    /// The connection's cadence allows the next Status at this instant.
+    /// This is legal pacing, not queue pressure.
+    Deferred(Instant),
+    /// The previous Status frame has not finished its transport write.
+    Unwritten,
+    /// The stream's outbound queue has no free slot.
+    QueueFull,
+}
+
+/// How a connection paces the Status frames it receives. A stream-6
+/// replacement resumes this pacing, so a reopened stream gets no fresh
+/// Status allowance.
+#[derive(Clone, Debug)]
+pub(in crate::zakura::block_sync) struct InboundStatusPacing {
+    /// Paces Status application, with one extra range change per window.
+    pub(in crate::zakura::block_sync) apply_meter: RateMeter,
+    /// Paces our Status replies.
+    pub(in crate::zakura::block_sync) reply_meter: RateMeter,
+    /// Whether the current window still allows one immediate range change.
+    pub(in crate::zakura::block_sync) range_bypass_available: bool,
+    /// The latest received Status that the apply meter deferred.
+    pub(in crate::zakura::block_sync) pending: Option<BlockSyncStatus>,
+}
+
+/// The inbound Status state that outlives one stream-6 session.
+#[derive(Clone, Debug)]
+pub(in crate::zakura::block_sync) struct ReceivedStatus {
+    /// The last Status that a routine applied. It was paced when it arrived,
+    /// so a replacement routine applies it again without spending a meter.
+    pub(in crate::zakura::block_sync) applied: BlockSyncStatus,
+    pub(in crate::zakura::block_sync) pacing: InboundStatusPacing,
+}
+
+#[derive(Debug)]
+pub(crate) struct StatusSender {
+    sender: Mutex<CadenceSender<Message>>,
+    received: Mutex<StoredStatus>,
+    max_inflight_requests: u32,
+}
+
+/// The stored inbound Status state and the routine generation that owns it.
+#[derive(Debug, Default)]
+struct StoredStatus {
+    /// The newest routine generation that read or wrote the state. A
+    /// replacement cancels its predecessor without waiting for it, so the
+    /// state refuses writes from an older generation.
+    owner: u64,
+    status: Option<ReceivedStatus>,
+}
+
+impl StatusSender {
+    /// A connection's sender, advertising at most `max_inflight_requests`; see
+    /// [`super::session::serving_max_inflight_requests`]. Updates are at least
+    /// `interval` apart, or the row's cadence if that is longer.
+    pub(crate) fn new(max_inflight_requests: u32, interval: Duration) -> Self {
+        let sender = CadenceSender::new()
+            .with_min_interval(u16::from(MSG_BS_STATUS), interval)
+            .expect("the Status row declares a cadence");
+        Self {
+            sender: Mutex::new(sender),
+            received: Mutex::new(StoredStatus::default()),
+            max_inflight_requests,
+        }
+    }
+
+    /// `status` as this connection sends it, with the serving in-flight limit applied.
+    pub(crate) fn advertised(&self, status: BlockSyncStatus) -> BlockSyncStatus {
+        BlockSyncStatus {
+            max_inflight_requests: status.max_inflight_requests.min(self.max_inflight_requests),
+            ..status
+        }
+    }
+
+    /// Store this connection's inbound Status pacing for a later stream-6
+    /// session, with the Status just applied, if any. Pacing without an
+    /// applied Status has nothing to resume, so it is not kept. A write from
+    /// a `generation` older than the state's owner changes nothing, so a
+    /// cancelled routine cannot restore pacing its replacement already spent.
+    pub(in crate::zakura::block_sync) fn record_received(
+        &self,
+        generation: u64,
+        applied: Option<BlockSyncStatus>,
+        pacing: InboundStatusPacing,
+    ) {
+        let mut stored = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        if generation < stored.owner {
+            return;
+        }
+        stored.owner = generation;
+        match (applied, stored.status.as_mut()) {
+            (Some(applied), _) => stored.status = Some(ReceivedStatus { applied, pacing }),
+            (None, Some(received)) => received.pacing = pacing,
+            (None, None) => {}
+        }
+    }
+
+    /// The inbound Status state that an earlier stream-6 session stored.
+    /// Reading makes `generation` the owner, so later writes from older
+    /// routines are refused. An older `generation` reads nothing.
+    pub(in crate::zakura::block_sync) fn received(
+        &self,
+        generation: u64,
+    ) -> Option<ReceivedStatus> {
+        let mut stored = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        if generation < stored.owner {
+            return None;
+        }
+        stored.owner = generation;
+        stored.status.clone()
+    }
+
+    /// Replace the pending Status and queue it if the cadence allows.
+    pub(crate) fn try_send(
+        &self,
+        status: BlockSyncStatus,
+        send: &FramedSend,
+    ) -> Result<StatusSend, OrderedSendError> {
+        let mut sender = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
+        sender
+            .update(Message::Status(self.advertised(status)))
+            .map_err(|error| OrderedSendError::Encode(error.into()))?;
+        match sender.send_row(u16::from(MSG_BS_STATUS), send) {
+            Ok(RowSend::Queued) => Ok(StatusSend::Queued),
+            Ok(RowSend::DeferredUntil(at)) => Ok(StatusSend::Deferred(at)),
+            Ok(RowSend::Unwritten) => Ok(StatusSend::Unwritten),
+            Ok(RowSend::QueueFull) => Ok(StatusSend::QueueFull),
+            Ok(RowSend::Idle) => unreachable!("the Status row was updated above"),
+            Err(CadenceSendError::Closed) => Err(OrderedSendError::Closed),
+            Err(error) => Err(OrderedSendError::Encode(error.into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zakura::{block_sync::BlockSyncMessage, framed_channel};
+    use std::{sync::Arc, time::Duration};
+    use zakura_chain::block;
+
+    #[tokio::test(start_paused = true)]
+    async fn replacements_and_range_corrections_share_the_connection_cadence() {
+        let sender = Arc::new(StatusSender::new(u32::MAX, Duration::ZERO));
+        let (old_send, mut old_recv) = framed_channel(4);
+        let original = BlockSyncStatus {
+            servable_high: block::Height(10),
+            ..BlockSyncStatus::default()
+        };
+        let sent_at = Instant::now();
+        assert_eq!(
+            sender.try_send(original, &old_send).unwrap(),
+            StatusSend::Queued
+        );
+        old_recv.recv().await.unwrap();
+        let replacement = sender.clone();
+        let (new_send, mut new_recv) = framed_channel(4);
+        let correction = BlockSyncStatus {
+            servable_high: block::Height(3),
+            ..original
+        };
+        // A cadence deferral is legal pacing, not queue pressure.
+        let due = StatusSend::Deferred(sent_at + Duration::from_secs(30));
+        assert_eq!(replacement.try_send(correction, &new_send).unwrap(), due);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert_eq!(replacement.try_send(correction, &new_send).unwrap(), due);
+        assert!(new_recv.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            replacement.try_send(correction, &new_send).unwrap(),
+            StatusSend::Queued
+        );
+        assert_eq!(
+            BlockSyncMessage::decode_frame(new_recv.recv().await.unwrap()).unwrap(),
+            BlockSyncMessage::Status(correction)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_status_writer_retains_only_one_frame_and_the_latest_update() {
+        let sender = StatusSender::new(u32::MAX, Duration::ZERO);
+        let (send, mut recv) = framed_channel(8);
+        sender.try_send(BlockSyncStatus::default(), &send).unwrap();
+        for height in 1..=50 {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            assert_eq!(
+                sender
+                    .try_send(
+                        BlockSyncStatus {
+                            servable_high: block::Height(height),
+                            ..BlockSyncStatus::default()
+                        },
+                        &send
+                    )
+                    .unwrap(),
+                StatusSend::Unwritten
+            );
+        }
+        assert_eq!(
+            send.capacity(),
+            7,
+            "one unwritten frame survives repeated updates"
+        );
+        recv.recv().await.unwrap();
+        let latest = BlockSyncStatus {
+            servable_high: block::Height(50),
+            ..BlockSyncStatus::default()
+        };
+        sender.try_send(latest, &send).unwrap();
+        assert_eq!(
+            BlockSyncMessage::decode_frame(recv.recv().await.unwrap()).unwrap(),
+            BlockSyncMessage::Status(latest)
+        );
+    }
+
+    /// A local interval slower than the row's cadence paces Status, and a
+    /// faster one cannot speed it up.
+    #[tokio::test(start_paused = true)]
+    async fn a_configured_interval_only_slows_the_status_cadence() {
+        for (configured, interval) in [
+            (Duration::from_secs(1), Duration::from_secs(30)),
+            (Duration::from_secs(60), Duration::from_secs(60)),
+        ] {
+            let sender = StatusSender::new(u32::MAX, configured);
+            let (send, mut recv) = framed_channel(4);
+            let sent_at = Instant::now();
+            let status = BlockSyncStatus::default();
+            assert_eq!(sender.try_send(status, &send).unwrap(), StatusSend::Queued);
+            recv.recv().await.unwrap();
+            assert_eq!(
+                sender.try_send(status, &send).unwrap(),
+                StatusSend::Deferred(sent_at + interval)
+            );
+            tokio::time::advance(interval).await;
+            assert_eq!(sender.try_send(status, &send).unwrap(), StatusSend::Queued);
+        }
+    }
+
+    /// Regulated Status carries the serving limit without lowering smaller advertisements.
+    #[tokio::test]
+    async fn status_advertises_at_most_the_serving_limit() {
+        let sender = StatusSender::new(2816, Duration::ZERO);
+        let (send, mut recv) = framed_channel(4);
+        let status = BlockSyncStatus {
+            max_inflight_requests: 32_000,
+            ..BlockSyncStatus::default()
+        };
+        sender.try_send(status, &send).unwrap();
+        assert_eq!(
+            BlockSyncMessage::decode_frame(recv.recv().await.unwrap()).unwrap(),
+            BlockSyncMessage::Status(BlockSyncStatus {
+                max_inflight_requests: 2816,
+                ..status
+            })
+        );
+        let small = BlockSyncStatus {
+            max_inflight_requests: 100,
+            ..status
+        };
+        assert_eq!(sender.advertised(small), small);
+    }
+}

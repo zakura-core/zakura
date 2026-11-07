@@ -1,4 +1,5 @@
 pub(crate) mod candidate_set;
+mod driver;
 mod initialize;
 mod inventory_registry;
 mod legacy_peer_trace;
@@ -14,4 +15,6 @@ pub(crate) use limit::{ActiveConnectionCounter, ConnectionTracker};
 use inventory_registry::InventoryRegistry;
 pub(crate) use set::PeerSet;
 
-pub use initialize::{init, init_with_zakura, init_with_zakura_header_sync};
+pub use initialize::init_with_zakura;
+#[cfg(any(test, feature = "proptest-impl"))]
+pub use initialize::{init, init_with_zakura_header_sync};

@@ -3,7 +3,6 @@
 #![warn(missing_docs)]
 
 mod action;
-mod address;
 mod commitment;
 mod note;
 mod sinsemilla;
@@ -18,8 +17,6 @@ pub mod shielded_data;
 pub mod tree;
 
 pub use action::Action;
-pub use address::Address;
-pub use commitment::{CommitmentRandomness, NoteCommitment, ValueCommitment};
-pub use keys::Diversifier;
+pub use commitment::{NoteCommitment, ValueCommitment};
 pub use note::{EncryptedNote, Nullifier, WrappedNoteKey};
 pub use shielded_data::{AuthorizedAction, Flags, ShieldedData};

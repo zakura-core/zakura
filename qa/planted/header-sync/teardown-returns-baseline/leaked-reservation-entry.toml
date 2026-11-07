@@ -1,0 +1,7 @@
+# Drops the reservation removal from `PeerWorkQueue::release_capacity`, so a
+# peer's reservation entry outlives the round it backs. The input's node
+# releases a round whose reservation still holds headers.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides peer_work.rs, which the patch changes, the reactor decides when
+# rounds retire. A change there can move the input off that release.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

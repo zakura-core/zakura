@@ -2,9 +2,9 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::iter;
+use std::{hint::black_box, iter, time::Instant};
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 
 use transparent::OutPoint;
 use zakura_chain::{
@@ -16,6 +16,9 @@ use zakura_chain::{
 use zakura_chain::transparent;
 
 use crate::components::mempool::storage::*;
+
+use super::super::{config::Config, fixtures::TxFactory};
+use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 
 /// Eviction memory time used for tests. Most tests won't care about this
 /// so we use a large enough value that will never be reached in the tests.
@@ -153,6 +156,46 @@ fn mempool_storage_crud_exact_mainnet() {
     // Check that it is /not/ in the mempool.
     assert_eq!(removal_count, 1);
     assert!(!storage.contains_transaction_exact(&unmined_tx.transaction.id().mined_id()));
+}
+
+/// `transactions_exact` must not return a same-effects variant whose authorizing
+/// data differs from the requested ID.
+#[test]
+fn transactions_exact_ignores_different_authorizing_data() {
+    let _init_guard = zakura_test::init();
+
+    let mut storage: Storage = Storage::new(&config::Config {
+        tx_cost_limit: u64::MAX,
+        eviction_memory_time: EVICTION_MEMORY_TIME,
+        ..Default::default()
+    });
+    let unmined_tx = Network::Mainnet
+        .unmined_transactions_in_blocks(..)
+        .find(|transaction| transaction.transaction.id().auth_digest().is_some())
+        .expect("mainnet test vectors contain a witnessed transaction");
+    let tx_id = unmined_tx.transaction.id();
+    storage
+        .insert(unmined_tx, Vec::new(), None)
+        .expect("test transaction fits in the mempool");
+
+    let mut different_authorizing_data = tx_id;
+    different_authorizing_data
+        .auth_digest_mut()
+        .expect("test selected a witnessed transaction")
+        .0[0] ^= 1;
+    assert_eq!(different_authorizing_data.mined_id(), tx_id.mined_id());
+
+    let exact: Vec<_> = storage
+        .transactions_exact(HashSet::from([tx_id]))
+        .map(UnminedTx::id)
+        .collect();
+    assert_eq!(exact, vec![tx_id]);
+    assert_eq!(
+        storage
+            .transactions_exact(HashSet::from([different_authorizing_data]))
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -688,4 +731,79 @@ fn standard_script_kind_rejects_nonstandard() {
         kind.is_none(),
         "non-standard script should be classified as None"
     );
+}
+
+#[test]
+fn same_effects_lookup_returns_only_requested_stored_transactions() {
+    let mut factory = TxFactory::new();
+    let mut storage = Storage::new(&Config::default());
+    let transactions = [factory.tx(10_000), factory.tx(10_000), factory.tx(10_000)];
+    let ids = transactions.each_ref().map(|tx| tx.transaction.id());
+    for tx in transactions {
+        storage.insert(tx, Vec::new(), None).unwrap();
+    }
+    let missing = factory.tx(10_000).transaction.id().mined_id();
+    let requested = HashSet::from([ids[0].mined_id(), missing, ids[2].mined_id()]);
+    let found: HashSet<_> = storage
+        .transactions_same_effects(requested)
+        .map(UnminedTx::id)
+        .collect();
+    assert_eq!(found, HashSet::from([ids[0], ids[2]]));
+    assert_eq!(storage.transactions_same_effects(HashSet::new()).count(), 0);
+    assert_eq!(
+        storage
+            .transactions_same_effects(HashSet::from([missing]))
+            .count(),
+        0
+    );
+}
+
+/// Compares selection cost at realistic pool sizes. Run the same harness on
+/// control and candidate; request-set cloning is included in both timings.
+#[test]
+#[ignore = "manual performance measurement; run with --release --ignored --nocapture"]
+#[allow(clippy::print_stdout, reason = "manual benchmark results")]
+fn benchmark_mempool_txid_lookup() {
+    const ITERATIONS: u32 = 500;
+    const SAMPLES: usize = 21;
+    let config = Config::default();
+    let default_count = config.tx_cost_limit / MEMPOOL_TRANSACTION_COST_THRESHOLD;
+    let mut factory = TxFactory::new();
+    for count in [0, default_count / 8, default_count] {
+        let mut storage = Storage::new(&config);
+        let mut stored = Vec::new();
+        for _ in 0..count {
+            let tx = factory.tx(10_000);
+            stored.push(tx.transaction.id().mined_id());
+            storage.insert(tx, Vec::new(), None).unwrap();
+        }
+        let missing = factory.tx(10_000).transaction.id().mined_id();
+        let hit = stored.first().copied().unwrap_or(missing);
+        let mixed = stored.iter().copied().take(15).chain([missing]).collect();
+        for (name, requested) in [
+            ("hit", HashSet::from([hit])),
+            ("miss", HashSet::from([missing])),
+            ("mixed", mixed),
+        ] {
+            let expected = storage.transactions_same_effects(requested.clone()).count();
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let found = storage
+                        .transactions_same_effects(black_box(requested.clone()))
+                        .count();
+                    assert_eq!(black_box(found), expected);
+                }
+                samples.push(start.elapsed() / ITERATIONS);
+            }
+            samples.sort();
+            println!(
+                "lookup transactions={count} case={name} median_ns={} min_ns={} max_ns={}",
+                samples[SAMPLES / 2].as_nanos(),
+                samples[0].as_nanos(),
+                samples[SAMPLES - 1].as_nanos(),
+            );
+        }
+    }
 }

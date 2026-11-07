@@ -71,7 +71,8 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
             .contains_key(&SourceId::from_digest([0; 32])));
     }
     // An evicted index is only a cache miss, even when the request is a continuation.
-    for marker in 0..MAX_RETAINED_PATH_LEASES - 1 {
+    // Ordinary slots fill first, and the last short path uses the reserve.
+    for marker in 0..MAX_RETAINED_PATH_LEASES {
         let source = SourceId::from_digest([u8::try_from(marker).unwrap(); 32]);
         assert!(matches!(
             reader
@@ -80,7 +81,7 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -90,8 +91,8 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
                 scope
             )
             .unwrap(),
-        RetainedPathLeaseOutcome::Busy
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
 }
 
 #[test]
@@ -104,7 +105,7 @@ fn continuation_cache_matches_session_target_and_first_locator() {
     for (session, next_target, locators, ancestor) in [
         (8, target, vec![path[3].hash], path[3].hash),
         (7, path[4].hash, vec![path[3].hash], path[3].hash),
-        (7, target, vec![path[2].hash, path[3].hash], path[2].hash),
+        (7, target, vec![path[2].hash, path[3].hash], path[3].hash),
     ] {
         let RetainedPathLeaseOutcome::Acquired(first) = reader
             .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
@@ -439,6 +440,116 @@ fn serving_leases_do_not_block_a_better_work_branch() {
 }
 
 #[test]
+fn selected_chain_membership_spans_the_finalized_boundary_and_follows_a_reorg() {
+    use zakura_node_services::header_chain::SelectedChainMembership::{
+        NotRetained, NotSelected, Selected,
+    };
+    // Heights 1 through 3 are finalized, and 4 through 6 are retained above them.
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let membership = |header: &VerifiedHeaderRef| {
+        reader
+            .selected_chain_membership(header.hash)
+            .expect("the membership query reads coherent state")
+    };
+    let selected = |header: &VerifiedHeaderRef| Selected(Frontier::new(header.height, header.hash));
+    for header in std::iter::once(&genesis).chain(&path) {
+        assert_eq!(membership(header), selected(header));
+    }
+    assert_eq!(
+        reader
+            .selected_chain_membership(block::Hash([0xab; 32]))
+            .unwrap(),
+        NotRetained
+    );
+
+    // Finality moves to height 5, so height 4 now answers from the finalized index.
+    finalize_serving_test_path(&runtime, &db, &path[3..5]);
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.finalized,
+        Frontier::new(path[4].height, path[4].hash)
+    );
+    assert!(
+        runtime
+            .transition_engine
+            .lock()
+            .unwrap()
+            .graph()
+            .header_node(path[3].hash)
+            .is_none(),
+        "finality pruned height 4 from the retained graph"
+    );
+    for header in std::iter::once(&genesis).chain(&path) {
+        assert_eq!(membership(header), selected(header));
+    }
+
+    // A two-header branch from height 5 has more work and replaces height 6.
+    let validation = reader.validation_context(path[4].hash).unwrap().unwrap();
+    let rules = HeaderRules::for_validation_lease(&validation).unwrap();
+    let parent = Frontier::new(path[4].height, path[4].hash);
+    let mut branch = Vec::new();
+    let mut previous = path[4].header.clone();
+    for marker in [0xf1, 0xf2] {
+        let mut header = *previous;
+        header.previous_block_hash = previous.hash();
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[31] = marker;
+        let header = Arc::new(header);
+        branch.push(header.clone());
+        previous = header;
+    }
+    let snapshot = runtime.publisher().snapshot();
+    let target = previous.hash();
+    assert_eq!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&snapshot, target, 1, 1),
+                        source: SourceId::from_digest([0xee; 32]),
+                        parent_hash: parent.hash,
+                        target_tip_hash: target,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: parent,
+                        },
+                        batch: zakura_header_chain::prepare_headers(
+                            HeaderBatchInput::new(&branch),
+                            parent,
+                            &rules,
+                            &SystemClock,
+                        )
+                        .unwrap(),
+                        aux: Vec::new(),
+                    })),
+                },
+                &TransitionContext {
+                    config: &runtime.config,
+                    clock: &SystemClock,
+                    full_state_authority: None,
+                    retention_references: &[],
+                },
+            )
+            .unwrap(),
+        ApplyResult::Committed
+    );
+    assert_eq!(
+        runtime.publisher().snapshot().frontiers.header_best.hash,
+        target
+    );
+    assert_eq!(membership(&path[5]), NotSelected);
+    for header in std::iter::once(&genesis).chain(&path[..5]) {
+        assert_eq!(membership(header), selected(header));
+    }
+    for (header, height) in branch.iter().zip([6, 7]) {
+        assert_eq!(
+            reader.selected_chain_membership(header.hash()).unwrap(),
+            Selected(Frontier::new(block::Height(height), header.hash()))
+        );
+    }
+}
+
+#[test]
 fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
@@ -725,7 +836,19 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
 /// finalized columns. Remaining headers sit in the retained graph above the finalized frontier.
 /// Returns the runtime, its open database, the genesis header, and the requested path.
 fn reconciled_store_with_finalized_prefix(
-    path_len: u8,
+    path_len: u32,
+) -> (
+    HeaderChainRuntime,
+    DiskDb,
+    VerifiedHeaderRef,
+    Vec<VerifiedHeaderRef>,
+) {
+    reconciled_store_with_finality(path_len, 3)
+}
+
+fn reconciled_store_with_finality(
+    path_len: u32,
+    finalized_count: usize,
 ) -> (
     HeaderChainRuntime,
     DiskDb,
@@ -751,7 +874,7 @@ fn reconciled_store_with_finalized_prefix(
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
-        header.nonce.0[0] = marker;
+        header.nonce.0[..4].copy_from_slice(&marker.to_le_bytes());
         let header = Arc::new(header);
         let height = parent
             .height
@@ -777,7 +900,7 @@ fn reconciled_store_with_finalized_prefix(
         .cf_handle("block_header_by_height")
         .expect("the finalized header column exists");
     let mut batch = DiskWriteBatch::new();
-    for header in std::iter::once(&genesis).chain(path[..3].iter()) {
+    for header in std::iter::once(&genesis).chain(path[..finalized_count].iter()) {
         batch.zs_insert(&hash_by_height, header.height, header.hash);
         batch.zs_insert(&height_by_hash, header.hash, header.height);
         batch.zs_insert(
@@ -789,21 +912,48 @@ fn reconciled_store_with_finalized_prefix(
     db.write(batch)
         .expect("the canonical finalized header fixture commits");
 
-    let finalized = Frontier::new(path[2].height, path[2].hash);
+    let finalized = Frontier::new(
+        path[finalized_count - 1].height,
+        path[finalized_count - 1].hash,
+    );
     let (runtime, _) = store
         .startup_reconciled(
             &engine_config,
             finalized,
-            path[..3].to_vec(),
-            path[3..].to_vec(),
+            path[..finalized_count].to_vec(),
+            path[finalized_count..].to_vec(),
         )
         .expect("the finalized prefix and retained suffix reconcile");
     (runtime, db, genesis, path)
 }
 
 #[test]
+fn repair_context_range_is_bounded_by_reclaimable_capacity() {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(6);
+    // Even an empty store cannot retain a range larger than its aggregate limit.
+    runtime.set_auxiliary_limits_for_test(1, 1);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(7, NonZeroU64::new(8).unwrap());
+    for index in [3, 4, 5] {
+        let context = runtime
+            .reader()
+            .vct_repair_context(owner, path[index].height)
+            .unwrap()
+            .unwrap();
+        assert!(context.admission_capacity_available);
+        assert_eq!(context.selected_header_count(), 1);
+        assert_eq!(
+            context.target,
+            Frontier::new(path[index].height, path[index].hash)
+        );
+    }
+}
+
+#[test]
 fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
-    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let (mut runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    runtime.set_auxiliary_limits_for_test(1, 3);
     let target = Frontier::new(path[3].height, path[3].hash);
     let snapshot = runtime.publisher().snapshot();
     let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
@@ -880,6 +1030,10 @@ fn repair_context_reconstructs_rejected_input_after_engine_hydration() {
         .expect("the recovered selected target still needs repair");
 
     assert_ne!(recovered.episode, before.episode);
+    assert!(
+        recovered.admission_capacity_available,
+        "a full recovered input bucket permits a selected replacement"
+    );
     assert!(recovered.excludes(input));
     assert!(recovered.retains_payload(input));
     assert!(recovered.retains_source(rejected.source));
@@ -1165,6 +1319,246 @@ fn selected_range_repair_rejects_atomically_then_commits_every_delivery() {
             1
         );
     }
+}
+
+/// Store each delivery as durable input on its retained header and refresh the runtime mirror.
+///
+/// Each delivery must name a distinct header.
+fn retain_aux_deliveries_for_test(runtime: &HeaderChainRuntime, deliveries: &[AuxDelivery]) {
+    let mut batch = DiskWriteBatch::new();
+    for delivery in deliveries {
+        let mut node = runtime
+            .store
+            .header_node(delivery.header_hash)
+            .expect("the retained header row decodes")
+            .expect("the delivery header is retained");
+        node.aux_delivery_ids.push(delivery.delivery_id);
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_NODE_BY_HASH,
+                delivery.header_hash.0,
+                &HeaderNodeDisk::from_domain(&node),
+            )
+            .expect("the header with auxiliary input encodes");
+        runtime
+            .store
+            .put_value(
+                &mut batch,
+                HEADER_AUX_DELIVERY,
+                HeaderAuxDeliveryKey {
+                    header: delivery.header_hash,
+                    delivery: delivery.delivery_id,
+                }
+                .as_bytes(),
+                delivery,
+            )
+            .expect("the auxiliary delivery encodes");
+    }
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the auxiliary input fixture commits");
+    *runtime
+        .transition_engine
+        .lock()
+        .expect("the transition engine mutex is not poisoned") =
+        load_transition_engine(&runtime.store)
+            .expect("the direct durable test fixture refreshes the runtime mirror");
+}
+
+/// Repair three headers that hold rootless near-tip rows in one range, below one rooted header.
+///
+/// `aggregate_limit` replaces the aggregate input limit. Returns the durable rows of each
+/// repaired target and the number of durable rows in the store.
+fn repair_rootless_near_tip_range(
+    aggregate_limit: Option<usize>,
+) -> (Vec<Vec<AuxDelivery>>, usize) {
+    let (mut runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(8);
+    if let Some(total) = aggregate_limit {
+        let per_header = runtime.config.limits.max_aux_deliveries_per_header.get();
+        runtime.set_auxiliary_limits_for_test(per_header, total);
+    }
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let targets: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| Frontier::new(header.height, header.hash))
+        .collect();
+    let rooted_header = Frontier::new(path[6].height, path[6].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(37, NonZeroU64::new(38).expect("thirty-eight is nonzero"));
+    let near_tip_owner =
+        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, path[7].hash)
+            .bind(39, NonZeroU64::new(40).expect("forty is nonzero"));
+    let near_tip_source = SourceId::from_digest([0xc1; 32]);
+    let record = |height: block::Height, marker: u8| zakura_header_chain::TreeAuxRecordV1 {
+        height,
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: u64::from(marker),
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([marker; 32]),
+    };
+    let mut near_tip_input: Vec<_> = targets
+        .iter()
+        .zip(0xc2_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                near_tip_source,
+                near_tip_owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            )
+        })
+        .collect();
+    near_tip_input.push(AuxDelivery::new(
+        EvidenceId::from_digest([0xc8; 32]),
+        rooted_header.hash,
+        near_tip_source,
+        near_tip_owner.into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(record(rooted_header.height, 0xc9)),
+    ));
+    retain_aux_deliveries_for_test(&runtime, &near_tip_input);
+
+    let repair = runtime
+        .reader()
+        .vct_repair_context(owner, targets[0].height)
+        .expect("the rootless range repair context is coherent")
+        .expect("the rootless selected range needs repair");
+    assert_eq!(
+        repair.selected_header_count(),
+        targets.len(),
+        "the range stops before the first rooted row"
+    );
+    assert_eq!(repair.request_target(), targets[2]);
+    assert_eq!(
+        runtime
+            .reader()
+            .vct_repair_context(owner, rooted_header.height)
+            .expect("the rooted repair context is coherent")
+            .expect("the rooted target remains repairable")
+            .selected_header_count(),
+        1,
+        "rooted input still constrains its replacement to one target"
+    );
+
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let headers: Vec<_> = path[3..6]
+        .iter()
+        .map(|header| header.header.clone())
+        .collect();
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected range passes deterministic preparation");
+    let source = SourceId::from_digest([0xca; 32]);
+    let replacements = targets
+        .iter()
+        .zip(0xcb_u8..)
+        .map(|(target, marker)| {
+            AuxDelivery::new(
+                EvidenceId::from_digest([marker; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                Some(record(target.height, marker)),
+            )
+        })
+        .collect();
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: StateVersion::default(),
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: owner.into(),
+                        source,
+                        parent_hash: parent.hash,
+                        target_tip_hash: targets[2].hash,
+                        completion: TargetCompletion::SelectedAuxiliaryRepair {
+                            common_ancestor: parent,
+                            selected_target: targets[2],
+                            episode: repair.episode,
+                        },
+                        batch,
+                        aux: replacements,
+                    })),
+                },
+                &context,
+            )
+            .expect("the rootless range repair applies"),
+        ApplyResult::Committed
+    ));
+    let rows = targets
+        .iter()
+        .map(|target| {
+            runtime
+                .store
+                .aux_deliveries(target.hash)
+                .expect("the repaired target rows are readable")
+        })
+        .collect();
+    let total = runtime
+        .store
+        .load_aux_deliveries()
+        .expect("the durable input rows are readable")
+        .len();
+    (rows, total)
+}
+
+#[test]
+fn repair_range_spans_rootless_near_tip_input() {
+    // Suppliers attach roots only to their finalized prefix, so headers received near the
+    // network tip keep rootless rows. When a later handoff moves above those headers, one repair
+    // must still cover them all instead of one header per round trip.
+    let (rows, _) = repair_rootless_near_tip_range(None);
+    for rows in rows {
+        assert_eq!(rows.len(), 2, "the repair adds a rooted row");
+        assert!(rows.iter().any(|row| row.tree_aux.is_some()));
+    }
+}
+
+#[test]
+fn saturated_rootless_range_repair_retains_every_root() {
+    // The four near-tip rows leave one free aggregate slot. The two lowest targets sit in the
+    // commit window, so their rows are protected, and the range admits three new roots by
+    // reclaiming the two rows above it. Aggregate pressure must evict those older rows, never a
+    // root that the range repair just supplied.
+    let (rows, total) = repair_rootless_near_tip_range(Some(5));
+    assert_eq!(total, 5, "the repair stays within the aggregate limit");
+    let repair_source = SourceId::from_digest([0xca; 32]);
+    for rows in &rows {
+        assert!(
+            rows.iter()
+                .any(|row| row.source == repair_source && row.tree_aux.is_some()),
+            "every target retains its new root"
+        );
+    }
+    assert_eq!(rows[2].len(), 1, "eviction removes the suffix rootless row");
 }
 
 #[test]
@@ -1707,19 +2101,18 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("a stale acquisition scope is a normal refusal"),
         RetainedPathLeaseOutcome::Busy
     );
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash], lease_scope,)
             .expect("the lease bound is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
-    assert_eq!(
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 8, grandchild.hash, &[anchor.hash], lease_scope)
             .expect("a new session cannot replace a live lease"),
-        RetainedPathLeaseOutcome::Busy,
-        "same-peer replacement requires exact release or expiry"
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     assert_eq!(
         reader
             .read_retained_path(owner, 8, lease.lease_id, lease_scope, anchor.hash, 1)
@@ -1893,7 +2286,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 child.hash,
             ),
         )
-        .expect("the first requester-order intersection is selected")
+        .expect("the nearest locator ancestor is selected")
     else {
         panic!("the target itself intersects the locator");
     };
@@ -1920,12 +2313,13 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             target_intersection.lease_id,
             target_intersection.scope,
         )
-        .expect("the requester-order test lease releases"));
+        .expect("the target-intersection lease releases"));
 
     assert!(!reader
         .release_retained_path(owner, 7, lease.lease_id, lease_scope)
         .expect("the exact owner can release its lease"));
-    for marker in 1..MAX_RETAINED_PATH_LEASES {
+    // Ordinary leases fill the general slots, and the last short path uses the reserve.
+    for marker in 1..=MAX_RETAINED_PATH_LEASES {
         let marker = u8::try_from(marker).expect("the lease cap fits in one byte");
         assert!(matches!(
             reader
@@ -1943,7 +2337,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -1956,8 +2350,8 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 ),
             )
             .expect("capacity refusal is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
     assert!(matches!(
         reader
@@ -2025,8 +2419,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         &runtime.publisher().snapshot(),
         target.hash,
     );
-    // Long retained paths may occupy every general slot. The registry preserves one slot for the
-    // bounded finalized fallback that supplies a VCT repair range.
+    // Transfers occupy every ordinary slot. The reserve still admits a bounded repair.
     let retained_target = Frontier::new(path[3].height, path[3].hash);
     let retained_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
         &runtime.publisher().snapshot(),
@@ -2077,7 +2470,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         .release_retained_path(owner, 11, lease.lease_id, scope)
         .expect("the finalized target cursor releases"));
 
-    // The finalized fallback also serves a bounded range from an earlier canonical locator.
+    // The same acquisition serves a range from an earlier canonical locator.
     let long_path_owner = SourceId::from_digest([0x84; 32]);
     let RetainedPathLeaseOutcome::Acquired(long_path_lease) = reader
         .acquire_retained_path(long_path_owner, 11, target.hash, &[genesis.hash], scope)
@@ -2132,7 +2525,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         .release_retained_path(nearest_owner, 11, nearest_lease.lease_id, scope)
         .expect("the nearest canonical locator cursor releases"));
 
-    // A locator at or above the target leaves no ancestor to continue from.
+    // A locator above the target cannot intersect its ancestry.
     let above_owner = SourceId::from_digest([0x82; 32]);
     assert!(matches!(
         reader
@@ -2337,15 +2730,19 @@ fn retained_path_lookup_stops_at_the_locator_outside_commit_locks() {
         let _writer = reader.store.writer.lock().unwrap();
         let _engine = reader.transition_engine.lock().unwrap();
         let ancestors = read
-            .retained_ancestry_to_locator(node, snapshot.frontiers.finalized, &[parent.hash])
-            .unwrap()
+            .retained_ancestry_to_nearest_locator(
+                node,
+                snapshot.frontiers.finalized,
+                &HashSet::from([parent.hash]),
+                None,
+            )
             .unwrap();
         assert_eq!(
             ancestors,
-            vec![
+            serving_snapshot::RetainedAncestry::Path(vec![
                 Frontier::new(target.height, target.hash),
                 Frontier::new(parent.height, parent.hash),
-            ]
+            ])
         );
     }
 
@@ -2364,13 +2761,27 @@ fn retained_path_lookup_stops_at_the_locator_outside_commit_locks() {
     };
     assert_eq!(page.headers[0].hash(), target.hash);
     assert!(page.complete);
+    // The nearest locator wins regardless of list order, so the walk never reaches the gap.
+    let RetainedPathLeaseOutcome::Acquired(reordered) = reader
+        .acquire_retained_path(
+            SourceId::from_digest([0xc2; 32]),
+            7,
+            target.hash,
+            &[path[2].hash, parent.hash],
+            scope,
+        )
+        .unwrap()
+    else {
+        panic!("the nearest locator only needs the intact suffix");
+    };
+    assert_eq!(reordered.common_ancestor.hash, parent.hash);
     assert!(matches!(
         reader
             .acquire_retained_path(
-                SourceId::from_digest([0xc2; 32]),
+                SourceId::from_digest([0xc3; 32]),
                 7,
                 target.hash,
-                &[path[2].hash, parent.hash],
+                &[path[2].hash],
                 scope,
             )
             .unwrap(),
@@ -2379,7 +2790,7 @@ fn retained_path_lookup_stops_at_the_locator_outside_commit_locks() {
 }
 
 #[test]
-fn retained_path_lookup_preserves_locator_priority_and_skips_other_branches() {
+fn retained_path_lookup_chooses_the_nearest_locator_and_skips_other_branches() {
     let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(6);
     let reader = runtime.reader();
     let target = &path[4];
@@ -2402,9 +2813,9 @@ fn retained_path_lookup_preserves_locator_priority_and_skips_other_branches() {
         .unwrap();
     db.write(batch).unwrap();
     for (index, (locators, ancestor)) in [
-        (vec![path[2].hash, path[3].hash], &path[2]),
+        (vec![path[2].hash, path[3].hash], &path[3]),
         (vec![path[3].hash, path[2].hash], &path[3]),
-        (vec![genesis.hash, path[3].hash], &genesis),
+        (vec![genesis.hash, path[3].hash], &path[3]),
         (vec![path[3].hash, genesis.hash], &path[3]),
         (vec![path[5].hash, path[3].hash], &path[3]),
         (vec![fork.hash, target.hash], target),
@@ -2467,17 +2878,20 @@ fn retained_path_survives_finalization_during_and_between_page_reads() {
         "finality removes the old retained row"
     );
     let ancestors = ancestry_read
-        .retained_ancestry_to_locator(
+        .retained_ancestry_to_nearest_locator(
             ancestry_read
                 .retained_path_node(target.hash)
                 .unwrap()
                 .unwrap(),
             before.frontiers.finalized,
-            &[path[2].hash],
+            &HashSet::from([path[2].hash]),
+            None,
         )
-        .unwrap()
         .unwrap();
-    assert_eq!(ancestors, vec![target, before.frontiers.finalized]);
+    assert_eq!(
+        ancestors,
+        serving_snapshot::RetainedAncestry::Path(vec![target, before.frontiers.finalized])
+    );
     let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
     assert_eq!(page.headers[0].hash(), target.hash);
     assert!(page.complete);
@@ -2559,7 +2973,7 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
     assert!(!page.complete);
 
     let pending_source = SourceId::from_digest([0xb2; 32]);
-    let reservation_id = runtime
+    let (reservation_id, capacity) = runtime
         .leases
         .lock()
         .unwrap()
@@ -2582,8 +2996,8 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
         common_ancestor: cursor.common_ancestor,
         scope,
         position: cursor.position,
-        retained_ancestor: cursor.retained_ancestor,
         retained_path: cursor.retained_path.clone(),
+        capacity,
     };
 
     let mut parent = path[2].clone();
@@ -2645,17 +3059,20 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
         .is_none());
 
     let ancestors = ancestry_read
-        .retained_ancestry_to_locator(
+        .retained_ancestry_to_nearest_locator(
             ancestry_read
                 .retained_path_node(target.hash)
                 .unwrap()
                 .unwrap(),
             before.frontiers.finalized,
-            &[path[2].hash],
+            &HashSet::from([path[2].hash]),
+            None,
         )
-        .unwrap()
         .unwrap();
-    assert_eq!(ancestors, vec![target, before.frontiers.finalized]);
+    assert_eq!(
+        ancestors,
+        serving_snapshot::RetainedAncestry::Path(vec![target, before.frontiers.finalized])
+    );
 
     let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
     assert_eq!(page.headers[0].hash(), target.hash);
@@ -2731,6 +3148,236 @@ fn finalize_serving_test_path(
             || {},
         )
         .expect("the authoritative test path finalizes");
+}
+
+#[test]
+fn capacity_signals_follow_reservations_and_capacity_classes() {
+    let mut leases = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let first = SourceId::from_digest([0; 32]);
+    let (first_id, _) = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(peer_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    for marker in 1..MAX_RETAINED_PATH_LEASES - 1 {
+        leases
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                now,
+                RetainedPathCapacity::General,
+            )
+            .unwrap();
+    }
+    let waiting = SourceId::from_digest([0xfe; 32]);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("general capacity is full")
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(other_wait)) = leases.reserve(
+        SourceId::from_digest([0xfd; 32]),
+        now,
+        RetainedPathCapacity::General,
+    ) else {
+        panic!("another peer shares the same full capacity class")
+    };
+    assert_eq!(general_wait, other_wait);
+    let fallback = SourceId::from_digest([0xff; 32]);
+    let (fallback_id, _) = leases
+        .reserve(fallback, now, RetainedPathCapacity::Bounded)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(fallback_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::Bounded)
+    else {
+        panic!("fallback capacity is full")
+    };
+    leases.release_reservation(fallback, fallback_id + 1);
+    assert!(!fallback_wait.is_released());
+    leases.release_reservation(fallback, fallback_id);
+    assert!(fallback_wait.is_released());
+    assert!(!general_wait.is_released());
+    assert!(!peer_wait.is_released());
+    leases.release_reservation(first, first_id);
+    assert!(general_wait.is_released());
+    assert!(other_wait.is_released());
+    assert!(peer_wait.is_released());
+    let (replacement, _) = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("another peer acquired the available general slot")
+    };
+    assert_ne!(general_wait, next_general_wait);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the replacement occupies this peer's slot")
+    };
+    leases.release_reservation(first, first_id);
+    assert!(!next_wait.is_released());
+    assert!(!next_general_wait.is_released());
+    leases.release_reservation(first, replacement);
+    assert!(next_wait.is_released());
+    assert!(next_general_wait.is_released());
+}
+
+#[test]
+fn capacity_signal_survives_reservation_commit_and_page_release() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd8; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the target is retained")
+    };
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 8, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first session holds this peer's slot")
+    };
+    assert!(!reader
+        .release_retained_path(source, 8, lease.lease_id, scope)
+        .unwrap());
+    assert!(!signal.is_released());
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    assert!(signal.is_released());
+    assert!(!reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
+}
+
+#[test]
+fn dropped_reservation_notifies_waiters() {
+    let leases = Arc::new(Mutex::new(RetainedPathLeaseRegistry::default()));
+    let peer = SourceId::from_digest([0xd9; 32]);
+    let (id, _) = leases
+        .lock()
+        .unwrap()
+        .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+        .unwrap();
+    let reservation = RetainedPathReservation {
+        leases: leases.clone(),
+        peer,
+        reservation_id: id,
+        active: true,
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+        leases
+            .lock()
+            .unwrap()
+            .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    assert!(!signal.is_released());
+    drop(reservation);
+    assert!(signal.is_released());
+}
+
+#[test]
+fn reservation_commit_keeps_the_waiter_until_exact_release_or_expiry() {
+    for expire in [false, true] {
+        let mut leases = RetainedPathLeaseRegistry::default();
+        let peer = SourceId::from_digest([0xda; 32]);
+        let now = Instant::now();
+        let (reservation, capacity) = leases
+            .reserve(peer, now, RetainedPathCapacity::General)
+            .unwrap();
+        let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+            leases.reserve(peer, now, RetainedPathCapacity::General)
+        else {
+            panic!("the reservation occupies this peer's slot")
+        };
+        let frontier = Frontier::new(block::Height(0), block::Hash([0; 32]));
+        let scope = HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(frontier.hash, frontier.hash),
+        };
+        let RetainedPathLeaseOutcome::Acquired(lease) = leases.commit_reservation(
+            peer,
+            reservation,
+            RetainedPathLeaseSpec {
+                peer,
+                session_id: 7,
+                target: frontier,
+                common_ancestor: frontier,
+                scope,
+                position: CanonicalHeaderPathPosition::Complete,
+                capacity,
+                retained_path: Arc::from([]),
+            },
+            now,
+        ) else {
+            panic!("the reservation commits its lease")
+        };
+        assert!(!signal.is_released());
+        assert!(!leases.release(peer, 8, lease.lease_id, scope));
+        assert!(!signal.is_released());
+        if expire {
+            leases.expire(now + RETAINED_PATH_LEASE_IDLE);
+        } else {
+            assert!(leases.release(peer, 7, lease.lease_id, scope));
+        }
+        assert!(signal.is_released());
+    }
+}
+
+#[tokio::test]
+async fn abandoned_blocking_acquisition_releases_its_lease_and_notifies_waiters() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xe5; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    assert!(matches!(outcome, RetainedPathLeaseOutcome::Acquired(_)));
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first acquisition owns the peer slot");
+    };
+    let (resume, blocked) = std::sync::mpsc::channel();
+    let task_reader = reader.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        blocked.recv().unwrap();
+        PendingRetainedPathAcquisition::new(task_reader, outcome)
+    });
+    drop(task);
+    assert!(!signal.is_released());
+    resume.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), signal.released())
+        .await
+        .unwrap();
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    let pending = PendingRetainedPathAcquisition::new(reader.clone(), outcome);
+    let RetainedPathLeaseOutcome::Acquired(lease) = pending.into_outcome() else {
+        panic!("abandonment must return the peer slot");
+    };
+    // Receiving the result transfers ownership to the caller.
+    assert!(reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
 }
 
 fn retained_checkpoint_fixture() -> (HeaderChainRuntime, DiskDb, Vec<VerifiedHeaderRef>) {
@@ -2883,4 +3530,904 @@ fn retained_checkpoint_still_rejects_mismatched_header_identity() {
         .apply_combined(request, &context, DiskWriteBatch::new(), || {})
         .is_err());
     assert_eq!(runtime.publisher().snapshot(), before);
+}
+
+/// Read a complete path, reacquiring the target with a continuation locator after each page.
+fn read_whole_retained_path(
+    reader: &HeaderChainReader,
+    owner: SourceId,
+    target: block::Hash,
+    locators: &[block::Hash],
+    scope: HeaderWorkAuthority,
+    page_count: u32,
+) -> (Frontier, Vec<Arc<block::Header>>) {
+    let mut locators = locators.to_vec();
+    let mut first_ancestor = None;
+    let mut headers = Vec::new();
+    loop {
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target, &locators, scope)
+            .expect("the target resolves on either side of finality")
+        else {
+            panic!("the same locator must acquire every target");
+        };
+        first_ancestor.get_or_insert(lease.common_ancestor);
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(
+                owner,
+                1,
+                lease.lease_id,
+                scope,
+                lease.common_ancestor.hash,
+                page_count,
+            )
+            .expect("the cursor reads a coherent page")
+        else {
+            panic!("the path must remain available");
+        };
+        assert_eq!(page.target.hash, target);
+        assert!(page.aux_deliveries.iter().all(Vec::is_empty));
+        headers.extend(page.headers.iter().cloned());
+        if page.complete {
+            break;
+        }
+        locators = vec![page
+            .headers
+            .last()
+            .expect("an incomplete page is nonempty")
+            .hash()];
+    }
+    (
+        first_ancestor.expect("the loop acquires at least once"),
+        headers,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_requests_have_identical_rules_across_finality() {
+    for finalized_count in [1, 3, 5] {
+        let (runtime, _db, genesis, path) = reconciled_store_with_finality(5, finalized_count);
+        let reader = runtime.reader();
+        let owner = SourceId::from_digest([0xc1; 32]);
+        let target = Frontier::new(path[2].height, path[2].hash);
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+        for page_count in [1, 4] {
+            let (ancestor, headers) = read_whole_retained_path(
+                &reader,
+                owner,
+                target.hash,
+                &[
+                    genesis.hash,
+                    path[0].hash,
+                    path[4].hash,
+                    block::Hash([0xff; 32]),
+                ],
+                scope,
+                page_count,
+            );
+            assert_eq!(ancestor.hash, path[0].hash);
+            assert_eq!(
+                headers,
+                vec![path[1].header.clone(), path[2].header.clone()]
+            );
+        }
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash, target.hash], scope)
+            .unwrap()
+        else {
+            panic!("the target itself must intersect in every storage band");
+        };
+        assert_eq!(lease.common_ancestor, target);
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, target.hash, 1)
+            .unwrap()
+        else {
+            panic!("the empty path must be readable");
+        };
+        assert!(page.headers.is_empty());
+        assert!(page.complete);
+        assert_eq!(
+            reader
+                .acquire_retained_path(owner, 1, target.hash, &[path[4].hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::NoLocatorIntersection
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band() {
+    let (runtime, _db, genesis, path) =
+        reconciled_store_with_finalized_prefix(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 4);
+    let reader = runtime.reader();
+    let ordinary_target = path.last().unwrap();
+    let ordinary_scope =
+        HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), ordinary_target.hash);
+    let mut ordinary_leases = Vec::new();
+    for marker in 1..MAX_RETAINED_PATH_LEASES {
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                1,
+                ordinary_target.hash,
+                &[genesis.hash],
+                ordinary_scope,
+            )
+            .unwrap()
+        else {
+            panic!("ordinary transfers must fill the general slots");
+        };
+        ordinary_leases.push(lease);
+    }
+    let owner = SourceId::from_digest([0xc2; 32]);
+    let RetainedPathLeaseOutcome::CapacityBusy(long_wait) = reader
+        .acquire_retained_path(
+            owner,
+            1,
+            ordinary_target.hash,
+            &[genesis.hash],
+            ordinary_scope,
+        )
+        .unwrap()
+    else {
+        panic!("a long path rejected from the reserve waits for ordinary capacity");
+    };
+    assert!(!long_wait.is_released());
+    let RetainedPathLeaseOutcome::CapacityBusy(missing_locator_wait) = reader
+        .acquire_retained_path(
+            owner,
+            1,
+            ordinary_target.hash,
+            &[block::Hash([0xee; 32])],
+            ordinary_scope,
+        )
+        .unwrap()
+    else {
+        panic!("reserve traversal stops at the range limit before resolving a missing locator");
+    };
+    assert_eq!(missing_locator_wait, long_wait);
+
+    // Each two-header repair uses the reserve and stops at its admitted target.
+    for (target, ancestor) in [
+        (&path[1], &genesis),
+        (&path[2], &path[0]),
+        (&path[3], &path[1]),
+    ] {
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[ancestor.hash], scope)
+            .unwrap()
+        else {
+            panic!("bounded repair must acquire the reserved slot");
+        };
+        assert_eq!(
+            runtime.leases.lock().unwrap().by_peer[&owner].capacity,
+            RetainedPathCapacity::Bounded
+        );
+        let RetainedPathLeaseOutcome::CapacityBusy(capacity_signal) = reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xc3; 32]),
+                1,
+                target.hash,
+                &[ancestor.hash],
+                scope,
+            )
+            .unwrap()
+        else {
+            panic!("one bounded lease fills the reserve and reports its release signal");
+        };
+        assert!(!capacity_signal.is_released());
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(
+                owner,
+                1,
+                lease.lease_id,
+                scope,
+                ancestor.hash,
+                crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
+            )
+            .unwrap()
+        else {
+            panic!("bounded repair must read the reserved path");
+        };
+        assert_eq!(page.headers.len(), 2);
+        assert_eq!(page.headers.last().unwrap().hash(), target.hash);
+        assert!(page.complete);
+        assert!(capacity_signal.is_released());
+    }
+
+    let target = &path[3];
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+    assert!(
+        matches!(
+            reader
+                .acquire_retained_path(owner, 1, target.hash, &[path[1].hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::Acquired(_)
+        ),
+        "a completed page releases the reserve"
+    );
+    assert!(!long_wait.is_released());
+    let released = ordinary_leases.pop().unwrap();
+    assert!(reader
+        .release_retained_path(released.peer, 1, released.lease_id, ordinary_scope)
+        .unwrap());
+    assert!(
+        long_wait.is_released(),
+        "a freed ordinary slot wakes long paths rejected from the reserve"
+    );
+    assert!(
+        matches!(
+            reader
+                .acquire_retained_path(
+                    released.peer,
+                    2,
+                    ordinary_target.hash,
+                    &[genesis.hash],
+                    ordinary_scope,
+                )
+                .unwrap(),
+            RetainedPathLeaseOutcome::Acquired(_)
+        ),
+        "a reserve lease must not consume a released general slot"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_long_transfers_use_ordinary_capacity_across_finality() {
+    let range = crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE;
+    let target_index = usize::try_from(range).unwrap();
+    for finalized_count in [1, target_index + 2] {
+        let (runtime, _db, genesis, path) =
+            reconciled_store_with_finality(range + 2, finalized_count);
+        let reader = runtime.reader();
+        let target = &path[target_index];
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+        let owner = SourceId::from_digest([0xc4; 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap()
+        else {
+            panic!("long paths must use ordinary capacity in either storage band");
+        };
+        assert_eq!(
+            runtime.leases.lock().unwrap().by_peer[&owner].capacity,
+            RetainedPathCapacity::General
+        );
+        let RetainedPathReadOutcome::Page(first) = reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, genesis.hash, range)
+            .unwrap()
+        else {
+            panic!("the first protocol range must be readable");
+        };
+        assert_eq!(first.headers.len(), target_index);
+        assert!(!first.complete);
+        let continuation = path[target_index - 1].hash;
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[continuation], scope)
+            .unwrap()
+        else {
+            panic!("the continuation must reacquire the target");
+        };
+        let RetainedPathReadOutcome::Page(last) = reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, continuation, range)
+            .unwrap()
+        else {
+            panic!("the final page must be readable");
+        };
+        assert_eq!(last.headers, vec![target.header.clone()]);
+        assert!(last.complete);
+        for marker in 1..MAX_RETAINED_PATH_LEASES {
+            assert!(matches!(
+                reader
+                    .acquire_retained_path(
+                        SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                        1,
+                        target.hash,
+                        &[genesis.hash],
+                        scope
+                    )
+                    .unwrap(),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ));
+        }
+        let repair_owner = SourceId::from_digest([0xc5; 32]);
+        let RetainedPathLeaseOutcome::CapacityBusy(long_wait) = reader
+            .acquire_retained_path(repair_owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap()
+        else {
+            panic!("a long path waits for ordinary capacity in either storage band");
+        };
+        assert!(!long_wait.is_released());
+        assert!(
+            matches!(
+                reader
+                    .acquire_retained_path(repair_owner, 1, target.hash, &[path[0].hash], scope)
+                    .unwrap(),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ),
+            "a protocol-sized repair must still use the reserve in either storage band"
+        );
+    }
+}
+
+#[test]
+fn retained_path_reservations_keep_capacity_classes_separate() {
+    let mut registry = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let peers: Vec<_> = (0..MAX_RETAINED_PATH_LEASES)
+        .map(|marker| SourceId::from_digest([u8::try_from(marker).unwrap(); 32]))
+        .collect();
+    let mut reservations = Vec::new();
+    for peer in &peers {
+        reservations.push(
+            registry
+                .reserve(*peer, now, RetainedPathCapacity::Bounded)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        reservations.last().unwrap().1,
+        RetainedPathCapacity::Bounded
+    );
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(general_wait)) = registry.reserve(
+        SourceId::from_digest([0xfe; 32]),
+        now,
+        RetainedPathCapacity::General,
+    ) else {
+        panic!("ordinary reservations fill the general class")
+    };
+    registry.release_reservation(peers[0], reservations[0].0);
+    assert!(
+        general_wait.is_released(),
+        "the reserve must not hide a freed ordinary slot"
+    );
+    assert_eq!(
+        registry
+            .reserve(peers[0], now, RetainedPathCapacity::General)
+            .unwrap()
+            .1,
+        RetainedPathCapacity::General
+    );
+    assert!(registry
+        .reserve(peers[0], now, RetainedPathCapacity::Bounded)
+        .is_err());
+    assert!(registry
+        .reserve(
+            SourceId::from_digest([0xff; 32]),
+            now,
+            RetainedPathCapacity::Bounded
+        )
+        .is_err());
+}
+
+#[test]
+fn reserve_rejection_reports_an_ordinary_slot_freed_after_admission() {
+    let mut registry = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let peers: Vec<_> = (0..MAX_RETAINED_PATH_LEASES)
+        .map(|marker| SourceId::from_digest([u8::try_from(marker).unwrap(); 32]))
+        .collect();
+    let reservations: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            registry
+                .reserve(*peer, now, RetainedPathCapacity::Bounded)
+                .unwrap()
+        })
+        .collect();
+    let (reserve_id, class) = *reservations.last().unwrap();
+    assert_eq!(class, RetainedPathCapacity::Bounded);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(reserve_wait)) = registry.reserve(
+        SourceId::from_digest([0xfe; 32]),
+        now,
+        RetainedPathCapacity::Bounded,
+    ) else {
+        panic!("the reserve is occupied");
+    };
+
+    // An ordinary slot frees while the reserve-admitted request walks its ancestry.
+    registry.release_reservation(peers[0], reservations[0].0);
+    let RetainedPathLeaseOutcome::CapacityBusy(ordinary_wait) =
+        registry.reject_beyond_reserve(*peers.last().unwrap(), reserve_id)
+    else {
+        panic!("a reserve rejection returns the ordinary capacity signal");
+    };
+    assert!(
+        ordinary_wait.is_released(),
+        "the requester must not wait for a slot that is already free"
+    );
+    assert!(
+        reserve_wait.is_released(),
+        "freeing any slot wakes bounded waiters"
+    );
+    assert!(!registry.reservations.contains_key(peers.last().unwrap()));
+}
+
+#[test]
+fn retained_path_busy_admission_does_not_lock_the_engine() {
+    let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix(4);
+    let reader = runtime.reader();
+    let target = path.last().unwrap();
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+    let owner = SourceId::from_digest([0xc6; 32]);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap(),
+        RetainedPathLeaseOutcome::Acquired(_)
+    ));
+    let engine = reader.transition_engine.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = engine.lock().unwrap();
+        panic!("poison the engine to detect any access after failed admission");
+    })
+    .join();
+    assert!(matches!(
+        reader
+            .acquire_retained_path(owner, 2, target.hash, &[genesis.hash], scope)
+            .unwrap(),
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+    for marker in 0..MAX_RETAINED_PATH_LEASES - 1 {
+        reader
+            .leases
+            .lock()
+            .unwrap()
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                Instant::now(),
+                RetainedPathCapacity::Bounded,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xff; 32]),
+                1,
+                target.hash,
+                &[genesis.hash],
+                scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+}
+
+#[test]
+fn stored_validation_context_equals_the_lease_built_from_rehashed_headers() {
+    let path_len = u8::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 6)
+        .expect("the predecessor span fixture is shorter than 256");
+    let (runtime, _, _, path) = reconciled_store_with_finalized_prefix(u32::from(path_len));
+    let (engine_config, _, _) = fixture();
+    let network = engine_config.network();
+    let parent = path.last().expect("the fixture path is nonempty");
+
+    let lease = runtime
+        .store
+        .validation_context(parent.hash, network)
+        .expect("the retained parent has a coherent validation context");
+
+    // Rebuild the lease the way it was built before hash reuse: hash every context header.
+    let parent_node = runtime
+        .store
+        .header_node(parent.hash)
+        .expect("the parent row decodes")
+        .expect("the parent is retained");
+    let mut facts = vec![zakura_header_chain::HeaderContextFact {
+        frontier: Frontier::new(parent_node.height, parent.hash),
+        header: parent_node.header.clone(),
+    }];
+    facts.extend(
+        authenticated_context_headers(&runtime.store, parent.hash, None)
+            .expect("the stored context authenticates")
+            .into_iter()
+            .rev()
+            .map(|context| context.fact()),
+    );
+    assert_eq!(
+        facts.len(),
+        zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 1
+    );
+    for fact in &facts {
+        assert_eq!(fact.frontier.hash, fact.header.hash());
+    }
+    let expected = zakura_header_chain::ValidationLease::new(
+        lease.parent(),
+        facts,
+        network.clone(),
+        runtime
+            .store
+            .metadata()
+            .expect("the metadata row exists")
+            .anchor_manifest_digest,
+    );
+    assert_eq!(lease, expected);
+}
+
+#[test]
+fn stored_validation_context_rejects_a_predecessor_row_with_altered_header_bytes() {
+    let (runtime, _, _, path) = reconciled_store_with_finalized_prefix(8);
+    let (engine_config, _, _) = fixture();
+    let parent = &path[7];
+    let altered = path[5].hash;
+    runtime
+        .store
+        .validation_context(parent.hash, engine_config.network())
+        .expect("the unaltered context is coherent");
+
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let mut row = runtime
+        .store
+        .db
+        .raw_get_cf(&cf, &altered.0)
+        .expect("the node row reads")
+        .expect("the predecessor is retained");
+    // The row starts with a four-byte header length, then the header: version (4), previous
+    // hash (32), merkle root (32), and commitment (32) precede the four-byte time.
+    row[4 + 100] ^= 0x01;
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(&mut batch, HEADER_NODE_BY_HASH, altered.0, &row)
+        .expect("the altered row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the fixture corruption is durable");
+
+    assert!(matches!(
+        runtime
+            .store
+            .validation_context(parent.hash, engine_config.network()),
+        Err(StoreError::Incoherent("durable header-chain read failed"))
+    ));
+}
+
+/// Rewrites the stored node row of `hash` with `rewrite`, durably.
+fn rewrite_node_row(
+    runtime: &HeaderChainRuntime,
+    hash: block::Hash,
+    rewrite: impl FnOnce(&mut Vec<u8>),
+) {
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let mut row = runtime
+        .store
+        .db
+        .raw_get_cf(&cf, &hash.0)
+        .expect("the node row reads")
+        .expect("the node is retained");
+    rewrite(&mut row);
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(&mut batch, HEADER_NODE_BY_HASH, hash.0, &row)
+        .expect("the row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the fixture corruption is durable");
+}
+
+#[test]
+fn validation_context_rejects_truncated_and_hash_flipped_predecessor_rows() {
+    use zakura_chain::serialization::ZcashSerialize;
+
+    for corruption in ["truncated", "stored hash flipped"] {
+        let (runtime, path, network) = hashed_evidence_fixture();
+        let parent = path.last().expect("the fixture path is nonempty").hash;
+        let corrupted = path[path.len() - 5].hash;
+        rewrite_node_row(&runtime, corrupted, |row| {
+            let (node, _) = HeaderNodeDisk::decode_hashed(row).expect("the stored row decodes");
+            let header_len = node
+                .header
+                .zcash_serialize_to_vec()
+                .expect("a decoded header serializes")
+                .len();
+            match corruption {
+                // Cut the row inside the stored hash that follows the header.
+                "truncated" => row.truncate(4 + header_len + 16),
+                // The row is a four-byte length, the header, then the redundant stored hash.
+                _ => row[4 + header_len] ^= 0x01,
+            }
+        });
+
+        assert!(
+            matches!(
+                runtime.store.validation_context(parent, &network),
+                Err(StoreError::Incoherent("durable header-chain read failed"))
+            ),
+            "{corruption} row must fail the integrity-checking decode"
+        );
+    }
+}
+
+#[test]
+fn validation_context_rejects_rows_with_tampered_parent_or_work_fields() {
+    use crate::service::finalized_state::disk_format::FallibleDiskValue;
+
+    for field in ["parent_hash", "block_work"] {
+        let (runtime, path, network) = hashed_evidence_fixture();
+        let parent = path.last().expect("the fixture path is nonempty").hash;
+        let tampered = path[path.len() - 5].hash;
+        // Re-encode a well-formed row: the header bytes and stored hash stay consistent, so
+        // only the hashed-header node construction can notice the contradicted field.
+        rewrite_node_row(&runtime, tampered, |row| {
+            let (mut node, _) = HeaderNodeDisk::decode_hashed(row).expect("the stored row decodes");
+            match field {
+                "parent_hash" => node.parent_hash.0[0] ^= 0x01,
+                // Valid headers have nonzero work, so doubling it changes the field.
+                _ => node.block_work <<= 1,
+            }
+            *row = node.encode().expect("a tampered field still encodes");
+        });
+
+        assert!(
+            matches!(
+                runtime.store.validation_context(parent, &network),
+                Err(StoreError::Incoherent("invalid durable node"))
+            ),
+            "a row with a tampered {field} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn validation_context_notices_corruption_written_between_two_builds() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("the uncorrupted context is coherent");
+
+    // A later build must read the row again rather than reuse anything from the first build.
+    rewrite_node_row(&runtime, path[path.len() - 5].hash, |row| {
+        row[4 + 100] ^= 0x01;
+    });
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent("durable header-chain read failed"))
+    ));
+}
+
+fn hashed_evidence_fixture() -> (HeaderChainRuntime, Vec<VerifiedHeaderRef>, Network) {
+    let path_len = u8::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 6)
+        .expect("the predecessor span fixture is shorter than 256");
+    let (runtime, _, _, path) = reconciled_store_with_finalized_prefix(u32::from(path_len));
+    let (engine_config, _, _) = fixture();
+    (runtime, path, engine_config.network().clone())
+}
+
+#[test]
+fn repeated_validation_contexts_reread_every_row_and_build_identical_leases() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    let first = runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("coherent");
+    let first_reads = HeaderChainStore::header_node_disk_reads();
+    HeaderChainStore::reset_header_node_disk_reads();
+    let second = runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("coherent");
+    let second_reads = HeaderChainStore::header_node_disk_reads();
+
+    assert_eq!(first, second);
+    // The parent is read by the build and again by the context walk, then one read per
+    // predecessor: no row is served from an earlier build.
+    let expected = u64::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 2)
+        .expect("the span fits in u64");
+    assert_eq!(first_reads, expected);
+    assert_eq!(second_reads, expected);
+}
+
+#[test]
+fn validation_context_rejects_a_missing_predecessor_row() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let missing = path[path.len() - 5].hash;
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut batch, HEADER_NODE_BY_HASH, missing.0)
+        .expect("the node row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the deletion is durable");
+
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent("validation context has a gap"))
+    ));
+}
+
+#[test]
+fn validation_context_rejects_a_valid_row_stored_under_another_hash() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let replaced = path[path.len() - 5].hash;
+    let other = path[path.len() - 6].hash;
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let other_row = runtime
+        .store
+        .db
+        .raw_get_cf(&cf, &other.0)
+        .expect("the node row reads")
+        .expect("the other predecessor is retained");
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_raw(&mut batch, HEADER_NODE_BY_HASH, replaced.0, &other_row)
+        .expect("the row is addressable");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the replacement is durable");
+
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent("node key/hash mismatch"))
+    ));
+}
+
+#[test]
+fn header_evidence_from_another_row_is_not_used() {
+    let (runtime, path, _) = hashed_evidence_fixture();
+    let cf = runtime
+        .store
+        .cf(HEADER_NODE_BY_HASH)
+        .expect("the node column family exists");
+    let raw = |hash: block::Hash| {
+        runtime
+            .store
+            .db
+            .raw_get_cf(&cf, &hash.0)
+            .expect("the node row reads")
+            .expect("the node is retained")
+    };
+    let a = path[path.len() - 2].hash;
+    let b = path[path.len() - 3].hash;
+    let (row_a, evidence_a) = HeaderNodeDisk::decode_hashed(&raw(a)).expect("row a decodes");
+    let (_, evidence_b) = HeaderNodeDisk::decode_hashed(&raw(b)).expect("row b decodes");
+    assert_eq!(evidence_a.hash(), a);
+    assert_eq!(evidence_b.hash(), b);
+
+    let expected = row_a
+        .clone()
+        .into_domain(Vec::new())
+        .expect("row a is coherent");
+    let with_foreign = row_a
+        .clone()
+        .into_domain_hashed(evidence_b, Vec::new())
+        .expect("foreign evidence is ignored and row a is re-hashed");
+    let with_own = row_a
+        .into_domain_hashed(evidence_a, Vec::new())
+        .expect("row a is coherent");
+    assert_eq!(with_foreign, expected);
+    assert_eq!(with_own, expected);
+    assert_eq!(expected.hash, a);
+
+    // Evidence for an equal header in a different allocation is not used either.
+    let (mut row_copy, evidence_copy) =
+        HeaderNodeDisk::decode_hashed(&raw(a)).expect("row a decodes");
+    row_copy.header = Arc::new(*row_copy.header);
+    assert!(!Arc::ptr_eq(evidence_copy.header(), &row_copy.header));
+    assert_eq!(
+        row_copy
+            .into_domain_hashed(evidence_copy, Vec::new())
+            .expect("row a is coherent"),
+        expected
+    );
+}
+
+/// Replace one retained predecessor's node row with a `HEADER_VALIDATION_CONTEXT` row.
+fn replace_node_with_context_row(
+    runtime: &HeaderChainRuntime,
+    target: &VerifiedHeaderRef,
+    context: HeaderValidationContextDisk,
+) {
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut batch, HEADER_NODE_BY_HASH, target.hash.0)
+        .expect("the node row is addressable");
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_VALIDATION_CONTEXT,
+            target.hash.0,
+            &context,
+        )
+        .expect("the context row encodes");
+    runtime
+        .store
+        .db
+        .write(batch)
+        .expect("the replacement is durable");
+}
+
+#[test]
+fn validation_context_fallback_rows_build_the_same_lease_and_reject_tampering() {
+    let (runtime, path, network) = hashed_evidence_fixture();
+    let parent = path.last().expect("the fixture path is nonempty").hash;
+    let target = path[path.len() - 5].clone();
+    let original = runtime
+        .store
+        .validation_context(parent, &network)
+        .expect("coherent");
+
+    // A coherent fallback row builds exactly the same lease.
+    replace_node_with_context_row(
+        &runtime,
+        &target,
+        HeaderValidationContextDisk {
+            header: target.header.clone(),
+            height: target.height,
+        },
+    );
+    assert_eq!(
+        runtime
+            .store
+            .validation_context(parent, &network)
+            .expect("coherent"),
+        original
+    );
+
+    // A wrong height is rejected.
+    replace_node_with_context_row(
+        &runtime,
+        &target,
+        HeaderValidationContextDisk {
+            header: target.header.clone(),
+            height: target
+                .height
+                .next()
+                .expect("the fixture height has a successor"),
+        },
+    );
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent(
+            "invalid immutable validation context"
+        ))
+    ));
+
+    // Different header bytes under the same key are rejected.
+    let mut altered = *target.header;
+    altered.time += chrono::Duration::seconds(1);
+    replace_node_with_context_row(
+        &runtime,
+        &target,
+        HeaderValidationContextDisk {
+            header: Arc::new(altered),
+            height: target.height,
+        },
+    );
+    assert!(matches!(
+        runtime.store.validation_context(parent, &network),
+        Err(StoreError::Incoherent(
+            "invalid immutable validation context"
+        ))
+    ));
 }

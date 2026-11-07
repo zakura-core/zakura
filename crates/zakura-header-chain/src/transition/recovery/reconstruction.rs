@@ -26,6 +26,9 @@ pub(super) fn reconstruct_derived_views(
     .map_err(|_| RecoveryFailure::Source {
         violations: vec![AuditViolation::ProtectedPath(finalized.hash)],
     })?;
+    graph.prefer_header_tip(
+        (config.mode == EngineMode::Integrated).then_some(audited.metadata.frontiers.header_best),
+    );
     graph
         .recompute_all_header_eligibility()
         .map_err(|_| RecoveryFailure::Source {

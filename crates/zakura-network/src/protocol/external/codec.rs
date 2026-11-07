@@ -18,10 +18,9 @@ use zakura_chain::{
     block::{self, Block},
     parameters::{Magic, Network},
     serialization::{
-        sha256d, zcash_deserialize_external_count, zcash_deserialize_string_external_count,
-        CompactSizeMessage, FakeWriter, ReadZcashExt, SerializationError as Error,
-        ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
-        MAX_PROTOCOL_MESSAGE_LEN,
+        sha256d, zcash_deserialize_string_external_count, CompactSizeMessage, FakeWriter,
+        ReadZcashExt, SerializationError as Error, ZcashDeserialize, ZcashDeserializeInto,
+        ZcashReader, ZcashSerialize, MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::Transaction,
 };
@@ -46,6 +45,17 @@ const HEADER_LEN: usize = 24usize;
 /// Bloom filter commands accepted and discarded for peer compatibility.
 const BLOOM_FILTER_COMMANDS: [[u8; 12]; 3] =
     [*b"filterload\0\0", *b"filteradd\0\0\0", *b"filterclear\0"];
+
+/// The most body bytes the decoder reserves before they arrive.
+///
+/// A peer names a body length in a 24-byte header. Reserving only this much keeps a
+/// hostile length from allocating a whole body. The buffer then grows with the bytes
+/// that actually arrive, and TCP flow control bounds those.
+const MAX_UNRECEIVED_BODY_RESERVATION: usize = 64 * 1024;
+
+/// The most bytes one connection's decoder can hold for an incomplete message: one
+/// header and one body of the protocol's maximum size.
+pub(crate) const MAX_INCOMPLETE_MESSAGE_BYTES: usize = HEADER_LEN + MAX_PROTOCOL_MESSAGE_LEN;
 
 /// The maximum body length allowed before the handshake completes.
 ///
@@ -136,13 +146,6 @@ impl Builder {
     /// Configure the codec for the given [`Network`].
     pub fn for_network(mut self, network: &Network) -> Self {
         self.network = network.clone();
-        self
-    }
-
-    /// Configure the codec for the given [`Version`].
-    #[allow(dead_code)]
-    pub fn for_version(mut self, version: Version) -> Self {
-        self.version = version;
         self
     }
 
@@ -239,7 +242,7 @@ impl Codec {
     /// Write the body of the message into the given writer. This allows writing
     /// the message body prior to writing the header, so that the header can
     /// contain a checksum of the message body.
-    fn write_body<W: Write>(&self, msg: &Message, mut writer: W) -> Result<(), Error> {
+    fn write_body<W: Write + ?Sized>(&self, msg: &Message, writer: &mut W) -> Result<(), Error> {
         match msg {
             Message::Version(VersionMessage {
                 version,
@@ -259,8 +262,8 @@ impl Codec {
                 // serialization can not error.
                 writer.write_i64::<LittleEndian>(timestamp.timestamp())?;
 
-                address_recv.zcash_serialize(&mut writer)?;
-                address_from.zcash_serialize(&mut writer)?;
+                address_recv.zcash_serialize(writer)?;
+                address_from.zcash_serialize(writer)?;
 
                 writer.write_u64::<LittleEndian>(nonce.0)?;
 
@@ -271,7 +274,7 @@ impl Codec {
                     ));
                 }
 
-                user_agent.zcash_serialize(&mut writer)?;
+                user_agent.zcash_serialize(writer)?;
                 writer.write_u32::<LittleEndian>(start_height.0)?;
                 writer.write_u8(*relay as u8)?;
             }
@@ -295,7 +298,7 @@ impl Codec {
                     ));
                 }
 
-                message.zcash_serialize(&mut writer)?;
+                message.zcash_serialize(writer)?;
 
                 writer.write_u8(*ccode as u8)?;
 
@@ -305,7 +308,7 @@ impl Codec {
                     ));
                 }
 
-                reason.zcash_serialize(&mut writer)?;
+                reason.zcash_serialize(writer)?;
                 if let Some(data) = data {
                     writer.write_all(data)?;
                 }
@@ -327,27 +330,27 @@ impl Codec {
                 // Regardless of the way we received the address,
                 // Zebra always sends `addr` messages
                 let v1_addrs: Vec<AddrV1> = addrs.iter().map(|addr| AddrV1::from(*addr)).collect();
-                v1_addrs.zcash_serialize(&mut writer)?
+                v1_addrs.zcash_serialize(writer)?
             }
             Message::GetAddr => { /* Empty payload -- no-op */ }
-            Message::Block(block) => block.zcash_serialize(&mut writer)?,
+            Message::Block(block) => block.zcash_serialize(writer)?,
             Message::GetBlocks { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
-                known_blocks.zcash_serialize(&mut writer)?;
+                known_blocks.zcash_serialize(writer)?;
                 stop.unwrap_or(block::Hash([0; 32]))
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
             }
             Message::GetHeaders { known_blocks, stop } => {
                 writer.write_u32::<LittleEndian>(self.builder.version.0)?;
-                known_blocks.zcash_serialize(&mut writer)?;
+                known_blocks.zcash_serialize(writer)?;
                 stop.unwrap_or(block::Hash([0; 32]))
-                    .zcash_serialize(&mut writer)?;
+                    .zcash_serialize(writer)?;
             }
-            Message::Headers(headers) => headers.zcash_serialize(&mut writer)?,
-            Message::Inv(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::GetData(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::NotFound(hashes) => hashes.zcash_serialize(&mut writer)?,
-            Message::Tx(transaction) => transaction.transaction().zcash_serialize(&mut writer)?,
+            Message::Headers(headers) => headers.zcash_serialize(writer)?,
+            Message::Inv(hashes) => hashes.zcash_serialize(writer)?,
+            Message::GetData(hashes) => hashes.zcash_serialize(writer)?,
+            Message::NotFound(hashes) => hashes.zcash_serialize(writer)?,
+            Message::Tx(transaction) => transaction.transaction().zcash_serialize(writer)?,
             Message::Mempool => { /* Empty payload -- no-op */ }
         }
         Ok(())
@@ -391,6 +394,11 @@ impl Decoder for Codec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         use Error::Parse;
 
+        // Ignored Bloom and unknown commands continue to the next message in the same
+        // call. Returning `Ok(None)` with a complete message buffered would stall the
+        // reader until the peer sends more bytes. Each discarded body is within
+        // `max_len`, and one call only discards bytes already buffered, so the work
+        // per call stays bounded without a separate count.
         'messages: loop {
             match self.state {
                 DecodeState::Head => {
@@ -434,8 +442,8 @@ impl Decoder for Codec {
                     metrics::counter!("zcash.net.in.bytes.total")
                         .increment((body_len + HEADER_LEN) as u64);
 
-                    // Reserve buffer space for the expected body and the following header.
-                    src.reserve(body_len + HEADER_LEN);
+                    // Reserve buffer space for the next arriving bytes, not the claimed body.
+                    src.reserve(body_len.min(MAX_UNRECEIVED_BODY_RESERVATION) + HEADER_LEN);
 
                     self.state = DecodeState::Body {
                         body_len,
@@ -470,6 +478,8 @@ impl Decoder for Codec {
                     }
 
                     if BLOOM_FILTER_COMMANDS.contains(&command) {
+                        metrics::counter!("zcash.net.in.discarded", "reason" => "bloom")
+                            .increment(1);
                         debug!(
                             command = %escape_command(&command),
                             "ignored unsupported bloom filter message"
@@ -477,7 +487,7 @@ impl Decoder for Codec {
                         continue 'messages;
                     }
 
-                    let mut body_reader = Cursor::new(&body);
+                    let mut body_reader = &body[..];
 
                     // The body bytes are owned locally and the decoder state was
                     // reset above, before entering this unwind boundary. Body
@@ -526,6 +536,8 @@ impl Decoder for Codec {
                                 // Since we can't verify their source, Zebra needs to ignore
                                 // unexpected messages, because closing the connection could
                                 // cause a denial of service or eclipse attack.
+                                metrics::counter!("zcash.net.in.discarded", "reason" => "unknown")
+                                    .increment(1);
                                 debug!(?command, %command_string, "unknown message command from peer");
                                 return Ok(None);
                             }
@@ -533,7 +545,7 @@ impl Decoder for Codec {
 
                         // Bitcoin allows extra data at the end of most messages,
                         // so old nodes can read newer formats and ignore extra fields.
-                        let extra_bytes = body.len() as u64 - body_reader.position();
+                        let extra_bytes = body_reader.len();
                         if extra_bytes == 0 {
                             trace!(?extra_bytes, %msg, "finished message decoding");
                         } else {
@@ -546,6 +558,8 @@ impl Decoder for Codec {
                     }));
 
                     match decode_result {
+                        // An unknown command decodes to nothing; continue to the next one.
+                        Ok(Ok(None)) => continue 'messages,
                         Ok(result) => return result,
                         Err(_panic_payload) => {
                             // Escaped for consistency with the other command logs:
@@ -748,14 +762,14 @@ impl Codec {
         Ok(Message::GetAddr)
     }
 
-    fn read_block<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
-        let result = Self::deserialize_block_spawning(reader);
-        let block = result?.into();
+    fn read_block(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let result = self.deserialize_block_spawning(reader);
+        let block: std::sync::Arc<Block> = result?.into();
 
         #[cfg(test)]
         self.panic_at_body_decode_point(BodyDecodePanic::AfterBlockConversion);
 
-        Ok(Message::Block(block))
+        Ok(Message::Block(block.into()))
     }
 
     fn read_getblocks<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
@@ -778,9 +792,10 @@ impl Codec {
     /// See [Zcash block header] for the enumeration of these fields.
     ///
     /// [Zcash block header](https://zips.z.cash/protocol/protocol.pdf#page=84)
-    fn read_headers<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
+    fn read_headers(&self, bytes: &mut &[u8]) -> Result<Message, Error> {
+        let mut reader = ZcashReader::from_slice(bytes);
         // CompactSizeMessage is bounded to MAX_PROTOCOL_MESSAGE_LEN on deserialization.
-        let count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let count: CompactSizeMessage = reader.read_value()?;
         // Infallible: CompactSizeMessage wraps u32, which always fits in usize.
         let count: usize = count.into();
         if count > MAX_HEADERS_PER_MESSAGE {
@@ -788,10 +803,7 @@ impl Codec {
                 "headers message exceeds the protocol limit of 160 entries",
             ));
         }
-        Ok(Message::Headers(zcash_deserialize_external_count(
-            count,
-            &mut reader,
-        )?))
+        Ok(Message::Headers(reader.read_external_count(count)?))
     }
 
     fn read_getheaders<R: Read>(&self, mut reader: R) -> Result<Message, Error> {
@@ -821,8 +833,8 @@ impl Codec {
         Ok(Message::NotFound(Vec::zcash_deserialize(reader)?))
     }
 
-    fn read_tx<R: Read + std::marker::Send>(&self, reader: R) -> Result<Message, Error> {
-        let result = Self::deserialize_transaction_spawning(reader);
+    fn read_tx(&self, reader: &mut &[u8]) -> Result<Message, Error> {
+        let result = self.deserialize_transaction_spawning(reader);
         let transaction = result?.into();
 
         #[cfg(test)]
@@ -850,9 +862,7 @@ impl Codec {
 
     /// Given the reader, deserialize the transaction in the rayon thread pool.
     #[allow(clippy::unwrap_in_result)]
-    fn deserialize_transaction_spawning<R: Read + std::marker::Send>(
-        reader: R,
-    ) -> Result<Transaction, Error> {
+    fn deserialize_transaction_spawning(&self, reader: &mut &[u8]) -> Result<Transaction, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -865,7 +875,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize(reader)))
+                s.spawn_fifo(|_s| result = Some(Transaction::zcash_deserialize_from_slice(reader)))
             })
         });
 
@@ -874,7 +884,7 @@ impl Codec {
 
     /// Given the reader, deserialize the block in the rayon thread pool.
     #[allow(clippy::unwrap_in_result)]
-    fn deserialize_block_spawning<R: Read + std::marker::Send>(reader: R) -> Result<Block, Error> {
+    fn deserialize_block_spawning(&self, reader: &mut &[u8]) -> Result<Block, Error> {
         let mut result = None;
 
         // Correctness: Do CPU-intensive work on a dedicated thread, to avoid blocking other futures.
@@ -887,7 +897,7 @@ impl Codec {
         // - There is no way to check the blocking task's future for panics
         tokio::task::block_in_place(|| {
             rayon::in_place_scope_fifo(|s| {
-                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize(reader)))
+                s.spawn_fifo(|_s| result = Some(Block::zcash_deserialize_from_slice(reader)))
             })
         });
 

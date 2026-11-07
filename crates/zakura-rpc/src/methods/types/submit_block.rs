@@ -6,12 +6,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
 };
 
 use tokio::sync::{mpsc, watch};
 
 use zakura_chain::block;
+
+use crate::methods::hex_data::HexData;
 
 // Allow doc links to these imports.
 #[allow(unused_imports)]
@@ -20,7 +21,7 @@ use crate::methods::GetBlockTemplateHandler;
 /// Optional argument `jsonparametersobject` for `submitblock` RPC request
 ///
 /// See the notes for the [`submit_block`](crate::methods::RpcServer::submit_block) RPC.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct SubmitBlockParameters {
     /// The workid for the block template.
     ///
@@ -34,12 +35,24 @@ pub struct SubmitBlockParameters {
     /// > Therefore, using a "workid" is a very cheap solution to enable more mutations.
     ///
     /// <https://en.bitcoin.it/wiki/BIP_0022#Rationale>
+    ///
+    /// Zakura accepts this field but does not read it. The verifier identifies a prepared
+    /// candidate by its content, so a submission reuses the prepared work whether or not the
+    /// miner echoes the work ID back.
     #[serde(rename = "workid")]
     pub work_id: Option<String>,
 }
 
-/// The maximum time a peer waits for an early-advertised block to commit.
-pub const PENDING_BLOCK_WAIT: Duration = Duration::from_secs(15);
+/// A compact mined-block submission.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SubmitSolutionParameters {
+    /// The prepared candidate identifier returned by `getblocktemplate`.
+    #[serde(rename = "workid")]
+    pub work_id: String,
+
+    /// The complete hex-encoded solved block header.
+    pub header: HexData,
+}
 
 const MAX_PENDING_BLOCKS: usize = 16;
 const MAX_MINED_SUBMISSIONS: usize = 16;
@@ -87,43 +100,59 @@ impl Drop for MinedSubmission {
     }
 }
 
-/// A mined-block lifecycle event consumed by the block gossip task.
+/// The RPC path that admitted a mined block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MinedBlockSubmission {
+    /// The miner submitted a complete block.
+    FullBlock,
+    /// The miner submitted a compact solved header.
+    CompactHeader,
+}
+
+impl MinedBlockSubmission {
+    /// Returns the RPC method name for metrics.
+    pub const fn rpc_method(self) -> &'static str {
+        match self {
+            Self::FullBlock => "submitblock",
+            Self::CompactHeader => "submitsolution",
+        }
+    }
+}
+
+/// An admitted local block eligible for optimistic announcement before commit.
 #[derive(Debug)]
-pub enum MinedBlockEvent {
-    /// State admitted the block, so peers can receive its inventory before commit completes.
-    Early {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-        /// When the RPC accepted the submitted bytes.
-        submitted_at: std::time::Instant,
-        /// Cancels the advertisement if contextual verification rejects the block.
-        pending: PendingBlockSignal,
-    },
-    /// The contextual commit completed.
-    Committed {
-        /// The block hash.
-        hash: block::Hash,
-        /// The block height.
-        height: block::Height,
-    },
+pub struct EarlyMinedBlock {
+    /// State's submission lifecycle, used to suppress early dispatch after commit.
+    pub admission: zakura_state::BlockAdmission,
+    /// Block hash.
+    pub hash: block::Hash,
+    /// Block height.
+    pub height: block::Height,
+    /// Serialized size in bytes.
+    pub size: usize,
+    /// When the RPC accepted the submitted bytes.
+    pub submitted_at: std::time::Instant,
+    /// The RPC method that accepted the submission.
+    pub submission: MinedBlockSubmission,
+    /// Cancels the advertisement if contextual verification rejects the block.
+    pub pending: PendingBlockSignal,
 }
 
 #[derive(Clone, Debug)]
 enum PendingStatus {
     Waiting,
-    Committed(Arc<block::Block>),
+    Committed,
     Failed,
 }
 
 #[derive(Debug)]
 struct PendingBlock {
     owner_id: u64,
+    block: Arc<block::Block>,
     status: watch::Sender<PendingStatus>,
 }
 
-/// Stores pending blocks and coalesces peer waits by block hash.
+/// Stores admitted block bodies with their registration owners.
 #[derive(Debug)]
 struct PendingBlockRegistryInner {
     entries: Mutex<HashMap<block::Hash, PendingBlock>>,
@@ -168,7 +197,7 @@ impl PendingBlockSignal {
             let status = self.0.borrow_and_update().clone();
             match status {
                 PendingStatus::Failed => return,
-                PendingStatus::Committed(_) => std::future::pending::<()>().await,
+                PendingStatus::Committed => std::future::pending::<()>().await,
                 PendingStatus::Waiting => {}
             }
 
@@ -181,33 +210,23 @@ impl PendingBlockSignal {
 
 /// Owns one pending-block registry entry.
 #[derive(Debug)]
-pub(crate) struct PendingBlockRegistration {
+pub struct PendingBlockRegistration {
     registry: PendingBlockRegistry,
     hash: block::Hash,
     owner_id: u64,
+    /// A receiver for this registration's own entry, kept so `signal` needs no lookup.
+    receiver: watch::Receiver<PendingStatus>,
     resolved: bool,
 }
 
 impl PendingBlockRegistration {
     /// Returns a signal that cancels stale early inventory after commit failure.
     pub(crate) fn signal(&self) -> PendingBlockSignal {
-        let entries = self
-            .registry
-            .0
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let status = entries
-            .get(&self.hash)
-            .filter(|entry| entry.owner_id == self.owner_id)
-            .expect("registration owns its entry until it resolves")
-            .status
-            .subscribe();
-        PendingBlockSignal(status)
+        PendingBlockSignal(self.receiver.clone())
     }
 
-    /// Resolves this registration and wakes its peer waiters.
-    pub(crate) fn resolve(mut self, result: Result<Arc<block::Block>, ()>) {
+    /// Resolves this registration and invalidates failed early advertisements.
+    pub fn resolve(mut self, result: Result<Arc<block::Block>, ()>) {
         self.registry.resolve(self.hash, self.owner_id, result);
         self.resolved = true;
     }
@@ -225,7 +244,7 @@ impl PendingBlockRegistry {
     /// Inserts a block before its early inventory is sent.
     ///
     /// Returns no registration when the hash already has an owner or the registry is full.
-    pub(crate) fn insert(&self, block: Arc<block::Block>) -> Option<PendingBlockRegistration> {
+    pub fn insert(&self, block: Arc<block::Block>) -> Option<PendingBlockRegistration> {
         let hash = block.hash();
         let mut entries = self
             .0
@@ -241,12 +260,20 @@ impl PendingBlockRegistry {
         }
 
         let owner_id = self.0.next_owner_id.fetch_add(1, Ordering::Relaxed);
-        let (status, _receiver) = watch::channel(PendingStatus::Waiting);
-        entries.insert(hash, PendingBlock { owner_id, status });
+        let (status, receiver) = watch::channel(PendingStatus::Waiting);
+        entries.insert(
+            hash,
+            PendingBlock {
+                owner_id,
+                block,
+                status,
+            },
+        );
         Some(PendingBlockRegistration {
             registry: self.clone(),
             hash,
             owner_id,
+            receiver,
             resolved: false,
         })
     }
@@ -269,50 +296,25 @@ impl PendingBlockRegistry {
         drop(entries);
 
         let status = match result {
-            Ok(block) => PendingStatus::Committed(block),
+            Ok(_) => PendingStatus::Committed,
             Err(()) => PendingStatus::Failed,
         };
         entry.status.send_replace(status);
     }
 
-    /// Waits for an early-advertised block to commit.
-    pub fn wait(
-        &self,
-        hash: block::Hash,
-    ) -> impl std::future::Future<Output = Option<Arc<block::Block>>> + Send + 'static {
-        let status = self
+    /// Returns an admitted body immediately while its contextual commit is pending.
+    pub fn get(&self, hash: block::Hash) -> Option<Arc<block::Block>> {
+        let block = self
             .0
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&hash)
-            .map(|entry| entry.status.subscribe());
-        let deadline = tokio::time::Instant::now() + PENDING_BLOCK_WAIT;
-
-        async move {
-            let mut status = status?;
-            let start = std::time::Instant::now();
-            let result = tokio::time::timeout_at(deadline, async {
-                loop {
-                    let current = status.borrow().clone();
-                    match current {
-                        PendingStatus::Waiting => {
-                            if status.changed().await.is_err() {
-                                return None;
-                            }
-                        }
-                        PendingStatus::Committed(block) => return Some(block),
-                        PendingStatus::Failed => return None,
-                    }
-                }
-            })
-            .await
-            .ok()
-            .flatten();
-            metrics::histogram!("mining.pending_peer_wait.duration_seconds")
-                .record(start.elapsed().as_secs_f64());
-            result
+            .map(|entry| Arc::clone(&entry.block));
+        if block.is_some() {
+            metrics::counter!("mining.pending_registry.served").increment(1);
         }
+        block
     }
 }
 
@@ -356,36 +358,85 @@ impl From<SubmitBlockErrorResponse> for SubmitBlockResponse {
     }
 }
 
-/// A submit block channel, used to inform the gossip task about mined blocks.
-pub struct SubmitBlockChannel {
-    /// The channel sender
-    sender: mpsc::UnboundedSender<MinedBlockEvent>,
-    /// The channel receiver
-    receiver: mpsc::UnboundedReceiver<MinedBlockEvent>,
+/// A compact submission rejection reason.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubmitSolutionErrorResponse {
+    /// The block was already committed.
+    Duplicate,
+    /// The block was already queued but has not committed.
+    DuplicateInconclusive,
+    /// The node could not establish acceptance, so the caller can retry.
+    Inconclusive,
+    /// Consensus rejected the block.
+    Rejected,
+    /// The prepared candidate no longer exists.
+    StaleWork,
+    /// The solved header changed a preserved candidate field.
+    CandidateMismatch,
 }
 
-impl SubmitBlockChannel {
+/// A `submitsolution` response.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SubmitSolutionResponse {
+    /// The compact submission failed.
+    ErrorResponse(SubmitSolutionErrorResponse),
+    /// The compact submission committed successfully and returns `null`.
+    Accepted,
+}
+
+impl From<SubmitSolutionErrorResponse> for SubmitSolutionResponse {
+    fn from(error: SubmitSolutionErrorResponse) -> Self {
+        Self::ErrorResponse(error)
+    }
+}
+
+impl From<SubmitBlockResponse> for SubmitSolutionResponse {
+    fn from(response: SubmitBlockResponse) -> Self {
+        match response {
+            SubmitBlockResponse::Accepted => Self::Accepted,
+            SubmitBlockResponse::ErrorResponse(error) => Self::ErrorResponse(match error {
+                SubmitBlockErrorResponse::Duplicate => SubmitSolutionErrorResponse::Duplicate,
+                SubmitBlockErrorResponse::DuplicateInconclusive => {
+                    SubmitSolutionErrorResponse::DuplicateInconclusive
+                }
+                SubmitBlockErrorResponse::Inconclusive => SubmitSolutionErrorResponse::Inconclusive,
+                SubmitBlockErrorResponse::Rejected => SubmitSolutionErrorResponse::Rejected,
+            }),
+        }
+    }
+}
+
+/// Carries optional early local-block announcements to gossip.
+pub struct EarlyMinedBlockChannel {
+    /// The channel sender
+    sender: mpsc::UnboundedSender<EarlyMinedBlock>,
+    /// The channel receiver
+    receiver: mpsc::UnboundedReceiver<EarlyMinedBlock>,
+}
+
+impl EarlyMinedBlockChannel {
     /// Creates a new submit block channel
     pub fn new() -> Self {
-        // Only admitted early events and successful commit events enter this channel. Invalid and
-        // duplicate submissions cannot fill it, and the gossip task does not wait for peer
-        // readiness while consuming it.
+        // Only authorized early events enter this channel. Committed announcements come
+        // from state, and gossip consumes both feeds without waiting for peer readiness.
         let (sender, receiver) = mpsc::unbounded_channel();
         Self { sender, receiver }
     }
 
     /// Get the channel sender
-    pub fn sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
+    pub fn sender(&self) -> mpsc::UnboundedSender<EarlyMinedBlock> {
         self.sender.clone()
     }
 
     /// Get the channel receiver
-    pub fn receiver(self) -> mpsc::UnboundedReceiver<MinedBlockEvent> {
+    pub fn receiver(self) -> mpsc::UnboundedReceiver<EarlyMinedBlock> {
         self.receiver
     }
 }
 
-impl Default for SubmitBlockChannel {
+impl Default for EarlyMinedBlockChannel {
     fn default() -> Self {
         Self::new()
     }
@@ -427,89 +478,38 @@ mod tests {
         assert!(submissions.reserve(hash).is_ok());
     }
 
-    #[tokio::test]
-    async fn pending_block_waits_for_success() {
+    #[test]
+    fn pending_block_is_served_until_commit() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
         let registration = registry
             .insert(block.clone())
             .expect("the registry accepts the block");
-        assert!(registry.insert(block.clone()).is_none());
-
-        let wait = tokio::spawn({
-            let registry = registry.clone();
-            async move { registry.wait(hash).await }
-        });
-        tokio::task::yield_now().await;
-        registration.resolve(Ok(block.clone()));
-
-        assert_eq!(wait.await.expect("wait task succeeds"), Some(block));
+        assert!(
+            registry.insert(block.clone()).is_none(),
+            "one hash has one owner"
+        );
+        assert_eq!(registry.get(hash), Some(block.clone()));
+        registration.resolve(Ok(block));
+        assert_eq!(registry.get(hash), None);
     }
 
     #[tokio::test]
-    async fn pending_block_wait_subscribes_before_polling() {
+    async fn pending_block_failure_removes_body_and_cancels_stale_inventory() {
         let registry = PendingBlockRegistry::default();
         let block = test_block();
         let hash = block.hash();
         let registration = registry
             .insert(block.clone())
-            .expect("the registry accepts the block");
-
-        let wait = registry.wait(hash);
-        registration.resolve(Ok(block.clone()));
-
-        assert_eq!(wait.await, Some(block));
-    }
-
-    #[tokio::test]
-    async fn pending_block_failure_returns_not_found() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let hash = block.hash();
-        let registration = registry
-            .insert(block)
-            .expect("the registry accepts the block");
-
-        let wait = tokio::spawn({
-            let registry = registry.clone();
-            async move { registry.wait(hash).await }
-        });
-        tokio::task::yield_now().await;
-        registration.resolve(Err(()));
-
-        assert_eq!(wait.await.expect("wait task succeeds"), None);
-    }
-
-    #[tokio::test]
-    async fn pending_block_failure_cancels_stale_inventory() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let registration = registry
-            .insert(block)
             .expect("the registry accepts the block");
         let mut signal = registration.signal();
-
         assert!(signal.is_valid());
+        assert_eq!(registry.get(hash), Some(block));
         registration.resolve(Err(()));
+        assert_eq!(registry.get(hash), None);
         signal.wait_for_failure().await;
         assert!(!signal.is_valid());
-    }
-
-    #[tokio::test]
-    async fn pending_block_waits_for_one_hash_are_coalesced() {
-        let registry = PendingBlockRegistry::default();
-        let block = test_block();
-        let hash = block.hash();
-        let registration = registry
-            .insert(block.clone())
-            .expect("the registry accepts the block");
-
-        let waits: Vec<_> = (0..64).map(|_| registry.wait(hash)).collect();
-        registration.resolve(Ok(block.clone()));
-        for result in futures::future::join_all(waits).await {
-            assert_eq!(result, Some(block.clone()));
-        }
     }
 
     #[test]

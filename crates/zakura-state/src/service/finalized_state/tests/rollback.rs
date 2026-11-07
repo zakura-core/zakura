@@ -146,7 +146,7 @@ fn assert_equivalent(
 
     // Transparent indexes and shielded nullifiers in the retained range must match a fresh sync.
     for block in retained {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             let tx_hash = transaction.hash();
 
             for (index, output) in transaction.outputs().iter().enumerate() {
@@ -195,7 +195,7 @@ fn assert_equivalent(
             block.hash
         );
 
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             for nullifier in transaction.sprout_nullifiers() {
                 assert!(
                     !rolled.contains_sprout_nullifier(nullifier),
@@ -226,7 +226,7 @@ fn count_reversible_features(blocks: &[SemanticallyVerifiedBlock]) -> (usize, us
     let mut shielded_nullifiers = 0;
 
     for block in blocks {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             transparent_spends += transaction
                 .inputs()
                 .iter()
@@ -518,7 +518,11 @@ pub(super) fn coinbase_tx(
 }
 
 /// A V1 transaction spending `outpoint` and paying `value` to `address`.
-fn spend_tx(outpoint: OutPoint, value: Amount<NonNegative>, address: &Address) -> Arc<Transaction> {
+pub(super) fn spend_tx(
+    outpoint: OutPoint,
+    value: Amount<NonNegative>,
+    address: &Address,
+) -> Arc<Transaction> {
     Arc::new(Transaction::V1 {
         inputs: vec![Input::PrevOut {
             outpoint,
@@ -533,10 +537,13 @@ fn spend_tx(outpoint: OutPoint, value: Amount<NonNegative>, address: &Address) -
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block(
+    parent: &zakura_chain::block::BlockRef,
+    transactions: Vec<Arc<Transaction>>,
+) -> Arc<Block> {
     let header = block::Header {
         previous_block_hash: parent.hash(),
-        ..*parent.header
+        ..*parent.header()
     };
     Arc::new(Block {
         header: Arc::new(header),
@@ -560,7 +567,7 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
             zakura_chain::sprout::commitment::NoteCommitment::from([2; 32]),
             zakura_chain::sprout::commitment::NoteCommitment::from([3; 32]),
         ],
-        ephemeral_key: zakura_chain::primitives::x25519::PublicKey::from([0; 32]),
+        ephemeral_key: zakura_chain::sprout::keys::EphemeralPublicKey::from([0; 32]),
         random_seed: zakura_chain::sprout::RandomSeed::from([0; 32]),
         vmacs: [
             zakura_chain::sprout::note::Mac::from([0; 32]),
@@ -578,17 +585,17 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
         outputs: Vec::new(),
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
-        joinsplit_data: Some(zakura_chain::transaction::JoinSplitData {
+        joinsplit_data: Some(Box::new(zakura_chain::transaction::JoinSplitData {
             first: joinsplit,
             rest: Vec::new(),
             pub_key: zakura_chain::primitives::ed25519::VerificationKeyBytes::from([0; 32]),
             sig: zakura_chain::primitives::ed25519::Signature::from([0; 64]),
-        }),
+        })),
         sapling_shielded_data: None,
     })
 }
 
-fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
+pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifier) {
     use proptest::{prelude::any, strategy::ValueTree, test_runner::TestRunner};
     use zakura_chain::{
         at_least_one,
@@ -631,7 +638,7 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
 }
 
 pub(super) fn child_block_with_history_commitment(
-    parent: &Block,
+    parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
     previous_history_tree: &zakura_chain::history_tree::HistoryTree,
@@ -727,6 +734,7 @@ fn rollback_reverses_intra_block_self_spend() {
         rolled
             .db
             .address_balance(&address)
+            .expect("indexed databases answer address balance queries")
             .map(|(balance, _)| balance),
         Some(value),
         "address balance is restored to its height-1 value",
@@ -1501,7 +1509,7 @@ fn legacy_block_info_replay_preserves_slow_start_deferred_funding_and_nsm_seed()
             .zs_delete(&Height(h));
     }
     state.db.write_batch(batch).unwrap();
-    let (_tx, rx) = crossbeam_channel::bounded(1);
+    let (_tx, rx) = crate::service::finalized_state::disk_format::upgrade::cancel_channel();
     Upgrade.run(Some(Height(3)), &state.db, &rx).unwrap();
     for (index, expected) in snapshots.into_iter().enumerate() {
         let height = Height(u32::try_from(index + 1).unwrap());

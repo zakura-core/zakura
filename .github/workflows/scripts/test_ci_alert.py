@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Tests for ci_alert.py and the workflow list in ci-alerts.yml."""
 
-import re
 import unittest
 from pathlib import Path
+
+import yaml
 
 import ci_alert
 
@@ -16,7 +17,6 @@ def run(number, conclusion, event="push", attempt=1):
     """Returns a minimal workflow run attempt, shaped like the GitHub API's."""
     return {
         "id": number,
-        "workflow_id": 7,
         "run_number": number,
         "run_attempt": attempt,
         "status": "completed",
@@ -30,134 +30,38 @@ def run(number, conclusion, event="push", attempt=1):
     }
 
 
-def kind(current, runs, attempts_before=(), attempts_after=(), retried=None):
-    """Returns the alert kind for `current`, given its other attempts and the completed runs.
+# These workflows have their own alert policy. Keep exceptions explicit so a new
+# scheduled workflow cannot silently miss the central notifier.
+ALERT_EXCEPTIONS = {
+    "PR node image bake": "Has a dedicated failure notification job.",
+    "VCT handoff canary": "Has phase-aware alerts with persistent deduplication.",
+}
 
-    Attempts are newest first. `retried` maps a run number to the conclusions of
-    that run's attempts before its latest one, newest first.
-    """
-    retried = retried or {}
 
-    def resolve(run):
-        """Returns `run`'s verdict, looking behind an undecided latest attempt."""
-        if ci_alert.is_decided(run["conclusion"]):
-            return run["conclusion"]
-        return ci_alert.newest_verdict(retried.get(run["run_number"], []))
+def workflow_events(workflow):
+    """Normalizes YAML event mappings, lists, and single event names."""
+    events = workflow["on"]
+    if isinstance(events, str):
+        return {events: None}
+    if isinstance(events, list):
+        return dict.fromkeys(events)
+    return events
 
-    newest_first = sorted(runs, key=lambda other: other["run_number"], reverse=True)
-    previous, contradicted = ci_alert.verdicts(
-        current, iter(attempts_before), iter(attempts_after), newest_first, resolve
+
+def needs_alert_coverage(workflow):
+    """Includes scheduled and branch-push workflows, conservatively ignoring branch filters."""
+    events = workflow_events(workflow)
+    if "schedule" in events:
+        return True
+    if "push" not in events:
+        return False
+    push = events["push"] or {}
+    # A tags-only filter disables branch pushes. Path filters do not.
+    return not (
+        ("tags" in push or "tags-ignore" in push)
+        and "branches" not in push
+        and "branches-ignore" not in push
     )
-    return ci_alert.alert_kind(current, previous, contradicted)
-
-
-def history_path(page):
-    """Returns the API path `ci_alert.history` requests for one page of push history."""
-    return (
-        f"{BASE}/workflows/7/runs?branch=main&event=push"
-        f"&per_page={ci_alert.HISTORY_PAGE_SIZE}&page={page}"
-    )
-
-
-def watched_workflows():
-    """Returns the workflow names listed under `workflow_run.workflows` in ci-alerts.yml."""
-    lines = (WORKFLOWS / "ci-alerts.yml").read_text().splitlines()
-    watched = []
-    for line in lines[lines.index("    workflows:") + 1 :]:
-        match = re.fullmatch(r"      - (.+)", line)
-        if not match:
-            break
-        watched.append(match.group(1))
-    return watched
-
-
-class AlertKindTest(unittest.TestCase):
-    def test_push_failure_alerts_once_per_breakage(self):
-        self.assertEqual(kind(run(2, "failure"), [run(1, "success")]), "failure")
-        self.assertIsNone(kind(run(3, "failure"), [run(1, "success"), run(2, "failure")]))
-
-    def test_scheduled_failure_alerts_every_time(self):
-        history = [run(1, "failure", "schedule")]
-        self.assertEqual(kind(run(2, "failure", "schedule"), history), "failure")
-
-    def test_first_failure_alerts(self):
-        self.assertEqual(kind(run(1, "failure"), []), "failure")
-
-    def test_timeouts_and_startup_failures_count_as_failures(self):
-        for conclusion in ("timed_out", "startup_failure"):
-            self.assertEqual(kind(run(2, conclusion), [run(1, "success")]), "failure")
-
-    def test_pass_after_failure_is_a_recovery(self):
-        self.assertEqual(kind(run(2, "success"), [run(1, "failure")]), "recovery")
-        self.assertIsNone(kind(run(2, "success"), [run(1, "success")]))
-
-    def test_the_run_itself_in_history_is_ignored(self):
-        current = run(2, "failure")
-        self.assertEqual(kind(current, [run(1, "success"), current]), "failure")
-
-    def test_cancelled_runs_neither_alert_nor_count(self):
-        self.assertIsNone(kind(run(3, "cancelled"), [run(1, "success")]))
-        history = [run(1, "failure"), run(2, "cancelled")]
-        self.assertIsNone(kind(run(3, "failure"), history))
-        self.assertEqual(kind(run(3, "success"), history), "recovery")
-
-    def test_failures_that_finish_together_alert_once(self):
-        # Both runs completed before either alert ran.
-        history = [run(100, "success"), run(101, "failure"), run(102, "failure")]
-        self.assertEqual(kind(run(101, "failure"), history), "failure")
-        self.assertIsNone(kind(run(102, "failure"), history))
-
-    def test_recoveries_that_finish_together_report_once(self):
-        history = [run(1, "failure"), run(2, "success"), run(3, "success")]
-        self.assertEqual(kind(run(2, "success"), history), "recovery")
-        self.assertIsNone(kind(run(3, "success"), history))
-
-    def test_a_newer_opposite_verdict_suppresses_the_alert(self):
-        self.assertIsNone(kind(run(2, "failure"), [run(1, "success"), run(3, "success")]))
-        self.assertIsNone(kind(run(2, "success"), [run(1, "failure"), run(3, "failure")]))
-        # A newer run without a verdict does not count.
-        self.assertEqual(
-            kind(run(2, "failure"), [run(1, "success"), run(3, "cancelled")]), "failure"
-        )
-
-    def test_a_later_attempt_with_the_opposite_verdict_suppresses_the_alert(self):
-        history = [run(4, "success")]
-        self.assertIsNone(kind(run(5, "failure"), history, attempts_after=["success"]))
-        self.assertEqual(kind(run(5, "failure"), history, attempts_after=["failure"]), "failure")
-        self.assertEqual(kind(run(5, "failure"), history, attempts_after=["cancelled"]), "failure")
-        # A cancelled newest attempt does not hide a passing attempt before it.
-        self.assertIsNone(
-            kind(run(5, "failure"), history, attempts_after=["cancelled", "success"])
-        )
-
-    def test_a_cancelled_retry_keeps_the_runs_earlier_verdict(self):
-        # Run 101 failed, then its retry was cancelled: 102 still recovers from it.
-        history = [run(100, "success"), run(101, "cancelled", attempt=2)]
-        self.assertEqual(
-            kind(run(102, "success"), history, retried={101: ["failure"]}), "recovery"
-        )
-        # Run 100 passed, then its retry was cancelled: 101's failure is fresh.
-        history = [run(99, "failure"), run(100, "cancelled", attempt=2)]
-        self.assertEqual(
-            kind(run(101, "failure"), history, retried={100: ["success"]}), "failure"
-        )
-        # A newer run whose retry was cancelled still passed, so main moved on.
-        history = [run(100, "success"), run(102, "cancelled", attempt=2)]
-        self.assertIsNone(kind(run(101, "failure"), history, retried={102: ["success"]}))
-
-    def test_rerun_follows_its_newest_decided_attempt(self):
-        # Attempt 2 was cancelled, attempt 1 failed.
-        attempts = ["cancelled", "failure"]
-        history = [run(4, "success")]
-        self.assertEqual(
-            kind(run(5, "success", attempt=3), history, attempts_before=attempts), "recovery"
-        )
-        self.assertIsNone(kind(run(5, "failure", attempt=3), history, attempts_before=attempts))
-
-    def test_rerun_without_an_earlier_verdict_falls_back_to_earlier_runs(self):
-        current = run(5, "failure", attempt=2)
-        self.assertEqual(kind(current, [run(4, "success")], attempts_before=["cancelled"]), "failure")
-        self.assertIsNone(kind(current, [run(4, "failure")], attempts_before=["cancelled"]))
 
 
 class AlertTextTest(unittest.TestCase):
@@ -165,106 +69,116 @@ class AlertTextTest(unittest.TestCase):
         """Returns `ci_alert.alert_text` for one attempt, answered from `responses`."""
         return ci_alert.alert_text("o/r", run_id, attempt, api=lambda path: responses[path])
 
-    def test_each_attempt_is_judged_on_its_own_conclusion(self):
-        # Attempt 2 had already failed again before attempt 1's alert ran.
-        first, second = run(50, "failure"), run(50, "failure", attempt=2)
+    def test_a_failed_attempt_posts_its_jobs_and_commit(self):
         responses = {
-            f"{BASE}/runs/50/attempts/1": first,
-            f"{BASE}/runs/50/attempts/2": second,
-            f"{BASE}/runs/50": second,
-            history_path(1): {"workflow_runs": [second, run(49, "success")]},
-            f"{BASE}/runs/50/attempts/1/jobs?per_page=100": {
-                "jobs": [{"name": "lint", "conclusion": "failure"}]
+            f"{BASE}/runs/7/attempts/1": run(7, "failure"),
+            f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {
+                "jobs": [
+                    {"name": "lint", "conclusion": "failure"},
+                    {"name": "test success", "conclusion": "failure"},
+                ]
             },
         }
-        self.assertIn("failed on `main`", self.alert(responses, 50, 1))
-        self.assertIsNone(self.alert(responses, 50, 2))
-
-    def test_a_cancelled_retry_of_an_older_run_keeps_its_failure(self):
-        current = run(102, "success")
-        responses = {
-            f"{BASE}/runs/102/attempts/1": current,
-            f"{BASE}/runs/102": current,
-            history_path(1): {
-                "workflow_runs": [current, run(101, "cancelled", attempt=2), run(100, "success")]
-            },
-            f"{BASE}/runs/101/attempts/1": run(101, "failure"),
-        }
-        self.assertIn("is passing again on `main`", self.alert(responses, 102, 1))
-
-    def test_a_run_being_retried_keeps_its_earlier_failure(self):
-        # Run 101 failed and is being retried while 102 passes.
-        current = run(102, "success")
-        retrying = dict(run(101, None, attempt=2), status="in_progress")
-        responses = {
-            f"{BASE}/runs/102/attempts/1": current,
-            f"{BASE}/runs/102": current,
-            history_path(1): {"workflow_runs": [current, retrying, run(100, "success")]},
-            f"{BASE}/runs/101/attempts/1": run(101, "failure"),
-        }
-        self.assertIn("is passing again on `main`", self.alert(responses, 102, 1))
-
-    def test_a_passing_attempt_behind_a_cancelled_retry_suppresses_the_failure(self):
-        failed, passed = run(50, "failure"), run(50, "success", attempt=2)
-        cancelled = run(50, "cancelled", attempt=3)
-        responses = {
-            f"{BASE}/runs/50/attempts/1": failed,
-            f"{BASE}/runs/50/attempts/2": passed,
-            f"{BASE}/runs/50": cancelled,
-            history_path(1): {"workflow_runs": [cancelled, run(49, "success")]},
-        }
-        self.assertIsNone(self.alert(responses, 50, 1))
-
-    def test_previous_verdict_is_found_beyond_the_first_history_page(self):
-        size = ci_alert.HISTORY_PAGE_SIZE
-        current = run(200, "success")
-        cancelled = [run(200 - offset, "cancelled") for offset in range(1, size)]
-        responses = {
-            f"{BASE}/runs/200/attempts/1": current,
-            f"{BASE}/runs/200": current,
-            history_path(1): {"workflow_runs": [current] + cancelled},
-            history_path(2): {"workflow_runs": [run(200 - size, "failure")]},
-        }
         self.assertEqual(
-            self.alert(responses, 200, 1),
-            ":large_green_circle: *Unit Tests* is passing again on `main` (push): "
-            "<https://github.com/o/r/actions/runs/200|run 200>",
-        )
-
-
-class MessageTest(unittest.TestCase):
-    def test_push_failure_names_jobs_and_commit(self):
-        text = ci_alert.message("failure", run(7, "failure"), ["lint", "test <unit>"])
-        self.assertEqual(
-            text.splitlines(),
+            self.alert(responses, 7, 1).splitlines(),
             [
                 ":red_circle: *Unit Tests* failed on `main` (push): "
                 "<https://github.com/o/r/actions/runs/7|run 7>",
-                "Failed jobs: `lint`, `test &lt;unit&gt;`",
+                "Failed jobs: `lint`",
                 "Commit: <https://github.com/o/r/commit/0123456789abcdef|012345678> "
                 "fix(x): y (A &lt;B&gt;)",
             ],
         )
 
+    def test_timeouts_and_startup_failures_post(self):
+        for conclusion in ("timed_out", "startup_failure"):
+            responses = {
+                f"{BASE}/runs/7/attempts/1": run(7, conclusion),
+                f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {"jobs": []},
+            }
+            self.assertIn("failed on `main`", self.alert(responses, 7, 1))
+
+    def test_an_attempt_that_did_not_fail_posts_nothing(self):
+        for conclusion in ("success", "cancelled", "skipped", None):
+            responses = {f"{BASE}/runs/7/attempts/1": run(7, conclusion)}
+            self.assertIsNone(self.alert(responses, 7, 1))
+
+    def test_continuous_sync_preserves_audit_suppression_but_alerts_other_failures(self):
+        """Checks the fallback using the step results exposed by GitHub's jobs API."""
+        cases = [
+            ("delivered or suppressed incident", "failure", "failure", "success", None, False),
+            ("SSH setup failed", "failure", "skipped", "skipped", "Configure SSH", True),
+            ("audit crashed or delivery failed", "failure", "failure", "skipped", None, True),
+            ("later summary check failed", "failure", "failure", "success", "Check daily summary delivery", True),
+            ("summary failed after healthy audit", "failure", "success", "success", "Check daily summary delivery", True),
+            ("timeout after handled audit", "timed_out", "failure", "success", None, True),
+            ("audit itself timed out", "failure", "timed_out", "success", None, True),
+            ("receipt step failed", "failure", "failure", "failure", None, True),
+        ]
+        for label, conclusion, audit, receipt, other, expected in cases:
+            with self.subTest(case=label):
+                attempt = run(7, conclusion, event="schedule")
+                attempt["path"] = ci_alert.CONTINUOUS_SYNC_PATH
+                job = {
+                    "name": "Continuous sync audit",
+                    "conclusion": conclusion,
+                    "steps": [
+                        {"name": ci_alert.AUDIT_STEP, "conclusion": audit},
+                        {"name": ci_alert.AUDIT_HANDLED_STEP, "conclusion": receipt},
+                    ],
+                }
+                if other:
+                    job["steps"].append({"name": other, "conclusion": "failure"})
+                responses = {
+                    f"{BASE}/runs/7/attempts/1": attempt,
+                    f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {"jobs": [job]},
+                }
+                self.assertEqual(self.alert(responses, 7, 1) is not None, expected)
+                # The special receipt must never silence another workflow.
+                attempt["path"] = ".github/workflows/tests-unit.yml"
+                self.assertIsNotNone(self.alert(responses, 7, 1))
+
+    def test_continuous_sync_missing_job_evidence_alerts(self):
+        """Missing steps or jobs must not count as proof of handled notifications."""
+        attempt = run(7, "failure", event="schedule")
+        attempt["path"] = ci_alert.CONTINUOUS_SYNC_PATH
+        for jobs in ([], [{"name": "Continuous sync audit", "conclusion": "failure"}]):
+            with self.subTest(jobs=jobs):
+                responses = {
+                    f"{BASE}/runs/7/attempts/1": attempt,
+                    f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {"jobs": jobs},
+                }
+                self.assertIsNotNone(self.alert(responses, 7, 1))
+
+    def test_the_reported_attempt_is_judged_not_the_latest(self):
+        # Attempt 2 has since passed; attempt 1's failure is still reported.
+        responses = {
+            f"{BASE}/runs/7/attempts/1": run(7, "failure"),
+            f"{BASE}/runs/7/attempts/2": run(7, "success", attempt=2),
+            f"{BASE}/runs/7/attempts/1/jobs?per_page=100": {"jobs": []},
+        }
+        self.assertIn("failed on `main`", self.alert(responses, 7, 1))
+        self.assertIsNone(self.alert(responses, 7, 2))
+
+
+class MessageTest(unittest.TestCase):
     def test_scheduled_failure_omits_the_commit(self):
-        text = ci_alert.message("failure", run(7, "failure", "schedule"), [])
         self.assertEqual(
-            text,
+            ci_alert.message(run(7, "failure", "schedule"), []),
             ":red_circle: *Unit Tests* failed on `main` (scheduled run): "
             "<https://github.com/o/r/actions/runs/7|run 7>",
         )
 
     def test_long_job_lists_are_truncated(self):
         jobs = [f"job {n}" for n in range(ci_alert.MAX_LISTED_JOBS + 3)]
-        text = ci_alert.message("failure", run(7, "failure"), jobs)
+        text = ci_alert.message(run(7, "failure"), jobs)
         self.assertIn(f"`job {ci_alert.MAX_LISTED_JOBS - 1}` and 3 more", text)
         self.assertNotIn(f"`job {ci_alert.MAX_LISTED_JOBS}`", text)
 
-    def test_recovery(self):
-        self.assertEqual(
-            ci_alert.message("recovery", run(8, "success"), []),
-            ":large_green_circle: *Unit Tests* is passing again on `main` (push): "
-            "<https://github.com/o/r/actions/runs/8|run 8>",
+    def test_job_names_are_escaped(self):
+        self.assertIn(
+            "Failed jobs: `test &lt;unit&gt;`",
+            ci_alert.message(run(7, "failure"), ["test <unit>"]),
         )
 
     def test_failed_jobs_keeps_only_failures(self):
@@ -285,15 +199,64 @@ class MessageTest(unittest.TestCase):
 
 
 class WatchedWorkflowsTest(unittest.TestCase):
-    def test_every_watched_workflow_exists(self):
-        names = set()
-        for path in WORKFLOWS.glob("*.yml"):
-            match = re.search(r"^name:\s*(.+?)\s*$", path.read_text(), re.MULTILINE)
-            if match:
-                names.add(match.group(1).strip("'\""))
-        watched = watched_workflows()
+    def test_every_automatic_workflow_has_an_alert_policy(self):
+        """Requires coverage or a named exception for every automatic workflow."""
+        workflows = {}
+        for path in sorted(WORKFLOWS.iterdir()):
+            if path.suffix not in {".yml", ".yaml"}:
+                continue
+            # BaseLoader preserves GitHub's `on` key instead of YAML 1.1's True.
+            workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            self.assertNotIn(workflow["name"], workflows, "Workflow names must be unique")
+            workflows[workflow["name"]] = workflow
+        watched = workflow_events(workflows["CI alerts"])["workflow_run"]["workflows"]
+        automatic = {
+            name for name, workflow in workflows.items() if needs_alert_coverage(workflow)
+        }
+        exceptions = set(ALERT_EXCEPTIONS)
         self.assertTrue(watched)
-        self.assertEqual(sorted(set(watched) - names), [])
+        self.assertEqual(len(watched), len(set(watched)), "Duplicate watched workflow")
+        self.assertEqual(set(watched) - workflows.keys(), set(), "Unknown watched workflow")
+        self.assertEqual(exceptions - automatic, set(), "Stale alert exception")
+        self.assertEqual(set(watched) & exceptions, set(), "Watched and exempted")
+        self.assertEqual(
+            automatic - set(watched) - exceptions,
+            set(),
+            "Add missing workflows to ci-alerts.yml or document an alert exception",
+        )
+
+    def test_audit_receipt_matches_the_workflow(self):
+        """Pins the API-visible receipt to the audit's output and failed-step name."""
+        workflow = yaml.load(
+            (WORKFLOWS.parents[1] / ci_alert.CONTINUOUS_SYNC_PATH).read_text(),
+            Loader=yaml.BaseLoader,
+        )
+        steps = {step["name"]: step for step in workflow["jobs"]["fleet"]["steps"]}
+        self.assertEqual(steps[ci_alert.AUDIT_STEP]["id"], "audit")
+        self.assertEqual(
+            steps[ci_alert.AUDIT_HANDLED_STEP]["if"],
+            "${{ !cancelled() && steps.audit.outputs.notification_handled == 'true' }}",
+        )
+
+    def test_event_forms_and_filters(self):
+        """Recognizes YAML trigger forms without mistaking job text for triggers."""
+        cases = [
+            ("on: push", True),
+            ('"on": [pull_request, push]', True),
+            ("on: {push: {}}", True),
+            ("on: {schedule: [{cron: '0 0 * * *'}]}", True),
+            ("on: {push: {branches: [main], paths: ['docs/**']}}", True),
+            ("on: {push: {branches-ignore: [release], tags: ['v*']}}", True),
+            ("on: {push: {tags: ['v*']}}", False),
+            ("on: {push: {tags-ignore: ['v*']}}", False),
+            ("on: [pull_request, workflow_dispatch]", False),
+            ("on: workflow_call", False),
+            ("on: workflow_dispatch\njobs: {example: {name: 'schedule: push'}}", False),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                workflow = yaml.load(source, Loader=yaml.BaseLoader)
+                self.assertEqual(needs_alert_coverage(workflow), expected)
 
 
 if __name__ == "__main__":

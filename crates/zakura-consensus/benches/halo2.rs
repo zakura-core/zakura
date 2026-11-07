@@ -29,11 +29,9 @@
 
 mod common;
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, hint::black_box, sync::Arc};
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use orchard::bundle::{Authorized, Bundle};
 
 use zakura_chain::{
@@ -44,7 +42,6 @@ use zakura_chain::{
     transparent,
 };
 
-use tower_batch_control::RequestWeight;
 use zakura_consensus::halo2::{Item, VERIFYING_KEY_PRE_NU6_2};
 use zcash_protocol::value::ZatBalance;
 
@@ -111,7 +108,7 @@ fn bench_halo2_verify(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("halo2");
 
-    group.throughput(Throughput::Elements(source_items[0].request_weight() as u64));
+    group.throughput(Throughput::Elements(source_items[0].action_count() as u64));
     group.bench_function("single bundle", |b| {
         let item = source_items[0].clone();
         b.iter(|| {
@@ -123,7 +120,7 @@ fn bench_halo2_verify(c: &mut Criterion) {
         let items = common::cycled(&source_items, n);
         // Scale throughput by total actions, not bundles, so the dashboard
         // series stays stable across test-vector changes.
-        let total_actions: u64 = items.iter().map(|i| i.request_weight() as u64).sum();
+        let total_actions: u64 = items.iter().map(|i| i.action_count() as u64).sum();
 
         group.throughput(Throughput::Elements(total_actions));
         group.bench_with_input(
@@ -148,7 +145,7 @@ fn bench_halo2_item_clone(c: &mut Criterion) {
 
     for item in source_items {
         items_by_action_count
-            .entry(item.request_weight())
+            .entry(item.action_count())
             .or_insert(item);
     }
 

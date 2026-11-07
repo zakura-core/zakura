@@ -149,7 +149,7 @@ pub fn chain_tips(
 
     for blocks in invalidated_branches.values() {
         for invalidated_block in blocks.iter() {
-            let parent = invalidated_block.block.header.previous_block_hash;
+            let parent = invalidated_block.block.header().previous_block_hash;
 
             invalidated_parents.insert(parent);
             invalidated_by_hash.insert(invalidated_block.hash, (invalidated_block.height, parent));
@@ -263,7 +263,7 @@ pub fn chain_tips(
 
     // zcashd sorts tips by descending height. Ties are broken by hash so that
     // repeated calls on an unchanged state return an identical list.
-    tips.sort_by(|a, b| {
+    tips.sort_unstable_by(|a, b| {
         b.height
             .cmp(&a.height)
             .then_with(|| a.hash.0.cmp(&b.hash.0))
@@ -295,7 +295,7 @@ fn invalidated_fork_height(
     db: &ZakuraDb,
 ) -> Height {
     let mut root_height = root_block.height;
-    let mut parent = root_block.block.header.previous_block_hash;
+    let mut parent = root_block.block.header().previous_block_hash;
 
     // Each step moves to a distinct invalidated block, so the walk cannot take more
     // steps than there are invalidated blocks.

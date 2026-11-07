@@ -123,12 +123,13 @@ fn intra_block_self_spend_chain_in_finalized_state() {
     let new_outputs = new_ordered_outputs_with_height(&block, height, &transaction_hashes);
 
     let semantically_verified = SemanticallyVerifiedBlock {
-        block: block.clone(),
+        block: block.clone().into(),
         hash: block::Hash([0x00; 32]),
         height,
-        new_outputs,
+        new_outputs: Arc::new(new_outputs),
         transaction_hashes,
         deferred_pool_balance_change: None,
+        origin: crate::BlockOrigin::Network,
         auth_data_root: None,
         receipt_order: None,
     };
@@ -183,8 +184,12 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         &spent_utxos_by_outpoint,
         &spent_utxos_by_out_loc,
         #[cfg(feature = "indexer")]
-        &HashMap::new(),
+        &HashMap::from([
+            (existing_outpoint, existing_output_location),
+            (t0_output_outpoint, t0_output_location),
+        ]),
         address_balances,
+        false,
     );
 
     // Write the batch and confirm the final on-disk balance matches the consensus value
@@ -195,6 +200,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
 
     let (balance, received) = zakura_db
         .address_balance(&address)
+        .expect("indexed databases answer address balance queries")
         .expect("address balance is present after writing the batch");
     assert_eq!(balance, value, "final balance equals the existing balance");
     assert_eq!(

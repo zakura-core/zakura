@@ -67,40 +67,63 @@ impl Push {
             _peer: peer,
             _peer_response: peer_response,
             _peer_budgets: self.peer.clone(),
+            _unwritten: None,
         };
+        PushPermit {
+            grants,
+            execution: self.execution().await,
+        }
+    }
+
+    /// Wait for execution slots alone, for state work a frame needs after
+    /// [`PushPermit::reserve_send`] gave its slots back. The frame already
+    /// holds its output, and execution comes after output as in
+    /// [`Self::acquire`], so the wait cannot invert that order. Cancelling
+    /// the wait takes nothing.
+    pub(crate) async fn execution(&self) -> ExecutionSlots {
+        let delayed = |bound| self.capacity.metrics.delayed(bound);
         let peer = wait(self.peer.execution.reserve(), || delayed("peer_execution")).await;
         let node = wait(self.capacity.node_execution.reserve(), || {
             delayed("node_execution")
         })
         .await;
-        PushPermit {
-            grants,
-            execution: ExecutionSlots::new(peer, node, self.peer.clone()),
-        }
+        ExecutionSlots::new(peer, node, self.peer.clone())
     }
 }
 
+/// A page's output grants and reserved transport slot. Dropping it sends nothing.
+#[derive(Debug)]
+pub(crate) struct PushSend<'a> {
+    grants: ResponseGrants,
+    slot: crate::zakura::transport::ResponseFrameSlot<'a>,
+}
+
 impl PushPermit {
-    /// Queue `frame` on `send`. Execution slots return now; the output
-    /// returns when the frame's transport write finishes.
-    ///
-    /// Returns false if the stream is closed.
-    pub(crate) async fn send(self, send: &FramedSend, frame: Frame) -> bool {
+    /// Wait for a response slot before spending subscription credit.
+    /// Cancellation releases these grants and any partially acquired slot.
+    /// Recheck the subscription after this wait, then commit and send without awaiting.
+    pub(crate) async fn reserve_send(
+        self,
+        send: &FramedSend,
+    ) -> Result<PushSend<'_>, crate::zakura::transport::GuardedReserveError> {
         let Self { grants, execution } = self;
         drop(execution);
-        match send.reserve_guarded().await {
-            Ok(slot) => {
-                slot.send(frame, FrameGuard::new(Arc::new(grants)));
-                true
-            }
-            Err(_) => false,
-        }
+        let slot = send.reserve_response_guarded().await?;
+        Ok(PushSend { grants, slot })
+    }
+}
+
+impl PushSend<'_> {
+    /// Queue the page immediately after its subscription credit is committed.
+    pub(crate) fn send(self, frame: Frame) {
+        self.slot
+            .send(frame, FrameGuard::new(Arc::new(self.grants)));
     }
 }
 
 /// Await `acquire`, counting a delay if it is not ready at once.
 async fn wait<T>(acquire: impl std::future::Future<Output = T>, delayed: impl FnOnce()) -> T {
-    tokio::pin!(acquire);
+    zakura_rt::pin!(acquire);
     if let Some(ready) = futures::FutureExt::now_or_never(&mut acquire) {
         return ready;
     }

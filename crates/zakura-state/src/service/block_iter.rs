@@ -1,20 +1,19 @@
 //! Iterators for blocks in the non-finalized and finalized state.
 
 use std::{marker::PhantomData, sync::Arc};
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle, HeaderHandle};
 
 use zakura_chain::block::{self, Block, Height};
 
-use crate::{
-    service::{
-        finalized_state::ZakuraDb,
-        non_finalized_state::{Chain, NonFinalizedState},
-        read,
-    },
-    HashOrHeight,
+use crate::service::{
+    finalized_state::ZakuraDb,
+    non_finalized_state::{Chain, NonFinalizedState},
+    read,
 };
 
 /// Generic state chain iterator, which iterates by block height or hash.
-/// Can be used for blocks, block headers, or any type indexed by [`HashOrHeight`].
+/// Can be used for blocks, block headers, or any type indexed by
+/// [`crate::HashOrHeight`].
 ///
 /// Starts at any hash or height in any non-finalized or finalized chain,
 /// and iterates in reverse height order. (Towards the genesis block.)
@@ -125,17 +124,17 @@ pub(crate) trait ChainItem {
 // Block iteration
 
 impl ChainItem for Block {
-    type Type = Arc<Block>;
+    type Type = Result<BlockHandle, AdmissionFailure>;
 
     fn read(chain: Option<&Arc<Chain>>, db: &ZakuraDb, height: Height) -> Option<Self::Type> {
-        read::block(chain, db, height.into())
+        read::block(chain, db, height.into()).transpose()
     }
 }
 
 // Block header iteration
 
 impl ChainItem for block::Header {
-    type Type = Arc<block::Header>;
+    type Type = HeaderHandle;
 
     fn read(chain: Option<&Arc<Chain>>, db: &ZakuraDb, height: Height) -> Option<Self::Type> {
         read::block_header(chain, db, height.into())
@@ -173,32 +172,6 @@ where
     // We need to look up the relevant chain, and the height for the hash.
     let chain = non_finalized_state.find_chain(|chain| chain.contains_block_hash(hash));
     let height = read::height_by_hash(chain.as_ref(), db, hash);
-
-    Iter {
-        chain,
-        db: db.clone(),
-        height,
-        iterable: PhantomData,
-    }
-}
-
-/// Returns a generic chain item iterator over a `chain` containing `hash_or_height`,
-/// in order from the largest height to genesis.
-///
-/// The item with `hash_or_height` is included in the iterator.
-/// `hash_or_height` must be in `chain` or `db`.
-#[allow(dead_code)]
-pub(crate) fn known_chain_ancestor_iter<Item>(
-    chain: Option<Arc<Chain>>,
-    db: &ZakuraDb,
-    hash_or_height: HashOrHeight,
-) -> Iter<Item>
-where
-    Item: ChainItem,
-{
-    // We need to look up the height for the hash.
-    let height =
-        hash_or_height.height_or_else(|hash| read::height_by_hash(chain.as_ref(), db, hash));
 
     Iter {
         chain,

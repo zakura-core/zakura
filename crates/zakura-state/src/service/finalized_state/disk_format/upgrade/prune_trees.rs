@@ -1,16 +1,16 @@
 //! Validates that duplicate Sapling and Orchard note commitment trees are
 //! absent from the database.
 
-use crossbeam_channel::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{CancelFormatChange, FormatChangeError};
+use super::{CancelFormatChange, CancelReceiver, FormatChangeError};
 
 /// Checks that note commitment trees use the deduplicated current format.
 pub(super) fn detailed_check(
     db: &ZakuraDb,
-    cancel_receiver: &Receiver<CancelFormatChange>,
+    cancel_receiver: &CancelReceiver,
 ) -> Result<Result<(), String>, FormatChangeError> {
     let mut result = Ok(());
 

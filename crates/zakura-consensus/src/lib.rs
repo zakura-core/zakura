@@ -47,6 +47,8 @@ pub mod error;
 pub mod router;
 pub mod transaction;
 
+pub use block::check::proof_of_work_is_valid;
+
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use block::check::difficulty_is_valid;
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -59,7 +61,7 @@ pub use block::{
 pub use checkpoint::{VerifyCheckpointError, MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 pub use config::Config;
 pub use error::BlockError;
-pub use primitives::{ed25519, groth16, halo2, redjubjub, redpallas, sapling::sapling_prover};
+pub use primitives::{ed25519, groth16, halo2, redjubjub, redpallas};
 
 // Benchmarks only: hidden from the documentation, exported so a bench target can reach it.
 #[doc(hidden)]

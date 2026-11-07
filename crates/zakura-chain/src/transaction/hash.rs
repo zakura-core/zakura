@@ -28,6 +28,7 @@
 //!
 //! [1]: crate::transaction::UnminedTx
 
+use crate::serialization::ZcashReader;
 use std::{fmt, sync::Arc};
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -184,13 +185,18 @@ impl std::str::FromStr for Hash {
 }
 
 impl ZcashSerialize for Hash {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_32_bytes(&self.into())
     }
 }
 
 impl ZcashDeserialize for Hash {
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(reader.read_32_bytes()?.into())
     }
 }
@@ -348,13 +354,18 @@ impl std::str::FromStr for WtxId {
 }
 
 impl ZcashSerialize for WtxId {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_64_bytes(&self.into())
     }
 }
 
 impl ZcashDeserialize for WtxId {
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         Ok(reader.read_64_bytes()?.into())
     }
 }

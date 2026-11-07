@@ -5,11 +5,11 @@
 //! - [`CompactSizeMessage`] for sizes that must be less than the network message limit, and
 //! - [`CompactSize64`] for flags, arbitrary counts, and sizes that span multiple blocks.
 
+use crate::serialization::ZcashReader;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::serialization::{
-    SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
-    MAX_PROTOCOL_MESSAGE_LEN,
+    SerializationError, ZcashDeserialize, ZcashSerialize, MAX_PROTOCOL_MESSAGE_LEN,
 };
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -284,7 +284,10 @@ impl ZcashSerialize for CompactSizeMessage {
     /// If the value exceeds `MAX_PROTOCOL_MESSAGE_LEN`.
     #[inline]
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: std::io::Write>(&self, writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         // # Security
         // Defence-in-depth for memory DoS via preallocation.
         //
@@ -305,18 +308,39 @@ impl ZcashSerialize for CompactSizeMessage {
 
 impl ZcashDeserialize for CompactSizeMessage {
     #[inline]
-    fn zcash_deserialize<R: std::io::Read>(reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // Use the same deserialization format as CompactSize64.
-        let size: CompactSize64 = reader.zcash_deserialize_into()?;
+        let size: CompactSize64 = reader.read_value()?;
 
         let size: usize = size.0.try_into()?;
         size.try_into()
     }
 }
 
+impl CompactSize64 {
+    /// The number of bytes the `CompactSize` encoding of `n` takes.
+    pub(crate) const fn encoded_len(n: u64) -> usize {
+        match n {
+            0x00..=0xfc => 1,
+            0x00fd..=0xffff => 3,
+            0x0001_0000..=0xffff_ffff => 5,
+            _ => 9,
+        }
+    }
+}
+
 impl ZcashSerialize for CompactSize64 {
+    fn zcash_serialized_size(&self) -> usize {
+        Self::encoded_len(self.0)
+    }
+
     #[inline]
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         let n = self.0;
         match n {
             0x00..=0xfc => writer.write_u8(n as u8),
@@ -338,7 +362,9 @@ impl ZcashSerialize for CompactSize64 {
 
 impl ZcashDeserialize for CompactSize64 {
     #[inline]
-    fn zcash_deserialize<R: std::io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         use SerializationError::Parse;
 
         let flag_byte = reader.read_u8()?;

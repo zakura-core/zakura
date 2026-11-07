@@ -1,12 +1,11 @@
 //! Consensus critical contextual checks
 
-use std::{borrow::Borrow, sync::Arc};
+use std::borrow::Borrow;
+use zakura_node_services::block_memory::{AdmissionFailure, BlockHandle};
 
 use zakura_chain::{
     amount::{NegativeAllowed, NonNegative},
-    block::{
-        self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
-    },
+    block::{self, merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
     value_balance::ValueBalance,
@@ -150,7 +149,7 @@ where
 
 /// Checks the recent-chain rules required for prepared mined-block relay.
 pub(crate) fn block_is_valid_for_recent_chain_data<C>(
-    candidate_block: &Block,
+    candidate_block: &block::BlockRef,
     candidate_height: block::Height,
     network: &Network,
     finalized_tip_height: Option<block::Height>,
@@ -218,7 +217,7 @@ where
         AdjustedDifficulty::new_from_block(candidate_block, network, relevant_data)
             .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
     check::difficulty_threshold_and_time_are_valid(
-        candidate_block.header.difficulty_threshold,
+        candidate_block.header().difficulty_threshold,
         difficulty_adjustment,
     )?;
 
@@ -259,15 +258,77 @@ where
     Ok(())
 }
 
+/// Checks whether `block`'s header commits to the authorizing data in its body, using the
+/// history tree of its parent in `non_finalized_state` or at the finalized tip.
+///
+/// From NU5, a block hash commits to signatures, proofs, scripts, and v6 anchors only through
+/// `hashBlockCommitments` (ZIP 244), so a body with the right transaction IDs can still carry
+/// authorizing data its header does not commit to. A consensus failure in such a body says
+/// nothing about the block. Callers use this check to tell the two apart.
+pub(crate) fn auth_data_commitment(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    block: BlockHandle,
+    precomputed_auth_data_root: Option<AuthDataRoot>,
+) -> crate::AuthDataCommitment {
+    use crate::{service::read, AuthDataCommitment};
+
+    if !matches!(
+        block.commitment(network),
+        Ok(block::Commitment::ChainHistoryBlockTxAuthCommitment(_))
+    ) {
+        return AuthDataCommitment::Bound;
+    }
+
+    let parent_hash = block.header().previous_block_hash;
+    let parent_chain =
+        non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
+    let finalized_parent = parent_chain.is_none();
+    let parent_height = read::find::height_by_hash(parent_chain.clone(), db, parent_hash);
+    let Some(history_tree) = read::tree::history_tree(parent_chain, db, parent_hash.into()) else {
+        return AuthDataCommitment::Unavailable;
+    };
+    // `history_tree` reads the finalized tip and its tree separately, so a block finalized
+    // between those reads returns the next block's tree. Only use it if the parent is still
+    // the finalized tip.
+    if finalized_parent && db.tip().map(|(_, hash)| hash) != Some(parent_hash) {
+        return AuthDataCommitment::Unavailable;
+    }
+    // The body's coinbase height is not checked yet, and the commitment check below requires
+    // a sequential height with a usable parent history tree.
+    let height = block.coinbase_height();
+    if parent_height.and_then(|parent| parent.next().ok()) != height
+        || (history_tree.hash().is_none()
+            && NetworkUpgrade::Heartwood.activation_height(network) != height)
+    {
+        return AuthDataCommitment::Unavailable;
+    }
+
+    match block_commitment_is_valid_for_chain_history(
+        block,
+        network,
+        &history_tree,
+        precomputed_auth_data_root,
+    ) {
+        Ok(()) => AuthDataCommitment::Bound,
+        Err(ValidateContextError::InvalidBlockCommitment(
+            error @ CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. },
+        )) => AuthDataCommitment::Mismatch(error),
+        Err(_) => AuthDataCommitment::Unavailable,
+    }
+}
+
 /// Check that `block` is contextually valid for `network`, using
 /// the `history_tree` up to and including the previous block.
 #[tracing::instrument(skip(block, history_tree))]
 pub(crate) fn block_commitment_is_valid_for_chain_history(
-    block: Arc<Block>,
+    block: BlockHandle,
     network: &Network,
     history_tree: &HistoryTree,
     precomputed_auth_data_root: Option<AuthDataRoot>,
 ) -> Result<(), ValidateContextError> {
+    let block = block.view();
     match block.commitment(network)? {
         block::Commitment::PreSaplingReserved(_)
         | block::Commitment::FinalSaplingRoot(_)
@@ -438,12 +499,18 @@ pub(crate) fn legacy_chain<I>(
     max_legacy_chain_blocks: usize,
 ) -> Result<(), BoxError>
 where
-    I: Iterator<Item = Arc<Block>>,
+    I: Iterator<Item = Result<BlockHandle, AdmissionFailure>>,
 {
     let mut ancestors = ancestors.peekable();
-    let tip_height = ancestors.peek().and_then(|block| block.coinbase_height());
+    let tip_height = ancestors.peek().and_then(|block| {
+        block
+            .as_ref()
+            .ok()
+            .and_then(|block| block.coinbase_height())
+    });
 
     for (index, block) in ancestors.enumerate() {
+        let block = block?;
         // Stop checking if the chain reaches Canopy. We won't find any more V5 transactions,
         // so the rest of our checks are useless.
         //
@@ -472,6 +539,7 @@ where
         // using our activation heights, the Zebra instance that verified those blocks had different
         // network upgrade heights.
         block
+            .view()
             .check_transaction_network_upgrade_consistency(network)
             .map_err(|error| {
                 format!("inconsistent network upgrade found in transaction: {error:?}")
@@ -480,8 +548,8 @@ where
         // If we find at least one transaction with a valid `network_upgrade` field, the Zebra instance that
         // verified those blocks used the same network upgrade heights. (Up to this point in the chain.)
         let has_network_upgrade = block
-            .transactions
-            .iter()
+            .view()
+            .transactions()
             .find_map(|trans| trans.network_upgrade())
             .is_some();
         if has_network_upgrade {
@@ -504,7 +572,7 @@ pub(crate) fn initial_contextual_validity(
     let relevant_headers = any_chain_ancestor_iter::<block::Header>(
         non_finalized_state,
         finalized_state,
-        semantically_verified.block.header.previous_block_hash,
+        semantically_verified.block.header().previous_block_hash,
     );
     let parent_height = relevant_headers.height;
 

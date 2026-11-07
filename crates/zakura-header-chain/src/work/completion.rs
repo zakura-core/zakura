@@ -135,19 +135,6 @@ where
         self.0.remove(&(source, request_id))
     }
 
-    /// Retire every request owned by one source, returning exact retired owners.
-    pub fn remove_source(&mut self, source: SourceId) -> Vec<O> {
-        let keys: Vec<_> = self
-            .0
-            .keys()
-            .filter(|(candidate, _)| *candidate == source)
-            .copied()
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| self.0.remove(&key))
-            .collect()
-    }
-
     fn get(&self, source: SourceId, request_id: NonZeroU64) -> Option<O> {
         self.0.get(&(source, request_id)).copied()
     }

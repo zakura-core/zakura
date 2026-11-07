@@ -1,11 +1,9 @@
 //! Address-book indexing benchmarks.
 #![allow(missing_docs)]
 
-use std::{net::SocketAddr, time::Duration};
+use std::{hint::black_box, net::SocketAddr, time::Duration};
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use tracing::Span;
 
 use zakura_chain::parameters::Network::Mainnet;

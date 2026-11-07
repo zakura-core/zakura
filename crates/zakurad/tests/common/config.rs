@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 use tempfile::TempDir;
 
 use zakura_chain::parameters::Network;

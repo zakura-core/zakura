@@ -5,7 +5,7 @@ mod tests;
 
 use std::{
     collections::{BTreeMap, HashSet},
-    io,
+    fmt, io,
     ops::Deref,
     sync::Arc,
 };
@@ -26,13 +26,13 @@ use crate::{
 };
 
 /// An error describing why a history tree operation failed.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum HistoryTreeError {
     #[error("zcash_history error: {inner:?}")]
     #[non_exhaustive]
-    InnerError { inner: zcash_history::Error },
+    InnerError { inner: zakura_mmr_tree::Error },
 
     #[error("I/O error: {0}")]
     IOError(#[from] io::Error),
@@ -42,6 +42,28 @@ pub enum HistoryTreeError {
 
     #[error("{network_upgrade:?} has no consensus branch ID, so it cannot have a history tree")]
     MissingBranchId { network_upgrade: NetworkUpgrade },
+}
+
+// Written out instead of derived: derived `Debug` is `#[inline]`, so every
+// codegen unit that formats this type compiles its own copy. The output
+// matches the derive.
+impl fmt::Debug for HistoryTreeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InnerError { inner } => {
+                f.debug_struct("InnerError").field("inner", inner).finish()
+            }
+            Self::IOError(error) => f.debug_tuple("IOError").field(error).finish(),
+            Self::InvalidCachedTree { reason } => f
+                .debug_struct("InvalidCachedTree")
+                .field("reason", reason)
+                .finish(),
+            Self::MissingBranchId { network_upgrade } => f
+                .debug_struct("MissingBranchId")
+                .field("network_upgrade", network_upgrade)
+                .finish(),
+        }
+    }
 }
 
 impl PartialEq for HistoryTreeError {
@@ -71,7 +93,7 @@ enum InnerHistoryTree {
 pub struct NonEmptyHistoryTree {
     network: Network,
     network_upgrade: NetworkUpgrade,
-    /// Merkle mountain range tree from `zcash_history`.
+    /// Merkle mountain range tree from [`zakura_mmr_tree`].
     /// This is a "runtime" structure used to add / remove nodes, and it's not
     /// persistent.
     inner: InnerHistoryTree,
@@ -601,14 +623,14 @@ impl HistoryTree {
     pub fn push(
         &mut self,
         network: &Network,
-        block: Arc<Block>,
+        block: &crate::block::BlockRef,
         sapling_root: &sapling::tree::Root,
         orchard_root: &orchard::tree::Root,
         ironwood_root: &ironwood::tree::Root,
     ) -> Result<(), HistoryTreeError> {
         self.push_from_parts(
             network,
-            HistoryTreeBlockParts::from_block(&block, sapling_root, orchard_root, ironwood_root),
+            HistoryTreeBlockParts::from_block(block, sapling_root, orchard_root, ironwood_root),
         )
     }
 

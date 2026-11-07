@@ -100,7 +100,11 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     {
         projected.forget_evicted_bodies(authority.evicted_bodies(event))?;
     }
-    projected.refresh_verified_selection()?;
+    projected.refresh_verified_selection(
+        context
+            .full_state_authority
+            .and_then(|authority| authority.verified_tip(event)),
+    )?;
 
     let (mut selected_tip, _) = projected.graph().view_select_best_header_chain()?;
     let full_state_finalized = match event {
@@ -241,6 +245,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let retention = projected.enforce_retention(
+        engine,
         selected_tip,
         context.retention_references.iter().copied(),
         context.config.limits,

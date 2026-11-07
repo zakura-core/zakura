@@ -1,16 +1,15 @@
 //! Equihash Solution and related items.
 
+use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use hex::{FromHex, FromHexError, ToHex};
-use serde_big_array::BigArray;
 
 use crate::{
     block::Header,
     parameters::Network,
     serialization::{
-        zcash_deserialize_bytes_external_count, zcash_serialize_bytes, CompactSizeMessage,
-        SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
+        CompactSize64, CompactSizeMessage, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
 };
 
@@ -66,9 +65,11 @@ const REGTEST_K: u32 = 5;
 #[allow(clippy::large_enum_variant)]
 pub enum Solution {
     /// Equihash solution on Mainnet or Testnet
-    Common(#[serde(with = "BigArray")] [u8; SOLUTION_SIZE]),
+    Common(#[serde(with = "crate::serialization::serde_adapters::bytes")] [u8; SOLUTION_SIZE]),
     /// Equihash solution on Regtest
-    Regtest(#[serde(with = "BigArray")] [u8; REGTEST_SOLUTION_SIZE]),
+    Regtest(
+        #[serde(with = "crate::serialization::serde_adapters::bytes")] [u8; REGTEST_SOLUTION_SIZE],
+    ),
 }
 
 impl Solution {
@@ -334,26 +335,33 @@ impl Default for Solution {
 }
 
 impl ZcashSerialize for Solution {
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
-        zcash_serialize_bytes(&self.value().to_vec(), writer)
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        let solution = self.value();
+        CompactSizeMessage::try_from(solution.len())?.zcash_serialize(writer)?;
+        writer.write_all(solution)
+    }
+
+    fn zcash_serialized_size(&self) -> usize {
+        let solution_len = self.value().len();
+        let length_prefix =
+            u64::try_from(solution_len).expect("Equihash solution sizes fit in u64");
+        CompactSize64::encoded_len(length_prefix) + solution_len
     }
 }
 
 impl ZcashDeserialize for Solution {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let len: CompactSizeMessage = reader.read_value()?;
         let len: usize = len.into();
 
-        // Validate the length against the consensus-required sizes before
-        // allocating, so an attacker-controlled CompactSize cannot force a
-        // multi-megabyte allocation.
-        if len > SOLUTION_SIZE {
+        if !matches!(len, SOLUTION_SIZE | REGTEST_SOLUTION_SIZE) {
             return Err(SerializationError::Parse(
                 "incorrect equihash solution size",
             ));
         }
-
-        let solution = zcash_deserialize_bytes_external_count(len, &mut reader)?;
+        let solution = reader.read_bytes(len)?;
         Self::from_bytes(&solution)
     }
 }

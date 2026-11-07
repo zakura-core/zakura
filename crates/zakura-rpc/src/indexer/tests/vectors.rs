@@ -15,7 +15,7 @@ use zakura_node_services::mempool::{MempoolChange, MempoolTxSubscriber};
 use zakura_state::{HashOrHeight, ReadRequest, ReadResponse};
 use zakura_test::{
     mock_service::{MockService, PanicAssertion},
-    prelude::color_eyre::{eyre::eyre, Result},
+    prelude::eyre::{eyre, Result},
 };
 
 #[cfg(feature = "indexer")]
@@ -30,6 +30,15 @@ use crate::{
     },
     sync::{IndexerClientConfig, IndexerClientTlsConfig},
 };
+
+/// A funded serialized block for a mocked state response.
+#[cfg(feature = "indexer")]
+fn raw_block(bytes: Vec<u8>) -> zakura_node_services::block_memory::OwnedRawBlock {
+    zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
+        .try_reserve(0)
+        .and_then(|reservation| reservation.retain(bytes))
+        .expect("an unlimited budget has room")
+}
 
 #[tokio::test]
 async fn rpc_server_spawn() -> Result<()> {
@@ -230,7 +239,7 @@ async fn test_get_block(
     mock_read_service
         .expect_request(ReadRequest::Block(HashOrHeight::Height(height)))
         .await
-        .respond(ReadResponse::Block(Some(block.clone())));
+        .respond(ReadResponse::Block(Some(block.clone().into())));
 
     let response = request_task
         .await?
@@ -299,8 +308,8 @@ async fn test_get_block_range(
         })
         .await
         .respond(ReadResponse::RawBlocks(vec![
-            (Height(1), block1.zcash_serialize_to_vec()?),
-            (Height(2), block2.zcash_serialize_to_vec()?),
+            (Height(1), raw_block(block1.zcash_serialize_to_vec()?)),
+            (Height(2), raw_block(block2.zcash_serialize_to_vec()?)),
         ]));
 
     let mut stream = request_task
@@ -334,7 +343,7 @@ async fn test_get_block_range(
                 expected_height,
             ))))
             .await
-            .respond(ReadResponse::Block(Some(expected_block.clone())));
+            .respond(ReadResponse::Block(Some(expected_block.clone().into())));
 
         let get_block_response = get_block_task
             .await?
@@ -375,8 +384,8 @@ async fn test_get_block_range(
         })
         .await
         .respond(ReadResponse::RawBlocks(vec![
-            (Height(1), block1.zcash_serialize_to_vec()?),
-            (Height(2), block2.zcash_serialize_to_vec()?),
+            (Height(1), raw_block(block1.zcash_serialize_to_vec()?)),
+            (Height(2), raw_block(block2.zcash_serialize_to_vec()?)),
         ]));
 
     let mut stream = request_task
@@ -426,7 +435,9 @@ async fn test_get_block_range(
                     .await
                     .respond(ReadResponse::RawBlocks(
                         (start..start + count)
-                            .map(|height| (Height(height), height.to_be_bytes().to_vec()))
+                            .map(|height| {
+                                (Height(height), raw_block(height.to_be_bytes().to_vec()))
+                            })
                             .collect(),
                     ));
             }
@@ -479,7 +490,7 @@ async fn test_get_block_range(
         .await
         .respond(ReadResponse::RawBlocks(
             (0..10)
-                .map(|height| (Height(height), height.to_be_bytes().to_vec()))
+                .map(|height| (Height(height), raw_block(height.to_be_bytes().to_vec())))
                 .collect(),
         ));
 
@@ -679,12 +690,12 @@ async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()
         for change in [
             NonFinalizedBlock {
                 hash,
-                block: block.clone(),
+                block: block.clone().into(),
                 receipt_order: Some(2),
             },
             NonFinalizedBlock {
                 hash,
-                block: block.clone(),
+                block: block.clone().into(),
                 receipt_order: Some(1),
             },
         ] {

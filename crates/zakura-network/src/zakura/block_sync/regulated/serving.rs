@@ -2,44 +2,40 @@
 
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-use zakura_chain::{block, serialization::ZcashSerialize};
+use zakura_chain::block;
 
-use super::wire::{Message, Range};
+use super::wire::{Message, Range, RangeEnding};
 use crate::zakura::{
     block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
     regulation::{
         Produce, Responded, ResponseCap, ResponseSink, ServeEnd, SinkProgress, WorkLease,
     },
+    resume_task_panic,
     wire_codec::WireError,
 };
 
-/// The source moves the lease into the actual blocking job and returns it with
-/// the result. Cancellation must not release execution while that job runs.
-pub(super) trait Source: Send + Sync + 'static {
-    fn read(&self, request: Read) -> BoxFuture<'static, Result<ReadResult, crate::BoxError>>;
-}
+use super::super::source::BlockRangeReadLease;
+pub(super) use super::super::source::{
+    BlockRangeRead as Read, BlockRangeReadResult as ReadResult, BlockRangeSource as Source,
+};
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::{
+    block_sync::block_sync_observe::{LeaseStep, ObserverSlot, ServingIdentity, ServingReporter},
+    regulation::{ReleaseReport, ServeStep},
+};
 
-pub(super) struct Read {
-    pub(super) range: Range,
-    pub(super) max_body_bytes: u32,
-    pub(super) lease: WorkLease,
-}
-
-/// Blocks drop before their execution lease. The source limits the result to
-/// the requested count and body bytes before retaining it.
-pub(super) struct ReadResult {
-    pub(super) blocks: Vec<(block::Height, Arc<block::Block>)>,
-    pub(super) lease: WorkLease,
-}
-
-pub(super) struct Server<S> {
+#[derive(Debug)]
+pub(super) struct Server<S: ?Sized> {
     source: Arc<S>,
+    session: Option<crate::zakura::FramedSend>,
     max_blocks: u32,
     max_body_bytes: u32,
+    /// Reports this session's leases and frames, in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    observed: Option<ServingReporter>,
 }
 
-impl<S> Server<S> {
+impl<S: ?Sized> Server<S> {
     pub(super) fn new(
         source: Arc<S>,
         max_blocks: u32,
@@ -52,22 +48,39 @@ impl<S> Server<S> {
         }
         Ok(Self {
             source,
+            session: None,
             max_blocks,
             max_body_bytes,
+            #[cfg(any(test, zakura_sim))]
+            observed: None,
         })
+    }
+
+    /// This server, reporting its reads for `session` to `observer`.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn with_observer(self, observer: ObserverSlot, session: ServingIdentity) -> Self {
+        Self {
+            observed: Some(ServingReporter::new(observer, session)),
+            ..self
+        }
     }
 }
 
-impl<S: Source> Produce for Server<S> {
+impl<S: ?Sized> Server<S> {
+    pub(super) fn with_session(mut self, send: crate::zakura::FramedSend) -> Self {
+        self.session = Some(send);
+        self
+    }
+}
+
+impl<S: Source + ?Sized> Produce for Server<S> {
     type Request = Range;
     type Message = Message;
 
     fn response_cap(&self, range: &Range) -> ResponseCap {
-        Range {
-            count: range.count.min(self.max_blocks),
-            ..*range
-        }
-        .response_cap(self.max_body_bytes)
+        range
+            .truncated(self.max_blocks)
+            .response_cap(self.max_body_bytes)
     }
 
     async fn produce(
@@ -79,35 +92,63 @@ impl<S: Source> Produce for Server<S> {
         if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
-        let read_range = Range {
-            count: range.count.min(self.max_blocks),
-            ..*range
-        };
+        let read_range = range.truncated(self.max_blocks);
         let result = self
             .source
             .read(Read {
-                range: read_range,
+                start_height: read_range.start(),
+                count: read_range.count(),
                 max_body_bytes: self.max_body_bytes,
-                lease,
+                lease: BlockRangeReadLease {
+                    work: lease,
+                    _session: self.session.clone(),
+                    #[cfg(any(test, zakura_sim))]
+                    observed: self.observed.clone(),
+                },
             })
             .await
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
         let requested = *range;
         let max_body_bytes = self.max_body_bytes;
-        // Encoding can be expensive. Await the actual job, even after session
-        // cancellation, and keep the source's lease with its retained blocks.
-        tokio::task::spawn_blocking(move || {
-            encode_response(requested, read_range.count, max_body_bytes, result, sink)
-        })
-        .await
-        .map_err(|error| ServeEnd::LocalFault(error.to_string()))?
+        // Copying up to the response cap into frames can still take a while.
+        // Await the actual job, even after session cancellation, and keep the
+        // source's lease with its retained blocks.
+        resume_task_panic(
+            zakura_rt::task::spawn_blocking_named("block_sync_serve_encode", move || {
+                encode_response(requested, read_range.count(), max_body_bytes, result, sink)
+            })
+            .await,
+        )
+        .map_err(|_| ServeEnd::Cancelled)?
     }
 
     fn local_failure(&self, range: &Range, sent: SinkProgress) -> Message {
         ending(*range, sent.frames)
     }
+
+    #[cfg(any(test, zakura_sim))]
+    fn observe(&self, range: &Range, step: ServeStep<'_, Message>) {
+        let Some(reporter) = &self.observed else {
+            return;
+        };
+        let ServeStep::FailureEnding(end) = step;
+        reporter.frame(range.start(), ending_type(end), 0);
+    }
+
+    #[cfg(any(test, zakura_sim))]
+    fn observe_lease(&self, range: &Range) -> Option<ReleaseReport> {
+        let reporter = self.observed.clone()?;
+        let (start, count) = (range.start(), range.count());
+        reporter.lease(start, count, LeaseStep::Acquired);
+        Some(ReleaseReport::new(move || {
+            reporter.lease(start, count, LeaseStep::Released)
+        }))
+    }
 }
 
+/// Send the source's serialized blocks unchanged as a contiguous prefix of
+/// `requested`, within `max_blocks` and `max_body_bytes`, then end the response.
+#[cfg_attr(any(test, zakura_sim), allow(unreachable_code))]
 fn encode_response(
     requested: Range,
     max_blocks: u32,
@@ -115,18 +156,18 @@ fn encode_response(
     result: ReadResult,
     mut sink: ResponseSink<Message>,
 ) -> Result<Responded, ServeEnd> {
+    let ReadResult { blocks, lease } = result;
     let mut returned = 0;
     let mut body_bytes = 0_u64;
-    for (height, block) in &result.blocks {
-        if result.lease.is_cancelled() {
+    // Consuming the blocks drops each one once it is framed, and any unsent
+    // remainder when the loop ends, all before `lease` is released.
+    for (height, bytes) in blocks {
+        if lease.is_cancelled() {
             return Err(ServeEnd::Cancelled);
         }
-        if returned == max_blocks || height.0 != requested.start.0 + returned {
+        if returned == max_blocks || height.0 != requested.start().0 + returned {
             break;
         }
-        let bytes = block
-            .zcash_serialize_to_vec()
-            .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
         // usize fits u64 on the supported 64-bit targets.
         let len = bytes.len() as u64;
         if len > block::MAX_BLOCK_BYTES {
@@ -139,23 +180,58 @@ fn encode_response(
         }
         sink.send(&Message::Block(bytes))
             .map_err(|error| ServeEnd::LocalFault(error.to_string()))?;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(observed) = &lease.observed {
+            observed.frame(
+                requested.start(),
+                crate::zakura::block_sync::MSG_BS_BLOCK,
+                len,
+            );
+        }
+        metrics::counter!("sync.block.body.served").increment(1);
         body_bytes += len;
         returned += 1;
     }
-    if result.lease.is_cancelled() {
+    if lease.is_cancelled() {
         return Err(ServeEnd::Cancelled);
     }
+    #[cfg(any(test, zakura_sim))]
+    return finish_observed(sink, requested, ending(requested, returned), &lease);
     sink.finish(&ending(requested, returned))
         .map_err(|error| ServeEnd::LocalFault(error.to_string()))
 }
 
-fn ending(range: Range, returned: u32) -> Message {
-    if returned == 0 {
-        Message::RangeUnavailable(range)
-    } else {
-        Message::BlocksDone {
-            start: range.start,
-            returned,
-        }
+/// Queues `end` for `requested` as `encode_response` does, then reports the
+/// ending frame to the lease's reporter if the sink took it.
+#[cfg(any(test, zakura_sim))]
+fn finish_observed(
+    sink: ResponseSink<Message>,
+    requested: Range,
+    end: Message,
+    lease: &BlockRangeReadLease,
+) -> Result<Responded, ServeEnd> {
+    let finished = sink
+        .finish(&end)
+        .map_err(|error| ServeEnd::LocalFault(error.to_string()));
+    if let (Ok(_), Some(observed)) = (&finished, &lease.observed) {
+        observed.frame(requested.start(), ending_type(&end), 0);
     }
+    finished
+}
+
+/// The message type of an ending that [`ending`] built.
+#[cfg(any(test, zakura_sim))]
+fn ending_type(end: &Message) -> u8 {
+    match end {
+        Message::End(range_ending) => range_ending.message_type(),
+        _ => unreachable!("`ending` builds an ending"),
+    }
+}
+
+fn ending(range: Range, returned: u32) -> Message {
+    Message::End(if returned == 0 {
+        RangeEnding::unavailable(range.start(), range.count())
+    } else {
+        RangeEnding::done(range.start(), returned)
+    })
 }

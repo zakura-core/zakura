@@ -36,6 +36,38 @@ impl From<PeerSocketAddr> for PeerSource {
     }
 }
 
+/// A block to advertise, with what the advertiser needs to size the broadcast.
+///
+/// Local callers that hold the block fill in `size`. An `inv` received from a peer carries only
+/// the hash, so it is `None` there.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+pub struct AdvertisedBlock {
+    /// The block hash.
+    pub hash: block::Hash,
+    /// The block's serialized size in bytes, if known. Legacy gossip sizes the broadcast's
+    /// advert window from it.
+    pub size: Option<u32>,
+}
+
+impl AdvertisedBlock {
+    /// Returns an advertisement of the block with `hash` and serialized `size`.
+    pub fn new(hash: block::Hash, size: usize) -> Self {
+        Self {
+            hash,
+            // A size that does not fit is unknown, rather than a misleadingly small block.
+            size: u32::try_from(size).ok(),
+        }
+    }
+}
+
+impl From<block::Hash> for AdvertisedBlock {
+    /// Returns an advertisement of the block with `hash` and unknown size.
+    fn from(hash: block::Hash) -> Self {
+        Self { hash, size: None }
+    }
+}
+
 /// A network request, represented in internal format.
 ///
 /// The network layer aims to abstract away the details of the Bitcoin wire
@@ -58,6 +90,10 @@ impl From<PeerSocketAddr> for PeerSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Request {
+    /// Disconnect a legacy peer without changing its misbehavior score or ban status.
+    /// The peer set handles this request locally and returns [`super::Response::Nil`].
+    DisconnectPeer(PeerSocketAddr),
+
     /// Requests additional peers from the server.
     ///
     /// # Response
@@ -101,6 +137,9 @@ pub enum Request {
     ///
     /// This is used by authenticated transports that can safely route a
     /// gossiped-inventory download back to the peer that advertised it.
+    ///
+    /// The legacy peer set prefers ready peers that advertised the inventory. If there are none,
+    /// it sends a single-block request to a ready legacy `source` that isn't missing the block.
     ///
     /// # Returns
     ///
@@ -169,7 +208,10 @@ pub enum Request {
     /// is no way for the network layer to distinguish them. For this reason, the
     /// response may occasionally contain a single hash of a new chain tip rather
     /// than a list of hashes of subsequent blocks. We believe that unsolicited
-    /// `inv` messages will always have exactly one block hash.
+    /// `inv` messages will always have exactly one block hash, so the connection
+    /// also hands a one-hash response to the inbound service as a
+    /// [`Request::AdvertiseBlock`], and the gossip downloader may fetch that
+    /// block as well.
     FindBlocks {
         /// Hashes of known blocks, ordered from highest height to lowest height.
         //
@@ -248,9 +290,9 @@ pub enum Request {
     /// [`Request::BlocksByHash`] against the "inbound" service passed to
     /// [`init`](crate::init).
     ///
-    /// The peer set routes this request specially, sending it to *a fraction of*
-    /// the available peers. See [`number_of_peers_to_broadcast()`](crate::PeerSet::number_of_peers_to_broadcast)
-    /// for more details.
+    /// Legacy gossip progressively advertises to connected peers in random order.
+    /// A bounded number of advertisements await block uploads at once. That window is sized
+    /// from the block's serialized size, so the first peers receive a large block sooner.
     ///
     /// The second field is the source peer that sent us this `inv`:
     /// `Some(source)` when the advertisement was relayed from a remote peer,
@@ -261,13 +303,17 @@ pub enum Request {
     /// # Returns
     ///
     /// Returns [`Response::Nil`](super::Response::Nil).
-    AdvertiseBlock(block::Hash, Option<PeerSource>),
+    AdvertiseBlock(AdvertisedBlock, Option<PeerSource>),
 
-    /// Advertise a block to all ready peers. This is equivalent to
-    /// [`Request::AdvertiseBlock`] except that the peer set will route
-    /// this request to all available ready peers. Used by the gossip task
-    /// to broadcast mined blocks to all ready peers.
-    AdvertiseBlockToAll(block::Hash),
+    /// Advertise a block to connected peers, paced like [`Request::AdvertiseBlock`].
+    /// Tip gossip uses [`Request::AdvertiseBlock`] or [`Request::AdvertiseMinedBlock`].
+    AdvertiseBlockToAll(AdvertisedBlock),
+
+    /// Advertise a locally mined block, prioritizing measured heartbeat RTT.
+    /// Every fourth advertisement goes to a random remaining peer instead.
+    /// Legacy gossip holds a bounded number of slots through block uploads.
+    /// Native gossip uses its existing broadcast policy.
+    AdvertiseMinedBlock(AdvertisedBlock),
 
     /// Request the contents of this node's mempool.
     ///
@@ -280,6 +326,7 @@ pub enum Request {
 impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&match self {
+            Request::DisconnectPeer(_) => "DisconnectPeer".to_string(),
             Request::Peers => "Peers".to_string(),
             Request::Ping(_) => "Ping".to_string(),
 
@@ -312,6 +359,7 @@ impl fmt::Display for Request {
 
             Request::AdvertiseBlock(_, _) => "AdvertiseBlock".to_string(),
             Request::AdvertiseBlockToAll(_) => "AdvertiseBlockToAll".to_string(),
+            Request::AdvertiseMinedBlock(_) => "AdvertiseMinedBlock".to_string(),
             Request::MempoolTransactionIds => "MempoolTransactionIds".to_string(),
         })
     }
@@ -321,6 +369,7 @@ impl Request {
     /// Returns the Zebra internal request type as a string.
     pub fn command(&self) -> &'static str {
         match self {
+            Request::DisconnectPeer(_) => "DisconnectPeer",
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 
@@ -335,7 +384,9 @@ impl Request {
             Request::PushTransaction(_, _) => "PushTransaction",
             Request::AdvertiseTransactionIds(_, _) => "AdvertiseTransactionIds",
 
-            Request::AdvertiseBlock(_, _) | Request::AdvertiseBlockToAll(_) => "AdvertiseBlock",
+            Request::AdvertiseBlock(_, _)
+            | Request::AdvertiseBlockToAll(_)
+            | Request::AdvertiseMinedBlock(_) => "AdvertiseBlock",
             Request::MempoolTransactionIds => "MempoolTransactionIds",
         }
     }

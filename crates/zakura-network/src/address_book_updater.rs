@@ -98,7 +98,22 @@ impl AddressBookUpdater {
             span!(Level::TRACE, "address book"),
         )
         .with_local_listener_services(advertised_services)
-        .with_expose_peer_addresses(config.expose_peer_addresses);
+        .with_expose_peer_addresses(config.expose_peer_addresses)
+        .with_unconditional_peers(config.unconditional_peers.clone());
+        if !config.unconditional_peers.is_empty() {
+            if config.expose_peer_addresses {
+                let unconditional_peers: Vec<_> = config.unconditional_peers.iter().collect();
+                info!(
+                    ?unconditional_peers,
+                    "ignoring misbehavior reports from unconditional peers"
+                );
+            } else {
+                info!(
+                    unconditional_peers = config.unconditional_peers.len(),
+                    "ignoring misbehavior reports from unconditional peers"
+                );
+            }
+        }
         if let Some(peer_registry) = peer_registry {
             address_book = address_book.with_peer_registry(peer_registry);
         }
@@ -108,16 +123,6 @@ impl AddressBookUpdater {
         // only needs read-only ban checks. Both handles share the ban list lock.
         let bans = address_book.bans();
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
-
-        #[cfg(feature = "progress-bar")]
-        let (mut address_info, address_bar, never_bar, failed_bar) = {
-            let address_bar = howudoin::new_root().label("Known Peers");
-            let never_bar =
-                howudoin::new_with_parent(address_bar.id()).label("Never Attempted Peers");
-            let failed_bar = howudoin::new_with_parent(never_bar.id()).label("Failed Peers");
-
-            (address_metrics.clone(), address_bar, never_bar, failed_bar)
-        };
 
         let worker_address_book = address_book.clone();
         let expose_peer_addresses = config.expose_peer_addresses;
@@ -140,39 +145,6 @@ impl AddressBookUpdater {
                     .lock()
                     .expect("mutex should be unpoisoned")
                     .update(event);
-
-                #[cfg(feature = "progress-bar")]
-                if matches!(howudoin::cancelled(), Some(true)) {
-                    address_bar.close();
-                    never_bar.close();
-                    failed_bar.close();
-                } else if address_info.has_changed()? {
-                    // We don't track:
-                    // - attempt pending because it's always small
-                    // - responded because it's the remaining attempted-but-not-failed peers
-                    // - recently live because it's similar to the connected peer counts
-
-                    let address_info = *address_info.borrow_and_update();
-
-                    address_bar
-                        .set_pos(u64::try_from(address_info.num_addresses).expect("fits in u64"));
-                    // .set_len(u64::try_from(address_info.address_limit).expect("fits in u64"));
-
-                    never_bar.set_pos(
-                        u64::try_from(address_info.never_attempted_gossiped).expect("fits in u64"),
-                    );
-                    // .set_len(u64::try_from(address_info.address_limit).expect("fits in u64"));
-
-                    failed_bar.set_pos(u64::try_from(address_info.failed).expect("fits in u64"));
-                    // .set_len(u64::try_from(address_info.address_limit).expect("fits in u64"));
-                }
-            }
-
-            #[cfg(feature = "progress-bar")]
-            {
-                address_bar.close();
-                never_bar.close();
-                failed_bar.close();
             }
 
             let error = Err(AllAddressBookUpdaterSendersClosed.into());

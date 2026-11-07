@@ -10,7 +10,6 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
-    sync::Arc,
     time::Duration,
 };
 
@@ -207,6 +206,7 @@ pub struct RemovedTransactionIds {
 
 impl RemovedTransactionIds {
     /// Returns the total number of transactions that were removed from the mempool.
+    #[cfg(test)]
     pub fn total_len(&self) -> usize {
         self.mined.len() + self.invalidated.len()
     }
@@ -479,9 +479,11 @@ impl Storage {
     ///
     /// # Fee floor
     ///
-    /// While the mempool is full, the lowest fee it admits is the cheapest package plus the
-    /// increment. The node does not store this floor. Any event that frees space, such as a
-    /// committed block, an expiry, or a reorg, lowers it immediately.
+    /// While the mempool is full, both the incoming transaction's own fee rate
+    /// and its rate combined with all unconfirmed ancestors must exceed every
+    /// selected victim's score by the increment. The node does not store a floor.
+    /// Events that free space, such as a committed block, expiry, or reorg, can
+    /// lower the admission threshold immediately.
     ///
     /// This departs from [ZIP-401], which evicts at random. ZIP-401 chose random eviction when
     /// every transaction paid the same fee. [ZIP-317] fees vary with transaction size, so
@@ -650,11 +652,18 @@ impl Storage {
     /// Maintains the order in which the other unmined transactions have been inserted into the mempool.
     ///
     /// Does not add or remove from the 'rejected' tracking set.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn remove_exact(&mut self, exact_wtxids: &HashSet<UnminedTxId>) -> usize {
-        self.verified
-            .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id()))
-            .len()
+        let tx_ids: Vec<_> = exact_wtxids
+            .iter()
+            .filter(|id| {
+                self.transactions()
+                    .get(&id.mined_id())
+                    .is_some_and(|tx| tx.transaction.id() == **id)
+            })
+            .map(UnminedTxId::mined_id)
+            .collect();
+        self.verified.remove_all(tx_ids).len()
     }
 
     /// Clears a list of mined transaction ids from the verified set's tracked transaction dependencies.
@@ -679,31 +688,29 @@ impl Storage {
     pub fn reject_and_remove_same_effects(
         &mut self,
         mined_ids: &HashSet<transaction::Hash>,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<impl AsRef<Transaction>>,
     ) -> RemovedTransactionIds {
-        let removed_mined = self
-            .verified
-            .remove_all_that(|tx| mined_ids.contains(&tx.transaction.id().mined_id()));
+        let removed_mined = self.verified.remove_all(mined_ids.iter().copied());
 
         let spent_outpoints: HashSet<_> = transactions
             .iter()
-            .flat_map(|tx| tx.spent_outpoints())
+            .flat_map(|tx| tx.as_ref().spent_outpoints())
             .collect();
         let sprout_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.sprout_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().sprout_nullifiers())
             .collect();
         let sapling_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.sapling_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().sapling_nullifiers())
             .collect();
         let orchard_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.orchard_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().orchard_nullifiers())
             .collect();
         let ironwood_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.ironwood_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().ironwood_nullifiers())
             .collect();
 
         let duplicate_spend_ids: HashSet<_> = self
@@ -732,7 +739,7 @@ impl Storage {
 
         let removed_duplicate_spend = self
             .verified
-            .remove_all_that(|tx| duplicate_spend_ids.contains(&tx.transaction.id()));
+            .remove_all(duplicate_spend_ids.iter().map(UnminedTxId::mined_id));
 
         for &mined_id in mined_ids {
             self.reject(
@@ -759,7 +766,6 @@ impl Storage {
     }
 
     /// Clears the whole mempool storage.
-    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.verified.clear();
         self.tip_rejected_exact.clear();
@@ -855,6 +861,8 @@ impl Storage {
             self.transactions()
                 .get(&tx_id.mined_id())
                 .map(|tx| &tx.transaction)
+                // The verified set is keyed by mined ID, so check the auth digest too.
+                .filter(|tx| tx.id() == tx_id)
         })
     }
 
@@ -867,11 +875,9 @@ impl Storage {
         &self,
         tx_ids: HashSet<Hash>,
     ) -> impl Iterator<Item = &UnminedTx> {
-        self.verified
-            .transactions()
-            .iter()
-            .filter(move |(tx_id, _)| tx_ids.contains(tx_id))
-            .map(|(_, tx)| &tx.transaction)
+        tx_ids
+            .into_iter()
+            .filter_map(|tx_id| self.transactions().get(&tx_id).map(|tx| &tx.transaction))
     }
 
     /// Returns a transaction and the transaction ids of its dependencies, if it is in the verified set.
@@ -1007,7 +1013,9 @@ impl Storage {
             TransactionDownloadVerifyError::DownloadFailed(_) |
             // If it was cancelled then a block was mined, or there was a network
             // upgrade, etc. No reason to reject it.
-            TransactionDownloadVerifyError::Cancelled => {}
+            TransactionDownloadVerifyError::Cancelled |
+            // The transaction was not verified. Another peer can still relay it.
+            TransactionDownloadVerifyError::PeerCoolingDown => {}
 
             TransactionDownloadVerifyError::PolicyRejected(error) => self.reject(
                 tx_id,
@@ -1045,10 +1053,8 @@ impl Storage {
             }
         }
 
-        // expiry height is effecting data, so we match by non-malleable TXID
-        let removed_tx_ids = self
-            .verified
-            .remove_all_that(|tx| tx_ids.contains(&tx.transaction.id().mined_id()));
+        // Expiry height is effecting data, so match by non-malleable TXID.
+        let removed_tx_ids = self.verified.remove_all(tx_ids.iter().copied());
 
         // also reject it
         for id in tx_ids {

@@ -1,13 +1,11 @@
 //! An implementation of [`DiskFormatUpgrade`] for marking the database as upgraded to a new format version.
 
-use crossbeam_channel::Receiver;
-
 use semver::Version;
 use zakura_chain::block::Height;
 
 use crate::service::finalized_state::ZakuraDb;
 
-use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
+use super::{CancelReceiver, DiskFormatUpgrade, FormatChangeError};
 
 /// Implements [`DiskFormatUpgrade`] for in-place upgrades that do not involve any migration
 /// of existing data into the new format.
@@ -40,7 +38,7 @@ impl DiskFormatUpgrade for NoMigration {
         &self,
         _initial_finalized_tip_height: Option<Height>,
         _db: &ZakuraDb,
-        _cancel_receiver: &Receiver<CancelFormatChange>,
+        _cancel_receiver: &CancelReceiver,
     ) -> Result<(), FormatChangeError> {
         Ok(())
     }

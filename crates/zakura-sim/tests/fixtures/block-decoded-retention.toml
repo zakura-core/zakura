@@ -1,0 +1,9 @@
+harness = "block/decoded-retention"
+generator = 1
+sha256 = "aa38dbbeb2aac5ed41cc440e840a43dcec67db52a407eaa85fe70ad663f9d846"
+scenario_sha256 = "7d74927c16c09ca2cbc902e4c3c793c18276ccf3ad65a95e516f672ef4a7f5dc"
+source = "crates/zakura-sim/tests/replay_exact.rs"
+
+[[witness]]
+property = "block/decoded-retention"
+expect = "holds"

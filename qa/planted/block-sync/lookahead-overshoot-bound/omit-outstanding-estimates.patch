@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/admission.rs b/crates/zakura-network/src/zakura/block_sync/admission.rs
+index f04f77e0c..a54b81cf2 100644
+--- a/crates/zakura-network/src/zakura/block_sync/admission.rs
++++ b/crates/zakura-network/src/zakura/block_sync/admission.rs
+@@ -226,10 +226,7 @@ impl AdmissionSnapshot {
+ /// the deep backlog — the pool that actually scales with look-ahead depth — is
+ /// charged at its true serialized cost instead of a flat decoded multiple.
+ fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
+-    let serialized = snapshot
+-        .retained()
+-        .wire_bytes()
+-        .saturating_add(snapshot.reserved_above_floor_bytes);
++    let serialized = snapshot.retained().wire_bytes();
+     // Decoded copies exist alongside their retained raw payloads, so the extra
+     // decoded cost is the full decoded multiple on top of the ×1 wire charge.
+     // A block that decodes larger than the calibrated multiple is charged its

@@ -18,7 +18,7 @@
 //! Sapling has one verifying key pair for all of history, so one cache covers it.
 //!
 //! Only `Ok` results are cached. A batch error is not per-item evidence, because
-//! [`Fallback`](tower_fallback::Fallback) re-verifies failures singly, and it may not be a verdict
+//! [`Fallback`](super::fallback::Fallback) re-verifies failures singly, and it may not be a verdict
 //! at all — a shut-down batch worker reports the same way. Caching it would reject a valid block.
 
 use std::{
@@ -33,6 +33,8 @@ use tower::{Service, ServiceExt};
 use zakura_chain::transaction::UnminedTxId;
 
 use crate::BoxError;
+
+use super::flush;
 
 #[cfg(test)]
 mod tests;
@@ -312,6 +314,9 @@ pub struct Cached<S> {
     /// The value this cache reports in the `verifier` label of its metrics.
     verifier_name: &'static str,
 
+    /// The batch worker a block flushes once its misses are queued, if any.
+    flush_verifier: Option<flush::Verifier>,
+
     /// The keys of the items that reached the inner service, in call order.
     ///
     /// Test-only. See [`Self::inner_calls_for`].
@@ -325,6 +330,7 @@ impl<S: Clone> Clone for Cached<S> {
             inner: self.inner.clone(),
             verified: self.verified.clone(),
             verifier_name: self.verifier_name,
+            flush_verifier: self.flush_verifier,
             #[cfg(test)]
             inner_calls: self.inner_calls.clone(),
         }
@@ -339,9 +345,17 @@ impl<S> Cached<S> {
             inner,
             verified: Arc::new(Mutex::new(VerifiedBundles::new(capacity))),
             verifier_name,
+            flush_verifier: None,
             #[cfg(test)]
             inner_calls: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Makes a block flush `verifier`, the batch worker behind this cache, once the block's
+    /// misses are in its queue. See [`flush`].
+    pub(super) fn with_flush(mut self, verifier: flush::Verifier) -> Self {
+        self.flush_verifier = Some(verifier);
+        self
     }
 
     /// Returns the wrapped verification service.
@@ -396,6 +410,7 @@ impl<S> Cached<S> {
             inner,
             verified: self.verified.clone(),
             verifier_name: self.verifier_name,
+            flush_verifier: self.flush_verifier,
             inner_calls: self.inner_calls.clone(),
         }
     }
@@ -419,7 +434,7 @@ where
     /// is whether the inner service will be used at all. Delegating would reserve inner capacity
     /// for every request, including the hits that never spend it:
     ///
-    ///   * [`Batch::poll_ready`](tower_batch_control::Batch) holds a semaphore permit until
+    ///   * [`Batch::poll_ready`](super::batch_control::Batch) holds a semaphore permit until
     ///     `Batch::call` consumes it. A hit never calls, so it holds that permit until the handle
     ///     drops, denying capacity to a genuine miss.
     ///   * `Batch::poll_ready` also errors once its worker exits. Callers poll before they call,
@@ -453,6 +468,9 @@ where
         let verified = self.verified.clone();
         let verifier_name = self.verifier_name;
         let mut inner = self.inner.clone();
+        let queueing = self
+            .flush_verifier
+            .and_then(|verifier| Some((flush::Queueing::for_request()?, verifier)));
 
         #[cfg(test)]
         let inner_calls = self.inner_calls.clone();
@@ -470,7 +488,11 @@ where
                             .push(key);
                     }
 
-                    inner.call(item).await
+                    let response = inner.call(item);
+                    if let Some((queueing, verifier)) = queueing {
+                        queueing.enqueued(verifier);
+                    }
+                    response.await
                 }
                 Err(error) => Err(error),
             };

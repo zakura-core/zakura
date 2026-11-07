@@ -14,10 +14,7 @@ use std::{ffi::OsString, process::Stdio};
 use std::os::unix::process::ExitStatusExt;
 
 use clap::Parser;
-use color_eyre::{
-    eyre::{ensure, eyre, Result},
-    Help,
-};
+use eyre::{ensure, eyre, Result, WrapErr};
 use itertools::Itertools;
 use serde_json::Value;
 
@@ -155,7 +152,6 @@ async fn main() -> Result<()> {
 
     // initialise
     init_tracing();
-    color_eyre::install()?;
 
     let args = args::Args::parse();
 
@@ -178,9 +174,10 @@ async fn main() -> Result<()> {
     // get the current block count
     let get_block_chain_info = rpc_output(&args, "getblockchaininfo", None)
         .await
-        .with_suggestion(|| {
-            "Is the RPC server address and port correct? Is authentication configured correctly?"
-        })?;
+        .wrap_err(
+            "getblockchaininfo failed. Is the RPC server address and port correct? \
+             Is authentication configured correctly?",
+        )?;
 
     // calculate the maximum height
     let height_limit = get_block_chain_info["blocks"]
@@ -191,14 +188,13 @@ async fn main() -> Result<()> {
     // within Zakura's rollback window (`MAX_BLOCK_REORG_HEIGHT`). A smaller margin
     // could let a reorg that Zakura would still follow orphan a shipped checkpoint.
     let height_limit = height_limit - HeightDiff::from(MAX_BLOCK_REORG_HEIGHT);
-    let height_limit = height_limit
-        .ok_or_else(|| {
-            eyre!(
-                "checkpoint generation needs at least {:?} blocks",
-                MAX_BLOCK_REORG_HEIGHT
-            )
-        })
-        .with_suggestion(|| "Hint: wait for the node to sync more blocks")?;
+    let height_limit = height_limit.ok_or_else(|| {
+        eyre!(
+            "checkpoint generation needs at least {:?} blocks. \
+                 Hint: wait for the node to sync more blocks",
+            MAX_BLOCK_REORG_HEIGHT
+        )
+    })?;
 
     // Start at the next block after the last checkpoint.
     // If there is no last checkpoint, start at genesis (height 0).

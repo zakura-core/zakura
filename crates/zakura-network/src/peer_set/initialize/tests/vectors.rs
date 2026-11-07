@@ -57,6 +57,16 @@ use crate::{
 
 use Network::*;
 
+/// [`Config::default`] with a temporary identity directory, so a test that starts a
+/// Zakura endpoint never loads the real `~/.zakura` key or overwrites its discovery
+/// sequence.
+fn test_defaults() -> Config {
+    Config {
+        identity_dir: crate::config::test_identity_dir(),
+        ..Config::default()
+    }
+}
+
 /// The maximum wall-clock time to wait for expected crawler test progress.
 const CRAWLER_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -155,6 +165,46 @@ async fn misbehavior_reports_are_batched_for_five_seconds() {
     batcher
         .await
         .expect("misbehavior batcher task should not panic");
+}
+
+/// The address book updater drops misbehavior reports for configured
+/// unconditional peers, and still bans other peers.
+#[tokio::test]
+async fn address_book_updater_ignores_unconditional_peer_misbehavior() {
+    let _init_guard = zakura_test::init();
+
+    let unconditional_addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let other_addr: PeerSocketAddr = "127.0.0.2:8233".parse().unwrap();
+
+    let config: Config = toml::from_str("unconditional_peers = ['127.0.0.1']")
+        .expect("unconditional peer config parses");
+    let (_address_book, bans, address_book_updater, _address_metrics, _updater_guard) =
+        AddressBookUpdater::spawn(&config, config.listen_addr, PeerServices::NODE_NETWORK);
+
+    // The updater applies changes in order, so the unconditional peer's report
+    // has been handled once the other peer is banned.
+    for addr in [unconditional_addr, other_addr] {
+        address_book_updater
+            .send(MetaAddr::new_misbehavior(
+                addr,
+                constants::MAX_PEER_MISBEHAVIOR_SCORE,
+            ))
+            .await
+            .expect("address book updater is running");
+    }
+
+    tokio::time::timeout(CRAWLER_TEST_TIMEOUT, async {
+        while !bans.contains(other_addr.ip()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the address book updater should ban the other peer");
+
+    assert!(
+        !bans.contains(unconditional_addr.ip()),
+        "unconditional peers must never be banned"
+    );
 }
 
 /// Test that zakura-network discovers dynamic bind-to-all-interfaces listener ports,
@@ -428,7 +478,7 @@ async fn written_peer_cache_can_be_read_manually() {
     let config = Config {
         initial_mainnet_peers: Default::default(),
         cache_dir: CacheDir::custom_path(cache_dir.path()),
-        ..Config::default()
+        ..test_defaults()
     };
     let address_book =
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
@@ -480,7 +530,7 @@ async fn written_peer_cache_is_automatically_read_on_startup() {
     let config = Config {
         initial_mainnet_peers: Default::default(),
         cache_dir: CacheDir::custom_path(cache_dir.path()),
-        ..Config::default()
+        ..test_defaults()
     };
     let address_book =
         init_with_peer_limit(1, nil_inbound_service, Mainnet, None, config.clone()).await;
@@ -1320,7 +1370,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 1,
         max_connections_per_ip: usize::MAX,
-        ..Config::default()
+        ..test_defaults()
     };
     let public_inbound_limit = config.peerset_inbound_connection_limit() - 1;
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
@@ -1334,7 +1384,7 @@ async fn listener_reserves_one_zcashd_compat_inbound_slot() {
         config.clone(),
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        success_stay_open_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_stay_open_inbound_handshaker),
         peerset_tx,
         bans,
         vec![IpAddr::V6(zcashd_compat_ip.to_ipv6_mapped())],
@@ -1419,7 +1469,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 1,
         max_connections_per_ip: 1,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1431,7 +1481,7 @@ async fn listener_zcashd_compat_reconnect_bypasses_recent_ip_limit() {
         config,
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        success_disconnect_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
         peerset_tx,
         bans,
         vec![zcashd_compat_ip.into()],
@@ -1496,7 +1546,7 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 2,
         max_connections_per_ip: usize::MAX,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1511,7 +1561,7 @@ async fn listener_zcashd_compat_accept_bypasses_success_delay() {
         config,
         tcp_listener,
         Duration::from_secs(1),
-        success_disconnect_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
         peerset_tx,
         BannedIps::default(),
         vec![zcashd_compat_ip.into()],
@@ -1574,7 +1624,7 @@ async fn listener_drains_ready_accept_burst_with_short_pacing() {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: BURST_CONNECTIONS,
         max_connections_per_ip: usize::MAX,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1589,7 +1639,7 @@ async fn listener_drains_ready_accept_burst_with_short_pacing() {
         config,
         tcp_listener,
         Duration::from_secs(1),
-        success_disconnect_inbound_handshaker,
+        tower::util::BoxCloneService::new(success_disconnect_inbound_handshaker),
         peerset_tx,
         BannedIps::default(),
         Vec::new(),
@@ -1630,7 +1680,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
     let mut config = Config {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         peerset_initial_target_size: 1,
-        ..Config::default()
+        ..test_defaults()
     };
     let (tcp_listener, listen_addr) = open_listener(&config.clone()).await;
     config.listen_addr = listen_addr;
@@ -1642,7 +1692,7 @@ async fn listener_bans_zcashd_compat_peer_before_reserved_slot() {
         config,
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        unreachable_inbound_handshaker,
+        tower::util::BoxCloneService::new(unreachable_inbound_handshaker),
         peerset_tx,
         bans,
         vec![zcashd_compat_ip.into()],
@@ -1902,7 +1952,7 @@ async fn self_connections_should_fail() {
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
-        ..Config::default()
+        ..test_defaults()
     };
 
     let address_book = init_with_peer_limit(
@@ -2010,7 +2060,7 @@ async fn remnant_nonces_from_outbound_connections_are_limited() {
     let config = Config {
         listen_addr,
         peerset_initial_target_size: TEST_PEERSET_INITIAL_TARGET_SIZE,
-        ..Config::default()
+        ..test_defaults()
     };
 
     let hs_timeout = TimeoutLayer::new(constants::HANDSHAKE_TIMEOUT);
@@ -2019,7 +2069,7 @@ async fn remnant_nonces_from_outbound_connections_are_limited() {
 
     let hs = peer::Handshake::builder()
         .with_config(config.clone())
-        .with_inbound_service(nil_inbound_service)
+        .with_inbound_service(tower::util::BoxCloneSyncService::new(nil_inbound_service))
         .with_user_agent(("Test user agent").to_string())
         .with_latest_chain_tip(NoChainTip)
         .want_transactions(true)
@@ -2121,14 +2171,14 @@ async fn add_initial_peers_deadlock() {
         network: Network::Mainnet,
         listen_addr: unused_v4,
 
-        ..Config::default()
+        ..test_defaults()
     };
 
     let nil_inbound_service = service_fn(|_| async { Ok(Response::Nil) });
 
     let init_future = init(
         config,
-        nil_inbound_service,
+        tower::util::BoxCloneSyncService::new(nil_inbound_service),
         NoChainTip,
         "Test user agent".to_string(),
         PeerServices::NODE_NETWORK,
@@ -2151,15 +2201,16 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
 
-        ..Config::default()
+        ..test_defaults()
     };
     config.zakura.listen_addr = Some("127.0.0.1:0".parse().expect("valid test bind address"));
     let inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
+    // Erase the inbound service type so every caller shares one compiled `init`.
     let (_peer_service, address_book, _) = init(
         config,
-        inbound_service,
+        tower::util::BoxCloneSyncService::new(inbound_service),
         NoChainTip,
         "Test user agent".to_string(),
         PeerServices::NODE_NETWORK,
@@ -2213,7 +2264,7 @@ where
     // (localhost should be enough).
     let unused_v4 = "0.0.0.0:0".parse().unwrap();
 
-    let mut default_config = default_config.into().unwrap_or_default();
+    let mut default_config = default_config.into().unwrap_or_else(test_defaults);
     default_config.zakura.listen_addr =
         Some("127.0.0.1:0".parse().expect("valid test bind address"));
 
@@ -2226,9 +2277,10 @@ where
         ..default_config
     };
 
+    // Erase the inbound service type so every caller shares one compiled `init`.
     let (_peer_service, address_book, _) = init(
         config,
-        inbound_service,
+        tower::util::BoxCloneSyncService::new(inbound_service),
         NoChainTip,
         "Test user agent".to_string(),
         PeerServices::NODE_NETWORK,
@@ -2376,7 +2428,7 @@ async fn spawn_replenishment_crawler_with(
     let config = Config {
         peerset_initial_target_size: CRAWLER_REPLENISHMENT_TARGET_SIZE_FOR_TESTS,
         crawl_new_peer_interval,
-        ..Config::default()
+        ..test_defaults()
     };
     let outbound_connection_limit = config.peerset_outbound_connection_limit();
 
@@ -2494,7 +2546,7 @@ async fn spawn_replenishment_crawler_with(
         demand_tx.clone(),
         demand_rx,
         candidates,
-        outbound_connector,
+        tower::util::BoxCloneService::new(outbound_connector),
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
@@ -2604,9 +2656,27 @@ where
         + 'static,
     C::Future: Send + 'static,
 {
+    // Boxed so every test shares one compiled crawler.
+    spawn_boxed_crawler_with_peer_limit(
+        peerset_initial_target_size.into(),
+        expected_connections,
+        tower::util::BoxCloneService::new(outbound_connector),
+    )
+    .await
+}
+
+async fn spawn_boxed_crawler_with_peer_limit(
+    peerset_initial_target_size: Option<usize>,
+    expected_connections: ExpectedCrawlerConnections,
+    outbound_connector: tower::util::BoxCloneService<
+        OutboundConnectorRequest,
+        (PeerSocketAddr, peer::Client),
+        BoxError,
+    >,
+) -> (Config, Vec<DiscoveredPeer>) {
     // Create a test config.
-    let mut config = Config::default();
-    if let Some(peerset_initial_target_size) = peerset_initial_target_size.into() {
+    let mut config = test_defaults();
+    if let Some(peerset_initial_target_size) = peerset_initial_target_size {
         config.peerset_initial_target_size = peerset_initial_target_size;
     }
 
@@ -2707,7 +2777,7 @@ where
         demand_tx,
         demand_rx,
         candidates,
-        outbound_connector,
+        tower::util::BoxCloneService::new(outbound_connector),
         peerset_tx,
         active_outbound_connections,
         address_book_updater,
@@ -2882,17 +2952,34 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
+    // Boxed so every test shares one compiled listener.
+    spawn_boxed_inbound_listener_with_peer_limit(
+        peerset_initial_target_size.into(),
+        max_connections_per_ip.into(),
+        tower::util::BoxCloneSyncService::new(listen_handshaker),
+    )
+    .await
+}
+
+async fn spawn_boxed_inbound_listener_with_peer_limit(
+    peerset_initial_target_size: Option<usize>,
+    max_connections_per_ip: Option<usize>,
+    listen_handshaker: tower::util::BoxCloneSyncService<
+        peer::HandshakeRequest<TcpStream>,
+        peer::Client,
+        BoxError,
+    >,
+) -> (Config, Vec<DiscoveredPeer>) {
     // Create a test config that listens on an unused port.
     let listen_addr = "127.0.0.1:0".parse().unwrap();
     let mut config = Config {
         listen_addr,
         max_connections_per_ip: max_connections_per_ip
-            .into()
             .unwrap_or(constants::DEFAULT_MAX_CONNS_PER_IP),
-        ..Config::default()
+        ..test_defaults()
     };
 
-    if let Some(peerset_initial_target_size) = peerset_initial_target_size.into() {
+    if let Some(peerset_initial_target_size) = peerset_initial_target_size {
         config.peerset_initial_target_size = peerset_initial_target_size;
     }
 
@@ -2925,7 +3012,7 @@ where
         config.clone(),
         tcp_listener,
         MIN_INBOUND_PEER_CONNECTION_INTERVAL_FOR_TESTS,
-        listen_handshaker,
+        tower::util::BoxCloneService::new(listen_handshaker),
         peerset_tx,
         bans,
         Vec::new(),
@@ -3086,7 +3173,7 @@ where
         network: Network::Mainnet,
         listen_addr: unused_v4,
 
-        ..Config::default()
+        ..test_defaults()
     };
 
     let (peerset_tx, peerset_rx) = mpsc::channel::<DiscoveredPeer>(peer_count + 1);

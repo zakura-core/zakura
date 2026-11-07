@@ -1,4 +1,4 @@
-//! A component owning the Tokio runtime.
+//! The Tokio runtime for server commands.
 //!
 //! The tokio runtime is used for:
 //! - non-blocking async tasks, via [`Future`]s and
@@ -7,44 +7,29 @@
 //! The rayon thread pool is used for:
 //! - long-running CPU-bound tasks like cryptography, via [`rayon::spawn_fifo`].
 
-#![allow(non_local_definitions)]
-
 use std::{future::Future, time::Duration};
 
-use abscissa_core::{Component, FrameworkError, Shutdown};
-use color_eyre::Report;
+use eyre::Report;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
-
-use crate::prelude::*;
 
 /// When Zebra is shutting down, wait this long for tokio tasks to finish.
 const TOKIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// An Abscissa component which owns a Tokio runtime.
-///
-/// The runtime is stored as an `Option` so that when it's time to enter an async
-/// context by calling `block_on` with a "root future", the runtime can be taken
-/// independently of Abscissa's component locking system. Otherwise whatever
-/// calls `block_on` holds an application lock for the entire lifetime of the
-/// async context.
-#[derive(Component, Debug)]
-pub struct TokioComponent {
-    pub rt: Option<Runtime>,
-}
+/// Tokio's default blocking-thread limit. Blocking work other than state reads keeps it.
+const DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
 
-impl TokioComponent {
-    #[allow(clippy::unwrap_in_result)]
-    pub fn new() -> Result<Self, FrameworkError> {
-        Ok(Self {
-            rt: Some(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("runtime building should not fail"),
-            ),
-        })
-    }
+/// Returns a new multi-threaded Tokio runtime with all drivers enabled.
+///
+/// The blocking pool adds `read_workers` threads to Tokio's default, so admitted state
+/// reads cannot starve other blocking work. Tokio starts blocking threads on demand, so
+/// idle read threads cost nothing.
+pub(crate) fn new_runtime(read_workers: usize) -> Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(DEFAULT_MAX_BLOCKING_THREADS.saturating_add(read_workers))
+        .enable_all()
+        .build()
+        .expect("runtime building should not fail")
 }
 
 /// Zakurad's graceful shutdown function, blocks until one of the supported
@@ -55,10 +40,15 @@ async fn shutdown() {
 
 /// Extension trait for running the server command on the Tokio runtime.
 pub(crate) trait RuntimeRun {
+    /// Runs the future returned by `run` until it finishes or a shutdown signal arrives,
+    /// then stops the runtime, waiting up to [`TOKIO_SHUTDOWN_TIMEOUT`] for its tasks.
+    ///
+    /// Returns the future's result, or `Ok` if a signal arrived during startup.
     fn run_with_graceful_shutdown<F>(
         self,
         run: impl FnOnce(CancellationToken, CancellationToken) -> F,
-    ) where
+    ) -> Result<(), Report>
+    where
         F: Future<Output = Result<(), Report>>;
 }
 
@@ -66,7 +56,8 @@ impl RuntimeRun for Runtime {
     fn run_with_graceful_shutdown<F>(
         self,
         run: impl FnOnce(CancellationToken, CancellationToken) -> F,
-    ) where
+    ) -> Result<(), Report>
+    where
         F: Future<Output = Result<(), Report>>,
     {
         let shutdown_token = CancellationToken::new();
@@ -80,7 +71,7 @@ impl RuntimeRun for Runtime {
             shutdown_cleanup_required,
         ));
 
-        finish_runtime(self, result);
+        finish_runtime(self, result)
     }
 }
 
@@ -107,7 +98,7 @@ pub(crate) async fn run_until_shutdown(
     }
 }
 
-fn finish_runtime(runtime: Runtime, result: Result<(), Report>) {
+fn finish_runtime(runtime: Runtime, result: Result<(), Report>) -> Result<(), Report> {
     // Don't wait for long blocking tasks before shutting down
     info!(
         ?TOKIO_SHUTDOWN_TIMEOUT,
@@ -115,15 +106,16 @@ fn finish_runtime(runtime: Runtime, result: Result<(), Report>) {
     );
     runtime.shutdown_timeout(TOKIO_SHUTDOWN_TIMEOUT);
 
-    match result {
+    match &result {
         Ok(()) => {
             info!("shutting down Zakura");
         }
         Err(error) => {
             warn!(?error, "shutting down Zakura due to an error");
-            APPLICATION.shutdown(Shutdown::Forced);
         }
     }
+
+    result
 }
 
 #[cfg(test)]
@@ -133,6 +125,49 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    /// Admitted state reads leave Tokio's default blocking threads to other work.
+    #[test]
+    fn saturated_reads_leave_blocking_threads_for_other_work() {
+        let limit = Duration::from_secs(5);
+        // The largest limit that a 512-thread pool shared with other work admitted.
+        let state = zakura_state::Config {
+            read_concurrency_limit: std::num::NonZeroU16::new(508).expect("508 is nonzero"),
+            ..Default::default()
+        };
+        let read_workers = state.read_worker_count();
+        let runtime = new_runtime(read_workers);
+
+        runtime.block_on(async {
+            let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut releases = Vec::with_capacity(read_workers);
+            // Admitted reads run as `spawn_blocking` jobs, one per worker slot.
+            for _ in 0..read_workers {
+                let (release, released) = oneshot::channel::<()>();
+                releases.push(release);
+                let started = started.clone();
+                tokio::task::spawn_blocking(move || {
+                    started
+                        .send(())
+                        .expect("the test waits for every read to start");
+                    // Dropping the sender ends the read.
+                    let _ = released.blocking_recv();
+                });
+            }
+            for _ in 0..read_workers {
+                tokio::time::timeout(limit, started_rx.recv())
+                    .await
+                    .expect("every admitted read gets a blocking thread")
+                    .expect("read jobs hold a sender until they start");
+            }
+
+            tokio::time::timeout(limit, tokio::task::spawn_blocking(|| ()))
+                .await
+                .expect("other blocking work finishes while reads fill their slots")
+                .expect("the unrelated job does not panic");
+            drop(releases);
+        });
+    }
 
     #[tokio::test]
     async fn graceful_shutdown_waits_for_root_future_cleanup() {
@@ -197,9 +232,6 @@ mod imp {
 
         zakura_chain::shutdown::set_shutting_down();
 
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
-
         info!(
             // use target to remove 'imp' from output
             target: "zakurad::signal",
@@ -220,9 +252,6 @@ mod imp {
             .expect("listening for ctrl-c signal should never fail");
 
         zakura_chain::shutdown::set_shutting_down();
-
-        #[cfg(feature = "progress-bar")]
-        howudoin::disable();
 
         info!(
             // use target to remove 'imp' from output

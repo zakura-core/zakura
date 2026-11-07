@@ -1,0 +1,21 @@
+[package]
+name = "zakura-rpc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zakura-rpc = { path = "../../../crates/zakura-rpc", features = ["fuzz-impl"] }
+
+[[bin]]
+name = "json_rpc_request"
+path = "fuzz_targets/json_rpc_request.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -3,19 +3,29 @@
 use thiserror::Error;
 use zakura_chain::block;
 
-use super::{Frame, ZakuraPeerId, FRAME_HEADER_BYTES};
+use super::{ZakuraPeerId, FRAME_HEADER_BYTES};
 
 mod config;
 mod error;
 mod events;
 #[cfg(any(test, feature = "header-fuzz"))]
 mod fuzz;
-mod pipe;
+#[cfg(any(test, zakura_sim))]
+pub mod observe;
+mod peer;
 mod reactor;
 mod scheduler;
 mod service;
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use reactor::{
+    trace_header_reactor_bytes, HeaderMachineFailure, HeaderMachinePhase, HeaderReactorHistory,
+    HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
+    HeaderReactorView,
+};
 #[cfg(test)]
 mod tests;
+pub mod v9;
 mod wire;
 
 pub use config::{header_sync_header_bytes_for_network, ZakuraHeaderSyncConfig};
@@ -23,8 +33,7 @@ pub use error::HeaderSyncStartError;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub use events::HeaderSyncAction;
 pub use events::{
-    Event, FullStateFrontiers, HeaderPathLease, HeaderPathLeaseResult, HeaderPathPage,
-    HeaderPathPageResult, HeaderSyncFatalEvent, HeaderSyncHandle, HeaderSyncMisbehavior,
+    Event, FullStateFrontiers, HeaderSyncFatalEvent, HeaderSyncHandle, HeaderSyncMisbehavior,
     HeaderSyncRequestId, HeaderSyncStartup, HeaderTargetAdmissionResult,
     HeaderTargetPreparationResult, VctRepairContextResult,
 };
@@ -37,15 +46,20 @@ pub use scheduler::retry::{
 };
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub(crate) use service::drive_header_sync_actions;
+pub(crate) use service::HeaderSyncPassthroughService;
+pub use service::HeaderSyncService;
 pub use service::PeerSession;
-pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
-#[cfg(test)]
-pub(crate) use wire::headers_response_bytes;
-pub(crate) use wire::headers_response_capacity;
+#[cfg(any(test, feature = "header-fuzz"))]
+pub use v9::replay_header_sync_v9_codec_bytes;
+pub use v9::{Headers, HeadersOutcome, HeadersOutcomeCode, Status, HEADER_SYNC_BUDGET};
 pub use wire::{
-    AuxSchema, GetHeaders, HeaderEntry, HeaderServingLimits, HeaderSyncCodec,
-    HeaderSyncDecodeContext, HeaderSyncMessage, HeaderSyncWireError, Headers, HeadersOutcome,
-    HeadersOutcomeCode, Status, TreeAuxRecordV1, DEFAULT_HS_RANGE, MAX_HS_MESSAGE_BYTES,
-    MAX_HS_RANGE, MSG_HS_GET_HEADERS, MSG_HS_HEADERS, MSG_HS_HEADERS_OUTCOME, MSG_HS_STATUS,
-    TREE_AUX_SCHEMA_V1_BYTES, ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+    AuxSchema, HeaderEntry, HeaderSyncWireError, TreeAuxRecordV1, DEFAULT_HS_RANGE,
+    MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
+    ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
+};
+
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use v9::{
+    trace_header_publisher_bytes, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView,
 };

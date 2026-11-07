@@ -15,15 +15,13 @@ use futures::{
     channel::{mpsc, oneshot},
     future::{self, AbortHandle, Future, FutureExt},
 };
-use tokio::{
-    sync::broadcast::{self, error::TryRecvError},
-    task::JoinHandle,
-};
+use tokio::{sync::broadcast, task::JoinHandle};
 
 use zakura_chain::block::Height;
 
 use crate::{
     constants,
+    peer::block_gossip::BlockAdvert,
     peer::{
         error::SharedPeerError, CancelHeartbeatTask, Client, ClientRequest, ConnectedAddr,
         ConnectionInfo, ErrorSlot,
@@ -37,6 +35,8 @@ use crate::{
 };
 
 #[cfg(test)]
+pub(crate) mod connected;
+#[cfg(test)]
 mod vectors;
 
 /// The maximum time a mocked peer connection should be alive during a test.
@@ -45,6 +45,7 @@ const MAX_PEER_CONNECTION_TIME: Duration = Duration::from_secs(10);
 /// A harness with mocked channels for testing a [`Client`] instance.
 pub struct ClientTestHarness {
     client_request_receiver: Option<mpsc::Receiver<ClientRequest>>,
+    block_advert_receiver: tokio::sync::mpsc::Receiver<BlockAdvert>,
     shutdown_receiver: Option<oneshot::Receiver<CancelHeartbeatTask>>,
     #[allow(dead_code)]
     inv_receiver: Option<broadcast::Receiver<InventoryChange>>,
@@ -63,6 +64,7 @@ impl ClientTestHarness {
             connection_task: None,
             heartbeat_task: None,
             connected_addr: None,
+            start_height: None,
         }
     }
 
@@ -120,6 +122,19 @@ impl ClientTestHarness {
             .expect("request receiver endpoint has already been dropped");
     }
 
+    /// Waits for the next queued block advert.
+    pub(crate) async fn receive_block_advert(&mut self) -> BlockAdvert {
+        self.block_advert_receiver
+            .recv()
+            .await
+            .expect("the connection remains open")
+    }
+
+    /// Returns the next block advert the [`Client`] queued, if any.
+    pub(crate) fn try_to_receive_block_advert(&mut self) -> Option<BlockAdvert> {
+        self.block_advert_receiver.try_recv().ok()
+    }
+
     /// Tries to receive a [`ClientRequest`] sent by the [`Client`] instance.
     ///
     /// The remote peer that would receive the requests is mocked for testing.
@@ -134,43 +149,6 @@ impl ClientTestHarness {
             Ok(request) => ReceiveRequestAttempt::Request(Box::new(request)),
             Err(mpsc::TryRecvError::Closed) => ReceiveRequestAttempt::Closed,
             Err(mpsc::TryRecvError::Empty) => ReceiveRequestAttempt::Empty,
-        }
-    }
-
-    /// Drops the receiver endpoint of [`InventoryChange`]s, forcefully closing the channel.
-    ///
-    /// The inventory registry that would track the changes is mocked for testing.
-    ///
-    /// Note: this closes the broadcast receiver, it doesn't have a separate `close()` method.
-    #[allow(dead_code)]
-    pub fn drop_inventory_change_receiver(&mut self) {
-        self.inv_receiver
-            .take()
-            .expect("inventory change receiver endpoint has already been dropped");
-    }
-
-    /// Tries to receive an [`InventoryChange`] sent by the [`Client`] instance.
-    ///
-    /// This method acts like a mock inventory registry, allowing tests to track the changes.
-    ///
-    /// TODO: make ReceiveRequestAttempt generic, and use it here.
-    #[allow(dead_code)]
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn try_to_receive_inventory_change(&mut self) -> Option<InventoryChange> {
-        let receive_result = self
-            .inv_receiver
-            .as_mut()
-            .expect("inventory change receiver endpoint has been dropped")
-            .try_recv();
-
-        match receive_result {
-            Ok(change) => Some(change),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Closed) => None,
-            Err(TryRecvError::Lagged(skipped_messages)) => unreachable!(
-                "unexpected lagged inventory receiver in tests, skipped {} messages",
-                skipped_messages,
-            ),
         }
     }
 
@@ -253,6 +231,7 @@ pub struct ClientTestHarnessBuilder<C = future::Ready<()>, H = future::Ready<()>
     heartbeat_task: Option<H>,
     version: Option<Version>,
     connected_addr: Option<ConnectedAddr>,
+    start_height: Option<Height>,
 }
 
 impl<C, H> ClientTestHarnessBuilder<C, H>
@@ -272,6 +251,12 @@ where
         self
     }
 
+    /// Configure the best chain height the peer advertised in its `version` message.
+    pub fn with_start_height(mut self, start_height: Height) -> Self {
+        self.start_height = Some(start_height);
+        self
+    }
+
     /// Configure the mock connection task future to use.
     pub fn with_connection_task<NewC>(
         self,
@@ -282,6 +267,7 @@ where
             heartbeat_task: self.heartbeat_task,
             version: self.version,
             connected_addr: self.connected_addr,
+            start_height: self.start_height,
         }
     }
 
@@ -295,6 +281,7 @@ where
             heartbeat_task: Some(heartbeat_task),
             version: self.version,
             connected_addr: self.connected_addr,
+            start_height: self.start_height,
         }
     }
 
@@ -302,6 +289,8 @@ where
     pub fn finish(self) -> (Client, ClientTestHarness) {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (client_request_sender, client_request_receiver) = mpsc::channel(1);
+        let (block_advert_sender, block_advert_receiver) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
         let (inv_sender, inv_receiver) = broadcast::channel(5);
 
         let error_slot = ErrorSlot::default();
@@ -329,7 +318,7 @@ where
             ),
             nonce: Nonce::default(),
             user_agent: "client test harness".to_string(),
-            start_height: Height(0),
+            start_height: self.start_height.unwrap_or(Height(0)),
             relay: true,
         };
 
@@ -342,9 +331,13 @@ where
         });
 
         let client = Client {
+            block_uploads: Default::default(),
+            request_slot: Default::default(),
+            peer_registry_updater: None,
             connection_info,
             shutdown_tx: Some(shutdown_sender),
             server_tx: client_request_sender,
+            block_advert_tx: block_advert_sender,
             inv_collector: inv_sender,
             error_slot: error_slot.clone(),
             connection_task,
@@ -353,6 +346,7 @@ where
 
         let harness = ClientTestHarness {
             client_request_receiver: Some(client_request_receiver),
+            block_advert_receiver,
             shutdown_receiver: Some(shutdown_receiver),
             inv_receiver: Some(inv_receiver),
             error_slot,

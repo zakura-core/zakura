@@ -5,8 +5,8 @@
 
 use std::{str::FromStr, sync::Arc};
 
-use derive_getters::Getters;
 use derive_new::new;
+use getset::CopyGetters;
 use serde::{Deserialize, Serialize};
 
 use zakura_chain::{
@@ -81,7 +81,7 @@ impl LongPollInput {
 
         // The mempool returns unordered transactions, we need to sort them here so
         // that the longpollid doesn't change unexpectedly.
-        tx_mined_ids.sort();
+        tx_mined_ids.sort_unstable();
 
         LongPollInput {
             tip_height,
@@ -123,13 +123,12 @@ impl LongPollInput {
 ///
 /// `zcashd` IDs are currently 69 hex/decimal digits long.
 /// IDs use 46 hex/decimal digits, or 62 after the first template withdrawal.
-#[derive(
-    Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Getters, new, schemars::JsonSchema,
-)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CopyGetters, new)]
 #[serde(try_from = "String", into = "String")]
 pub struct LongPollId {
     /// Template withdrawal generation. Zero preserves the legacy wire format.
     #[new(default)]
+    #[getset(get_copy = "pub")]
     pub(crate) revision: u64,
     // Fields that invalidate old work:
     //
@@ -140,6 +139,7 @@ pub struct LongPollId {
     ///
     /// The height is technically redundant, but it helps with debugging.
     /// It also reduces the probability of a missed tip change.
+    #[getset(get_copy = "pub")]
     pub(crate) tip_height: u32,
 
     /// A checksum of the tip hash used to generate the template containing this long poll ID.
@@ -150,6 +150,7 @@ pub struct LongPollId {
     ///
     /// It's ok to do a probabilistic check here,
     /// so we choose a 1 in 2^32 chance of missing a block change.
+    #[getset(get_copy = "pub")]
     pub(crate) tip_hash_checksum: u32,
 
     /// The max time in the same template as this long poll ID.
@@ -157,6 +158,7 @@ pub struct LongPollId {
     /// See [`LongPollInput::max_time`] for how it is used.
     ///
     /// Zcash times are limited to 32 bits by the consensus rules.
+    #[getset(get_copy = "pub")]
     pub(crate) max_timestamp: u32,
 
     // Fields that allow old work:
@@ -172,6 +174,7 @@ pub struct LongPollId {
     ///
     /// Using the number of transactions makes mempool checksum attacks much harder.
     /// It also helps with debugging, and reduces the probability of a missed mempool change.
+    #[getset(get_copy = "pub")]
     pub(crate) mempool_transaction_count: u32,
 
     /// A checksum of the effecting hashes of the transactions in the mempool,
@@ -195,6 +198,7 @@ pub struct LongPollId {
     ///
     /// If an attacker could also keep the number of transactions constant,
     /// a new template will be generated when the tip hash changes, or the max time is reached.
+    #[getset(get_copy = "pub")]
     pub(crate) mempool_transaction_content_checksum: u32,
 }
 
@@ -215,9 +219,13 @@ impl LongPollId {
     /// Returns whether the IDs share the parent and time limit, ignoring withdrawals.
     /// Internal miners use exact work IDs to decide which withdrawn work to cancel.
     pub fn same_work_context(&self, old_long_poll_id: &LongPollId) -> bool {
+        self.same_tip(old_long_poll_id) && self.max_timestamp == old_long_poll_id.max_timestamp
+    }
+
+    /// Returns whether the IDs were generated on the same chain tip.
+    pub fn same_tip(&self, old_long_poll_id: &LongPollId) -> bool {
         self.tip_height == old_long_poll_id.tip_height
             && self.tip_hash_checksum == old_long_poll_id.tip_hash_checksum
-            && self.max_timestamp == old_long_poll_id.max_timestamp
     }
 }
 

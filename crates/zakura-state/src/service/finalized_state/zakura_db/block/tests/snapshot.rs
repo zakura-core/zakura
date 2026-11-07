@@ -32,6 +32,7 @@
 
 use std::sync::Arc;
 
+use indexmap::IndexMap;
 use serde::Serialize;
 
 use zakura_chain::{
@@ -96,10 +97,15 @@ struct BlockData {
 }
 
 impl BlockData {
-    pub fn new(height: Height, block: &Block) -> BlockData {
+    pub fn new(
+        height: Height,
+        block: &zakura_node_services::block_memory::BlockHandle,
+    ) -> BlockData {
         BlockData {
             height: height.0,
-            block: block.into(),
+            block: zakura_chain::serialization::ZcashSerialize::zcash_serialize_to_vec(block)
+                .unwrap()
+                .into(),
         }
     }
 }
@@ -266,6 +272,7 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
                 .expect("hashes up to tip have heights");
             let stored_block = state
                 .block(query_height.into())
+                .unwrap()
                 .expect("heights up to tip have blocks");
 
             // Check the shielded note commitment trees.
@@ -330,8 +337,7 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
             // Check block transaction hashes and transactions.
             //
             // TODO: split out transaction snapshots into their own function (#3151)
-            for tx_index in 0..stored_block.transactions.len() {
-                let block_transaction = &stored_block.transactions[tx_index];
+            for (tx_index, block_transaction) in stored_block.view().transactions().enumerate() {
                 let transaction_location = TransactionLocation::from_usize(query_height, tx_index);
 
                 let transaction_hash = block_transaction.hash();
@@ -344,6 +350,7 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
                 // Check that the transaction indexes are consistent.
                 let (direct_transaction, direct_transaction_height, _) = state
                     .transaction(transaction_hash)
+                    .unwrap()
                     .expect("transactions in blocks must also be available directly");
                 let stored_transaction_hash = state
                     .transaction_hash(transaction_location)
@@ -353,7 +360,8 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
                     .expect("locations of transactions in blocks must be indexed by hash");
 
                 assert_eq!(
-                    &direct_transaction, block_transaction,
+                    direct_transaction.as_ref(),
+                    block_transaction,
                     "transactions in block must be the same as transactions looked up directly",
                 );
                 assert_eq!(
@@ -372,8 +380,8 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
                 stored_transaction_hashes.push(stored_transaction_hash);
                 stored_transactions.push(transaction_data);
 
-                for output_index in 0..stored_block.transactions[tx_index].outputs().len() {
-                    let output = &stored_block.transactions[tx_index].outputs()[output_index];
+                for output_index in 0..block_transaction.outputs().len() {
+                    let output = &block_transaction.outputs()[output_index];
                     let outpoint =
                         transparent::OutPoint::from_usize(transaction_hash, output_index);
                     let output_location =
@@ -442,13 +450,11 @@ fn snapshot_block_and_transaction_data(state: &FinalizedState) {
         // But we expect them to always have cached roots,
         // because those roots are used to populate the anchor column families.
         insta::assert_ron_snapshot!("sprout_tree_at_tip", sprout_tree_at_tip);
-        insta::assert_ron_snapshot!(
-            "sprout_trees",
-            stored_sprout_trees,
-            {
-                "." => insta::sorted_redaction()
-            }
-        );
+        // Match the old redaction's ordering of serialized root bytes.
+        let mut sprout_tree_entries: Vec<_> = stored_sprout_trees.iter().collect();
+        sprout_tree_entries.sort_unstable_by_key(|(root, _)| <[u8; 32]>::from(*root));
+        let sorted_sprout_trees: IndexMap<_, _> = sprout_tree_entries.into_iter().collect();
+        insta::assert_ron_snapshot!("sprout_trees", sorted_sprout_trees);
         insta::assert_ron_snapshot!("sapling_trees", stored_sapling_trees);
         insta::assert_ron_snapshot!("orchard_trees", stored_orchard_trees);
 
@@ -516,7 +522,10 @@ fn snapshot_transparent_address_data(state: &FinalizedState, height: u32) {
         }
 
         let mut stored_utxos = Vec::new();
-        for (utxo_loc, utxo) in state.address_utxos(&address) {
+        for (utxo_loc, utxo) in state
+            .address_utxos(&address)
+            .expect("snapshot databases build transparent indexes")
+        {
             assert!(stored_utxo_locations.contains(&utxo_loc));
 
             stored_utxos.push(utxo);

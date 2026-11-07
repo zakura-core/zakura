@@ -14,19 +14,20 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
-    stream::{FuturesUnordered, Stream, StreamExt},
+    Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
+use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneSyncService, Service, ServiceExt};
 
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
@@ -53,17 +54,11 @@ mod tests;
 
 use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
 
-/// The maximum response time for block-body requests that can wait for a mined-block commit.
+/// The maximum amount of time an inbound service response can take.
 ///
 /// If the response takes longer than this time, it will be cancelled,
 /// and the peer might be disconnected.
-///
-/// This constant must exceed the 15-second `PENDING_BLOCK_WAIT` in `zakura-rpc`, so that a peer
-/// waiting for an early-advertised block reaches that wait's own timeout first.
-pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(18);
-
-/// The maximum response time for requests that do not wait for a mined-block commit.
-const DEFAULT_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
+pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
 
 /// The number of bytes the [`Inbound`] service will queue in response to a single block or
 /// transaction request, before ignoring any additional block or transaction IDs in that request.
@@ -92,19 +87,30 @@ pub const GETDATA_MAX_BLOCK_COUNT: usize = 16;
 /// Minimum interval between zcashd-compat errors for requested pruned block bodies.
 const ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+// Zakura requesters reject `FindBlocks` responses above their limit, so this
+// node must never answer with more.
+const _: () = assert!(
+    // A `u32` always fits `usize` on the 32- and 64-bit targets Zakura supports.
+    zs::constants::MAX_FIND_BLOCK_HASHES_RESULTS as usize
+        == zn::constants::MAX_FIND_BLOCKS_RESPONSE_HASHES
+);
+
 /// Actionable error emitted when a zcashd sidecar requests a pruned block body.
 pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
     "zcashd_compat: cannot serve block because its body has been pruned; a zcashd sidecar \
      requiring this block cannot continue syncing. Restore zcashd from a newer snapshot, or use \
      archive storage on Zakura side https://zakura.com/snapshots/ .";
 
-type BlockDownloadPeerSet =
-    Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
-type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
-type Mempool = Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+type BlockDownloadPeerSet = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
+type State =
+    Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
+type Mempool = Buffer<
+    mempool::Request,
+    futures::future::BoxFuture<'static, Result<mempool::Response, BoxError>>,
+>;
 type SemanticBlockVerifier = Buffer<
-    BoxService<zakura_consensus::Request, block::Hash, RouterError>,
     zakura_consensus::Request,
+    futures::future::BoxFuture<'static, Result<block::Hash, RouterError>>,
 >;
 type GossipedBlockDownloads =
     BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;
@@ -214,11 +220,18 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
     }
 }
 
-/// Returns a committed block from any active chain.
-async fn block_by_hash(
+/// Returns an admitted block or a committed block from any active chain.
+///
+/// Peers can request a hash on any active chain, even when this node does not consider it best.
+async fn block_by_hash_or_pending(
     mut state: State,
+    pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<Arc<Block>>, zn::BoxError> {
+) -> Result<Option<BlockHandle>, zn::BoxError> {
+    if let Some(block) = pending_blocks.get(hash) {
+        return Ok(Some(block.into()));
+    }
+
     let response = state
         .ready()
         .await?
@@ -397,25 +410,6 @@ impl Inbound {
         zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
-        Self::new_with_pending_blocks(
-            full_verify_concurrency_limit,
-            expose_peer_addresses,
-            zcashd_compat_pruning_retention,
-            zcashd_compat_peer_ips,
-            setup,
-            PendingBlockRegistry::default(),
-        )
-    }
-
-    /// Creates an inbound service with a pending-block registry shared with mining RPCs.
-    pub fn new_with_pending_blocks(
-        full_verify_concurrency_limit: usize,
-        expose_peer_addresses: bool,
-        zcashd_compat_pruning_retention: Option<u32>,
-        zcashd_compat_peer_ips: Vec<IpAddr>,
-        setup: oneshot::Receiver<InboundSetupData>,
-        pending_blocks: PendingBlockRegistry,
-    ) -> Inbound {
         Inbound {
             setup: Setup::Pending {
                 full_verify_concurrency_limit,
@@ -431,8 +425,14 @@ impl Inbound {
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
             )),
-            pending_blocks,
+            pending_blocks: PendingBlockRegistry::default(),
         }
+    }
+
+    /// Shares one pending-block registry with the mining RPCs.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.pending_blocks = pending_blocks;
+        self
     }
 
     /// Remove `self.setup`, temporarily replacing it with an invalid state.
@@ -562,9 +562,13 @@ impl Service<zn::Request> for Inbound {
                             ));
                         }
 
-                        // The outcome, including a replacement refused by the queue bounds, is
-                        // logged by `retry_poisoned` itself.
-                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        // A failed parent recovery is left to the syncer. A re-request would
+                        // leave the recovery bounds, because it is an ordinary download.
+                        if !mismatch.parent_recovery {
+                            // The outcome, including a replacement refused by the queue bounds,
+                            // is logged by `retry_poisoned` itself.
+                            let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        }
                         continue;
                     }
 
@@ -624,15 +628,6 @@ impl Service<zn::Request> for Inbound {
             }
         };
 
-        let response_timeout = if matches!(
-            &req,
-            zn::Request::BlocksByHash(_) | zn::Request::BlocksByHashFrom { .. }
-        ) {
-            MAX_INBOUND_RESPONSE_TIME
-        } else {
-            DEFAULT_INBOUND_RESPONSE_TIME
-        };
-
         let response = match req {
             zn::Request::Peers => {
                 // # Security
@@ -679,10 +674,9 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
-                    let mut pending_lookups = FuturesUnordered::new();
                     let mut lookup_results = Vec::new();
 
                     for (index, &hash) in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT).enumerate() {
@@ -690,25 +684,23 @@ impl Service<zn::Request> for Inbound {
                             break;
                         }
 
-                        // Subscribe before the state lookup. A commit can remove the registry entry
-                        // while state answers this request.
-                        let pending_wait = pending_blocks.wait(hash);
-                        match block_by_hash(state.clone(), hash).await? {
-                            Some(block) => {
-                                state_lookup_bytes = state_lookup_bytes
-                                    .saturating_add(block.zcash_serialized_size());
-                                lookup_results.push((index, hash, Some(block)));
-                            }
-                            None => pending_lookups.push(async move {
-                                (index, hash, pending_wait.await)
-                            }),
+                        let block = match block_by_hash_or_pending(
+                            state.clone(),
+                            pending_blocks.clone(),
+                            hash,
+                        )
+                        .await
+                        {
+                            Ok(block) => Some(block),
+                            Err(error) if is_read_capacity_refusal(&*error) => None,
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(Some(block)) = &block {
+                            state_lookup_bytes = state_lookup_bytes
+                                .saturating_add(block.zcash_serialized_size());
                         }
+                        lookup_results.push((index, hash, block));
                     }
-
-                    while let Some(result) = pending_lookups.next().await {
-                        lookup_results.push(result);
-                    }
-                    lookup_results.sort_unstable_by_key(|(index, _, _)| *index);
 
                     for (_, hash, block) in lookup_results {
                         if total_size >= byte_limit {
@@ -719,6 +711,12 @@ impl Service<zn::Request> for Inbound {
                         //
                         // If there was a database error, return the error,
                         // and stop processing further chunks.
+                        let Some(block) = block else {
+                            // The state refused the read for lack of capacity. Peers cannot
+                            // rely on `notfound`, but it lets them retry elsewhere sooner.
+                            blocks.push(Missing(hash));
+                            continue;
+                        };
                         match block {
                             Some(block) => {
                                 // If checking the serialized size of the block performs badly,
@@ -862,7 +860,7 @@ impl Service<zn::Request> for Inbound {
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
-            zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+            zn::Request::AdvertiseBlock(zn::AdvertisedBlock { hash, .. }, Some(zn::PeerSource::Zakura(peer_id))) => {
                 debug!(
                     ?hash,
                     ?peer_id,
@@ -871,28 +869,28 @@ impl Service<zn::Request> for Inbound {
                 metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::AdvertiseBlock(hash, advertiser) => {
-                block_downloads.download_and_verify(hash, advertiser);
+            zn::Request::AdvertiseBlock(block, advertiser) => {
+                block_downloads.download_and_verify(block.hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             // The size of this response is limited by the `Connection` state machine in the network layer
             zn::Request::MempoolTransactionIds => {
                 mempool.clone().oneshot(mempool::Request::TransactionIds).map_ok(|resp| match resp {
-                    mempool::Response::TransactionIds(transaction_ids) if transaction_ids.is_empty() => zn::Response::Nil,
                     mempool::Response::TransactionIds(transaction_ids) => zn::Response::TransactionIds(transaction_ids.into_iter().collect()),
                     _ => unreachable!("Mempool component should always respond to a `TransactionIds` request with a `TransactionIds` response"),
                 })
                     .boxed()
             }
+            zn::Request::DisconnectPeer(_) => unreachable!("disconnect requests are local to the peer set"),
             zn::Request::Ping(_) => {
                 unreachable!("ping requests are handled internally");
             }
 
-            zn::Request::AdvertiseBlockToAll(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
+            zn::Request::AdvertiseBlockToAll(_) | zn::Request::AdvertiseMinedBlock(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
         };
 
         async move {
-            match tokio::time::timeout(response_timeout, response).await {
+            match tokio::time::timeout(MAX_INBOUND_RESPONSE_TIME, response).await {
                 Ok(response) => response,
                 Err(error) => Err(Box::new(error) as zn::BoxError),
             }

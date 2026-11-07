@@ -4,12 +4,13 @@
 
 use std::{cmp::min, time::Duration};
 
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;
 
 use zakura_chain::{
+    block::Block,
     local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
     parameters::Network::*,
     serialization::ZcashDeserialize,
@@ -79,9 +80,9 @@ async fn checkpoint_completion_notifies_handoff_without_another_caller() -> Resu
             &Mainnet,
             Some(initial_tip),
             committed_tip.0,
-            state,
+            crate::transaction::boxed_state(state),
         );
-        let response = verifier.call(blocks[1].clone());
+        let response = verifier.call(blocks[1].clone().into());
         let response = if drop_response {
             drop(response);
             None
@@ -157,7 +158,7 @@ async fn checkpoint_handoff_only_notifies_at_configured_boundary() -> Result<(),
             &Mainnet,
             Some(initial_tip),
             boundary,
-            state,
+            crate::transaction::boxed_state(state),
         );
         for block in blocks.iter().skip(1).take_while(|block| {
             block.coinbase_height().expect("the fixtures have heights") <= boundary
@@ -165,7 +166,7 @@ async fn checkpoint_handoff_only_notifies_at_configured_boundary() -> Result<(),
             assert_eq!(
                 timeout(
                     Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-                    verifier.call(block.clone())
+                    verifier.call(block.clone().into())
                 )
                 .await??,
                 block.hash()
@@ -223,10 +224,10 @@ async fn checkpoint_handoff_survives_a_delayed_buffer_worker() -> Result<(), Rep
         BTreeMap::from([(block::Height(0), hash)]),
         &Mainnet,
         None,
-        state,
+        crate::transaction::boxed_state(state),
     )
     .map_err(|error| eyre!(error))?;
-    let response = verifier.call(genesis);
+    let response = verifier.call(genesis.into());
     tokio::select! {
         started = started_rx.recv() => started.expect("the checkpoint commit starts"),
         _ = &mut worker => panic!("the verifier keeps the state buffer open"),
@@ -289,12 +290,12 @@ async fn failed_handoff_check_preserves_committed_checkpoint_progress() -> Resul
             BTreeMap::from([(block::Height(0), hash)]),
             &Mainnet,
             None,
-            state,
+            crate::transaction::boxed_state(state),
         )
         .map_err(|error| eyre!(error))?;
         let result = timeout(
             Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            verifier.call(genesis.clone()),
+            verifier.call(genesis.clone().into()),
         )
         .await?;
         assert_eq!(result?, hash);
@@ -310,7 +311,6 @@ async fn single_item_checkpoint_list_test() -> Result<(), Report> {
     single_item_checkpoint_list().await
 }
 
-#[spandoc::spandoc]
 async fn single_item_checkpoint_list() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -326,9 +326,13 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
             .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        genesis_checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -343,20 +347,35 @@ async fn single_item_checkpoint_list() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for block 0
-    let verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(block0.clone()),
-    );
-    /// SPANDOC: Wait for the response for block 0
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "single_item_checkpoint_list::comment",
+            text = %"Make sure the verifier service is ready"
+        ))
+        .await?;
+    let verify_future = tracing::error_span!(
+        "single_item_checkpoint_list::comment",
+        text = %"Set up the future for block 0"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(block0.clone().into()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let verify_response = verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect("block should verify");
+    let verify_response = async {
+        verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect("block should verify")
+    }
+    .instrument(tracing::error_span!(
+        "single_item_checkpoint_list::comment",
+        text = %"Wait for the response for block 0"
+    ))
+    .await;
 
     assert_eq!(verify_response, hash0);
 
@@ -381,7 +400,6 @@ async fn multi_item_checkpoint_list_test() -> Result<(), Report> {
     multi_item_checkpoint_list().await
 }
 
-#[spandoc::spandoc]
 async fn multi_item_checkpoint_list() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -405,9 +423,13 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
         .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -424,21 +446,39 @@ async fn multi_item_checkpoint_list() -> Result<(), Report> {
 
     // Now verify each block
     for (block, height, hash) in checkpoint_data {
-        /// SPANDOC: Make sure the verifier service is ready
-        let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+        let ready_verifier_service =
+            async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+                .instrument(tracing::error_span!(
+                    "multi_item_checkpoint_list::comment",
+                    text = %"Make sure the verifier service is ready"
+                ))
+                .await?;
 
-        /// SPANDOC: Set up the future for block {?height}
-        let verify_future = timeout(
-            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block.clone()),
-        );
-        /// SPANDOC: Wait for the response for block {?height}
+        let verify_future = tracing::error_span!(
+            "multi_item_checkpoint_list::comment",
+            ?height,
+            text = %"Set up the future for block"
+        )
+        .in_scope(|| {
+            timeout(
+                Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+                ready_verifier_service.call(block.clone().into()),
+            )
+        });
         // TODO(teor || jlusby): check error kind
-        let verify_response = verify_future
-            .map_err(|e| eyre!(e))
-            .await
-            .expect("timeout should not happen")
-            .expect("future should succeed");
+        let verify_response = async {
+            verify_future
+                .map_err(|e| eyre!(e))
+                .await
+                .expect("timeout should not happen")
+                .expect("future should succeed")
+        }
+        .instrument(tracing::error_span!(
+            "multi_item_checkpoint_list::comment",
+            ?height,
+            text = %"Wait for the response for block"
+        ))
+        .await;
 
         assert_eq!(verify_response, hash);
 
@@ -502,7 +542,11 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
     .map_err(|error| eyre!(error.to_string()))?;
     let network = generated.network;
     let state_service = zakura_state::init_test(&network).await;
-    let mut checkpoint_verifier = CheckpointVerifier::new(&network, None, state_service);
+    let mut checkpoint_verifier = CheckpointVerifier::new(
+        &network,
+        None,
+        crate::transaction::boxed_state(state_service),
+    );
 
     for block in generated.blocks {
         let block = Arc::new(block);
@@ -513,7 +557,7 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
                 .ready()
                 .map_err(|error| eyre!(error))
                 .await?
-                .call(block),
+                .call(block.into()),
         )
         .await
         .expect("generated checkpoint verification should not time out")
@@ -626,11 +670,11 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
         [(block::Height(0), hash0), (block::Height(1), hash1)],
         &network,
         None,
-        state_service,
+        crate::transaction::boxed_state(state_service),
     )?;
 
-    let block0_result = verifier.ready().await?.call(block0);
-    let block1_result = verifier.ready().await?.call(block1);
+    let block0_result = verifier.ready().await?.call(block0.into());
+    let block1_result = verifier.ready().await?.call(block1.into());
     let (block0_result, block1_result) = tokio::join!(
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block0_result),
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block1_result),
@@ -686,11 +730,11 @@ async fn checkpoint_negative_parent_deficit_resets_the_verifier() -> Result<(), 
         [(block::Height(0), hash0), (block::Height(1), block1.hash())],
         &network,
         None,
-        state_service,
+        crate::transaction::boxed_state(state_service),
     )?;
 
-    let block0_result = verifier.ready().await?.call(block0);
-    let block1_result = verifier.ready().await?.call(block1);
+    let block0_result = verifier.ready().await?.call(block0.into());
+    let block1_result = verifier.ready().await?.call(block1.into());
     let (block0_result, block1_result) = tokio::join!(
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block0_result),
         timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block1_result),
@@ -743,10 +787,6 @@ async fn continuous_blockchain_restart() -> Result<(), Report> {
 }
 
 /// Test a continuous blockchain on `network`, restarting verification at `restart_height`.
-//
-// This span is far too verbose for use during normal testing.
-// Turn the SPANDOC: comments into doc comments to re-enable.
-//#[spandoc::spandoc]
 async fn continuous_blockchain(
     restart_height: Option<block::Height>,
     network: Network,
@@ -784,7 +824,7 @@ async fn continuous_blockchain(
         .map(|(_block, height, hash)| (*height, *hash))
         .collect();
 
-    // SPANDOC: Verify blocks, restarting at {?restart_height} {?network}
+    // Verify blocks, restarting at the requested height on the selected network.
     {
         let initial_tip = restart_height.map(|block::Height(height)| {
             (blockchain[height as usize].1, blockchain[height as usize].2)
@@ -794,7 +834,7 @@ async fn continuous_blockchain(
             checkpoint_list,
             &network,
             initial_tip,
-            state_service.clone(),
+            crate::transaction::boxed_state(state_service.clone()),
         )
         .map_err(|e| eyre!(e))?;
 
@@ -840,10 +880,10 @@ async fn continuous_blockchain(
             if let Some(restart_height) = restart_height {
                 if height <= restart_height {
                     let mut state_service = state_service.clone();
-                    // SPANDOC: Make sure the state service is ready for block {?height}
+                    // Make sure the state service is ready for the current block.
                     let ready_state_service = state_service.ready().map_err(|e| eyre!(e)).await?;
 
-                    // SPANDOC: Add block directly to the state {?height}
+                    // Add the current block directly to the state.
                     ready_state_service
                         .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
                             block.clone().into(),
@@ -856,16 +896,16 @@ async fn continuous_blockchain(
                 }
             }
 
-            // SPANDOC: Make sure the verifier service is ready for block {?height}
+            // Make sure the verifier service is ready for the current block.
             let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
 
-            // SPANDOC: Set up the future for block {?height}
+            // Set up the verification future for the current block.
             let verify_future = timeout(
                 Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-                ready_verifier_service.call(block.clone()),
+                ready_verifier_service.call(block.clone().into()),
             );
 
-            // SPANDOC: spawn verification future in the background for block {?height}
+            // Spawn the verification future in the background.
             let handle = tokio::spawn(verify_future.in_current_span());
             handles.push(handle);
 
@@ -911,7 +951,7 @@ async fn continuous_blockchain(
             );
         }
 
-        // SPANDOC: wait on spawned verification tasks for restart height {?restart_height} {?network}
+        // Wait on spawned verification tasks.
         while let Some(result) = handles.next().await {
             result??.map_err(|e| eyre!(e))?;
         }
@@ -942,7 +982,6 @@ async fn block_higher_than_max_checkpoint_fail_test() -> Result<(), Report> {
     block_higher_than_max_checkpoint_fail().await
 }
 
-#[spandoc::spandoc]
 async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -959,9 +998,13 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
             .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        genesis_checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -976,20 +1019,35 @@ async fn block_higher_than_max_checkpoint_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for block 415000
-    let verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(block415000.clone()),
-    );
-    /// SPANDOC: Wait for the response for block 415000, and expect failure
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "block_higher_than_max_checkpoint_fail::comment",
+            text = %"Make sure the verifier service is ready"
+        ))
+        .await?;
+    let verify_future = tracing::error_span!(
+        "block_higher_than_max_checkpoint_fail::comment",
+        text = %"Set up the future for block 415000"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(block415000.clone().into()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let _ = verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect_err("bad block hash should fail");
+    let _ = async {
+        verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect_err("bad block hash should fail")
+    }
+    .instrument(tracing::error_span!(
+        "block_higher_than_max_checkpoint_fail::comment",
+        text = %"Wait for the response for block 415000, and expect failure"
+    ))
+    .await;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1012,7 +1070,6 @@ async fn wrong_checkpoint_hash_fail_test() -> Result<(), Report> {
     wrong_checkpoint_hash_fail().await
 }
 
-#[spandoc::spandoc]
 async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1033,9 +1090,13 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
             .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(genesis_checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        genesis_checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1050,14 +1111,23 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready (1/3)
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for bad block 0 (1/3)
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "wrong_checkpoint_hash_fail::comment",
+            text = %"Make sure the verifier service is ready (1/3)"
+        ))
+        .await?;
     // TODO(teor || jlusby): check error kind
-    let bad_verify_future_1 = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(bad_block0.clone()),
-    );
+    let bad_verify_future_1 = tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Set up the future for bad block 0 (1/3)"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(bad_block0.clone().into()),
+        )
+    });
     // We can't await the future yet, because bad blocks aren't cleared
     // until the chain is verified
 
@@ -1074,14 +1144,23 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready (2/3)
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for bad block 0 again (2/3)
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "wrong_checkpoint_hash_fail::comment",
+            text = %"Make sure the verifier service is ready (2/3)"
+        ))
+        .await?;
     // TODO(teor || jlusby): check error kind
-    let bad_verify_future_2 = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(bad_block0.clone()),
-    );
+    let bad_verify_future_2 = tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Set up the future for bad block 0 again (2/3)"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(bad_block0.clone().into()),
+        )
+    });
     // We can't await the future yet, because bad blocks aren't cleared
     // until the chain is verified
 
@@ -1098,20 +1177,35 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Make sure the verifier service is ready (3/3)
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for good block 0 (3/3)
-    let good_verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(good_block0.clone()),
-    );
-    /// SPANDOC: Wait for the response for good block 0, and expect success (3/3)
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "wrong_checkpoint_hash_fail::comment",
+            text = %"Make sure the verifier service is ready (3/3)"
+        ))
+        .await?;
+    let good_verify_future = tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Set up the future for good block 0 (3/3)"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(good_block0.clone().into()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let verify_response = good_verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect("future should succeed");
+    let verify_response = async {
+        good_verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect("future should succeed")
+    }
+    .instrument(tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Wait for the response for good block 0, and expect success (3/3)"
+    ))
+    .await;
 
     assert_eq!(verify_response, good_block0_hash);
 
@@ -1130,13 +1224,19 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
 
     // Now, await the bad futures, which should have completed
 
-    /// SPANDOC: Wait for the response for block 0, and expect failure (1/3)
     // TODO(teor || jlusby): check error kind
-    let _ = bad_verify_future_1
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect_err("bad block hash should fail");
+    let _ = async {
+        bad_verify_future_1
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect_err("bad block hash should fail")
+    }
+    .instrument(tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Wait for the response for block 0, and expect failure (1/3)"
+    ))
+    .await;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1151,13 +1251,19 @@ async fn wrong_checkpoint_hash_fail() -> Result<(), Report> {
         block::Height(0)
     );
 
-    /// SPANDOC: Wait for the response for block 0, and expect failure again (2/3)
     // TODO(teor || jlusby): check error kind
-    let _ = bad_verify_future_2
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect_err("bad block hash should fail");
+    let _ = async {
+        bad_verify_future_2
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect_err("bad block hash should fail")
+    }
+    .instrument(tracing::error_span!(
+        "wrong_checkpoint_hash_fail::comment",
+        text = %"Wait for the response for block 0, and expect failure again (2/3)"
+    ))
+    .await;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1180,7 +1286,6 @@ async fn checkpoint_drop_cancel_test() -> Result<(), Report> {
     checkpoint_drop_cancel().await
 }
 
-#[spandoc::spandoc]
 async fn checkpoint_drop_cancel() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1206,9 +1311,13 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
         .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1226,14 +1335,25 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
     let mut futures = Vec::new();
     // Now collect verify futures for each block
     for (block, height, hash) in checkpoint_data {
-        /// SPANDOC: Make sure the verifier service is ready
-        let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
+        let ready_verifier_service =
+            async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+                .instrument(tracing::error_span!(
+                    "checkpoint_drop_cancel::comment",
+                    text = %"Make sure the verifier service is ready"
+                ))
+                .await?;
 
-        /// SPANDOC: Set up the future for block {?height}
-        let verify_future = timeout(
-            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-            ready_verifier_service.call(block.clone()),
-        );
+        let verify_future = tracing::error_span!(
+            "checkpoint_drop_cancel::comment",
+            ?height,
+            text = %"Set up the future for block"
+        )
+        .in_scope(|| {
+            timeout(
+                Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+                ready_verifier_service.call(block.clone().into()),
+            )
+        });
 
         futures.push((verify_future, height, hash));
 
@@ -1256,11 +1376,18 @@ async fn checkpoint_drop_cancel() -> Result<(), Report> {
     drop(checkpoint_verifier);
 
     for (verify_future, height, hash) in futures {
-        /// SPANDOC: Check the response for block {?height}
-        let verify_response = verify_future
-            .map_err(|e| eyre!(e))
-            .await
-            .expect("timeout should not happen");
+        let verify_response = async {
+            verify_future
+                .map_err(|e| eyre!(e))
+                .await
+                .expect("timeout should not happen")
+        }
+        .instrument(tracing::error_span!(
+            "checkpoint_drop_cancel::comment",
+            ?height,
+            text = %"Check the response for block"
+        ))
+        .await;
 
         if height <= block::Height(1) {
             let verify_hash =
@@ -1280,7 +1407,6 @@ async fn hard_coded_mainnet_test() -> Result<(), Report> {
     hard_coded_mainnet().await
 }
 
-#[spandoc::spandoc]
 async fn hard_coded_mainnet() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
@@ -1290,7 +1416,11 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
 
     let state_service = zakura_state::init_test(&Mainnet).await;
     // Use the hard-coded checkpoint list
-    let mut checkpoint_verifier = CheckpointVerifier::new(&Network::Mainnet, None, state_service);
+    let mut checkpoint_verifier = CheckpointVerifier::new(
+        &Network::Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    );
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1302,20 +1432,35 @@ async fn hard_coded_mainnet() -> Result<(), Report> {
     );
     assert!(checkpoint_verifier.checkpoint_list.max_height() > block::Height(0));
 
-    /// SPANDOC: Make sure the verifier service is ready
-    let ready_verifier_service = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    /// SPANDOC: Set up the future for block 0
-    let verify_future = timeout(
-        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
-        ready_verifier_service.call(block0.clone()),
-    );
-    /// SPANDOC: Wait for the response for block 0
+    let ready_verifier_service = async { checkpoint_verifier.ready().map_err(|e| eyre!(e)).await }
+        .instrument(tracing::error_span!(
+            "hard_coded_mainnet::comment",
+            text = %"Make sure the verifier service is ready"
+        ))
+        .await?;
+    let verify_future = tracing::error_span!(
+        "hard_coded_mainnet::comment",
+        text = %"Set up the future for block 0"
+    )
+    .in_scope(|| {
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            ready_verifier_service.call(block0.clone().into()),
+        )
+    });
     // TODO(teor || jlusby): check error kind
-    let verify_response = verify_future
-        .map_err(|e| eyre!(e))
-        .await
-        .expect("timeout should not happen")
-        .expect("block should verify");
+    let verify_response = async {
+        verify_future
+            .map_err(|e| eyre!(e))
+            .await
+            .expect("timeout should not happen")
+            .expect("block should verify")
+    }
+    .instrument(tracing::error_span!(
+        "hard_coded_mainnet::comment",
+        text = %"Wait for the response for block 0"
+    ))
+    .await;
 
     assert_eq!(verify_response, hash0);
 
@@ -1376,16 +1521,20 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
         .collect();
 
     let state_service = zakura_state::init_test(&Mainnet).await;
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, None, state_service)
-            .map_err(|e| eyre!(e))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        None,
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|e| eyre!(e))?;
 
     // Verify through the first post-genesis checkpoint and wait for commits so
     // the state tip sits at height 3 before the buggy reset path runs.
     let mut first_range = FuturesUnordered::new();
     for (block, _height, _hash) in &blockchain[..=3] {
         let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-        first_range.push(ready.call(block.clone()));
+        first_range.push(ready.call(block.clone().into()));
     }
     timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
         while let Some(result) = first_range.next().await {
@@ -1407,19 +1556,19 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     // Keep the first height-4 future pending so we can drive its NewerRequest
     // error (and the resulting reset) after the range has verified.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let superseded_height_4 = ready.call(block4.clone());
+    let superseded_height_4 = ready.call(block4.clone().into());
 
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let height_5 = ready.call(block5);
+    let height_5 = ready.call(block5.into());
 
     // Resubmit height 4 while it is still queued: replaces the older request
     // with NewerRequest on the superseded oneshot.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let replacement_height_4 = ready.call(block4);
+    let replacement_height_4 = ready.call(block4.into());
 
     // Completing the continuous chain verifies (3, 6] and advances progress.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let height_6 = ready.call(block6);
+    let height_6 = ready.call(block6.into());
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
         PreviousCheckpoint(block::Height(6)),
@@ -1444,7 +1593,7 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     // The next call applies any queued reset. Correct behavior keeps progress
     // at PreviousCheckpoint(6) so the following range can still form.
     let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-    let height_7 = ready.call(blockchain[7].0.clone());
+    let height_7 = ready.call(blockchain[7].0.clone().into());
 
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1458,7 +1607,7 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     final_range.push(height_7);
     for (block, _height, _hash) in &blockchain[8..=10] {
         let ready = checkpoint_verifier.ready().map_err(|e| eyre!(e)).await?;
-        final_range.push(ready.call(block.clone()));
+        final_range.push(ready.call(block.clone().into()));
     }
     // The replacement height-4 / 5 / 6 commits from the prior range should also
     // succeed; poll them alongside the final range.
@@ -1523,18 +1672,22 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
             }
         }
     });
-    let mut verifier =
-        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
-            .map_err(|error| eyre!(error))?;
+    let mut verifier = CheckpointVerifier::from_list(
+        checkpoints,
+        &Mainnet,
+        Some(initial_tip),
+        crate::transaction::boxed_state(state),
+    )
+    .map_err(|error| eyre!(error))?;
 
-    let side_chain = verifier.call(blocks[4].clone());
+    let side_chain = verifier.call(blocks[4].clone().into());
     // Model a competing block after basic validation without mining another valid PoW.
     let side_hash = block::Hash([0xAA; 32]);
     verifier.queued.get_mut(&block::Height(4)).unwrap()[0].block =
         CheckpointVerifiedBlock::new(blocks[4].clone(), Some(side_hash), None);
     let mut commits = FuturesUnordered::new();
     for block in &blocks[4..=6] {
-        commits.push(verifier.call(block.clone()));
+        commits.push(verifier.call(block.clone().into()));
     }
     assert_eq!(
         verifier.previous_checkpoint_height(),
@@ -1546,7 +1699,7 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
     ));
 
     // This call applies any reset while the state tip remains at height 3.
-    commits.push(verifier.call(blocks[7].clone()));
+    commits.push(verifier.call(blocks[7].clone().into()));
     assert_eq!(
         verifier.previous_checkpoint_height(),
         PreviousCheckpoint(block::Height(6)),
@@ -1554,7 +1707,7 @@ async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), 
     );
     assert_eq!(verifier.reset_generation, 0);
     for block in &blocks[8..=10] {
-        commits.push(verifier.call(block.clone()));
+        commits.push(verifier.call(block.clone().into()));
     }
     release_commits.send_replace(true);
     timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
@@ -1594,7 +1747,7 @@ async fn stale_commit_reset_must_not_rewind_recovered_checkpoint_progress() -> R
         checkpoint_list,
         &Mainnet,
         Some(blockchain[3]),
-        state_service,
+        crate::transaction::boxed_state(state_service),
     )
     .map_err(|e| eyre!(e))?;
 
@@ -1701,20 +1854,24 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
             }
         }
     });
-    let mut checkpoint_verifier =
-        CheckpointVerifier::from_list(checkpoint_list, &Mainnet, Some(initial_tip), state_service)
-            .map_err(|error| eyre!(error))?;
+    let mut checkpoint_verifier = CheckpointVerifier::from_list(
+        checkpoint_list,
+        &Mainnet,
+        Some(initial_tip),
+        crate::transaction::boxed_state(state_service),
+    )
+    .map_err(|error| eyre!(error))?;
 
     let ready = checkpoint_verifier
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let height_5 = ready.call(blockchain[5].0.clone());
+    let height_5 = ready.call(blockchain[5].0.clone().into());
     let ready = checkpoint_verifier
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let height_6 = ready.call(blockchain[6].0.clone());
+    let height_6 = ready.call(blockchain[6].0.clone().into());
 
     checkpoint_verifier
         .reset_sender
@@ -1728,7 +1885,7 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let height_4 = ready.call(blockchain[4].0.clone());
+    let height_4 = ready.call(blockchain[4].0.clone().into());
     assert_eq!(checkpoint_verifier.reset_generation, 1);
     assert_eq!(
         checkpoint_verifier.previous_checkpoint_height(),
@@ -1748,7 +1905,7 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
         .ready()
         .map_err(|error| eyre!(error))
         .await?;
-    let retry_height_5 = ready.call(blockchain[5].0.clone());
+    let retry_height_5 = ready.call(blockchain[5].0.clone().into());
 
     assert_eq!(checkpoint_verifier.reset_generation, 2);
     assert_eq!(
@@ -1793,10 +1950,14 @@ async fn dropped_response_must_preserve_failed_commit_reset() -> Result<(), Repo
             }
         }
     });
-    let mut verifier =
-        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
-            .map_err(|error| eyre!(error))?;
-    let response = verifier.call(block);
+    let mut verifier = CheckpointVerifier::from_list(
+        checkpoints,
+        &Mainnet,
+        Some(initial_tip),
+        crate::transaction::boxed_state(state),
+    )
+    .map_err(|error| eyre!(error))?;
+    let response = verifier.call(block.into());
     assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
     drop(response);
     release.send_replace(true);
@@ -1836,6 +1997,43 @@ fn state_commit_duplicate_errors_are_duplicate_requests() {
     assert_eq!(err.misbehavior_score(), 0);
 }
 
+/// A checkpoint body whose authorizing data does not match its header's commitment can only
+/// come from its supplier, so the score must reach the syncer through the state's wrapper.
+#[test]
+fn state_checkpoint_auth_commitment_mismatch_is_scored() {
+    let mismatch = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                expected: [0; 32],
+                actual: [1; 32],
+            },
+        ),
+    ));
+    let source: BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(mismatch));
+
+    let err = VerifyCheckpointError::CommitCheckpointVerified(source);
+
+    assert!(err.is_auth_commitment_mismatch());
+    assert!(!err.is_duplicate_request());
+    assert_eq!(err.misbehavior_score(), 100);
+}
+
+/// Blocks the state drops behind a forged ancestor body were served by peers that did nothing
+/// wrong, so they stay unscored and are recognized for a retry.
+#[test]
+fn state_checkpoint_rejected_body_descendants_are_unscored() {
+    let descendant = zs::CommitBlockError::ValidateContextError(Box::new(
+        zs::ValidateContextError::AncestorBodyRejected(zakura_chain::block::Hash([9; 32])),
+    ));
+    let source: BoxError = Box::new(zs::CommitCheckpointVerifiedError::from(descendant));
+
+    let err = VerifyCheckpointError::CommitCheckpointVerified(source);
+
+    assert!(err.is_descendant_of_auth_commitment_mismatch());
+    assert!(!err.is_auth_commitment_mismatch());
+    assert_eq!(err.misbehavior_score(), 0);
+}
+
 /// Checkpoint commit failures can depend on auxiliary roots supplied by a
 /// different peer, so they must not be attributed to the block supplier.
 #[test]
@@ -1855,4 +2053,67 @@ fn state_checkpoint_commit_context_errors_are_unscored() {
     let err = VerifyCheckpointError::CommitCheckpointVerified(source);
 
     assert_eq!(err.misbehavior_score(), 0);
+}
+
+/// Local origin belongs to each request, even while waiting for the rest of its range.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_local_checkpoint_commits_are_announced_after_callers_are_dropped() {
+    use zakura_chain::serialization::ZcashSerialize;
+    let _init = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .range(0..=3)
+        .map(|(_, bytes)| Arc::<Block>::zcash_deserialize(*bytes).unwrap())
+        .collect();
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        block_announcements: mut announcements,
+        ..
+    } = zs::init_test_services(&Mainnet).await;
+    let list: BTreeMap<_, _> = [0usize, 3]
+        .into_iter()
+        // The only indices are 0 and 3, so both fit in u32.
+        .map(|i| (block::Height(i as u32), blocks[i].hash()))
+        .collect();
+    let mut verifier =
+        CheckpointVerifier::from_list(list, &Mainnet, None, crate::transaction::boxed_state(state))
+            .unwrap();
+    verifier.call(blocks[0].clone().into()).await.unwrap();
+    assert_eq!(
+        announcements.recv(true).await.unwrap().origin,
+        zs::BlockOrigin::Network
+    );
+    for block in &blocks[1..3] {
+        let origin = zs::BlockOrigin::LocalSubmission {
+            size: block.zcash_serialized_size(),
+        };
+        drop(verifier.call_with_origin(block.clone().into(), origin));
+    }
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
+    let last = verifier.call(blocks[3].clone().into());
+    for block in &blocks[1..3] {
+        let announcement = timeout(Duration::from_secs(10), announcements.recv(false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(announcement.hash, block.hash());
+        assert_eq!(
+            announcement.origin,
+            zs::BlockOrigin::LocalSubmission {
+                size: block.zcash_serialized_size()
+            }
+        );
+        assert!(matches!(
+            read.clone()
+                .oneshot(zs::ReadRequest::BlockInfo(block.hash().into()))
+                .await
+                .unwrap(),
+            zs::ReadResponse::BlockInfo(Some(_))
+        ));
+    }
+    last.await.unwrap();
+    let ordinary = announcements.recv(true).await.unwrap();
+    assert_eq!(ordinary.hash, blocks[3].hash());
+    assert_eq!(ordinary.origin, zs::BlockOrigin::Network);
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
 }

@@ -104,14 +104,6 @@ pub fn oversized_single_transaction_block_many_inputs() -> Block {
     single_transaction_block_many_inputs(true)
 }
 
-/// Generate a block with one transaction and multiple transparent outputs just above limit
-///
-/// TODO: add a coinbase height to the returned block
-///       make the returned block stable under round-trip serialization
-pub fn oversized_single_transaction_block_many_outputs() -> Block {
-    single_transaction_block_many_outputs(true)
-}
-
 /// Implementation of block generation with multiple transparent transactions
 fn multi_transaction_block(oversized: bool) -> Block {
     // A dummy transaction

@@ -53,15 +53,6 @@ impl AttributePreference {
             Acceptable
         }
     }
-
-    /// Returns `true` for `Preferred` attributes.
-    #[allow(dead_code)]
-    pub fn is_preferred(&self) -> bool {
-        match self {
-            Preferred => true,
-            Acceptable => false,
-        }
-    }
 }
 
 impl PeerPreference {

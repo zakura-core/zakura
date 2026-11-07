@@ -23,18 +23,10 @@ use zcash_address::{ToAddress, ZcashAddress};
 
 use super::super::*;
 use super::utils::fake_history_tree;
+use crate::tests::test_rpc::TestRpcImpl;
 
 type Mock<Req, Resp> = MockService<Req, Resp, PanicAssertion, BoxError>;
 type Verifier = Mock<zakura_consensus::Request, Hash>;
-type TestRpc<M, R> = RpcImpl<
-    M,
-    Mock<zakura_state::Request, zakura_state::Response>,
-    R,
-    MockChainTip,
-    MockAddressBookPeers,
-    Verifier,
-    MockSyncStatus,
->;
 
 fn network() -> Network {
     Network::new_regtest(RegtestParameters {
@@ -52,7 +44,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     mempool: M,
     read: R,
     tip: MockChainTip,
-) -> (TestRpc<M, R>, Verifier) {
+) -> (TestRpcImpl, Verifier) {
     // Template construction runs on the blocking pool and can exceed the mock
     // default of 300 ms on busy CI runners. Use the enclosing test deadline.
     let verifier: Verifier = MockService::build()
@@ -62,7 +54,7 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     let mut sync_status = MockSyncStatus::default();
     sync_status.set_is_close_to_tip(true);
     let (_, rx) = watch::channel(None);
-    let (rpc, queue) = RpcImpl::new(
+    let (rpc, queue) = TestRpcImpl::new_for_tests(
         network,
         config::mining::Config {
             miner_address: Some(miner_address),
@@ -247,7 +239,7 @@ fn chain_info(height: u32, hash: u8, balance: i64) -> GetBlockTemplateChainInfo 
 fn mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
-    TestRpc<impl MempoolService, impl ReadStateService>,
+    TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     Verifier,
 ) {
@@ -286,7 +278,7 @@ fn mining_rpc(
 fn counting_mining_rpc(
     info: watch::Receiver<GetBlockTemplateChainInfo>,
 ) -> (
-    TestRpc<impl MempoolService, impl ReadStateService>,
+    TestRpcImpl,
     zakura_chain::chain_tip::mock::MockChainTipSender,
     Arc<AtomicUsize>,
     Arc<AtomicBool>,
@@ -726,15 +718,21 @@ fn concurrent_caller_selecting_new_parent_makes_slow_caller_rebuild() {
 async fn stale_parent_selection_is_refused() {
     let (_, info) = watch::channel(chain_info(2, 1, 0));
     let (rpc, tip, _) = mining_rpc(info);
-    assert!(rpc.select_mining_template_parent(Hash([1; 32])));
+    assert!(rpc
+        .track_template_parent(Hash([1; 32]), &mut rpc.gbt.template_rejections.subscribe())
+        .is_some());
     tip.send_best_tip_hash(Hash([2; 32]));
-    assert!(!rpc.select_mining_template_parent(Hash([1; 32])));
+    assert!(!rpc
+        .track_template_parent(Hash([1; 32]), &mut rpc.gbt.template_rejections.subscribe())
+        .is_some());
     assert_eq!(
         rpc.gbt.template_rejections.borrow().parent,
         Some(Hash([1; 32])),
         "a refused selection leaves the state untouched"
     );
-    assert!(rpc.select_mining_template_parent(Hash([2; 32])));
+    assert!(rpc
+        .track_template_parent(Hash([2; 32]), &mut rpc.gbt.template_rejections.subscribe())
+        .is_some());
 }
 
 #[tokio::test]
@@ -989,6 +987,7 @@ fn long_poll_mainnet_deadline_survives_slow_state_fetch() {
         sender.send_best_tip_height(original.tip_height);
         sender.send_best_tip_hash(original.tip_hash);
         sender.send_estimated_distance_to_network_chain_tip(0);
+        sender.send_best_tip_block_time(chrono::Utc::now());
         let read_count = Arc::new(AtomicUsize::new(0));
         let reads = read_count.clone();
         let slow_read = Arc::new(AtomicBool::new(false));
@@ -1093,7 +1092,9 @@ fn superseded_deadline_build_does_not_resume_long_polling() {
         let other = chain_info(2, 2, 0);
         info_tx.send_replace(other.clone());
         tip.send_best_tip_hash(other.tip_hash);
-        assert!(rpc.select_mining_template_parent(other.tip_hash));
+        assert!(rpc
+            .track_template_parent(other.tip_hash, &mut rpc.gbt.template_rejections.subscribe())
+            .is_some());
 
         let mut restored = original;
         restored.cur_time = restored.max_time;
@@ -1178,7 +1179,8 @@ async fn long_poll_preserves_negative_balance_error() {
 fn rejection_during_construction_rebuilds_template() {
     mining_runtime(async {
         let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
-        let (rpc, _, mut verifier) = mining_rpc(info);
+        // Recovery treats a closed tip channel as a stale parent, so keep the sender alive.
+        let (rpc, _tip, mut verifier) = mining_rpc(info);
         let gate = BlockingPoolGate::new().await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
@@ -1251,17 +1253,25 @@ fn recovery_construction_yields_and_rebuilds_on_parent_change() {
                 tip.send_best_tip_hash(Hash([2; 32]));
             }
             gate.release().await;
-            let (response, ()) = bounded(async {
-                tokio::join!(request, async {
-                    verifier
-                        .expect_request_that(|req| {
-                            matches!(req, zakura_consensus::Request::Prepare { .. })
-                        })
-                        .await
-                        .respond(Hash([9; 32]));
+            let response = if change_tip {
+                // Recovery stops at the tip change before it dispatches validation.
+                let response = bounded(request).await;
+                assert!(verifier.try_next_request().now_or_never().is_none());
+                response
+            } else {
+                let (response, ()) = bounded(async {
+                    tokio::join!(request, async {
+                        verifier
+                            .expect_request_that(|req| {
+                                matches!(req, zakura_consensus::Request::Prepare { .. })
+                            })
+                            .await
+                            .respond(Hash([9; 32]));
+                    })
                 })
-            })
-            .await;
+                .await;
+                response
+            };
             if change_tip {
                 assert!(
                     response
@@ -1367,78 +1377,50 @@ async fn recovery_preserves_negative_balance_error() {
 /// Real proof smoke coverage complements the deterministic scheduling tests.
 /// Run explicitly: cargo test -p zakura-rpc --release shielded_template_rewards -- --ignored
 #[tokio::test]
-#[ignore = "generates three real shielded proofs"]
+#[ignore = "generates a real shielded proof"]
 async fn shielded_template_rewards() {
     use config::mining::{default_miner_address, MinerAddressType};
     use types::{get_block_template::MinerParams, long_poll::LongPollInput};
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
     let _guard = zakura_test::init();
-    for (pool, address_type) in [
-        ("sapling", MinerAddressType::Sapling),
-        ("orchard", MinerAddressType::Unified),
-        ("ironwood", MinerAddressType::Unified),
-    ] {
-        // Orchard rewards precede NU6.3; Sapling and Ironwood exercise NSM activation.
-        let net = if pool == "orchard" {
-            Network::new_regtest(RegtestParameters {
-                activation_heights: ConfiguredActivationHeights {
-                    nu5: Some(1),
-                    nu6: Some(100),
-                    nu6_1: Some(101),
-                    nu6_2: Some(102),
-                    nu6_3: Some(103),
-                    nu7: Some(104),
-                    ..Default::default()
-                },
-                test_nsm_reissuance_height: Some(Height(104)),
-                ..Default::default()
-            })
-        } else {
-            network()
-        };
-        let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
-        let (mut rpc, _, _) = mining_rpc(info);
-        rpc.network = net.clone();
-        let params = MinerParams::new(
-            &net,
-            config::mining::Config {
-                miner_address: Some(
-                    default_miner_address(net.kind(), &address_type)
-                        .parse()
-                        .unwrap(),
-                ),
-                ..Default::default()
-            },
-        )
+    let net = network();
+    let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
+    let (mut rpc, _, _) = mining_rpc(info);
+    rpc.network = net.clone();
+    let params = MinerParams::new(
+        &net,
+        config::mining::Config {
+            miner_address: Some(
+                default_miner_address(net.kind(), &MinerAddressType::Unified)
+                    .parse()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chain = chain_info(2, 1, 400_000_000);
+    let id =
+        LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![]).generate_id();
+    let template = tokio::time::timeout(
+        Duration::from_secs(300),
+        rpc.build_mining_template(None, &params, &chain, id, vec![], None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let tx: Transaction = template
+        .coinbase_txn
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
         .unwrap();
-        let chain = chain_info(2, 1, 400_000_000);
-        let id = LongPollInput::new(chain.tip_height, chain.tip_hash, chain.max_time, vec![])
-            .generate_id();
-        let template = tokio::time::timeout(
-            Duration::from_secs(300),
-            rpc.build_mining_template(None, &params, &chain, id, vec![], None),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let tx: Transaction = template
-            .coinbase_txn
-            .data
-            .as_ref()
-            .zcash_deserialize_into()
-            .unwrap();
-        let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
-        let expected = base + if pool == "orchard" { 0 } else { 55 };
-        let (sapling, orchard, ironwood) = (
-            i64::from(tx.sapling_value_balance().sapling_amount()),
-            i64::from(tx.orchard_value_balance().orchard_amount()),
-            i64::from(tx.ironwood_value_balance().ironwood_amount()),
-        );
-        let balances = match pool {
-            "sapling" => (-expected, 0, 0),
-            "orchard" => (0, -expected, 0),
-            _ => (0, 0, -expected),
-        };
-        assert_eq!((sapling, orchard, ironwood), balances, "{pool}");
-    }
+    let base = i64::from(halving_block_subsidy(Height(3), &net).unwrap());
+    let expected = base + 55;
+    let (sapling, orchard, ironwood) = (
+        i64::from(tx.sapling_value_balance().sapling_amount()),
+        i64::from(tx.orchard_value_balance().orchard_amount()),
+        i64::from(tx.ironwood_value_balance().ironwood_amount()),
+    );
+    assert_eq!((sapling, orchard, ironwood), (0, 0, -expected));
 }

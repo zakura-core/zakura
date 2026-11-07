@@ -8,7 +8,7 @@
 //! of the updated cached state, restart zebra without peers, and submit blocks above the
 //! finalized tip height.
 
-use color_eyre::eyre::{Context, Result};
+use eyre::{Context, Result};
 
 use zakura_chain::parameters::Network;
 use zakura_node_services::rpc_client::RpcRequestClient;
@@ -72,7 +72,7 @@ pub(crate) async fn run() -> Result<()> {
             .await?;
 
         assert!(res.status().is_success());
-        let res_text = res.text().await?;
+        let res_text = String::from_utf8_lossy(res.body());
 
         // Test rpc endpoint response
         assert!(

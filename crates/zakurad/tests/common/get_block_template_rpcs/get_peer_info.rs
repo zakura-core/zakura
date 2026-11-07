@@ -1,6 +1,6 @@
 //! Tests that `getpeerinfo` RPC method responds with info about at least 1 peer.
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 
 use zakura_chain::parameters::Network;
 use zakura_node_services::rpc_client::RpcRequestClient;
@@ -16,9 +16,7 @@ use crate::common::{
 pub(crate) async fn run() -> Result<()> {
     let _init_guard = zakura_test::init();
 
-    let test_type = TestType::LaunchWithEmptyState {
-        launches_lightwalletd: false,
-    };
+    let test_type = TestType::LaunchWithEmptyState;
     let test_name = "get_peer_info_test";
     let network = Network::Mainnet;
 

@@ -1533,18 +1533,23 @@ where
             .ok()?;
 
             let template = self.precomputed_template_for_state_tip(cache).await?;
+            let parent = template.previous_block_hash;
+            let mut served = None;
             self.gbt.template_rejections.send_if_modified(|state| {
-                let changed = state.parent != Some(template.previous_block_hash);
-                state.set_parent(template.previous_block_hash);
+                let changed = state.parent != Some(parent);
+                served = Some(state.serve_on(parent));
                 changed
             });
-            let revision = {
-                let rejections = template_rejections.borrow_and_update();
-                if rejections.needs_fallback() {
-                    return None;
+            let revision = served.flatten()?;
+            {
+                // Mark the state seen. If another request re-pointed it at another parent, or a
+                // rejection landed after the read above, read again rather than acknowledge a
+                // state this call didn't read.
+                let seen = template_rejections.borrow_and_update();
+                if seen.parent != Some(parent) || seen.revision != revision {
+                    continue;
                 }
-                rejections.revision
-            };
+            }
             let mut long_poll_id = template.long_poll_id;
             long_poll_id.revision = revision;
 

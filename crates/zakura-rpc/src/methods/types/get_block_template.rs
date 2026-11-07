@@ -160,6 +160,16 @@ impl TemplateRejections {
         self.parent = Some(parent);
     }
 
+    /// Points the state at `parent` and returns the revision to serve `parent`'s work under, or
+    /// `None` if that work needs the fallback.
+    ///
+    /// The read happens in the same step as the switch. A read after a separate switch can see
+    /// another parent's records, because a concurrent caller can re-point the state in between.
+    pub(crate) fn serve_on(&mut self, parent: block::Hash) -> Option<u64> {
+        self.set_parent(parent);
+        (!self.needs_fallback()).then_some(self.revision)
+    }
+
     /// Returns the records for `parent`, if it is the current or the previous parent.
     fn records_for(&mut self, parent: block::Hash) -> Option<&mut ParentRecords> {
         if self.parent == Some(parent) {

@@ -29,6 +29,34 @@ use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::{MinerAddress, MinerParams, TemplatePreparationQueue};
 
+/// A cached request serving the new tip's work reads that parent's records, even when a request
+/// holding the old tip's work re-points the state right after.
+///
+/// Before `serve_on`, the cached path switched the parent and read `needs_fallback()` in two
+/// steps, so the old tip's empty records could hide the new tip's rejection.
+#[test]
+fn serving_reads_the_records_of_its_own_parent() {
+    let old_tip = zakura_chain::block::Hash([1; 32]);
+    let new_tip = zakura_chain::block::Hash([2; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.set_parent(new_tip);
+    assert!(state.reject(new_tip, "rejected"));
+    let revision = state.revision;
+
+    // A request holding old-tip work re-points the state at the old tip.
+    assert_eq!(state.serve_on(old_tip), Some(revision));
+    // A request serving new-tip work must see the new tip's rejection.
+    assert_eq!(state.serve_on(new_tip), None);
+
+    // The separate read the cached path used to do: after the old-tip request re-points the
+    // state, `needs_fallback()` reports the old tip's empty records.
+    state.set_parent(old_tip);
+    assert!(
+        !state.needs_fallback(),
+        "the read sees the old tip's records"
+    );
+}
+
 #[test]
 fn template_rejection_targets_work_and_ignores_old_parents() {
     let parent = zakura_chain::block::Hash([1; 32]);

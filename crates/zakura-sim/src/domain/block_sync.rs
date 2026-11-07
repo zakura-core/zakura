@@ -1122,13 +1122,13 @@ where
         })
     }
 
-    fn violation(reading: &Measured<()>) -> (String, String) {
+    fn violation(measured: &Measured<()>) -> (String, String) {
         (
             format!(
                 "the sequencer retains at most L + 401·b + Q·b = {} wire bytes",
-                reading.limit
+                measured.limit
             ),
-            format!("it retains {}", reading.quantity),
+            format!("it retains {}", measured.quantity),
         )
     }
 }
@@ -1192,19 +1192,19 @@ where
         })
     }
 
-    fn violation(reading: &Measured<ReservedTerms>) -> (String, String) {
+    fn violation(measured: &Measured<ReservedTerms>) -> (String, String) {
         let ReservedTerms {
             limits,
             handoffs,
             open,
-        } = &reading.terms;
+        } = &measured.terms;
         (
             format!(
                 "the byte budget counts at most M + 2·k·B + h·B = {} bytes, with M = {}, \
                  k = {} and h = {handoffs}",
-                reading.limit, limits.budget, limits.per_request
+                measured.limit, limits.budget, limits.per_request
             ),
-            format!("it counts {}, with {open} handoffs open", reading.quantity),
+            format!("it counts {}, with {open} handoffs open", measured.quantity),
         )
     }
 }
@@ -1314,13 +1314,13 @@ where
         })
     }
 
-    fn violation(reading: &Measured<LookaheadTerms>) -> (String, String) {
-        let LookaheadTerms { limits, quantities } = &reading.terms;
+    fn violation(measured: &Measured<LookaheadTerms>) -> (String, String) {
+        let LookaheadTerms { limits, quantities } = &measured.terms;
         (
             format!(
                 "above-window bytes R + E stay within L + H + (W + 1)·k·B = {}, with \
                  L = {}, H = {}, W = {} and k = {}",
-                reading.limit,
+                measured.limit,
                 limits.lookahead,
                 quantities.hint_error,
                 limits.workers,

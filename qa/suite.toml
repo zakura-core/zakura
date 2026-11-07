@@ -143,6 +143,12 @@ test = "regenerate_reset_mid_flight_input"
 run = false
 reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
 
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_capacity_frontier_first_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed frontier-first input"
+
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
 # `zakura_sim release` and `zakura_sim asan` jobs make. The ASan lane needs

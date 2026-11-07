@@ -1581,12 +1581,10 @@ fn completions_carry_typed_identities() {
     assert_eq!(rejected.result, ResultIdentity::Rejected);
 }
 
-/// B2: a `CapacityBusy` refusal names the signal it handed out, read from
-/// the registry: the peer's own lease, the ordinary class for a path
-/// beyond the reserve slot, and the reserve class when every slot is taken.
-/// A prepare's identity sums its headers' work from their targets, so a
-/// weighted branch logs more work per header, and a header whose target
-/// has no work leaves the sum unknown.
+/// A prepare's identity sums each header's work from its own target: two
+/// headers at weight 2 then one unweighted header, as a weighted fork that
+/// grew, log both weights' work. A header whose target has no work leaves
+/// the sum unknown.
 #[test]
 fn a_prepares_work_is_summed_from_its_targets() {
     let (port, chain) = chain(1);
@@ -1596,21 +1594,27 @@ fn a_prepares_work_is_summed_from_its_targets() {
             fixture.target_request(&port.engine().snapshot(), chain[0], headers, request_id);
         run(&port, port.prepare_header_target(request)).1.request
     };
-    let weighted = fixture.extend(chain[0], 3, 1);
-    let RequestIdentity::PrepareHeaderTarget { work, first, .. } = prepare(&weighted, 2) else {
+    let mut headers = fixture.extend(chain[0], 2, 1);
+    let fork_tip = Frontier::new(block::Height(3), headers[1].hash());
+    headers.extend(fixture.extend(fork_tip, 1, 0));
+    let RequestIdentity::PrepareHeaderTarget { work, first, .. } = prepare(&headers, 2) else {
         panic!("a prepare has a prepare identity");
     };
-    let per_header = fixture
-        .target(1)
-        .to_work()
-        .expect("fixture targets have work");
+    let work_of = |branch| {
+        fixture
+            .target(branch)
+            .to_work()
+            .expect("fixture targets have work")
+            .as_u256()
+    };
+    assert_ne!(work_of(1), work_of(0));
     assert_eq!(
         work.map(|work| work.as_u256()),
-        Some(per_header.as_u256() * 3)
+        Some(work_of(1) * 2 + work_of(0))
     );
     assert_eq!(
         first,
-        Some(Frontier::new(block::Height(2), weighted[0].hash()))
+        Some(Frontier::new(block::Height(2), headers[0].hash()))
     );
 
     let mut workless = *fixture.extend(chain[0], 1, 2)[0];
@@ -1622,6 +1626,9 @@ fn a_prepares_work_is_summed_from_its_targets() {
     assert_eq!(work, None);
 }
 
+/// B2: a `CapacityBusy` refusal names the signal it handed out, read from
+/// the registry: the peer's own lease, the ordinary class for a path
+/// beyond the reserve slot, and the reserve class when every slot is taken.
 #[test]
 fn refusals_name_the_signal_they_hand_out() {
     let (port, chain) = long_chain(4_001);

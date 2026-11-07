@@ -557,7 +557,7 @@ mod tests {
             let ready: Vec<(Identity, TaskId)> = (0..w.ready.len())
                 .filter(|i| w.ready[*i])
                 .map(|i| {
-                    let at = At { op: PointOp::Poll, n: 1, site: None };
+                    let at = At { op: PointOp::Poll, n: 1, object: None, site: None };
                     (Identity::task(format!("t{i}.1"), at), ids[i])
                 })
                 .collect();

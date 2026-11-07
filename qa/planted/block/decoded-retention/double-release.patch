@@ -1,0 +1,11 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -424,7 +424,7 @@
+             .pool
+             .0
+             .reserved
+-            .checked_update(|used| used.checked_sub(1))
++            .checked_update(|used| used.checked_sub(2))
+             .is_err()
+         {
+             self.pool.close();

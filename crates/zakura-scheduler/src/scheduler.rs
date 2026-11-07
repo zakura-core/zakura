@@ -117,17 +117,24 @@ pub(crate) struct RunState {
 }
 
 impl RunState {
-    /// Records that `task` reached its next point of kind `op`.
+    /// Records that `task` reached its next point of kind `op`, on `object`
+    /// if the primitive reports one.
     pub(crate) fn advance_point(
         &mut self,
         task: TaskId,
         op: Op,
+        object: Option<ObjectId>,
         site: Option<&'static std::panic::Location<'static>>,
     ) -> At {
         let meta = &mut self.tasks[task.index()];
         let n = meta.point_counts.entry(op).or_insert(0);
         *n = n.saturating_add(1);
-        meta.at = At { op, n: *n, site };
+        meta.at = At {
+            op,
+            n: *n,
+            object,
+            site,
+        };
         meta.at
     }
 
@@ -169,6 +176,7 @@ impl RunState {
             at: At {
                 op: Op::Poll,
                 n: 1,
+                object: None,
                 site: None,
             },
             blocking: false,
@@ -321,7 +329,16 @@ impl Drop for ClearRun {
 }
 
 /// Runs `f` on this thread's run state, or returns `None` outside a run.
+///
+/// # Panics
+///
+/// Inside a `zakura_rt` boundary read. Every hook, the task waker and the
+/// executor bridge reach the run's state through here, so a read that
+/// would change the schedule it observes fails before it does.
+#[track_caller]
 pub(crate) fn with_run<R>(f: impl FnOnce(&mut RunState) -> R) -> Option<R> {
+    #[cfg(zakura_sim)]
+    zakura_rt::sim::refuse_in_boundary_read("the scheduler run state");
     RUN.with(|r| r.borrow_mut().as_mut().map(f))
 }
 
@@ -395,6 +412,8 @@ impl Wake for TaskWaker {
             self.thread,
             "a simulated task's waker fired from another OS thread"
         );
+        // A wake reaches the run's state through `with_run`, which refuses
+        // it inside a boundary read.
         with_run(|s| {
             if s.gen != self.gen {
                 return;
@@ -602,7 +621,7 @@ impl Scheduler {
             Ok(CoroutineResult::Yield(Yield::Pending)) => {
                 self.state(|s| {
                     s.mid_poll.remove(&task);
-                    s.advance_point(task, Op::Poll, None);
+                    s.advance_point(task, Op::Poll, None, None);
                     // A wake during the poll, or an abort, makes it ready again.
                     if s.woken.remove(&task) || s.cancel_requested.contains(&task) {
                         s.ready.insert(task);
@@ -701,6 +720,13 @@ impl Scheduler {
         let ids = fired.keys().copied().collect();
         fired.into_values().for_each(Waker::wake);
         ids
+    }
+
+    /// The tasks stopped mid-poll, at a preemption point or parked on a
+    /// lock, rather than at a poll boundary. Each is partway through
+    /// synchronous code that yielded at a point.
+    pub fn mid_poll(&self) -> BTreeSet<TaskId> {
+        self.state(|s| s.mid_poll.clone())
     }
 
     /// What the run can do next.

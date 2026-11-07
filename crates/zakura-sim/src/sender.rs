@@ -2,7 +2,7 @@
 //! sender side).
 //!
 //! These check the node's own frames as a peer's role models labelled them
-//! on arrival ([`Observation::NodeFrame`]), under the sender's rules. Each
+//! ([`Observation::NodeFrame`]), under the sender's rules. Each
 //! template reads the frames whose rule is its row: a page's `OverCredit`
 //! belongs to its subscription row, as [`crate::table::rule_row`] picks it.
 

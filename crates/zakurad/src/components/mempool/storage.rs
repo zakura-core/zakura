@@ -10,7 +10,6 @@
 use std::{
     collections::{HashMap, HashSet},
     mem::size_of,
-    sync::Arc,
     time::Duration,
 };
 
@@ -655,9 +654,16 @@ impl Storage {
     /// Does not add or remove from the 'rejected' tracking set.
     #[cfg(test)]
     pub fn remove_exact(&mut self, exact_wtxids: &HashSet<UnminedTxId>) -> usize {
-        self.verified
-            .remove_all_that(|tx| exact_wtxids.contains(&tx.transaction.id()))
-            .len()
+        let tx_ids: Vec<_> = exact_wtxids
+            .iter()
+            .filter(|id| {
+                self.transactions()
+                    .get(&id.mined_id())
+                    .is_some_and(|tx| tx.transaction.id() == **id)
+            })
+            .map(UnminedTxId::mined_id)
+            .collect();
+        self.verified.remove_all(tx_ids).len()
     }
 
     /// Clears a list of mined transaction ids from the verified set's tracked transaction dependencies.
@@ -682,31 +688,29 @@ impl Storage {
     pub fn reject_and_remove_same_effects(
         &mut self,
         mined_ids: &HashSet<transaction::Hash>,
-        transactions: Vec<Arc<Transaction>>,
+        transactions: Vec<impl AsRef<Transaction>>,
     ) -> RemovedTransactionIds {
-        let removed_mined = self
-            .verified
-            .remove_all_that(|tx| mined_ids.contains(&tx.transaction.id().mined_id()));
+        let removed_mined = self.verified.remove_all(mined_ids.iter().copied());
 
         let spent_outpoints: HashSet<_> = transactions
             .iter()
-            .flat_map(|tx| tx.spent_outpoints())
+            .flat_map(|tx| tx.as_ref().spent_outpoints())
             .collect();
         let sprout_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.sprout_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().sprout_nullifiers())
             .collect();
         let sapling_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.sapling_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().sapling_nullifiers())
             .collect();
         let orchard_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.orchard_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().orchard_nullifiers())
             .collect();
         let ironwood_nullifiers: HashSet<_> = transactions
             .iter()
-            .flat_map(|transaction| transaction.ironwood_nullifiers())
+            .flat_map(|transaction| transaction.as_ref().ironwood_nullifiers())
             .collect();
 
         let duplicate_spend_ids: HashSet<_> = self
@@ -735,7 +739,7 @@ impl Storage {
 
         let removed_duplicate_spend = self
             .verified
-            .remove_all_that(|tx| duplicate_spend_ids.contains(&tx.transaction.id()));
+            .remove_all(duplicate_spend_ids.iter().map(UnminedTxId::mined_id));
 
         for &mined_id in mined_ids {
             self.reject(
@@ -871,11 +875,9 @@ impl Storage {
         &self,
         tx_ids: HashSet<Hash>,
     ) -> impl Iterator<Item = &UnminedTx> {
-        self.verified
-            .transactions()
-            .iter()
-            .filter(move |(tx_id, _)| tx_ids.contains(tx_id))
-            .map(|(_, tx)| &tx.transaction)
+        tx_ids
+            .into_iter()
+            .filter_map(|tx_id| self.transactions().get(&tx_id).map(|tx| &tx.transaction))
     }
 
     /// Returns a transaction and the transaction ids of its dependencies, if it is in the verified set.
@@ -1051,10 +1053,8 @@ impl Storage {
             }
         }
 
-        // expiry height is effecting data, so we match by non-malleable TXID
-        let removed_tx_ids = self
-            .verified
-            .remove_all_that(|tx| tx_ids.contains(&tx.transaction.id().mined_id()));
+        // Expiry height is effecting data, so match by non-malleable TXID.
+        let removed_tx_ids = self.verified.remove_all(tx_ids.iter().copied());
 
         // also reject it
         for id in tx_ids {

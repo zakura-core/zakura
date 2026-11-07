@@ -16,7 +16,7 @@
 //! [`HeaderOp`] lists the eight asynchronous [`Port`] methods. `selected_chain`
 //! isn't one of them. It returns a watch receiver synchronously, so it has no
 //! pending state and no faults. In header scenarios only an apply's
-//! completion sends a new snapshot on it, and receivers may see several
+//! completion or commit, or a run's reset, sends a new snapshot on it, and receivers may see several
 //! commits coalesced into one change. The reactor's `Misbehavior` and `DropPeer` actions aren't storage
 //! calls either. The direct dispatch path logs them and returns.
 //!
@@ -68,12 +68,13 @@
 //!
 //! # Excluded histories
 //!
-//! Each operation's production stages run atomically at its completion.
-//! Production runs some stages earlier, and other operations can see their
-//! effects before the reply. Any production history that depends on another
-//! operation seeing such an intermediate stage is excluded, as is the API
-//! draft's Ambiguous outcome. Covering them would need an operation split
-//! into separate execute and reply stages. The known instances:
+//! Each operation's production stages run atomically at its completion,
+//! except an apply's commit and reply, which can split as the next section
+//! says. Production runs some stages earlier, and other operations can see
+//! their effects before the reply. Any other production history that depends
+//! on another operation seeing such an intermediate stage is excluded, as is
+//! the API draft's Ambiguous outcome. Covering them would need an operation
+//! split into separate execute and reply stages. The known instances:
 //!
 //! * A reservation held while an acquire resolves its path. Say acquire A
 //!   reserves its peer's slot at 1 s. Acquire B, from the same peer, gets
@@ -90,11 +91,6 @@
 //! * Work that ran anyway after a fault. A state read keeps running after its
 //!   adapter times out, so a read can time out at 30 s and still consume its
 //!   lease a moment later, and a release can time out after releasing.
-//! * A commit visible before its apply replies. The writer commits and
-//!   publishes the snapshot, then sends the reply, so production readers can
-//!   see the commit in between. Here both happen in one completion. Readers
-//!   still see the commit before the caller handles its reply, but no other
-//!   storage operation completes between the publish and the reply.
 //!
 //! ST3's single-completion model covers none of these. ST3 treats any new
 //! history of this shape as covered by this rule. It needs no contract
@@ -105,12 +101,26 @@
 //! is the same page the fallback gives. Only its timing is lost, as the
 //! second instance shows.
 //!
+//! # Commit and reply
+//!
+//! A commit visible before its apply replies is covered. The writer commits
+//! and publishes the snapshot, then sends the reply, so production readers can
+//! see the commit in between, and other storage operations can complete
+//! there. [`controlled::ControlledPort::commit`] runs an apply's engine
+//! outcome and keeps its reply, and [`controlled::ControlledPort::deliver`]
+//! hands it over in a later step. The simulator's `ReplyHold` picks which
+//! applies split this way. An apply that installs nothing has nothing to show
+//! early, so it completes in one step. A fault or rejection commits nothing,
+//! so it always does.
+//!
 //! # Execution
 //!
 //! Every operation runs in the one completion action the run picks, which is
 //! its linearization point. Reads capture committed state there. An acquire
 //! creates its lease, a read consumes it and a release drops it there. An
-//! apply commits and publishes its snapshot there, before its reply.
+//! apply commits and publishes its snapshot there, before its reply, unless
+//! its reply is held, when the commit is its linearization point and the
+//! reply follows later.
 //!
 //! Caller cancellation never stops accepted work. A reactor timeout drops its
 //! future, and a publisher page job outlives its session, but production state

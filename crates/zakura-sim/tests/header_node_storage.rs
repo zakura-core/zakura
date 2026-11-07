@@ -17,7 +17,10 @@ use support::inputs;
 use zakura_sim::{
     check::after_step,
     harness::{
-        header_node::{Base, Chain, Fork, Policy},
+        header_node::{
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            Base, Chain, Fork, Policy,
+        },
         header_sync::{
             storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
             StorageScenario, OPERATION_IDS,
@@ -97,6 +100,7 @@ fn worked_example(policy: Policy) -> StorageScenario {
         ],
         policy,
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 
@@ -106,7 +110,24 @@ fn any() -> Policy {
         base: Base::Any,
         bound_ms: None,
         holds: Vec::new(),
+        reply_holds: Vec::new(),
     }
+}
+
+/// A header scenario can't wait for a queued reply, which only the block
+/// node records: a header completion stores its reply.
+#[test]
+#[should_panic(expected = "a header scenario can't wait for ReplyQueued")]
+fn a_header_hold_cant_wait_for_a_queued_reply() {
+    Storage::prepare(&worked_example(Policy {
+        holds: vec![Hold {
+            select: Select::nth(OpKind::Prepare, 1),
+            until: Trigger::ReplyQueued(Select::nth(OpKind::Locator, 1)),
+            then: vec![Allow::Engine],
+            deadline_ms: None,
+        }],
+        ..any()
+    }));
 }
 
 /// The node's storage facts, in log order, with their steps.
@@ -134,7 +155,10 @@ fn facts(report: &RunReport) -> Vec<(u64, &StorageFact)> {
 fn operation_ids_are_unique_and_complete_once() {
     let scenario = worked_example(any());
     let (mut faulted, mut paired_error) = (false, false);
-    for input in sweep() {
+    // The transport's scheduling choices come before the storage outcome
+    // draws, so a plan needs room for both. Most 256-byte plans run out before
+    // the first outcome draw and complete every operation with the engine.
+    for input in inputs(64, 1_024) {
         let (report, _) = run(&scenario, input);
         let ids = report
             .properties
@@ -656,6 +680,7 @@ fn node_at_a3(
             ..Policy::converging()
         },
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 

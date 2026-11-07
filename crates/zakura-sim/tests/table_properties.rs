@@ -64,6 +64,7 @@ fn frame(stream: Stream, seq: u64, row: Option<&str>, label: Label) -> Observati
     Observation::PeerFrame {
         connection: 1,
         stream: id(stream),
+        quic_stream: None,
         seq,
         row: row.map(str::to_owned),
         rule_stream: id(stream),
@@ -79,6 +80,7 @@ fn judged(stream: Stream, seq: u64) -> Observation {
     Observation::FrameJudged {
         connection: 1,
         stream: id(stream),
+        quic_stream: None,
         seq,
     }
 }
@@ -179,6 +181,7 @@ fn consequences_follow_the_table() {
     }
     assert!(is_fault_cause("service_protocol_reject"));
     assert!(is_fault_cause("ordered_read_rejected"));
+    assert!(is_fault_cause("undersized_frame_cap"));
     for neutral in [
         "idle_timeout",
         "ordered_read_timeout",
@@ -269,6 +272,7 @@ fn a_fault_without_a_fault_close_is_a_violation() {
             Observation::PeerFrame {
                 connection: 2,
                 stream: id(TEST_STREAM),
+                quic_stream: None,
                 seq: 0,
                 row: Some("ping".to_owned()),
                 rule_stream: id(TEST_STREAM),
@@ -280,6 +284,7 @@ fn a_fault_without_a_fault_close_is_a_violation() {
             Observation::FrameJudged {
                 connection: 2,
                 stream: id(TEST_STREAM),
+                quic_stream: None,
                 seq: 0,
             },
         ],
@@ -376,6 +381,7 @@ fn emptying_a_cadence_bucket_is_never_punished() {
     let exhausting = Observation::PeerFrame {
         connection: 1,
         stream: id(TEST_STREAM),
+        quic_stream: None,
         seq: 0,
         row: Some("status".to_owned()),
         rule_stream: id(TEST_STREAM),
@@ -443,6 +449,7 @@ fn every_unjustified_punishment_is_a_violation() {
         } => Observation::PeerFrame {
             connection,
             stream,
+            quic_stream: None,
             seq,
             row,
             rule_stream,
@@ -454,6 +461,7 @@ fn every_unjustified_punishment_is_a_violation() {
         Observation::FrameJudged { stream, seq, .. } => Observation::FrameJudged {
             connection,
             stream,
+            quic_stream: None,
             seq,
         },
         Observation::ConnectionClosed { cause, .. } => {
@@ -604,6 +612,7 @@ fn an_over_credit_page_on_another_stream_belongs_to_its_subscription() {
     let page = Observation::PeerFrame {
         connection: 1,
         stream: id(pages),
+        quic_stream: None,
         seq: 0,
         row: Some("watch".to_owned()),
         rule_stream: id(watch),

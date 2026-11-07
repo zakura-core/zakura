@@ -12,7 +12,7 @@ use tower::{layer::Layer, timeout::TimeoutLayer};
 
 use zakura_chain::{
     block::Block,
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
 };
 use zakura_state as zs;
 use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
@@ -299,7 +299,7 @@ static BLOCK_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
             .into();
     let hash = Ok(block.hash());
 
-    vec![(Request::Commit(block), hash)]
+    vec![(Request::Commit(block.into()), hash)]
 });
 
 static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: LazyLock<
@@ -310,7 +310,10 @@ static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: LazyLock<
             .unwrap()
             .into();
 
-    vec![(Request::Commit(block), Err(ExpectedTranscriptError::Any))]
+    vec![(
+        Request::Commit(block.into()),
+        Err(ExpectedTranscriptError::Any),
+    )]
 });
 
 static NO_COINBASE_TRANSCRIPT: LazyLock<
@@ -319,7 +322,7 @@ static NO_COINBASE_TRANSCRIPT: LazyLock<
     let block = block_no_transactions();
 
     vec![(
-        Request::Commit(Arc::new(block)),
+        Request::Commit(Arc::new(block).into()),
         Err(ExpectedTranscriptError::Any),
     )]
 });
@@ -347,7 +350,7 @@ static STATE_VERIFY_TRANSCRIPT_GENESIS: LazyLock<
 
     vec![(
         zs::Request::Block(hash.into()),
-        Ok(zs::Response::Block(Some(block))),
+        Ok(zs::Response::Block(Some(block.into()))),
     )]
 });
 
@@ -512,7 +515,11 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
     for mined in [true, false] {
         let mut state_config = zs::Config::ephemeral();
         state_config.vct_fast_sync = false;
-        let (state, _read, _tip, _change) = zs::init(state_config, &network, boundary, 0)
+        let zakura_state::InitializedState {
+            state,
+            read_state: _read,
+            ..
+        } = zs::init(state_config, &network, boundary, 0)
             .await
             .expect("ephemeral state opens");
         let state = Buffer::new(state, 32);
@@ -546,7 +553,7 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                 .ready()
                 .await
                 .unwrap()
-                .call(Request::Commit(genesis.clone()))
+                .call(Request::Commit(genesis.clone().into()))
                 .await
                 .unwrap(),
             genesis.hash()
@@ -584,11 +591,12 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         };
         let request = if mined {
             Request::CommitMined {
-                block: candidate,
+                size: candidate.zcash_serialized_size(),
+                block: candidate.into(),
                 admission: zs::BlockAdmission::pending(),
             }
         } else {
-            Request::Commit(candidate)
+            Request::Commit(candidate.into())
         };
         let candidate_response = tokio::spawn(router.ready().await.unwrap().call(request));
 
@@ -626,7 +634,7 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
                     .ready()
                     .await
                     .unwrap()
-                    .call(Request::Commit(block.clone()))
+                    .call(Request::Commit(block.clone().into()))
                     .await
                     .unwrap(),
                 block.hash(),
@@ -740,7 +748,7 @@ async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
         };
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            router.oneshot(Request::Commit(Arc::new(block))),
+            router.oneshot(Request::Commit(Arc::new(block).into())),
         )
         .await
         .unwrap()
@@ -833,7 +841,7 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
             .unwrap()
         };
         let checkpoint_error = in_progress_checkpoint()
-            .oneshot(block.clone())
+            .oneshot(block.clone().into())
             .await
             .unwrap_err();
         assert_eq!(
@@ -848,7 +856,7 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
             crate::transaction::boxed_state(unknown_block_state),
             crate::transaction::boxed_transaction_verifier(transaction),
         )
-        .oneshot(Request::Commit(block.clone()))
+        .oneshot(Request::Commit(block.clone().into()))
         .await
         .unwrap_err();
         assert_eq!(
@@ -869,7 +877,7 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
                 ),
             };
             let error = router
-                .oneshot(Request::Commit(block.clone()))
+                .oneshot(Request::Commit(block.clone().into()))
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -936,7 +944,7 @@ async fn forged_height_across_upgrade_is_a_payload_mismatch() {
         ),
     };
     let error = router
-        .oneshot(Request::Commit(Arc::new(block)))
+        .oneshot(Request::Commit(Arc::new(block).into()))
         .await
         .unwrap_err();
     assert_eq!(

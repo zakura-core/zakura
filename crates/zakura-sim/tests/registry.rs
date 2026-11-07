@@ -22,9 +22,10 @@ use zakura_sim::{
     model::{Direction, Label, LabelOutcome, LabelledFrame},
     observe::Exit,
     property::{
-        Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent, HasView,
-        Kind, Lifecycle, LivenessBound, Obligation, ObligationKey, Property, PropertyId, Registry,
-        RegistryChecker, RegistryError, Source, Sources, Status, Subject, Tee, Verdict,
+        Assume, AssumeRecord, Assumptions, Capture, Cardinality, CheckCtx, CheckEvent,
+        EndViolation, HasView, Inconclusive, Kind, Lifecycle, LivenessBound, Obligation,
+        ObligationKey, Property, PropertyId, Registry, RegistryChecker, RegistryError, Source,
+        Sources, Status, Subject, Tee, Verdict,
     },
     ActionSource, Boundary, Checker, HarnessFailure, Identity, IdleStatus, Observation,
     ObservationLog, Outcome, Plan, PropertyOutcome, PropertyReport, RunEnd, RunReport, Sim,
@@ -40,6 +41,8 @@ struct World {
     level: Cell<u32>,
     /// When the view was captured. `None` reads the state live.
     captured: Cell<Option<Capture>>,
+    /// The violations the run's end shows.
+    end: RefCell<Vec<EndViolation>>,
 }
 
 impl HasView for World {
@@ -53,6 +56,11 @@ impl HasView for World {
     /// The capture the test set, or a live read.
     fn captured(&self) -> Capture {
         self.captured.get().unwrap_or(Capture::Live)
+    }
+
+    /// The end violations the test set.
+    fn end_violations(&self, _: &ObservationLog) -> Vec<EndViolation> {
+        self.end.borrow().clone()
     }
 }
 
@@ -674,6 +682,108 @@ fn known_violation_does_not_stop_the_run() {
     );
 }
 
+/// A violation the view reports only at the run's end counts against its
+/// property, at the run's last step. A property already violated keeps its
+/// first violation, and an ID nothing registered is ignored.
+#[test]
+fn an_end_violation_counts_unless_the_property_already_broke() {
+    let bumps = |twice: bool| {
+        let world = honest();
+        world.end.borrow_mut().extend([
+            EndViolation {
+                property: LEVEL,
+                expected: "settled".to_owned(),
+                actual: "still open".to_owned(),
+            },
+            EndViolation {
+                property: PropertyId::new("test/unregistered"),
+                expected: String::new(),
+                actual: String::new(),
+            },
+        ]);
+        let task_world = world.clone();
+        let known = level(Status::Known { issue: 1523 });
+        report(world, vec![known], Assumptions::none(), move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                bump(&task_world);
+                if twice {
+                    task::yield_now().await;
+                    bump(&task_world);
+                }
+            });
+        })
+    };
+
+    let ended = bumps(false);
+    assert_eq!(
+        outcome(&ended, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: vec![ended.end.steps]
+        }
+    );
+    assert!(ended
+        .properties
+        .iter()
+        .all(|p| p.property != "test/unregistered"));
+
+    let broke = bumps(true);
+    assert_eq!(
+        outcome(&broke, &LEVEL),
+        PropertyOutcome::Violated {
+            witness: vec![exit_step(&broke.log, "bump.1")]
+        }
+    );
+}
+
+const SETTLED: PropertyId = PropertyId::new("test/settled-at-two");
+
+/// Holds once the counter reaches 2. At 1 its trigger has fired, but it
+/// can't judge yet, so it's unsettled.
+fn settled_at_two(cx: &mut CheckCtx<'_, World>) -> Verdict {
+    match cx.view() {
+        0 => Verdict::NotApplicable,
+        1 => {
+            cx.unsettled(Inconclusive::TeardownOpen);
+            Verdict::NotApplicable
+        }
+        _ => Verdict::Holds,
+    }
+}
+
+/// A run whose latest evaluation was unsettled is `Inconclusive` with the
+/// check's reason. A later evaluation that judges the property clears it.
+#[test]
+fn an_unsettled_last_evaluation_is_inconclusive() {
+    let bumps = |count| {
+        let world = honest();
+        let task_world = world.clone();
+        let property = Property {
+            id: SETTLED,
+            claim: "the counter settles at 2",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::View],
+            status: Status::Active,
+            check: settled_at_two,
+            witness: None,
+        };
+        report(world, vec![property], Assumptions::none(), move |sim| {
+            sim.scheduler().spawn_root("bump", async move {
+                for _ in 0..count {
+                    bump(&task_world);
+                    task::yield_now().await;
+                }
+            });
+        })
+    };
+    assert_eq!(outcome(&bumps(1), &SETTLED), inconclusive("teardown-open"));
+    assert!(
+        matches!(outcome(&bumps(2), &SETTLED), PropertyOutcome::Held { .. }),
+        "the second bump settles it"
+    );
+    assert_eq!(outcome(&bumps(0), &SETTLED), PropertyOutcome::NotApplicable);
+}
+
 /// An `Ops` bound counts the named task's points of one operation after
 /// the obligation opens.
 #[test]
@@ -745,8 +855,8 @@ fn duplicate_id_rejected() {
     assert_eq!(result.err(), Some(RegistryError::DuplicateId { id: LEVEL }));
 }
 
-/// `Registry::new` rejects an `Ops` bound that names an object until
-/// zakura#1643 keeps `Point.object`.
+/// `Registry::new` rejects an `Ops` bound that names an object until objects
+/// carry creation labels.
 #[test]
 fn ops_bound_with_object_rejected() {
     let property = request_served(

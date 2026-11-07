@@ -33,7 +33,7 @@ use crate::{
     config,
     methods::{LoggedLastEvent, RpcImpl},
     server::RpcServer,
-    MinedBlockEvent, PendingBlockRegistry,
+    EarlyMinedBlock, PendingBlockRegistry,
 };
 
 /// The node's buffered mempool service.
@@ -113,7 +113,7 @@ pub fn new_rpc_impl(
     user_agent: String,
     services: NodeRpcServices,
     last_warn_error_log_rx: LoggedLastEvent,
-    mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+    mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     pending_blocks: PendingBlockRegistry,
     end_of_support_height: Option<block::Height>,
 ) -> (NodeRpcImpl, JoinHandle<()>) {

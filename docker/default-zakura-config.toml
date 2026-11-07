@@ -58,10 +58,9 @@ cookie_dir = "/home/zebra/.cache/zakura"
 cache_dir = "/home/zebra/.cache/zakura"
 
 [tracing]
-# Zebra recognizes whether its logs are being written to a terminal or a file,
-# and uses colored logs for terminals and uncolored logs for files. To force
-# colors even for files, uncomment the line below. To disable colors, set
-# `use_color` to false.
+# Log lines are plain text. When stderr is a terminal, zakurad clears the
+# screen and prints its logo at startup. To do that even when stderr is not a
+# terminal, uncomment the line below. To disable it, set `use_color` to false.
 
 # force_use_color = true
 use_color = true

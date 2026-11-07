@@ -35,9 +35,16 @@ impl Semaphore {
         self.inner.available_permits()
     }
 
+    /// Permits free now, read with no preemption point, for a
+    /// [`boundary_read`](crate::sim::boundary_read).
+    pub fn peek_available(&self) -> usize {
+        self.inner.available_permits()
+    }
+
     /// Adds `n` permits, waking waiters in order.
     #[track_caller]
     pub fn add_permits(&self, n: usize) {
+        crate::sim::refuse_in_boundary_read("adding semaphore permits");
         self.inner.add_permits(n);
         point(Op::Release, Location::caller());
     }

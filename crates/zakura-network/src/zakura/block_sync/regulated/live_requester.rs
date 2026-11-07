@@ -357,6 +357,68 @@ mod tests {
         assert!(!connection.is_cancelled());
     }
 
+    /// A peer fault needs certainty: bytes past what this session asked for, or a
+    /// response with nothing owed. A body that exactly uses its reservation passes.
+    #[test]
+    fn only_bytes_past_the_request_identify_an_over_sender() {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        let frame_payload: Vec<u8> = std::iter::once(MSG_BS_BLOCK)
+            .chain(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.iter().copied())
+            .collect();
+        let body_bytes = u32::try_from(frame_payload.len() - 1).unwrap();
+        let block: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+
+        let authorize_with_reservation = |reserved: Option<u32>| {
+            let pool = ReservationPool::new(1).unwrap();
+            let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+            let (sender, _recv) = framed_channel(1);
+            let requester = LiveRequester {
+                shared: Arc::new(Shared {
+                    requester: Mutex::new(Requester::new(1)),
+                    _session: sender,
+                }),
+                pool: pool.clone(),
+                fence,
+                transport_admits: false,
+            };
+            if let Some(reserved) = reserved {
+                let writer = requester
+                    .reserve(
+                        block::Height(1),
+                        &[hash],
+                        reserved,
+                        pool.try_entry().unwrap(),
+                        requester.open().unwrap(),
+                    )
+                    .unwrap();
+                assert!(writer.publish(|| {}));
+                assert!(writer.try_start(|| true));
+            }
+            requester.authorize(&Frame {
+                message_type: u16::from(MSG_BS_BLOCK),
+                flags: 0,
+                payload: frame_payload.clone(),
+            })
+        };
+
+        assert!(matches!(
+            authorize_with_reservation(Some(body_bytes)),
+            Ok(Authorization::Block(block::Height(1)))
+        ));
+        assert!(matches!(
+            authorize_with_reservation(Some(body_bytes - 1)),
+            Err(SinkReject::Protocol(_))
+        ));
+        assert!(matches!(
+            authorize_with_reservation(None),
+            Err(SinkReject::Protocol(_))
+        ));
+    }
+
     #[test]
     fn missing_endings_close_without_peer_fault_and_keep_entries_through_reader_cleanup() {
         let pool = ReservationPool::new(3).unwrap();

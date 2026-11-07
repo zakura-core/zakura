@@ -330,7 +330,10 @@ fn rejections_clear_when_a_block_frees_space() {
     assert!(storage.contains_rejected(&cheap_id));
 
     // A block mines one transaction, which frees space and clears the tip rejections.
-    storage.reject_and_remove_same_effects(&[mined_id.mined_id()].into(), vec![]);
+    storage.reject_and_remove_same_effects(
+        &[mined_id.mined_id()].into(),
+        Vec::<Arc<zakura_chain::transaction::Transaction>>::new(),
+    );
     storage.clear_tip_rejections();
 
     assert_eq!(storage.insert(cheap.clone(), vec![], None), Ok(cheap_id));
@@ -483,7 +486,10 @@ fn mining_a_parent_releases_capacity_for_another_grandchild() {
     insert(&mut storage, &grandchild, vec![first_output(&child)]);
     let mined = [parent.transaction.id().mined_id()].into();
     storage.clear_mined_dependencies(&mined);
-    storage.reject_and_remove_same_effects(&mined, vec![]);
+    storage.reject_and_remove_same_effects(
+        &mined,
+        Vec::<Arc<zakura_chain::transaction::Transaction>>::new(),
+    );
     let next = factory.tx(10_000);
     insert(&mut storage, &next, vec![first_output(&grandchild)]);
     storage.verified.assert_dependency_groups_are_bounded();
@@ -977,7 +983,7 @@ proptest! {
                 let mined = roots[parent_picks.first().map_or(0, |pick| pick.index(roots.len()))];
                 let mined: HashSet<_> = [mined].into();
                 storage.clear_mined_dependencies(&mined);
-                storage.reject_and_remove_same_effects(&mined, vec![]);
+                storage.reject_and_remove_same_effects(&mined, Vec::<Arc<zakura_chain::transaction::Transaction>>::new());
                 storage.verified.assert_dependency_groups_are_bounded();
                 continue;
             }

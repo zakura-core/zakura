@@ -32,9 +32,7 @@ pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARG
 /// `RETAINED_PATH_LEASE_IDLE`.
 pub const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
-/// The most headers one page or one bounded path covers, zakura-state's
-/// `MAX_HEADER_SYNC_HEIGHT_RANGE`.
-pub const MAX_HEADER_SYNC_HEIGHT_RANGE: u32 = 4_000;
+pub use crate::full_state::MAX_HEADER_SYNC_HEIGHT_RANGE;
 
 /// Which slots a lease may use. Ordinary leases use all but one slot. A
 /// path short enough for one page may also use the last, reserve slot.

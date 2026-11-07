@@ -81,6 +81,11 @@ pub struct SessionLayout {
 }
 
 impl SessionLayout {
+    /// A layout of `streams`, which the caller has validated and ordered by kind.
+    pub(crate) fn from_validated(streams: Arc<[Stream]>) -> Self {
+        Self { streams }
+    }
+
     /// The session's streams, ordered by kind.
     pub fn streams(&self) -> &[Stream] {
         &self.streams
@@ -191,9 +196,7 @@ impl ServiceRegistry {
                     }
                 })?;
                 primary_kind = Some(primary.kind);
-                let layout = SessionLayout {
-                    streams: streams.into(),
-                };
+                let layout = SessionLayout::from_validated(streams.into());
                 for stream in layout.streams.iter() {
                     session_layouts.insert((stream.kind, stream.version), layout.clone());
                 }
@@ -496,6 +499,22 @@ impl ServiceRegistry {
                 frame,
             )
             .await
+    }
+
+    /// The protocol checks [`request`](Self::request) would run on `frame`,
+    /// without the service's work.
+    pub fn check_request(&self, stream_kind: u16, frame: &Frame) -> Result<(), SinkReject> {
+        let Some(service) = self.service_for_kind(stream_kind) else {
+            return Err(SinkReject::protocol(
+                "request stream kind is not registered",
+            ));
+        };
+        let Some(handler) = service.as_request_response() else {
+            return Err(SinkReject::protocol(
+                "service does not accept request frames",
+            ));
+        };
+        handler.check_request(stream_kind, frame)
     }
 
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.

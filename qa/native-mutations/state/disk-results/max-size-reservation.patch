@@ -1,0 +1,13 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -266,8 +266,8 @@ impl ZakuraDb {
+     /// The block's recorded serialized size, or the largest legal size when the
+     /// database has no record for it. Reads reserve memory from this bound.
+     fn stored_block_size(&self, height: Height) -> u64 {
+-        self.block_info(height.into())
+-            .map_or(MAX_BLOCK_BYTES, |info| u64::from(info.size()))
++        let _ = height;
++        MAX_BLOCK_BYTES
+     }
+ 
+     /// Decode a stored block without read admission, and report its serialized size.

@@ -2,16 +2,15 @@
 //! witness test fails.
 #![cfg(zakura_sim)]
 
-use std::{fs, path::Path, time::Duration};
-
-use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 use zakura_rt::time::sleep;
 use zakura_sim::{
     domain::discovery::WAIT_COMPLETE_WAKES,
     harness::{self, discovery::WaitComplete, Subsystem},
     property::{
-        HasView, Kind, LivenessBound, Property, PropertyId, Source, Status, Subject, Verdict,
+        HasView, Kind, LivenessBound, Property, PropertyId, Source, Status, Subject,
+        TriggerHistory, Verdict,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig, Sim,
@@ -104,48 +103,6 @@ fn unregistered_property_fails() {
     );
 }
 
-/// A committed fuzz input's sidecar, `<name>.toml` beside `<name>.bin`.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Sidecar {
-    /// The harness that runs the input.
-    harness: String,
-    /// The harness's generator version when the input was built.
-    generator: u32,
-    /// The input's SHA-256, in hex.
-    sha256: String,
-}
-
-/// Every committed fuzz input has a sidecar that names a registered
-/// harness at its current generator and matches the input's digest, so the
-/// explorer can seed its corpus from them.
-#[test]
-fn committed_inputs_match_their_sidecars() {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let mut inputs = 0;
-    for entry in fs::read_dir(&fixtures).expect("the fixture directory exists") {
-        let path = entry.expect("the directory lists").path();
-        if path.extension().is_none_or(|e| e != "bin") {
-            continue;
-        }
-        inputs += 1;
-        let sidecar = path.with_extension("toml");
-        let text = fs::read_to_string(&sidecar)
-            .unwrap_or_else(|error| panic!("{}: {error}", sidecar.display()));
-        let sidecar: Sidecar =
-            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", sidecar.display()));
-        let entry = harness::find(&sidecar.harness).expect("the sidecar names a harness");
-        assert_eq!(sidecar.generator, entry.generator, "{}", path.display());
-        let bytes = fs::read(&path).expect("the input reads");
-        let digest: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        assert_eq!(sidecar.sha256, digest, "{}", path.display());
-    }
-    assert!(inputs > 0, "the S4.7 input is committed");
-}
-
 /// What [`Probe`]'s one task does.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 enum Behavior {
@@ -212,7 +169,7 @@ impl Subsystem for Probe {
             needs: &[Source::Schedule],
             status,
             check: |_| Verdict::Holds,
-            witness: Some(any_step),
+            witness: Some(TriggerHistory::Log(any_step)),
         };
         vec![
             holds(HOLDS, Status::Active),
@@ -232,7 +189,7 @@ impl Subsystem for Probe {
                     cx.oblige(obligation);
                     Verdict::Holds
                 },
-                witness: Some(any_step),
+                witness: Some(TriggerHistory::Log(any_step)),
             },
             Property {
                 witness: None,
@@ -311,13 +268,19 @@ fn unrelated_violation_fails() {
     }
 }
 
-/// A property with no trigger-history check can't back a witness test.
+/// A property with no trigger-history check can't back a `Holds` or
+/// `Violated` witness test. An `Applicable` one claims no bug, so it
+/// passes on the property's outcome.
 #[test]
 fn no_trigger_history_fails() {
-    assert_eq!(
-        witness(probe(Behavior::Sleep), NO_HISTORY, Expect::Holds),
-        Err(WitnessError::NoTriggerHistory)
-    );
+    for expect in [Expect::Holds, Expect::Violated] {
+        assert_eq!(
+            witness(probe(Behavior::Sleep), NO_HISTORY, expect),
+            Err(WitnessError::NoTriggerHistory),
+            "{expect:?}"
+        );
+    }
+    check_witness(probe(Behavior::Sleep), NO_HISTORY, Expect::Applicable);
 }
 
 /// Recording a witness test writes the trace of the run it judged, and

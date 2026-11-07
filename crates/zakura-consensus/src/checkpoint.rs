@@ -1247,8 +1247,23 @@ where
         Poll::Ready(Ok(()))
     }
 
-    #[instrument(name = "checkpoint", skip(self, block))]
     fn call(&mut self, block: BlockHandle) -> Self::Future {
+        self.call_with_origin(block, zs::BlockOrigin::Network)
+    }
+}
+
+impl<S> CheckpointVerifier<S>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    /// Verify and commit a block while retaining its source through detached checkpoint work.
+    #[instrument(name = "checkpoint", skip(self, block))]
+    pub fn call_with_origin(
+        &mut self,
+        block: BlockHandle,
+        origin: zs::BlockOrigin,
+    ) -> <Self as Service<BlockHandle>>::Future {
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();
@@ -1277,6 +1292,7 @@ where
             Err(e) => return async { Err(e) }.boxed(),
         };
 
+        req_block.block = req_block.block.with_origin(origin);
         self.process_checkpoint_range();
 
         metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);

@@ -31,7 +31,7 @@ use zakura_network::{
     AddressBook, InventoryResponse, PeerSocketAddr, Request, Response,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::EarlyMinedBlockChannel;
 use zakura_state::{ChainTipChange, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -45,7 +45,7 @@ use crate::{
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
-        sync::{self, BlockGossipError, SyncStatus},
+        sync::{self, BlockGossipError, RecentSyncLengths, SyncStatus},
     },
     BoxError,
 };
@@ -85,6 +85,7 @@ async fn empty_mempool_requests_return_empty_inventory() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let response = timeout(
@@ -114,6 +115,7 @@ async fn mempool_requests_for_transactions() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(true).await;
 
     let added_transactions: Vec<UnminedTx> = added_transactions
@@ -195,6 +197,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Test `Request::PushTransaction`
@@ -287,6 +290,7 @@ async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), 
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let peer_source =
@@ -373,6 +377,7 @@ async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), cr
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let source =
@@ -456,6 +461,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Test `Request::AdvertiseTransactionIds`
@@ -554,6 +560,7 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let peer_id = zakura_network::zakura::ZakuraPeerId::new(vec![7; 32])
@@ -654,6 +661,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Push test transaction
@@ -952,6 +960,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
+        _syncer,
     ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 2 is the tip child. Rewriting only its
@@ -1058,6 +1067,7 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
+        _syncer,
     ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
@@ -1142,6 +1152,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
         mut chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Get the next block
@@ -1258,10 +1269,14 @@ async fn caches_getaddr_response() {
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         // UTXO verification doesn't matter for these tests.
-        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
-            zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
-                .await
-                .expect("ephemeral state initialization succeeds");
+        let zakura_state::InitializedState {
+            state,
+            read_state: _read_only_state_service,
+            latest_chain_tip,
+            ..
+        } = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1415,10 +1430,14 @@ async fn refused_block_reads_send_notfound() {
     let unknown = zakura_chain::block::Hash([0x22; 32]);
     let broken = zakura_chain::block::Hash([0x33; 32]);
 
-    let (_state, _read_only_state, latest_chain_tip, _chain_tip_change) =
-        zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state: _state,
+        read_state: _read_only_state,
+        latest_chain_tip,
+        ..
+    } = zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let state = Buffer::new(
         BoxService::new(tower::service_fn(move |request| async move {
             match request {
@@ -1522,6 +1541,7 @@ async fn setup(
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
+    RecentSyncLengths,
 ) {
     let (
         inbound_service,
@@ -1535,6 +1555,7 @@ async fn setup(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         _misbehavior_rx,
+        syncer,
     ) = setup_with_misbehavior_receiver(add_transactions).await;
 
     (
@@ -1548,6 +1569,7 @@ async fn setup(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        syncer,
     )
 }
 
@@ -1577,6 +1599,7 @@ async fn setup_with_misbehavior_receiver(
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
     tokio::sync::mpsc::Receiver<(PeerSocketAddr, u32)>,
+    RecentSyncLengths,
 ) {
     let _init_guard = zakura_test::init();
 
@@ -1593,10 +1616,15 @@ async fn setup_with_misbehavior_receiver(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state,
+        read_state: read_only_state_service,
+        latest_chain_tip,
+        mut chain_tip_change,
+        block_announcements,
+    } = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1688,15 +1716,15 @@ async fn setup_with_misbehavior_receiver(
     // Pretend we're close to tip
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
     let sync_gossip_task_handle = tokio::spawn(
         sync::gossip_best_tip_block_hashes(
             sync_status.clone(),
-            chain_tip_change.clone(),
+            latest_chain_tip.clone(),
+            block_announcements,
             peer_set.clone(),
             read_only_state_service,
             Some(submitblock_channel.receiver()),
-            zakura_rpc::MinedSubmissions::default(),
         )
         .in_current_span(),
     );
@@ -1775,6 +1803,7 @@ async fn setup_with_misbehavior_receiver(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         misbehavior_rx,
+        recent_syncs,
     )
 }
 

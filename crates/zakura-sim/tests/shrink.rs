@@ -21,7 +21,7 @@ use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, run_harness, HarnessEntry, RecordInput, Subsystem},
-    property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, Verdict},
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, TriggerHistory, Verdict},
     record::{DrawRecord, Record, StepRecord},
     trace::{
         replay_explained_with, replay_with,
@@ -278,7 +278,7 @@ fn stale_properties<S: Subsystem>() -> Vec<Property<S>> {
         needs: &[],
         status: Status::Active,
         check,
-        witness: Some(witness),
+        witness: Some(TriggerHistory::Log(witness)),
     };
     vec![
         property(
@@ -598,6 +598,7 @@ fn skipped_pick_runs_the_default() {
         offset: None,
         draws: Vec::new(),
         obs: None,
+        machine: None,
     };
     let ping = StepRecord {
         pick: Identity::peer("p1", "ping1").to_string(),
@@ -695,6 +696,7 @@ fn deletion_takes_later_same_source_picks() {
             offset: None,
             draws: Vec::new(),
             obs: None,
+            machine: None,
         })
     };
     let picks = [
@@ -882,7 +884,7 @@ impl Subsystem for PlantedClock {
             needs: &[],
             status: Status::Active,
             check: no_clock_read,
-            witness: Some(any_run),
+            witness: Some(TriggerHistory::Log(any_run)),
         }]
     }
 
@@ -950,9 +952,21 @@ fn interrupt_keeps_best() {
         std::fs::read(out.path().join(ORIGINAL_DIR).join(TRACE_FILE)).unwrap(),
         recorded
     );
-    // The best candidate so far is kept as a plan and re-recorded.
+    // The best candidate keeps its scenario and plan together.
     assert!(out.path().join(BEST_PLAN_FILE).is_file());
     let reduced = open(&out.path().join(REDUCED_DIR));
+    let candidate: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            out.path()
+                .join(zakura_sim::trace::shrink::BEST_CANDIDATE_FILE),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.path().join(BEST_PLAN_FILE)).unwrap()).unwrap();
+    assert_eq!(candidate["scenario"], reduced.meta.scenario);
+    assert_eq!(candidate["plan"], plan);
     let after = report.after.unwrap();
     assert_eq!(after, Counts::of(&reduced));
     assert!(after.non_default <= report.before.non_default);
@@ -981,6 +995,7 @@ fn shrink_report_counts_executed_events() {
         Counts {
             non_default: picks(&original),
             events: original.end.as_ref().unwrap().steps,
+            input_bytes: None,
         }
     );
     assert_eq!(
@@ -988,6 +1003,7 @@ fn shrink_report_counts_executed_events() {
         Some(Counts {
             non_default: picks(&reduced),
             events: reduced.end.as_ref().unwrap().steps,
+            input_bytes: None,
         })
     );
     assert!(report.fixed_point && report.stopped.is_none(), "{report:?}");
@@ -1102,7 +1118,7 @@ impl Subsystem for LeakingFailure {
                     Verdict::Holds
                 }
             },
-            witness: Some(any_run),
+            witness: Some(TriggerHistory::Log(any_run)),
         }]
     }
 

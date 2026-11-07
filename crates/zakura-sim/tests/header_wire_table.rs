@@ -3,13 +3,13 @@
 //! of a header-sync rule, from a setup history that brings its models to the
 //! state the act needs. Each frame's label comes from the peer's models, its
 //! judgement from the node's reader stage that decides it, and its
-//! consequence from P3b's generated properties, assembled here from
-//! `table_properties` (M5-Q13).
+//! consequence from P3b's generated properties, which the harness registers
+//! (M5-Q13, P3d).
 #![cfg(zakura_sim)]
 
 mod support;
 
-use std::{collections::BTreeMap, rc::Rc};
+use std::collections::BTreeMap;
 
 use support::inputs;
 use zakura_network::zakura::v9::RegtestMessage;
@@ -27,8 +27,6 @@ use zakura_sim::{
         limit::ADVERSARY_RATE,
         peer_addr, PeerAction, PeerSpec, NODE_ADDR,
     },
-    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
-    table::table_properties,
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
@@ -41,41 +39,11 @@ const ONE_PAGE: CreditSpec = CreditSpec {
     bytes: 263,
 };
 
-/// A view-less harness, for the generated properties, which read only the
-/// log.
-struct Logged;
-
-impl HasView for Logged {
-    type View = ();
-
-    /// Nothing.
-    fn view(&self) {}
-}
-
-/// Every generated receiver property of header sync's table (M5-Q13).
-fn table_checker() -> RegistryChecker<Logged> {
-    let properties: Vec<Property<Logged>> =
-        table_properties("header-sync", &RegtestMessage::LAYOUT);
-    RegistryChecker::new(
-        Registry::new(properties).expect("generated IDs are unique"),
-        Rc::new(Logged),
-        Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Storage]),
-    )
-}
-
-/// Runs `scenario` under `plan` with [`table_checker`], and returns the
-/// report even of a run that ended in a harness failure.
+/// Runs `scenario` under `plan`, and returns the report even of a run that
+/// ended in a harness failure.
 fn run(scenario: &WireScenario, plan: PlanInput) -> RunReport {
     let ports = HeaderWire::prepare(scenario);
-    let mut checker = table_checker();
-    let ran = run_prepared::<HeaderWire>(
-        scenario,
-        ports,
-        plan,
-        &mut MemorySink::default(),
-        Some(&mut checker),
-    );
+    let ran = run_prepared::<HeaderWire>(scenario, ports, plan, &mut MemorySink::default(), None);
     match ran {
         Ok(report) => report,
         Err(HarnessError::Run { report, .. }) => *report,
@@ -483,6 +451,9 @@ fn check(act: Act, withhold: bool, plan: PlanInput) -> Checked {
     // its step, so only the absence of a read tells the stages apart.
     match stage(act) {
         Stage::Header => assert_eq!(read, None, "{act:?}: a header-stage fault was read whole"),
+        // A session that already handled the first ending has no subscription
+        // left, so its precheck refuses this one unread, as `ExtraEnding`.
+        Stage::Frame if matches!(act, Act::ExtraEndingAhead) && read.is_none() => {}
         Stage::Frame => assert!(
             read.is_some_and(|read| read < judged),
             "{act:?}: judged before its payload was read"

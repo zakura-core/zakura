@@ -1156,3 +1156,692 @@ fn a_foreign_storage_failure_replays_exactly() {
     .expect("the trace replays");
     assert!(report.verified(), "{report:?}");
 }
+
+const WORK_INPUT: &[u8] = include_bytes!("fixtures/block-work-ownership.bin");
+
+#[test]
+fn work_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_WORK_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(report.end.unwrap().steps, 10);
+    }
+}
+
+#[test]
+fn work_machine_records_and_replays_without_transport() {
+    let dir = record_named("block/work-ownership", WORK_INPUT);
+    let trace = open(dir.path());
+    let entry = harness::find("block/work-ownership").unwrap();
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/work-ownership",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), 10);
+    assert_eq!(trace.meta.scenario["input"], json!(WORK_INPUT));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:block-work:")));
+    assert!(trace.steps.iter().all(|step| step.draws.is_empty()));
+    assert!(trace
+        .steps
+        .iter()
+        .any(|step| matches!(step.machine.as_deref(), Some(zakura_sim::record::machine::MachineStep::Work(work)) if work.actual.reserved > 0)));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    // The property applies from step 3, the first whose model holds a charged
+    // in-flight item, through step 10.
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 8 }
+    );
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "work_machine_replay_child"])
+        .env("ZAKURA_WORK_MACHINE_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 3)["machine"]["step"]["actual"]["reserved"] = json!(999);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 3,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn work_machine_preserves_empty_and_short_inputs() {
+    for input in [&[][..], &[0, 0][..], WORK_INPUT] {
+        let entry = harness::find("block/work-ownership").unwrap();
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        let mut sink = zakura_sim::MemorySink::default();
+        let explored = (entry.run_bytes)(input, &mut sink, None);
+        assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+        assert_eq!(
+            explored.result.unwrap().end.steps,
+            input.len().div_ceil(4) as u64
+        );
+        assert_eq!(trace.steps.len(), input.len().div_ceil(4));
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+}
+
+#[test]
+fn work_machine_prefix_and_missing_evidence_never_verify() {
+    let dir = record_named("block/work-ownership", WORK_INPUT);
+    edit(dir.path(), |lines| {
+        lines.truncate(5);
+    });
+    assert!(TraceReader::open(dir.path()).is_err());
+    let prefix = TraceReader::open_prefix(dir.path()).unwrap();
+    let report = replay(
+        &prefix,
+        ReplayOptions {
+            prefix: true,
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.verified());
+    assert!(!report.complete);
+    assert!(report.end.is_none());
+
+    let dir = record_named("block/work-ownership", WORK_INPUT);
+    edit(dir.path(), |lines| {
+        step(lines, 2).as_object_mut().unwrap().remove("machine");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 2,
+            field: "machine"
+        })
+    ));
+}
+
+const FUNDING_INPUT: &[u8] = include_bytes!("fixtures/block-work-funding.bin");
+
+const RETENTION_INPUT: &[u8] = include_bytes!("fixtures/block-decoded-retention.bin");
+
+#[test]
+fn decoded_retention_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_DECODED_RETENTION_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(
+            report.end.unwrap().steps,
+            RETENTION_INPUT.len() as u64 / 4 + 1
+        );
+    }
+}
+
+#[test]
+fn decoded_retention_replays_final_holders_in_a_fresh_process() {
+    use zakura_sim::record::machine::MachineStep;
+    let entry = harness::find("block/decoded-retention").unwrap();
+    let dir = record(entry, RETENTION_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/decoded-retention",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.meta.scenario["input"], json!(RETENTION_INPUT));
+    assert_eq!(trace.meta.generator, 1);
+    assert_eq!(trace.steps.len(), RETENTION_INPUT.len() / 4 + 1);
+    let Some(MachineStep::DecodedRetention(parts)) = trace.steps[5].machine.as_deref() else {
+        panic!("missing allocation reads")
+    };
+    let actual = parts.actual.as_ref().unwrap();
+    assert_eq!(actual.allocations[0].holders, 3);
+    assert_eq!(actual.allocations[0].transaction_holders, vec![1]);
+    let Some(MachineStep::DecodedRetention(closed)) = trace.steps[9].machine.as_deref() else {
+        panic!("missing closed-pool read")
+    };
+    assert!(closed.actual.as_ref().unwrap().pools[2].closed);
+    // Closing pool 2 while a handle retains its charge keeps that charge until the drain.
+    let charged = record(entry, &[0, 0, 0, 2, 6, 0, 0, 2]);
+    let charged = open(charged.path());
+    let Some(MachineStep::DecodedRetention(closed)) = charged.steps[1].machine.as_deref() else {
+        panic!("missing charged closed-pool read")
+    };
+    assert!(closed.actual.as_ref().unwrap().pools[2].closed);
+    assert_eq!(closed.actual.as_ref().unwrap().pools[2].blocks, 1);
+    let Some(MachineStep::DecodedRetention(drain)) = trace.steps.last().unwrap().machine.as_deref()
+    else {
+        panic!("missing pre-destruction drain")
+    };
+    assert!(drain.drain);
+    assert!(drain
+        .actual
+        .as_ref()
+        .unwrap()
+        .pools
+        .iter()
+        .all(|pool| pool.bytes == 0));
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "decoded_retention_replay_child"])
+        .env("ZAKURA_DECODED_RETENTION_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+    edit(dir.path(), |lines| {
+        step(lines, 6)["machine"]["step"]["actual"]["allocations"][0]["transaction_holders"][0] =
+            json!(2);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 6,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn decoded_retention_preserves_short_inputs_and_requires_a_live_witness() {
+    let entry = harness::find("block/decoded-retention").unwrap();
+    for input in [&[][..], &[0, 0][..], RETENTION_INPUT] {
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        assert_eq!(trace.steps.len(), input.len().div_ceil(4) + 1);
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+    // An empty run never reaches the trigger, so the property never applies.
+    assert_eq!(
+        (entry.witness)(
+            &json!({"input": []}),
+            PlanInput::Bytes(Vec::new()),
+            "block/decoded-retention",
+            zakura_sim::witness::Expect::Holds,
+            &mut zakura_sim::NullSink,
+        ),
+        Err(zakura_sim::witness::WitnessError::Outcome(
+            PropertyOutcome::NotApplicable
+        ))
+    );
+}
+
+#[test]
+fn work_funding_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_WORK_FUNDING_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(
+            report.end.unwrap().steps,
+            (FUNDING_INPUT.len() / 4 + 1) as u64
+        );
+    }
+}
+
+#[test]
+fn work_funding_records_and_replays_retained_runtime_owners() {
+    use zakura_sim::record::machine::MachineStep;
+    let entry = harness::find("block/work-funding").unwrap();
+    let dir = record(entry, FUNDING_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/work-funding",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), FUNDING_INPUT.len() / 4 + 1);
+    assert_eq!(trace.meta.scenario["input"], json!(FUNDING_INPUT));
+    assert_eq!(trace.meta.generator, 2);
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:block-work-funding:") && step.draws.is_empty()));
+    let Some(MachineStep::WorkFunding(reset)) = trace.steps[7].machine.as_deref() else {
+        panic!("runtime funding view missing");
+    };
+    assert_eq!(reset.actual.reserved, 100);
+    assert_eq!(reset.actual.receipts[0].bytes, 100);
+    assert_eq!(reset.actual.funded, 0);
+    let Some(MachineStep::WorkFunding(drain)) = trace.steps.last().unwrap().machine.as_deref()
+    else {
+        panic!("runtime funding drain missing");
+    };
+    assert!(drain.drain);
+    assert_eq!(drain.actual.reserved, 0);
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    // The property applies from the first step whose prefix reaches the
+    // trigger. A `Holds` trigger needs the final drain, so only that step counts.
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 1 }
+    );
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "work_funding_replay_child"])
+        .env("ZAKURA_WORK_FUNDING_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 8)["machine"]["step"]["actual"]["receipts"][0]["bytes"] = json!(99);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 8,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn work_funding_preserves_short_inputs_and_observes_drain() {
+    let entry = harness::find("block/work-funding").unwrap();
+    for input in [&[][..], &[0, 0][..], FUNDING_INPUT, &[0; 512][..]] {
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        let mut sink = zakura_sim::MemorySink::default();
+        let explored = (entry.run_bytes)(input, &mut sink, None);
+        assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+        assert_eq!(
+            explored.result.unwrap().end.steps,
+            input.len().div_ceil(4) as u64 + 1
+        );
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+    // A drain-only run never reaches the trigger, so the property never applies.
+    assert_eq!(
+        (entry.witness)(
+            &json!({"input": []}),
+            PlanInput::Bytes(Vec::new()),
+            "block/work-funding",
+            zakura_sim::witness::Expect::Holds,
+            &mut zakura_sim::NullSink
+        ),
+        Err(zakura_sim::witness::WitnessError::Outcome(
+            PropertyOutcome::NotApplicable
+        ))
+    );
+}
+
+#[test]
+fn work_funding_missing_evidence_and_drain_cannot_verify() {
+    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    edit(dir.path(), |lines| {
+        step(lines, 2).as_object_mut().unwrap().remove("machine");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 2,
+            field: "machine"
+        })
+    ));
+    let dir = record_named("block/work-funding", FUNDING_INPUT);
+    edit(dir.path(), |lines| {
+        lines.truncate(lines.len() - 2);
+    });
+    assert!(TraceReader::open(dir.path()).is_err());
+    let prefix = TraceReader::open_prefix(dir.path()).unwrap();
+    let report = replay(
+        &prefix,
+        ReplayOptions {
+            prefix: true,
+            ..ReplayOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.verified());
+    assert!(!report.complete);
+    assert!(report.end.is_none());
+}
+
+const REACTOR_INPUT: &[u8] = include_bytes!("fixtures/header-reactor-policy.bin");
+
+#[test]
+fn reactor_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_REACTOR_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+    }
+}
+
+#[test]
+fn reactor_machine_records_and_replays_without_transport() {
+    let dir = record_named("header/reactor-policy", REACTOR_INPUT);
+    let trace = open(dir.path());
+    let entry = harness::find("header/reactor-policy").unwrap();
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "header/reactor-policy",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), REACTOR_INPUT.len().div_ceil(4));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:header-reactor:")));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "reactor_machine_replay_child"])
+        .env("ZAKURA_REACTOR_MACHINE_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 3)["machine"]["step"]["actual"]["revision"] = json!(999);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 3,
+            field: "machine"
+        })
+    ));
+}
+
+const PUBLISHER_INPUT: &[u8] = include_bytes!("fixtures/header-publisher-policy.bin");
+
+#[test]
+fn publisher_machine_records_and_replays_without_transport() {
+    let name = "header/publisher-policy";
+    let dir = record_named(name, PUBLISHER_INPUT);
+    let trace = open(dir.path());
+    (harness::find(name).unwrap().witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        name,
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), PUBLISHER_INPUT.len().div_ceil(4));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:header-publisher:")));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+
+    edit(dir.path(), |lines| {
+        step(lines, 3)["machine"]["step"]["actual"]["slots"] = json!(999);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 3,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn reactor_machine_preserves_empty_and_short_inputs() {
+    for input in [&[][..], &[0, 0][..], REACTOR_INPUT] {
+        let entry = harness::find("header/reactor-policy").unwrap();
+        let dir = record(entry, input);
+        let trace = open(dir.path());
+        let mut sink = zakura_sim::MemorySink::default();
+        let explored = (entry.run_bytes)(input, &mut sink, None);
+        assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+        assert_eq!(
+            explored.result.unwrap().end.steps,
+            input.len().div_ceil(4) as u64
+        );
+        assert!(replayed(dir.path(), ReplayOptions::default())
+            .unwrap()
+            .verified());
+    }
+}
+
+const BLOCK_REACTOR_INPUT: &[u8] = include_bytes!("fixtures/block-reactor-policy.bin");
+
+#[test]
+fn block_reactor_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_BLOCK_REACTOR_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert_eq!(report.end.unwrap().steps, 15);
+    }
+}
+
+#[test]
+fn reactor_machine_records_and_replays_query_identities() {
+    use zakura_sim::record::machine::{MachineStep, ReactorAction, ReactorRefusal};
+    let entry = harness::find("block/reactor-policy").unwrap();
+    let dir = record(entry, BLOCK_REACTOR_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "block/reactor-policy",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), 15);
+    assert_eq!(trace.meta.scenario["input"], json!(BLOCK_REACTOR_INPUT));
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:block-reactor:") && step.draws.is_empty()));
+    let actions = |index: usize| {
+        let Some(MachineStep::Reactor(step)) = trace.steps[index].machine.as_deref() else {
+            panic!("reactor evidence missing");
+        };
+        step.actions.clone()
+    };
+    assert!(matches!(
+        actions(0).as_slice(),
+        [ReactorAction::AuthorityChanged { .. }, ReactorAction::QueryAccepted { query }]
+            if query.query_id == 1
+    ));
+    assert!(matches!(
+        actions(1).as_slice(),
+        [ReactorAction::QueryRefused { query, refusal: ReactorRefusal::Full }]
+            if query.query_id == 2
+    ));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "block_reactor_machine_replay_child"])
+        .env("ZAKURA_BLOCK_REACTOR_MACHINE_CHILD", dir.path())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+
+    edit(dir.path(), |lines| {
+        step(lines, 2)["machine"]["step"]["actual"]["state"]["next_query_id"] = json!(99);
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 2,
+            field: "machine"
+        })
+    ));
+}
+
+const DISCOVERY_BOOK_INPUT: &[u8] = include_bytes!("fixtures/discovery-record-book.bin");
+const DISCOVERY_STATE_INPUT: &[u8] = include_bytes!("fixtures/discovery-session-installation.bin");
+
+#[test]
+fn discovery_machine_replay_child() {
+    if let Some(dir) = std::env::var_os("ZAKURA_DISCOVERY_MACHINE_CHILD") {
+        let report = replayed(Path::new(&dir), ReplayOptions::default()).unwrap();
+        assert!(report.verified(), "{report:?}");
+    }
+}
+
+/// Replays the trace in `dir` in a fresh process.
+fn replay_in_child(dir: &Path) {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "discovery_machine_replay_child"])
+        .env("ZAKURA_DISCOVERY_MACHINE_CHILD", dir)
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    assert!(
+        String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+}
+
+#[test]
+fn discovery_book_records_and_replays_signed_samples() {
+    use zakura_sim::record::machine::MachineStep;
+    let entry = harness::find("discovery/record-book").unwrap();
+    let dir = record(entry, DISCOVERY_BOOK_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "discovery/record-book",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.meta.generator, 2);
+    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 4);
+    assert!(trace
+        .steps
+        .iter()
+        .all(|step| step.pick.starts_with("machine:discovery-book:") && step.draws.is_empty()));
+    let books = || {
+        trace
+            .steps
+            .iter()
+            .filter_map(|step| match step.machine.as_deref() {
+                Some(MachineStep::DiscoveryBook(book)) => Some(book),
+                _ => None,
+            })
+    };
+    let sampled = books().find(|book| !book.sample.is_empty()).unwrap();
+    assert!(sampled.sample.len() <= 3, "a window holds three records");
+    assert!(books().all(|book| book.actual == book.expected));
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    // The property applies from the first step whose prefix reaches the
+    // trigger, so 13 of the input's 20 steps count.
+    assert_eq!(trace.steps.len(), 20);
+    assert_eq!(
+        report.properties[0].outcome,
+        PropertyOutcome::Held { applicable: 13 }
+    );
+    replay_in_child(dir.path());
+
+    // A changed signed sample or a changed eviction fact cannot replay.
+    let sampled_step = u64::try_from(sampled.step).unwrap();
+    edit(dir.path(), |lines| {
+        let sample = &mut step(lines, sampled_step)["machine"]["step"]["sample"][0];
+        *sample = json!("00");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            field: "machine",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn discovery_state_records_and_replays_installations() {
+    let entry = harness::find("discovery/session-installation").unwrap();
+    let dir = record(entry, DISCOVERY_STATE_INPUT);
+    let trace = open(dir.path());
+    (entry.witness)(
+        &trace.meta.scenario,
+        PlanInput::Bytes(Vec::new()),
+        "discovery/session-installation",
+        zakura_sim::witness::Expect::Holds,
+        &mut zakura_sim::NullSink,
+    )
+    .unwrap();
+    assert_eq!(trace.steps.len(), DISCOVERY_STATE_INPUT.len() / 4);
+    let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
+    assert!(report.verified());
+    replay_in_child(dir.path());
+    edit(dir.path(), |lines| {
+        step(lines, 1).as_object_mut().unwrap().remove("machine");
+    });
+    assert!(matches!(
+        replayed(dir.path(), ReplayOptions::default()),
+        Err(ReplayError::Nondeterministic {
+            step: 1,
+            field: "machine"
+        })
+    ));
+}
+
+#[test]
+fn discovery_machines_preserve_empty_and_short_inputs() {
+    for name in ["discovery/record-book", "discovery/session-installation"] {
+        for input in [&[][..], &[0, 0][..], &[0; 512][..]] {
+            let entry = harness::find(name).unwrap();
+            let dir = record(entry, input);
+            let trace = open(dir.path());
+            let mut sink = zakura_sim::MemorySink::default();
+            let explored = (entry.run_bytes)(input, &mut sink, None);
+            assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
+            assert_eq!(trace.steps.len(), input.len().div_ceil(4));
+            assert!(replayed(dir.path(), ReplayOptions::default())
+                .unwrap()
+                .verified());
+        }
+    }
+}
+
+#[test]
+fn verification_capacity_replays_in_a_fresh_process() {
+    let dir = record_named("discovery/verification-capacity", &[]);
+    assert!(replayed(dir.path(), ReplayOptions::default())
+        .unwrap()
+        .verified());
+    replay_in_child(dir.path());
+}

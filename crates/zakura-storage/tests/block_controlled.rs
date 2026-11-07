@@ -130,7 +130,7 @@ impl Harness {
             owner: self.scope().bind(1, NonZeroU64::MIN),
             source: SourceId::from_digest([7; 32]),
             token: self.next_token,
-            block: block.clone(),
+            block: block.clone().into(),
         }
     }
 

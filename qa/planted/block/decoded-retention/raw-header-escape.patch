@@ -1,0 +1,7 @@
+--- a/crates/zakura-node-services/src/block_memory.rs
++++ b/crates/zakura-node-services/src/block_memory.rs
+@@ -443,3 +443,3 @@
+             Self::Shared(block) => HeaderHandle::Shared(block.header.clone()),
+-            Self::Owned(block) => HeaderHandle::Block(block.clone()),
++            Self::Owned(block) => HeaderHandle::Shared(block.0.block.header.clone()),
+         }

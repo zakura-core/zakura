@@ -156,8 +156,116 @@ const OVER_MARGIN: &str = "requests_past_twice_the_serving_limit_reach_over_marg
 /// The witness that no scenario reaches an [`unreachable`] row.
 const UNREACHED: &str = "ids_no_scenario_reaches_stay_not_applicable";
 
+/// The file of `header-sync/wire`'s witness tests (P3d).
+const HEADER_WITNESSES: &str = "tests/header_wire_witness.rs";
+
+/// A header-sync generated property's row: its witness test in
+/// [`HEADER_WITNESSES`], and the scripted bypass there that violates every
+/// generated header-sync ID.
+const fn header(property: &'static str, passing: &'static str) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(HEADER_WITNESSES, passing),
+        bypass: HEADER_BYPASS,
+    }
+}
+
+/// A header-sync generated property no scenario reaches, for `reason`:
+/// `witness` shows it stays `NotApplicable`, and the scripted bypass still
+/// violates it.
+const fn header_unreachable(
+    property: &'static str,
+    reason: &'static str,
+    witness: &'static str,
+) -> Coverage {
+    Coverage {
+        property,
+        passing: Passing::Unreachable {
+            reason,
+            witness: sim_test(HEADER_WITNESSES, witness),
+        },
+        bypass: HEADER_BYPASS,
+    }
+}
+
+/// The scripted bypass that violates every header-sync generated ID.
+const HEADER_BYPASS: Bypass = Bypass::Test(sim_test(
+    HEADER_WITNESSES,
+    "scripted_bypasses_violate_every_generated_header_id",
+));
+
+/// The honest witness, and the check that the witnesses list every ID.
+const EVERY: &str = "every_generated_property_applies_in_its_witness";
+/// The `undeclared-type` and `status` fault witnesses.
+const STATUS: &str = "status_faults_apply_in_their_witnesses";
+/// The `subscribe-headers` fault witnesses.
+const SUBSCRIBE: &str = "subscribe_headers_faults_apply_in_their_witnesses";
+/// The `headers` fault witnesses.
+const HEADERS: &str = "headers_faults_apply_in_their_witnesses";
+/// The `headers-outcome` fault witnesses.
+const OUTCOME: &str = "headers_outcome_faults_apply_in_their_witnesses";
+/// Why no header-sync scenario reaches an `over-owed-closes` ID.
+const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
+                        so the models label an overrun over-credit, never over-owed";
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
+    Coverage {
+        property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_handoff_input_holds_payload_inventory_agrees",
+        ),
+        bypass: Bypass::Planted("lost-payload-release"),
+    },
+    Coverage {
+        property: "block/decoded-retention",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "decoded_retention_replays_final_holders_in_a_fresh_process",
+        ),
+        bypass: Bypass::Planted("raw-transaction-escape"),
+    },
+    Coverage {
+        property: "block/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_query_identities",
+        ),
+        bypass: Bypass::Planted("refusal-consumes-query-id"),
+    },
+    Coverage {
+        property: "block/work-funding",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_funding_records_and_replays_retained_runtime_owners",
+        ),
+        bypass: Bypass::Planted("lost-reservation-release"),
+    },
+    Coverage {
+        property: "block/work-ownership",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("missing-published-charge"),
+    },
+    Coverage {
+        property: "header/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("locator-call-settles-without-removal"),
+    },
+    Coverage {
+        property: "header/publisher-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "publisher_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("lost-credit"),
+    },
     Coverage {
         property: super::NO_TASK_PANIC,
         passing: passes("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
@@ -177,6 +285,30 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/timer-cancel", "timer_cancel_witness"),
     race("race/ab-ba", "ab_ba_witness"),
     race("race/abort-without-join", "abort_without_join_witness"),
+    Coverage {
+        property: "discovery/record-book",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_book_records_and_replays_signed_samples",
+        ),
+        bypass: Bypass::Planted("skip-book-eviction"),
+    },
+    Coverage {
+        property: "discovery/session-installation",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_state_records_and_replays_installations",
+        ),
+        bypass: Bypass::Planted("install-superseded-result"),
+    },
+    Coverage {
+        property: crate::domain::discovery::VERIFICATION_CAPACITY,
+        passing: passes(
+            "tests/discovery.rs",
+            "verification_results_keep_their_slots",
+        ),
+        bypass: Bypass::Planted("release-before-install"),
+    },
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: passes("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
@@ -202,6 +334,41 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Test(sim_test(
             "tests/header_node.rs",
             "direct_dispatch_guard_reports_a_violation",
+        )),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::CHUNK_BUDGET_BOUND,
+        passing: passes(
+            "tests/header_node_capacity.rs",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
+        bypass: Bypass::Planted("uncapped-secondary-reservation"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/header_teardown.rs",
+            "the_close_relink_input_holds_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("kept-queue-lease"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::STALE_COMPLETION_INERT,
+        passing: passes(
+            "tests/header_stale.rs",
+            "the_stale_prepare_input_holds_stale_completion_inert",
+        ),
+        bypass: Bypass::Planted("stale-release"),
+    },
+    Coverage {
+        property: super::header_sync::HEADER_FAULT_PENALIZED,
+        passing: passes(
+            "tests/header_wire_prepare_fault.rs",
+            "a_disconnect_mid_prepare_is_still_penalized",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/header_wire_prepare_fault.rs",
+            "hidden_cooldowns_violate_the_penalty_rule",
         )),
     },
     Coverage {
@@ -317,6 +484,103 @@ pub static COVERAGE: &[Coverage] = &[
         "block-sync/s6v3/range-unavailable/receiver-work-authorized",
         "an ending carries no body, so the node admits no work from it",
     ),
+    header("header-sync/s5v9/conformant-never-closes", EVERY),
+    header("header-sync/s5v9/status/sender-cadence", EVERY),
+    header(
+        "header-sync/s5v9/subscribe-headers/sender-within-live",
+        EVERY,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/sender-within-credit",
+        EVERY,
+    ),
+    header("header-sync/s5v9/headers/sender-answers-open", EVERY),
+    header("header-sync/s5v9/headers-outcome/sender-ends-once", EVERY),
+    header("header-sync/s5v9/undeclared-type-closes", STATUS),
+    header("header-sync/s5v9/status/reserved-flags-closes", STATUS),
+    header("header-sync/s5v9/status/short-payload-closes", STATUS),
+    header("header-sync/s5v9/status/long-payload-closes", STATUS),
+    header("header-sync/s5v9/status/bad-content-closes", STATUS),
+    header("header-sync/s5v9/status/cadence-never-closes", STATUS),
+    header(
+        "header-sync/s5v9/subscribe-headers/reserved-flags-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/short-payload-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/long-payload-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/over-live-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/over-credit-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/after-close-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/bad-cursor-closes",
+        SUBSCRIBE,
+    ),
+    header(
+        "header-sync/s5v9/subscribe-headers/bad-content-closes",
+        SUBSCRIBE,
+    ),
+    header("header-sync/s5v9/headers/reserved-flags-closes", HEADERS),
+    header("header-sync/s5v9/headers/short-payload-closes", HEADERS),
+    header("header-sync/s5v9/headers/long-payload-closes", HEADERS),
+    header("header-sync/s5v9/headers/unsolicited-closes", HEADERS),
+    header("header-sync/s5v9/headers/bad-content-closes", HEADERS),
+    header(
+        "header-sync/s5v9/headers-outcome/reserved-flags-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/short-payload-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/long-payload-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/unsolicited-closes",
+        OUTCOME,
+    ),
+    header(
+        "header-sync/s5v9/headers-outcome/bad-content-closes",
+        OUTCOME,
+    ),
+    header_unreachable(
+        "header-sync/s5v9/headers/over-owed-closes",
+        NOT_OWED,
+        HEADERS,
+    ),
+    header_unreachable(
+        "header-sync/s5v9/headers-outcome/over-owed-closes",
+        NOT_OWED,
+        OUTCOME,
+    ),
+    // Any production change that punishes an honest header-sync peer also
+    // violates `conformant-never-closes`, and a planted case's input must
+    // violate its property alone. The scripted bypass punishes an honest
+    // peer whose frame a label excuses.
+    Coverage {
+        property: crate::domain::session::HONEST_NEVER_PUNISHED,
+        passing: passes(HEADER_WITNESSES, "honest_peer_never_punished"),
+        bypass: Bypass::Test(sim_test(
+            HEADER_WITNESSES,
+            "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
+        )),
+    },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its committed input unpatched as a
     // witness test that expects a hold, before it runs the patch.
@@ -408,5 +672,16 @@ pub static COVERAGE: &[Coverage] = &[
             "the_decoded_input_stall_input_holds_input_decoded_bound",
         )),
         bypass: Bypass::Planted("no-room-check"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_reset_mid_flight_input_holds_reactor_query_lifecycle",
+        ),
+        bypass: Bypass::Pending(
+            "no committed input is known to fill or close the action channel, so no planted \
+             refusal bug can reach this check yet; checker tests cover crafted refusals",
+        ),
     },
 ];

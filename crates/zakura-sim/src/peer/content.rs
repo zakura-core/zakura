@@ -48,7 +48,7 @@ use zakura_network::zakura::{
     AuxSchema, MessageRole, MAX_HS_MESSAGE_BYTES, MAX_HS_RANGE, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
-use super::honest::HonestChain;
+use super::{evidence::InvalidPage, honest::HonestChain};
 use crate::model::{Label, Labels};
 
 /// The schema bits the specification defines: bit 0, schema 1.
@@ -187,6 +187,23 @@ impl ContentLabeller {
     /// `hash`'s height on the peer's chain, if it has a chain and the hash.
     fn height(&self, hash: block::Hash) -> Option<u32> {
         self.chain.as_ref()?.height(hash)
+    }
+
+    /// The header the peer's fixture made invalid
+    /// ([`HonestChain::invalid_tip`]) and the page's subscription, if
+    /// `message` is a page carrying that header.
+    pub(crate) fn invalid_header(&self, message: &RegtestMessage) -> Option<InvalidPage> {
+        let header = self.chain.as_ref()?.invalid_tip()?.hash;
+        let Message::Headers(page) = message else {
+            return None;
+        };
+        page.entries
+            .iter()
+            .any(|entry| entry.header.hash() == header)
+            .then_some(InvalidPage {
+                header,
+                subscription: page.subscription_id,
+            })
     }
 
     /// `BadContent` if the peer's `message`, `payload_len` bytes long,

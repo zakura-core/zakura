@@ -135,7 +135,7 @@ fn spawn_sync(sim: &mut zakura_sim::Sim, blocks: &Blocks) {
                 owner: scope.bind(1, NonZeroU64::MIN),
                 source: SourceId::from_digest([7; 32]),
                 token,
-                block: block.clone(),
+                block: block.clone().into(),
             });
         }
         sent.push(BlockSyncAction::RecordBodyInvalid {

@@ -7,6 +7,7 @@ mod managed;
 mod manifest;
 mod preflight;
 mod supervisor;
+mod trust_roots;
 #[cfg(unix)]
 mod unix;
 

@@ -1,0 +1,14 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -658,7 +658,10 @@ impl ZakuraDb {
+                 return None;
+             }
+             let (location, raw) = transactions.next()?;
+-            let transaction = self.decode_transaction(&raw);
++            let transaction = zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
++                .try_reserve(0)
++                .and_then(|reservation| reservation.retain(Transaction::from_bytes(raw.raw_bytes())))
++                .map(TransactionHandle::from);
+             finished = transaction.is_err();
+             Some(transaction.map(|transaction| (location, transaction)))
+         })

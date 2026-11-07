@@ -162,7 +162,9 @@ static SPINNER: HarnessEntry = entry::<Spinner>();
 /// `input`'s scenario prefix, zero-padded, as `run_bytes` draws it.
 fn prefix(entry: &HarnessEntry, input: &[u8]) -> Vec<u8> {
     let mut prefix = input[..entry.scenario_bytes.min(input.len())].to_vec();
-    prefix.resize(entry.scenario_bytes, 0);
+    if !entry.machine {
+        prefix.resize(entry.scenario_bytes, 0);
+    }
     prefix
 }
 
@@ -429,9 +431,9 @@ fn classify_table() {
                 vec![],
                 0,
             )))),
+            // The failure's own text, as the run's `end` record holds it.
             ExploreOutcome::HarnessFailure {
-                reason: harness_error(synthetic(Outcome::Harness, None, None, vec![], 0))
-                    .to_string(),
+                reason: HarnessFailure::UnknownDrawKind.to_string(),
             },
             Some(Bucket::Harness),
             vec![],
@@ -466,13 +468,22 @@ fn classify_table() {
                 2,
             ))),
             ExploreOutcome::Abandoned { leaked: 2 },
-            None,
+            Some(Bucket::Abandoned),
             vec![],
         ),
     ];
     for (row, run, outcome, bucket, notes) in rows {
         let classified = classify(&TABLE, &run);
-        assert_eq!(classified, Classified { outcome, notes }, "{row}");
+        let leaked = run.leaked();
+        assert_eq!(
+            classified,
+            Classified {
+                outcome,
+                notes,
+                leaked
+            },
+            "{row}"
+        );
         assert_eq!(classified.outcome.bucket(), bucket, "{row}");
     }
 }
@@ -533,11 +544,15 @@ fn classify_reads_every_report() {
                 (DRAFT.to_owned(), Bucket::Draft),
                 (KNOWN_TOO.to_owned(), Bucket::Known),
             ],
+            leaked: 0,
         }
     );
+}
 
-    // A harness failure after a Known violation ranks first, and keeps the
-    // note.
+/// A harness failure after a Known and an Active violation ranks first, and
+/// keeps both violations as notes, the Active one under `active`.
+#[test]
+fn a_harness_failure_keeps_its_active_violation() {
     let run = run_of(Err(harness_error(synthetic(
         Outcome::Harness,
         None,
@@ -550,7 +565,17 @@ fn classify_reads_every_report() {
         matches!(classified.outcome, ExploreOutcome::HarnessFailure { .. }),
         "{classified:?}"
     );
-    assert_eq!(classified.notes, [(KNOWN.to_owned(), Bucket::Known)]);
+    assert_eq!(
+        classified.notes,
+        [
+            (KNOWN.to_owned(), Bucket::Known),
+            (ACTIVE.to_owned(), Bucket::Active),
+        ]
+    );
+    assert_eq!(
+        classified.buckets(),
+        [Bucket::Active, Bucket::Known, Bucket::Harness]
+    );
 }
 
 #[test]

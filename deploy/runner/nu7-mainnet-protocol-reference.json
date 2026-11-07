@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "network": {
+    "name": "Mainnet",
+    "magic": "24e92764",
+    "branchId": "77190ad9",
+    "activationHeight": 3543405
+  },
+  "sourceRevision": "d7b2e2cc4379e80ba66005f6e8aac33c75d06514",
+  "sourceUrl": "https://github.com/zakura-core/zakura/tree/d7b2e2cc4379e80ba66005f6e8aac33c75d06514/crates/zakura-chain/src/parameters",
+  "parameters": {
+    "targetSpacingSeconds": 25,
+    "minimumProtocolVersion": 170190,
+    "nsmReissuanceHeight": 8939664,
+    "coinbaseMaturityBlocks": 100,
+    "fees": {
+      "minerPercent": 40,
+      "nsmPercent": 60,
+      "nsmRounding": "floor-on-block-aggregate"
+    },
+    "difficulty": {
+      "averagingTimespanSeconds": 2550,
+      "averagingWindowBlocks": 102,
+      "dampingFactor": 4,
+      "maxAdjustDownPercent": 32,
+      "maxAdjustUpPercent": 16,
+      "medianTimeSpanBlocks": 11,
+      "minimumDifficultyGapMultiplier": null,
+      "minimumDifficultyGapSeconds": null,
+      "minimumDifficultyStrictlyGreater": false,
+      "powLimit": "0007ffff00000000000000000000000000000000000000000000000000000000",
+      "powLimitCompact": "1f07ffff"
+    },
+    "actionLimits": {
+      "globalShieldedBudget": 330,
+      "orchardActionsPerPool": 330,
+      "saplingSpendsAndOutputs": 300,
+      "sproutJoinSplits": 0
+    }
+  }
+}

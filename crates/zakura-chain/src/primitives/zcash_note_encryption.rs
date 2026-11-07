@@ -9,6 +9,10 @@ use crate::{
 
 /// Returns true if all Sapling, Orchard, or Ironwood outputs, if any, decrypt
 /// successfully with an all-zeroes outgoing viewing key.
+///
+/// This does not validate Sapling value commitments: the conversion through
+/// librustzcash keeps `cv` as bytes. The semantic verifier's
+/// `Transaction::sapling_point_encodings_are_valid` check rejects an invalid one.
 pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height) -> bool {
     let nu = NetworkUpgrade::current(network, height);
 

@@ -214,7 +214,7 @@ impl ControlledSide {
             owner: scope.bind(1, std::num::NonZeroU64::MIN),
             source: SOURCE,
             token: self.next_token,
-            block: block.block.clone(),
+            block: block.block.clone().into(),
         });
         self.service
             .complete(id, BlockOutcome::Admit)

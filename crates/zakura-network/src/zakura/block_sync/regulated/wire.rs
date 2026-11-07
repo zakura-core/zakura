@@ -3,7 +3,11 @@
 
 use std::time::Duration;
 
-use super::super::{config::MAX_BS_INFLIGHT_REQUESTS, wire::*, *};
+use super::super::{
+    config::{BS_BLOCKS_PER_RESPONSE, MAX_BS_INFLIGHT_REQUESTS},
+    wire::*,
+    *,
+};
 use crate::zakura::{
     regulation::ResponseCap,
     wire_codec::{BoundedReader, HeightLe, LeU32, Wire, WireError, WireMessage, U8},
@@ -124,15 +128,34 @@ impl Range {
     }
 
     /// Bodies count toward the advertised byte limit. Tags and the ending do not.
-    pub(in crate::zakura::block_sync) fn response_cap(self, body_bytes: u32) -> ResponseCap {
+    pub(in crate::zakura::block_sync) const fn response_cap(self, body_bytes: u32) -> ResponseCap {
+        // Widening u32 to u64 is lossless.
+        let (body_bytes, count) = (body_bytes as u64, self.count as u64);
+        let blocks = count * block::MAX_BLOCK_BYTES;
+        let bodies = if body_bytes < blocks {
+            body_bytes
+        } else {
+            blocks
+        };
         ResponseCap {
             frames: self.count,
-            bytes: u64::from(body_bytes).min(u64::from(self.count) * block::MAX_BLOCK_BYTES)
-                + u64::from(self.count)
-                + 9,
+            bytes: bodies + count + 9,
         }
     }
 }
+
+/// The largest response a server sends. A server cuts every range to the
+/// advertised [`BS_BLOCKS_PER_RESPONSE`] blocks before it sizes or reads the
+/// range (`Server::response_cap`), so a response holds one body of at most
+/// `MAX_BLOCK_BYTES` and its ending.
+pub(in crate::zakura::block_sync) const LARGEST_SERVED_RESPONSE: ResponseCap = Range {
+    start: block::Height::MIN,
+    count: BS_BLOCKS_PER_RESPONSE,
+}
+.response_cap(MAX_BS_RESPONSE_BYTES);
+
+const _: () =
+    assert!(BS_BLOCKS_PER_RESPONSE >= 1 && BS_BLOCKS_PER_RESPONSE <= MAX_BS_BLOCKS_PER_REQUEST);
 
 /// Which ending closed a range.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

@@ -4,7 +4,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde_json::Value;
@@ -77,10 +77,13 @@ pub enum RecordError {
         property: String,
     },
     /// A rerun of a failing run didn't do what that run did, so
-    /// [`crate::trace::record_failure`] kept no trace.
+    /// [`crate::trace::record_failure`] saved no trace under `traces/`.
     Nondeterministic {
         /// What differed.
         detail: String,
+        /// The directory that keeps the compared records and their first
+        /// difference, or `None` if saving them failed.
+        evidence: Option<PathBuf>,
     },
 }
 
@@ -100,9 +103,18 @@ impl fmt::Display for RecordError {
             RecordError::NotViolated { property } => {
                 write!(f, "the run doesn't violate {property}")
             }
-            RecordError::Nondeterministic { detail } => {
-                write!(f, "the rerun is nondeterministic: {detail}")
-            }
+            RecordError::Nondeterministic {
+                detail,
+                evidence: Some(dir),
+            } => write!(
+                f,
+                "the rerun is nondeterministic: {detail} (evidence in {})",
+                dir.display()
+            ),
+            RecordError::Nondeterministic {
+                detail,
+                evidence: None,
+            } => write!(f, "the rerun is nondeterministic: {detail}"),
         }
     }
 }
@@ -118,9 +130,8 @@ impl std::error::Error for RecordError {}
 /// meta names them.
 ///
 /// For a full input, the first [`HarnessEntry::scenario_bytes`] bytes
-/// decode the scenario. An input shorter than that reads the missing
-/// scenario bytes as 0. `input.bin` is written before `trace.jsonl`, so a
-/// trace that names it never lacks it.
+/// decode the scenario ([`HarnessEntry::scenario`]). `input.bin` is written
+/// before `trace.jsonl`, so a trace that names it never lacks it.
 ///
 /// A run that ends in a harness failure still writes a complete trace, whose
 /// `end` record says so.
@@ -171,10 +182,8 @@ fn record_with<T>(
     let (scenario, plan, input, derived_from) = match what {
         RecordInput::Input(input) => {
             let split = harness.scenario_bytes.min(input.len());
-            let mut prefix = input[..split].to_vec();
-            prefix.resize(harness.scenario_bytes, 0);
             let plan = Plan::from_fuzz(&input[split..]);
-            ((harness.draw)(&prefix), plan, Some(input), None)
+            (harness.scenario(input), plan, Some(input), None)
         }
         RecordInput::Plan { scenario, plan } => {
             (scenario.clone(), Plan::from_fuzz(plan), None, None)

@@ -40,7 +40,7 @@ pub fn run(
             let mut batch = DiskWriteBatch::new();
             let mut should_index_at_height = false;
 
-            let transactions = zakura_db.transactions_by_location_range(
+            let transactions = zakura_db.stored_transactions_by_location_range(
                 crate::TransactionLocation::from_index(height, 1)
                     ..=crate::TransactionLocation::max_for_height(height),
             );

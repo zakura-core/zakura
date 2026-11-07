@@ -1,6 +1,11 @@
 //! Fixed test vectors for zakura-network configuration.
 
-use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use zakura_chain::{
     amount::Amount,
@@ -19,10 +24,10 @@ use crate::{
     },
     zakura::{
         ZakuraLocalLimits, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNECTIONS,
-        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
+        DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config, P2pStack,
+    CacheDir, Config, P2pStack, UnconditionalPeers,
 };
 
 use super::super::load_or_generate_zakura_secret_key;
@@ -271,6 +276,31 @@ fn zakura_node_secret_key_is_redacted_from_debug_and_serialization() {
     let serialized = toml::to_string(&config).unwrap();
     assert!(!serialized.contains("zakura_node_secret_key"));
     assert!(!serialized.contains(secret));
+}
+
+#[test]
+fn test_configs_keep_identity_files_out_of_the_real_identity_dir() {
+    let _init_guard = zakura_test::init();
+
+    let config = Config::for_test(P2pStack::Dual);
+    let other = Config::for_test(P2pStack::Dual);
+    let node_id = zakura_quic::NodeSecretKey::from_bytes(&[7; 32]).public();
+
+    for path in [
+        config.identity_dir.clone(),
+        crate::config::zakura_secret_key_file_path(&config.identity_dir, &config.network),
+        config.zakura_discovery_sequence_file(&node_id),
+    ] {
+        assert!(
+            !path.starts_with(crate::config::default_network_identity_dir()),
+            "test identity files must not land in the real identity dir: {path:?}",
+        );
+        assert!(path.starts_with(std::env::temp_dir()), "{path:?}");
+    }
+    assert_ne!(
+        config.identity_dir, other.identity_dir,
+        "parallel test nodes must not share identity files",
+    );
 }
 
 #[test]
@@ -747,6 +777,28 @@ fn zakura_nat_traversal_fails_and_names_the_transport_spec() {
     assert!(!config.zakura.nat_traversal);
 }
 
+/// Each native stream kind receives one stream window, so a window below a
+/// block-sync frame fails config validation instead of the endpoint's startup.
+#[test]
+fn zakura_stream_window_below_the_largest_native_frame_fails_for_v2_stacks() {
+    let _init_guard = zakura_test::init();
+    let largest = crate::zakura::MAX_BS_FRAME_BYTES;
+    let config = |stack: &str, window: u32| {
+        format!("p2p_stack = \"{stack}\"\n[zakura.quic]\nstream_receive_window_bytes = {window}\n")
+    };
+
+    let error = toml::from_str::<Config>(&config("dual", largest - 1))
+        .expect_err("a stream window below a block-sync frame must fail at startup")
+        .to_string();
+    assert!(error.contains("stream_receive_window_bytes"), "{error}");
+    assert!(error.contains(&largest.to_string()), "{error}");
+
+    toml::from_str::<Config>(&config("dual", largest))
+        .expect("a stream window that holds a block-sync frame is valid");
+    toml::from_str::<Config>(&config("legacy", 64 * 1024))
+        .expect("a legacy-only node creates no QUIC endpoint, so its stream window is unused");
+}
+
 #[test]
 fn zakura_quic_out_of_range_value_fails_and_names_the_key() {
     let _init_guard = zakura_test::init();
@@ -862,25 +914,28 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
     .unwrap();
     assert_eq!(config.zakura.max_connections, 256);
     assert_eq!(
-        config.zakura.budgeted_max_connections(),
-        Ok(DEFAULT_ZAKURA_MAX_CONNECTIONS)
+        config.zakura.budgeted_max_connections(&config.network),
+        Ok(DEFAULT_ZAKURA_BUDGETED_CONNECTIONS)
     );
     assert_eq!(
         ZakuraLocalLimits::from_config(&config).max_connections,
-        DEFAULT_ZAKURA_MAX_CONNECTIONS
+        DEFAULT_ZAKURA_BUDGETED_CONNECTIONS
     );
 
     let config: Config = toml::from_str(
         r#"
         [zakura]
         max_connections = 256
-        peer_memory_budget_bytes = 19595788288
+        peer_memory_budget_bytes = 38751881472
         "#,
     )
     .unwrap();
-    // One 256 MiB socket queue and 288 live connections of 64 MiB: 256
-    // admitted and 32 of headroom.
-    assert_eq!(config.zakura.budgeted_max_connections(), Ok(256));
+    // One 256 MiB socket queue, 32 handshakes of 64 MiB, and 256 admitted
+    // connections of 141,937,353 bytes.
+    assert_eq!(
+        config.zakura.budgeted_max_connections(&config.network),
+        Ok(256)
+    );
 
     // The transport holds the admitted connections and the headroom, half of
     // it kept for dials (zakura-quic ADM-12), and two closing connections per
@@ -904,8 +959,8 @@ fn zakura_peer_memory_budget_lowers_or_refuses_at_load() {
         (124, 16, 248)
     );
 
-    // A 1 GiB receive window leaves the default budget room for 7 QUIC
-    // connections, less than its headroom alone.
+    // With a 1 GiB receive window, the handshake headroom alone exceeds the
+    // default budget.
     let error = toml::from_str::<Config>(
         r#"
         p2p_stack = "dual"
@@ -1453,6 +1508,101 @@ fn regtest_accepts_checkpoints_covering_delayed_canopy() {
     );
 }
 
+#[test]
+fn unconditional_peers_default_to_empty() {
+    assert!(Config::default().unconditional_peers.is_empty());
+
+    let config: Config = toml::from_str("").unwrap();
+    assert!(config.unconditional_peers.is_empty());
+}
+
+#[test]
+fn unconditional_peers_parse_ips_and_cidr_ranges_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8::1', '2001:db8:1::/48']",
+    )
+    .expect("IP addresses and CIDR ranges parse");
+
+    assert_eq!(config.unconditional_peers.len(), 4);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["192.0.2.1", "198.51.100.0/24", "2001:db8::1", "2001:db8:1::/48"]"#
+        ),
+        "plain IP addresses serialize without a prefix length:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+}
+
+#[test]
+fn unconditional_peers_reject_invalid_entries() {
+    for entry in [
+        "not an ip",
+        "zakura.example.com",
+        "192.0.2.1:8233",
+        "192.0.2.0/33",
+        "192.0.2.5/24",
+        "2001:db8::1/32",
+        "::ffff:192.0.2.5/120",
+        "",
+    ] {
+        let error = toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']"))
+            .expect_err("invalid unconditional peer entries must fail config load");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid network.unconditional_peers entry"),
+            "unexpected error for {entry:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unconditional_peers_match_addresses_in_configured_ranges() {
+    let peers: UnconditionalPeers = toml::from_str::<Config>(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8:1::/48']",
+    )
+    .unwrap()
+    .unconditional_peers;
+
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    assert!(peers.contains(ip("192.0.2.1")));
+    assert!(!peers.contains(ip("192.0.2.2")));
+
+    assert!(peers.contains(ip("198.51.100.0")));
+    assert!(peers.contains(ip("198.51.100.255")));
+    assert!(!peers.contains(ip("198.51.101.0")));
+
+    assert!(peers.contains(ip("2001:db8:1:ffff::1")));
+    assert!(!peers.contains(ip("2001:db8:2::1")));
+}
+
+#[test]
+fn unconditional_peers_match_ipv4_mapped_ipv6_forms() {
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    let ipv4_entry: Config = toml::from_str("unconditional_peers = ['192.0.2.0/24']").unwrap();
+    assert!(ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.7")));
+    assert!(!ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.3.7")));
+
+    let mapped_entry: Config =
+        toml::from_str("unconditional_peers = ['::ffff:192.0.2.1']").unwrap();
+    assert!(mapped_entry.unconditional_peers.contains(ip("192.0.2.1")));
+    assert!(mapped_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.1")));
+    assert!(!mapped_entry.unconditional_peers.contains(ip("192.0.2.2")));
+}
+
 /// The deployer's rendered NU7 fork node config, kept in sync with the renderer by
 /// `deploy/nu7-fork/test_fork.py`. Loading it here proves zakurad accepts the shape
 /// the deployer writes, which a TOML parser alone cannot.
@@ -1650,5 +1800,135 @@ fn loaded_block_sync_session_slots_must_fund_one_request_each() {
             .expect_err("unfundable session slots must not load")
             .to_string();
         assert!(error.contains("at most 3,633"), "unexpected error: {error}");
+    }
+}
+
+/// The TCP ingress partition follows the connection limit and cannot overflow.
+#[test]
+fn tcp_ingress_bound_follows_the_connection_limit() {
+    let config = Config::default();
+    assert_eq!(
+        config.tcp_ingress_bound_bytes(),
+        config.peerset_total_connection_limit() as u64
+            * crate::protocol::external::MAX_INCOMPLETE_MESSAGE_BYTES as u64,
+    );
+    assert!(config.tcp_ingress_bound_bytes() > 0);
+}
+
+#[test]
+fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
+    let _init_guard = zakura_test::init();
+
+    let config: Config = toml::from_str("").expect("empty config parses");
+    assert_eq!(config.advert_window_min, 32);
+    assert_eq!(config.advert_window_max, 64);
+    assert_eq!(config.advert_window_small_size_bytes, 102_400);
+    assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
+
+    let config: Config = toml::from_str(
+        "advert_window_min = 2\n\
+         advert_window_max = 16\n\
+         advert_window_small_size_bytes = 100\n\
+         advert_window_full_size_bytes = 1000\n",
+    )
+    .expect("configured fan-out parses");
+    assert_eq!(config.advert_window_min, 2);
+    assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_small_size_bytes, 100);
+    assert_eq!(config.advert_window_full_size_bytes, 1000);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip, config);
+
+    // Equal bounds are a fixed window.
+    let config: Config = toml::from_str("advert_window_min = 50\nadvert_window_max = 50")
+        .expect("equal bounds parse");
+    assert_eq!(config.advert_window_min, config.advert_window_max);
+
+    let config: Config = toml::from_str("advert_window_small_size_bytes = 0")
+        .expect("a zero small-size boundary parses");
+    assert_eq!(config.advert_window_small_size_bytes, 0);
+}
+
+/// Explicit values survive config loading; omitted bounds respect the configured bound.
+#[test]
+fn advert_windows_preserve_explicit_values() {
+    let _init_guard = zakura_test::init();
+    for (text, expected) in [
+        ("", (32, 64)),
+        ("advert_window_min = 32\nadvert_window_max = 64", (32, 64)),
+        (
+            "advert_window_min = 1000\nadvert_window_max = 1000",
+            (1000, 1000),
+        ),
+        ("advert_window_min = 16\nadvert_window_max = 64", (16, 64)),
+        ("advert_window_max = 16", (16, 16)),
+        ("advert_window_min = 1001", (1001, 1001)),
+    ] {
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            (config.advert_window_min, config.advert_window_max),
+            expected
+        );
+    }
+}
+
+#[test]
+fn advert_delays_roundtrip_and_validate() {
+    let _init_guard = zakura_test::init();
+    let config: Config =
+        toml::from_str("advert_delay_min = '25ms'\nadvert_delay_max = '500ms'").unwrap();
+    assert_eq!(config.advert_delay_min, Duration::from_millis(25));
+    assert_eq!(config.advert_delay_max, Duration::from_millis(500));
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(config, roundtrip);
+    let default: Config = toml::from_str("").unwrap();
+    assert_eq!(default.advert_delay_min, Duration::ZERO);
+    assert_eq!(default.advert_delay_max, Duration::ZERO);
+    for text in [
+        "advert_delay_min = '1s'\nadvert_delay_max = '500ms'",
+        "advert_delay_min = '-1s'",
+        "advert_delay_max = '-1s'",
+    ] {
+        assert!(toml::from_str::<Config>(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn invalid_advert_fanout_config_is_rejected() {
+    let _init_guard = zakura_test::init();
+
+    for (config, field) in [
+        ("advert_window_min = 0", "advert_window_min"),
+        (
+            "advert_window_min = 10\nadvert_window_max = 9",
+            "advert_window_min",
+        ),
+        (
+            "advert_window_full_size_bytes = 0",
+            "advert_window_full_size_bytes",
+        ),
+        (
+            "advert_window_small_size_bytes = 1572864",
+            "advert_window_small_size_bytes",
+        ),
+        (
+            "advert_window_small_size_bytes = 1572865",
+            "advert_window_small_size_bytes",
+        ),
+        (
+            "advert_window_full_size_bytes = 102400",
+            "advert_window_full_size_bytes",
+        ),
+        // Removed settings.
+        ("advert_target_secs = 1.0", "advert_target_secs"),
+        ("advert_window_initial = 32", "advert_window_initial"),
+        ("advert_window_fixed = 8", "advert_window_fixed"),
+    ] {
+        let error = toml::from_str::<Config>(config)
+            .expect_err("invalid fan-out config is rejected")
+            .to_string();
+        assert!(error.contains(field), "{config:?} gave {error}");
     }
 }

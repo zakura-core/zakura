@@ -11,6 +11,7 @@
 #![cfg(zakura_sim)]
 
 pub mod action;
+pub mod campaign;
 pub mod check;
 pub mod domain;
 mod downstream;
@@ -28,9 +29,11 @@ pub mod peer;
 pub mod plan;
 pub mod property;
 pub mod record;
+pub mod seed;
 mod sender;
 pub mod sim;
 pub mod storage;
+pub mod suite;
 pub mod table;
 pub mod trace;
 pub mod witness;

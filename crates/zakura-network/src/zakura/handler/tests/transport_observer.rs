@@ -973,3 +973,40 @@ async fn regulation_events_name_the_frames_that_caused_them() -> Result<(), BoxE
     assert_eq!(tagged, [Some(1), Some(3)]);
     Ok(())
 }
+
+/// A lifecycle step reaches the observer with the exact identity it names.
+#[test]
+fn session_steps_report_their_exact_identities() {
+    let recorder = Arc::new(Recorder::default());
+    let close_cause = CloseCause::new();
+    close_cause.observe_with(registered_tap(recorder.clone()));
+    let steps = [
+        SessionStep::AttemptStarted { attempt: 3 },
+        SessionStep::MemberArrived {
+            wire_id: 9,
+            member: 65,
+        },
+        SessionStep::GenerationInstalled {
+            generation: 12,
+            attempt: Some(3),
+        },
+        SessionStep::GenerationExited {
+            generation: 12,
+            opened_locally: true,
+            current: true,
+        },
+    ];
+    for step in steps {
+        trace_session_step(&ZakuraConnTrace::without_peer(1), &close_cause, 64, step);
+    }
+    let expected: Vec<_> = steps
+        .iter()
+        .map(|step| TransportEvent::SessionLifecycle {
+            conn_id: CONN,
+            kind: 64,
+            step: *step,
+        })
+        .collect();
+    assert_eq!(recorder.events(), expected);
+    assert_eq!(steps.map(SessionStep::identity), [3, 9, 12, 12]);
+}

@@ -5,7 +5,8 @@
 //! does ([`super::header_sync::HeaderWire`]'s `draw`).
 //!
 //! Each act's setup history is the one `tests/header_wire_table.rs` gives
-//! it, with every header fault's payload sent.
+//! it, with every header fault's payload sent. [`act_scenario`] builds it
+//! for any act, so P3d's witnesses reuse it.
 
 use super::{
     header_node::{Chain, Policy},
@@ -111,7 +112,7 @@ impl SavedPlan {
                 policy: Policy::converging(),
                 ..WireScenario::default()
             },
-            SavedPlan::Act(act) => acting(act),
+            SavedPlan::Act(act) => act_scenario(act),
         }
     }
 }
@@ -135,7 +136,8 @@ fn adversary(
     }
 }
 
-/// `act`'s focused scenario, M5-E1's setup history for it.
+/// `act`'s focused scenario, M5-E1's setup history for it, with one
+/// adversary, `peer-0`.
 ///
 /// - Acts on the node's subscription: the peer holds 1,200 headers and
 ///   announces them, but serves no page, so the subscription stays live with
@@ -147,9 +149,11 @@ fn adversary(
 ///   for `after-close`, whose one page reaches the target and makes the
 ///   peer close), and the peer subscribes from 50 with one page of credit,
 ///   holding every later grant. `over-live` opens a second subscription
-///   first.
+///   first. A conformant `subscribe-headers` frame renews that
+///   subscription.
+/// - `status-burst`: 30 bursts, which empty the `Status` bucket.
 /// - The rest: the peer holds the node's 50 headers, so nobody subscribes.
-fn acting(act: Act) -> WireScenario {
+pub fn act_scenario(act: Act) -> WireScenario {
     let quiet = AdversarySpec {
         announce: true,
         serve: false,
@@ -165,6 +169,9 @@ fn acting(act: Act) -> WireScenario {
     };
     let script = match act {
         Act::OverLive => vec![Act::SecondOpen, Act::OverLive],
+        // 602 tokens, in bursts of 40 with two more each second, as
+        // `tests/header_wire_table.rs` sends them.
+        Act::StatusBurst => vec![Act::StatusBurst; 30],
         act => vec![act],
     };
     let (node, peer) = match act {
@@ -192,9 +199,12 @@ fn acting(act: Act) -> WireScenario {
                 script,
             ),
         ),
-        Act::SecondOpen | Act::OverLive | Act::BadCursor { .. } => {
-            (120, adversary(PRELOAD, Some(held), quiet, script))
-        }
+        Act::SecondOpen
+        | Act::OverLive
+        | Act::BadCursor { .. }
+        | Act::MinPayload {
+            row: Row::SubscribeHeaders,
+        } => (120, adversary(PRELOAD, Some(held), quiet, script)),
         Act::AfterClose => (PRELOAD + 1, adversary(PRELOAD, Some(held), quiet, script)),
         Act::OverCreditHeader | Act::OverCreditObjects | Act::ExtraEndingAhead => {
             (PRELOAD, adversary(1_200, None, quiet, script))

@@ -13,6 +13,7 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::Semaphore as TokioSemaphore;
 use zakura_node_services::header_chain as port;
 
+use super::super::dispatch::StorageDispatch;
 use super::*;
 use crate::zakura::{
     testkit::{TraceCapture, TraceReader},
@@ -34,10 +35,169 @@ impl HeaderSyncObserver for Recorder {
 }
 
 impl Recorder {
-    /// The events recorded since the last call.
+    /// The events recorded since the last call, without retained-header ownership,
+    /// reservations, capacity accounting, budget changes, credit, causes,
+    /// session admissions, refusals and ends, readmission cooldowns, or the
+    /// adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
+        self.take_all()
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    ReactorEvent::HeadersHeld { .. }
+                        | ReactorEvent::HeadersEnded { .. }
+                        | ReactorEvent::ReservationOpened { .. }
+                        | ReactorEvent::ReservationBound { .. }
+                        | ReactorEvent::ReservationEnded { .. }
+                        | ReactorEvent::PageStaged { .. }
+                        | ReactorEvent::LeaseReturned { .. }
+                        | ReactorEvent::RoundReleased { .. }
+                        | ReactorEvent::BudgetChanged { .. }
+                        | ReactorEvent::CreditIssued { .. }
+                        | ReactorEvent::CauseSet { .. }
+                        | ReactorEvent::HeadroomWait { .. }
+                        | ReactorEvent::CachedPassDeferred { .. }
+                        | ReactorEvent::SessionAdmitted { .. }
+                        | ReactorEvent::SessionEnded { .. }
+                        | ReactorEvent::SessionRefused { .. }
+                        | ReactorEvent::CooldownStarted { .. }
+                        | ReactorEvent::CallEnded {
+                            end: CallEnd::Dropped,
+                            ..
+                        }
+                        | ReactorEvent::SnapshotAdopted { .. }
+                        | ReactorEvent::StatusQueued { .. }
+                        | ReactorEvent::StatusDeferred { .. }
+                        | ReactorEvent::TipPublished { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The adopted state and publications recorded since the last call.
+    fn take_adoption(&self) -> Vec<ReactorEvent> {
+        self.take_all()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ReactorEvent::SnapshotAdopted { .. }
+                        | ReactorEvent::StatusQueued { .. }
+                        | ReactorEvent::StatusDeferred { .. }
+                        | ReactorEvent::TipPublished { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// Every event recorded since the last call.
+    fn take_all(&self) -> Vec<ReactorEvent> {
         std::mem::take(&mut *self.0.lock().expect("no test panics while holding it"))
     }
+
+    /// Every event recorded since the last call, left for the next.
+    fn peek_all(&self) -> Vec<ReactorEvent> {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .clone()
+    }
+}
+
+mod retained;
+
+/// One shared log of what a [`PendingCall`](observe::PendingCall) reports and what
+/// its future holds drops, in order.
+#[derive(Debug, Default)]
+struct DropOrder(StdMutex<Vec<String>>);
+
+impl HeaderSyncObserver for DropOrder {
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics while holding it")
+            .push(format!("{event:?}"));
+    }
+}
+
+/// Something a guarded future holds, which logs its own drop, as a storage call's
+/// receipt or a permit's release would.
+struct LogsDrop(Arc<DropOrder>);
+
+impl Drop for LogsDrop {
+    fn drop(&mut self) {
+        self.0
+             .0
+            .lock()
+            .expect("no test panics while holding it")
+            .push("held dropped".to_owned());
+    }
+}
+
+/// A guarded call dropped unfinished reports its dropped end before anything its
+/// future holds drops, so a storage receipt always follows its call's end.
+#[tokio::test]
+async fn a_dropped_call_reports_before_its_future_drops() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot(Some(order.clone()));
+    let held = LogsDrop(order.clone());
+    let pending = observe::PendingCall::new(
+        Box::pin(async move {
+            let _held = held;
+            std::future::pending::<()>().await
+        }),
+        observe::PortTap::new(1, &slot),
+    );
+    drop(pending);
+    assert_eq!(
+        *order.0.lock().expect("no test panics while holding it"),
+        [
+            format!(
+                "{:?}",
+                ReactorEvent::CallEnded {
+                    call: 1,
+                    end: CallEnd::Dropped
+                }
+            ),
+            "held dropped".to_owned(),
+        ]
+    );
+}
+
+/// A call that finished, or that reported its own end and then dropped at a later
+/// await, reports no second end.
+#[tokio::test]
+async fn an_ended_call_reports_no_dropped_end() {
+    let order = Arc::new(DropOrder::default());
+    let slot = ObserverSlot(Some(order.clone()));
+    let mut finished =
+        observe::PendingCall::new(Box::pin(async {}), observe::PortTap::new(1, &slot));
+    (&mut finished).await;
+    drop(finished);
+    assert!(order.0.lock().expect("no test panics").is_empty());
+
+    let tap = observe::PortTap::new(2, &slot);
+    let inner = tap.clone();
+    let mut ended = observe::PendingCall::new(
+        Box::pin(async move {
+            inner.end(CallEnd::Replied);
+            std::future::pending::<()>().await
+        }),
+        tap,
+    );
+    assert!(futures::poll!(&mut ended).is_pending());
+    drop(ended);
+    assert_eq!(
+        *order.0.lock().expect("no test panics"),
+        [format!(
+            "{:?}",
+            ReactorEvent::CallEnded {
+                call: 2,
+                end: CallEnd::Replied
+            }
+        )]
+    );
 }
 
 /// Where a [`ScriptedPort`] call panics.
@@ -64,6 +224,10 @@ struct ScriptedPort {
     panic: Option<PanicAt>,
     /// Prepares the port answered.
     prepares: AtomicUsize,
+    /// Targets that later prepares seal, last first, before prepares fail.
+    prepared: StdMutex<Vec<port::PreparedHeaderTarget>>,
+    /// Applies succeed.
+    applies: bool,
 }
 
 impl ScriptedPort {
@@ -156,7 +320,12 @@ impl port::Port for ScriptedPort {
         Box::pin(async move {
             self.answer().await;
             self.prepares.fetch_add(1, Ordering::SeqCst);
-            Err(local_failure(request.owner))
+            let sealed = self
+                .prepared
+                .lock()
+                .expect("no test panics while holding it")
+                .pop();
+            sealed.ok_or_else(|| local_failure(request.owner))
         })
     }
 
@@ -168,6 +337,9 @@ impl port::Port for ScriptedPort {
         let owner = target.owner();
         Box::pin(async move {
             self.answer().await;
+            if self.applies {
+                return Ok(port::ApplyHeaderTargetOutcome::Applied);
+            }
             Err(local_failure(owner))
         })
     }
@@ -239,6 +411,7 @@ fn request_ref(active: &ActiveHeaderRequest) -> RequestRef {
         peer: active.peer.clone(),
         session_id: active.owner.session_id(),
         request_id: active.request_id.get(),
+        incarnation: active.incarnation().get(),
         owner: active.owner,
         target_tip_hash: active.target.status.selected_tip_hash,
     }
@@ -252,6 +425,26 @@ fn retired(active: &ActiveHeaderRequest, reason: HeaderRequestTerminal) -> React
         purpose: active.purpose.clone(),
         reason,
     }
+}
+
+/// Asserts that `events` report `active`'s round released, with no lease
+/// left in the queue, before they report it retired.
+fn assert_released_before_retired(events: &[ReactorEvent], active: &ActiveHeaderRequest) {
+    let released = events.iter().position(|event| {
+        *event
+            == ReactorEvent::RoundReleased {
+                peer: active.peer.clone(),
+                incarnation: active.incarnation().get(),
+                queue_owned: 0,
+            }
+    });
+    let retired = events.iter().position(|event| {
+        matches!(event, ReactorEvent::Retired { request, .. } if *request == request_ref(active))
+    });
+    assert!(
+        matches!((released, retired), (Some(released), Some(retired)) if released < retired),
+        "{events:?}"
+    );
 }
 
 /// The apply call for `peer`'s active request, sealed as its own preparation.
@@ -384,7 +577,8 @@ fn reason_index(reason: HeaderRequestTerminal) -> usize {
 }
 
 /// Every reason reaches the observer with the retired request's exact
-/// identity, including the five that the request-terminal trace skips.
+/// identity, including the five that the request-terminal trace skips, once
+/// the queue has released the round.
 #[test]
 fn every_active_retirement_reason_reaches_the_observer() {
     for (index, reason) in EVERY_REASON.into_iter().enumerate() {
@@ -403,6 +597,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
 
         reactor.retire_peer_work(&peer, reason);
 
+        assert_released_before_retired(&recorder.peek_all(), &seeded);
         assert_eq!(
             recorder.take(),
             vec![ReactorEvent::Retired {
@@ -410,6 +605,7 @@ fn every_active_retirement_reason_reaches_the_observer() {
                     peer: peer.clone(),
                     session_id: 7,
                     request_id: 9,
+                    incarnation: seeded.incarnation().get(),
                     owner: seeded.owner,
                     target_tip_hash: seeded.target.status.selected_tip_hash,
                 },
@@ -423,7 +619,8 @@ fn every_active_retirement_reason_reaches_the_observer() {
 }
 
 /// A committed snapshot that obsoletes an active request retires it without
-/// going through `retire_peer_work`, and the observer still sees it.
+/// going through `retire_peer_work`, and the observer still sees it, once
+/// the queue has released the round.
 #[test]
 fn snapshot_retirement_is_observed() {
     let recorder = Arc::new(Recorder::default());
@@ -445,6 +642,7 @@ fn snapshot_retirement_is_observed() {
 
     reactor.retire_obsolete_work(&newer);
 
+    assert_released_before_retired(&recorder.peek_all(), &seeded);
     assert_eq!(
         recorder.take(),
         vec![retired(&seeded, HeaderRequestTerminal::SnapshotObsolete)]
@@ -453,7 +651,8 @@ fn snapshot_retirement_is_observed() {
 }
 
 /// A repair retry retires the repair's active request without going through
-/// `retire_peer_work`, and the observer still sees it.
+/// `retire_peer_work`, and the observer still sees it, once the queue has
+/// released the round.
 #[test]
 fn repair_retry_retirement_is_observed() {
     let recorder = Arc::new(Recorder::default());
@@ -481,6 +680,7 @@ fn repair_retry_retirement_is_observed() {
         VctRepairRetry::local(source, HeaderRequestTerminal::RepairObsolete),
     );
 
+    assert_released_before_retired(&recorder.peek_all(), &seeded);
     let events = recorder.take();
     assert_eq!(
         events.first(),
@@ -492,6 +692,91 @@ fn repair_retry_retirement_is_observed() {
             HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
         ),
         "the seeded request is a repair"
+    );
+}
+
+/// A completion's handler runs under its call's `Completion` cause and the
+/// refresh after it under `Refresh`, each restoring the cause before it, so
+/// the handler's effects and only those carry `Completion`.
+#[tokio::test]
+async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (..) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let seeded = active(&reactor, &peer);
+    recorder.take_all();
+
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
+    complete_next(&mut reactor).await;
+
+    let cause = |cause| ReactorEvent::CauseSet { cause };
+    let events: Vec<_> = recorder
+        .take_all()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReactorEvent::CauseSet { .. }
+                    | ReactorEvent::CallEnded { .. }
+                    | ReactorEvent::Retired { .. }
+                    | ReactorEvent::Handled { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ReactorEvent::CallEnded {
+                call: 1,
+                end: CallEnd::Replied,
+            },
+            cause(ReactorCause::Completion { call: 1 }),
+            retired(&seeded, HeaderRequestTerminal::TargetRejected),
+            cause(ReactorCause::Idle),
+            cause(ReactorCause::Refresh { call: 1 }),
+            cause(ReactorCause::Idle),
+            ReactorEvent::Handled {
+                call: 1,
+                panicked: false,
+            },
+        ]
+    );
+}
+
+/// A nested unit of work reports its cause, then restores the outer one,
+/// which restores the reactor's own.
+#[test]
+fn a_nested_cause_restores_the_outer_one() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    recorder.take_all();
+    caused!(
+        reactor,
+        ReactorCause::Startup,
+        caused!(reactor, ReactorCause::Watch, ())
+    );
+    let cause = |cause| ReactorEvent::CauseSet { cause };
+    assert_eq!(
+        recorder.take_all(),
+        [
+            cause(ReactorCause::Startup),
+            cause(ReactorCause::Watch),
+            cause(ReactorCause::Startup),
+            cause(ReactorCause::Idle),
+        ]
     );
 }
 
@@ -510,7 +795,10 @@ async fn handled_follows_the_callbacks_effects() {
     let seeded = active(&reactor, &peer);
     recorder.take();
 
-    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
     complete_next(&mut reactor).await;
 
     assert_eq!(
@@ -584,22 +872,36 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
             },
         )
     } else {
+        let operation = prepare_operation(
+            &reactor,
+            &peer,
+            HeaderTargetPurpose::Normal,
+            old.entries.clone(),
+        );
+        let HeaderPortOperation::PrepareHeaderTarget { target, .. } = &operation else {
+            unreachable!("`prepare_operation` always builds a prepare")
+        };
+        let target = *target;
         (
-            prepare_operation(
-                &reactor,
-                &peer,
-                HeaderTargetPurpose::Normal,
-                old.entries.clone(),
-            ),
+            operation,
             PortCall::Prepare {
                 peer: peer.clone(),
                 source,
                 owner,
+                target,
+                hashes: old
+                    .entries
+                    .iter()
+                    .map(|entry| entry.header.hash())
+                    .collect(),
             },
         )
     };
     recorder.take();
-    assert!(reactor.dispatch_action(operation));
+    assert!(matches!(
+        reactor.dispatch_action(operation),
+        StorageDispatch::Started(_)
+    ));
 
     let _new_outbound = connect(&mut reactor, &peer, 2);
     seed_applying_request(&mut reactor, &snapshot, peer.clone(), 2);
@@ -640,6 +942,92 @@ async fn stale_apply_bracket_leaves_the_replacement_alone() {
     assert_stale_call_leaves_the_replacement_alone(HeaderTargetPhase::Applying).await;
 }
 
+/// A repair round whose peer departs while it prepares is kept: the
+/// disconnect retires nothing, and the prepare's reply is handled against
+/// that same round. So `header-sync/stale-completion-inert` counts a repair
+/// stale only by its retirement, never by its session alone, and it tells a
+/// repair by the body repair owner its calls name. It decides that at the
+/// call's end, before the handler runs. This fixture's repair isn't
+/// assigned, so the handler then retires it as obsolete, and every
+/// retirement or release it makes is the kept round's.
+#[tokio::test]
+async fn a_kept_repair_prepare_settles_its_own_round_after_its_peer_departs() {
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let port = Arc::new(ScriptedPort {
+        gate: Some(gate.clone()),
+        ..ScriptedPort::default()
+    });
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        port.clone(),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (source, owner, context) = super::timeouts::seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Preparing,
+    );
+    assert!(owner.body_owner().is_some(), "a repair has a body owner");
+    port.prepared
+        .lock()
+        .expect("no test panics while holding it")
+        .push(super::timeouts::prepared_vct_target(
+            &reactor, &snapshot, &peer, source, owner, &context,
+        ));
+    let kept = active(&reactor, &peer);
+    let operation = prepare_operation(&reactor, &peer, kept.purpose.clone(), kept.entries.clone());
+    recorder.take_all();
+    assert!(matches!(
+        reactor.dispatch_action(operation),
+        StorageDispatch::Started(_)
+    ));
+    reactor.handle_peer_disconnected(&peer, 7, "test disconnect");
+    gate.add_permits(1);
+    complete_next(&mut reactor).await;
+
+    let events = recorder.take_all();
+    let ended = events
+        .iter()
+        .position(|event| matches!(event, ReactorEvent::CallEnded { call: 1, .. }))
+        .expect("the prepare ended");
+    assert!(
+        events[..ended]
+            .iter()
+            .any(|event| matches!(event, ReactorEvent::SessionEnded { session_id: 7, .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events[..ended].iter().any(|event| matches!(
+            event,
+            ReactorEvent::Retired { .. } | ReactorEvent::RoundReleased { .. }
+        )),
+        "the departure keeps the repair round: {events:?}"
+    );
+    assert!(
+        events[..ended].iter().any(|event| matches!(
+            event,
+            ReactorEvent::Dispatched {
+                call: 1,
+                op: PortCall::Prepare { owner: prepared, .. },
+            } if prepared.body_owner().is_some()
+        )),
+        "the prepare names the repair's body owner: {events:?}"
+    );
+    let round = kept.incarnation().get();
+    for event in bracket(&events, 1) {
+        match event {
+            ReactorEvent::Retired { request, .. } => assert_eq!(request.incarnation, round),
+            ReactorEvent::RoundReleased { incarnation, .. } => assert_eq!(*incarnation, round),
+            _ => {}
+        }
+    }
+}
+
 /// A stale prepare for a replaced session completes while its replacement
 /// prepares. Its bracket retires nothing, and the replacement stays active.
 #[tokio::test]
@@ -666,14 +1054,15 @@ async fn timed_out_locator_ends_timed_out() {
     recorder.take();
 
     let started = Instant::now();
-    assert!(
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Started(_)
+    ));
     complete_next(&mut reactor).await;
 
     assert_eq!(started.elapsed(), reactor.startup.request_timeout);
@@ -739,29 +1128,55 @@ async fn synthetic_prepare_ends_not_submitted() {
     recorder.take();
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
-        assert!(reactor.dispatch_action(operation));
-        complete_next(&mut reactor).await;
-        assert_eq!(
-            recorder.take(),
-            vec![
-                ReactorEvent::Dispatched {
-                    call,
-                    op: PortCall::Prepare {
-                        peer: peer.clone(),
-                        source,
-                        owner,
-                    },
-                },
-                ReactorEvent::CallEnded {
-                    call,
-                    end: CallEnd::NotSubmitted,
-                },
-                ReactorEvent::Handled {
-                    call,
-                    panicked: false,
-                },
-            ]
+        let HeaderPortOperation::PrepareHeaderTarget {
+            target, entries, ..
+        } = &operation
+        else {
+            unreachable!("`prepare_operation` always builds a prepare")
+        };
+        let (target, hashes) = (
+            *target,
+            entries
+                .iter()
+                .map(|entry| entry.header.hash())
+                .collect::<Vec<_>>(),
         );
+        assert!(matches!(
+            reactor.dispatch_action(operation),
+            StorageDispatch::Started(_)
+        ));
+        complete_next(&mut reactor).await;
+        let mut expected = vec![
+            ReactorEvent::Dispatched {
+                call,
+                op: PortCall::Prepare {
+                    peer: peer.clone(),
+                    source,
+                    owner,
+                    target,
+                    hashes,
+                },
+            },
+            ReactorEvent::CallEnded {
+                call,
+                end: CallEnd::NotSubmitted,
+            },
+        ];
+        if call == 2 {
+            // The oversized page is the peer's malformed input, even though no
+            // preparing round awaits the call.
+            expected.push(ReactorEvent::Misbehavior {
+                peer: peer.clone(),
+                reason: HeaderSyncMisbehavior::MalformedMessage,
+                origin: Some(7),
+                current: Some(7),
+            });
+        }
+        expected.push(ReactorEvent::Handled {
+            call,
+            panicked: false,
+        });
+        assert_eq!(recorder.take(), expected);
     }
     assert!(port.calls.lock().expect("unpoisoned").is_empty());
     assert_eq!(port.prepares.load(Ordering::SeqCst), 0);
@@ -788,7 +1203,10 @@ async fn port_panic_before_and_after_submission() {
         let seeded = active(&reactor, &peer);
         recorder.take();
 
-        assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        assert!(matches!(
+            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            StorageDispatch::Started(_)
+        ));
         complete_next(&mut reactor).await;
 
         assert_eq!(
@@ -852,7 +1270,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     observer.recorder.take();
 
-    assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
     let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
         .catch_unwind()
         .await;
@@ -900,7 +1321,10 @@ async fn observer_panic_unwinds_with_its_own_payload() {
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
 
-        assert!(reactor.dispatch_action(apply_operation(&reactor, &peer)));
+        assert!(matches!(
+            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            StorageDispatch::Started(_)
+        ));
         let payload = AssertUnwindSafe(reactor.pending_port_operations.next())
             .catch_unwind()
             .await
@@ -984,23 +1408,31 @@ async fn offer_waiting_on_staging_full_and_locator_capacity() {
     let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target);
     recorder.take();
 
-    assert!(
+    assert!(matches!(
         reactor.dispatch_action(HeaderPortOperation::QueryHeaderLocator {
             peer: peer.clone(),
             session_id: 0,
             target_tip_hash: target,
             scope,
-        })
-    );
+        }),
+        StorageDispatch::Deferred(_)
+    ));
 
     assert_eq!(
         recorder.take(),
-        vec![ReactorEvent::OfferWaiting {
-            peer,
-            session_id: 0,
-            target_tip_hash: target,
-            cause: WaitCause::LocatorCapacity,
-        }]
+        vec![
+            ReactorEvent::StorageRefused {
+                call: 1,
+                kind: StorageCallKind::Locator,
+                cause: observe::RefusalCause::LocatorCapacity,
+            },
+            ReactorEvent::OfferWaiting {
+                peer,
+                session_id: 0,
+                target_tip_hash: target,
+                cause: WaitCause::LocatorCapacity,
+            }
+        ]
     );
     assert!(reactor.pending_port_operations.is_empty());
 }
@@ -1213,6 +1645,84 @@ fn no_observer_evaluates_nothing() {
     );
 }
 
+/// Each installed session reports its admission once, with its ID, its
+/// direction, the session it replaced and the origin its peer carried, and a
+/// refused one reports none. Only the current session's disconnect reports
+/// its end.
+#[test]
+fn admitted_and_ended_sessions_are_observed() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = ZakuraPeerId::new(vec![0x51; 32]).expect("the test peer ID has the required length");
+    let sessions = || {
+        recorder
+            .take_all()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ReactorEvent::SessionAdmitted { .. } | ReactorEvent::SessionEnded { .. }
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let origin = |id: u64| crate::zakura::SessionOrigin {
+        connection: id + 10,
+        quic_stream: Some(id + 20),
+        generation: id + 30,
+    };
+    let admitted = |session_id, replaced, origin| ReactorEvent::SessionAdmitted {
+        peer: peer.clone(),
+        session_id,
+        direction: ServicePeerDirection::Inbound,
+        replaced,
+        origin,
+    };
+
+    let _first = connect(&mut reactor, &peer, 1);
+    assert_eq!(
+        sessions(),
+        [admitted(1, None, None)],
+        "the first session is admitted"
+    );
+    let (send, _second) = framed_channel(8);
+    reactor.handle_peer_connected(
+        PeerSession::from_parts_with_session_id(peer.clone(), 2, send, CancellationToken::new())
+            .with_origin(Some(origin(2))),
+    );
+    assert_eq!(
+        sessions(),
+        [admitted(2, Some(1), Some(origin(2)))],
+        "its replacement is admitted, naming the session it replaced and its own origin"
+    );
+    reactor.handle_peer_disconnected(&peer, 1, "test");
+    assert_eq!(
+        sessions(),
+        [],
+        "the replaced session's disconnect is a no-op"
+    );
+    reactor.handle_peer_disconnected(&peer, 2, "test");
+    assert_eq!(
+        sessions(),
+        [ReactorEvent::SessionEnded {
+            peer: peer.clone(),
+            session_id: 2,
+            reason: "test",
+        }],
+        "the current session's disconnect ends it"
+    );
+    reactor.state.unproductive_peer_cooldowns.insert(
+        peer.clone(),
+        Instant::now() + std::time::Duration::from_secs(60),
+    );
+    let _refused = connect(&mut reactor, &peer, 3);
+    assert_eq!(sessions(), [], "a refused readmission isn't");
+}
+
 /// The `Misbehavior` events in `events`.
 fn misbehaviors(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
     events
@@ -1320,10 +1830,12 @@ fn current_session_failures_name_their_origin() {
     );
 }
 
-/// A prepare for session 1 that fails after session 2 replaced it is
-/// discarded before any dispatch, so it reports no misbehavior.
+/// A prepare for session 1 that fails after session 2 replaced it leaves the
+/// replacement's round alone. Its invalid headers still came from the peer, so
+/// it reports misbehavior with session 1 as the origin and holds back the
+/// peer's readmission.
 #[test]
-fn stale_prepare_emits_no_misbehavior() {
+fn stale_prepare_reports_its_own_session() {
     let recorder = Arc::new(Recorder::default());
     let (mut reactor, snapshot) = observed_reactor(
         Arc::new(ScriptedPort::default()),
@@ -1349,8 +1861,170 @@ fn stale_prepare_emits_no_misbehavior() {
         old_owner,
         HeaderTargetPreparationResult::Failed(invalid_header_failure(source, old_owner)),
     );
-    assert_eq!(misbehaviors(recorder.take()), vec![]);
+    assert_eq!(
+        misbehaviors(recorder.take()),
+        vec![ReactorEvent::Misbehavior {
+            peer: peer.clone(),
+            reason: HeaderSyncMisbehavior::InvalidHeader,
+            origin: Some(1),
+            current: Some(2),
+        }]
+    );
     assert_eq!(active(&reactor, &peer), replacement);
+    assert!(reactor.sessions.contains_key(&peer));
+    assert!(reactor
+        .state
+        .unproductive_peer_cooldowns
+        .contains_key(&peer));
+}
+
+/// The penalty events in `events`: each `Misbehavior`, `CooldownStarted`,
+/// `SessionAdmitted` and `SessionRefused`, in order.
+fn penalties(events: Vec<ReactorEvent>) -> Vec<ReactorEvent> {
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReactorEvent::Misbehavior { .. }
+                    | ReactorEvent::CooldownStarted { .. }
+                    | ReactorEvent::SessionAdmitted { .. }
+                    | ReactorEvent::SessionRefused { .. }
+            )
+        })
+        .collect()
+}
+
+/// A peer disconnects while the node prepares its invalid headers. The failed
+/// prepare still reports `Misbehavior` against the departed session, then the
+/// cooldown it installs, and the peer's reconnect is refused. With a zero
+/// cooldown, nothing is installed, so nothing is reported and the reconnect
+/// is admitted.
+#[test]
+fn a_late_fault_cools_down_the_peer_and_refuses_its_reconnect() {
+    for cooldown in [
+        std::time::Duration::from_secs(60),
+        std::time::Duration::ZERO,
+    ] {
+        let recorder = Arc::new(Recorder::default());
+        let (mut reactor, snapshot) = observed_reactor(
+            Arc::new(ScriptedPort::default()),
+            Some(recorder.clone()),
+            crate::zakura::ZakuraTrace::noop(),
+        );
+        reactor.startup.config.unproductive_peer_cooldown = cooldown;
+        let peer = peer();
+        let _outbound = connect(&mut reactor, &peer, 1);
+        let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+        reactor
+            .peer_work_queue
+            .active_mut(&peer)
+            .expect("the seeded request is active")
+            .phase = HeaderTargetPhase::Preparing;
+        reactor.handle_peer_disconnected(&peer, 1, "test disconnect");
+        recorder.take_all();
+
+        reactor.handle_header_target_prepared(
+            peer.clone(),
+            source,
+            owner,
+            HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+        );
+        let _reconnect = connect(&mut reactor, &peer, 2);
+
+        let misbehavior = ReactorEvent::Misbehavior {
+            peer: peer.clone(),
+            reason: HeaderSyncMisbehavior::InvalidHeader,
+            origin: Some(1),
+            current: None,
+        };
+        let expected = if cooldown.is_zero() {
+            vec![
+                misbehavior,
+                ReactorEvent::SessionAdmitted {
+                    peer: peer.clone(),
+                    session_id: 2,
+                    direction: ServicePeerDirection::Inbound,
+                    replaced: None,
+                    origin: None,
+                },
+            ]
+        } else {
+            vec![
+                misbehavior,
+                ReactorEvent::CooldownStarted {
+                    peer: peer.clone(),
+                    origin: 1,
+                    cooldown,
+                },
+                ReactorEvent::SessionRefused {
+                    peer: peer.clone(),
+                    session_id: 2,
+                },
+            ]
+        };
+        assert_eq!(
+            penalties(recorder.take_all()),
+            expected,
+            "cooldown {cooldown:?}"
+        );
+    }
+}
+
+/// The cooldown a late fault starts lasts its full length. One second before
+/// it ends, and after maintenance has pruned, a reconnect is still refused.
+/// One second after, maintenance has dropped it and the next reconnect is
+/// admitted.
+#[tokio::test(start_paused = true)]
+async fn a_late_fault_refuses_reconnects_until_its_cooldown_ends() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let cooldown = std::time::Duration::from_secs(60);
+    let second = std::time::Duration::from_secs(1);
+    reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 1);
+    let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 1);
+    reactor
+        .peer_work_queue
+        .active_mut(&peer)
+        .expect("the seeded request is active")
+        .phase = HeaderTargetPhase::Preparing;
+    reactor.handle_peer_disconnected(&peer, 1, "test disconnect");
+    reactor.handle_header_target_prepared(
+        peer.clone(),
+        source,
+        owner,
+        HeaderTargetPreparationResult::Failed(invalid_header_failure(source, owner)),
+    );
+    recorder.take_all();
+
+    tokio::time::advance(cooldown - second).await;
+    reactor.refresh_statuses();
+    let _early = connect(&mut reactor, &peer, 2);
+    assert_eq!(
+        penalties(recorder.take_all()),
+        vec![ReactorEvent::SessionRefused {
+            peer: peer.clone(),
+            session_id: 2,
+        }],
+        "one second before the cooldown ends"
+    );
+
+    tokio::time::advance(second * 2).await;
+    reactor.refresh_statuses();
+    let _late = connect(&mut reactor, &peer, 3);
+    assert!(
+        matches!(
+            &penalties(recorder.take_all())[..],
+            [ReactorEvent::SessionAdmitted { session_id: 3, .. }]
+        ),
+        "one second after the cooldown ends"
+    );
 }
 
 /// A dispatch for session 1's work while session 2 is current reports both
@@ -1383,5 +2057,109 @@ fn dispatch_reports_distinct_origin_and_current() {
             origin: Some(1),
             current: Some(2),
         }]
+    );
+}
+
+/// The reactor reports the snapshot it adopts at construction and each newer one
+/// it observes, the tip watch's initial value and each send with whether a
+/// receiver saw it, and each `Status` it queues or defers with its session.
+#[tokio::test(start_paused = true)]
+async fn adopted_state_and_its_publications_are_observed() {
+    let recorder = Arc::new(Recorder::default());
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.observer = ObserverSlot(Some(recorder.clone()));
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the observed reactor builds");
+    let adopted = |snapshot: &zakura_header_chain::EngineSnapshot| ReactorEvent::SnapshotAdopted {
+        state_version: snapshot.state_version,
+        header_generation: snapshot.header_generation,
+        finalized: snapshot.frontiers.finalized,
+        header_best: snapshot.frontiers.header_best,
+        suffix_work: snapshot.header_best_score.suffix_work.as_u256(),
+        oldest_retained: snapshot.oldest_retained_height,
+    };
+    let published = |tip: zakura_header_chain::Frontier, delivered| ReactorEvent::TipPublished {
+        height: tip.height,
+        hash: tip.hash,
+        delivered,
+    };
+    let queued =
+        |snapshot: &zakura_header_chain::EngineSnapshot, limits| ReactorEvent::StatusQueued {
+            peer: peer(),
+            session_id: 7,
+            status: Status::from_snapshot(snapshot, limits),
+        };
+    assert_eq!(
+        recorder.take_adoption(),
+        [adopted(&snapshot), published(anchor, true)],
+        "construction adopts the snapshot and publishes the initial tip"
+    );
+
+    // The session's queue holds one frame, so its first status fills it.
+    let (send, mut outbound) = framed_channel(1);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_connection(
+        peer(),
+        7,
+        send,
+        CancellationToken::new(),
+        CancellationToken::new(),
+        CloseCause::new(),
+    ));
+    let limits = reactor.page_limits;
+    assert_eq!(recorder.take_adoption(), [queued(&snapshot, limits)]);
+
+    // A new tip moves the tip watch. Its status waits for the one-second floor,
+    // then the full queue defers it.
+    let mut newer = snapshot.clone();
+    newer.state_version = newer.state_version.checked_next().unwrap();
+    newer.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x51; 32]));
+    reactor.observe_latest_committed_snapshot(newer.clone());
+    assert_eq!(
+        recorder.take_adoption(),
+        [
+            adopted(&newer),
+            published(newer.frontiers.header_best, true)
+        ]
+    );
+    reactor.observe_latest_committed_snapshot(newer.clone());
+    assert_eq!(
+        recorder.take_adoption(),
+        [],
+        "the same snapshot adopts nothing"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    reactor.refresh_statuses();
+    assert_eq!(
+        recorder.take_adoption(),
+        [ReactorEvent::StatusDeferred {
+            peer: peer(),
+            session_id: 7,
+        }]
+    );
+
+    // Once the queue drains, the retry queues the latest status.
+    outbound.try_recv().expect("the first status is queued");
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    reactor.refresh_statuses();
+    assert_eq!(recorder.take_adoption(), [queued(&newer, limits)]);
+
+    // With the handle gone, no receiver sees the next tip.
+    drop(handle);
+    let mut newest = newer;
+    newest.state_version = newest.state_version.checked_next().unwrap();
+    newest.frontiers.header_best =
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x52; 32]));
+    reactor.observe_latest_committed_snapshot(newest.clone());
+    assert_eq!(
+        recorder.take_adoption()[..2],
+        [
+            adopted(&newest),
+            published(newest.frontiers.header_best, false)
+        ]
     );
 }

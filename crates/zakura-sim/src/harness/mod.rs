@@ -13,17 +13,22 @@
 pub mod block_node;
 pub mod block_semantic;
 pub mod block_sync;
+pub mod block_work;
 pub mod coverage;
 pub mod discovery;
+pub mod discovery_machine;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
+pub mod header_work;
+pub mod machine;
 pub mod policy;
 mod record;
+pub mod scenario;
 pub mod wire_node;
 pub mod wire_plans;
 
-use std::{fmt, net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +80,16 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// The length of the scenario prefix in fuzz input. Bump `GENERATOR`
     /// when it changes. A harness with a fixed scenario sets 0.
     const SCENARIO_BYTES: usize;
+
+    /// The harnesses whose runs this harness's runs include, by name, such
+    /// as each race fixture's for `fixtures/all`. A fuzz target that runs
+    /// this harness can cover only these. None by default.
+    const COMPOSES: &'static [&'static str] = &[];
+
+    /// Whether the harness plants the bugs its `Active` properties catch,
+    /// as the race fixtures do, so its runs must violate them. `false` by
+    /// default.
+    const PLANTED: bool = false;
 
     /// Everything that varies between runs of this harness, written in full
     /// to `meta.scenario`. It must hold no floats.
@@ -175,17 +190,43 @@ pub fn run_prepared<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
+    let (report, ()) =
+        run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_, _, _, _| ())?;
+    Ok(report)
+}
+
+/// [`run_prepared`], also returning what `read` takes from the harness and
+/// the run's final end, reports and log, before the scheduler shuts down
+/// ([`Sim::on_end`]), since shutdown can resume suspended tasks.
+pub(crate) fn run_reading<S: Subsystem, T: 'static>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+    read: impl FnOnce(&S, &RunEnd, &[PropertyReport], &ObservationLog) -> T + 'static,
+) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
     let config = limit_livelock(S::config(scenario), &assumptions);
     let mut sim = Sim::new(config, input);
     let this = Rc::new(S::build(&mut sim, scenario, prepared));
+    let read_out = Rc::new(RefCell::new(None));
+    sim.on_end({
+        let this = Rc::clone(&this);
+        let read_out = Rc::clone(&read_out);
+        move |end, properties, log| *read_out.borrow_mut() = Some(read(&this, end, properties, log))
+    });
     let mut checker = registry_checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
     };
+    let read = read_out
+        .borrow_mut()
+        .take()
+        .expect("`Sim::run` runs its end hooks once");
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);
@@ -195,7 +236,7 @@ pub fn run_prepared<S: Subsystem>(
             failure: failure.clone(),
             report: Box::new(report),
         }),
-        _ => Ok(report),
+        _ => Ok((report, read)),
     }
 }
 
@@ -341,14 +382,21 @@ pub struct HarnessEntry {
     pub generator: u32,
     /// [`Subsystem::SCENARIO_BYTES`].
     pub scenario_bytes: usize,
+    /// Whether the harness drives a pure machine. A machine reads a short input
+    /// as it is; every other harness reads missing scenario bytes as 0.
+    pub machine: bool,
+    /// [`Subsystem::COMPOSES`].
+    pub composes: &'static [&'static str],
+    /// [`Subsystem::PLANTED`].
+    pub planted: bool,
     /// [`run_harness`] on a serialized scenario, with no extra checker.
     pub run: fn(&Value, PlanInput, &mut dyn RecordSink) -> Result<RunReport, HarnessError>,
     /// [`meta`] for a serialized scenario.
     pub meta: fn(&Value) -> Result<MetaRecord, HarnessError>,
     /// [`run_config`] for a serialized scenario.
     pub config: fn(&Value) -> Result<RunConfig, HarnessError>,
-    /// [`Subsystem::draw`], serialized. The prefix must be exactly
-    /// `scenario_bytes` long.
+    /// [`Subsystem::draw`], serialized. Outside a machine, the prefix must be
+    /// exactly `scenario_bytes` long.
     pub draw: fn(&[u8]) -> Value,
     /// Every property the harness checks in any scenario, with its status.
     pub properties: fn() -> Vec<PropertyRef>,
@@ -365,6 +413,18 @@ pub type WitnessFn =
     fn(&Value, PlanInput, &str, Expect, &mut dyn RecordSink) -> Result<(), WitnessError>;
 
 impl HarnessEntry {
+    /// The scenario that the full fuzz `input`'s prefix decodes to.
+    pub fn scenario(&self, input: &[u8]) -> Value {
+        let prefix = &input[..input.len().min(self.scenario_bytes)];
+        if self.machine || prefix.len() == self.scenario_bytes {
+            (self.draw)(prefix)
+        } else {
+            let mut padded = prefix.to_vec();
+            padded.resize(self.scenario_bytes, 0);
+            (self.draw)(&padded)
+        }
+    }
+
     /// Property `id`'s status in this harness, as the explorer's classifier
     /// reads it. `None` if the harness never reports `id`.
     pub fn status(&self, id: &str) -> Option<Status> {
@@ -392,6 +452,9 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         name: S::NAME,
         generator: S::GENERATOR,
         scenario_bytes: S::SCENARIO_BYTES,
+        machine: false,
+        composes: S::COMPOSES,
+        planted: S::PLANTED,
         run: run_value::<S>,
         meta: meta_value::<S>,
         config: config_value::<S>,
@@ -404,6 +467,15 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
 
 /// Every harness, by name.
 pub static HARNESSES: &[HarnessEntry] = &[
+    block_work::ENTRY,
+    block_work::FUNDING_ENTRY,
+    block_work::DECODED_RETENTION_ENTRY,
+    header_work::REACTOR_ENTRY,
+    header_work::PUBLISHER_ENTRY,
+    block_work::REACTOR_ENTRY,
+    discovery_machine::BOOK_ENTRY,
+    discovery_machine::STATE_ENTRY,
+    entry::<discovery::VerificationCapacity>(),
     entry::<fixtures::Race<fixtures::LostUpdate>>(),
     entry::<fixtures::Race<fixtures::SnapshotReserve>>(),
     entry::<fixtures::Race<fixtures::MissedNotify>>(),

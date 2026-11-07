@@ -1,4 +1,4 @@
-//! Exercise the standalone rollback utility against disposable on-disk databases.
+//! Exercise `zakurad rollback-state` against disposable on-disk databases.
 
 use std::{path::Path, process::Command, sync::Arc};
 
@@ -47,41 +47,58 @@ fn fixture(cache_dir: &Path, pruned: bool) -> Vec<Arc<Block>> {
                 CheckpointVerifiedBlock::from(block.clone()).into(),
                 None,
                 None,
-                "standalone rollback test",
+                "rollback-state test",
             )
             .expect("mainnet fixture commits");
     }
     blocks
 }
 
+/// Runs `zakurad rollback-state` to height 1 on the state in `cache_dir`, with `extra` arguments.
+///
+/// `zakurad` loads an empty configuration file, so a developer's own `zakura.toml` cannot change
+/// the result.
 fn rollback(cache_dir: &Path, extra: &[&str]) -> std::process::Output {
+    let config_dir = tempfile::tempdir().expect("disposable directory exists");
+    let config_path = config_dir.path().join("zakura.toml");
+    std::fs::write(&config_path, "").expect("the disposable directory is writable");
+
     // Nextest supplies the relocated binary path when running tests from an archive.
-    let executable = std::env::var("CARGO_BIN_EXE_zakura-rollback-state")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zakura-rollback-state").to_owned());
+    let executable = std::env::var("CARGO_BIN_EXE_zakurad")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_zakurad").to_owned());
     let mut child = Command::new(executable)
-        .args(["--network", "Mainnet", "--height", "1", "--cache-dir"])
+        .arg("--config")
+        .arg(&config_path)
+        .args([
+            "rollback-state",
+            "--network",
+            "Mainnet",
+            "--height",
+            "1",
+            "--cache-dir",
+        ])
         .arg(cache_dir)
         .args(extra)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("standalone utility starts");
+        .expect("zakurad starts");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while child
         .try_wait()
-        .expect("utility status is readable")
+        .expect("zakurad status is readable")
         .is_none()
     {
         if std::time::Instant::now() >= deadline {
-            child.kill().expect("timed-out utility can be stopped");
-            child.wait().expect("timed-out utility is reaped");
-            panic!("standalone rollback exceeded 60 seconds");
+            child.kill().expect("timed-out zakurad can be stopped");
+            child.wait().expect("timed-out zakurad is reaped");
+            panic!("zakurad rollback-state exceeded 60 seconds");
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     child
         .wait_with_output()
-        .expect("utility output is readable")
+        .expect("zakurad output is readable")
 }
 
 fn assert_tip_and_utxos(cache_dir: &Path, pruned: bool, blocks: &[Arc<Block>], height: u32) {
@@ -110,8 +127,36 @@ fn assert_tip_and_utxos(cache_dir: &Path, pruned: bool, blocks: &[Arc<Block>], h
     }
 }
 
+/// Unsupported x86 hosts must fail before opening or creating a state database.
+#[cfg(all(
+    target_arch = "x86_64",
+    feature = "x86_64-asm",
+    not(feature = "portable")
+))]
 #[test]
-fn standalone_pruned_rollback_previews_then_removes_tip_and_outputs() {
+fn rollback_rejects_unsupported_cpu_before_opening_state() {
+    if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("adx") {
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("disposable directory exists");
+    let cache_dir = dir.path().join("state");
+    let output = rollback(&cache_dir, &["--dry-run"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("This Zakura binary requires CPU features this machine lacks"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !cache_dir.exists(),
+        "CPU rejection must not create a state database"
+    );
+}
+
+#[test]
+fn pruned_rollback_previews_then_removes_tip_and_outputs() {
     let dir = tempfile::tempdir().expect("disposable directory exists");
     let blocks = fixture(dir.path(), true);
     let preview = rollback(dir.path(), &["--storage-mode", "pruned", "--dry-run"]);
@@ -134,7 +179,7 @@ fn standalone_pruned_rollback_previews_then_removes_tip_and_outputs() {
 }
 
 #[test]
-fn standalone_archive_default_still_rolls_back_indexed_state() {
+fn archive_default_still_rolls_back_indexed_state() {
     let dir = tempfile::tempdir().expect("disposable directory exists");
     let blocks = fixture(dir.path(), false);
     assert!(rollback(dir.path(), &["--dry-run"]).status.success());
@@ -144,7 +189,7 @@ fn standalone_archive_default_still_rolls_back_indexed_state() {
 }
 
 #[test]
-fn standalone_archive_rejects_index_free_state_without_mutation() {
+fn archive_rejects_index_free_state_without_mutation() {
     let dir = tempfile::tempdir().expect("disposable directory exists");
     let blocks = fixture(dir.path(), true);
     for args in [
@@ -155,8 +200,13 @@ fn standalone_archive_rejects_index_free_state_without_mutation() {
     ] {
         let result = rollback(dir.path(), &args);
         assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr)
-            .contains("cannot open state in archive storage mode"));
+        // `zakurad` logs command errors to stdout.
+        assert!(
+            String::from_utf8_lossy(&result.stdout)
+                .contains("cannot open state in archive storage mode"),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
         assert_tip_and_utxos(dir.path(), true, &blocks, 2);
     }
 }

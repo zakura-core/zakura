@@ -5,3 +5,9 @@
 harness = "block-sync/storage"
 generator = 2
 sha256 = "4fa5ce72c2dcba356e9db4a472497944eb6720eac3db88e18f4b37cd57d8916d"
+scenario_sha256 = "9e7c3dfa125e98317a97cce6c60ce23ef0962665b04cd3274db9a34ac2a42f29"
+source = "crates/zakura-sim/tests/block_resource_properties.rs"
+
+[[witness]]
+property = "block-sync/retained-byte-bound"
+expect = "holds"

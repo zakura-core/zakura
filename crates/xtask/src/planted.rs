@@ -9,8 +9,8 @@
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
-//! build uses the workspace's `planted` profile in `target/planted/target`,
-//! apart from the checkout's own target directory. Then for each case it:
+//! recording build uses the workspace's `planted` profile in
+//! `target/planted/target`, apart from the checkout's own target directory. Then for each case it:
 //!
 //! 1. records the input with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
@@ -44,27 +44,71 @@
 //! violates it without its trigger history, so the gate stays the committed
 //! input, which must violate exactly the case's property.
 //!
+//! `--targets` runs only the cases whose committed input runs on a harness
+//! that a simulator fuzz target runs, as the fuzz package's
+//! `[package.metadata.zakura-sim.targets]` table maps them, and prints
+//! each target's cases, or that it has none. After step 3 it also confirms
+//! each patched input through its target in fresh processes, as
+//! `cargo xtask sim-minimize` confirms an original: the patched target must
+//! crash with the case's property alone and name the harness,
+//! `zakura-sim confirm` must find the property's trigger history, and a
+//! fresh `zakura-sim replay` must match the trace Exact. It builds
+//! `zakura-sim` and the target in `target/planted/confirm-builds/`, outside
+//! the scratch worktree, so later cases and runs reuse the builds, and both
+//! binaries must embed the patched checkout's source digest. A check that
+//! fails is its own failure, never a catch.
+//!
+//! `--shard <index>/<count>` runs only every `count`th case in path order,
+//! starting at position `index`. It picks from the cases that the property
+//! and `--targets` keep, and `--changed-since` filters its pick. The
+//! `count` shards of one count together run every case once. A shard that
+//! holds no case fails the run, so a run that passes ran at least one case.
+//! A case's shard follows from its position, so adding or removing a case
+//! moves every later case to another shard: across that change, a case can
+//! run on two nights in a row, or wait up to `2 * count - 1` nights. The
+//! nightly job runs one shard a night, and a remote host runs the whole
+//! catalogue (qa/fuzz/sim's README, Long runs).
+//!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
 //! checks changed, or every case if the shared machinery changed: this
 //! runner, the simulator that records and judges each run, its scheduler
 //! and runtime, or the build configuration. A renamed file counts as a
 //! change to its old and its new path.
+//!
+//! `cargo xtask planted pilot (sensitivity|discovery)` runs the mutation
+//! pilot's paired experiments on the reviewed catalogue's cases; see
+//! [`pilot`].
 
 use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
     fmt, fs,
-    path::{Component, Path, PathBuf},
+    path::{self, Component, Path, PathBuf},
     process::Command,
+    sync::atomic::AtomicBool,
+    time::Duration,
 };
 
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{run_command, sim::SIM_RUSTFLAGS, BoxError};
+use crate::{
+    run_command,
+    sim::SIM_RUSTFLAGS,
+    sim_minimize::{self, Sanitizer, Status},
+    BoxError,
+};
+
+mod pilot;
+
+#[allow(dead_code)]
+#[path = "../../zakura-sim/build/provenance.rs"]
+mod provenance;
+
+pub(super) use pilot::run as pilot;
 
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
@@ -96,6 +140,52 @@ const CAMPAIGN_INPUTS: usize = 32;
 /// The campaign's longest input, in bytes.
 const CAMPAIGN_INPUT_BYTES: usize = 64;
 
+/// The longest one child of a confirmation through a fuzz target may run.
+const TARGET_CHILD: Duration = Duration::from_secs(300);
+
+/// The directory under the planted work directory where a confirmation
+/// through a fuzz target builds `zakura-sim` and the target. It sits
+/// outside the scratch worktree, which each run removes, so later cases,
+/// later runs and CI's cache of `target/` reuse the builds.
+const CONFIRM_BUILDS: &str = "confirm-builds";
+
+/// One part of the catalogue: the cases at positions `index`,
+/// `index + count`, `index + 2 * count` and so on, in path order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Shard {
+    index: usize,
+    count: usize,
+}
+
+impl Shard {
+    /// Reads `<index>/<count>`, where `index` is below `count`.
+    pub(super) fn parse(text: &str) -> Result<Shard, String> {
+        let usage = || format!("expected `<index>/<count>` with index below count, not `{text}`");
+        let (index, count) = text.split_once('/').ok_or_else(usage)?;
+        let index: usize = index.parse().map_err(|_| usage())?;
+        let count: usize = count.parse().map_err(|_| usage())?;
+        if index >= count {
+            return Err(usage());
+        }
+        Ok(Shard { index, count })
+    }
+
+    /// The cases of `cases` in this shard, in their order.
+    fn select<T>(self, cases: Vec<T>) -> Vec<T> {
+        cases
+            .into_iter()
+            .skip(self.index)
+            .step_by(self.count)
+            .collect()
+    }
+}
+
+impl fmt::Display for Shard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.index, self.count)
+    }
+}
+
 /// One retained bypass patch.
 #[derive(Clone, Debug)]
 struct Case {
@@ -112,6 +202,9 @@ struct Case {
     /// Other properties the patch's bug breaks, which a campaign run may
     /// violate instead of the case's property.
     also_violates: Vec<String>,
+    /// The simulator fuzz target that runs the input's harness, with
+    /// `--targets`.
+    target: Option<String>,
 }
 
 /// A case's `<name>.toml`.
@@ -169,6 +262,10 @@ enum Run {
     },
     /// The build or the `zakura-sim` command failed before writing a trace.
     Failed(String),
+    /// The pilot's run passed its deadline or died from a signal, whatever
+    /// files it wrote. The pilot counts it as a harness failure, never as a
+    /// result of the code under test.
+    Killed(String),
 }
 
 /// What a case's short campaign found.
@@ -207,6 +304,14 @@ enum Verdict {
     /// The patched run violated the property, but its witness test failed,
     /// as when the run missed the trigger history.
     WitnessFails(String),
+    /// The patched input didn't confirm through the fuzz target that runs
+    /// its harness.
+    TargetMisses {
+        /// The target.
+        target: String,
+        /// The confirmation's status and reason.
+        why: String,
+    },
     /// A campaign input's patched run failed, ended at a harness failure,
     /// violated another property, didn't report the case's property, or
     /// violated it without its trigger history.
@@ -251,6 +356,12 @@ impl fmt::Display for Verdict {
             Verdict::WitnessFails(why) => {
                 write!(f, "the patched run's witness test fails: {why}")
             }
+            Verdict::TargetMisses { target, why } => {
+                write!(
+                    f,
+                    "the patched input doesn't confirm through {target}: {why}"
+                )
+            }
             Verdict::CampaignFails { input, verdict } => {
                 write!(f, "campaign input {}: {verdict}", input.display())
             }
@@ -259,23 +370,70 @@ impl fmt::Display for Verdict {
 }
 
 /// Runs every planted case, or only `property`'s, and fails unless each is
-/// caught. With `changed_since`, it runs only the cases a change since that
-/// revision affects, and passes if none is.
+/// caught. With `shard`, it runs only that shard's cases, and fails if
+/// the shard has none. With `changed_since`, it runs only the cases a
+/// change since that revision affects, and passes if none is. With
+/// `targets`, it runs only the cases a simulator fuzz target runs, and
+/// confirms each through its target.
 pub(super) fn run(
     repo_root: &Path,
     property: Option<&str>,
+    shard: Option<Shard>,
     changed_since: Option<&str>,
+    targets: bool,
 ) -> Result<(), BoxError> {
-    let cases: Vec<Case> = cases(repo_root)?
+    let mut cases: Vec<Case> = cases(repo_root)?
         .into_iter()
         .filter(|case| property.is_none_or(|p| case.property == p))
         .collect();
+    if targets {
+        let harnesses = sim_minimize::fuzz_targets(repo_root)?;
+        let mut on_targets = Vec::new();
+        for mut case in cases {
+            case.target = target_of(&harnesses, &harness_of(repo_root, &case.input)?);
+            if case.target.is_some() {
+                on_targets.push(case);
+            }
+        }
+        cases = on_targets;
+        for (target, harness) in &harnesses {
+            let Some(harness) = harness else { continue };
+            let names: Vec<String> = cases
+                .iter()
+                .filter(|case| case.target.as_ref() == Some(target))
+                .map(|case| format!("{} {}", case.property, case.patch.display()))
+                .collect();
+            match names.as_slice() {
+                [] => println!("{target} ({harness}): no retained production bypass"),
+                names => println!("{target} ({harness}): {}", names.join(", ")),
+            }
+        }
+    }
     if cases.is_empty() {
-        return Err(match property {
-            Some(property) => format!("no planted case for {property}").into(),
-            None => format!("no planted cases under {PLANTED_DIR}").into(),
+        return Err(match (property, targets) {
+            (Some(property), true) => {
+                format!("no planted case for {property} runs on a fuzz target").into()
+            }
+            (Some(property), false) => format!("no planted case for {property}").into(),
+            (None, true) => "no planted case runs on a fuzz target".into(),
+            (None, false) => format!("no planted cases under {PLANTED_DIR}").into(),
         });
     }
+    // The shard picks from the catalogue before `changed_since` does, so a
+    // case's shard doesn't move with the changes.
+    let total = cases.len();
+    let cases = match shard {
+        Some(shard) => {
+            let picked = shard.select(cases);
+            if picked.is_empty() {
+                return Err(
+                    format!("shard {shard} holds none of the {total} planted cases").into(),
+                );
+            }
+            picked
+        }
+        None => cases,
+    };
     let cases = match changed_since {
         Some(rev) => {
             let changed = changed_since_rev(repo_root, rev)?;
@@ -353,6 +511,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                 input,
                 checks,
                 also_violates,
+                target: None,
             })
         })
         .collect()
@@ -478,6 +637,13 @@ fn find_patches(dir: &Path, patches: &mut Vec<PathBuf>) -> Result<(), BoxError> 
     Ok(())
 }
 
+/// Where confirmations through a fuzz target build, in the planted work
+/// directory `work`: [`CONFIRM_BUILDS`], beside the scratch worktree rather
+/// than in it.
+fn confirm_builds(work: &Path) -> PathBuf {
+    work.join(CONFIRM_BUILDS)
+}
+
 /// Removes the scratch worktree at `worktree`, if there is one.
 fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), BoxError> {
     if worktree.exists() {
@@ -495,7 +661,7 @@ fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), BoxError> {
 /// each. Returns how many cases failed.
 fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxError> {
     let target = work.join("target");
-    run_command(&mut cargo_sim(worktree, &target, "build"))?;
+    run_command(&mut cargo_sim(worktree, &target))?;
     // The patched builds reuse the target directory, so the baseline keeps
     // its own copy of the binary.
     let baseline = work.join("baseline-zakura-sim");
@@ -504,7 +670,8 @@ fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxE
     for (index, case) in cases.iter().enumerate() {
         let scratch = work.join(format!("case-{index}"));
         fs::create_dir_all(&scratch)?;
-        let verdict = check_case(worktree, &scratch, &target, &baseline, case);
+        let builds = confirm_builds(work);
+        let verdict = check_case(worktree, &scratch, &target, &builds, &baseline, case);
         run_command(git(worktree).args(["reset", "--hard", "--quiet", "HEAD"]))?;
         run_command(git(worktree).args(["clean", "-fdq"]))?;
         let verdict = verdict?;
@@ -518,11 +685,13 @@ fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxE
 
 /// Runs the input on the unpatched `baseline` binary, then patches
 /// `worktree` and runs it again, building in `target` and writing both
-/// traces under `scratch`.
+/// traces under `scratch`. A confirmation through a fuzz target builds
+/// under `builds`.
 fn check_case(
     worktree: &Path,
     scratch: &Path,
     target: &Path,
+    builds: &Path,
     baseline: &Path,
     case: &Case,
 ) -> Result<Verdict, BoxError> {
@@ -535,6 +704,7 @@ fn check_case(
         &case.property,
         "holds",
         &scratch.join("baseline"),
+        None,
     )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
@@ -542,24 +712,138 @@ fn check_case(
     if let Err(why) = apply(worktree, &case.patch) {
         return Ok(Verdict::PatchDoesntApply(why));
     }
-    let mut patched_sim = cargo_sim(worktree, target, "run");
-    patched_sim.arg("--");
+    if let Err(error) = run_command(&mut cargo_sim(worktree, target)) {
+        return Ok(Verdict::Failed(format!(
+            "the patched build failed: {error}"
+        )));
+    }
     let patched = record(
-        patched_sim,
+        Command::new(target.join(PROFILE).join("zakura-sim")),
         &harness,
         &input,
         &case.property,
         "violated",
         &scratch.join("patched"),
+        None,
     )?;
-    match classify(&case.property, &patched) {
-        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign")),
-        verdict => Ok(verdict),
+    let verdict = match classify(&case.property, &patched) {
+        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
+        verdict => return Ok(verdict),
+    };
+    match (&verdict, &case.target) {
+        (Verdict::Caught(_), Some(fuzz)) => {
+            Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
+        }
+        _ => Ok(verdict),
+    }
+}
+
+/// The fuzz target that runs `harness`, from the fuzz package's targets
+/// and the harnesses they run, `harnesses`. The first by name, if several
+/// do.
+fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Option<String> {
+    harnesses
+        .iter()
+        .find(|(_, runs)| runs.as_deref() == Some(harness))
+        .map(|(target, _)| target.clone())
+}
+
+/// Confirms `case`'s committed input in the patched `worktree` through the
+/// fuzz target `target`, which runs `harness`, in fresh processes, with
+/// [`sim_minimize::confirm`]: the target must crash with the case's
+/// property alone and name `harness`, `zakura-sim confirm` must find the
+/// property's trigger history, and a fresh replay must match Exact. Builds
+/// under `builds`, which outlives the worktree, and writes under `scratch`.
+///
+/// The builds are reused, so both pinned binaries must also name the
+/// patched source: each embeds the source digest that `zakura-sim`'s build
+/// script computed, and the digest must be the patched worktree's
+/// ([`names_source`]). `None` if every check passed.
+fn through_target(
+    worktree: &Path,
+    builds: &Path,
+    scratch: &Path,
+    case: &Case,
+    target: &str,
+    harness: &str,
+) -> Result<Option<Verdict>, BoxError> {
+    let out = path::absolute(scratch.join("target"))?;
+    if out.exists() {
+        fs::remove_dir_all(&out)?;
+    }
+    let request = sim_minimize::Request {
+        target: target.to_owned(),
+        harness: harness.to_owned(),
+        input: path::absolute(worktree.join(&case.input))?,
+        property: case.property.clone(),
+        out: out.clone(),
+        budget: sim_minimize::Budget {
+            runs: 1,
+            wall: TARGET_CHILD,
+            child: TARGET_CHILD,
+        },
+        sanitizer: Sanitizer::Address,
+    };
+    let report = sim_minimize::confirm(
+        worktree,
+        &path::absolute(builds)?,
+        &request,
+        &AtomicBool::new(false),
+    )?;
+    let misses = |why: String| {
+        Ok(Some(Verdict::TargetMisses {
+            target: target.to_owned(),
+            why: format!(
+                "{why}; see {}",
+                out.join(sim_minimize::REPORT_FILE).display()
+            ),
+        }))
+    };
+    if report.status != Status::Confirmed {
+        return misses(format!(
+            "{}: {}",
+            report.status,
+            report.reason.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    let source = provenance::Provenance::read(worktree, provenance::SOURCE_PATHS).source;
+    let bin = sim_minimize::bin_dir(&out);
+    for binary in [bin.join("zakura-sim"), bin.join(target)] {
+        if let Err(why) = names_source(&fs::read(&binary)?, &source) {
+            return misses(format!("{}: {why}", binary.display()));
+        }
+    }
+    println!(
+        "{} {}: confirmed through {target}; see {}",
+        case.property,
+        case.patch.display(),
+        out.join(sim_minimize::REPORT_FILE).display()
+    );
+    Ok(None)
+}
+
+/// Checks that `binary` embeds `source`, the patched checkout's source
+/// digest as `zakura-sim`'s build script computes it, so it was built from
+/// that source and not reused from an earlier one. A digest git couldn't
+/// compute names no source.
+fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
+    if source == provenance::UNKNOWN {
+        return Err("git couldn't compute the patched checkout's source digest".to_owned());
+    }
+    if binary
+        .windows(source.len())
+        .any(|window| window == source.as_bytes())
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "the build doesn't embed the patched checkout's source digest {source}"
+        ))
     }
 }
 
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
-/// build in `target`, which recording the committed input built. Each input
+/// build in `target`, which [`check_case`] built. Each input
 /// and its trace go under `dir`.
 fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
     if dir.exists() {
@@ -579,6 +863,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
             &case.property,
             "violated",
             &dir.join(format!("run-{index}")),
+            None,
         )?;
         match classify(&case.property, &run) {
             Verdict::Caught(_) => caught += 1,
@@ -667,17 +952,21 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// `cargo <verb>` for `worktree`'s `zakura-sim` binary, built with
-/// [`PROFILE`] and the simulator's flags in `target`. A `run` takes the
-/// binary's arguments after a `--`.
-fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
+/// `cargo build` for `worktree`'s `zakura-sim` binary, with [`PROFILE`] and
+/// the simulator's flags, in `target`.
+///
+/// A bypass patch can leave the code it bypasses unused, so the build
+/// reports warnings but doesn't fail on them, even where the environment
+/// denies them, as CI's Rust setup does with `CARGO_BUILD_WARNINGS=deny`.
+fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
         .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_BUILD_WARNINGS", "warn")
         .current_dir(worktree)
-        .arg(verb)
+        .arg("build")
         .args([
             "--locked",
             "--profile",
@@ -693,6 +982,11 @@ fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
 /// Records `input` on `harness` with `zakura_sim`, a `zakura-sim` command,
 /// as a witness test of `property` that expects `expect`, writing the trace
 /// to `out`, and reads its `end` record and the test's result.
+///
+/// With a `deadline` and its interrupt flag, the command's output goes to
+/// `<out>.log`. A run past the deadline, or one that a signal killed, is
+/// [`Run::Killed`], whatever files it already wrote. A set flag kills the
+/// run and stops the pilot.
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -700,25 +994,47 @@ fn record(
     property: &str,
     expect: &str,
     out: &Path,
+    deadline: Option<(Duration, &AtomicBool)>,
 ) -> Result<Run, BoxError> {
     if out.exists() {
         fs::remove_dir_all(out)?;
     }
-    let status = zakura_sim
+    zakura_sim
         .args(["record", "--sim", harness, "--input"])
         .arg(input)
         .arg("--out")
         .arg(out)
-        .args(["--witness", property, "--expect", expect])
-        .status()?;
+        .args(["--witness", property, "--expect", expect]);
+    let ended = match deadline {
+        None => format!("exited with {}", zakura_sim.status()?),
+        Some((deadline, interrupt)) => {
+            let log = out.with_extension("log");
+            let end = sim_minimize::run_child(&mut zakura_sim, &log, Some(deadline), interrupt)?;
+            let ended = format!("{end}; see {}", log.display());
+            match end {
+                sim_minimize::ChildEnd::Interrupted => return Err(pilot::INTERRUPTED_ERROR.into()),
+                // Its trace and witness result may look whole, but the
+                // run didn't finish.
+                sim_minimize::ChildEnd::TimedOut | sim_minimize::ChildEnd::Signaled(_) => {
+                    return Ok(Run::Killed(format!("`zakura-sim record` {ended}")))
+                }
+                sim_minimize::ChildEnd::Exited(_) => ended,
+            }
+        }
+    };
     // A failed witness test exits 1 too, but only after writing its result.
     let Ok(witness) = fs::read_to_string(out.join("witness.json")) else {
-        return Ok(Run::Failed(format!(
-            "`zakura-sim record` exited with {status}"
-        )));
+        return Ok(Run::Failed(format!("`zakura-sim record` {ended}")));
     };
     let witness: WitnessFile = serde_json::from_str(&witness)?;
-    let trace = fs::read_to_string(out.join("trace.jsonl"))?;
+    let trace = match fs::read_to_string(out.join("trace.jsonl")) {
+        Ok(trace) => trace,
+        Err(error) => {
+            return Ok(Run::Failed(format!(
+                "`zakura-sim record` {ended} and wrote its witness result, but its trace is unreadable: {error}"
+            )))
+        }
+    };
     let end = trace.lines().next_back().ok_or("the trace is empty")?;
     let mut run = end_of(property, end)?;
     if let Run::Ended {
@@ -774,7 +1090,7 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
 /// Why `baseline` doesn't hold `property` cleanly, or `None` if it does.
 fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
     match baseline {
-        Run::Failed(why) => Some(why.clone()),
+        Run::Failed(why) | Run::Killed(why) => Some(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..
@@ -801,7 +1117,7 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
 /// What the patched run shows about `property`.
 fn classify(property: &str, patched: &Run) -> Verdict {
     match patched {
-        Run::Failed(why) => Verdict::Failed(why.clone()),
+        Run::Failed(why) | Run::Killed(why) => Verdict::Failed(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..
@@ -1047,6 +1363,44 @@ mod tests {
         );
     }
 
+    /// The shards of one count split the cases between them, each case in
+    /// exactly one, and keep path order.
+    #[test]
+    fn shards_split_the_cases() {
+        let cases: Vec<usize> = (0..10).collect();
+        let shards: Vec<Vec<usize>> = (0..3)
+            .map(|index| Shard { index, count: 3 }.select(cases.clone()))
+            .collect();
+        assert_eq!(shards, [vec![0, 3, 6, 9], vec![1, 4, 7], vec![2, 5, 8]]);
+        assert_eq!(Shard { index: 0, count: 1 }.select(cases.clone()), cases);
+        assert!(Shard { index: 4, count: 7 }
+            .select(vec![0, 1, 2])
+            .is_empty());
+    }
+
+    /// Every simulator build warns rather than fails on warnings, so a
+    /// patch that leaves code unused still builds where the environment
+    /// sets `CARGO_BUILD_WARNINGS=deny`.
+    #[test]
+    fn simulator_builds_override_denied_warnings() {
+        let build = cargo_sim(Path::new("worktree"), Path::new("target"));
+        let warnings = build
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_WARNINGS")
+            .and_then(|(_, value)| value);
+        assert_eq!(warnings, Some(std::ffi::OsStr::new("warn")));
+        assert_eq!(build.get_args().next(), Some(std::ffi::OsStr::new("build")));
+    }
+
+    #[test]
+    fn a_shard_parses_only_an_index_below_its_count() {
+        assert_eq!(Shard::parse("2/7"), Ok(Shard { index: 2, count: 7 }));
+        assert_eq!(Shard::parse("0/1"), Ok(Shard { index: 0, count: 1 }));
+        for text in ["7/7", "0/0", "1", "a/2", "1/b", "-1/2", "1/2/3", ""] {
+            assert!(Shard::parse(text).is_err(), "{text}");
+        }
+    }
+
     /// A case is affected by a change to its patch's files, its checks, its
     /// own files, or the runner, and not by an unrelated change.
     #[test]
@@ -1071,7 +1425,10 @@ mod tests {
     fn shared_changes_affect_the_committed_case() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let cases = cases(&repo_root).expect("the planted cases parse");
-        let case = cases.first().expect("a committed case");
+        let case = cases
+            .iter()
+            .find(|case| case.property.starts_with("discovery/"))
+            .expect("a committed discovery case");
         let watched = watched(&repo_root, case).expect("the case's files exist");
         for path in [
             "crates/xtask/src/sim.rs",
@@ -1093,6 +1450,97 @@ mod tests {
         ] {
             assert!(is_affected(&watched, &[PathBuf::from(path)]), "{path}");
         }
+    }
+
+    /// With `--targets`, a case runs through a fuzz target that runs its
+    /// input's harness, such as the discovery wait case through
+    /// `discovery_wait_complete`. Checking each case keeps the test valid as
+    /// cases and targets are added.
+    #[test]
+    fn committed_cases_run_through_the_target_of_their_harness() {
+        let repo_root = crate::repo_root().expect("xtask lives in the workspace");
+        let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
+        let mut on_targets = BTreeMap::new();
+        for case in cases(&repo_root).expect("the planted cases parse") {
+            let harness = harness_of(&repo_root, &case.input).expect("the input has a sidecar");
+            if let Some(target) = target_of(&harnesses, &harness) {
+                assert_eq!(
+                    harnesses.get(&target),
+                    Some(&Some(harness)),
+                    "{}: its target runs its harness",
+                    case.property
+                );
+                on_targets.insert(case.property, target);
+            }
+        }
+        assert_eq!(
+            on_targets
+                .get("discovery/wait-complete-wakes")
+                .map(String::as_str),
+            Some("discovery_wait_complete")
+        );
+    }
+
+    /// A harness maps to the first target by name that runs it, and a
+    /// target that runs no harness maps nothing.
+    #[test]
+    fn a_harness_maps_to_the_first_target_that_runs_it() {
+        let harnesses = BTreeMap::from([
+            ("a_probe".to_owned(), None),
+            ("b_target".to_owned(), Some("h/one".to_owned())),
+            ("c_target".to_owned(), Some("h/one".to_owned())),
+            ("d_target".to_owned(), Some("h/two".to_owned())),
+        ]);
+        assert_eq!(target_of(&harnesses, "h/one").as_deref(), Some("b_target"));
+        assert_eq!(target_of(&harnesses, "h/two").as_deref(), Some("d_target"));
+        assert_eq!(target_of(&harnesses, "h/three"), None);
+    }
+
+    /// The builds a confirmation through a fuzz target makes outlive the
+    /// scratch worktree, which every run removes, so the next case, the
+    /// next run and CI's cache of `target/` reuse them.
+    #[test]
+    fn confirm_builds_outlive_the_worktree() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        fs::write(root.join("file"), "file").expect("the file is written");
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+        let work = root.join("target").join("planted");
+        let worktree = work.join("worktree");
+        git_ok(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                "target/planted/worktree",
+            ],
+        );
+        let built = confirm_builds(&work)
+            .join("sim")
+            .join("debug")
+            .join("zakura-sim");
+        fs::create_dir_all(built.parent().expect("a parent")).expect("the directory is created");
+        fs::write(&built, "binary").expect("the build is written");
+
+        remove_worktree(root, &worktree).expect("the worktree is removed");
+        assert!(!worktree.exists());
+        assert_eq!(fs::read(&built).expect("the build is kept"), b"binary");
+    }
+
+    /// A confirmation's binaries must embed the patched checkout's source
+    /// digest, so a reused build of other source doesn't pass.
+    #[test]
+    fn a_build_names_its_source() {
+        let source = "ab".repeat(32);
+        let binary = [b"head".as_slice(), source.as_bytes(), b"tail"].concat();
+        assert_eq!(names_source(&binary, &source), Ok(()));
+        let other = "cd".repeat(32);
+        assert!(names_source(&binary, &other).unwrap_err().contains(&other));
+        assert!(names_source(provenance::UNKNOWN.as_bytes(), provenance::UNKNOWN).is_err());
     }
 
     /// Runs `git` in `dir` with a fixed identity, and expects it to pass.
@@ -1137,6 +1585,46 @@ mod tests {
         );
         assert!(is_affected(&[PathBuf::from("a/service.rs")], &changed));
         assert!(is_affected(&[PathBuf::from("b")], &changed));
+    }
+
+    /// Writes a case for each `(property, name)` under `root`'s
+    /// [`PLANTED_DIR`]: a patch that changes `src/<name>.rs`, and a case file
+    /// naming `qa/inputs/<name>.bin`.
+    fn write_cases(root: &Path, cases: &[(&str, &str)]) {
+        for (property, name) in cases {
+            let dir = root.join(PLANTED_DIR).join(property);
+            fs::create_dir_all(&dir).expect("the property directory is created");
+            fs::write(
+                dir.join(format!("{name}.patch")),
+                format!("--- a/src/{name}.rs\n+++ b/src/{name}.rs\n@@ -1 +1 @@\n-fn a() {{}}\n+fn b() {{}}\n"),
+            )
+            .expect("the patch is written");
+            fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("input = \"qa/inputs/{name}.bin\"\n"),
+            )
+            .expect("the case file is written");
+        }
+    }
+
+    /// A shard that holds no case fails the run, so a passing run always
+    /// ran a case.
+    #[test]
+    fn an_empty_shard_fails() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        write_cases(repo.path(), &[("a", "one"), ("a", "two")]);
+        let error = super::run(
+            repo.path(),
+            None,
+            Some(Shard { index: 2, count: 7 }),
+            None,
+            false,
+        )
+        .expect_err("shard 2/7 of two cases is empty");
+        assert!(
+            error.to_string().contains("shard 2/7 holds none of the 2"),
+            "{error}"
+        );
     }
 
     /// A revision git can't resolve fails the run instead of selecting no
@@ -1201,7 +1689,8 @@ mod tests {
             assert!(
                 watched
                     .iter()
-                    .any(|path| path.starts_with("crates/zakura-network")),
+                    .any(|path| path.starts_with("crates/zakura-network")
+                        || path.starts_with("crates/zakura-node-services")),
                 "{} watches the production file it patches",
                 case.patch.display()
             );

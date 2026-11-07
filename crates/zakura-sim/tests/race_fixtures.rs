@@ -14,7 +14,7 @@ use zakura_sim::{
             AbBa, AbortWithoutJoin, All, Fixture, LostUpdate, MissedNotify, PickScenario, Race,
             Scenario, SnapshotReserve, TimerCancel, Variant, Which,
         },
-        run_harness,
+        run_harness, Subsystem,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
@@ -326,4 +326,14 @@ fn the_fixed_harness_draws_only_the_fix() {
     assert!(Variant::ALL
         .iter()
         .all(|v| (0..=u8::MAX).any(|b| All::draw(&[0, b, 0]).variant == *v)));
+}
+
+/// `fixtures/all` composes each fixture's own harness and `fixtures/fixed`,
+/// so `race_fixtures` can cover them.
+#[test]
+fn all_composes_every_fixture_and_fixed() {
+    let mut expected: Vec<&str> = Which::ALL.iter().map(|which| which.property()).collect();
+    expected.push(<zakura_sim::harness::fixtures::Fixed as Subsystem>::NAME);
+    assert_eq!(All::COMPOSES, expected.as_slice());
+    assert!(<zakura_sim::harness::fixtures::Fixed as Subsystem>::COMPOSES.is_empty());
 }

@@ -8,7 +8,7 @@
 
 mod support;
 
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use support::{
     inputs,
@@ -36,7 +36,6 @@ use zakura_sim::{
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         PeerAction, PeerSpec,
     },
-    property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
     table::{sender_properties, GeneratedId, Template},
     MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -71,17 +70,6 @@ const ONE_HEADER_PAGE: usize = 263;
 /// The node's chain at the start of the honest runs.
 const PRELOAD: u32 = 50;
 
-/// A view-less harness, for the generated properties, which read only the
-/// log.
-struct Logged;
-
-impl HasView for Logged {
-    type View = ();
-
-    /// Nothing.
-    fn view(&self) {}
-}
-
 /// The plans the honest runs take: all defaults, then two byte-chosen.
 fn plans() -> Vec<PlanInput> {
     let mut plans = vec![Plan::from_fuzz(&[])];
@@ -89,30 +77,16 @@ fn plans() -> Vec<PlanInput> {
     plans
 }
 
-/// A checker of header sync's sender properties, assembled in the test
-/// (M5-Q13).
-fn sender_checker() -> RegistryChecker<Logged> {
-    RegistryChecker::new(
-        Registry::new(sender_properties("header-sync", &RegtestMessage::LAYOUT))
-            .expect("generated IDs are unique"),
-        Rc::new(Logged),
-        Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Storage]),
-    )
-}
-
-/// Runs `scenario` under `plan` with the sender checker, and returns the
-/// report even of a run that ended in a harness failure, so the test can
-/// say what failed.
+/// Runs `scenario` under `plan`, and returns the report even of a run that
+/// ended in a harness failure, so the test can say what failed.
 fn run(scenario: &WireScenario, plan: PlanInput) -> RunReport {
     let ports = HeaderWire::prepare(scenario);
-    let mut checker = sender_checker();
     let ran = run_prepared::<HeaderWire>(
         scenario,
         ports.clone(),
         plan,
         &mut MemorySink::default(),
-        Some(&mut checker),
+        None,
     );
     let report = match ran {
         Ok(report) => report,
@@ -210,7 +184,7 @@ fn every_node_frame_is_conformant(report: &RunReport) {
 /// past its `Open`'s credit `OverCredit`.
 #[test]
 fn node_frames_obey_the_sender_limits() {
-    let ids: Vec<String> = sender_properties::<Logged>("header-sync", &RegtestMessage::LAYOUT)
+    let ids: Vec<String> = sender_properties::<Node>("header-sync", &RegtestMessage::LAYOUT)
         .into_iter()
         .map(|property| property.id.to_string())
         .collect();

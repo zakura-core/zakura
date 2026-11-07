@@ -1274,6 +1274,58 @@ async fn a_stopped_stream_returns_its_credit() {
     .unwrap();
 }
 
+/// API-10: a credit hold keeps a sender stuck on DATA_BLOCKED after the
+/// receiver read the bytes, and dropping the hold lets it finish.
+#[tokio::test]
+async fn releasing_a_credit_hold_unblocks_the_sender() {
+    const WINDOW: usize = 256 * 1024;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let config = QuicConfig {
+            // usize fits in u32 for this constant.
+            receive_window_bytes: WINDOW as u32,
+            // A larger stream window, so the connection window blocks.
+            stream_receive_window_bytes: 4 * WINDOW as u32,
+            ..test_config()
+        };
+        let (_server, _client, conn, inbound) = held_pair_with(&config, 1).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let writer = tokio::spawn(async move {
+            send.write_all(&[3; 2 * WINDOW]).await.unwrap();
+            send.finish().unwrap();
+        });
+        let (_send, mut recv) = inbound.accept_bi().await.unwrap();
+        let mut frame = vec![0; WINDOW];
+        // usize fits in u64 on supported targets.
+        let hold = recv.hold_credit(WINDOW as u64);
+        recv.read_exact(&mut frame).await.unwrap();
+        while inbound
+            .stats()
+            .await
+            .unwrap()
+            .connection
+            .frame_rx
+            .data_blocked
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut rest = vec![0; WINDOW];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), recv.read_exact(&mut rest[..1]))
+                .await
+                .is_err(),
+            "the hold keeps the read bytes' credit from the sender"
+        );
+        drop(hold);
+        // The cancelled read kept its reply, so no byte is lost.
+        recv.read_exact(&mut rest).await.unwrap();
+        assert!(recv.read_chunk(1).await.unwrap().is_none());
+        writer.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// API-9: raising the stream limit at runtime lets a blocked opener through,
 /// and the load snapshot reports the new limit.
 #[tokio::test]
@@ -1484,6 +1536,47 @@ async fn blocked_write_fails_when_the_peer_stops() {
     .unwrap();
 }
 
+/// API-5, DRV-9: `stopped` resolves with the peer's code while the writer
+/// writes nothing, a stop before accept resolves it at once, a dropped
+/// handle's waiter stays pending, and a closed connection resolves every
+/// waiter with the close reason.
+#[tokio::test]
+async fn stopped_resolves_on_the_peer_stop_and_on_close() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let (_server, _client, conn, inbound) = held_pair(64).await;
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"x").await.unwrap();
+        let (_peer_send, mut peer_recv) = inbound.accept_bi().await.unwrap();
+        let mut stopped = Box::pin(send.stopped());
+        assert!(futures::poll!(&mut stopped).is_pending());
+        peer_recv.stop(VarInt::from_u32(9)).unwrap();
+        assert_eq!(stopped.await, Ok(VarInt::from_u32(9)));
+
+        // The peer stops a stream this node hasn't accepted yet.
+        let (mut peer_send, mut peer_recv) = inbound.open_bi().await.unwrap();
+        peer_send.write_all(b"x").await.unwrap();
+        peer_recv.stop(VarInt::from_u32(11)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (accepted, _accepted_recv) = conn.accept_bi().await.unwrap();
+        assert_eq!(accepted.stopped().await, Ok(VarInt::from_u32(11)));
+
+        // A dropped handle's waiter resolves only at the close.
+        let (dropped, _dropped_recv) = conn.open_bi().await.unwrap();
+        let mut orphaned = Box::pin(dropped.stopped());
+        drop(dropped);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(futures::poll!(&mut orphaned).is_pending());
+
+        let (live, _live_recv) = conn.open_bi().await.unwrap();
+        let stopped = live.stopped();
+        conn.close(VarInt::from_u32(0), b"done");
+        assert_eq!(stopped.await, Err(crate::ConnectionError::LocallyClosed));
+        assert_eq!(orphaned.await, Err(crate::ConnectionError::LocallyClosed));
+    })
+    .await
+    .unwrap();
+}
+
 /// `finish` after writes that wait on flow control finishes after them.
 #[tokio::test]
 async fn finish_waits_for_writes_queued_behind_flow_control() {
@@ -1588,8 +1681,11 @@ async fn drained_connections_leave_the_table() {
         conn.close(VarInt::from_u32(0), b"done");
         inbound.closed().await;
         drop(inbound);
-        // Draining lasts three PTOs, a few milliseconds on loopback.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Draining lasts three PTOs. A loaded host measures a long RTT, so
+        // the test waits for the slot to free instead of a fixed time.
+        while server.endpoint.connection_count() + server.endpoint.closing_connection_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let started = std::time::Instant::now();
         server.endpoint.shutdown().await;
         assert!(

@@ -13,15 +13,15 @@
 
 mod support;
 
-use std::{collections::BTreeMap, net::SocketAddr, rc::Rc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 use support::{
     inputs,
-    steer::{before, steer, Pair, Steer},
+    steer::{before, steer, Steer},
 };
 use zakura_chain::parameters::Network;
 use zakura_network::{
-    zakura::{v9::RegtestMessage, ZakuraHandlerError, ZakuraLocalLimits},
+    zakura::{ZakuraHandlerError, ZakuraLocalLimits},
     Config,
 };
 use zakura_sim::{
@@ -36,8 +36,6 @@ use zakura_sim::{
         honest::{CreditSpec, GrantPolicy, HonestSpec, SubscribeSpec},
         peer_addr, PeerSpec, NODE_ADDR,
     },
-    property::{Assumptions, HasView, Property, Registry, RegistryChecker, Source, Sources},
-    table::{sender_properties, table_properties},
     Checker, MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, StepCtx,
 };
 
@@ -53,49 +51,17 @@ const HEADERS: u16 = 3;
 /// The ID of header sync's generated `conformant-never-closes`.
 const NEVER_CLOSES: &str = "header-sync/s5v9/conformant-never-closes";
 
-/// A view-less harness, for the generated properties, which read only the
-/// log.
-struct Logged;
-
-impl HasView for Logged {
-    type View = ();
-
-    /// Nothing.
-    fn view(&self) {}
-}
-
-/// Every generated receiver and sender property of header sync's table,
-/// assembled in the test (M5-Q13).
-fn table_checker() -> RegistryChecker<Logged> {
-    let mut properties: Vec<Property<Logged>> =
-        table_properties("header-sync", &RegtestMessage::LAYOUT);
-    properties.extend(sender_properties("header-sync", &RegtestMessage::LAYOUT));
-    RegistryChecker::new(
-        Registry::new(properties).expect("generated IDs are unique"),
-        Rc::new(Logged),
-        Assumptions::none(),
-        &Sources::observed(&[Source::Frames, Source::Closes, Source::Storage]),
-    )
-}
-
-/// Runs `scenario` under `plan` with the table checker and `extra`, and
-/// returns the report, even of a run that ended in a harness failure, with
-/// its records and the ports.
+/// Runs `scenario` under `plan` with `extra`, and returns the report, even
+/// of a run that ended in a harness failure, with its records and the
+/// ports.
 fn run_with(
     scenario: &WireScenario,
     plan: PlanInput,
     extra: &mut dyn Checker,
 ) -> (RunReport, Vec<String>, WirePorts) {
     let ports = HeaderWire::prepare(scenario);
-    let mut table = table_checker();
     let mut sink = MemorySink::default();
-    let ran = run_prepared::<HeaderWire>(
-        scenario,
-        ports.clone(),
-        plan,
-        &mut sink,
-        Some(&mut Pair(&mut table, extra)),
-    );
+    let ran = run_prepared::<HeaderWire>(scenario, ports.clone(), plan, &mut sink, Some(extra));
     let report = match ran {
         Ok(report) => report,
         Err(HarnessError::Run { report, .. }) => *report,

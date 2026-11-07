@@ -293,7 +293,8 @@ impl BlockScenario {
     /// `M` is `10·B` and the look-ahead limit `L` is `2.5·B`, more than the
     /// 400 bodies the commit window retains. Once the window's heights
     /// arrive, the node requests heights above it until its estimates spend
-    /// `L`.
+    /// `L`. The first request above the window comes at about step 323,000, so
+    /// the run stops at 350,000 steps.
     pub fn above_window() -> Self {
         BlockScenario {
             blocks: 420,
@@ -308,7 +309,7 @@ impl BlockScenario {
             max_inflight_block_bytes: Some(20_000_000),
             max_reorder_lookahead_bytes: Some(5_000_000),
             max_response_bytes: Some(2_000_000),
-            steps: Some(300_000),
+            steps: Some(350_000),
             ..BlockScenario::default()
         }
     }
@@ -320,14 +321,13 @@ impl BlockScenario {
     /// its routine; and the chain resets to a fork from height 12 at 12 s of
     /// virtual time, after the 8 s request timeout.
     ///
-    /// The pause starts at height 6, not 5. From height 5, some plans leave
-    /// free only a routine that never completed a request. That routine has
-    /// no RTprop sample, so it defers the floor to the paused routines,
-    /// which still publish free slots and measured RTprops. No routine then
-    /// asks for height 7 before the reset. Main shows the same deferral on
-    /// 7 of 24 plans. From height 6, the routine that delivered height 5
-    /// stays free and measured, and all 24 plans ask for height 7 before
-    /// the timeout.
+    /// The pause starts at height 6, not 5. From height 6, the routine that
+    /// delivered height 5 stays free and measured, so its request for
+    /// height 7 has a floor rescue deadline of about 2 s and times out
+    /// before the reset. From height 5, some plans leave free only a
+    /// routine that never completed a request. That routine asks for height
+    /// 7 (#1812), but its request has no delivery measurement, so its
+    /// deadline of about 15.6 s passes the reset.
     pub fn floor_churn() -> Self {
         let after = |submissions| {
             Some(policy::Trigger::Count(
@@ -445,7 +445,7 @@ impl BlockScenario {
             config.max_inflight_requests = limit;
         }
         if let Some(bytes) = self.max_inflight_block_bytes {
-            config.max_inflight_block_bytes = bytes;
+            config.max_inflight_block_bytes = Some(bytes);
         }
         if let Some(bytes) = self.max_reorder_lookahead_bytes {
             config.max_reorder_lookahead_bytes = bytes;

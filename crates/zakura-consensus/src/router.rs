@@ -47,7 +47,7 @@ pub mod service_trait;
 #[cfg(test)]
 mod tests;
 
-/// The bound for the chain verifier and transaction verifier buffers.
+/// The bound for the chain verifier buffer.
 ///
 /// We choose the verifier buffer bound based on the maximum number of
 /// concurrent verifier users, to avoid contention:
@@ -60,6 +60,19 @@ mod tests;
 /// We deliberately add extra slots, because they only cost a small amount of
 /// memory, but missing slots can significantly slow down Zebra.
 const VERIFIER_BUFFER_BOUND: usize = 5;
+
+/// The bound for the transaction verifier buffer.
+///
+/// The block verifier sends every transaction in a block through this buffer, so a large block
+/// queues thousands of requests at once. With a few slots, the block verifier and the buffer's
+/// worker take turns for each transaction instead of overlapping.
+///
+/// Queued requests share their transaction and output data with the block that holds them, so a
+/// slot adds only its own bookkeeping. The queue is first in, first out, so a mempool request that
+/// arrives behind a block's requests waits for their verifier setup, about a microsecond each.
+/// Mempool verification has its own concurrency limit, so it doesn't rely on this bound for
+/// backpressure.
+const TRANSACTION_VERIFIER_BUFFER_BOUND: usize = 4096;
 
 /// The block verifier router routes requests to either the checkpoint verifier or the
 /// semantic block verifier, depending on the maximum checkpoint height.
@@ -94,15 +107,32 @@ where
 }
 
 /// Routes transaction-verifier reads around the serialized read-write state buffer.
-#[derive(Clone, Debug)]
+///
+/// The transaction verifier clones this router for every transaction, and most block
+/// transactions never read state through it. The read service is shared, so that clone stays
+/// cheap, and copied only for a read request. The mutex makes the shared service `Sync`
+/// without requiring it of the service itself; it is held only to copy the service.
+#[derive(Debug)]
 struct TransactionStateRouter<S, R> {
     state: S,
-    read_state: R,
+    read_state: Arc<std::sync::Mutex<R>>,
+}
+
+impl<S: Clone, R> Clone for TransactionStateRouter<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            read_state: Arc::clone(&self.read_state),
+        }
+    }
 }
 
 impl<S, R> TransactionStateRouter<S, R> {
     fn new(state: S, read_state: R) -> Self {
-        Self { state, read_state }
+        Self {
+            state,
+            read_state: Arc::new(std::sync::Mutex::new(read_state)),
+        }
     }
 }
 
@@ -141,7 +171,11 @@ where
             request => return self.state.clone().oneshot(request).boxed(),
         };
 
-        let read_state = self.read_state.clone();
+        let read_state = self
+            .read_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         async move {
             let response = read_state.oneshot(read_request).await?;
             response.try_into().map_err(BoxError::from)
@@ -362,7 +396,11 @@ where
         // V5+ transaction IDs authenticate the expiry height, but not the coinbase input height.
         // Check their agreement before a peer-controlled height selects the checkpoint verifier.
         if let Some(height) = block.coinbase_height() {
-            let coinbase = &block.transactions[0];
+            let coinbase = block
+                .view()
+                .transactions()
+                .next()
+                .expect("coinbase height requires a transaction");
             if coinbase.version() >= 5 {
                 if let Err(error) =
                     transaction::check::coinbase_height_matches_expiry(&height, coinbase)
@@ -370,13 +408,13 @@ where
                     // A rewritten expiry changes the coinbase transaction ID. That body fails
                     // its header commitment, so only the supplier is at fault.
                     let merkle_root: block::merkle::Root =
-                        block.transactions.iter().map(|tx| tx.hash()).collect();
-                    let error = if merkle_root == block.header.merkle_root {
+                        block.view().transactions().map(|tx| tx.hash()).collect();
+                    let error = if merkle_root == block.header().merkle_root {
                         VerifyBlockError::Transaction(error)
                     } else {
                         BlockError::BadMerkleRoot {
                             actual: merkle_root,
-                            expected: block.header.merkle_root,
+                            expected: block.header().merkle_root,
                         }
                         .into()
                     };
@@ -398,9 +436,11 @@ where
                 .boxed()
             }
 
-            Some(height) if height <= self.max_checkpoint_height => {
-                self.checkpoint.call(block).map_err(Into::into).boxed()
-            }
+            Some(height) if height <= self.max_checkpoint_height => self
+                .checkpoint
+                .call_with_origin(block, request.origin())
+                .map_err(Into::into)
+                .boxed(),
             // This also covers blocks with no height, which the block verifier
             // will reject immediately.
             _ => self.block.call(request).map_err(Into::into).boxed(),
@@ -461,6 +501,9 @@ where
         + 'static,
     Mempool::Future: Send + 'static,
 {
+    // Keys are built off the async workers; nothing waits for them, so startup is not delayed.
+    let _key_preload = crate::primitives::halo2::spawn_key_preload();
+
     // Give other tasks priority before spawning the checkpoint task.
     tokio::task::yield_now().await;
 
@@ -547,7 +590,10 @@ where
     // transaction verification
 
     let transaction = transaction::Verifier::new(network, transaction_state, mempool);
-    let transaction = spawn_buffer(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
+    let transaction = spawn_buffer(
+        BoxService::new(transaction),
+        TRANSACTION_VERIFIER_BUFFER_BOUND,
+    );
 
     // block verification
     let (list, max_checkpoint_height) = init_checkpoint_list(config, network);

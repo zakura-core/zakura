@@ -214,6 +214,13 @@ const DISCOVERY_WITNESSES: &str = "tests/discovery_wire_witness.rs";
 /// Why a discovery ID whose guard is discovery's own has no bypass yet.
 const DISCOVERY_GUARD: Bypass = Bypass::Pending("disc-3.2 adds its planted case");
 
+/// Why a discovery `over-margin-closes` ID has no bypass yet. Without a
+/// fact for the node's commitment releases, the evidence judges a request
+/// past the margin only before a fault close (`peer/evidence.rs`).
+const RELEASE_FACT: Bypass = Bypass::Pending(
+    "no fact shows the node releasing a commitment; disc-3.2 adds one with its planted case",
+);
+
 /// Why a discovery ID whose guard is the shared reader's has no bypass
 /// yet.
 const READER_GUARD: Bypass = Bypass::Pending("disc-3.3 adds its planted case");
@@ -632,7 +639,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-peers/over-margin-closes",
         GET_PEERS_ACTS,
-        DISCOVERY_GUARD,
+        RELEASE_FACT,
     ),
     discovery(
         "discovery/s4v2/get-peers/bad-content-closes",
@@ -692,7 +699,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-services/over-margin-closes",
         GET_SERVICES_ACTS,
-        DISCOVERY_GUARD,
+        RELEASE_FACT,
     ),
     discovery(
         "discovery/s4v2/get-services/bad-content-closes",
@@ -736,7 +743,10 @@ pub static COVERAGE: &[Coverage] = &[
                      Services, and a larger one is long-payload",
             witness: sim_test(DISCOVERY_WITNESSES, SERVICES_ACTS),
         },
-        bypass: DISCOVERY_GUARD,
+        bypass: Bypass::Pending(
+            "no planted case reaches it on this node; disc-3.2 adds a scripted bypass, as \
+             header sync's unreachable IDs have",
+        ),
     },
     // Any production change that punishes an honest header-sync peer also
     // violates `conformant-never-closes`, and a planted case's input must

@@ -150,6 +150,15 @@ pub enum TransactionError {
     #[error("Groth16 proof is malformed: {0}")]
     MalformedGroth16(String),
 
+    /// This build cannot verify Sprout JoinSplit proofs, because it was compiled without
+    /// the `sprout` feature.
+    ///
+    /// This is a local capability limit, not a consensus verdict: the transaction may be
+    /// valid. ZIP 218 disallows JoinSplits from NU7 onward, so only pre-NU7 transactions
+    /// above the last checkpoint can reach it.
+    #[error("Sprout JoinSplit proof verification is not built: rebuild with the `sprout` feature")]
+    SproutVerifierNotBuilt,
+
     #[error(
         "Sprout joinSplitSig MUST represent a valid signature under joinSplitPubKey of dataToBeSigned: {0}"
     )]
@@ -460,6 +469,11 @@ impl TransactionError {
             Self::SmallOrder => consensus("transaction.small_order"),
             Self::Groth16(_) => consensus("transaction.groth16"),
             Self::MalformedGroth16(_) => consensus("transaction.malformed_groth16"),
+            // Retryable so a build without Sprout stalls on a valid pre-NU7 JoinSplit
+            // block instead of durably recording that block as invalid.
+            Self::SproutVerifierNotBuilt => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
             Self::Ed25519(_) => consensus("transaction.ed25519"),
             Self::RedJubjub(_) => consensus("transaction.redjubjub"),
             Self::RedPallas(_) => consensus("transaction.redpallas"),

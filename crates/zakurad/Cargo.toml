@@ -63,7 +63,10 @@ default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc
 
 
 # Standard builds enable Pasta assembly; `portable` is the explicit override.
-default = ["default-release-binaries"]
+#
+# `sprout` stays on until the checkpoints cover NU7 activation on every network,
+# because until then a pre-NU7 block with JoinSplits can still need full verification.
+default = ["default-release-binaries", "sprout"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin", "indicatif", "zakura-consensus/progress-bar", "zakura-state/progress-bar", "zakura-network/progress-bar"]
@@ -79,6 +82,11 @@ portable = ["dep:orchard", "orchard/portable"]
 x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
+
+# Sprout JoinSplit proof verification, only needed to fully verify pre-NU7 blocks
+# above the last checkpoint. On by default for now. See the `sprout` feature in
+# `zakura-consensus`.
+sprout = ["zakura-consensus/sprout"]
 
 # The indexer gRPC server, started when `rpc.indexer_listen_addr` is configured
 indexer-rpc = ["zakura-rpc/indexer-rpc"]

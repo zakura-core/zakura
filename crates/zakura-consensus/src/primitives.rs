@@ -11,6 +11,7 @@ mod cache;
 pub mod ed25519;
 pub(crate) mod fallback;
 pub(crate) mod flush;
+#[cfg(feature = "sprout")]
 pub mod groth16;
 pub mod halo2;
 pub mod redjubjub;

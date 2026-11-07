@@ -405,6 +405,10 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // can fail.
         TransparentInputNotFound | ValidateMempoolLockTimeError(_) => Ignore,
 
+        // This build has no Sprout verifier, so it cannot tell whether the
+        // peer's JoinSplit is valid.
+        SproutVerifierNotBuilt => Ignore,
+
         // Policy rejections: blocks can contain these transactions.
         Zip317(_)
         | NonStandardScriptSigSize { .. }

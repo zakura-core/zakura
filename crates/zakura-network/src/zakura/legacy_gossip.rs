@@ -2856,8 +2856,10 @@ impl LegacyGossipSink {
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
-            let frame = Self::decode_request(stream_kind, &frame)?;
-            let Some(charge) = self.inbound_budget.try_charge(frame.retained_bytes()) else {
+            let request = Self::decode_request(stream_kind, &frame)?;
+            // The block owns `frame` until the response, so free its payload now.
+            drop(frame);
+            let Some(charge) = self.inbound_budget.try_charge(request.retained_bytes()) else {
                 metrics::counter!("zakura.p2p.legacy.inbound.refused", "work" => "request")
                     .increment(1);
                 return Err(SinkReject::local("legacy request inbound bytes exhausted"));
@@ -2868,7 +2870,7 @@ impl LegacyGossipSink {
                 .try_send(LegacyInboundWork::Request(LegacyRequestInbound {
                     peer_id: peer_id.clone(),
                     request_id,
-                    frame,
+                    frame: request,
                     response_tx,
                     _charge: charge,
                 })) {
@@ -4007,6 +4009,39 @@ mod tests {
         assert!(matches!(refused, Err(SinkReject::Local(_))));
         assert_eq!(sink.inbound_budget.available(), 1 << 20);
         Ok(())
+    }
+
+    /// A request waiting for its response keeps no copy of its wire payload.
+    #[tokio::test]
+    async fn a_waiting_request_frees_its_wire_payload() {
+        let hashes: Vec<_> = (0..=u8::MAX).map(block_hash).collect();
+        let (sink, mut queue) = budgeted_sink(1 << 20);
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let ((call, payload), held) = zakura_test::allocations::measure(|| {
+            let frame = LegacyRequestFrame::BlocksByHash(hashes.clone())
+                .encode_frame()
+                .expect("the request encodes");
+            let payload = frame.payload.len();
+            let mut call = sink.request(
+                inbound_peer(),
+                ZAKURA_STREAM_LEGACY_REQUESTS,
+                7,
+                1 << 20,
+                1 << 20,
+                frame,
+            );
+            assert!(call.as_mut().poll(&mut context).is_pending());
+            // The decoded request lives in the queued item, not in the call.
+            drop(queue.try_recv().expect("the request is queued"));
+            (call, payload)
+        });
+        assert!(
+            held.retained_bytes < payload,
+            "the waiting call holds {} bytes, and the payload was {payload}",
+            held.retained_bytes
+        );
+        drop(call);
     }
 
     /// A pushed transaction charges its decoded size, not its smaller wire size.

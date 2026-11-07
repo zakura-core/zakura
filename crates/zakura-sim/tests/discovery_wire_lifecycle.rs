@@ -18,7 +18,9 @@ use std::{
 };
 
 use tempfile::TempDir;
-use zakura_network::zakura::{ZakuraDiscoveryHandle, ZAKURA_STREAM_DISCOVERY};
+use zakura_network::zakura::{
+    ZakuraDiscoveryHandle, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT, ZAKURA_STREAM_DISCOVERY,
+};
 use zakura_quic::NodeId;
 use zakura_sim::{
     harness::{
@@ -170,6 +172,10 @@ fn peer_frames(report: &RunReport, connection: u64) -> Vec<(&str, &'static str)>
         .collect()
 }
 
+/// How long after the initial exchange timeout the timed-out session's
+/// connection may close: the close waits for scheduled tasks to run.
+const TIMEOUT_SLACK: Duration = Duration::from_millis(100);
+
 /// The three answers of an exchange, each conformant.
 const EXCHANGE: [(&str, &str); 3] = [
     ("hello", "conformant"),
@@ -293,6 +299,14 @@ fn saved_plans_replay_their_end_records() {
                 );
                 let (wait, fired) = admission_to_close(&report);
                 assert_ne!(fired, 0, "{name}: no timer ended the initial wait");
+                // The node's own timeout ends the wait, not a later timer.
+                assert!(
+                    (DISCOVERY_INITIAL_EXCHANGE_TIMEOUT
+                        ..DISCOVERY_INITIAL_EXCHANGE_TIMEOUT + TIMEOUT_SLACK)
+                        .contains(&wait),
+                    "{name}: the initial wait lasted {wait:?}, the timeout is \
+                     {DISCOVERY_INITIAL_EXCHANGE_TIMEOUT:?}"
+                );
                 waits.push((plan, wait));
             }
             SavedPlan::Verification => {

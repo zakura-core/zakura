@@ -609,6 +609,129 @@ fn headroom_counts_pending_locator_reads_at_their_negotiated_size() {
     assert!(!reactor.state.peers[&third].status_spent);
 }
 
+/// Records every event it's handed.
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<observe::ReactorEvent>>);
+
+impl observe::HeaderSyncObserver for Recorded {
+    fn observe(&self, event: observe::ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .push(event);
+    }
+}
+
+impl Recorded {
+    /// The `HeadroomWait` and `CachedPassDeferred` events recorded so far.
+    fn waits(&self) -> Vec<observe::ReactorEvent> {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    observe::ReactorEvent::HeadroomWait { .. }
+                        | observe::ReactorEvent::CachedPassDeferred { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// An offer held back with no header room left reports a `HeadroomWait`
+/// for its peer, session and target.
+#[test]
+fn a_held_back_offer_reports_its_headroom_wait() {
+    let (mut reactor, mut actions, snapshot) = offers_reactor();
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 4000, 0);
+    let (waiting, _outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let status = status_for(&snapshot, target);
+    let height = status.selected_tip_height;
+    reactor.handle_status(waiting.clone(), 0, status);
+    assert!(actions.try_recv().is_err(), "no room, so no locator read");
+    assert_eq!(
+        recorder.waits(),
+        [observe::ReactorEvent::HeadroomWait {
+            peer: waiting,
+            session_id: 0,
+            target_tip_hash: target,
+            target_height: height,
+        }]
+    );
+}
+
+/// A locator that finds no room to reserve reports a `HeadroomWait`.
+#[test]
+fn a_locator_with_no_room_reports_its_headroom_wait() {
+    let (mut reactor, mut actions, mut snapshot) = offers_reactor();
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    reactor.startup.committed_snapshots = None;
+    snapshot.frontiers.header_best = zakura_header_chain::Frontier::new(
+        block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 - 401),
+        block::Hash([0x40; 32]),
+    );
+    reactor.observe_latest_committed_snapshot(snapshot.clone());
+    let (owner, _owner_outbound) = connect(&mut reactor, 0x71);
+    seed_applying_request(&mut reactor, &snapshot, owner.clone(), 0);
+    let (waiting, _outbound) = connect(&mut reactor, 0x72);
+    let target = block::Hash([0x42; 32]);
+    let mut status = status_for(&snapshot, target);
+    status.selected_tip_height = block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 + 1);
+    reactor.handle_status(waiting.clone(), 0, status);
+    let scope = expect_locator_query(&mut actions, &waiting, target);
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&owner, 151, 250);
+    complete_locator(&mut reactor, &snapshot, &waiting, scope, target, true);
+    assert_eq!(
+        recorder.waits(),
+        [observe::ReactorEvent::HeadroomWait {
+            peer: waiting,
+            session_id: 0,
+            target_tip_hash: target,
+            target_height: block::Height(INTEGRATED_HEADER_BODY_WINDOW_V1 + 1),
+        }]
+    );
+}
+
+/// A wanted cached-offer pass the pass budget refuses reports
+/// `CachedPassDeferred` with the time left to the budget's next refill, a
+/// whole interval just after a refill and less once part of it has passed.
+#[tokio::test(start_paused = true)]
+async fn a_refused_cached_pass_reports_its_refill() {
+    let (mut reactor, _actions, _snapshot) = offers_reactor();
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    reactor.state.cached_pass_budget.passes = 0;
+    reactor.state.cached_pass_budget.refilled_at = Instant::now();
+    reactor.schedule_cached_statuses();
+    let elapsed = state::CACHED_PASS_REFILL / 4;
+    time::advance(elapsed).await;
+    reactor.schedule_cached_statuses();
+    assert_eq!(
+        recorder.waits(),
+        [
+            observe::ReactorEvent::CachedPassDeferred {
+                refill_in: state::CACHED_PASS_REFILL,
+            },
+            observe::ReactorEvent::CachedPassDeferred {
+                refill_in: state::CACHED_PASS_REFILL - elapsed,
+            },
+        ]
+    );
+}
+
 #[test]
 fn locator_losing_headroom_keeps_offer_for_body_progress() {
     let (mut reactor, mut actions, mut snapshot) = offers_reactor();

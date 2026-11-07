@@ -1708,6 +1708,47 @@ fn reactor_machine_records_and_replays_query_identities() {
 }
 
 const DISCOVERY_BOOK_INPUT: &[u8] = include_bytes!("fixtures/discovery-record-book.bin");
+
+/// The committed record-book input is the witness `zakura-network` encodes
+/// under the current decoder.
+#[test]
+fn discovery_book_input_is_the_encoded_witness() {
+    assert_eq!(
+        DISCOVERY_BOOK_INPUT,
+        zakura_network::zakura::discovery_book_witness_bytes(),
+        "the committed input changed; regenerate it with regenerate_discovery_book_input if \
+         that's intended"
+    );
+}
+
+/// Rewrites `fixtures/discovery-record-book.{bin,toml}` from the witness
+/// `zakura-network` encodes. Run it with `RUSTFLAGS="--cfg zakura_sim" cargo
+/// test -p zakura-sim --test replay_exact -- --ignored
+/// regenerate_discovery_book_input`.
+#[test]
+#[ignore = "rewrites the committed input"]
+fn regenerate_discovery_book_input() {
+    let entry = harness::find("discovery/record-book").unwrap();
+    let input = zakura_network::zakura::discovery_book_witness_bytes();
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/discovery-record-book");
+    std::fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
+    let sidecar = format!(
+        "harness = \"{harness}\"\n\
+         generator = {generator}\n\
+         sha256 = \"{digest}\"\n\
+         scenario_sha256 = \"{scenario}\"\n\
+         source = \"crates/zakura-sim/tests/replay_exact.rs\"\n\
+         \n\
+         [[witness]]\n\
+         property = \"{harness}\"\n\
+         expect = \"holds\"\n",
+        harness = entry.name,
+        generator = entry.generator,
+        digest = zakura_sim::seed::sha256(&input),
+        scenario = zakura_sim::seed::scenario_sha256(&(entry.draw)(&input)),
+    );
+    std::fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
+}
 const DISCOVERY_STATE_INPUT: &[u8] = include_bytes!("fixtures/discovery-session-installation.bin");
 
 #[test]
@@ -1746,8 +1787,8 @@ fn discovery_book_records_and_replays_signed_samples() {
         &mut zakura_sim::NullSink,
     )
     .unwrap();
-    assert_eq!(trace.meta.generator, 2);
-    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 4);
+    assert_eq!(trace.meta.generator, 3);
+    assert_eq!(trace.steps.len(), DISCOVERY_BOOK_INPUT.len() / 2);
     assert!(trace
         .steps
         .iter()
@@ -1767,11 +1808,11 @@ fn discovery_book_records_and_replays_signed_samples() {
     let report = replayed(dir.path(), ReplayOptions::default()).unwrap();
     assert!(report.verified());
     // The property applies from the first step whose prefix reaches the
-    // trigger, so 13 of the input's 20 steps count.
-    assert_eq!(trace.steps.len(), 20);
+    // trigger, step 8's replacement, so 11 of the input's 18 steps count.
+    assert_eq!(trace.steps.len(), 18);
     assert_eq!(
         report.properties[0].outcome,
-        PropertyOutcome::Held { applicable: 13 }
+        PropertyOutcome::Held { applicable: 11 }
     );
     replay_in_child(dir.path());
 
@@ -1821,15 +1862,19 @@ fn discovery_state_records_and_replays_installations() {
 
 #[test]
 fn discovery_machines_preserve_empty_and_short_inputs() {
-    for name in ["discovery/record-book", "discovery/session-installation"] {
-        for input in [&[][..], &[0, 0][..], &[0; 512][..]] {
+    // The record book reads two bytes per operation, and the session owner four.
+    for (name, width) in [
+        ("discovery/record-book", 2),
+        ("discovery/session-installation", 4),
+    ] {
+        for input in [&[][..], &[0][..], &[0, 0][..], &[0; 512][..]] {
             let entry = harness::find(name).unwrap();
             let dir = record(entry, input);
             let trace = open(dir.path());
             let mut sink = zakura_sim::MemorySink::default();
             let explored = (entry.run_bytes)(input, &mut sink, None);
             assert_eq!(explored.scenario.unwrap(), trace.meta.scenario);
-            assert_eq!(trace.steps.len(), input.len().div_ceil(4));
+            assert_eq!(trace.steps.len(), input.len().div_ceil(width));
             assert!(replayed(dir.path(), ReplayOptions::default())
                 .unwrap()
                 .verified());

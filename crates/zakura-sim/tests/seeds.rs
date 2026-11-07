@@ -144,7 +144,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-close-relink" => value(StorageScenario::close_relink()),
         "header-storage-grow" => value(StorageScenario::grow()),
         "header-storage-holds" => value(StorageScenario::holds()),
-        "header-storage-triggers" => value(StorageScenario::triggers()),
+        "header-storage-triggers" | "header-storage-stale-prepare" => {
+            value(StorageScenario::triggers())
+        }
         _ => None,
     }
 }

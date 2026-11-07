@@ -22,16 +22,45 @@ use zakura_sim::{
 /// The Plan bytes after each seed's prefix.
 const PLAN_BYTES: usize = 1_024;
 
-/// A seed's file stem and scenario.
-type Seed = (&'static str, fn() -> StorageScenario);
+/// A seed's file stem, scenario, and which [`PLAN_BYTES`] slice of the
+/// [`byte_inputs`] stream its Plan is.
+type Seed = (&'static str, fn() -> StorageScenario, usize);
 
-/// Every seed.
-const SEEDS: [Seed; 5] = [
-    ("header-storage-default", StorageScenario::default),
-    ("header-storage-close-relink", StorageScenario::close_relink),
-    ("header-storage-grow", StorageScenario::grow),
-    ("header-storage-holds", StorageScenario::holds),
-    ("header-storage-triggers", StorageScenario::triggers),
+/// The witness each seed carries, by stem: a property its run holds, which a
+/// planted case's patch on the same input violates.
+const WITNESSES: [(&str, &str); 3] = [
+    (
+        "header-storage-close-relink",
+        "header-sync/chunk-budget-bound",
+    ),
+    (
+        "header-storage-close-relink",
+        "header-sync/teardown-returns-baseline",
+    ),
+    (
+        "header-storage-stale-prepare",
+        "header-sync/stale-completion-inert",
+    ),
+];
+
+/// Every seed. `header-storage-stale-prepare` is the trigger scenario
+/// under the slice whose run ends a prepare after its round retired, while
+/// the same peer's next round is active.
+const SEEDS: [Seed; 6] = [
+    ("header-storage-default", StorageScenario::default, 0),
+    (
+        "header-storage-close-relink",
+        StorageScenario::close_relink,
+        1,
+    ),
+    ("header-storage-grow", StorageScenario::grow, 2),
+    ("header-storage-holds", StorageScenario::holds, 3),
+    ("header-storage-triggers", StorageScenario::triggers, 4),
+    (
+        "header-storage-stale-prepare",
+        StorageScenario::triggers,
+        11,
+    ),
 ];
 
 /// The committed fixture directory.
@@ -39,8 +68,8 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Seed `index`'s full fuzz input: its scenario's canonical prefix, then
-/// its own slice of [`byte_inputs`].
+/// A seed's full fuzz input: its scenario's canonical prefix, then slice
+/// `index` of [`byte_inputs`].
 fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
     let stream = byte_inputs(64, 1_024).concat();
     let plan = stream
@@ -55,7 +84,7 @@ fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
 #[test]
 fn committed_seeds_are_their_scenarios_and_run_clean() {
     let entry = harness::find(Storage::NAME).unwrap();
-    for (index, (stem, scenario)) in SEEDS.iter().enumerate() {
+    for (stem, scenario, index) in SEEDS {
         let scenario = scenario();
         let committed = fs::read(fixtures().join(format!("{stem}.bin")))
             .unwrap_or_else(|error| panic!("{stem}: {error}"));
@@ -104,12 +133,12 @@ fn committed_seeds_are_their_scenarios_and_run_clean() {
 #[test]
 #[ignore = "rewrites the committed seeds"]
 fn regenerate_storage_seeds() {
-    for (index, (stem, scenario)) in SEEDS.iter().enumerate() {
+    for (stem, scenario, index) in SEEDS {
         let scenario = scenario();
         let input = input(index, &scenario);
         let base = fixtures().join(stem);
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let sidecar = format!(
+        let mut sidecar = format!(
             "# The committed fuzz input `{stem}.bin`: the harness that runs it, the\n\
              # generator version it was built for, and its SHA-256. Its 344-byte\n\
              # prefix is the scenario's canonical encoding, then 1,024 Plan bytes.\n\
@@ -125,6 +154,11 @@ fn regenerate_storage_seeds() {
                 &serde_json::to_value(&scenario).expect("scenarios serialize")
             ),
         );
+        for (_, property) in WITNESSES.iter().filter(|(seed, _)| *seed == stem) {
+            sidecar.push_str(&format!(
+                "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n"
+            ));
+        }
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

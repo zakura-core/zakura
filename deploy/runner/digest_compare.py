@@ -445,10 +445,18 @@ def watch(helper, thread, state_path):
                             pass
                 if diagnostic.get("result") == "unreachable" and diagnostic.get("execution") == "not_started":
                     transport_failures += 1
-                    if transport_failures <= 3:
-                        print(json.dumps({"event": "transport_retry", "attempt": transport_failures, "classification": diagnostic}), flush=True)
-                        time.sleep(min(15 * transport_failures, 30))
-                        continue
+                    if transport_failures > 3 and "controller_unreachable" not in events:
+                        message = "Mainnet digest comparison monitor cannot reach the controller after three retries. Collector health is unknown. The watcher remains running and will check once per minute; no deployment is authorized by this alert."
+                        queued = subprocess.run(["codex", "queue", "--thread", thread, "--message", message, "--resume"], capture_output=True, text=True, timeout=30)
+                        active_writer = "already has an active writer" in queued.stderr and "Queued message" in queued.stdout
+                        if queued.returncode or ("warning" in queued.stderr.lower() and not active_writer):
+                            raise RuntimeError("could not notify the owning chat about controller reachability")
+                        events.add("controller_unreachable")
+                        state_path.write_text(json.dumps(sorted(events)))
+                    write_json(state_path.with_name("watch-status.json"), {"state": "controller_unreachable", "at": time.time(), "attempt": transport_failures})
+                    print(json.dumps({"event": "transport_retry", "attempt": transport_failures, "classification": diagnostic}), flush=True)
+                    time.sleep(min(15 * transport_failures, 30) if transport_failures <= 3 else 60)
+                    continue
                 if diagnostic.get("result") == "check_failed" and diagnostic.get("status") == 255 and transport_failures < 3:
                     # This command only reads an atomically replaced status file. Its uncertain result
                     # may be retried after an independent connection check; no node mutation is replayed.
@@ -461,6 +469,11 @@ def watch(helper, thread, state_path):
                         continue
                 raise RuntimeError(f"controller status check failed: exit {result.returncode}; classification={json.dumps(diagnostic, sort_keys=True)}")
             transport_failures = 0
+            if "controller_unreachable" in events:
+                events.remove("controller_unreachable")
+                state_path.write_text(json.dumps(sorted(events)))
+                print(json.dumps({"event": "controller_reachable_again", "at": time.time()}), flush=True)
+            write_json(state_path.with_name("watch-status.json"), {"state": "connected", "at": time.time()})
             status = json.loads(result.stdout)
             if status["state"] == "collecting" and time.time() - status["at"] <= 60 and "collector_failed_or_stalled" in events:
                 events.remove("collector_failed_or_stalled")

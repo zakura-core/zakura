@@ -49,15 +49,16 @@ class ComparisonTests(unittest.TestCase):
                 self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30])
                 self.assertEqual(run.call_count, 4)
 
-    def test_watcher_stops_after_transport_retry_budget_is_exhausted(self):
+    def test_watcher_notifies_once_and_recovers_after_longer_transport_outage(self):
         failure = SimpleNamespace(returncode=4, stdout="", stderr='ssh-check: {"result":"unreachable","cause":"ssh","execution":"not_started"}')
         queued = SimpleNamespace(returncode=0, stdout="Queued message", stderr="")
+        status = SimpleNamespace(returncode=0, stdout=json.dumps({"state":"stopped","at":0}), stderr="")
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(comparison.subprocess, "run", side_effect=[failure] * 4 + [queued]) as run, patch.object(comparison.time, "sleep") as sleep:
-                with self.assertRaisesRegex(RuntimeError, "unreachable"):
-                    comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
-        self.assertEqual(run.call_count, 5)
-        self.assertEqual(sleep.call_count, 3)
+            with patch.object(comparison.subprocess, "run", side_effect=[failure] * 4 + [queued, failure, status, queued]) as run, patch.object(comparison.time, "sleep") as sleep:
+                comparison.watch(Path("helper"), "thread", Path(directory) / "events.json")
+            self.assertNotIn("controller_unreachable", json.loads((Path(directory) / "events.json").read_text()))
+        self.assertEqual(run.call_count, 8)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [15, 30, 30, 60, 60])
 
     def test_watcher_does_not_retry_authentication_failure(self):
         failure = SimpleNamespace(returncode=5, stdout="", stderr='ssh-check: {"result":"auth_refused"}')

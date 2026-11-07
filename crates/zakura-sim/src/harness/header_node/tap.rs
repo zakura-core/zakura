@@ -550,6 +550,16 @@ impl TapState {
                     .effects
                     .push((LinkEffect::HeadroomWait, peer.clone()));
             }
+            // The events it takes and its turns, kept in order with what it
+            // adopts. The run's own shutdown sets causes too, so only the
+            // run's are kept.
+            if let (Some(now), ReactorEvent::CauseSet { cause }) =
+                (zakura_scheduler::hooks::now().filter(|_| in_run), &event)
+            {
+                if let Some(fact) = AdoptionFact::of_cause(cause) {
+                    state.adoption.record(now.since_start(), fact);
+                }
+            }
             return;
         }
         let at = zakura_scheduler::hooks::now()

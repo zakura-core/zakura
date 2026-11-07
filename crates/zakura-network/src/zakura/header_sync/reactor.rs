@@ -7,7 +7,7 @@ use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, watch, Semaphore},
-    task::JoinHandle,
+    task::{coop, JoinHandle},
     time::{self, Instant},
 };
 
@@ -517,8 +517,9 @@ impl HeaderSyncReactor {
             }
             // Inspect watches on every turn, even when peer queues never become empty.
             // `changed` delivers a final unseen value before reporting channel closure.
+            // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
             if let Some(snapshots) = committed_snapshots.as_mut() {
-                match snapshots.changed().now_or_never() {
+                match coop::unconstrained(snapshots.changed()).now_or_never() {
                     Some(Ok(())) => {
                         let snapshot = snapshots.borrow_and_update().clone();
                         if let Some(snapshot) = snapshot {
@@ -540,7 +541,7 @@ impl HeaderSyncReactor {
                 }
             }
             if let Some(repairs) = vct_root_repairs.as_mut() {
-                match repairs.changed().now_or_never() {
+                match coop::unconstrained(repairs.changed()).now_or_never() {
                     Some(Ok(())) => {
                         let status = *repairs.borrow_and_update();
                         caused!(

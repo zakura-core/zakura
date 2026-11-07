@@ -467,6 +467,20 @@ fn a_lost_deferred_timer_violates_at_the_next_timer() {
     assert_eq!(violation.witness, [1, violation.step]);
 }
 
+/// If the deferred timer is lost and no other timer is armed, the run goes
+/// idle before the deferred instant. Time can't reach it then, so the
+/// obligation violates there instead of staying open.
+#[test]
+fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
+    let report = run(&[Fact(Wait), Fact(Defer(1))]);
+    let violation = report.end.violation.as_ref().expect("the run went idle");
+    assert_eq!(violation.property, SERVED);
+    assert_eq!(
+        violation.expected,
+        r#"Owner("w") discharged by its deferred deadline, 1000000 ns"#
+    );
+}
+
 /// A deferral to an instant already behind the clock expires at once, so a
 /// later fact of the same step can't discharge it, and a later deferral
 /// can't move it.

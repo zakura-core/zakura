@@ -284,7 +284,10 @@ impl Sources {
 ///    to an instant already behind the clock expires there, before the
 ///    step's later facts.
 /// 6. When no task can run after the step, it expires every
-///    `BeforeQuiescence` obligation still open that isn't deferred.
+///    `BeforeQuiescence` obligation still open that isn't deferred. A
+///    deferred one waits while a timer can still advance the clock, and
+///    expires once the run goes idle with nothing armed, since its instant
+///    can't come then. Only a run cut off while it waits leaves it open.
 ///
 /// It evaluates every property before it returns the step's first new
 /// violation of an `Active` property, which ends the run. A `Known` or
@@ -792,9 +795,16 @@ fn step_property<S: HasView>(
     }
 
     state.open.retain(|open| {
+        // A deferred obligation waits only while time can still reach its
+        // instant.
         let gone = open.obligation.bound == LivenessBound::BeforeQuiescence
-            && open.deferred.is_none()
-            && cx.status != zakura_scheduler::Status::Running;
+            && match open.deferred {
+                None => cx.status != zakura_scheduler::Status::Running,
+                Some(_) => !matches!(
+                    cx.status,
+                    zakura_scheduler::Status::Running | zakura_scheduler::Status::WaitingOnTime
+                ),
+            };
         if gone {
             events.push(event(Lifecycle::Expired));
             violations.push(expiry(property, open, floor, cx));

@@ -11,12 +11,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
-use itertools::Itertools;
+use itertools::{EitherOrBoth, Itertools};
 use zakura_node_services::block_memory::{
     AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, ReadMemoryExhausted,
     TransactionHandle,
@@ -141,7 +141,9 @@ impl ZakuraDb {
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
         let first_tx = TransactionLocation::min_for_height(height);
 
-        self.db.zs_contains(&tx_by_loc, &first_tx)
+        // Check RocksDB first: a concurrent move adds the block to static files
+        // before it deletes the rows.
+        self.db.zs_contains(&tx_by_loc, &first_tx) || self.static_file_contains(height)
     }
 
     /// Returns the finalized hash for a given `block::Height` if it is present.
@@ -400,10 +402,7 @@ impl ZakuraDb {
 
         // Transactions
 
-        let transactions: Vec<RawBytes> = self
-            .raw_transactions_by_height(height)
-            .map(|(_, tx)| tx)
-            .collect();
+        let transactions = self.raw_block_transactions(height);
 
         if self.raw_block_transactions_may_be_pruned(height) {
             let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
@@ -573,7 +572,13 @@ impl ZakuraDb {
         let Some(header) = self.block_header(location.height.into()) else {
             return Ok(None);
         };
-        let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
+        // A concurrent move adds the transaction to static files before it
+        // deletes the row, so check static files after RocksDB.
+        let Some(raw) = self
+            .db
+            .zs_get::<_, _, RawBytes>(&tx_by_loc, &location)
+            .or_else(|| self.static_file_transaction(location))
+        else {
             return Ok(None);
         };
         let transaction = self.decode_transaction(&raw)?;
@@ -595,9 +600,13 @@ impl ZakuraDb {
             .block_header(transaction_location.height.into())
             .map(|header| header.time);
 
-        self.db
+        let raw: RawBytes = self
+            .db
             .zs_get(&tx_by_loc, &transaction_location)
-            .and_then(|tx| block_time.map(|time| (tx, transaction_location.height, time)))
+            .or_else(|| self.static_file_transaction(transaction_location))?;
+        let tx = Arc::<Transaction>::from_bytes(raw.raw_bytes());
+
+        block_time.map(|time| (tx, transaction_location.height, time))
     }
 
     /// Reserve an upper bound on `raw`'s decoded transaction, decode it, and settle
@@ -624,17 +633,33 @@ impl ZakuraDb {
         )
     }
 
-    /// Returns an iterator of all raw [`Transaction`]s for a provided block
-    /// height in finalized state.
+    /// Returns the raw transactions of block `height` in finalized state, from
+    /// static files or `tx_by_loc`. Returns no transactions if the body is missing.
     #[allow(clippy::unwrap_in_result)]
-    fn raw_transactions_by_height(
-        &self,
-        height: Height,
-    ) -> impl Iterator<Item = (TransactionLocation, RawBytes)> + '_ {
-        self.raw_transactions_by_location_range(
-            TransactionLocation::min_for_height(height)
-                ..=TransactionLocation::max_for_height(height),
-        )
+    fn raw_block_transactions(&self, height: Height) -> Vec<RawBytes> {
+        if let Some(transactions) = self.static_file_block_transactions(height) {
+            return transactions;
+        }
+
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let transactions: Vec<RawBytes> = self
+            .db
+            .zs_forward_range_iter(
+                tx_by_loc,
+                TransactionLocation::min_for_height(height)
+                    ..=TransactionLocation::max_for_height(height),
+            )
+            .map(|(_, raw): (TransactionLocation, RawBytes)| raw)
+            .collect();
+
+        if transactions.is_empty() {
+            // A concurrent move can delete the rows after the static file check above.
+            return self
+                .static_file_block_transactions(height)
+                .unwrap_or_default();
+        }
+
+        transactions
     }
 
     /// Returns an iterator of all [`Transaction`]s in the provided range
@@ -673,12 +698,13 @@ impl ZakuraDb {
     where
         R: RangeBounds<TransactionLocation>,
     {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        self.db.zs_forward_range_iter(tx_by_loc, range)
+        self.raw_transactions_by_location_range(range)
+            .map(|(location, raw)| (location, Transaction::from_bytes(raw.raw_bytes())))
     }
 
     /// Returns an iterator of all raw [`Transaction`]s in the provided range
-    /// of [`TransactionLocation`]s in finalized state.
+    /// of [`TransactionLocation`]s in finalized state, from `tx_by_loc` and
+    /// static files merged in location order.
     #[allow(clippy::unwrap_in_result)]
     pub fn raw_transactions_by_location_range<R>(
         &self,
@@ -687,8 +713,41 @@ impl ZakuraDb {
     where
         R: RangeBounds<TransactionLocation>,
     {
+        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
+
+        // RocksDB iterators read a snapshot taken when they are created. Creating
+        // it before listing static file ranges means a concurrent move can only
+        // add a block to both sides, never remove it from both.
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        self.db.zs_forward_range_iter(tx_by_loc, range)
+        let rows = self.db.zs_forward_range_iter(tx_by_loc, range);
+
+        let start = match bounds.0 {
+            Bound::Included(location) | Bound::Excluded(location) => location.height,
+            Bound::Unbounded => Height(0),
+        };
+        let end = match bounds.1 {
+            Bound::Included(location) | Bound::Excluded(location) => location.height,
+            Bound::Unbounded => Height::MAX,
+        };
+        let static_rows = self
+            .static_file_ranges_within(start..=end)
+            .into_iter()
+            .flat_map(|heights| (heights.start().0..=heights.end().0).map(Height))
+            .flat_map(move |height| {
+                self.static_file_block_transactions(height)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, raw)| (TransactionLocation::from_usize(height, index), raw))
+            })
+            .filter(move |(location, _)| bounds.contains(location));
+
+        rows.merge_join_by(static_rows, |row, static_row| row.0.cmp(&static_row.0))
+            .map(|rows| match rows {
+                EitherOrBoth::Left(row) | EitherOrBoth::Right(row) | EitherOrBoth::Both(row, _) => {
+                    row
+                }
+            })
     }
 
     /// Returns `true` if raw transaction bytes exist in the half-open height range

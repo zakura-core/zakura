@@ -43,15 +43,6 @@ pub enum DiscoveryRow {
 }
 
 impl DiscoveryRow {
-    /// Every row, in table order.
-    pub const ALL: [DiscoveryRow; 5] = [
-        DiscoveryRow::Hello,
-        DiscoveryRow::GetPeers,
-        DiscoveryRow::Peers,
-        DiscoveryRow::GetServices,
-        DiscoveryRow::Services,
-    ];
-
     /// The row's name in the table.
     pub fn name(self) -> &'static str {
         match self {
@@ -107,21 +98,15 @@ pub enum DiscoveryRule {
 }
 
 impl DiscoveryRule {
-    /// Every rule, one per row, in table order.
-    pub const ALL: [DiscoveryRule; 5] = [
-        DiscoveryRule::HelloSignature,
-        DiscoveryRule::GetPeersLimit,
-        DiscoveryRule::PeersSignature,
-        DiscoveryRule::GetServicesWanted,
-        DiscoveryRule::ServicesNodeId,
-    ];
-
     /// The row the rule's frame is on.
     pub fn row(self) -> DiscoveryRow {
-        DiscoveryRow::ALL[DiscoveryRule::ALL
-            .iter()
-            .position(|rule| *rule == self)
-            .expect("every rule is listed")]
+        match self {
+            DiscoveryRule::HelloSignature => DiscoveryRow::Hello,
+            DiscoveryRule::GetPeersLimit => DiscoveryRow::GetPeers,
+            DiscoveryRule::PeersSignature => DiscoveryRow::Peers,
+            DiscoveryRule::GetServicesWanted => DiscoveryRow::GetServices,
+            DiscoveryRule::ServicesNodeId => DiscoveryRow::Services,
+        }
     }
 }
 

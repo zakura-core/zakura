@@ -1,6 +1,9 @@
 //! Discovery's shared logical state, owned under the discovery handle's mutex.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use thiserror::Error;
 use zakura_quic::NodeId;
@@ -8,10 +11,10 @@ use zakura_rt::collections::{HashMap, HashSet};
 
 use super::protocol::{
     advertised_services, entry_is_expired, hello_verdict, normalize_direct_addrs,
-    normalize_services, push_unique_service, BookChange, DialCandidateExclusions, DisclosureKey,
-    DiscoveryBookError, DiscoveryRecordValidationContext, DiscoveryWireError, ImportBatchOutcome,
-    ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary, ZakuraDiscoveryBook,
-    ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
+    normalize_services, push_unique_service, BookChange, DialAdmission, DialCandidateExclusions,
+    DisclosureKey, DiscoveryBookError, DiscoveryRecordValidationContext, DiscoveryWireError,
+    ImportBatchOutcome, ImportOutcome, RecordVerdict, Services, ZakuraCachedLiveServiceSummary,
+    ZakuraDiscoveryBook, ZakuraDiscoveryConfig, ZakuraDiscoveryDialCandidate, ZakuraDiscoveryEntry,
     ZakuraDiscoveryLocalConfig, ZakuraDiscoveryPersistedEntry, ZakuraNodeRecord,
     ZakuraNodeRecordBody, ZakuraServiceId, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
     MAX_DISCOVERY_EXCLUDED_NODE_IDS, MAX_SERVICE_SUMMARIES_PER_RESPONSE,
@@ -477,7 +480,7 @@ impl DiscoveryState {
             outcome.attempted += 1;
             match self
                 .book
-                .import_verified_record(record, source, now, &context, changes)
+                .import_verified_record(record, source, None, now, &context, changes)
             {
                 Ok(import_outcome) => outcome.record_success(import_outcome),
                 Err(_) => outcome.rejected += 1,
@@ -494,6 +497,7 @@ impl DiscoveryState {
         &mut self,
         session: &DiscoverySessionKey,
         record: VerifiedRecord,
+        remote_ip: Option<IpAddr>,
         connected: &[NodeId],
         now: u64,
         changes: &mut Vec<BookChange>,
@@ -501,7 +505,7 @@ impl DiscoveryState {
         if !self.is_current_session(session) {
             return Err(SessionRecordError::Superseded);
         }
-        Ok(self.install_connected_peer_record(record, connected, now, changes)?)
+        Ok(self.install_connected_peer_record(record, remote_ip, connected, now, changes)?)
     }
 
     /// Installs a connected peer's own record and updates its service hints.
@@ -512,9 +516,13 @@ impl DiscoveryState {
     ///
     /// The install first drops hints of peers no longer `connected`, so
     /// connection churn cannot grow the hints past the connection limit.
+    ///
+    /// The book confirms the record addresses on `remote_ip`, the
+    /// connection's authenticated remote IP, and no other address.
     pub(super) fn install_connected_peer_record(
         &mut self,
         record: VerifiedRecord,
+        remote_ip: Option<IpAddr>,
         connected: &[NodeId],
         now: u64,
         changes: &mut Vec<BookChange>,
@@ -535,6 +543,7 @@ impl DiscoveryState {
         let import_result = self.book.import_verified_record(
             record.clone(),
             Some(peer_node_id),
+            remote_ip,
             now,
             &context,
             changes,
@@ -712,12 +721,15 @@ impl DiscoveryState {
         )
     }
 
-    /// Returns at most `limit` dial candidates.
+    /// Offers dial candidates to `admit` in dial order until it admits
+    /// `limit` of them, as [`ZakuraDiscoveryBook::admit_dial_candidates`]
+    /// does.
     ///
     /// Candidates advertise every `required_services` entry, bounded to one
     /// record's service count. Candidates advertising any `preferred_services`
     /// entry come first. `rng` breaks ties between signed records.
-    pub(super) fn dial_candidates<R: rand_10::Rng + ?Sized>(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn admit_dial_candidates<R: rand_10::Rng + ?Sized>(
         &self,
         limit: usize,
         required_services: &[ZakuraServiceId],
@@ -725,11 +737,12 @@ impl DiscoveryState {
         exclusions: DialCandidateExclusions<'_>,
         now: u64,
         rng: &mut R,
-    ) -> Vec<ZakuraDiscoveryDialCandidate> {
+        admit: impl FnMut(ZakuraDiscoveryDialCandidate) -> DialAdmission,
+    ) {
         let required_services = required_services
             .get(..self.config.book_limits.max_services_per_record)
             .unwrap_or(required_services);
-        self.book.dial_candidates(
+        self.book.admit_dial_candidates(
             limit,
             required_services,
             preferred_services,
@@ -737,7 +750,8 @@ impl DiscoveryState {
             now,
             (self.config.dial_backoff_base, self.config.dial_backoff_max),
             rng,
-        )
+            admit,
+        );
     }
 
     /// Returns the admitted sessions by node id: connection, session, and whether outbound.

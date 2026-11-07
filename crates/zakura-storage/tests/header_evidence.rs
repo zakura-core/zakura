@@ -16,10 +16,13 @@ use zakura_node_services::header_chain::{
 };
 use zakura_rt::sync::Semaphore;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId},
-    evidence::{LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, OwnerState, StateField},
+    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
+    evidence::{
+        LeaseFact, LeaseKey, ModelFailure, Owner, OwnerModel, OwnerState, ResultIdentity,
+        StateField,
+    },
     fixture::HeaderFixture,
-    Outcome,
+    Fault, Outcome,
 };
 
 /// Polls `future` once, which completes any engine-port call.
@@ -472,4 +475,94 @@ fn each_changed_state_field_is_a_mismatch() {
             "{field:?}"
         );
     }
+}
+
+/// Only an apply commits, so a `Committed` head for a membership read is an
+/// effect the model doesn't allow.
+#[test]
+fn a_commit_of_a_read_is_unexpected() {
+    let (port, chain) = chain(1);
+    let mut model = OwnerModel::new();
+    let mut call = port.selected_chain_contains(chain[0].hash);
+    assert!(pin!(&mut call)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    let mut submitted = port.take_facts();
+    assert_eq!(model.apply(&submitted), Ok(()));
+    let mut forged = submitted.pop().expect("the submission published a fact");
+    forged.seq += 1;
+    forged.txn += 1;
+    forged.kind = FactKind::Committed {
+        id: OpId(1),
+        generation: port.engine().snapshot().header_generation,
+        state_digest: port.engine().state_digest(),
+    };
+    assert_eq!(
+        model.apply(std::slice::from_ref(&forged)),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: forged.txn,
+            found: forged.kind.clone(),
+        })
+    );
+    drop(call);
+}
+
+/// A committed apply ran its engine outcome at the commit, so its delivery
+/// can't report a fault, even one whose result matches it.
+#[test]
+fn a_committed_apply_delivered_as_a_fault_is_unexpected() {
+    let (port, chain) = chain(1);
+    let mut model = OwnerModel::new();
+    let fixture = HeaderFixture::regtest();
+    let next = fixture.extend(chain[0], 1, 0);
+    let request = fixture.target_request(&port.engine().snapshot(), chain[0], &next, 2);
+    let prepared = ready(port.engine().prepare_header_target(request)).expect("prepares");
+    let mut call = port.apply_header_target(prepared);
+    assert!(pin!(&mut call)
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    port.commit(OpId(1)).expect("the apply commits");
+    checked(&port, &mut model);
+    port.deliver(OpId(1)).expect("the reply is delivered");
+    let mut facts = port.take_facts();
+    let FactKind::Completed(completion) = &mut facts[0].kind else {
+        panic!("a delivery publishes its completion");
+    };
+    completion.outcome = Outcome::Fault(Fault::LocalResource);
+    completion.result = ResultIdentity::Fault(Fault::LocalResource);
+    let forged = facts[0].kind.clone();
+    assert_eq!(
+        model.apply(&facts),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: facts[0].txn,
+            found: forged,
+        })
+    );
+    drop(call);
+}
+
+/// Nothing changes the engine after shutdown, so a `Reset` head after it
+/// is an effect the model doesn't allow.
+#[test]
+fn a_reset_after_shutdown_is_unexpected() {
+    let (port, chain) = chain(1);
+    let mut model = OwnerModel::new();
+    port.shut_down();
+    let mut facts = port.take_facts();
+    assert_eq!(model.apply(&facts), Ok(()));
+    let mut forged = facts.pop().expect("shutdown publishes a fact");
+    forged.seq += 1;
+    forged.txn += 1;
+    forged.kind = FactKind::Reset {
+        kind: ResetKind::Invalidate,
+        target: chain[0].hash,
+        generation: port.engine().snapshot().header_generation,
+    };
+    assert_eq!(
+        model.apply(std::slice::from_ref(&forged)),
+        Err(ModelFailure::UnexpectedEffect {
+            txn: forged.txn,
+            found: forged.kind.clone(),
+        })
+    );
 }

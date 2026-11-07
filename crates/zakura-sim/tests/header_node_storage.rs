@@ -100,6 +100,7 @@ fn worked_example(policy: Policy) -> StorageScenario {
         ],
         policy,
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 
@@ -109,6 +110,7 @@ fn any() -> Policy {
         base: Base::Any,
         bound_ms: None,
         holds: Vec::new(),
+        reply_holds: Vec::new(),
     }
 }
 
@@ -678,6 +680,7 @@ fn node_at_a3(
             ..Policy::converging()
         },
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 

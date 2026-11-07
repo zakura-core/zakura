@@ -9,7 +9,8 @@ use zakura_sim::{
     domain::discovery::WAIT_COMPLETE_WAKES,
     harness::{self, discovery::WaitComplete, Subsystem},
     property::{
-        HasView, Kind, LivenessBound, Property, PropertyId, Source, Status, Subject, Verdict,
+        HasView, Kind, LivenessBound, Property, PropertyId, Source, Status, Subject,
+        TriggerHistory, Verdict,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
     Observation, ObservationLog, Plan, PlanChoice, PlanInput, PropertyOutcome, RunConfig, Sim,
@@ -168,7 +169,7 @@ impl Subsystem for Probe {
             needs: &[Source::Schedule],
             status,
             check: |_| Verdict::Holds,
-            witness: Some(any_step),
+            witness: Some(TriggerHistory::Log(any_step)),
         };
         vec![
             holds(HOLDS, Status::Active),
@@ -188,7 +189,7 @@ impl Subsystem for Probe {
                     cx.oblige(obligation);
                     Verdict::Holds
                 },
-                witness: Some(any_step),
+                witness: Some(TriggerHistory::Log(any_step)),
             },
             Property {
                 witness: None,

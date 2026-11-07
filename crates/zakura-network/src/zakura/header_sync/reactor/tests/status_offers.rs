@@ -1873,6 +1873,198 @@ async fn the_select_watch_arm_reports_its_read() {
     );
 }
 
+/// One step of a flooded run, in the order the run loop took it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloodStep {
+    /// The loop took a wire event. `budget_spent` says the task's Tokio
+    /// cooperative budget was used up once it had.
+    Taken { budget_spent: bool },
+    /// The test changed the watch.
+    Published,
+    /// The loop started handling a watch read.
+    Read,
+}
+
+/// The watch a flooded run changes.
+#[derive(Clone, Copy, Debug)]
+enum FloodedWatch {
+    CommittedSnapshots,
+    VctRootRepairs,
+}
+
+/// Keeps the wire queue full from inside the run loop, and changes a watch
+/// at every other turn's first wire take, until `left` runs out. Running
+/// inside the loop's own task lets it see that task's cooperative budget.
+///
+/// A turn that reads a change spends one more unit of budget than one that
+/// doesn't. Changing the watch on every turn would spend two units a turn,
+/// and with Tokio's even budget the budget would always run out on the
+/// read itself. Every other turn spends three units per two turns, so the
+/// budget also runs out on a `select!` take with a change still unread.
+struct FloodPublisher {
+    steps: std::sync::Mutex<Vec<FloodStep>>,
+    turns: std::sync::atomic::AtomicUsize,
+    left: std::sync::atomic::AtomicUsize,
+    refill: Box<dyn Fn() + Send + Sync>,
+    publish: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for FloodPublisher {
+    /// Names the publisher, since its closures have no `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FloodPublisher")
+    }
+}
+
+impl observe::HeaderSyncObserver for FloodPublisher {
+    /// Records wire takes and watch reads. While publications are left, it
+    /// replaces each taken event and changes the watch at every other turn's
+    /// first take.
+    fn observe(&self, event: observe::ReactorEvent) {
+        use std::sync::atomic::Ordering;
+        let mut steps = self.steps.lock().expect("no test panics holding it");
+        match event {
+            observe::ReactorEvent::EventTaken {
+                queue: observe::EventQueue::Wire,
+                point,
+                ..
+            } => {
+                steps.push(FloodStep::Taken {
+                    budget_spent: !zakura_rt::task::coop::has_budget_remaining(),
+                });
+                if self.left.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
+                (self.refill)();
+                if point == observe::TakePoint::TurnStart
+                    && self.turns.fetch_add(1, Ordering::Relaxed) % 2 == 0
+                {
+                    self.left.fetch_sub(1, Ordering::Relaxed);
+                    (self.publish)();
+                    steps.push(FloodStep::Published);
+                }
+            }
+            observe::ReactorEvent::CauseSet {
+                cause: observe::ReactorCause::Watch,
+            } => steps.push(FloodStep::Read),
+            _ => {}
+        }
+    }
+}
+
+/// Runs a reactor on the test's Tokio runtime with its wire queue kept full
+/// until [`FloodPublisher`] has changed `watched` `publications` times, and
+/// returns the steps in order.
+async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<FloodStep> {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    let (repairs, repairs_rx) = watch::channel(Default::default());
+    startup.committed_snapshots = Some(snapshots_rx);
+    startup.vct_root_repairs = Some(repairs_rx);
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    let status = status_for(&snapshot, block::Hash([1; 32]));
+    let message = move || Event::Status {
+        peer: peer.clone(),
+        session_id: 0,
+        status: status.clone(),
+    };
+    while handle.try_send(message()).is_ok() {}
+    let refill = Box::new(move || {
+        let _ = handle.try_send(message());
+    });
+    let publish: Box<dyn Fn() + Send + Sync> = match watched {
+        FloodedWatch::CommittedSnapshots => Box::new(move || {
+            snapshots.send_modify(|snapshot| {
+                let snapshot = snapshot.as_mut().expect("the test publishes a snapshot");
+                snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+            });
+        }),
+        FloodedWatch::VctRootRepairs => {
+            Box::new(move || repairs.send_modify(|status| status.generation += 1))
+        }
+    };
+    let publisher = Arc::new(FloodPublisher {
+        steps: Default::default(),
+        turns: Default::default(),
+        left: publications.into(),
+        refill,
+        publish,
+    });
+    reactor.startup.observer.0 = Some(publisher.clone());
+    let task = tokio::spawn(reactor.run());
+    for _ in 0..publications * 2 {
+        tokio::task::yield_now().await;
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    let steps = publisher
+        .steps
+        .lock()
+        .expect("no test panics holding it")
+        .clone();
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| **step == FloodStep::Published)
+            .count(),
+        publications,
+        "every publication ran before shutdown"
+    );
+    assert!(
+        steps.contains(&FloodStep::Taken { budget_spent: true }),
+        "the flood used up the loop's cooperative budget"
+    );
+    steps
+}
+
+/// The most wire events the loop took after any watch change and before its
+/// next watch read.
+fn most_taken_before_a_read(steps: &[FloodStep]) -> usize {
+    steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| **step == FloodStep::Published)
+        .map(|(at, _)| {
+            steps[at + 1..]
+                .iter()
+                .take_while(|step| **step != FloodStep::Read)
+                .filter(|step| matches!(step, FloodStep::Taken { .. }))
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// A flooded wire queue spends the run loop's Tokio cooperative budget, and
+/// a spent budget makes a watch's `changed` report pending. The loop must
+/// still read a committed snapshot within two wire events of its change,
+/// as each turn's start checks the watch, takes one event, and its
+/// `select!` takes one more. The simulator polls with no Tokio budget, so
+/// only these native tests guard the turn start's budget-free probes.
+#[tokio::test]
+async fn a_spent_budget_hides_no_snapshot() {
+    let steps = flooded_watch_steps(FloodedWatch::CommittedSnapshots, 1_000).await;
+    let most = most_taken_before_a_read(&steps);
+    assert!(most <= 2, "a change waited through {most} wire events");
+}
+
+/// The same bound for the VCT root repair watch, which the turn start also
+/// checks.
+#[tokio::test]
+async fn a_spent_budget_hides_no_repair_status() {
+    let steps = flooded_watch_steps(FloodedWatch::VctRootRepairs, 1_000).await;
+    let most = most_taken_before_a_read(&steps);
+    assert!(most <= 2, "a change waited through {most} wire events");
+}
+
 /// A continuously ready Status queue cannot hide the snapshot that releases a resource stall.
 #[tokio::test]
 async fn saturated_status_queue_observes_snapshot_and_resumes_discovery() {

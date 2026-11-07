@@ -212,6 +212,7 @@ pub fn decode(prefix: &[u8]) -> Result<StorageScenario, Rejection> {
             },
             bound_ms: (header[BOUND] != 0).then(|| u64::from(header[BOUND]) * BOUND_UNIT_MS),
             holds: Vec::new(),
+            reply_holds: Vec::new(),
         },
         controls: Vec::new(),
     };
@@ -271,6 +272,9 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
         return Err(Unencodable(format!(
             "it has {mirrors} mirrors, not 1 to {MAX_MIRRORS}"
         )));
+    }
+    if !scenario.policy.reply_holds.is_empty() {
+        return Err(Unencodable("the grammar has no reply hold".to_owned()));
     }
     let mut writer = LAYOUT.writer();
     let header = writer.header();
@@ -332,10 +336,13 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
                 slot[2] = units::<u8>(len.into(), 1, 1, MAX_GROWTH as u8, "a growth")? - 1;
                 GROW
             }
-            ControlAction::Shutdown => {
-                return Err(Unencodable(
-                    "the grammar has no shutdown control step".to_owned(),
-                ))
+            action @ (ControlAction::Shutdown
+            | ControlAction::Reset(_)
+            | ControlAction::Release { .. }
+            | ControlAction::StopStorage) => {
+                return Err(Unencodable(format!(
+                    "the grammar has no {action:?} control step"
+                )))
             }
         };
         slot[1] = mirror_index(&step.peer, mirrors)?;

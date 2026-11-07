@@ -35,7 +35,7 @@ use crate::{
     },
     property::{
         CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId, Source,
-        Status, Subject, Unit, Verdict,
+        Status, Subject, TriggerHistory, Unit, Verdict,
     },
     storage::BLOCK_SERVICE,
     Observation, ObservationLog,
@@ -97,7 +97,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_submit_only_requested::<S>,
-            witness: Some(any_submission),
+            witness: Some(TriggerHistory::Log(any_submission)),
         },
         Property {
             id: PropertyId::new(STALE_COMPLETION_INERT),
@@ -108,7 +108,9 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_stale_completion_inert::<S>,
-            witness: Some(stale_completion_beside_a_current_submission),
+            witness: Some(TriggerHistory::Log(
+                stale_completion_beside_a_current_submission,
+            )),
         },
         Property {
             id: PropertyId::new(CAPACITY_RELEASE_WAKES),
@@ -122,7 +124,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_capacity_release_wakes::<S>,
-            witness: Some(room_freed_past_the_frontier),
+            witness: Some(TriggerHistory::Log(room_freed_past_the_frontier)),
         },
         Property {
             id: PropertyId::new(DETACHED_SUBMISSION_BOUNDED),
@@ -136,7 +138,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_detached_submission_bounded::<S>,
-            witness: Some(reset_or_verdict_while_held),
+            witness: Some(TriggerHistory::Log(reset_or_verdict_while_held)),
         },
         Property {
             id: PropertyId::new(INPUT_DECODED_BOUND),
@@ -151,7 +153,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_input_decoded_bound::<S>,
-            witness: Some(any_decoded_queued),
+            witness: Some(TriggerHistory::Log(any_decoded_queued)),
         },
         Property {
             id: PropertyId::new(REACTOR_QUERY_LIFECYCLE),
@@ -166,7 +168,7 @@ where
             needs: REACTOR_NEEDS,
             status: Status::Draft,
             check: check_reactor_query_lifecycle::<S>,
-            witness: Some(query_reached_storage),
+            witness: Some(TriggerHistory::Log(query_reached_storage)),
         },
     ]
 }

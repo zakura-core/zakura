@@ -11,6 +11,13 @@
 //! which the reactor's unit witness shows, since a direct handover is the
 //! only way to reach that check. `header-sync/header-fault-penalized` holds
 //! over the run, and own-9 retires the departed session.
+//!
+//! The node is the redial's responder, so only the peer may open its header
+//! session again. A Zakura initiator re-offers a parked session within a few
+//! seconds, and the node admits it once maintenance republishes the
+//! cooldown's end, which `zakura-network`'s
+//! `a_redial_late_in_the_cooldown_reopens_when_it_ends` pins. This scripted
+//! peer opens one header session per connection and never re-offers it.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -256,8 +263,9 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
             "plan {index}: {redial:?}"
         );
         // These pin this fixture's whole history, not the cooldown: the
-        // parked redial's connection idles out before anything readmits
-        // it, so own-9 only ever admits and ends the first session.
+        // scripted peer never re-offers its parked session, so the redial's
+        // connection idles out and own-9 only ever admits and ends the
+        // first session.
         let session_facts = sessions.facts();
         assert!(
             matches!(

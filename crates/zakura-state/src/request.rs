@@ -44,7 +44,7 @@ use crate::{
     ReadResponse, Response,
 };
 
-/// Notifies a mined-block submitter when state admits its block to the active write queue.
+/// Notifies a mined-block submitter when state admits and commits its block.
 #[derive(Clone, Debug)]
 pub struct BlockAdmission(watch::Sender<Admission>);
 
@@ -61,6 +61,8 @@ enum Admission {
         /// Whether optimistic relay was still authorized at admission.
         relay: bool,
     },
+    /// State committed the block; its committed announcement now owns relay.
+    Committed,
     /// State rejected the block before admission.
     Rejected,
 }
@@ -94,17 +96,70 @@ impl BlockAdmission {
         )
     }
 
-    /// Marks the block as admitted to the active non-finalized write queue.
-    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
-        self.0.send_if_modified(|admission| match *admission {
-            Admission::Pending { relay } => {
-                *admission = Admission::Admitted {
-                    relay: relay && optimistic_relay_still_authorized,
+    /// Returns true once the writer commits this submission, independently of RPC progress.
+    pub fn is_committed(&self) -> bool {
+        matches!(*self.0.borrow(), Admission::Committed)
+    }
+
+    /// Waits until state commits this submission.
+    ///
+    /// A rejected submission never commits. Callers must also observe verification failure or
+    /// use a timeout, as the early broadcast path does.
+    pub async fn wait_for_commit(&self) {
+        self.0
+            .subscribe()
+            .wait_for(|admission| matches!(admission, Admission::Committed))
+            .await
+            .expect("this admission keeps its sender alive");
+    }
+
+    /// Stops further early broadcasts before the writer publishes the committed announcement.
+    pub(crate) fn commit(&self) {
+        self.0.send_if_modified(|admission| {
+            if matches!(admission, Admission::Admitted { .. }) {
+                *admission = Admission::Committed;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Publishes admission atomically with a nonblocking writer handoff.
+    ///
+    /// `send` must not await, inspect this admission, or invoke callbacks. Readers cannot see a
+    /// pending admission after the writer receives the block; a failed send publishes rejection.
+    pub(crate) fn admit_with<T, E>(
+        &self,
+        optimistic_relay_still_authorized: bool,
+        send: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut result = None;
+        self.0.send_if_modified(|admission| {
+            let sent = send();
+            let changed = if let Admission::Pending { relay } = *admission {
+                *admission = if sent.is_ok() {
+                    Admission::Admitted {
+                        relay: relay && optimistic_relay_still_authorized,
+                    }
+                } else {
+                    Admission::Rejected
                 };
                 true
-            }
-            _ => false,
+            } else {
+                false
+            };
+            result = Some(sent);
+            changed
         });
+        result.expect("the watch modification always executes the handoff")
+    }
+
+    /// Marks the block as admitted to the active write queue.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub(crate) fn admit(&self, optimistic_relay_still_authorized: bool) {
+        let _: Result<(), std::convert::Infallible> =
+            self.admit_with(optimistic_relay_still_authorized, || Ok(()));
     }
 
     /// Marks the block as rejected before admission.
@@ -133,7 +188,10 @@ impl BlockAdmission {
             .await
             .expect("the admission holds its own sender");
 
-        matches!(*admission, Admission::Admitted { .. })
+        matches!(
+            *admission,
+            Admission::Admitted { .. } | Admission::Committed
+        )
     }
 
     /// Marks the block as admitted in cross-crate lifecycle tests.
@@ -354,6 +412,8 @@ impl std::str::FromStr for HashOrHeight {
 /// moving work out of the single-threaded state service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticallyVerifiedBlock {
+    /// Process-local origin of this commit, retained through the write queue.
+    pub origin: crate::BlockOrigin,
     /// The block to commit to the state.
     ///
     /// This struct owns the allocations derived from the block, `new_outputs` and
@@ -687,6 +747,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change,
+            origin: _,
             auth_data_root: _,
             receipt_order,
         } = semantically_verified;
@@ -747,6 +808,7 @@ impl ContextuallyVerifiedBlock {
             // Already folded into the proposal's chain value pool change.
             deferred_pool_balance_change: _,
             // Not part of a contextual verification: the commitment check reads the block.
+            origin: _,
             auth_data_root: _,
         } = solved;
 
@@ -765,6 +827,12 @@ impl ContextuallyVerifiedBlock {
 }
 
 impl CheckpointVerifiedBlock {
+    /// Attach the source of this commit without changing verified block data.
+    pub fn with_origin(mut self, origin: crate::BlockOrigin) -> Self {
+        self.0.origin = origin;
+        self
+    }
+
     /// Creates a [`CheckpointVerifiedBlock`] from [`Block`] with optional deferred balance and
     /// optional pre-computed hash.
     pub fn new(
@@ -801,6 +869,7 @@ impl CheckpointVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: None,
         })
@@ -845,6 +914,7 @@ impl SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
         }
@@ -903,6 +973,7 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: None,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
         }
@@ -1016,6 +1087,42 @@ mod tests {
         assert_eq!(checkpoint.auth_data_root, Some(block.auth_data_root()));
     }
 
+    #[test]
+    fn admission_is_visible_when_a_writer_observes_its_handoff() {
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        let reader = admission.clone();
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let (received_tx, received_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            writer_rx.recv().unwrap();
+            received_tx.send(()).unwrap();
+            // The writer already received the block, but the enqueue closure has not returned.
+            assert!(matches!(*reader.0.borrow(), Admission::Admitted { .. }));
+            assert!(reader.optimistic_relay_authorized());
+        });
+        admission
+            .admit_with(true, || {
+                writer_tx.send(())?;
+                received_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok::<_, std::sync::mpsc::SendError<()>>(())
+            })
+            .unwrap();
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_writer_handoff_rejects_admission_without_optimistic_inventory() {
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        let result = admission.admit_with(true, || Err::<(), _>("writer closed"));
+        assert_eq!(result, Err("writer closed"));
+        assert!(!admission.optimistic_relay_authorized());
+        assert!(!admission.wait().await);
+    }
+
     #[tokio::test]
     async fn block_admission_keeps_its_first_terminal_state() {
         let rejected = BlockAdmission::pending();
@@ -1037,6 +1144,36 @@ mod tests {
         assert!(stale.wait().await);
         assert!(!stale.optimistic_relay_authorized());
     }
+
+    #[tokio::test]
+    async fn committed_admission_stays_accepted_but_disables_early_relay() {
+        let admission = BlockAdmission::pending();
+        admission.authorize_optimistic_relay();
+        admission.admit(true);
+        let observer = admission.clone();
+        assert!(!observer.is_committed());
+        assert!(futures::poll!(Box::pin(observer.wait_for_commit())).is_pending());
+        admission.commit();
+        assert!(observer.is_committed());
+        assert!(observer.wait().await);
+        assert!(!observer.optimistic_relay_authorized());
+        observer.wait_for_commit().await;
+        admission.reject();
+        admission.admit(true);
+        admission.authorize_optimistic_relay();
+        assert!(observer.is_committed());
+        assert!(!observer.optimistic_relay_authorized());
+    }
+
+    #[tokio::test]
+    async fn commit_notification_cannot_accept_a_rejected_submission() {
+        let admission = BlockAdmission::pending();
+        admission.reject();
+        admission.commit();
+        assert!(!admission.wait().await);
+        assert!(!admission.is_committed());
+        assert!(futures::poll!(Box::pin(admission.wait_for_commit())).is_pending());
+    }
 }
 
 impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
@@ -1050,6 +1187,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             deferred_pool_balance_change: Some(DeferredPoolBalanceChange::new(
                 valid.chain_value_pool_change.deferred_amount(),
             )),
+            origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: valid.receipt_order,
         }
@@ -1065,6 +1203,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             new_outputs: Arc::new(finalized.new_outputs),
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
+            origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: None,
         }

@@ -368,6 +368,7 @@ impl StorageScenario {
                         deadline_ms: None,
                     },
                 ],
+                reply_holds: Vec::new(),
             },
             ..StorageScenario::default()
         }
@@ -581,14 +582,52 @@ impl Subsystem for Storage {
     /// If a hold or control step waits for a trigger the node never records
     /// ([`policy::undriven`]).
     fn prepare(scenario: &StorageScenario) -> Ports {
-        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
-            scenario
-                .controls
-                .iter()
-                .filter_map(|step| step.when.as_ref()),
-        );
+        let triggers = scenario
+            .policy
+            .holds
+            .iter()
+            .map(|hold| &hold.until)
+            .chain(scenario.policy.reply_holds.iter().map(|hold| &hold.until))
+            .chain(
+                scenario
+                    .controls
+                    .iter()
+                    .filter_map(|step| step.when.as_ref()),
+            );
         if let Some(why) = triggers.filter_map(policy::undriven).next() {
             panic!("{why}");
+        }
+        if let Some(hold) = scenario
+            .policy
+            .reply_holds
+            .iter()
+            .find(|hold| hold.select.kind.is_some_and(|kind| kind != OpKind::Apply))
+        {
+            panic!("a reply hold picks only applies, but {hold:?} names another kind");
+        }
+        let released = |trigger: &Trigger| trigger.find(&|t| *t == Trigger::Released).is_some();
+        if scenario
+            .policy
+            .reply_holds
+            .iter()
+            .map(|hold| &hold.until)
+            .chain(
+                scenario
+                    .controls
+                    .iter()
+                    .filter_map(|step| step.when.as_ref()),
+            )
+            .any(released)
+        {
+            panic!("`released` holds only in a hold's own trigger");
+        }
+        let holds = scenario.policy.holds.len();
+        if let Some(step) = scenario
+            .controls
+            .iter()
+            .find(|step| matches!(step.action, ControlAction::Release { hold } if hold >= holds))
+        {
+            panic!("{step:?} releases a hold the policy's {holds} holds don't have");
         }
         let fixture = HeaderFixture::regtest();
         let node = Arc::new(ControlledPort::new(&fixture));
@@ -691,7 +730,8 @@ impl Subsystem for Storage {
             ports.fixture.clone(),
             scenario.controls.clone(),
             predicates,
-        );
+        )
+        .with_port(ports.node.clone());
         sim.add_source(Box::new(control));
         Storage {
             port: ports.node,

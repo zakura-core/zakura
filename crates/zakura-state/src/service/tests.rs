@@ -15,7 +15,7 @@ use zakura_chain::{
     chain_tip::ChainTip,
     fmt::SummaryDebug,
     parameters::{Network, NetworkUpgrade},
-    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     transaction, transparent,
     value_balance::ValueBalance,
 };
@@ -72,7 +72,7 @@ async fn sent_sibling_removal_keeps_await_utxo_ready() {
             kind: NonFinalizedWriteFailureKind::Retryable,
         }),
     ] {
-        let (mut state, _, _, _) =
+        let crate::InitializedState { mut state, .. } =
             StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
                 .await
                 .unwrap();
@@ -103,7 +103,7 @@ async fn block_info_does_not_wait_for_a_queued_parent() {
     let _init_guard = zakura_test::init();
     use tower::Service;
 
-    let (mut state, _, _, _) =
+    let crate::InitializedState { mut state, .. } =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
             .await
             .unwrap();
@@ -224,10 +224,15 @@ async fn cancelled_checkpoint_caller_keeps_queued_writer_and_tip_payloads_charge
 
     let _init_guard = zakura_test::init();
     let limit = Duration::from_secs(10);
-    let (mut state, read, tip, changes) =
-        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        latest_chain_tip: tip,
+        chain_tip_change: changes,
+        ..
+    } = StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+        .await
+        .unwrap();
     let child: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -341,7 +346,11 @@ async fn read_workers_are_shared_with_owned_ranges_after_caller_drop() {
         read_concurrency_limit: std::num::NonZeroU16::MIN,
         ..Config::ephemeral()
     };
-    let (mut state, read, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        ..
+    } = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
         .await
         .unwrap();
     let genesis: Arc<Block> = Arc::new(
@@ -614,7 +623,7 @@ fn v4_coinbase_mainnet_chain() -> Vec<Arc<Block>> {
 
 /// Returns a state with blocks 0 and 1 of `chain` finalized.
 async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
-    let (mut state, _, _, _) =
+    let crate::InitializedState { mut state, .. } =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
@@ -822,7 +831,10 @@ fn mined_orphans_finish_without_entering_the_sync_queue() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let runtime = Runtime::new().expect("the Tokio runtime starts");
-    let (mut state_service, _, _, _) = runtime
+    let crate::InitializedState {
+        state: mut state_service,
+        ..
+    } = runtime
         .block_on(StateService::new(
             Config::ephemeral(),
             &network,
@@ -1151,10 +1163,12 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
         chain.push(Arc::new(block));
     }
 
-    let (mut state_service, _, _, _) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let crate::InitializedState {
+        state: mut state_service,
+        ..
+    } = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
 
     // Commit the first two blocks as checkpoint verified blocks, so the finalized tip becomes a
     // parent that `can_fork_chain_at` accepts.
@@ -1246,9 +1260,10 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
     use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
 
     let network = Network::Mainnet;
-    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-        .await
-        .expect("the ephemeral state opens");
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("the ephemeral state opens");
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
         .zcash_deserialize_into()
         .expect("the child block vector decodes");
@@ -1296,9 +1311,10 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
 
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
-    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-        .await
-        .expect("the ephemeral state opens");
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("the ephemeral state opens");
     for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=1) {
         let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
         state
@@ -1423,9 +1439,10 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
         enable_zakura_header_seed_from_committed_blocks: header_runtime,
         ..Config::ephemeral()
     };
-    let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
-        .await
-        .unwrap();
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(config, &network, Height::MAX, 0)
+            .await
+            .unwrap();
     let genesis = block::genesis::regtest_genesis_block();
     let mut parent = genesis.make_fake_child();
     Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
@@ -2245,10 +2262,13 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     // The state-only fixture commits bodies directly.
     // The fixture has no network-supplied auxiliary root.
     config.vct_fast_sync = false;
-    let (mut state_service, read, _tip, _tip_change) =
-        StateService::new(config, &network, max_checkpoint_height, 0)
-            .await
-            .expect("test state initialization succeeds");
+    let crate::InitializedState {
+        state: mut state_service,
+        read_state: read,
+        ..
+    } = StateService::new(config, &network, max_checkpoint_height, 0)
+        .await
+        .expect("test state initialization succeeds");
 
     // Commit blocks 0 and 1 to the finalized state and wait for each write to land on disk, so the
     // finalized tip catches up to the maximum checkpoint height and the last block hash we sent.
@@ -2363,10 +2383,13 @@ async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
         .range(0..=2)
         .map(|(_, bytes)| bytes.zcash_deserialize_into::<Arc<Block>>().unwrap())
         .collect();
-    let (mut state, _read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
-            .await
-            .expect("ephemeral state opens");
+    let crate::InitializedState {
+        mut state,
+        read_state: _read,
+        ..
+    } = StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+        .await
+        .expect("ephemeral state opens");
     state
         .queue_and_commit_to_finalized_state(blocks[0].clone().into())
         .await??;
@@ -2434,10 +2457,13 @@ async fn legacy_mode_handoff_keeps_header_runtime_detached() -> Result<()> {
         .expect("the mainnet genesis vector is available")
         .zcash_deserialize_into::<Arc<Block>>()?;
 
-    let (mut state, read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height(0), 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        ..
+    } = StateService::new(Config::ephemeral(), &network, Height(0), 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let result = state
         .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
         .await;
@@ -2504,10 +2530,13 @@ async fn handoff_trigger_microbench() -> Result<()> {
 
     // Use `Height::MAX` so the height condition is never met: the helper runs its full guard but
     // never transitions, which is exactly the non-transitioning path we want to measure.
-    let (mut state_service, _read, _tip, _tip_change) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let crate::InitializedState {
+        state: mut state_service,
+        read_state: _read,
+        ..
+    } = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
 
     for block in &blocks[0..=1] {
         let checkpoint = CheckpointVerifiedBlock::from(block.clone());
@@ -2696,7 +2725,7 @@ proptest! {
             in continuous_empty_blocks_from_test_vectors(),
     ) {
         let _init_guard = zakura_test::init();
-        let (mut state_service, _, _, _) = Runtime::new().unwrap().block_on(async {
+        let crate::InitializedState { state: mut state_service, .. } = Runtime::new().unwrap().block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
         }).expect("ephemeral state initialization succeeds");
@@ -2792,7 +2821,7 @@ proptest! {
         let _init_guard = zakura_test::init();
 
         let runtime = Runtime::new().unwrap();
-        let (mut state_service, _read_only_state_service, latest_chain_tip, mut chain_tip_change) = runtime.block_on(async {
+        let crate::InitializedState { state: mut state_service, read_state: _read_only_state_service, latest_chain_tip, mut chain_tip_change, .. } = runtime.block_on(async {
             // We're waiting to verify each block here, so we don't need the maximum checkpoint height.
             StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await
         }).expect("ephemeral state initialization succeeds");
@@ -3063,10 +3092,13 @@ fn read_only_open_with_malformed_version_returns_typed_error() {
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_write_lag_does_not_open_the_orphan_queue_bound() {
     let network = Network::Mainnet;
-    let (mut state, _read, _tip, _height) =
-        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-            .await
-            .expect("an ephemeral state service is created");
+    let crate::InitializedState {
+        mut state,
+        read_state: _read,
+        ..
+    } = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("an ephemeral state service is created");
 
     assert!(
         state.block_write_sender.finalized.is_some(),
@@ -3103,7 +3135,7 @@ async fn checkpoint_write_lag_does_not_open_the_orphan_queue_bound() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies() {
     let _init_guard = zakura_test::init();
-    let (mut state, _, _, _) =
+    let crate::InitializedState { mut state, .. } =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
             .await
             .expect("ephemeral state opens");
@@ -3226,9 +3258,10 @@ async fn known_block_prefers_committed_state_over_sent_cache() {
     let mut config = Config::ephemeral();
     config.enable_zakura_header_seed_from_committed_blocks = true;
     config.vct_fast_sync = false;
-    let (mut state, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
-        .await
-        .unwrap();
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -3274,9 +3307,10 @@ async fn parent_input_check_uses_the_parent_utxo_set() {
     let _init_guard = zakura_test::init();
     let mut config = Config::ephemeral();
     config.vct_fast_sync = false;
-    let (mut state, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
-        .await
-        .expect("the test state opens");
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("the test state opens");
     let blocks: Vec<Arc<Block>> = [
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
         zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
@@ -3505,10 +3539,11 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
     // State A: database holds 0..=1, the non-finalized state holds 2..=5.
     let mut config = Config::ephemeral();
     config.vct_fast_sync = false;
-    let (mut state_a, _, _, _) =
-        StateService::new(config.clone(), &Network::Mainnet, Height::MAX, 0)
-            .await
-            .expect("state opens");
+    let crate::InitializedState {
+        state: mut state_a, ..
+    } = StateService::new(config.clone(), &Network::Mainnet, Height::MAX, 0)
+        .await
+        .expect("state opens");
     for block in &blocks[..2] {
         state_a
             .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
@@ -3589,7 +3624,9 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
     );
 
     // State B: database holds 0..=2, so state A's published chain (root 2) overlaps it.
-    let (mut state_b, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+    let crate::InitializedState {
+        state: mut state_b, ..
+    } = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
         .await
         .expect("state opens");
     for block in &blocks[..3] {
@@ -3653,10 +3690,14 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
 async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     let _init_guard = zakura_test::init();
     let limit = Duration::from_secs(10);
-    let (mut state, _, _, _) =
-        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        block_announcements: mut announcements,
+        ..
+    } = StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+        .await
+        .unwrap();
     let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .unwrap();
@@ -3673,6 +3714,12 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     .unwrap()
     .unwrap();
 
+    assert_eq!(announcements.recv(true).await.unwrap().hash, parent);
+    let local_child = CheckpointVerifiedBlock::from(child.clone()).with_origin(
+        crate::BlockOrigin::LocalSubmission {
+            size: child.zcash_serialized_size(),
+        },
+    );
     // Keep the real writer alive but control its response and reset ordering.
     let real_writer = state.block_write_sender.finalized.take().unwrap();
     let (gate, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
@@ -3680,9 +3727,9 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
     let (reset_tx, reset_rx) = tokio::sync::mpsc::unbounded_channel();
     let real_reset_rx = std::mem::replace(&mut state.invalid_block_write_reset_receiver, reset_rx);
 
-    let old_response = state.queue_and_commit_to_finalized_state(child.clone().into());
+    let old_response = state.queue_and_commit_to_finalized_state(local_child.clone());
     let old_write = intercepted.try_recv().unwrap();
-    let replacement = state.queue_and_commit_to_finalized_state(child.clone().into());
+    let replacement = state.queue_and_commit_to_finalized_state(local_child.clone());
     assert_eq!(state.finalized_state_queued_blocks.len(), 1);
     assert!(intercepted.try_recv().is_err());
     reset_tx.send(parent).unwrap();
@@ -3691,6 +3738,7 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
         .send(Err(CommitBlockError::WriteTaskExited.into()))
         .unwrap();
     assert!(old_response.await.unwrap().is_err());
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
 
     // The checkpoint task asks for Tip after receiving the error, even if its
     // generation has since been superseded or its original caller was dropped.
@@ -3706,8 +3754,21 @@ async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
         .expect("recovery must release the replacement without another block request")
         .expect("the writer channel stays open");
     assert!(state.finalized_state_queued_blocks.is_empty());
+    drop(replacement);
     real_writer.send(replacement_write).unwrap();
-    timeout(limit, replacement).await.unwrap().unwrap().unwrap();
+    let announcement = timeout(limit, announcements.recv(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(announcement.hash, child.hash());
+    assert_eq!(announcement.origin, local_child.0.origin);
+    assert!(matches!(
+        read.oneshot(crate::ReadRequest::BlockInfo(child.hash().into()))
+            .await
+            .unwrap(),
+        crate::ReadResponse::BlockInfo(Some(_))
+    ));
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
     state.invalid_block_write_reset_receiver = real_reset_rx;
 }
 
@@ -3785,9 +3846,10 @@ async fn rejected_checkpoint_body_fails_descendants_with_a_retryable_error() {
         },
         ..Default::default()
     });
-    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height(10), 0)
-        .await
-        .expect("the ephemeral state opens");
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(Config::ephemeral(), &network, Height(10), 0)
+            .await
+            .expect("the ephemeral state opens");
     let limit = Duration::from_secs(10);
 
     let genesis = block::genesis::regtest_genesis_block();
@@ -3868,9 +3930,10 @@ async fn nu5_state_with_genesis() -> (StateService, Network, Arc<Block>) {
         },
         ..Default::default()
     });
-    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height(0), 0)
-        .await
-        .expect("the ephemeral state opens");
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(Config::ephemeral(), &network, Height(0), 0)
+            .await
+            .expect("the ephemeral state opens");
     let genesis = block::genesis::regtest_genesis_block();
     timeout(
         Duration::from_secs(10),
@@ -4253,9 +4316,10 @@ async fn assert_precious_block_request(header_runtime: bool) {
         enable_zakura_header_seed_from_committed_blocks: header_runtime,
         ..Config::ephemeral()
     };
-    let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
-        .await
-        .unwrap();
+    let crate::InitializedState { mut state, .. } =
+        StateService::new(config, &network, Height::MAX, 0)
+            .await
+            .unwrap();
     let genesis_hash = network.genesis_hash();
     let siblings = commit_precious_siblings(&mut state, limit).await;
     let best_tip = |state: &StateService| {
@@ -4322,6 +4386,14 @@ async fn assert_precious_block_request(header_runtime: bool) {
 /// Returns the non-finalized blocks by descending raw hash, so the first is the normal
 /// equal-work winner and the second is the hash loser.
 async fn commit_precious_siblings(state: &mut StateService, limit: Duration) -> Vec<Arc<Block>> {
+    commit_siblings_with_origin(state, limit, false).await
+}
+
+async fn commit_siblings_with_origin(
+    state: &mut StateService,
+    limit: Duration,
+    local: bool,
+) -> Vec<Arc<Block>> {
     let genesis = block::genesis::regtest_genesis_block();
     let mut parent = genesis.make_fake_child();
     Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
@@ -4348,9 +4420,15 @@ async fn commit_precious_siblings(state: &mut StateService, limit: Duration) -> 
     let mut siblings = template.make_fake_siblings(2);
     siblings.sort_by_key(|block| std::cmp::Reverse(block.hash().0));
     for block in &siblings {
+        let mut prepared = block.clone().prepare();
+        if local {
+            prepared.origin = crate::BlockOrigin::LocalSubmission {
+                size: block.zcash_serialized_size(),
+            };
+        }
         timeout(
             limit,
-            state.queue_and_commit_to_non_finalized_state(block.clone().prepare(), None),
+            state.queue_and_commit_to_non_finalized_state(prepared, None),
         )
         .await
         .unwrap()
@@ -4411,10 +4489,15 @@ fn precious_block_preference_is_cleared_by_a_restart() {
     };
 
     let (winner, loser) = node_run().block_on(async {
-        let (mut state, read, latest_chain_tip, _) =
-            StateService::new(config.clone(), &network, max_checkpoint_height, 0)
-                .await
-                .unwrap();
+        let crate::InitializedState {
+            mut state,
+            read_state: read,
+            latest_chain_tip,
+            block_announcements: mut announcements,
+            ..
+        } = StateService::new(config.clone(), &network, max_checkpoint_height, 0)
+            .await
+            .unwrap();
         let siblings = commit_precious_siblings(&mut state, limit).await;
         let (winner, loser) = (siblings[0].hash(), siblings[1].hash());
         let mut snapshots = read.subscribe_header_chain_snapshots();
@@ -4427,6 +4510,9 @@ fn precious_block_preference_is_cleared_by_a_restart() {
             .unwrap();
         assert_eq!(read.best_tip().unwrap().1, loser);
         assert_eq!(latest_chain_tip.best_tip_hash(), Some(loser));
+        let ordinary = announcements.recv(true).await.unwrap();
+        assert_eq!(ordinary.hash, loser);
+        assert_eq!(ordinary.origin, crate::BlockOrigin::Network);
         let preferred = wait_for_verified_best(&mut snapshots, loser, limit).await;
         // Header-only selection keeps the raw-hash order.
         assert_eq!(preferred.frontiers.header_best.hash, winner);
@@ -4435,10 +4521,21 @@ fn precious_block_preference_is_cleared_by_a_restart() {
     });
 
     node_run().block_on(async {
-        let (state, read, latest_chain_tip, _) =
-            StateService::new(config, &network, max_checkpoint_height, 0)
-                .await
-                .unwrap();
+        let crate::InitializedState {
+            state,
+            read_state: read,
+            latest_chain_tip,
+            block_announcements: mut announcements,
+            ..
+        } = StateService::new(config, &network, max_checkpoint_height, 0)
+            .await
+            .unwrap();
+        let recovered = timeout(limit, announcements.recv(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.hash, winner);
+        assert_eq!(recovered.origin, crate::BlockOrigin::Network);
         let restored = read.latest_non_finalized_state();
         assert_eq!(
             restored.chain_count(),
@@ -4483,10 +4580,14 @@ async fn assert_evicted_precious_block_redelivery(header_runtime: bool) {
         enable_zakura_header_seed_from_committed_blocks: header_runtime,
         ..Config::ephemeral()
     };
-    let (mut state, read, latest_chain_tip, _) =
-        StateService::new(config, &network, Height::MAX, 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        latest_chain_tip,
+        ..
+    } = StateService::new(config, &network, Height::MAX, 0)
+        .await
+        .unwrap();
     let siblings = commit_precious_siblings(&mut state, limit).await;
     let (winner, loser) = (siblings[0].clone(), siblings[1].clone());
     // Renumbering a sibling's nonce gives another child of the same parent.
@@ -4592,10 +4693,14 @@ async fn dropped_precious_block_response_still_publishes_before_releasing_its_sl
         enable_zakura_header_seed_from_committed_blocks: true,
         ..Config::ephemeral()
     };
-    let (mut state, read, latest_chain_tip, _) =
-        StateService::new(config, &network, Height::MAX, 0)
-            .await
-            .unwrap();
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        latest_chain_tip,
+        ..
+    } = StateService::new(config, &network, Height::MAX, 0)
+        .await
+        .unwrap();
     let siblings = commit_precious_siblings(&mut state, limit).await;
     let (winner, loser) = (siblings[0].hash(), siblings[1].hash());
     let mut snapshots = read.subscribe_header_chain_snapshots();
@@ -4700,9 +4805,10 @@ async fn wait_for_idle_writer(state: &StateService, limit: Duration) {
 async fn precious_block_request_fails_fast_during_checkpoint_sync() {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(Default::default());
-    let (state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
-        .await
-        .unwrap();
+    let crate::InitializedState { state, .. } =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .unwrap();
     assert!(state.block_write_sender.finalized.is_some());
 
     let error = timeout(
@@ -4785,7 +4891,7 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
     }
 
     let _init_guard = zakura_test::init();
-    let (mut state, _, _, _) =
+    let crate::InitializedState { mut state, .. } =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
             .await
             .expect("ephemeral state opens");
@@ -4876,4 +4982,39 @@ async fn block_with_a_ready_parent_skips_the_orphan_queue() {
         .get_mut(&orphan_hash)
         .is_some());
     assert!(writer.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_sibling_commits_survive_a_delayed_announcement_consumer() {
+    let _init = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let crate::InitializedState {
+        mut state,
+        read_state: read,
+        latest_chain_tip: tip,
+        block_announcements: mut announcements,
+        ..
+    } = StateService::new(Config::ephemeral(), &network, Height(1), 0)
+        .await
+        .unwrap();
+    let siblings = commit_siblings_with_origin(&mut state, Duration::from_secs(10), true).await;
+    assert_eq!(tip.best_tip_hash(), Some(siblings[0].hash()));
+    for block in siblings {
+        let announcement = announcements.recv(false).await.unwrap();
+        assert_eq!(announcement.hash, block.hash());
+        assert_eq!(
+            announcement.origin,
+            crate::BlockOrigin::LocalSubmission {
+                size: block.zcash_serialized_size()
+            }
+        );
+        assert!(matches!(
+            read.clone()
+                .oneshot(crate::ReadRequest::BlockInfo(block.hash().into()))
+                .await
+                .unwrap(),
+            crate::ReadResponse::BlockInfo(Some(_))
+        ));
+    }
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
 }

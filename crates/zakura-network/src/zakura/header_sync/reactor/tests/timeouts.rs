@@ -675,6 +675,48 @@ async fn pending_vct_prepare_and_apply_emit_one_fatal_event_at_thirty_minutes() 
     }
 }
 
+/// Once a local operation is fatal, maintenance still prunes and republishes
+/// an ending cooldown, so its past end doesn't keep the loop's deadline due.
+#[tokio::test(start_paused = true)]
+async fn a_cooldown_still_ends_after_a_fatal_local_operation() {
+    let mut fixture = VctLocalFixture::new(
+        PendingVctLocalPort::pending(true),
+        HeaderTargetPhase::Applying,
+    );
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    assert!(fixture
+        .reactor
+        .report_fatal_vct_local_operation(Instant::now()));
+
+    let cooldown = std::time::Duration::from_secs(15);
+    fixture
+        .reactor
+        .state
+        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    fixture.reactor.publish_peer_state();
+    assert!(!fixture
+        .reactor
+        .candidates
+        .borrow()
+        .backed_off_node_ids
+        .is_empty());
+
+    time::advance(cooldown).await;
+    fixture.reactor.refresh_statuses();
+    assert!(fixture
+        .reactor
+        .candidates
+        .borrow()
+        .backed_off_node_ids
+        .is_empty());
+    assert!(
+        fixture.reactor.next_maintenance_deadline() > Instant::now(),
+        "an ended cooldown doesn't keep maintenance due"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
     for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {

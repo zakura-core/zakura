@@ -1340,6 +1340,40 @@ mod tests {
         assert!(committed.await.unwrap());
     }
 
+    /// A late early event starts a fresh advert after the committed broadcast has finished.
+    #[tokio::test(start_paused = true)]
+    async fn delayed_early_broadcast_repeats_a_completed_committed_advert() {
+        let hash = block::Hash([19; 32]);
+        let slots = BlockUploadSlots::new(1);
+        let (peer, mut receiver) = peer();
+        let committed = tokio::spawn(broadcast_block(
+            vec![peer.clone()],
+            hash,
+            1,
+            true,
+            slots.clone(),
+        ));
+        accept(&mut receiver, hash).await;
+        peer.uploads.requested(hash);
+        peer.uploads.written(hash);
+        assert!(committed.await.unwrap().is_ok());
+
+        // Awaiting completion releases the upload claim: this is not the overlapping case.
+        assert!(receiver.try_recv().is_err());
+        let delayed_early = tokio::spawn(broadcast_block(vec![peer.clone()], hash, 1, true, slots));
+        let duplicate = timeout(BLOCK_REQUEST_WAIT, receiver.recv())
+            .await
+            .expect("a late early event currently sends another inventory")
+            .expect("the peer's advert channel is still open");
+        assert_eq!(duplicate.hash, hash);
+        duplicate.result.send(Ok(())).unwrap();
+        tokio::task::yield_now().await;
+        peer.uploads.requested(hash);
+        peer.uploads.written(hash);
+        assert!(delayed_early.await.unwrap().is_ok());
+        assert!(receiver.try_recv().is_err());
+    }
+
     /// An early broadcast whose inventory write fails is retried by the committed broadcast.
     #[tokio::test(start_paused = true)]
     async fn failed_early_advert_is_sent_by_the_committed_broadcast() {

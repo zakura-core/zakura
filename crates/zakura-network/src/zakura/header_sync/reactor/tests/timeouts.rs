@@ -797,9 +797,23 @@ async fn a_spent_budget_hides_no_ready_completion() {
     ready_vct_completion_precedes_unseen_snapshot(true).await;
 }
 
+/// Counts the reactor's watch reads.
+#[derive(Debug, Default)]
+struct WatchReads(AtomicUsize);
+
+impl observe::HeaderSyncObserver for WatchReads {
+    /// Counts each `WatchObserved`.
+    fn observe(&self, event: observe::ReactorEvent) {
+        if matches!(event, observe::ReactorEvent::WatchObserved { .. }) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Starts the reactor with an apply that completes at its hard deadline and a
 /// snapshot published at that deadline, after spending the task's coop budget
-/// when `spend_budget` is set, and checks no deadline event fires.
+/// when `spend_budget` is set. Once the reactor reads the snapshot, checks no
+/// deadline event fired.
 async fn ready_vct_completion_precedes_unseen_snapshot(spend_budget: bool) {
     let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
     let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
@@ -817,6 +831,8 @@ async fn ready_vct_completion_precedes_unseen_snapshot(spend_budget: bool) {
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
     snapshot.state_version = snapshot.state_version.checked_next().unwrap();
     updates.send(Some(snapshot)).unwrap();
+    let reads = Arc::new(WatchReads::default());
+    fixture.reactor.startup.observer.0 = Some(reads.clone());
     let shutdown = fixture.reactor.startup.shutdown.clone();
     let mut fatal_events = fixture.fatal_events;
     let reactor = fixture.reactor;
@@ -828,7 +844,16 @@ async fn ready_vct_completion_precedes_unseen_snapshot(spend_budget: bool) {
         }
         reactor.run().await;
     });
-    tokio::task::yield_now().await;
+    for _ in 0..1_000 {
+        if reads.0.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        reads.0.load(Ordering::SeqCst) > 0,
+        "the reactor reads the published snapshot"
+    );
     assert!(
         matches!(
             fatal_events.try_recv(),

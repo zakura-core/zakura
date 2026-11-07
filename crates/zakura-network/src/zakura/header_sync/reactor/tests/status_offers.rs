@@ -1937,7 +1937,7 @@ impl observe::HeaderSyncObserver for FloodPublisher {
                 }
                 (self.refill)();
                 if point == observe::TakePoint::TurnStart
-                    && self.turns.fetch_add(1, Ordering::Relaxed) % 2 == 0
+                    && self.turns.fetch_add(1, Ordering::Relaxed).is_multiple_of(2)
                 {
                     self.left.fetch_sub(1, Ordering::Relaxed);
                     (self.publish)();

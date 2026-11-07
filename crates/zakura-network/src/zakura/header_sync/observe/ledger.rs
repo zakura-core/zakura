@@ -92,10 +92,13 @@ pub enum ClaimRule {
     LeakedReservation,
     /// A released round kept a lease: the queue kept one when it released
     /// the round, or one no call holds hadn't returned when the round was
-    /// released or a call holding it was handled.
+    /// released or a call holding it was handled, or by teardown.
     LeakedLease,
-    /// A call was handled with its round's headers still held.
+    /// A call was handled with its round's headers still held, or still
+    /// held them at teardown.
     OpenOwnership,
+    /// A reservation never ended by teardown.
+    OpenReservation,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -1006,11 +1009,14 @@ impl HeaderWorkLedger {
         })
     }
 
-    /// Requires every call to have ended, every held header to have left its
-    /// call, every handoff to have reached its apply, every reservation to
-    /// have ended and every lease to have returned, once the reactor's
-    /// teardown is done.
-    pub fn finish(&self) -> Result<(), String> {
+    /// Checks that a torn-down reactor left nothing open, once its calls
+    /// were dropped or handled. A call left unended or unheld, a handoff no
+    /// apply took, or a binding no round started breaks an integrity rule,
+    /// which this returns. Headers a call still holds (`OpenOwnership`), a
+    /// reservation never ended (`OpenReservation`) and a staged lease never
+    /// returned (`LeakedLease`) are claim breaks, kept for
+    /// [`take_claims`](Self::take_claims).
+    pub fn finish(&mut self) -> Result<(), String> {
         if let Some(handoff) = &self.handoff {
             return Err(format!(
                 "UnresolvedHandoff: call {} handed its headers to call {}, which never took \
@@ -1027,16 +1033,6 @@ impl HeaderWorkLedger {
                     "UnheldCall: call {call} never held its round's headers"
                 ));
             }
-            if record.held.as_ref().is_some_and(|held| !held.ended) {
-                return Err(format!(
-                    "OpenOwnership: call {call} never ended its headers"
-                ));
-            }
-        }
-        if let Some(reservation) = self.reservations.keys().next() {
-            return Err(format!(
-                "OpenReservation: reservation {reservation} never ended"
-            ));
         }
         if let Some(binding) = &self.binding {
             return Err(format!(
@@ -1044,18 +1040,35 @@ impl HeaderWorkLedger {
                 binding.reservation, binding.request.incarnation
             ));
         }
-        if let Some((incarnation, round)) = self
-            .started
-            .iter()
-            .find(|(_, round)| round.returned != round.staged)
-        {
-            return Err(format!(
-                "LeakedLease: teardown finished with {} of round {incarnation}'s {} staged \
-                 headers unreturned",
-                round.staged - round.returned,
-                round.staged
-            ));
+        let mut claims = Vec::new();
+        for (call, record) in &self.calls {
+            if record.held.as_ref().is_some_and(|held| !held.ended) {
+                claims.push(ClaimBreak {
+                    rule: ClaimRule::OpenOwnership,
+                    detail: format!("OpenOwnership: call {call} never ended its headers"),
+                });
+            }
         }
+        for reservation in self.reservations.keys() {
+            claims.push(ClaimBreak {
+                rule: ClaimRule::OpenReservation,
+                detail: format!("OpenReservation: reservation {reservation} never ended"),
+            });
+        }
+        for (incarnation, round) in &self.started {
+            if round.returned != round.staged {
+                claims.push(ClaimBreak {
+                    rule: ClaimRule::LeakedLease,
+                    detail: format!(
+                        "LeakedLease: teardown finished with {} of round {incarnation}'s {} \
+                         staged headers unreturned",
+                        round.staged - round.returned,
+                        round.staged
+                    ),
+                });
+            }
+        }
+        self.claims.extend(claims);
         Ok(())
     }
 
@@ -1321,7 +1334,7 @@ mod tests {
 
     #[test]
     fn a_prepare_handed_to_its_apply_folds_clean() {
-        let ledger = fold(after(
+        let mut ledger = fold(after(
             &[(1, 1)],
             vec![
                 dispatched(1, prepare(1)),
@@ -1448,7 +1461,7 @@ mod tests {
 
         let mut unresolved = base;
         unresolved.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
-        let ledger = fold(unresolved).expect("an open handoff folds");
+        let mut ledger = fold(unresolved).expect("an open handoff folds");
         assert!(ledger
             .finish()
             .expect_err("the apply never took the headers")
@@ -1507,7 +1520,7 @@ mod tests {
         });
         refused_as(wrong, "WrongRound");
 
-        let open = fold(held_call).expect("a held call folds");
+        let mut open = fold(held_call).expect("a held call folds");
         assert!(open
             .finish()
             .expect_err("a held call stays open")
@@ -1803,7 +1816,7 @@ mod tests {
                 panicked: false,
             },
         ]);
-        let settled =
+        let mut settled =
             fold(held).expect("the call's leases return before its completion is handled");
         assert_eq!(settled.released_rounds(), 1);
         assert_eq!(settled.unsettled_rounds(), 0);
@@ -2122,7 +2135,7 @@ mod tests {
             call: 1,
             end: CallEnd::Dropped,
         });
-        let ledger = fold(dropped).expect("a dropped call is checked at teardown");
+        let mut ledger = fold(dropped).expect("a dropped call is checked at teardown");
         assert!(ledger
             .finish()
             .expect_err("the call never held its headers")
@@ -2145,13 +2158,19 @@ mod tests {
         );
     }
 
-    /// At teardown every reservation has ended.
+    /// At teardown every reservation has ended, which is a claim rule.
     #[test]
     fn teardown_leaves_no_reservation() {
-        let ledger = fold(vec![opened(1, 1, 5)]).expect("an open reservation folds");
-        assert!(ledger
+        let mut ledger = fold(vec![opened(1, 1, 5)]).expect("an open reservation folds");
+        ledger
             .finish()
-            .expect_err("the reservation never ended")
-            .starts_with("OpenReservation"));
+            .expect("an open reservation is a claim break");
+        let claims = ledger.take_claims();
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].rule, ClaimRule::OpenReservation);
+        assert!(
+            claims[0].detail.starts_with("OpenReservation"),
+            "{claims:?}"
+        );
     }
 }

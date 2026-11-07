@@ -4,6 +4,8 @@
 //! the events, and the property reports a break at the step that found it.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{cell::RefCell, io::Write, path::Path, process::Command};
 
 use serde_json::Value;
@@ -12,14 +14,18 @@ use zakura_sim::{
     domain::header_sync::{CHUNK_BUDGET_BOUND, TEARDOWN_RETURNS_BASELINE},
     harness::{
         self,
-        header_node::claim::RoundEvidence,
+        header_node::{
+            claim::SettlementEvidence,
+            policy::{Allow, Hold, OpKind, Select, Trigger},
+            ControlAction, ControlStep, Policy,
+        },
         header_sync::{Storage, StorageScenario},
         record, run_prepared, HarnessEntry, HarnessError, RecordInput, Subsystem,
     },
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::Expect,
-    MemorySink, Plan, PlanInput, RunReport,
+    MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// The committed close-and-relink seed (`tests/header_storage_seeds.rs`),
@@ -98,7 +104,7 @@ const CHILD: &str = "ZAKURA_SIM_TEARDOWN_TRACE";
 
 thread_local! {
     /// The released rounds of the run [`capture_run`] last prepared.
-    static CAPTURED: RefCell<Option<RoundEvidence>> = const { RefCell::new(None) };
+    static CAPTURED: RefCell<Option<SettlementEvidence>> = const { RefCell::new(None) };
 }
 
 /// `header-sync/storage`'s own run, keeping its released rounds in
@@ -125,9 +131,10 @@ fn captured() -> String {
     format!("{:?}\n", rounds.rows())
 }
 
-/// The committed close-and-relink witness, recorded in this process and
-/// replayed exactly in a fresh process of the same test binary, gives the
-/// released rounds at each drain its recorded run gave.
+/// Each teardown witness, the committed close-and-relink input and
+/// [`held_lease_witness`], recorded in this process and replayed exactly in
+/// a fresh process of the same test binary, gives the settlement at each
+/// drain its recorded run gave.
 #[test]
 fn the_teardown_witness_replays_in_a_fresh_process() {
     let entry = HarnessEntry {
@@ -145,26 +152,194 @@ fn the_teardown_witness_replays_in_a_fresh_process() {
             .expect("the test harness captures stdout");
         return;
     }
-    let dir = TempDir::new().expect("a temporary directory");
-    record(&entry, RecordInput::Input(CLOSE_RELINK_INPUT), dir.path())
-        .expect("the witness records");
-    let recorded = captured();
-    let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
-        .args([
-            "--exact",
-            "the_teardown_witness_replays_in_a_fresh_process",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, dir.path())
-        .output()
-        .expect("the test binary runs");
-    let stdout = String::from_utf8_lossy(&child.stdout);
-    assert!(child.status.success(), "{child:?}");
-    let replayed = stdout
-        .split_once("ROUNDS-BEGIN\n")
-        .and_then(|(_, rest)| rest.split_once("ROUNDS-END"))
-        .map(|(rounds, _)| rounds)
-        .unwrap_or_else(|| panic!("the child prints its rounds: {stdout}"));
-    assert_eq!(replayed, recorded);
+    let held_lease = serde_json::to_value(held_lease_witness()).expect("a scenario serializes");
+    let PlanInput::Bytes(plan) = support::inputs(1, 256).remove(0) else {
+        unreachable!("fuzz inputs are bytes");
+    };
+    for witness in 0..2 {
+        let what = match witness {
+            0 => RecordInput::Input(CLOSE_RELINK_INPUT),
+            _ => RecordInput::Plan {
+                scenario: &held_lease,
+                plan: &plan,
+            },
+        };
+        let dir = TempDir::new().expect("a temporary directory");
+        record(&entry, what, dir.path()).expect("the witness records");
+        let recorded = captured();
+        let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
+            .args([
+                "--exact",
+                "the_teardown_witness_replays_in_a_fresh_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, dir.path())
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{child:?}");
+        let replayed = stdout
+            .split_once("ROUNDS-BEGIN\n")
+            .and_then(|(_, rest)| rest.split_once("ROUNDS-END"))
+            .map(|(rounds, _)| rounds)
+            .unwrap_or_else(|| panic!("the child prints its rounds: {stdout}"));
+        assert_eq!(replayed, recorded, "witness {witness}");
+    }
 }
+
+/// The plan's teardown witness: the node's first prepare is held, and
+/// `mirror-0`'s link closes once that prepare is submitted, so the queue
+/// releases its round while the call still holds the round's headers. The
+/// close lifts the hold, the prepare is handled, and the round settles.
+/// The node shuts down once that prepare is handled, and its teardown
+/// settles. `header-sync/teardown-returns-baseline` holds at both levels,
+/// and the run never fails `ShutdownIncomplete`.
+fn held_lease_witness() -> StorageScenario {
+    let first_prepare = || Select::nth(OpKind::Prepare, 1);
+    StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: first_prepare(),
+                until: Trigger::Closed("mirror-0".to_owned()),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![
+            ControlStep {
+                peer: "mirror-0".to_owned(),
+                action: ControlAction::Close,
+                when: Some(Trigger::Submitted(first_prepare())),
+            },
+            ControlStep {
+                peer: "node".to_owned(),
+                action: ControlAction::Shutdown,
+                when: Some(Trigger::Handled(first_prepare())),
+            },
+        ],
+        ..StorageScenario::default()
+    }
+}
+
+/// [`held_lease_witness`]: under every plan, a released round stays
+/// unsettled while its prepare holds it, then settles, and the stopped node
+/// settles too, with the property applying and holding.
+#[test]
+fn teardown_waits_for_held_lease() {
+    let scenario = held_lease_witness();
+    let mut held = 0;
+    for input in support::inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let settlement = ports.rounds.clone();
+        let report =
+            run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.harness, None, "{:?}", report.end);
+        let rows = settlement.rows();
+        let teardown = report
+            .properties
+            .iter()
+            .find(|property| property.property == TEARDOWN_RETURNS_BASELINE)
+            .map(|property| property.outcome.clone());
+        assert!(
+            matches!(teardown, Some(PropertyOutcome::Held { .. })),
+            "{teardown:?}: {rows:?}"
+        );
+        assert!(settlement.settled(), "the stopped node settles: {rows:?}");
+        let waited = rows
+            .iter()
+            .position(|row| row.released > 0 && row.unsettled > 0);
+        if let Some(waited) = waited {
+            assert!(
+                rows[waited..]
+                    .iter()
+                    .any(|row| row.unsettled == 0 && !row.settled),
+                "the round settles before the node does: {rows:?}"
+            );
+            held += 1;
+        }
+    }
+    assert!(
+        held > 0,
+        "no plan released the round while its prepare held it"
+    );
+}
+
+/// The node's first locator read is held for a second after its
+/// submission, and the node shuts down once that read is submitted, so
+/// storage still holds the read's permit when the reactor goes and returns
+/// it later. Every teardown read is checked against storage's permits at
+/// that read, so an honest run holds throughout. A hold until `mirror-0`'s
+/// link closed would lift at the stop, which closes the link, before the
+/// reactor is gone.
+fn held_locator_witness() -> StorageScenario {
+    let first_locator = || Select::nth(OpKind::Locator, 1);
+    StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: first_locator(),
+                until: Trigger::VirtualTime(1_000),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Shutdown,
+            when: Some(Trigger::Submitted(first_locator())),
+        }],
+        ..StorageScenario::default()
+    }
+}
+
+/// [`held_locator_witness`] settles the node and holds under every plan.
+/// Some teardown read finds a permit storage still holds, and a later one
+/// finds it back, so each teardown read is checked against what storage
+/// holds then. With `forgotten-locator-permit` applied, that later read
+/// finds the leaked permit.
+#[test]
+fn a_locator_held_across_reactor_exit_holds() {
+    let scenario = held_locator_witness();
+    for input in support::inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let settlement = ports.rounds.clone();
+        let capacity = ports.capacity.clone();
+        let report =
+            run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert!(settlement.settled(), "{:?}", settlement.rows());
+        let teardown: Vec<_> = capacity
+            .readings()
+            .into_iter()
+            .filter(|reading| reading.teardown)
+            .collect();
+        let held = teardown
+            .iter()
+            .position(|reading| reading.locator_permits < LOCATOR_CAPACITY)
+            .unwrap_or_else(|| {
+                panic!("no teardown read found storage holding a permit: {teardown:?}")
+            });
+        assert!(
+            teardown[held..]
+                .iter()
+                .any(|reading| reading.locator_permits == LOCATOR_CAPACITY),
+            "a later teardown read finds the permit back: {teardown:?}"
+        );
+        let outcome = report
+            .properties
+            .iter()
+            .find(|property| property.property == TEARDOWN_RETURNS_BASELINE)
+            .map(|property| property.outcome.clone());
+        assert!(
+            matches!(outcome, Some(PropertyOutcome::Held { .. })),
+            "{outcome:?}"
+        );
+    }
+}
+
+/// The reactor's locator permits, as the capacity probe counts them.
+const LOCATOR_CAPACITY: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;

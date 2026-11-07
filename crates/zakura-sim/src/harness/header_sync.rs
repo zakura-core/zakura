@@ -46,7 +46,10 @@ use super::{
 };
 use crate::{
     domain::{
-        header_sync::{chunk_budget_bound, teardown_returns_baseline, BudgetView, TeardownView},
+        header_sync::{
+            chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
+            TeardownView,
+        },
         session::{honest_never_punished, HonestPeers},
     },
     observe::StorageFact,
@@ -640,16 +643,19 @@ impl HasView for Storage {
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence, for
-    /// the tip and penalty rules.
+    /// Records the run's end in the node's adoption, fault and round
+    /// evidence, for the tip, penalty and teardown rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
+        self.rounds.end(end);
     }
 
-    /// [`fault_end_violations`].
+    /// [`fault_end_violations`] and [`teardown_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        fault_end_violations(&self.faults, log)
+        let mut found = fault_end_violations(&self.faults, log);
+        found.extend(teardown_end_violations(&self.rounds));
+        found
     }
 }
 
@@ -999,18 +1005,21 @@ impl HasView for HeaderWire {
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence and
-    /// its session view, for the tip and penalty rules and the own-9 end
-    /// check.
+    /// Records the run's end in the node's adoption, fault and round
+    /// evidence and its session view, for the tip, penalty and teardown
+    /// rules and the own-9 end check.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
         self.sessions.end(end);
+        self.rounds.end(end);
     }
 
-    /// [`fault_end_violations`].
+    /// [`fault_end_violations`] and [`teardown_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        fault_end_violations(&self.faults, log)
+        let mut found = fault_end_violations(&self.faults, log);
+        found.extend(teardown_end_violations(&self.rounds));
+        found
     }
 }
 

@@ -1893,17 +1893,20 @@ enum FloodedWatch {
 }
 
 /// Keeps the wire queue full from inside the run loop, and changes a watch
-/// at every other turn's first wire take, until `left` runs out. Running
-/// inside the loop's own task lets it see that task's cooperative budget.
+/// at the first wire take of about half the turns, until `left` runs out.
+/// Running inside the loop's own task lets it see that task's cooperative
+/// budget.
 ///
-/// A turn that reads a change spends one more unit of budget than one that
-/// doesn't. Changing the watch on every turn would spend two units a turn,
-/// and with Tokio's even budget the budget would always run out on the
-/// read itself. Every other turn spends three units per two turns, so the
-/// budget also runs out on a `select!` take with a change still unread.
+/// Which turns change the watch decides where in a turn the budget runs out.
+/// A turn spends one unit on its `select!` take, and without the fix one
+/// more when its probe reads a change. A fixed pattern can keep the budget
+/// running out at the same point: changing the watch every turn spends two
+/// units a turn, so Tokio's even budget always runs out on the read itself.
+/// A hashed bit per turn (Fibonacci hashing) makes it run out at every
+/// point, with or without the fix.
 struct FloodPublisher {
     steps: std::sync::Mutex<Vec<FloodStep>>,
-    turns: std::sync::atomic::AtomicUsize,
+    turns: std::sync::atomic::AtomicU64,
     left: std::sync::atomic::AtomicUsize,
     refill: Box<dyn Fn() + Send + Sync>,
     publish: Box<dyn Fn() + Send + Sync>,
@@ -1918,8 +1921,8 @@ impl std::fmt::Debug for FloodPublisher {
 
 impl observe::HeaderSyncObserver for FloodPublisher {
     /// Records wire takes and watch reads. While publications are left, it
-    /// replaces each taken event and changes the watch at every other turn's
-    /// first take.
+    /// replaces each taken event, and changes the watch at a turn's first
+    /// take when the turn's hashed bit is clear.
     fn observe(&self, event: observe::ReactorEvent) {
         use std::sync::atomic::Ordering;
         let mut steps = self.steps.lock().expect("no test panics holding it");
@@ -1936,9 +1939,11 @@ impl observe::HeaderSyncObserver for FloodPublisher {
                     return;
                 }
                 (self.refill)();
-                if point == observe::TakePoint::TurnStart
-                    && self.turns.fetch_add(1, Ordering::Relaxed).is_multiple_of(2)
-                {
+                if point != observe::TakePoint::TurnStart {
+                    return;
+                }
+                let turn = self.turns.fetch_add(1, Ordering::Relaxed);
+                if (turn.wrapping_mul(2_654_435_761) >> 16) & 1 == 0 {
                     self.left.fetch_sub(1, Ordering::Relaxed);
                     (self.publish)();
                     steps.push(FloodStep::Published);
@@ -1999,7 +2004,10 @@ async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<
     });
     reactor.startup.observer.0 = Some(publisher.clone());
     let task = tokio::spawn(reactor.run());
-    for _ in 0..publications * 2 {
+    for _ in 0..100_000 {
+        if publisher.left.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            break;
+        }
         tokio::task::yield_now().await;
     }
     shutdown.cancel();
@@ -2019,14 +2027,30 @@ async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<
         "every publication ran before shutdown"
     );
     assert!(
-        steps.contains(&FloodStep::Taken { budget_spent: true }),
-        "the flood used up the loop's cooperative budget"
+        spent_with_a_change_unread(&steps),
+        "the flood used up the loop's cooperative budget with a change unread"
     );
     steps
 }
 
+/// Whether the budget ran out on a wire take that came after some watch
+/// change and before its read, which is when a budgeted probe would miss it.
+fn spent_with_a_change_unread(steps: &[FloodStep]) -> bool {
+    let mut unread = false;
+    steps.iter().any(|step| {
+        match step {
+            FloodStep::Published => unread = true,
+            FloodStep::Read => unread = false,
+            FloodStep::Taken { budget_spent } => return unread && *budget_spent,
+        }
+        false
+    })
+}
+
 /// The most wire events the loop took after any watch change and before its
-/// next watch read.
+/// next watch read, or the end of the run. Once the publications stop, the
+/// loop drains the full queue, so a change still unread then shows as more
+/// than two takes.
 fn most_taken_before_a_read(steps: &[FloodStep]) -> usize {
     steps
         .iter()

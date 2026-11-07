@@ -175,6 +175,7 @@ async fn failed_connection_notifies_gossip_before_writer_close() {
         let (sender, receiver) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
         connection.block_advert_rx = receiver;
         let gossip = BlockGossipPeer {
+            announced: Default::default(),
             sender,
             address: None,
             uploads: connection.block_uploads.clone(),

@@ -8,6 +8,7 @@ use crate::{
     harness::header_node::{
         capacity::{BoundaryRead, CapacityEvidence},
         claim::{Claim, ClaimEvidence, SettlementEvidence},
+        stale::StaleEvidence,
     },
     property::{
         CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
@@ -216,6 +217,81 @@ where
     } else {
         Verdict::NotApplicable
     }
+}
+
+/// A stale prepare or apply completion's own handling never charges,
+/// releases or credits another owner's work, and never starts or
+/// dispatches work.
+pub const STALE_COMPLETION_INERT: &str = "header-sync/stale-completion-inert";
+
+/// What the stale-completion check reads: one reactor's claim breaks and
+/// the stale calls its tap found.
+pub trait StaleView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// The reactor's stale prepare and apply calls.
+    fn stale_calls(&self) -> &StaleEvidence;
+}
+
+/// [`STALE_COMPLETION_INERT`], as a harness whose view is a [`StaleView`]
+/// registers it.
+pub fn stale_completion_inert<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: StaleView,
+{
+    Property {
+        id: PropertyId::new(STALE_COMPLETION_INERT),
+        claim: "a stale header prepare or apply completion's own handling never charges, \
+                releases or credits another owner's work, and never starts or dispatches work",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_stale_completion::<S>,
+        witness: Some(TriggerHistory::View(stale_ended::<S::View>)),
+    }
+}
+
+/// Checks [`STALE_COMPLETION_INERT`] at the boundary after a step.
+///
+/// The tap's stale-completion check
+/// ([`crate::harness::header_node::stale`]) finds the stale calls and
+/// judges each fact their handlers report, by the cause the reactor
+/// records with it. A forbidden effect the step's drain found violates at
+/// once. It applies once a drain found a stale call. Whether a maintenance
+/// decision in the same turn was right is the maintenance properties' to
+/// judge, so facts under any other cause aren't.
+fn check_stale_completion<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: StaleView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "a stale completion's handler returns only its own round's budget";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::StaleCompletionEffect])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.stale_calls().found_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended
+/// stale.
+fn stale_ended<V: StaleView>(view: &V, _: &ObservationLog) -> bool {
+    view.stale_calls().any()
 }
 
 /// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: the queue released a

@@ -26,6 +26,7 @@ use zakura_sim::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             reservation::ReservationEvidence,
             session::SessionEvidence,
+            stale::StaleEvidence,
             tap::ReactorTap,
             Chain, ControlAction, ControlStep, DispatchFlag, HeaderNode, Policy,
         },
@@ -351,6 +352,7 @@ fn probe_failure(
         ReservationEvidence::default(),
         CapacityEvidence::default(),
         SettlementEvidence::default(),
+        StaleEvidence::default(),
     );
     sim.add_source(Box::new(tap));
     let nodes = spawn(&mut sim, &fixture, &observer);

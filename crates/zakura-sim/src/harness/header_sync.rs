@@ -35,6 +35,7 @@ use super::{
         preload,
         reservation::ReservationEvidence,
         session::SessionEvidence,
+        stale::StaleEvidence,
         tap::ReactorTap,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
         Policy, PolicySource, Topology,
@@ -46,7 +47,10 @@ use super::{
 };
 use crate::{
     domain::{
-        header_sync::{chunk_budget_bound, teardown_returns_baseline, BudgetView, TeardownView},
+        header_sync::{
+            chunk_budget_bound, stale_completion_inert, teardown_returns_baseline, BudgetView,
+            StaleView, TeardownView,
+        },
         session::{honest_never_punished, HonestPeers},
     },
     observe::StorageFact,
@@ -497,6 +501,9 @@ pub struct Ports {
     /// The node's released rounds at each drain, which its tap keeps during
     /// the run.
     pub rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, which its tap finds during
+    /// the run.
+    pub stale_calls: StaleEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -512,6 +519,8 @@ pub struct Storage {
     claims: ClaimEvidence,
     /// The node's released rounds, from its tap.
     rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, from its tap.
+    stale_calls: StaleEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -546,6 +555,8 @@ pub struct StorageView {
     pub claims: ClaimEvidence,
     /// The node's released rounds at each drain.
     pub rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls.
+    pub stale_calls: StaleEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -572,6 +583,18 @@ impl TeardownView for StorageView {
     }
 }
 
+impl StaleView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::stale_calls`].
+    fn stale_calls(&self) -> &StaleEvidence {
+        &self.stale_calls
+    }
+}
+
 impl HonestPeers for StorageView {
     /// True if `index` is in [`StorageView::honest_peers`].
     fn is_honest(&self, index: usize) -> bool {
@@ -595,6 +618,7 @@ impl HasView for Storage {
             capacity: self.capacity.clone(),
             claims: self.claims.clone(),
             rounds: self.rounds.clone(),
+            stale_calls: self.stale_calls.clone(),
         }
     }
 
@@ -697,6 +721,7 @@ impl Subsystem for Storage {
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
             rounds: SettlementEvidence::default(),
+            stale_calls: StaleEvidence::default(),
         }
     }
 
@@ -722,6 +747,7 @@ impl Subsystem for Storage {
             ports.reservations.clone(),
             ports.capacity.clone(),
             ports.rounds.clone(),
+            ports.stale_calls.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
@@ -792,6 +818,7 @@ impl Subsystem for Storage {
             capacity: ports.capacity,
             claims,
             rounds: ports.rounds,
+            stale_calls: ports.stale_calls,
             faults,
             topology,
         }
@@ -893,6 +920,9 @@ pub struct WirePorts {
     /// The node's released rounds at each drain, which its tap keeps during
     /// the run.
     pub rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, which its tap finds during
+    /// the run.
+    pub stale_calls: StaleEvidence,
 }
 
 impl WirePorts {
@@ -927,6 +957,8 @@ pub struct HeaderWire {
     claims: ClaimEvidence,
     /// The node's released rounds, from its tap.
     rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, from its tap.
+    stale_calls: StaleEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -954,6 +986,7 @@ impl HasView for HeaderWire {
             capacity: self.capacity.clone(),
             claims: self.claims.clone(),
             rounds: self.rounds.clone(),
+            stale_calls: self.stale_calls.clone(),
         }
     }
 
@@ -1045,6 +1078,7 @@ impl Subsystem for HeaderWire {
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
             rounds: SettlementEvidence::default(),
+            stale_calls: StaleEvidence::default(),
         }
     }
 
@@ -1081,6 +1115,7 @@ impl Subsystem for HeaderWire {
             ports.reservations.clone(),
             ports.capacity.clone(),
             ports.rounds.clone(),
+            ports.stale_calls.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
@@ -1160,6 +1195,7 @@ impl Subsystem for HeaderWire {
             capacity: ports.capacity,
             claims,
             rounds: ports.rounds,
+            stale_calls: ports.stale_calls,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),
@@ -1261,12 +1297,14 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 }
 
 /// The storage harness's properties, [`OPERATION_IDS`],
-/// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`] and
-/// [`TEARDOWN_RETURNS_BASELINE`], all active. A test harness that wraps
-/// [`Storage`] with its view registers them too.
+/// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
+/// [`TEARDOWN_RETURNS_BASELINE`] and [`STALE_COMPLETION_INERT`], all
+/// active. A test harness that wraps [`Storage`] with its view registers
+/// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 /// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
+/// [`STALE_COMPLETION_INERT`]: crate::domain::header_sync::STALE_COMPLETION_INERT
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1292,6 +1330,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         },
         chunk_budget_bound(),
         teardown_returns_baseline(),
+        stale_completion_inert(),
     ]
 }
 

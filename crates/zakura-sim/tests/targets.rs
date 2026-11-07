@@ -164,8 +164,8 @@ fn declared_targets_are_the_sim_packages() {
 }
 
 /// The discovery seed carries the lost-wakeup bypass, and the header
-/// storage seeds carry the planted cases that name the close-and-relink
-/// seed.
+/// storage seeds carry the planted cases that name the close-and-relink and
+/// stale-prepare seeds.
 #[test]
 fn bypasses_follow_their_committed_input() {
     let load = |harness| seed::load(&[fixtures()], Some(harness)).unwrap().admitted;
@@ -185,6 +185,10 @@ fn bypasses_follow_their_committed_input() {
         patches,
         [
             "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
+            "qa/planted/header-sync/stale-completion-inert/stale-charge.patch",
+            "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
+            "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
+            "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
             "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",

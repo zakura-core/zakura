@@ -19,12 +19,20 @@
 //! its tap witnesses. [`Trigger::ReplyTaken`] shows only that it took it,
 //! and [`Trigger::ReplyQueued`] only that the reply reached its queue.
 //!
+//! A [`ReplyHold`] holds a committed operation's reply, so the run can
+//! commit it in one step and deliver its reply in a later one. Only a
+//! family whose operations [`Family::commits`] has any.
+//!
 //! A node records only the events it can witness, so each node kind rejects
 //! a scenario that waits for an event it never records, rather than leave
 //! that hold shut: `header_node::policy::undriven` and
 //! `block_node::policy::undriven` say which.
 
-use std::{collections::BTreeMap, fmt::Debug, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::SimInstant;
@@ -44,6 +52,10 @@ pub trait Family {
 
     /// Whether `allow` offers `outcome`.
     fn allows(allow: Self::Allow, outcome: Self::Outcome) -> bool;
+
+    /// Whether operations of `kind` can commit before they reply, so a
+    /// [`ReplyHold`] may pick them.
+    fn commits(kind: Self::Kind) -> bool;
 }
 
 /// `t` plus `d`, saturating at the largest instant.
@@ -114,8 +126,12 @@ pub enum Trigger<K> {
     Submitted(Select<K>),
     /// A selected operation's caller dropped its call.
     CallerDropped(Select<K>),
-    /// A selected operation completed. Its reply is only queued then.
+    /// A selected operation completed. Its reply is only queued then. A
+    /// reply-held operation completes when its reply is delivered.
     Completed(Select<K>),
+    /// A selected operation committed and its [`ReplyHold`] kept the reply.
+    /// It counts the commit, not the delivery, which `completed` counts.
+    Committed(Select<K>),
     /// A selected operation's reply reached its caller's queue: block
     /// sync's handle, for a block operation. A completion queues no reply
     /// when that queue is closed. Nothing has taken the reply yet.
@@ -144,11 +160,14 @@ pub enum Trigger<K> {
     /// test counts once its engine switches its header tip, before it
     /// commits any new body.
     Grown(String),
-    /// This actor's chain switched to a fork: a `Control` reset committed
-    /// the fork's tip and published it on the actor's watch. A block-sync
-    /// mirror counts once it holds the fork's bodies too. The block-sync
-    /// node under test counts once its engine switches its header tip to
-    /// the fork, before its verified chain resets.
+    /// This actor's chain was reset by a `Control` step. In block sync, a
+    /// reset switches the chain to a fork: it counts once the fork's tip is
+    /// committed and published on the actor's watch, for a mirror once it
+    /// holds the fork's bodies too, and for the node under test once its
+    /// engine switches its header tip, before its verified chain resets.
+    /// In header sync, only the node under test resets, through an operator
+    /// invalidation or reconsideration, and it counts each one that
+    /// committed, whichever way selection moved.
     Reset(String),
     /// This actor prepared a `Control` chain change's headers, which it
     /// applies in a later step. Only the block-sync node under test takes a
@@ -165,6 +184,11 @@ pub enum Trigger<K> {
     /// peer, as its tap reports: once per admission, the setup link's
     /// included, so a replacement is the second. Never holds without a tap.
     SessionAdmitted(String),
+    /// A `Release` control step named the hold whose trigger this is.
+    /// Holds only in a hold's own `until`, and a release opens its hold
+    /// whatever the trigger says, so `until: released` opens only through
+    /// a release.
+    Released,
     /// This many milliseconds after the held operation's submission, or
     /// after the run's start in a control step. Time stops there.
     VirtualTime(u64),
@@ -213,11 +237,28 @@ pub struct Hold<K, A> {
     pub deadline_ms: Option<u64>,
 }
 
+/// Keeps the reply of each operation `select` picks, once the run commits
+/// it, until `until` holds. Then the reply's delivery is offered. Only an
+/// operation the family [`Family::commits`] is picked, and only a commit
+/// holds its reply: a fault or rejection commits nothing, so it completes in
+/// one step. A held reply ignores the base bound, and a
+/// [`Trigger::VirtualTime`] in `until` counts from the commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, bound(deserialize = "K: Deserialize<'de>"))]
+pub struct ReplyHold<K> {
+    /// The operations whose replies it holds. The first reply hold that
+    /// matches an operation at its submission holds it.
+    pub select: Select<K>,
+    /// When the reply is offered for delivery.
+    pub until: Trigger<K>,
+}
+
 /// One kind of operation fact a trigger counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Event {
     Submitted,
     CallerDropped,
+    Committed,
     Completed,
     ReplyQueued,
     ReplyTaken,
@@ -254,6 +295,8 @@ struct Op<K> {
     session: Option<u64>,
     /// The hold that picked it.
     hold: Option<usize>,
+    /// The reply hold that picked it.
+    reply_hold: Option<usize>,
 }
 
 /// What [`Predicates`] knows about one port call from its dispatch and end.
@@ -272,6 +315,8 @@ struct Call<K, Key> {
 struct Context<Key> {
     /// The held operation, for [`Select::held`].
     held: Option<Key>,
+    /// The hold whose trigger this is, for [`Trigger::Released`].
+    hold: Option<usize>,
     /// Time since the held operation's submission, or since the run's start.
     since: Duration,
 }
@@ -282,10 +327,17 @@ type HoldOn<'a, F> = (
     Context<<F as Family>::Key>,
 );
 
+/// A reply hold on an operation, and the context its trigger is judged in.
+type ReplyHoldOn<'a, F> = (
+    &'a ReplyHold<<F as Family>::Kind>,
+    Context<<F as Family>::Key>,
+);
+
 /// The holds and everything they count. See the module doc.
 #[derive(Clone, Debug)]
 pub struct Predicates<F: Family> {
     holds: Vec<Hold<F::Kind, F::Allow>>,
+    reply_holds: Vec<ReplyHold<F::Kind>>,
     /// Each operation's stages, in order.
     ops: BTreeMap<F::Key, Vec<Op<F::Kind>>>,
     calls: BTreeMap<u64, Call<F::Kind, F::Key>>,
@@ -296,6 +348,8 @@ pub struct Predicates<F: Family> {
     /// Each handled call, in order.
     handled: Vec<u64>,
     links: Vec<(LinkEffect, String)>,
+    /// The holds a `Release` step opened.
+    released: BTreeSet<usize>,
 }
 
 impl<F: Family> Predicates<F> {
@@ -303,12 +357,23 @@ impl<F: Family> Predicates<F> {
     pub fn new(holds: Vec<Hold<F::Kind, F::Allow>>) -> Self {
         Predicates {
             holds,
+            reply_holds: Vec::new(),
             ops: BTreeMap::new(),
             calls: BTreeMap::new(),
             submitted: BTreeMap::new(),
             events: Vec::new(),
             handled: Vec::new(),
             links: Vec::new(),
+            released: BTreeSet::new(),
+        }
+    }
+
+    /// These predicates with `reply_holds` too. Call before anything is
+    /// observed, since each picks operations at their submission.
+    pub fn with_reply_holds(self, reply_holds: Vec<ReplyHold<F::Kind>>) -> Self {
+        Predicates {
+            reply_holds,
+            ..self
         }
     }
 
@@ -325,11 +390,18 @@ impl<F: Family> Predicates<F> {
             nth: *nth,
             session,
             hold: None,
+            reply_hold: None,
         };
         op.hold = self
             .holds
             .iter()
             .position(|hold| !hold.select.held && op.matches(&hold.select));
+        if F::commits(kind) {
+            op.reply_hold = self
+                .reply_holds
+                .iter()
+                .position(|hold| !hold.select.held && op.matches(&hold.select));
+        }
         let stages = self.ops.entry(key).or_default();
         stages.push(op);
         let stage = stages.len() - 1;
@@ -388,6 +460,12 @@ impl<F: Family> Predicates<F> {
     /// Counts the reactor's handling of port call `call`.
     pub(crate) fn handled(&mut self, call: u64) {
         self.handled.push(call);
+    }
+
+    /// Opens hold `hold` for a `Release` step. Releasing it again does
+    /// nothing.
+    pub fn release(&mut self, hold: usize) {
+        self.released.insert(hold);
     }
 
     /// Counts one link effect on the link to `peer`.
@@ -450,6 +528,7 @@ impl<F: Family> Predicates<F> {
         match trigger {
             Trigger::Submitted(select) => events(Event::Submitted, select),
             Trigger::CallerDropped(select) => events(Event::CallerDropped, select),
+            Trigger::Committed(select) => events(Event::Committed, select),
             Trigger::Completed(select) => events(Event::Completed, select),
             Trigger::ReplyQueued(select) => events(Event::ReplyQueued, select),
             Trigger::ReplyTaken(select) => events(Event::ReplyTaken, select),
@@ -465,7 +544,7 @@ impl<F: Family> Predicates<F> {
             Trigger::Prepared(peer) => links(LinkEffect::Prepared, peer),
             Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
             Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
-            Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
+            Trigger::Released | Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }
         }
@@ -474,6 +553,7 @@ impl<F: Family> Predicates<F> {
     /// Whether `trigger` holds in `cx`.
     fn holds_in(&self, trigger: &Trigger<F::Kind>, cx: Context<F::Key>) -> bool {
         match trigger {
+            Trigger::Released => cx.hold.is_some_and(|hold| self.released.contains(&hold)),
             Trigger::VirtualTime(ms) => cx.since >= Duration::from_millis(*ms),
             Trigger::Count(n, inner) => self.count(inner, cx) >= *n as usize, // u32 fits usize
             Trigger::All(all) => all.iter().all(|inner| self.holds_in(inner, cx)),
@@ -488,6 +568,7 @@ impl<F: Family> Predicates<F> {
             trigger,
             Context {
                 held: None,
+                hold: None,
                 since: now.since_start(),
             },
         )
@@ -519,6 +600,7 @@ impl<F: Family> Predicates<F> {
             &self.holds[hold],
             Context {
                 held: Some(key),
+                hold: Some(hold),
                 since,
             },
         ))
@@ -535,9 +617,60 @@ impl<F: Family> Predicates<F> {
     ) -> Option<bool> {
         let (hold, cx) = self.hold_on(key, since)?;
         Some(
-            self.holds_in(&hold.until, cx)
+            (self.is_released(cx) || self.holds_in(&hold.until, cx))
                 && hold.then.iter().any(|allow| F::allows(*allow, outcome)),
         )
+    }
+
+    /// Whether a `Release` step opened the hold `cx` judges.
+    fn is_released(&self, cx: Context<F::Key>) -> bool {
+        cx.hold.is_some_and(|hold| self.released.contains(&hold))
+    }
+
+    /// The reply hold on operation `key`'s current stage, and the context
+    /// its trigger is judged in, `since` its commit.
+    fn reply_hold_on(&self, key: F::Key, since: Duration) -> Option<ReplyHoldOn<'_, F>> {
+        let hold = self.ops.get(&key)?.last()?.reply_hold?;
+        Some((
+            &self.reply_holds[hold],
+            Context {
+                held: Some(key),
+                hold: None,
+                since,
+            },
+        ))
+    }
+
+    /// Whether a reply hold picked operation `key`'s current stage, so an
+    /// engine completion commits it and holds its reply.
+    pub(crate) fn reply_held(&self, key: F::Key) -> bool {
+        self.ops
+            .get(&key)
+            .and_then(|stages| stages.last())
+            .is_some_and(|op| op.reply_hold.is_some())
+    }
+
+    /// Whether committed operation `key`'s reply is offered for delivery,
+    /// `since` its commit: once its reply hold's trigger holds, or at once
+    /// if no reply hold picked it.
+    pub(crate) fn delivery_offered(&self, key: F::Key, since: Duration) -> bool {
+        self.reply_hold_on(key, since)
+            .is_none_or(|(hold, cx)| self.holds_in(&hold.until, cx))
+    }
+
+    /// Where time must stop for committed operation `key`, `since` its
+    /// commit, at `now`: its reply hold's unreached virtual times.
+    pub(crate) fn delivery_boundaries(
+        &self,
+        key: F::Key,
+        since: Duration,
+        now: SimInstant,
+        out: &mut Vec<Boundary>,
+    ) {
+        let Some((hold, _)) = self.reply_hold_on(key, since) else {
+            return;
+        };
+        opens(&hold.until, since, now, out);
     }
 
     /// Where time must stop for operation `key`, `since` its submission, at
@@ -552,16 +685,13 @@ impl<F: Family> Predicates<F> {
         out: &mut Vec<Boundary>,
     ) {
         let by = |d: Duration| Boundary::Deadline(after(now, d.saturating_sub(since)));
-        let Some((hold, _)) = self.hold_on(key, since) else {
+        let Some((hold, cx)) = self.hold_on(key, since) else {
             out.extend(bound.map(by));
             return;
         };
-        let mut times = Vec::new();
-        virtual_times(&hold.until, &mut times);
-        for at in times.into_iter().map(Duration::from_millis) {
-            if at > since {
-                out.push(Boundary::Opens(after(now, at - since)));
-            }
+        // A released hold is open, so its trigger's times no longer matter.
+        if !self.is_released(cx) {
+            opens(&hold.until, since, now, out);
         }
         out.extend(hold.deadline_ms.map(Duration::from_millis).map(by));
     }
@@ -575,6 +705,18 @@ impl<K: Copy + Eq> Op<K> {
             && select
                 .session
                 .is_none_or(|session| Some(session) == self.session)
+    }
+}
+
+/// Where `trigger`'s unreached virtual times open, judged `since` the
+/// instant they count from, at `now`.
+fn opens<K>(trigger: &Trigger<K>, since: Duration, now: SimInstant, out: &mut Vec<Boundary>) {
+    let mut times = Vec::new();
+    virtual_times(trigger, &mut times);
+    for at in times.into_iter().map(Duration::from_millis) {
+        if at > since {
+            out.push(Boundary::Opens(after(now, at - since)));
+        }
     }
 }
 

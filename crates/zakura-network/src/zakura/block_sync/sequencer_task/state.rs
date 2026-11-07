@@ -314,7 +314,7 @@ impl SequencerState {
         self.reaction_epoch
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, zakura_sim))]
     pub(super) fn current_scope(&self) -> Option<zakura_header_chain::BodyWorkAuthority> {
         self.current_scope
     }

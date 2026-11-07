@@ -234,6 +234,7 @@ fn grow_witness() -> StorageScenario {
             ControlAction::Grow { len: 2 },
             Trigger::Submitted(locator()),
         )],
+        weights: Default::default(),
     }
 }
 
@@ -425,6 +426,7 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
         }],
         policy: Policy::converging(),
         controls: Vec::new(),
+        weights: Default::default(),
     };
     for input in inputs(16, 256) {
         let run = run(&scenario, input);

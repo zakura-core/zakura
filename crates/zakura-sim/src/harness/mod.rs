@@ -29,7 +29,7 @@ pub mod scenario;
 pub mod wire_node;
 pub mod wire_plans;
 
-use std::{fmt, net::SocketAddr, rc::Rc, time::Duration};
+use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, time::Duration};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -191,17 +191,43 @@ pub fn run_prepared<S: Subsystem>(
     sink: &mut dyn RecordSink,
     extra: Option<&mut dyn Checker>,
 ) -> Result<RunReport, HarnessError> {
+    let (report, ()) =
+        run_reading::<S, ()>(scenario, prepared, input, sink, extra, |_, _, _, _| ())?;
+    Ok(report)
+}
+
+/// [`run_prepared`], also returning what `read` takes from the harness and
+/// the run's final end, reports and log, before the scheduler shuts down
+/// ([`Sim::on_end`]), since shutdown can resume suspended tasks.
+pub(crate) fn run_reading<S: Subsystem, T: 'static>(
+    scenario: &S::Scenario,
+    prepared: S::Prepared,
+    input: PlanInput,
+    sink: &mut dyn RecordSink,
+    extra: Option<&mut dyn Checker>,
+    read: impl FnOnce(&S, &RunEnd, &[PropertyReport], &ObservationLog) -> T + 'static,
+) -> Result<(RunReport, T), HarnessError> {
     // One read of the assumptions sets both the step loop's livelock limit
     // and the checker's, so the two can't disagree (V12 F-299).
     let assumptions = S::assumptions(scenario);
     let config = limit_livelock(S::config(scenario), &assumptions);
     let mut sim = Sim::new(config, input);
     let this = Rc::new(S::build(&mut sim, scenario, prepared));
+    let read_out = Rc::new(RefCell::new(None));
+    sim.on_end({
+        let this = Rc::clone(&this);
+        let read_out = Rc::clone(&read_out);
+        move |end, properties, log| *read_out.borrow_mut() = Some(read(&this, end, properties, log))
+    });
     let mut checker = registry_checker(&this, assumptions);
     let report = match extra {
         Some(extra) => sim.run(&mut Tee(Dyn(&mut *checker), Dyn(extra)), sink),
         None => sim.run(&mut *checker, sink),
     };
+    let read = read_out
+        .borrow_mut()
+        .take()
+        .expect("`Sim::run` runs its end hooks once");
     // The harness outlives the run, so production tasks never see their
     // handles close mid-run.
     drop(checker);
@@ -211,7 +237,7 @@ pub fn run_prepared<S: Subsystem>(
             failure: failure.clone(),
             report: Box::new(report),
         }),
-        _ => Ok(report),
+        _ => Ok((report, read)),
     }
 }
 

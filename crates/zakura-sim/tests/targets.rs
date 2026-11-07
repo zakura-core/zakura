@@ -189,6 +189,7 @@ fn bypasses_follow_their_committed_input() {
             "qa/planted/header-sync/stale-completion-inert/stale-credit.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-release.patch",
             "qa/planted/header-sync/stale-completion-inert/stale-retirement.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
             "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",

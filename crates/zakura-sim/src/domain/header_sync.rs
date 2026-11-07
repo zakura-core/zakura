@@ -486,7 +486,8 @@ where
 /// Checks the watch rule for `queue` over the view's adoption evidence
 /// ([`AdoptionEvidence::watch_read`]). It applies once a state is
 /// published. A publication still waiting for its read or its third event
-/// leaves the run inconclusive if it ends there.
+/// leaves the run inconclusive if it ends there, unless
+/// [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
 where
     S: HasView,
@@ -505,6 +506,41 @@ where
             why,
         ),
     }
+}
+
+/// The watch property for the flooded `queue`'s violation at the run's end:
+/// a publication still unread ([`WatchRead::Open`]) when the run settled
+/// ([`AdoptionEvidence::run_settled`]), unless the harness had started to
+/// stop the node (`stopping`). A correct loop with an unread publication
+/// always has its watch arm ready, so it can't settle with one. Only a
+/// shutdown, which wins the loop's biased `select!`, may leave one unread
+/// ([`EndedBy`](crate::property::EndedBy)). A harness whose view is an
+/// [`AdoptionView`] reports these from [`HasView::end_violations`], after it
+/// handed the run's end to [`AdoptionEvidence::end`].
+pub fn watch_end_violations(
+    adoption: &AdoptionEvidence,
+    queue: EventQueue,
+    stopping: bool,
+) -> Vec<EndViolation> {
+    let open = adoption.watch_read(queue) == WatchRead::Open;
+    if !open || stopping || adoption.run_settled() != Some(true) {
+        return Vec::new();
+    }
+    let property = match queue {
+        EventQueue::Wire => WATCH_OBSERVED_UNDER_FLOOD,
+        EventQueue::Lifecycle => WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+    };
+    vec![EndViolation {
+        property: PropertyId::new(property),
+        expected: "each published state is read from the committed watch before the run \
+                   settles"
+            .to_owned(),
+        actual: format!(
+            "the run settled with a published state unread and fewer than {} {queue:?} \
+             events taken since, with no shutdown begun",
+            crate::harness::header_node::adoption::WATCH_READ_EVENTS + 1
+        ),
+    }]
 }
 
 /// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state

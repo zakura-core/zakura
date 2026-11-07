@@ -372,6 +372,12 @@ impl AdoptionEvidence {
         self.store().settled = Some(settled(end));
     }
 
+    /// Whether the run [`settled`], once it has ended
+    /// ([`AdoptionEvidence::end`]).
+    pub fn run_settled(&self) -> Option<bool> {
+        self.store().settled
+    }
+
     /// Every fact so far, in the order the reactor reported them.
     pub fn facts(&self) -> Vec<Stamped> {
         self.store().facts.clone()

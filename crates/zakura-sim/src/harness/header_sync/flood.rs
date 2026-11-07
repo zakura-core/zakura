@@ -5,13 +5,16 @@
 //! It checks the watch properties besides `header-sync/storage`'s.
 
 use serde::{Deserialize, Serialize};
+use zakura_network::zakura::observe::EventQueue;
 
 use super::{
     storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
     StorageScenario, StorageView,
 };
 use crate::{
-    domain::header_sync::{watch_observed_under_flood, watch_observed_under_lifecycle_flood},
+    domain::header_sync::{
+        watch_end_violations, watch_observed_under_flood, watch_observed_under_lifecycle_flood,
+    },
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -54,6 +57,14 @@ pub enum FloodScenario {
 }
 
 impl FloodScenario {
+    /// The event queue this fixture floods.
+    pub fn queue(self) -> EventQueue {
+        match self {
+            FloodScenario::Wire => EventQueue::Wire,
+            FloodScenario::Lifecycle => EventQueue::Lifecycle,
+        }
+    }
+
     /// The storage scenario this fixture runs.
     pub fn storage(self) -> StorageScenario {
         let at_tip = || MirrorSpec {
@@ -129,7 +140,7 @@ impl FloodScenario {
 }
 
 /// `header-sync/storage` on a [`FloodScenario`].
-pub struct Flood(Storage);
+pub struct Flood(Storage, FloodScenario);
 
 impl HasView for Flood {
     type View = StorageView;
@@ -144,9 +155,16 @@ impl HasView for Flood {
         self.0.ended(end);
     }
 
-    /// The storage harness's end violations.
+    /// The storage harness's end violations, then the flooded queue's watch
+    /// property's ([`watch_end_violations`]).
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        self.0.end_violations(log)
+        let mut found = self.0.end_violations(log);
+        found.extend(watch_end_violations(
+            &self.0.adoption,
+            self.1.queue(),
+            self.0.topology.shutdown_picked(),
+        ));
+        found
     }
 
     /// The storage harness's stamped facts.
@@ -177,7 +195,7 @@ impl Subsystem for Flood {
 
     /// The storage harness on the fixture.
     fn build(sim: &mut Sim, scenario: &FloodScenario, ports: Ports) -> Self {
-        Flood(Storage::build(sim, &scenario.storage(), ports))
+        Flood(Storage::build(sim, &scenario.storage(), ports), *scenario)
     }
 
     /// The storage harness's properties, then the two watch properties,

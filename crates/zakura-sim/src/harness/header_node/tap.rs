@@ -779,6 +779,12 @@ impl ReactorTap {
         self.state.claims.clone()
     }
 
+    /// The reactor's settlement at each drain, which the tap fills as the
+    /// drains happen.
+    pub fn rounds(&self) -> SettlementEvidence {
+        self.state.rounds.clone()
+    }
+
     /// The notice the harness gives this tap when it stops the reactor.
     pub fn shutdown(&self) -> TapShutdown {
         TapShutdown(self.state.clone())

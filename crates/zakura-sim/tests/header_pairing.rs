@@ -520,6 +520,51 @@ fn a_run_that_ends_mid_stop_fails() {
     assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
 }
 
+/// A stop that wedges, with the reactor parked and the drain run dry, fails
+/// as `ShutdownIncomplete` even though a checker read every drain's
+/// settlement, as `header-sync/teardown-returns-baseline` does. Only a drain
+/// cut off at its bound leaves the stop to the property.
+#[test]
+fn a_wedged_stop_with_a_dry_drain_fails_though_its_settlement_was_read() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let rounds = tap.rounds();
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let read = rounds.clone();
+    let mut checker = zakura_sim::check::after_step(move |cx| {
+        let _ = read.at(cx.step);
+        None
+    });
+    let report = sim.run(&mut checker, &mut MemorySink::default());
+    // The run reached its budget, and its drain ended well short of the
+    // bound, since the parked reactor leaves nothing ready.
+    let config = storage_config();
+    assert!(
+        report.end.steps > config.budget && report.end.steps < config.budget + config.drain_bound,
+        "{:?}",
+        report.end
+    );
+    assert!(
+        rounds
+            .rows()
+            .last()
+            .is_some_and(|row| row.step == report.end.steps),
+        "the last drain recorded a settlement"
+    );
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
 /// A stop cut off at the drain bound is the teardown property's to report,
 /// but a tap with no property reading its settlement still fails it as
 /// `ShutdownIncomplete`, so the unfinished stop never ends silently.

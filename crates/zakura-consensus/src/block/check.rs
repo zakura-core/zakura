@@ -1,6 +1,6 @@
 //! Consensus check functions
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 
@@ -8,7 +8,7 @@ use zakura_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
     },
-    block::{Block, Hash, Header, Height},
+    block::{BlockRef, Hash, Header, Height},
     parameters::{
         subsidy::{
             founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
@@ -22,6 +22,7 @@ use zakura_chain::{
     work::{difficulty::ExpandedDifficulty, equihash},
 };
 use zakura_header_chain::{CompactTargetError, PowPolicy};
+use zakura_state::ValidateContextError;
 
 use crate::{error::*, funding_stream_address};
 
@@ -56,24 +57,32 @@ impl UnmatchedCoinbaseOutputs {
     }
 }
 
+/// Facts established by the coinbase-position check without another transaction pass.
+#[derive(Debug)]
+pub(super) struct CoinbaseSummary<'a> {
+    pub coinbase_tx: &'a transaction::Transaction,
+    /// Whether a non-coinbase transaction spends a transparent output.
+    pub has_transparent_spends: bool,
+}
+
 /// Checks if there is exactly one coinbase transaction in `Block`,
 /// and if that coinbase transaction is the first transaction in the block.
-/// Returns the coinbase transaction is successful.
+/// Returns the borrowed coinbase and whether any other transaction has transparent inputs.
 ///
 /// > A transaction that has a single transparent input with a null prevout field,
 /// > is called a coinbase transaction. Every block has a single coinbase
 /// > transaction as the first transaction in the block.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-pub fn coinbase_is_first(block: &Block) -> Result<Arc<transaction::Transaction>, BlockError> {
+pub(super) fn coinbase_is_first(block: &BlockRef) -> Result<CoinbaseSummary<'_>, BlockError> {
     // # Consensus
     //
     // > A block MUST have at least one transaction
     //
     // <https://zips.z.cash/protocol/protocol.pdf#blockheader>
     let first = block
-        .transactions
-        .first()
+        .transactions()
+        .next()
         .ok_or(BlockError::NoTransactions)?;
     // > The first transaction in a block MUST be a coinbase transaction,
     // > and subsequent transactions MUST NOT be coinbase transactions.
@@ -84,18 +93,48 @@ pub fn coinbase_is_first(block: &Block) -> Result<Arc<transaction::Transaction>,
     // > field, is called a coinbase transaction.
     //
     // <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-    let mut rest = block.transactions.iter().skip(1);
+    let rest = block.transactions().skip(1);
     if !first.is_coinbase() {
         Err(TransactionError::CoinbasePosition)?;
     }
     // > A transparent input in a non-coinbase transaction MUST NOT have a null prevout
     //
     // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
-    if !rest.all(|tx| tx.is_valid_non_coinbase()) {
-        Err(TransactionError::CoinbaseAfterFirst)?;
+    let mut has_transparent_spends = false;
+    for tx in rest {
+        if !tx.is_valid_non_coinbase() {
+            Err(TransactionError::CoinbaseAfterFirst)?;
+        }
+        has_transparent_spends |= tx.has_transparent_inputs();
     }
 
-    Ok(first.clone())
+    Ok(CoinbaseSummary {
+        coinbase_tx: first,
+        has_transparent_spends,
+    })
+}
+
+/// Rejects transparent outputs spent by different transactions in the same block.
+///
+/// This depends only on transaction IDs, so callers must establish the block's Merkle
+/// binding before attributing a failure to its header. Duplicate inputs within one
+/// transaction remain the transaction verifier's responsibility and retain its error
+/// classification. Coinbase inputs do not reference outputs and are skipped.
+pub(super) fn transparent_spends_are_unique(block: &BlockRef) -> Result<(), ValidateContextError> {
+    let mut spent = HashSet::new();
+    for transaction in block.transactions() {
+        for outpoint in transaction.spent_outpoints() {
+            if spent.contains(&outpoint) {
+                return Err(ValidateContextError::duplicate_transparent_spend_in_block(
+                    outpoint,
+                ));
+            }
+        }
+        // Insert only after checking this transaction, so an internal duplicate does
+        // not become a cross-transaction failure with a different peer penalty.
+        spent.extend(transaction.spent_outpoints());
+    }
+    Ok(())
 }
 
 /// Returns `Ok(ExpandedDifficulty)` if the`difficulty_threshold` of `header` is at least as difficult as
@@ -197,7 +236,7 @@ pub fn proof_of_work_is_valid(
 ///
 /// [3.9]: https://zips.z.cash/protocol/protocol.pdf#subsidyconcepts
 pub fn subsidy_is_valid(
-    block: &Block,
+    block: &BlockRef,
     net: &Network,
     expected_block_subsidy: Amount<NonNegative>,
 ) -> Result<DeferredPoolBalanceChange, BlockError> {
@@ -209,8 +248,8 @@ pub fn subsidy_is_valid(
 
     let mut coinbase_outputs = UnmatchedCoinbaseOutputs::new(
         block
-            .transactions
-            .first()
+            .transactions()
+            .next()
             .ok_or(SubsidyError::NoCoinbase)?
             .outputs(),
     );
@@ -468,8 +507,8 @@ pub fn time_is_valid_at(
 /// ZIP 218 sets `SproutBlockJoinSplitLimit` to zero. Zakura rejects any
 /// JoinSplit at or after NU7, because ZIP 2003 disallows the only transaction
 /// versions that can carry one. See [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
-pub fn shielded_action_limits_are_valid<'a>(
-    transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
+pub fn shielded_action_limits_are_valid<T: AsRef<Transaction>>(
+    transactions: impl IntoIterator<Item = T>,
     height: Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
@@ -479,7 +518,7 @@ pub fn shielded_action_limits_are_valid<'a>(
 
     let totals = transactions
         .into_iter()
-        .map(|tx| tx.shielded_action_counts())
+        .map(|tx| tx.as_ref().shielded_action_counts())
         .fold(
             ShieldedActionCounts::default(),
             ShieldedActionCounts::saturating_add,
@@ -543,17 +582,17 @@ pub fn shielded_action_limits_are_valid<'a>(
 /// [7.6]: https://zips.z.cash/protocol/nu5.pdf#blockheader
 pub fn merkle_root_validity(
     network: &Network,
-    block: &Block,
+    block: &BlockRef,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
     // Check the header commitments first. The network upgrade check trusts the coinbase height,
     // which a peer can rewrite without changing a V5 block's hash.
     let merkle_root = transaction_hashes.iter().cloned().collect();
 
-    if block.header.merkle_root != merkle_root {
+    if block.header().merkle_root != merkle_root {
         return Err(BlockError::BadMerkleRoot {
             actual: merkle_root,
-            expected: block.header.merkle_root,
+            expected: block.header().merkle_root,
         });
     }
 

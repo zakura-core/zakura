@@ -138,8 +138,7 @@ async fn receipt_sessions_reset_orders_before_replaying_known_blocks() {
             let (requests, mut received) = mpsc::channel(1);
             let server = tokio::spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(SubscriptionServer(requests))
-                    .serve_with_incoming(TcpIncoming::from(listener))
+                    .serve_with_incoming(SubscriptionServer(requests), TcpIncoming::from(listener))
                     .await
                     .unwrap();
             });
@@ -257,8 +256,7 @@ async fn empty_new_session_clears_old_orders_and_tracks_finalized_tip() {
             let (requests, mut received) = mpsc::channel(1);
             let server = tokio::spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(SubscriptionServer(requests))
-                    .serve_with_incoming(TcpIncoming::from(listener))
+                    .serve_with_incoming(SubscriptionServer(requests), TcpIncoming::from(listener))
                     .await
                     .unwrap();
             });
@@ -357,8 +355,7 @@ async fn mirror_prefers_primary_receipt_over_delivery_order_and_hash() {
         let (requests, mut received) = mpsc::channel(1);
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(SubscriptionServer(requests))
-                .serve_with_incoming(TcpIncoming::from(listener))
+                .serve_with_incoming(SubscriptionServer(requests), TcpIncoming::from(listener))
                 .await
                 .unwrap();
         });

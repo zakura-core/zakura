@@ -3,10 +3,12 @@
 use std::ops::Deref;
 
 use super::{
-    Cardinality, Inconclusive, Kind, LivenessBound, Obligation, ObligationKey, Property,
-    PropertyId, Subject, Verdict,
+    Cardinality, FactAnswer, FactDischarge, Inconclusive, Kind, LivenessBound, Obligation,
+    ObligationKey, Property, PropertyId, Source, Subject, Verdict,
 };
-use crate::{check::Violation, model::LabelledFrame, Observation, StepCtx};
+use crate::{
+    check::Violation, end::RunEnd, model::LabelledFrame, Observation, ObservationLog, StepCtx,
+};
 
 /// A harness's read-only view of the code under test. Checks read it through
 /// [`CheckCtx::view`].
@@ -32,6 +34,44 @@ pub trait HasView {
     fn captured(&self) -> Capture {
         Capture::Live
     }
+
+    /// Tells the harness how the run ended, before the registry reports.
+    /// Checks see only steps, so a view that needs the end to judge what was
+    /// still owed when the run stopped keeps it from here.
+    fn ended(&self, _end: &RunEnd) {}
+
+    /// The violations only the run's end shows, judged over its whole `log`
+    /// after [`ended`](HasView::ended), such as an obligation still open
+    /// when a settled run stopped. The registry records each against its
+    /// property, unless that property was already violated. None by
+    /// default.
+    fn end_violations(&self, _log: &ObservationLog) -> Vec<EndViolation> {
+        Vec::new()
+    }
+
+    /// The stamps of the view-side facts that [`view`](HasView::view) shows
+    /// after stamp `after`, or of all of them with `None`, in increasing
+    /// order. `None` if the harness keeps no stamped facts, as by default.
+    ///
+    /// A stamp orders the facts the harness records: each fact gets one,
+    /// larger than every earlier fact's. The registry reads the new ones
+    /// after each step whose view is fresh ([`captured`](HasView::captured))
+    /// and offers them to the obligations that view-side facts answer
+    /// ([`CheckCtx::fact_obligation`]).
+    fn stamps_after(&self, _after: Option<u64>) -> Option<Vec<u64>> {
+        None
+    }
+}
+
+/// A violation [`HasView::end_violations`] found at the run's end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndViolation {
+    /// The violated property.
+    pub property: PropertyId,
+    /// What the property expected.
+    pub expected: String,
+    /// What the run did.
+    pub actual: String,
 }
 
 /// When a view's state was captured.
@@ -66,7 +106,10 @@ pub struct CheckCtx<'a, S: HasView> {
     property: &'a Property<S>,
     /// Every property in the registry, this one included.
     registered: &'a [Property<S>],
-    obliged: Vec<Obligation>,
+    /// The stamps of the view-side facts the step added, or `None` if the
+    /// harness keeps no stamped facts.
+    facts: Option<&'a [u64]>,
+    obliged: Vec<Obligation<S::View>>,
     recorded: Vec<Violation>,
     missing: Option<String>,
     labelled: Vec<LabelledFrame>,
@@ -75,9 +118,9 @@ pub struct CheckCtx<'a, S: HasView> {
 }
 
 /// What a check left behind besides its verdict.
-pub(crate) struct CheckParts {
+pub(crate) struct CheckParts<V> {
     /// The obligations it opened, in order.
-    pub(crate) obliged: Vec<Obligation>,
+    pub(crate) obliged: Vec<Obligation<V>>,
     /// The violations it recorded, in order.
     pub(crate) recorded: Vec<Violation>,
     /// The first evidence it found missing.
@@ -92,18 +135,19 @@ pub(crate) struct CheckParts {
 
 impl<'a, S: HasView> CheckCtx<'a, S> {
     /// The context for `property`'s check after `step`, in a registry of
-    /// `registered`.
+    /// `registered`, where the step added the view-side `facts`.
     pub(crate) fn new(
         step: &'a StepCtx<'a>,
         handle: &'a S,
-        property: &'a Property<S>,
-        registered: &'a [Property<S>],
+        (property, registered): (&'a Property<S>, &'a [Property<S>]),
+        facts: Option<&'a [u64]>,
     ) -> Self {
         CheckCtx {
             step,
             handle,
             property,
             registered,
+            facts,
             obliged: Vec::new(),
             recorded: Vec::new(),
             missing: None,
@@ -114,7 +158,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     }
 
     /// What the check left behind besides its verdict.
-    pub(crate) fn into_parts(self) -> CheckParts {
+    pub(crate) fn into_parts(self) -> CheckParts<S::View> {
         CheckParts {
             obliged: self.obliged,
             recorded: self.recorded,
@@ -142,6 +186,12 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
         self.handle.view()
     }
 
+    /// The stamps of the view-side facts the step added, in order. Empty
+    /// if the harness keeps no stamped facts ([`HasView::stamps_after`]).
+    pub fn new_stamps(&self) -> &[u64] {
+        self.facts.unwrap_or_default()
+    }
+
     /// An obligation on `subject`, opened at this step under the property's
     /// liveness bound. `trigger` is the trigger's position in
     /// [`StepCtx::observations`], as [`Obligation::trigger`] describes. Its
@@ -156,7 +206,7 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
         trigger: Option<usize>,
         subject: Subject,
         discharged_by: fn(&ObligationKey, &Observation) -> bool,
-    ) -> Obligation {
+    ) -> Obligation<S::View> {
         let Kind::Liveness { bound } = self.property.kind else {
             panic!(
                 "{} opens an obligation, but isn't a liveness property",
@@ -175,6 +225,27 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             discharged_by,
             cardinality: Cardinality::One,
             witness: vec![self.step.step],
+            facts: None,
+        }
+    }
+
+    /// An obligation on `subject` that view-side facts answer through
+    /// `answer`, and observations never do. `after` is the trigger fact's
+    /// stamp, as [`FactDischarge::after`] describes. Its other fields are
+    /// [`obligation`](Self::obligation)'s.
+    ///
+    /// # Panics
+    ///
+    /// If the property isn't a liveness property.
+    pub fn fact_obligation(
+        &self,
+        after: Option<u64>,
+        subject: Subject,
+        answer: fn(&ObligationKey, &S::View, u64) -> FactAnswer,
+    ) -> Obligation<S::View> {
+        Obligation {
+            facts: Some(FactDischarge { after, answer }),
+            ..self.obligation(None, subject, |_, _| false)
         }
     }
 
@@ -184,8 +255,11 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
     /// # Panics
     ///
     /// If its key names another property, or its bound is an `Ops` bound
-    /// that names an object or counts polls.
-    pub fn oblige(&mut self, obligation: Obligation) {
+    /// that names an object or counts polls. If view-side facts answer it,
+    /// also if the property doesn't need the view, the harness keeps no
+    /// stamped facts, its trigger stamp isn't one the step added, or its
+    /// bound is an `Ops` bound, since facts and points share no order.
+    pub fn oblige(&mut self, obligation: Obligation<S::View>) {
         assert_eq!(
             &obligation.key.property,
             self.id(),
@@ -211,6 +285,26 @@ impl<'a, S: HasView> CheckCtx<'a, S> {
             ),
             "no observation counts toward an Ops bound on polls"
         );
+        if let Some(facts) = &obligation.facts {
+            assert!(
+                self.property.needs.contains(&Source::View),
+                "{} reads view-side facts, so it needs the view",
+                self.id()
+            );
+            let added = self
+                .facts
+                .expect("view-side facts answer only in a harness that stamps them");
+            assert!(
+                facts
+                    .after
+                    .is_none_or(|after| added.binary_search(&after).is_ok()),
+                "a fact obligation's trigger is a fact the step added"
+            );
+            assert!(
+                !matches!(obligation.bound, LivenessBound::Ops { .. }),
+                "view-side facts and points share no order, so facts can't answer an Ops bound"
+            );
+        }
         self.obliged.push(obligation);
     }
 

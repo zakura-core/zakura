@@ -518,6 +518,11 @@ fn witnesses() -> Vec<Witness> {
         ),
         drawn(
             block,
+            "block reset past the tip",
+            [&[0xFF, 0x0E][..], &plan()].concat(),
+        ),
+        drawn(
+            block,
             "block stale beside current",
             [&[0xFF, 0x06][..], &plan()].concat(),
         ),

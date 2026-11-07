@@ -26,7 +26,7 @@ pub use methods::types::{
         fetch_chain_info, proposal::proposal_block_from_template, MinerAddress, MinerParams,
     },
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistration, PendingBlockRegistry,
-        PendingBlockSignal, SubmitBlockChannel,
+        EarlyMinedBlock, EarlyMinedBlockChannel, MinedBlockSubmission, PendingBlockRegistration,
+        PendingBlockRegistry, PendingBlockSignal,
     },
 };

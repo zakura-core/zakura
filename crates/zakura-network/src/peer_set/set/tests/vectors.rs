@@ -418,8 +418,9 @@ fn block_gossip_skips_busy_outdated_peers() {
         );
 
         let hash = block::Hash([6; 32]);
-        let _broadcast =
-            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        let _broadcast = tokio::spawn(
+            peer_set.route_block_broadcast(Request::AdvertiseBlock(hash.into(), None)),
+        );
         tokio::task::yield_now().await;
         let advert = handles[0]
             .try_to_receive_block_advert()
@@ -1570,8 +1571,9 @@ fn unready_sidecar_block_gossip_is_delivered() {
         let sidecar = peer_set.take_ready_service(&sidecar_addr).unwrap();
         peer_set.push_unready(sidecar_addr, sidecar);
         let hash = block::Hash([7; 32]);
-        let broadcast =
-            tokio::spawn(peer_set.route_block_broadcast(Request::AdvertiseBlock(hash, None)));
+        let broadcast = tokio::spawn(
+            peer_set.route_block_broadcast(Request::AdvertiseBlock(hash.into(), None)),
+        );
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1611,7 +1613,7 @@ fn block_advertiser_reaches_busy_peers_with_no_ready_peer() {
 
         let hash = block::Hash([8; 32]);
         // Called through `Service`, as the node's block gossip task does.
-        let broadcast = tokio::spawn(advertiser.oneshot(Request::AdvertiseMinedBlock(hash)));
+        let broadcast = tokio::spawn(advertiser.oneshot(Request::AdvertiseMinedBlock(hash.into())));
         tokio::task::yield_now().await;
         assert_eq!(recv_advertise_block(&mut ordinary_handle), Some(hash));
         assert_eq!(recv_advertise_block(&mut sidecar_handle), Some(hash));
@@ -1657,7 +1659,10 @@ fn block_advertiser_peer_list_is_republished_only_on_membership_change() {
         // A peer set broadcast drops the removed peer before the next poll. The poll stays
         // pending with no peer left, but still publishes the removal.
         peer_set.remove(&ordinary_addr);
-        drop(peer_set.route_block_broadcast(Request::AdvertiseBlock(block::Hash([7; 32]), None)));
+        drop(
+            peer_set
+                .route_block_broadcast(Request::AdvertiseBlock(block::Hash([7; 32]).into(), None)),
+        );
         std::future::poll_fn(|cx| {
             assert!(peer_set.poll_ready(cx).is_pending());
             std::task::Poll::Ready(())
@@ -1685,7 +1690,8 @@ fn block_advertiser_waits_for_a_connected_peer() {
             .with_minimum_peer_version(minimum_peer_version)
             .build();
         let mut advertiser = peer_set.block_advertiser();
-        let broadcast = advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32])));
+        let broadcast =
+            advertiser.advertise(Request::AdvertiseMinedBlock(block::Hash([9; 32]).into()));
         assert!(
             tokio::time::timeout(Duration::from_secs(60), broadcast)
                 .await
@@ -1734,7 +1740,11 @@ async fn driver_admits_idle_sidecar_and_keeps_original_duplicate() {
         ready.await.unwrap();
         assert!(adverts.peers.borrow()[0].sender.same_channel(&sender));
         let hash = block::Hash([51; 32]);
-        let broadcast = tokio::spawn(adverts.clone().oneshot(Request::AdvertiseMinedBlock(hash)));
+        let broadcast = tokio::spawn(
+            adverts
+                .clone()
+                .oneshot(Request::AdvertiseMinedBlock(hash.into())),
+        );
         let advert = original.receive_block_advert().await;
         assert_eq!(advert.hash, hash);
         advert.result.send(Ok(())).unwrap();
@@ -1922,8 +1932,9 @@ async fn driver_bounds_requests_and_services_refresh_while_waiting() {
             .await
             .expect("ordinary queue capacity becomes available")
             .unwrap();
-        let waiting_advert =
-            tokio::spawn(adverts.oneshot(Request::AdvertiseMinedBlock(block::Hash([71; 32]))));
+        let waiting_advert = tokio::spawn(
+            adverts.oneshot(Request::AdvertiseMinedBlock(block::Hash([71; 32]).into())),
+        );
         shutdown.cancel();
         for result in queued {
             assert!(timeout(Duration::from_secs(1), result)
@@ -2405,8 +2416,11 @@ async fn driver_refresh_retries_a_revoked_advertisement_on_a_later_peer() {
             .unwrap();
 
         let hash = block::Hash([83; 32]);
-        let mut broadcast =
-            tokio::spawn(adverts.clone().oneshot(Request::AdvertiseMinedBlock(hash)));
+        let mut broadcast = tokio::spawn(
+            adverts
+                .clone()
+                .oneshot(Request::AdvertiseMinedBlock(hash.into())),
+        );
         let advert = revoked.receive_block_advert().await;
         assert_eq!(advert.hash, hash);
         // The peer is banned before its connection writes the inventory, so the connection

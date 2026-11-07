@@ -198,6 +198,25 @@ impl SyncCoordinator {
             .map(|_| ())
     }
 
+    /// Transfers block-apply ownership to native Zakura if startup began in the
+    /// legacy genesis bootstrap, and returns whether this call made the transfer.
+    ///
+    /// Startup begins native when the header runtime is already ready before the
+    /// coordinator is created, so the genesis fetch can finish with nothing to hand
+    /// off. Only that native case is a no-op: a draining, fallback-owned, or failed
+    /// coordinator cannot be reached before the handoff, so it stays an error.
+    pub(crate) fn finish_legacy_bootstrap_if_pending(
+        &self,
+    ) -> Result<bool, LifecycleTransitionError> {
+        match self.apply_phase() {
+            ApplyPhase::LegacyBootstrap { .. } => self.finish_legacy_bootstrap().map(|()| true),
+            ApplyPhase::Native { .. } => Ok(false),
+            ApplyPhase::FallbackDraining { .. }
+            | ApplyPhase::LegacyFallback { .. }
+            | ApplyPhase::Failed { .. } => Err(LifecycleTransitionError::IllegalPhase),
+        }
+    }
+
     /// Wait until bootstrap completes or fallback owns/drains the apply pipeline.
     pub(crate) async fn wait_for_zakura_ownership(&self) {
         loop {
@@ -1054,6 +1073,59 @@ mod tests {
             ApplyPhase::Failed { .. }
         ));
         drop(operation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn genesis_handoff_rejects_coordinators_that_left_native() {
+        let coordinator = SyncCoordinator::new();
+        let operation = coordinator
+            .queue_apply()
+            .expect("native ownership admits a queued operation");
+        let fallback_coordinator = coordinator.clone();
+        let fallback = tokio::spawn(async move {
+            fallback_coordinator
+                .acquire_legacy_fallback(Duration::from_secs(30))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::FallbackDraining { .. }
+        ));
+        assert_eq!(
+            coordinator.finish_legacy_bootstrap_if_pending(),
+            Err(LifecycleTransitionError::IllegalPhase),
+            "a draining coordinator is not a native startup"
+        );
+
+        tokio::time::advance(LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE).await;
+        fallback
+            .await
+            .expect("the fallback task remains live")
+            .expect_err("the pending apply outlives the drain deadline");
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::Failed { .. }
+        ));
+        assert_eq!(
+            coordinator.finish_legacy_bootstrap_if_pending(),
+            Err(LifecycleTransitionError::IllegalPhase),
+            "a failed coordinator must not be treated as a native startup"
+        );
+        drop(operation);
+
+        let coordinator = SyncCoordinator::new();
+        let lease = coordinator
+            .acquire_legacy_fallback(Duration::from_secs(30))
+            .await
+            .expect("an idle native coordinator yields a fallback lease");
+        assert_eq!(
+            coordinator.finish_legacy_bootstrap_if_pending(),
+            Err(LifecycleTransitionError::IllegalPhase),
+            "a fallback-owned coordinator is not a native startup"
+        );
+        drop(lease);
     }
 
     #[tokio::test(start_paused = true)]

@@ -128,7 +128,7 @@ use crate::{
     address_book::AddressMetrics,
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{
-        block_gossip::{BlockGossipPeer, BlockUploadSlots, BLOCK_UPLOAD_CONCURRENCY},
+        block_gossip::{AdvertFanout, BlockGossipPeer},
         LoadTrackedClient, MinimumPeerVersion,
     },
     peer_set::{
@@ -242,8 +242,8 @@ where
     block_gossip_peers_tx: watch::Sender<Vec<BlockGossipPeer>>,
     /// Whether `block_gossip_peers` changed since it was last published.
     block_gossip_peers_changed: bool,
-    /// Share the upload slots across early, committed, and concurrent block broadcasts.
-    block_gossip_slots: BlockUploadSlots,
+    /// Selects each block broadcast's initial group and delay.
+    block_gossip_fanout: AdvertFanout,
 
     /// Inbound peer IPs that must always receive block inventory broadcasts.
     block_gossip_peer_ips: HashSet<IpAddr>,
@@ -380,7 +380,7 @@ where
             block_gossip_peers: HashMap::new(),
             block_gossip_peers_tx: watch::channel(Vec::new()).0,
             block_gossip_peers_changed: false,
-            block_gossip_slots: BlockUploadSlots::new(BLOCK_UPLOAD_CONCURRENCY),
+            block_gossip_fanout: AdvertFanout::from_config(config),
             block_gossip_peer_ips: block_gossip_peer_ips.into_iter().collect(),
             legacy_peer_trace: LegacyPeerTrace::new(config.zakura.spawn_tracer()),
 
@@ -1019,6 +1019,40 @@ where
         }
     }
 
+    /// Performs P2C on the ready block `advertisers` that are preferred block sources.
+    ///
+    /// A ready client only has space in its request channel. If its connection is awaiting a
+    /// response to an earlier request, such as a transaction `getdata`, a block request sent to it
+    /// waits for that response. Load does not capture this: an advertiser with a lower round-trip
+    /// estimate can be less loaded even with a request outstanding.
+    ///
+    /// Falls back to P2C over all `advertisers` if none of them is preferred. If the selected
+    /// connection is busy, the block request still waits behind its current response.
+    fn select_block_advertiser(&self, advertisers: &HashSet<D::Key>) -> Option<D::Key> {
+        let preferred_advertisers: HashSet<D::Key> = advertisers
+            .iter()
+            .filter(|key| {
+                self.ready_services
+                    .get(*key)
+                    .is_some_and(|svc| svc.is_preferred_block_source())
+            })
+            .copied()
+            .collect();
+
+        if let Some(peer) = self.select_p2c_peer_from_list(&preferred_advertisers) {
+            return Some(peer);
+        }
+
+        let peer = self.select_p2c_peer_from_list(advertisers);
+        let selected_busy_peer = peer
+            .and_then(|key| self.ready_services.get(&key))
+            .is_some_and(|svc| !svc.can_send_request_now());
+        if selected_busy_peer {
+            metrics::counter!("pool.route_inv.advertiser.awaiting_response.count").increment(1);
+        }
+        peer
+    }
+
     /// Randomly chooses `max_peers` ready services, ignoring service load.
     ///
     /// The chosen peers are unique, but their order is not fully random.
@@ -1183,7 +1217,10 @@ where
         // peers would be able to influence our choice by switching addresses.
         // But we need the choice to be random,
         // so that a peer can't provide all our inventory responses.
-        let peer = self.select_p2c_peer_from_list(&advertising_peer_list);
+        let peer = match hash {
+            InventoryHash::Block(_) => self.select_block_advertiser(&advertising_peer_list),
+            _ => self.select_p2c_peer_from_list(&advertising_peer_list),
+        };
 
         if let Some(mut svc) = peer.and_then(|key| self.take_ready_service(&key)) {
             let peer = peer.expect("just checked peer is Some");
@@ -1395,11 +1432,13 @@ where
         self.route_multiple(req, self.number_of_peers_to_broadcast())
     }
 
-    /// Pace legacy inventory through the corresponding uploads, including busy sidecars.
+    /// Schedule legacy inventory by block size, including busy sidecars.
     fn route_block_broadcast(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        let (hash, mined) = match req {
-            Request::AdvertiseBlock(hash, _) | Request::AdvertiseBlockToAll(hash) => (hash, false),
-            Request::AdvertiseMinedBlock(hash) => (hash, true),
+        let (block, mined) = match req {
+            Request::AdvertiseBlock(block, _) | Request::AdvertiseBlockToAll(block) => {
+                (block, false)
+            }
+            Request::AdvertiseMinedBlock(block) => (block, true),
             _ => unreachable!("block routing only accepts block advertisements"),
         };
         self.prune_block_gossip_peers();
@@ -1413,9 +1452,10 @@ where
             .collect();
         crate::peer::block_gossip::broadcast_block(
             peers,
-            hash,
+            block.hash,
+            self.block_gossip_fanout.window(block.size),
             mined,
-            self.block_gossip_slots.clone(),
+            tokio::time::Instant::now() + self.block_gossip_fanout.delay(block.size),
         )
     }
 
@@ -1551,7 +1591,7 @@ where
     {
         crate::peer::block_gossip::BlockAdvertiser {
             peers: self.block_gossip_peers_tx.subscribe(),
-            slots: self.block_gossip_slots.clone(),
+            fanout: self.block_gossip_fanout,
             minimum_peer_version: self.minimum_peer_version.clone(),
             bans: self.bans.clone(),
             refresh: None,

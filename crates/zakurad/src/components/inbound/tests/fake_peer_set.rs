@@ -19,7 +19,7 @@ use zakura_chain::{
     block::{Block, Height},
     fmt::humantime_seconds,
     parameters::Network::{self, *},
-    serialization::{DateTime32, ZcashDeserializeInto},
+    serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
     transaction::{UnminedTx, UnminedTxId, VerifiedUnminedTx},
 };
 use zakura_consensus::{error::TransactionError, transaction, Config as ConsensusConfig};
@@ -31,7 +31,7 @@ use zakura_network::{
     AddressBook, InventoryResponse, PeerSocketAddr, Request, Response,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::EarlyMinedBlockChannel;
 use zakura_state::{ChainTipChange, Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -45,7 +45,7 @@ use crate::{
             Config as MempoolConfig, Mempool, MempoolError, SameEffectsChainRejectionError,
             UnboxMempoolError,
         },
-        sync::{self, BlockGossipError, SyncStatus},
+        sync::{self, BlockGossipError, RecentSyncLengths, SyncStatus},
     },
     BoxError,
 };
@@ -67,6 +67,11 @@ async fn wait_for_gossip() {
     tokio::time::sleep(TRANSACTION_GOSSIP_DELAY).await;
 }
 
+/// The committed-tip advertisement of `block`, with the size the state reads.
+fn advertised(block: &Block) -> zakura_network::AdvertisedBlock {
+    zakura_network::AdvertisedBlock::new(block.hash(), block.zcash_serialized_size())
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn empty_mempool_requests_return_empty_inventory() {
     let (
@@ -80,6 +85,7 @@ async fn empty_mempool_requests_return_empty_inventory() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let response = timeout(
@@ -109,6 +115,7 @@ async fn mempool_requests_for_transactions() {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(true).await;
 
     let added_transactions: Vec<UnminedTx> = added_transactions
@@ -190,6 +197,7 @@ async fn mempool_push_transaction() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Test `Request::PushTransaction`
@@ -282,6 +290,7 @@ async fn peer_pushed_transaction_is_verified_without_redownload() -> Result<(), 
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let peer_source =
@@ -368,6 +377,7 @@ async fn peer_pushed_transactions_are_limited_by_per_peer_cap() -> Result<(), cr
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let source =
@@ -451,6 +461,7 @@ async fn mempool_advertise_transaction_ids() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Test `Request::AdvertiseTransactionIds`
@@ -549,6 +560,7 @@ async fn peer_mempool_full_queue_is_refused_without_disconnect() -> Result<(), c
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     let peer_id = zakura_network::zakura::ZakuraPeerId::new(vec![7; 32])
@@ -649,6 +661,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
         _chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Push test transaction
@@ -720,7 +733,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
     wait_for_gossip().await;
     let possible_requests = &mut [
         Request::AdvertiseTransactionIds(hs, None),
-        Request::AdvertiseBlock(block_two.hash(), None),
+        Request::AdvertiseBlock(advertised(&block_two), None),
     ]
     .to_vec();
 
@@ -779,7 +792,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 
     // Test the block is gossiped
     peer_set
-        .expect_request(Request::AdvertiseBlock(block_three.hash(), None))
+        .expect_request(Request::AdvertiseBlock(advertised(&block_three), None))
         .await
         .respond(Response::Nil);
 
@@ -888,7 +901,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 
         // Test the block is gossiped
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(advertised(&block), None))
             .await
             .respond(Response::Nil);
 
@@ -947,6 +960,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
+        _syncer,
     ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 2 is the tip child. Rewriting only its
@@ -967,7 +981,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     let _request = inbound_service
         .clone()
         .oneshot(Request::AdvertiseBlock(
-            block_hash,
+            block_hash.into(),
             Some(zakura_network::PeerSource::LegacySocket(advertiser_addr)),
         ))
         .await?;
@@ -980,7 +994,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
         })
         .await
         .respond(Response::Blocks(vec![Available((
-            poisoned,
+            poisoned.into(),
             Some(advertiser_addr),
         ))]));
 
@@ -1028,7 +1042,7 @@ async fn inbound_poisoned_coinbase_height_scores_and_requeues() -> Result<(), cr
     peer_set
         .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(Response::Blocks(vec![Available((canonical, None))]));
+        .respond(Response::Blocks(vec![Available((canonical.into(), None))]));
 
     tx_verifier.expect_no_requests().await;
 
@@ -1053,6 +1067,7 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         _sync_gossip_task_handle,
         _tx_gossip_task_handle,
         mut misbehavior_rx,
+        _syncer,
     ) = setup_with_misbehavior_receiver(false).await;
 
     // `setup` commits genesis and block 1, so block 3 is one hop from the tip, and its parent is
@@ -1069,7 +1084,10 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
 
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(child_hash, Some(source.clone())))
+        .oneshot(Request::AdvertiseBlock(
+            child_hash.into(),
+            Some(source.clone()),
+        ))
         .await?;
 
     peer_set
@@ -1079,7 +1097,7 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         })
         .await
         .respond(Response::Blocks(vec![Available((
-            child,
+            child.into(),
             Some(advertiser_addr),
         ))]));
 
@@ -1090,7 +1108,7 @@ async fn inbound_poisoned_parent_recovery_scores_and_is_not_requeued() -> Result
         })
         .await
         .respond(Response::Blocks(vec![Available((
-            poisoned_parent,
+            poisoned_parent.into(),
             Some(advertiser_addr),
         ))]));
 
@@ -1134,6 +1152,7 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
         mut chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        _syncer,
     ) = setup(false).await;
 
     // Get the next block
@@ -1143,14 +1162,14 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash, None))
+        .oneshot(Request::AdvertiseBlock(block_hash.into(), None))
         .await?;
 
     // Block is fetched, and committed to the state
     peer_set
         .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(Response::Blocks(vec![Available((block, None))]));
+        .respond(Response::Blocks(vec![Available((block.into(), None))]));
 
     // Wait for the chain tip update
     if let Err(timeout_error) = timeout(
@@ -1179,14 +1198,14 @@ async fn inbound_block_height_lookahead_limit() -> Result<(), crate::BoxError> {
     // Push test block hash
     let _request = inbound_service
         .clone()
-        .oneshot(Request::AdvertiseBlock(block_hash, None))
+        .oneshot(Request::AdvertiseBlock(block_hash.into(), None))
         .await?;
 
     // Block is fetched, but the downloader drops it because it is too high
     peer_set
         .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
         .await
-        .respond(Response::Blocks(vec![Available((block, None))]));
+        .respond(Response::Blocks(vec![Available((block.into(), None))]));
 
     let response = state_service
         .clone()
@@ -1250,10 +1269,14 @@ async fn caches_getaddr_response() {
         let address_book = Arc::new(std::sync::Mutex::new(address_book));
 
         // UTXO verification doesn't matter for these tests.
-        let (state, _read_only_state_service, latest_chain_tip, _chain_tip_change) =
-            zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
-                .await
-                .expect("ephemeral state initialization succeeds");
+        let zakura_state::InitializedState {
+            state,
+            read_state: _read_only_state_service,
+            latest_chain_tip,
+            ..
+        } = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
         let state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1338,6 +1361,158 @@ async fn caches_getaddr_response() {
     }
 }
 
+/// The state's read result limit serves the default inbound peers, each holding one
+/// legacy `getdata` block request, clamped to its own 8 GiB ceiling.
+#[test]
+fn read_result_limit_derives_from_getdata_and_inbound_limits() {
+    const CEILING: u64 = 8 * 1024 * 1024 * 1024;
+    assert_eq!(
+        zakura_state::READ_RESULT_BLOCKS_PER_PEER,
+        u64::try_from(super::super::GETDATA_MAX_BLOCK_COUNT).unwrap()
+    );
+    let network = zakura_network::Config::default();
+    assert_eq!(
+        zakura_state::DEFAULT_READ_RESULT_PEERS,
+        network.peerset_inbound_connection_limit()
+    );
+    assert_eq!(zakura_state::DEFAULT_READ_RESULT_CEILING_BYTES, CEILING);
+
+    // The ceiling clamps the 115.2 GB derivation to 8 GiB.
+    let default = crate::config::ZakuradConfig::default();
+    assert_eq!(
+        default
+            .mirrored_state_config()
+            .read_result_byte_limit
+            .map(std::num::NonZeroU64::get),
+        Some(CEILING)
+    );
+
+    // A small peer set keeps its derived limit below the ceiling.
+    let config = crate::config::ZakuradConfig {
+        network: zakura_network::Config {
+            peerset_initial_target_size: 5,
+            ..network.clone()
+        },
+        ..Default::default()
+    };
+    let derived = StateConfig::read_result_byte_limit_for_peers(
+        config.network.peerset_inbound_connection_limit(),
+        u64::MAX,
+    );
+    assert!(derived.get() < CEILING);
+    assert_eq!(
+        config.mirrored_state_config().read_result_byte_limit,
+        Some(derived)
+    );
+
+    // The peer memory budget funds QUIC windows, not reads: raising or lowering it
+    // leaves the read limit where it was.
+    for budget in [1 << 30, 64 << 30] {
+        let mut changed = crate::config::ZakuradConfig::default();
+        changed.network.zakura.peer_memory_budget_bytes = budget;
+        assert_eq!(
+            changed
+                .mirrored_state_config()
+                .read_result_byte_limit
+                .map(std::num::NonZeroU64::get),
+            Some(CEILING)
+        );
+    }
+}
+
+/// A block read that the state refuses for lack of capacity becomes `notfound`, so the
+/// peer can retry sooner. Other state errors still fail the request.
+#[tokio::test]
+async fn refused_block_reads_send_notfound() {
+    let _init_guard = zakura_test::init();
+
+    let refused = zakura_chain::block::Hash([0x11; 32]);
+    let unknown = zakura_chain::block::Hash([0x22; 32]);
+    let broken = zakura_chain::block::Hash([0x33; 32]);
+
+    let zakura_state::InitializedState {
+        state: _state,
+        read_state: _read_only_state,
+        latest_chain_tip,
+        ..
+    } = zakura_state::init(StateConfig::ephemeral(), &Mainnet, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
+    let state = Buffer::new(
+        BoxService::new(tower::service_fn(move |request| async move {
+            match request {
+                zakura_state::Request::AnyChainBlock(hash) if hash == refused.into() => Err(
+                    BoxError::from(zakura_node_services::block_memory::ReadMemoryExhausted),
+                ),
+                zakura_state::Request::AnyChainBlock(hash) if hash == broken.into() => {
+                    Err(BoxError::from("disk failure"))
+                }
+                zakura_state::Request::AnyChainBlock(_) => Ok(zakura_state::Response::Block(None)),
+                request => panic!("unexpected state request: {request:?}"),
+            }
+        })),
+        1,
+    );
+    let block_verifier = Buffer::new(
+        BoxService::new(tower::service_fn(
+            |_request: zakura_consensus::Request| async move {
+                Err::<zakura_chain::block::Hash, _>(zakura_consensus::RouterError::from(
+                    zakura_consensus::VerifyCheckpointError::Finished,
+                ))
+            },
+        )),
+        1,
+    );
+
+    let (setup_tx, setup_rx) = oneshot::channel();
+    let inbound = ServiceBuilder::new().buffer(1).service(BoxService::new(
+        ServiceBuilder::new().load_shed().service(Inbound::new(
+            MAX_INBOUND_CONCURRENCY,
+            false,
+            None,
+            Vec::new(),
+            setup_rx,
+        )),
+    ));
+    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let setup_data = InboundSetupData {
+        address_book: Arc::new(std::sync::Mutex::new(AddressBook::new(
+            SocketAddr::from_str("0.0.0.0:0").unwrap(),
+            &Mainnet,
+            DEFAULT_MAX_CONNS_PER_IP,
+            Span::none(),
+        ))),
+        block_download_peer_set: BoxCloneSyncService::new(Buffer::new(
+            BoxService::new(MockService::build().for_unit_tests::<zakura_network::Request, zakura_network::Response, crate::BoxError>()),
+            1,
+        )),
+        block_verifier,
+        mempool: Buffer::new(BoxService::new(MockService::build().for_unit_tests()), 1),
+        state,
+        latest_chain_tip,
+        network: Mainnet,
+        misbehavior_sender,
+    };
+    assert!(setup_tx.send(setup_data).is_ok(), "inbound setup is sent");
+
+    let response = inbound
+        .clone()
+        .oneshot(Request::BlocksByHash(
+            [refused, unknown].into_iter().collect(),
+        ))
+        .await
+        .expect("a refused read still answers the request");
+    assert_eq!(
+        response,
+        Response::Blocks(vec![Missing(refused), Missing(unknown)])
+    );
+
+    inbound
+        .oneshot(Request::BlocksByHash([broken].into_iter().collect()))
+        .await
+        .expect_err("a state failure that is not a refusal fails the request");
+}
+
 /// Setup a fake Zebra network stack, with fake peer set.
 ///
 /// Adds some initial state blocks, and mempool transactions if `add_transactions` is true.
@@ -1366,6 +1541,7 @@ async fn setup(
     ChainTipChange,
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
+    RecentSyncLengths,
 ) {
     let (
         inbound_service,
@@ -1379,6 +1555,7 @@ async fn setup(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         _misbehavior_rx,
+        syncer,
     ) = setup_with_misbehavior_receiver(add_transactions).await;
 
     (
@@ -1392,6 +1569,7 @@ async fn setup(
         chain_tip_change,
         sync_gossip_task_handle,
         tx_gossip_task_handle,
+        syncer,
     )
 }
 
@@ -1421,6 +1599,7 @@ async fn setup_with_misbehavior_receiver(
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
     tokio::sync::mpsc::Receiver<(PeerSocketAddr, u32)>,
+    RecentSyncLengths,
 ) {
     let _init_guard = zakura_test::init();
 
@@ -1437,10 +1616,15 @@ async fn setup_with_misbehavior_receiver(
     let (sync_status, mut recent_syncs) = SyncStatus::new();
 
     // UTXO verification doesn't matter for these tests.
-    let (state, read_only_state_service, latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state,
+        read_state: read_only_state_service,
+        latest_chain_tip,
+        mut chain_tip_change,
+        block_announcements,
+    } = zakura_state::init(state_config.clone(), &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 
@@ -1520,7 +1704,7 @@ async fn setup_with_misbehavior_receiver(
         false,
         buffered_peer_set.clone(),
         state_service.clone(),
-        tower::util::BoxCloneService::new(read_only_state_service),
+        tower::util::BoxCloneService::new(read_only_state_service.clone()),
         buffered_tx_verifier.clone(),
         sync_status.clone(),
         latest_chain_tip.clone(),
@@ -1532,12 +1716,14 @@ async fn setup_with_misbehavior_receiver(
     // Pretend we're close to tip
     SyncStatus::sync_close_to_tip(&mut recent_syncs);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
     let sync_gossip_task_handle = tokio::spawn(
         sync::gossip_best_tip_block_hashes(
             sync_status.clone(),
-            chain_tip_change.clone(),
+            latest_chain_tip.clone(),
+            block_announcements,
             peer_set.clone(),
+            read_only_state_service,
             Some(submitblock_channel.receiver()),
         )
         .in_current_span(),
@@ -1549,7 +1735,7 @@ async fn setup_with_misbehavior_receiver(
     // (The genesis block gets skipped, because block 1 is committed before the task is spawned.)
     for block in committed_blocks.iter().skip(1) {
         peer_set
-            .expect_request(Request::AdvertiseBlock(block.hash(), None))
+            .expect_request(Request::AdvertiseBlock(advertised(block), None))
             .await
             .respond(Response::Nil);
     }
@@ -1617,6 +1803,7 @@ async fn setup_with_misbehavior_receiver(
         sync_gossip_task_handle,
         tx_gossip_task_handle,
         misbehavior_rx,
+        recent_syncs,
     )
 }
 

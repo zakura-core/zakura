@@ -299,8 +299,10 @@ type VerifierService = Cached<BatchFallbackService>;
 /// gossiped into the mempool does not have to be verified again when the block that mines it
 /// arrives. One cache covers all of Sapling: its spend and output verifying keys have never
 /// changed, so unlike Orchard there are no circuit eras to keep apart.
-pub static VERIFIER: LazyLock<VerifierService> =
-    LazyLock::new(|| Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME));
+pub static VERIFIER: LazyLock<VerifierService> = LazyLock::new(|| {
+    Cached::new(batch_fallback_verifier(), CACHE_CAPACITY, VERIFIER_NAME)
+        .with_flush(super::flush::Verifier::Sapling)
+});
 
 /// Builds the uncached batching-and-fallback stack.
 fn batch_fallback_verifier() -> BatchFallbackService {

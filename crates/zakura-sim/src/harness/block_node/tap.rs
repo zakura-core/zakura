@@ -56,9 +56,9 @@ use crate::{
     domain::block_sync::OwnerInput,
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     observe::{
-        BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncRange,
-        BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained, BlockSyncSubmission,
-        BlockSyncWorkItem, StorageFact,
+        BlockSyncBody, BlockSyncClaim, BlockSyncFact, BlockSyncHolder, BlockSyncPayload,
+        BlockSyncRange, BlockSyncRequest, BlockSyncRequestedHeight, BlockSyncRetained,
+        BlockSyncSubmission, BlockSyncWorkItem, StorageFact,
     },
     storage::{block_owner, hex},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
@@ -459,6 +459,13 @@ impl BlockTap {
                 }
                 .to_owned(),
             },
+            BlockEvent::StaleScope {
+                body: held,
+                scope_epoch,
+            } => BlockSyncFact::StaleScope {
+                body: body(held),
+                scope_epoch: scope_epoch.map(|epoch| epoch.get()),
+            },
             BlockEvent::ServingLease {
                 peer: requesting,
                 conn_id,
@@ -563,6 +570,14 @@ impl BlockTap {
                     .collect(),
             },
             BlockEvent::Sequencer(ownership) => BlockSyncFact::Sequencer {
+                payloads: ownership
+                    .payloads
+                    .iter()
+                    .map(|payload| BlockSyncPayload {
+                        id: payload.id,
+                        decoded_attributed_memory_bytes: payload.decoded_attributed_memory_bytes,
+                    })
+                    .collect(),
                 reorder: ownership
                     .reorder
                     .iter()
@@ -587,6 +602,10 @@ impl BlockTap {
                         detached: submission.detached,
                     })
                     .collect(),
+            },
+            BlockEvent::Reactor { transition, state } => BlockSyncFact::Reactor {
+                transition: (*transition).into(),
+                state: (**state).into(),
             },
             BlockEvent::SequencerClosed => BlockSyncFact::SequencerClosed,
             // The enum is non-exhaustive, and an event the log can't hold
@@ -644,6 +663,8 @@ impl Allocations {
             bytes: retained.bytes,
         };
         BlockSyncRetained {
+            payload_id: retained.payload_id,
+            policy_decoded_bytes: retained.policy_decoded_bytes,
             body: body(&held),
             admitted_estimate_bytes: retained.admitted_estimate_bytes,
             allocation: self.number(retained.allocation, held),
@@ -680,6 +701,7 @@ fn phase(phase: RequestWritePhase) -> &'static str {
 /// `dropped-<phase>`.
 fn step(step: RequestStep) -> String {
     match step {
+        RequestStep::Funded => "funded".to_owned(),
         RequestStep::Published => "published".to_owned(),
         RequestStep::Started => "started".to_owned(),
         RequestStep::Written => "written".to_owned(),

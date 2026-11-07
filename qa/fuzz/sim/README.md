@@ -21,6 +21,14 @@ a sanitizer must turn the feature off:
 RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s none --no-default-features race_fixtures
 ```
 
+`sim-fuzz.yml` runs each mapped target for two minutes nightly, or on a
+manual dispatch. That run is a smoke: it shows each target still builds and
+runs, and isn't meant to find bugs. [Long runs](#long-runs) covers the long
+campaigns. It caches `corpus/<target>/` under the target's name and a digest of
+its harness's `cargo xtask sim-versions` output, adds the harness's committed seeds, and replays that corpus in a
+fresh process before fuzzing. `scripts/check-fuzz-campaign.py` fails a pull request
+whose target has no harness or no campaign.
+
 ## Targets
 
 - `discovery_wait_complete` runs discovery's `wait_complete` harness.
@@ -28,12 +36,67 @@ RUSTFLAGS="--cfg zakura_sim" cargo +nightly-2026-07-15 fuzz run --fuzz-dir . -s 
   encodes the scenario in the action grammar of
   `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
   isn't the harness's generator, 2, runs the default scenario. Pass
-  `-max_len=4096`, the input size the grammar is built for.
+  `-max_len=4096`, the input size the grammar is built for, and
+  `-len_control=0`. A run takes tens to hundreds of milliseconds, so
+  libFuzzer's default length control keeps mutations inside the prefix for
+  hours. Its committed seeds,
+  `crates/zakura-sim/tests/fixtures/header-storage-*.bin`, each use part of
+  the grammar and carry Plan bytes past the prefix.
 - `race_fixtures` runs the six race fixtures through `fixtures::All`, whose
   three-byte prefix picks the fixture, the variant and the worker count.
 - `feedback_probe` runs `explore::feedback::Probe`, whose runs differ only
   in data, with a collector that turns each run's end time into a feature.
   It checks the feedback transport and searches for nothing.
+
+`block_work_ownership` and `block_work_funding` use the shared trace and replay
+pipeline without starting QUIC. Both consume at most 512 causal bytes. They have
+separate decoder-v1 identities; the same bytes represent different operations in
+each target. The funding target drives real queue reservations, unpublished
+requests, writer owners and receipts. It observes retained funding across reset
+and drains these owners before queue destruction. Its last record contains that
+drain. Operation 24 injects a funding discrepancy to test containment.
+
+`block_decoded_retention` runs `block/decoded-retention` through the same pipeline.
+Its decoder-v1 reads at most 512 causal bytes in four-byte operations: action,
+source slot, destination slot, and pool. Actions modulo seven admit a block,
+clone a handle, retain a header, retain a transaction, drop a handle, do nothing,
+or close a pool. Eight slots hold production handles. Two pools enforce equal
+pipeline byte limits, and a third pool enforces a count limit. The fixture uses the
+Regtest genesis payload. Each history drains its handles before pool destruction.
+
+The independent model derives charges from its handle graph. Weak probes read
+actual header and transaction references, the allocation's pool, and a
+fresh attributed-size traversal. They detect raw handles that escape the owner.
+These checks cover completed owner operations. They do not establish asynchronous
+worker retention, allocator RSS, or safety between operations. The committed
+seed exercises final-part retention, capacity refusal, and closure.
+The retained production patches challenge raw-handle escape, missing admission,
+and incorrect release. A charge cannot change pool, so no wrong-owner settlement
+path exists for decoded blocks; this is an API check, not a runtime mutation.
+Campaigns run outside blocking PR CI.
+
+The funding property compares actual retention with the independent model at
+completed operations. It does not establish asynchronous cancellation races,
+decoded-body retention, or backend-worker retention. Run long campaigns manually
+or nightly; this target adds no blocking PR fuzz campaign.
+
+`block_reactor_policy` uses the same pipeline for the reactor's query and view
+policy, with reactor decoder 3 read from at most 512 causal bytes. Each record
+holds the input, the exact identity of each accepted or refused query, and the
+production and model views. The target establishes pure transitions. The real
+action channel, reply routes, and shutdown have witnesses in `zakura-network`.
+
+`discovery_record_book` and `discovery_session_installation` use the shared trace
+and replay pipeline without starting QUIC. Each consumes at most 512 causal
+bytes under its own decoder-v2 identity. They compare the real owner with its
+independent model after each completed operation. The tests
+`book_trace_reports_exact_install_replacement_and_eviction` and
+`session_trace_separates_stale_results_and_retained_hints` show that each witness
+input reaches its rules, and that an empty input reaches none. They do not
+establish asynchronous races or teardown. `discovery_verification_capacity` runs the real
+handle under the scheduler and checks that unsettled verification results stay
+within the slots while a slow holder keeps the state lock. Run long campaigns
+manually or nightly; these targets add no blocking PR fuzz campaign.
 
 ## Semantic feedback
 
@@ -252,6 +315,66 @@ bundle give. It counts minimized bundles on their own line.
 `cargo-fuzz` creates each target's `corpus/` and `artifacts/` directories,
 which Git ignores. Don't commit corpus files.
 
+## Target readiness
+
+`cargo xtask sim-targets` checks each target `qa/suite.toml` declares in
+this package, or each `--target`:
+
+```console
+cargo xtask sim-targets --out <dir> [--target <name>]... [--sanitizer address|none] [--child-secs <s>]
+```
+
+For each target, it resolves the harness through
+`[package.metadata.zakura-sim.targets]`, runs each of the harness's admitted
+seeds in the `zakura-sim` process, builds the target with the pinned
+nightly, and runs the built target once on the seeds, with the suite row's
+libFuzzer arguments and `ZAKURA_SIM_STATS` set. The target's stats file
+must name the harness the table maps it to, so a target whose
+`sim_target!` runs another harness fails. Each target gets one status:
+
+- `ready`: the target accepted every seed, its stats name its harness and
+  count every seed, and a seed's run applied a property of the harness's
+  own, not only `sim/no-task-panic` or `sim/no-livelock`;
+- `no-applicable-property`: all of that, except that no seed's run applied
+  a property of the harness's own;
+- `unresolved`: the table maps the target to no registered harness;
+- `seeds-rejected`: a required seed of the harness, or a seed whose sidecar
+  doesn't say a registered harness, failed validation;
+- `no-seeds`: the harness has no admitted seed;
+- `build-failed`: `cargo fuzz build` failed;
+- `seeds-failed`: the target failed on the seeds, with a panic, a crash, a
+  sanitizer report, a timeout or an error exit;
+- `wrong-harness`: the stats name another harness;
+- `unaccounted`: the target exited cleanly, but its output and stats don't
+  account for every seed, or a seed is longer than the row's `-max_len`,
+  which libFuzzer cuts it to.
+
+It prints each target's status, the harness's own properties that applied
+and those that didn't, the optional seeds it quarantined, and the retained
+bypasses under `qa/planted/` whose input runs on the harness, or that there
+are none. `<dir>/readiness.json` holds the same report, with each built
+target's commit, dirty state and toolchain from its build identity, and
+`<dir>/<target>/` holds the binary, the seeds, the log and the stats. The
+command exits 0 only if every target is `ready`. A seed run shows that a
+target builds and runs its harness. It says nothing about how well the
+target searches.
+
+`cargo xtask planted --targets` runs each retained bypass whose input runs
+on a target's harness, and also confirms the patched input through that
+target in fresh processes, as `sim-minimize` confirms an original: the
+patched target must crash with the property alone and name the harness,
+`zakura-sim confirm` must find the property's trigger history, and a fresh
+replay must match Exact. It builds the patched `zakura-sim` and target in
+`target/planted/confirm-builds/`, outside the scratch worktree, so later
+runs reuse the builds, and both binaries must embed the patched checkout's
+source digest. It prints each target's bypasses, or that it has none.
+
+The nightly `zakura_sim targets` job in `tests-unit.yml` runs
+`cargo xtask sim-targets`. It also runs on manual dispatch, never on pull
+requests. `planted --targets` rebuilds the patched `zakura-sim` and target
+for each case, which takes hours over the whole catalogue, so it runs on a
+remote host, as [Long runs](#long-runs) says.
+
 ## Seeds
 
 Curated seeds live in `crates/zakura-sim/tests/fixtures/` as `<name>.bin`
@@ -414,3 +537,41 @@ only from a target with a collector.
 `cargo xtask sim-minimize` minimizes a saved failure, as
 [Minimizing a crash](#minimizing-a-crash) describes, and
 `cargo xtask sim-triage` archives it, as [Triage](#triage) describes.
+
+## Long runs
+
+The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
+each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
+runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
+`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+case's shard follows from its position in path order. Adding or removing a
+case moves every later case to another shard, so across that change a case
+can run on two nights in a row or wait up to 13 nights. A shard that holds no
+case fails the run. Each shard has its own failure issue,
+`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing run
+of that shard closes it, so a pass of another shard can't close it. A remote
+host runs the rest, including `cargo xtask planted --targets`, and its results
+never block a pull request. No CI job runs `planted --targets`.
+
+`scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
+writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs
+`cargo xtask planted` over the whole catalogue, then
+`cargo xtask planted --targets`. With `--seconds`, it then builds every
+target in [Targets](#targets), and then runs one [campaign](#campaigns) per
+target, all at once, each with the suite row's libFuzzer limits. Each
+target's store is `campaigns/<target>/` in the run's directory, and each
+campaign starts from the harness's curated seeds. A failed step doesn't stop
+the later ones. The script fails if a planted check fails, if a campaign
+fails to build or start, or if a campaign doesn't end `complete`. Findings
+alone don't change a campaign's status; read them with
+`cargo xtask sim-campaign evidence`.
+
+```console
+# Push the commit to the host's checkout, then start the run detached.
+git push ssh://<host>/<checkout> <branch>
+ssh <host> 'cd <checkout> && git checkout <branch> && nohup scripts/sim-long-runs.sh \
+    --out ~/sim-runs --seconds 14400 --workers 2 > ~/sim-runs.log 2>&1 < /dev/null &'
+
+# Each step logs whether it passed, how long it took, and where its log is.
+ssh <host> 'cat ~/sim-runs.log'
+```

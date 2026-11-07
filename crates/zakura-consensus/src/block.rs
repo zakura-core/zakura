@@ -8,12 +8,13 @@
 //! verification, where it may be accepted or rejected.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use chrono::Utc;
 use futures::stream::FuturesUnordered;
@@ -290,6 +291,8 @@ where
 /// body can differ in that data under the same block hash, so a failure found earlier
 /// is intrinsic only if the header commits to the delivered authorizing data. A mismatch is
 /// reported as the commitment failure state would report, and an unknown binding is retryable.
+/// A supplied `auth_data_root` must be computed from this block's transactions; `None` asks
+/// state to compute it from the delivered body.
 ///
 /// Duplicate spends and nullifiers are kept as they are: transaction IDs commit to outpoints and
 /// nullifiers (ZIP 244, and the whole v4 encoding), and the Merkle root was checked before this,
@@ -297,7 +300,8 @@ where
 async fn confirm_auth_data_binding<S>(
     state_service: S,
     network: &Network,
-    block: Arc<block::Block>,
+    block: BlockHandle,
+    auth_data_root: Option<block::merkle::AuthDataRoot>,
     error: VerifyBlockError,
 ) -> VerifyBlockError
 where
@@ -324,7 +328,7 @@ where
         return error;
     }
 
-    let parent = block.header.previous_block_hash;
+    let parent = block.header().previous_block_hash;
     let unconfirmed = |error| VerifyBlockError::AuthDataUnconfirmed {
         parent,
         source: Box::new(error),
@@ -333,7 +337,7 @@ where
     // never reaches state, so a wait would hold this verification slot until it timed out.
     let commitment = zs::BlockCommitmentData {
         block,
-        auth_data_root: None,
+        auth_data_root,
     };
     let check = state_service.oneshot(zs::Request::CheckAuthDataCommitment(commitment));
     match tokio::time::timeout(AUTH_DATA_CHECK_TIMEOUT, check).await {
@@ -430,11 +434,11 @@ where
 
     fn call(&mut self, request: Request) -> Self::Future {
         let block = request.block();
-        let hash = match zakura_header_chain::validate_encoding_version_hash(&block.header) {
+        let hash = match zakura_header_chain::validate_encoding_version_hash(block.header()) {
             Ok(hash) => hash,
             Err(error) => return async move { Err(BlockError::from(error).into()) }.boxed(),
         };
-        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(block.clone()));
+        let receipt = (!request.is_proposal()).then(|| self.receipt_orders.register(hash, &block));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -445,6 +449,7 @@ where
 
         let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
+            let mut auth_data_root = None;
             let result: Result<block::Hash, VerifyBlockError> = async {
                 // Keep this receipt registered until verification finishes or is cancelled.
                 let _receipt = receipt;
@@ -505,16 +510,16 @@ where
                 // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
                 let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
                 if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
-                    check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
+                    check::difficulty_threshold_is_valid(block.header(), &network, &height, &hash)?;
                 } else {
                     // Do the difficulty checks first, to raise the threshold for
                     // attacks that use any other fields.
-                    check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                    check::equihash_solution_is_valid(&block.header, &network)?;
+                    check::difficulty_is_valid(block.header(), &network, &height, &hash)?;
+                    check::equihash_solution_is_valid(block.header(), &network)?;
                 }
 
                 if let Some(admission) = &mined {
-                    let parent = block.header.previous_block_hash;
+                    let parent = block.header().previous_block_hash;
                     match state_service
                         .ready()
                         .await
@@ -538,7 +543,7 @@ where
                         &network,
                         block.clone(),
                         hash,
-                        (height, receipt_order),
+                        (height, receipt_order, request.origin()),
                         admission,
                     )
                     .await?
@@ -556,25 +561,50 @@ where
                     return Ok(hash);
                 }
 
-                // Next, check the Merkle root validity, to ensure that
-                // the header binds to the transactions in the blocks.
-
-                // Precomputing this avoids duplicating transaction hash computations.
-                let transaction_hashes: Arc<[_]> =
-                    block.transactions.iter().map(|t| t.hash()).collect();
-
-                check::merkle_root_validity(&network, &block, &transaction_hashes)?;
-
-                // Since errors cause an early exit, try to do the
-                // quick checks first.
-
-                // Quick field validity and structure checks
+                // Run the inexpensive header-time and body rules before hashing any
+                // transaction data. Proposals are local, so they return their first failure
+                // immediately. A committed block establishes the transaction Merkle binding
+                // first: a time failure is retryable and a body failure is attributed to the
+                // header only once the delivered body is known to be the header's, so a peer
+                // that tampers with a body still receives a payload-mismatch verdict.
                 let now = Utc::now();
-                check::time_is_valid_at(&block.header, now, &height, &hash)
-                    .map_err(VerifyBlockError::Time)?;
-                let coinbase_tx = check::coinbase_is_first(&block)?;
+                let quick_checks: Result<_, VerifyBlockError> = (|| {
+                    check::time_is_valid_at(block.header(), now, &height, &hash)
+                        .map_err(VerifyBlockError::Time)?;
+                    let coinbase = check::coinbase_is_first(&block)?;
+                    check::shielded_action_limits_are_valid(
+                        block.view().transactions(),
+                        height,
+                        &network,
+                    )?;
+                    Ok(coinbase)
+                })();
+                let quick_checks = match quick_checks {
+                    Err(error) if request.is_proposal() => return Err(error),
+                    result => result,
+                };
 
-                check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
+                // The Merkle root check needs only transaction IDs. Authorizing data is hashed
+                // after it and after the quick checks, so a body that does not match its
+                // header, or fails a cheap rule, never has its proofs and signatures hashed.
+                let transaction_hashes = block.view().transaction_hashes();
+                check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+                let check::CoinbaseSummary {
+                    coinbase_tx,
+                    has_transparent_spends,
+                } = quick_checks?;
+                if has_transparent_spends {
+                    check::transparent_spends_are_unique(&block).map_err(|error| {
+                        VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(
+                            Box::new(error),
+                        ))
+                    })?;
+                }
+
+                // Hash each transaction's authorizing data once, for the transaction requests
+                // and the state's authorizing-data check.
+                let auth_data_digests = block.view().auth_data_digests();
+                auth_data_root = Some(auth_data_digests.root);
 
                 // ZIP 234 derives the block subsidy from the NSM value balance after the parent
                 // block, so a block at or above the start height needs its parent's chain
@@ -584,7 +614,7 @@ where
                 // a proposal whose parent has not committed is rejected immediately.
                 let nsm_value_balance =
                     if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
-                        let parent_hash = block.header.previous_block_hash;
+                        let parent_hash = block.header().previous_block_hash;
                         let parent_request = if request.is_proposal() {
                             zs::Request::BlockInfo(parent_hash)
                         } else {
@@ -632,7 +662,7 @@ where
                 // Now do the slower checks
 
                 // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
-                tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
+                tx::check::coinbase_outputs_are_decryptable(coinbase_tx, &network, height)?;
 
                 // Send transactions to the transaction verifier to be checked
                 let mut async_checks = FuturesUnordered::new();
@@ -643,48 +673,72 @@ where
                 ));
 
                 let external_inputs: Arc<[transparent::OutPoint]> = block
-                    .transactions
-                    .iter()
+                    .view()
+                    .transactions()
                     .flat_map(|transaction| transaction.inputs())
                     .filter_map(transparent::Input::outpoint)
                     .filter(|outpoint| !known_utxos.contains_key(outpoint))
                     .collect();
-                let parent = block.header.previous_block_hash;
+                let parent = block.header().previous_block_hash;
+                // Kept apart from `known_utxos`, which also becomes the block's `new_outputs`
+                // and carries the in-block ordering of each output.
+                let mut parent_utxos = Arc::new(HashMap::new());
                 if !external_inputs.is_empty() {
-                    if let zs::ParentInputs::Missing(outpoint) =
-                        check_parent_inputs(state_service.clone(), parent, external_inputs.clone())
-                            .await
+                    match check_parent_inputs(
+                        state_service.clone(),
+                        parent,
+                        external_inputs.clone(),
+                    )
+                    .await
                     {
-                        return Err(VerifyBlockError::MissingTransparentInput { parent, outpoint });
+                        zs::ParentInputs::Missing(outpoint) => {
+                            return Err(VerifyBlockError::MissingTransparentInput {
+                                parent,
+                                outpoint,
+                            });
+                        }
+                        zs::ParentInputs::Unspent(utxos) => parent_utxos = utxos,
+                        zs::ParentInputs::ParentUnavailable | zs::ParentInputs::Inconclusive => {}
                     }
                 }
 
                 let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                     Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+
+                // Dispatch shielded transactions first: their proof batches are the longest
+                // checks, so starting them before the transparent checks shortens the block's
+                // critical path.
+                let (shielded, transparent): (Vec<_>, Vec<_>) = auth_data_digests
+                    .unmined_ids(&transaction_hashes)
+                    .zip(block.transactions())
+                    .partition(|(_, tx)| tx.has_shielded_data());
+
+                // Flush the shielded batches once this block's shielded transactions have queued
+                // their items, instead of after every transaction starts. See `primitives::flush`.
                 // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the
                 // pointer-keyed registration before the `Arc` address can be reused.
-                let _block_batch_flush = primitives::register_block_verifier_batch_flush(
-                    &known_outpoint_hashes,
-                    block.transactions.len(),
-                );
+                let _block_batch_flush = (!shielded.is_empty()).then(|| {
+                    primitives::flush::BlockFlush::register(&known_outpoint_hashes, shielded.len())
+                });
 
-                for (&transaction_hash, transaction) in
-                    transaction_hashes.iter().zip(block.transactions.iter())
-                {
+                for (transaction_id, transaction) in shielded.into_iter().chain(transparent) {
                     let rsp = transaction_verifier
                         .ready()
                         .await
                         .expect("transaction verifier is always ready")
                         .call(tx::Request::Block {
-                            transaction_hash,
-                            transaction: transaction.clone(),
+                            transaction_id,
+                            transaction,
                             known_outpoint_hashes: known_outpoint_hashes.clone(),
                             known_utxos: known_utxos.clone(),
+                            parent_utxos: parent_utxos.clone(),
                             height,
-                            time: block.header.time,
+                            time: block.header().time,
                         });
                     async_checks.push(rsp);
                 }
+                // Free the outputs as soon as the last transaction check finishes with them.
+                drop(parent_utxos);
                 tracing::trace!(len = async_checks.len(), "built async tx checks");
 
                 // Get the transaction results back from the transaction verifier.
@@ -742,7 +796,8 @@ where
                                         zs::ParentInputs::ParentUnavailable => {
                                             VerifyBlockError::ParentUnavailable { parent }
                                         }
-                                        zs::ParentInputs::Inconclusive => {
+                                        zs::ParentInputs::Unspent(_)
+                                        | zs::ParentInputs::Inconclusive => {
                                             VerifyBlockError::Transaction(
                                                 TransactionError::TransparentInputNotFound,
                                             )
@@ -797,7 +852,7 @@ where
                 })?;
 
                 check::miner_fees_are_valid(
-                    &coinbase_tx,
+                    coinbase_tx,
                     height,
                     block_transaction_fees,
                     expected_block_subsidy,
@@ -806,17 +861,15 @@ where
                 )?;
 
                 // Finally, submit the block for contextual verification.
-                let new_outputs = Arc::into_inner(known_utxos)
-                    .expect("all verification tasks using known_utxos are complete");
-
                 let prepared_block = zs::SemanticallyVerifiedBlock {
+                    origin: request.origin(),
                     block,
                     hash,
                     height,
-                    new_outputs,
+                    new_outputs: known_utxos,
                     transaction_hashes,
                     deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                    auth_data_root: None,
+                    auth_data_root: Some(auth_data_digests.root),
                     receipt_order,
                 };
 
@@ -840,12 +893,14 @@ where
 
             match result {
                 // Proposals never become body evidence, so they keep the first failure.
-                Err(error) if !request.is_proposal() => {
-                    Err(
-                        confirm_auth_data_binding(state_service, &network, request.block(), error)
-                            .await,
-                    )
-                }
+                Err(error) if !request.is_proposal() => Err(confirm_auth_data_binding(
+                    state_service,
+                    &network,
+                    request.block(),
+                    auth_data_root,
+                    error,
+                )
+                .await),
                 result => result,
             }
         }
@@ -863,9 +918,9 @@ async fn try_prepared_fast_path<S>(
     prepared_candidates: &prepared::PreparedCandidateCache,
     state_service: &mut S,
     network: &Network,
-    block: Arc<block::Block>,
+    block: BlockHandle,
     hash: block::Hash,
-    (height, receipt_order): (block::Height, Option<u64>),
+    (height, receipt_order, origin): (block::Height, Option<u64>, zs::BlockOrigin),
     admission: &zs::BlockAdmission,
 ) -> Result<Option<block::Hash>, VerifyBlockError>
 where
@@ -883,15 +938,15 @@ where
         return Ok(None);
     };
 
-    check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
+    check::time_is_valid_at(block.header(), Utc::now(), &height, &hash)
         .map_err(VerifyBlockError::Time)?;
-    for transaction in &block.transactions {
-        tx::check::lock_time_has_passed(transaction, height, block.header.time)
+    for transaction in block.view().transactions() {
+        tx::check::lock_time_has_passed(transaction, height, block.header().time)
             .map_err(VerifyBlockError::Transaction)?;
     }
-    // No Merkle root check: the hit's `CandidateId` covers the header's Merkle root and every
-    // transaction byte, and the cached candidate passed `merkle_root_validity` before it was
-    // cached, so the same root, transaction set and branch IDs are already checked.
+    // No Merkle root check: a hit has the cached candidate's Merkle root and equal transactions,
+    // and the cached candidate passed `merkle_root_validity` before it was cached, so the same
+    // root, transaction set and branch IDs are already checked.
     // Preparation check:
     // https://github.com/zakura-core/zakura/blob/107634e1793ff0c57ef8dd3a1969c29af9b5598c/crates/zakura-consensus/src/block.rs#L483
     metrics::histogram!("mining.solved_header_check.duration_seconds")
@@ -902,6 +957,7 @@ where
     prepared_block.hash = hash;
     prepared_block.height = height;
     prepared_block.receipt_order = receipt_order;
+    prepared_block.origin = origin;
 
     if source == PreparedCandidateSource::ServerTemplate
         && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?
@@ -943,8 +999,7 @@ where
     };
 
     if let (Ok(_), Some(source), Some(cache_copy)) = (&response, prepared_source, cache_copy) {
-        let id = prepared::CandidateId::of(&cache_copy.block, network);
-        prepared_candidates.insert(id, source, cache_copy);
+        prepared_candidates.insert(source, cache_copy, network);
         metrics::histogram!("mining.preparation.duration_seconds")
             .record(preparation_start.elapsed().as_secs_f64());
     }

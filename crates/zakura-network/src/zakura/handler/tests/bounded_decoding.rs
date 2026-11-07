@@ -25,7 +25,7 @@ fn validate_item(
         flags: 0,
         payload,
     };
-    state.validate_frame(7, &frame)
+    state.validate_frame(7, frame).map(|_| ())
 }
 
 #[test]

@@ -137,12 +137,12 @@ fn assert_unpunished(
     actions: &mut mpsc::Receiver<HeaderPortOperation>,
     peer: &ZakuraPeerId,
 ) {
-    let state = reactor
-        .peer_state
+    let handles = reactor
+        .sessions
         .get(peer)
         .expect("`HistoryPruned` never disconnects");
-    assert_eq!(state.unproductive_requests, 0);
-    assert!(!state.session.cancel_token().is_cancelled());
+    assert_eq!(reactor.state.peers[peer].unproductive_requests, 0);
+    assert!(!handles.session.cancel_token().is_cancelled());
     while let Ok(action) = actions.try_recv() {
         assert!(
             matches!(action, HeaderPortOperation::QueryHeaderLocator { .. }),
@@ -255,7 +255,7 @@ async fn schema_one_is_probed_again_after_a_bounded_backoff() {
             &open,
             HeadersOutcomeCode::HistoryPruned,
         );
-        let fallback = reactor.pruned_peers[&peer]
+        let fallback = reactor.state.pruned_peers[&peer]
             .aux_fallback
             .expect("a failed probe renews the fallback");
         delays.push(fallback.delay);
@@ -393,15 +393,14 @@ fn a_stale_history_pruned_outcome_changes_nothing() {
     reactor.handle_outcome(
         peer.clone(),
         1,
-        v9::Ended {
-            id: open.subscription_id,
-            outcome: HeadersOutcomeCode::HistoryPruned,
-            pages: 0,
-            reached: false,
-            accepted: open.acknowledged,
-        },
+        v9::Ended::seeded(
+            open.subscription_id,
+            HeadersOutcomeCode::HistoryPruned,
+            open.acknowledged,
+        ),
     );
     assert!(reactor
+        .state
         .pruned_peers
         .get(&peer)
         .is_none_or(|pruned| pruned.aux_fallback.is_none()));
@@ -420,6 +419,7 @@ fn a_stale_history_pruned_outcome_changes_nothing() {
         HeadersOutcomeCode::HistoryPruned,
     );
     assert!(reactor
+        .state
         .pruned_peers
         .get(&peer)
         .is_none_or(|pruned| pruned.aux_fallback.is_none()));
@@ -741,7 +741,7 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
     );
     let fallen_back = peers.clone();
     for peer in &fallen_back {
-        assert!(reactor.pruned_peers[peer].aux_fallback.is_some());
+        assert!(reactor.state.pruned_peers[peer].aux_fallback.is_some());
     }
 
     // Root repair still asks a fallen-back peer for schema 1.
@@ -814,6 +814,7 @@ async fn pruned_publishers_bring_a_node_from_genesis_past_their_index_height() {
     );
     assert_eq!(rounds, [(prober.clone(), AuxSchema::V1, true)]);
     assert!(reactor
+        .state
         .pruned_peers
         .get(&prober)
         .is_none_or(|pruned| pruned.aux_fallback.is_none()));

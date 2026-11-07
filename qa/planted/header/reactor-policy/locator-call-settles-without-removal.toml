@@ -1,0 +1,2 @@
+input = "crates/zakura-sim/tests/fixtures/header-reactor-policy.bin"
+checks = ["crates/zakura-network/src/zakura/header_sync/reactor"]

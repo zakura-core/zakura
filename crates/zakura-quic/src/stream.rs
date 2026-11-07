@@ -6,15 +6,20 @@
 //! one read in flight. A cancelled operation's reply stays in the handle, and
 //! the next call waits for it first, so cancelling a call never reorders or
 //! loses stream data.
+//!
+//! A reader can hold receive credit for bytes it keeps after reading them
+//! (API-10). The hold rides in the stream's next command, and the connection
+//! takes it out of its receive window before that command's read, so the
+//! peer gets the credit back only when the [`CreditHold`] drops.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, future::Future, mem, sync::Arc};
 
 use bytes::{Buf as _, Bytes};
-use quinn_proto::{StreamId, VarInt};
+use quinn_proto::{ConnectionError, StreamId, VarInt};
 use zakura_rt::sync::oneshot::{self, error::TryRecvError};
 
 use crate::{
-    driver::{ConnCmd, ConnRef, ReadReply},
+    driver::{ConnCmd, ConnRef, ConnShared, ReadReply},
     error::{ClosedStream, ReadError, ReadExactError, ReadToEndError, WriteError},
 };
 
@@ -130,6 +135,51 @@ impl SendStream {
         result
     }
 
+    /// Resolves with the peer's STOP_SENDING code once the peer stops the
+    /// stream, or with the close reason once the connection closes.
+    ///
+    /// The future doesn't borrow the handle, so a caller can make it once and
+    /// keep it across writes. It costs no task, and a stop wakes only this
+    /// stream's waiters. A stop that arrives after [`finish`](Self::finish),
+    /// [`reset`](Self::reset) or a drop never resolves it.
+    pub fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<VarInt, ConnectionError>> + Send + 'static {
+        let shared = self.conn.shared.clone();
+        // Subscribe now, so the slot exists only while the handle can write.
+        // The connection task drops it when the handle finishes, resets or
+        // drops.
+        let mut stop = (self.state == SendState::Open).then(|| shared.watch_stop(self.id));
+        async move {
+            let mut closed = shared.closed.subscribe();
+            loop {
+                if let Some(code) = stop.as_mut().and_then(|stop| *stop.borrow_and_update()) {
+                    return Ok(code);
+                }
+                if let Some(error) = closed.borrow_and_update().clone() {
+                    return Err(error);
+                }
+                // `shared` keeps the close sender alive, so its wait can't
+                // fail. A failed stop wait means the slot dropped, and only
+                // the close can resolve this future from then on.
+                zakura_rt::select! {
+                    biased;
+                    changed = async {
+                        match stop.as_mut() {
+                            Some(stop) => stop.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if changed.is_err() {
+                            stop = None;
+                        }
+                    }
+                    _ = closed.changed() => {}
+                }
+            }
+        }
+    }
+
     /// Finishes the stream after the data already written.
     pub fn finish(&mut self) -> Result<(), ClosedStream> {
         if self.state != SendState::Open {
@@ -193,6 +243,8 @@ pub struct RecvStream {
     finished: bool,
     stopped: bool,
     pending: Option<oneshot::Receiver<ReadReply>>,
+    /// Credit held since the last command, which the next one carries.
+    unsent_hold: u64,
 }
 
 impl RecvStream {
@@ -204,6 +256,23 @@ impl RecvStream {
             finished: false,
             stopped: false,
             pending: None,
+            unsent_hold: 0,
+        }
+    }
+
+    /// Keeps `bytes` of the connection's receive window from the peer until
+    /// the returned hold drops (API-10).
+    ///
+    /// The connection takes the bytes out of its window before this stream's
+    /// next read, so the bytes that read takes return no credit while the
+    /// caller holds them. Bytes this handle already buffered returned their
+    /// credit when it read them, so the hold covers as many later bytes
+    /// instead. Dropping the hold, from any task, grants the credit back.
+    pub fn hold_credit(&mut self, bytes: u64) -> CreditHold {
+        self.unsent_hold = self.unsent_hold.saturating_add(bytes);
+        CreditHold {
+            shared: self.conn.shared.clone(),
+            bytes,
         }
     }
 
@@ -235,6 +304,7 @@ impl RecvStream {
                     .send(ConnCmd::Read {
                         id: self.id,
                         max,
+                        hold: mem::take(&mut self.unsent_hold),
                         reply,
                     })
                     .map_err(ReadError::ConnectionLost)?;
@@ -345,15 +415,47 @@ impl RecvStream {
         self.stopped = true;
         self.buffered.clear();
         self.pending = None;
-        let _ = self.conn.send(ConnCmd::Stop { id: self.id, code });
+        let _ = self.conn.send(ConnCmd::Stop {
+            id: self.id,
+            code,
+            hold: mem::take(&mut self.unsent_hold),
+        });
         Ok(())
     }
 }
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if !self.stopped && !self.finished {
-            let _ = self.conn.send(ConnCmd::DropRecv { id: self.id });
+        // An unsent hold still goes out, so its release can't grow the window.
+        if (!self.stopped && !self.finished) || self.unsent_hold > 0 {
+            let _ = self.conn.send(ConnCmd::DropRecv {
+                id: self.id,
+                hold: self.unsent_hold,
+            });
         }
+    }
+}
+
+/// Receive credit a reader keeps from its peer (API-10).
+///
+/// [`RecvStream::hold_credit`] creates it. Dropping it grants the credit back
+/// to the peer. It doesn't keep the connection open.
+#[derive(Debug)]
+#[must_use = "dropping a credit hold grants its bytes back to the peer"]
+pub struct CreditHold {
+    shared: Arc<ConnShared>,
+    bytes: u64,
+}
+
+impl CreditHold {
+    /// The bytes this hold keeps.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for CreditHold {
+    fn drop(&mut self) {
+        self.shared.release_credit(self.bytes);
     }
 }

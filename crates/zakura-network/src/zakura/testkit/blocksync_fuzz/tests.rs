@@ -955,7 +955,7 @@ async fn fuzz_commit_stall_resident_plateau() {
     // committer needs no checkpoint batch.)
     let resident_budget: u64 = 8 * 1024 * 1024;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: 64 * 1024 * 1024,
+        max_inflight_block_bytes: Some(64 * 1024 * 1024),
         max_reorder_lookahead_bytes: resident_budget,
         ..fuzz_config()
     };
@@ -1097,7 +1097,7 @@ async fn fuzz_multi_peer_tight_budget() {
     // Opening demand exceeds the ceiling, forcing reservation contention.
     let byte_ceiling: u64 = 3 * 1024 * 1024;
     let config = ZakuraBlockSyncConfig {
-        max_inflight_block_bytes: byte_ceiling,
+        max_inflight_block_bytes: Some(byte_ceiling),
         ..fuzz_config()
     };
     let peers: Vec<_> = (1u8..=8)

@@ -1534,6 +1534,12 @@ fn completions_carry_typed_identities() {
             common_ancestor: chain[2],
             target: Frontier::new(block::Height(4), next[0].hash()),
             headers: 1,
+            work: HeaderFixture::regtest()
+                .genesis_header()
+                .difficulty_threshold
+                .to_work()
+                .map(Into::into),
+            first: Some(Frontier::new(block::Height(4), next[0].hash())),
         }
     );
     assert_eq!(prepare.result, ResultIdentity::Prepared);
@@ -1573,6 +1579,51 @@ fn completions_carry_typed_identities() {
         .complete(id, Outcome::Rejected)
         .expect("a foreign handle is rejected");
     assert_eq!(rejected.result, ResultIdentity::Rejected);
+}
+
+/// A prepare's identity sums each header's work from its own target: two
+/// headers at weight 2 then one unweighted header, as a weighted fork that
+/// grew, log both weights' work. A header whose target has no work leaves
+/// the sum unknown.
+#[test]
+fn a_prepares_work_is_summed_from_its_targets() {
+    let (port, chain) = chain(1);
+    let fixture = HeaderFixture::regtest().with_weight(1, 2);
+    let prepare = |headers: &[Arc<block::Header>], request_id| {
+        let request =
+            fixture.target_request(&port.engine().snapshot(), chain[0], headers, request_id);
+        run(&port, port.prepare_header_target(request)).1.request
+    };
+    let mut headers = fixture.extend(chain[0], 2, 1);
+    let fork_tip = Frontier::new(block::Height(3), headers[1].hash());
+    headers.extend(fixture.extend(fork_tip, 1, 0));
+    let RequestIdentity::PrepareHeaderTarget { work, first, .. } = prepare(&headers, 2) else {
+        panic!("a prepare has a prepare identity");
+    };
+    let work_of = |branch| {
+        fixture
+            .target(branch)
+            .to_work()
+            .expect("fixture targets have work")
+            .as_u256()
+    };
+    assert_ne!(work_of(1), work_of(0));
+    assert_eq!(
+        work.map(|work| work.as_u256()),
+        Some(work_of(1) * 2 + work_of(0))
+    );
+    assert_eq!(
+        first,
+        Some(Frontier::new(block::Height(2), headers[0].hash()))
+    );
+
+    let mut workless = *fixture.extend(chain[0], 1, 2)[0];
+    workless.difficulty_threshold = zakura_chain::work::difficulty::INVALID_COMPACT_DIFFICULTY;
+    let RequestIdentity::PrepareHeaderTarget { work, .. } = prepare(&[Arc::new(workless)], 3)
+    else {
+        panic!("a prepare has a prepare identity");
+    };
+    assert_eq!(work, None);
 }
 
 /// B2: a `CapacityBusy` refusal names the signal it handed out, read from

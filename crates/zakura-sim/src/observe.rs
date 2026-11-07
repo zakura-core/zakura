@@ -835,6 +835,13 @@ pub enum StorageRequest {
         target: StoragePoint,
         /// How many headers.
         headers: u32,
+        /// The headers' summed block work, in decimal: the target's work
+        /// above `common_ancestor`. `None` if a header's target has no
+        /// work.
+        work: Option<String>,
+        /// The first header, `common_ancestor`'s child on the target's
+        /// branch. `None` for a request with no headers.
+        first: Option<StoragePoint>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {

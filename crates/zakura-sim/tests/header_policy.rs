@@ -65,6 +65,8 @@ fn request(kind: OpKind, session: u64) -> StorageRequest {
                 hash: "11".to_owned(),
             },
             headers: 1,
+            work: None,
+            first: None,
         },
         OpKind::Apply => StorageRequest::ApplyHeaderTarget {
             owner: owner(session),

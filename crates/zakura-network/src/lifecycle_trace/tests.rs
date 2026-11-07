@@ -302,6 +302,29 @@ fn request_rows_show_the_request_a_selected_connection_is_already_serving() {
 }
 
 #[test]
+fn requests_flushed_by_a_failed_connection_record_its_error() {
+    let (trace, mut rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "failed");
+    let request = Request::BlocksByHash([hash(5)].into_iter().collect());
+
+    conn.dispatched(1, &request, "advertised", 1);
+    let stamped = conn.stamp_dispatched(&request);
+    conn.enqueued(&stamped);
+    conn.flushed(&stamped, &request, &"connection closed");
+    conn.dispatched(2, &Request::Peers, "p2c", 1);
+
+    let rows = rows(&drain(&mut rx), tables::P2P_REQUEST);
+    let flushed = &rows[2];
+    assert_eq!(flushed["event"], "dequeue");
+    assert_eq!(flushed["request_id"], "1");
+    assert_eq!(flushed["result"], "error");
+    assert_eq!(flushed["error"], "connection closed");
+    assert_eq!(flushed["queued"], "0");
+    // A flushed request never becomes the connection's active request.
+    assert!(rows[3]["active_request"].is_empty());
+}
+
+#[test]
 fn unstamped_requests_are_active_but_not_queued() {
     let (trace, mut rx) = capture(JsonlTraceTables::all());
     let conn = trace.connection(false, "pinged");
@@ -408,6 +431,33 @@ fn p2p_block_rows_record_hash_height_and_size() {
     assert_eq!(row["hash"], block.hash().to_string());
     assert_eq!(row["height"], "1");
     assert_eq!(row["body_bytes"], block.zcash_serialized_size().to_string());
+}
+
+#[test]
+fn p2p_block_rows_reuse_cached_block_sizes() {
+    use zakura_chain::serialization::{ZcashDeserializeInto, ZcashSerialize};
+
+    let (trace, mut rx) = capture(JsonlTraceTables::all());
+    let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    let other: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector is a valid block");
+    // A size no serialization produces shows that the row reads the cache.
+    trace.block_sizes.insert(block.hash(), 7);
+
+    let sender = trace.connection(false, "first");
+    let receiver = trace.connection(true, "second");
+    sender.p2p_recv(&Message::Block(block.clone()));
+    receiver.p2p_recv(&Message::Block(block));
+    sender.p2p_recv(&Message::Block(other.clone()));
+    receiver.p2p_recv(&Message::Block(other.clone()));
+
+    let rows = rows(&drain(&mut rx), tables::P2P);
+    let sizes: Vec<_> = rows.iter().map(|row| row["body_bytes"].clone()).collect();
+    let other_size = other.zcash_serialized_size().to_string();
+    assert_eq!(sizes, ["7", "7", other_size.as_str(), other_size.as_str()]);
 }
 
 #[test]

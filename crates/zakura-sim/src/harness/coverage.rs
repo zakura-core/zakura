@@ -355,8 +355,8 @@ pub static COVERAGE: &[Coverage] = &[
     Coverage {
         property: super::super::domain::header_sync::STALE_COMPLETION_INERT,
         passing: passes(
-            "tests/header_node_late.rs",
-            "prepare_completed_after_replacement_is_inert",
+            "tests/header_stale.rs",
+            "the_stale_prepare_input_holds_stale_completion_inert",
         ),
         bypass: Bypass::Planted("stale-release"),
     },

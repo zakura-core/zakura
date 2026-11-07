@@ -940,6 +940,71 @@ async fn stale_apply_bracket_leaves_the_replacement_alone() {
     assert_stale_call_leaves_the_replacement_alone(HeaderTargetPhase::Applying).await;
 }
 
+/// A repair round whose peer departs while it prepares is kept: the
+/// disconnect retires nothing, and the prepare's completion is handled
+/// against that same round. So `header-sync/stale-completion-inert` counts a
+/// repair stale only by its retirement, never by its session alone. Any
+/// retirement or release its handler makes is the kept round's.
+#[tokio::test]
+async fn a_kept_repair_prepare_settles_its_own_round_after_its_peer_departs() {
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort {
+            gate: Some(gate.clone()),
+            ..ScriptedPort::default()
+        }),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    super::timeouts::seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Preparing,
+    );
+    let kept = active(&reactor, &peer);
+    let operation = prepare_operation(&reactor, &peer, kept.purpose.clone(), kept.entries.clone());
+    recorder.take_all();
+    assert!(matches!(
+        reactor.dispatch_action(operation),
+        StorageDispatch::Started(_)
+    ));
+    reactor.handle_peer_disconnected(&peer, 7, "test disconnect");
+    gate.add_permits(1);
+    complete_next(&mut reactor).await;
+
+    let events = recorder.take_all();
+    let ended = events
+        .iter()
+        .position(|event| matches!(event, ReactorEvent::CallEnded { call: 1, .. }))
+        .expect("the prepare ended");
+    assert!(
+        events[..ended]
+            .iter()
+            .any(|event| matches!(event, ReactorEvent::SessionEnded { session_id: 7, .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events[..ended].iter().any(|event| matches!(
+            event,
+            ReactorEvent::Retired { .. } | ReactorEvent::RoundReleased { .. }
+        )),
+        "the departure keeps the repair round: {events:?}"
+    );
+    let round = kept.incarnation().get();
+    for event in bracket(&events, 1) {
+        match event {
+            ReactorEvent::Retired { request, .. } => assert_eq!(request.incarnation, round),
+            ReactorEvent::RoundReleased { incarnation, .. } => assert_eq!(*incarnation, round),
+            _ => {}
+        }
+    }
+}
+
 /// A stale prepare for a replaced session completes while its replacement
 /// prepares. Its bracket retires nothing, and the replacement stays active.
 #[tokio::test]

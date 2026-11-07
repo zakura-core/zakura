@@ -355,3 +355,19 @@ fn other_causes_tasks_and_dropped_calls_are_not_judged() {
     assert_eq!(check.drain(1), Vec::<String>::new());
     assert!(evidence.windows().is_empty());
 }
+
+/// A stale fault's penalty isn't an effect on other work: a `Misbehavior`
+/// under a stale handler breaks nothing, so a stale prepare that fails with
+/// a peer fault may still penalize its peer.
+#[test]
+fn a_stale_faults_penalty_is_allowed() {
+    let mut events = retired_window();
+    events.push(ReactorEvent::Misbehavior {
+        peer: mirror(),
+        reason: zakura_network::zakura::HeaderSyncMisbehavior::InvalidHeader,
+        origin: Some(1),
+        current: Some(2),
+    });
+    let (mut check, _) = fed(events);
+    assert_eq!(check.drain(1), Vec::<String>::new());
+}

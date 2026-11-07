@@ -16,6 +16,9 @@ use crate::{OutputLocation, TransactionLocation, ValidateContextError};
 
 use super::{counted_set::CountedSet, RevertPosition, SharedMap, UpdateWith};
 
+/// Share historical height groups while bounding the group copied by a write.
+const HEIGHTS_PER_OUTPUT_CHUNK: u32 = 32;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransparentTransfers {
     /// The partial chain balance for a transparent address.
@@ -36,10 +39,11 @@ pub struct TransparentTransfers {
     /// The `getaddressutxos` RPC doesn't need these transaction IDs to be sorted in chain order,
     /// but it might in future. So Zebra does it anyway.
     ///
-    /// Outputs are grouped by the height of the block that created them. Each group is shared
-    /// between chain snapshots, so committing a block copies one pointer per earlier height
-    /// rather than every earlier output. Groups are never empty.
-    created_utxos: BTreeMap<Height, Arc<CreatedOutputs>>,
+    /// Outputs are grouped by height, then by 32-height chunks. Snapshots share chunks;
+    /// copying a chunk copies at most 32 height entries, sharing their output payloads.
+    /// A single chunk is stored directly, avoiding a second map allocation for short
+    /// histories. Both levels are sparse; occupied chunks and height groups are nonempty.
+    created_utxos: CreatedUtxos,
 
     /// The partial list of UTXOs spent by a transparent address.
     ///
@@ -54,6 +58,106 @@ pub struct TransparentTransfers {
 
 /// The outputs one block created for an address, in chain order.
 type CreatedOutputs = BTreeMap<OutputLocation, transparent::Output>;
+
+/// The occupied heights within one chunk, in chain order.
+type CreatedOutputHeights = BTreeMap<Height, Arc<CreatedOutputs>>;
+
+/// Keep short histories in one map; share chunks only when a history spans multiple chunks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CreatedUtxos {
+    /// Empty, or containing heights from just one chunk.
+    Single(CreatedOutputHeights),
+    /// At least two nonempty chunks, ordered by their height range.
+    Chunked(BTreeMap<u32, Arc<CreatedOutputHeights>>),
+}
+
+impl Default for CreatedUtxos {
+    fn default() -> Self {
+        Self::Single(BTreeMap::new())
+    }
+}
+
+impl CreatedUtxos {
+    /// Insert an output, promoting the single map only when another chunk is needed.
+    fn insert(
+        &mut self,
+        location: OutputLocation,
+        output: transparent::Output,
+    ) -> Option<transparent::Output> {
+        let height = location.height();
+        let chunk_id = height.0 / HEIGHTS_PER_OUTPUT_CHUNK;
+        if let Self::Single(heights) = self {
+            if let Some((&first_height, _)) = heights.first_key_value() {
+                let existing_id = first_height.0 / HEIGHTS_PER_OUTPUT_CHUNK;
+                if existing_id != chunk_id {
+                    let existing = std::mem::take(heights);
+                    *self = Self::Chunked(BTreeMap::from([(existing_id, Arc::new(existing))]));
+                }
+            }
+        }
+        let heights = match self {
+            Self::Single(heights) => heights,
+            Self::Chunked(chunks) => Arc::make_mut(chunks.entry(chunk_id).or_default()),
+        };
+        Arc::make_mut(heights.entry(height).or_default()).insert(location, output)
+    }
+
+    /// Remove an output and collapse back to one map when only one chunk remains.
+    fn remove(&mut self, location: &OutputLocation) -> bool {
+        let height = location.height();
+        let chunk_id = height.0 / HEIGHTS_PER_OUTPUT_CHUNK;
+        let heights =
+            match self {
+                Self::Single(heights) => heights,
+                Self::Chunked(chunks) => Arc::make_mut(chunks.get_mut(&chunk_id).expect(
+                    "created output chunk exists because the block was previously applied",
+                )),
+            };
+        let outputs = heights
+            .get_mut(&height)
+            .expect("created output height exists because the block was previously applied");
+        // Dropping the last output needs no copy of the shared output group.
+        let removed = if outputs.len() == 1 && outputs.contains_key(location) {
+            heights.remove(&height);
+            true
+        } else {
+            Arc::make_mut(outputs).remove(location).is_some()
+        };
+        let empty = heights.is_empty();
+        if let Self::Chunked(chunks) = self {
+            if empty {
+                chunks.remove(&chunk_id);
+                if chunks.len() == 1 {
+                    let (_, remaining) = chunks
+                        .pop_first()
+                        .expect("one chunk remains after removing an empty chunk");
+                    *self = Self::Single(Arc::unwrap_or_clone(remaining));
+                }
+            }
+        }
+        removed
+    }
+
+    /// Iterate occupied heights in chain order in either representation.
+    fn heights(&self) -> impl Iterator<Item = (&Height, &Arc<CreatedOutputs>)> {
+        let (single, chunks) = match self {
+            Self::Single(heights) => (Some(heights), None),
+            Self::Chunked(chunks) => (None, Some(chunks)),
+        };
+        single
+            .into_iter()
+            .chain(
+                chunks
+                    .into_iter()
+                    .flat_map(|chunks| chunks.values().map(Arc::as_ref)),
+            )
+            .flat_map(|heights| heights.iter())
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Single(heights) if heights.is_empty())
+    }
+}
 
 // A created UTXO
 //
@@ -84,12 +188,9 @@ impl
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
 
-        let height_outputs = self
+        let previous_entry = self
             .created_utxos
-            .entry(transaction_location.height)
-            .or_default();
-        let previous_entry =
-            Arc::make_mut(height_outputs).insert(output_location, created_utxo.utxo.output.clone());
+            .insert(output_location, created_utxo.utxo.output.clone());
         assert_eq!(
             previous_entry, None,
             "unexpected created output: duplicate update or duplicate UTXO",
@@ -117,20 +218,7 @@ impl
         let transaction_location = transaction_location(created_utxo);
         let output_location = OutputLocation::from_outpoint(transaction_location, outpoint);
 
-        let height_outputs = self
-            .created_utxos
-            .get_mut(&transaction_location.height)
-            .expect("created output height exists because the block was previously applied");
-        // Drop a group that only holds this output instead of copying it to empty it.
-        let output_was_removed =
-            if height_outputs.len() == 1 && height_outputs.contains_key(&output_location) {
-                self.created_utxos.remove(&transaction_location.height);
-                true
-            } else {
-                Arc::make_mut(height_outputs)
-                    .remove(&output_location)
-                    .is_some()
-            };
+        let output_was_removed = self.created_utxos.remove(&output_location);
         assert!(
             output_was_removed,
             "unexpected revert of created output: duplicate update or duplicate UTXO",
@@ -298,8 +386,8 @@ impl TransparentTransfers {
     #[allow(dead_code)]
     pub fn created_utxos(&self) -> impl Iterator<Item = (&OutputLocation, &transparent::Output)> {
         self.created_utxos
-            .values()
-            .flat_map(|outputs| outputs.iter())
+            .heights()
+            .flat_map(|(_, outputs)| outputs.iter())
     }
 
     /// Returns the [`OutputLocation`]s of the spent transparent outputs sent to this address,

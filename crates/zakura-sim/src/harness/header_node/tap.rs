@@ -257,6 +257,7 @@ impl TapState {
             step,
             released: work.ledger.released_rounds(),
             unsettled: work.ledger.unsettled_rounds(),
+            stuck: work.ledger.stuck_rounds(),
             shutdown: self.shutdown.load(Ordering::Relaxed),
             settled: self.settled.load(Ordering::Relaxed),
         });
@@ -788,6 +789,12 @@ impl ReactorTap {
     /// they happen.
     pub fn claims(&self) -> ClaimEvidence {
         self.state.claims.clone()
+    }
+
+    /// The reactor's settlement at each drain, which the tap fills as the
+    /// drains happen.
+    pub fn rounds(&self) -> SettlementEvidence {
+        self.state.rounds.clone()
     }
 
     /// The notice the harness gives this tap when it stops the reactor.

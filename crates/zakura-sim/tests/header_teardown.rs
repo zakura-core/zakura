@@ -267,18 +267,20 @@ fn teardown_waits_for_held_lease() {
     );
 }
 
-/// The node's first locator read is held until `mirror-0`'s link closes,
-/// and the node shuts down once that read is submitted, so storage can
-/// still hold the read's permit when the reactor goes and return it after.
-/// Every teardown read is checked against storage's permits at that read,
-/// so an honest run holds throughout.
+/// The node's first locator read is held for a second after its
+/// submission, and the node shuts down once that read is submitted, so
+/// storage still holds the read's permit when the reactor goes and returns
+/// it later. Every teardown read is checked against storage's permits at
+/// that read, so an honest run holds throughout. A hold until `mirror-0`'s
+/// link closed would lift at the stop, which closes the link, before the
+/// reactor is gone.
 fn held_locator_witness() -> StorageScenario {
     let first_locator = || Select::nth(OpKind::Locator, 1);
     StorageScenario {
         policy: Policy {
             holds: vec![Hold {
                 select: first_locator(),
-                until: Trigger::Closed("mirror-0".to_owned()),
+                until: Trigger::VirtualTime(1_000),
                 then: vec![Allow::Engine],
                 deadline_ms: None,
             }],
@@ -294,18 +296,50 @@ fn held_locator_witness() -> StorageScenario {
 }
 
 /// [`held_locator_witness`] settles the node and holds under every plan.
-/// With `forgotten-locator-permit` applied, a plan whose locator completes
-/// after the reactor goes finds the leaked permit on a later teardown read.
+/// Some teardown read finds a permit storage still holds, and a later one
+/// finds it back, so each teardown read is checked against what storage
+/// holds then. With `forgotten-locator-permit` applied, that later read
+/// finds the leaked permit.
 #[test]
 fn a_locator_held_across_reactor_exit_holds() {
     let scenario = held_locator_witness();
     for input in support::inputs(8, 256) {
         let ports = Storage::prepare(&scenario);
         let settlement = ports.rounds.clone();
+        let capacity = ports.capacity.clone();
         let report =
             run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
                 .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(report.end.violation, None, "{:?}", report.end);
         assert!(settlement.settled(), "{:?}", settlement.rows());
+        let teardown: Vec<_> = capacity
+            .readings()
+            .into_iter()
+            .filter(|reading| reading.teardown)
+            .collect();
+        let held = teardown
+            .iter()
+            .position(|reading| reading.locator_permits < LOCATOR_CAPACITY)
+            .unwrap_or_else(|| {
+                panic!("no teardown read found storage holding a permit: {teardown:?}")
+            });
+        assert!(
+            teardown[held..]
+                .iter()
+                .any(|reading| reading.locator_permits == LOCATOR_CAPACITY),
+            "a later teardown read finds the permit back: {teardown:?}"
+        );
+        let outcome = report
+            .properties
+            .iter()
+            .find(|property| property.property == TEARDOWN_RETURNS_BASELINE)
+            .map(|property| property.outcome.clone());
+        assert!(
+            matches!(outcome, Some(PropertyOutcome::Held { .. })),
+            "{outcome:?}"
+        );
     }
 }
+
+/// The reactor's locator permits, as the capacity probe counts them.
+const LOCATOR_CAPACITY: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;

@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use zakura_network::zakura::observe::ClaimRule;
 
+use crate::{Outcome, RunEnd};
+
 /// A claim rule the tap checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
@@ -65,6 +67,10 @@ pub struct Settlement {
     /// haven't returned, or a call that held their headers hasn't been
     /// handled.
     pub unsettled: usize,
+    /// How many of those unsettled rounds have no call that holds their
+    /// headers still unended, so storage has nothing left that could settle
+    /// them.
+    pub stuck: usize,
     /// Whether the harness began stopping the reactor.
     pub shutdown: bool,
     /// Whether the stopped reactor's teardown is done: the reactor is gone
@@ -72,74 +78,99 @@ pub struct Settlement {
     pub settled: bool,
 }
 
+/// What [`SettlementEvidence`] keeps.
+#[derive(Debug, Default)]
+struct SettlementStore {
+    /// Each drain's settlement, in order, with whether a property read it.
+    rows: Vec<(Settlement, bool)>,
+    /// Whether the run ended at rest: idle, or with its drain run dry.
+    at_rest: bool,
+}
+
 /// One reactor's settlement at each drain, each with whether a property
-/// read it, shared by its tap and whoever reads them. Cloning shares the
-/// store.
+/// read it, and how the run ended, shared by its tap and whoever reads
+/// them. Cloning shares the store.
 #[derive(Clone, Debug, Default)]
-pub struct SettlementEvidence(Arc<Mutex<Vec<(Settlement, bool)>>>);
+pub struct SettlementEvidence(Arc<Mutex<SettlementStore>>);
 
 impl SettlementEvidence {
-    /// Keeps `rounds`, unread. Nothing else is called while the lock is
+    /// Runs `read` on the store. Nothing else is called while the lock is
     /// held.
+    fn with<R>(&self, read: impl FnOnce(&mut SettlementStore) -> R) -> R {
+        read(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Keeps `rounds`, unread.
     pub(crate) fn record(&self, rounds: Settlement) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((rounds, false));
+        self.with(|store| store.rows.push((rounds, false)));
+    }
+
+    /// Notes how the run ended: at rest when it went idle or its drain ran
+    /// dry, and not when its drain was cut off at its bound.
+    pub(crate) fn end(&self, end: &RunEnd) {
+        let at_rest = match end.outcome {
+            Outcome::Idle { .. } => true,
+            Outcome::Budget => end.drain.is_some_and(|drain| !drain.exhausted),
+            _ => false,
+        };
+        self.with(|store| store.at_rest = at_rest);
     }
 
     /// The settlement the drain of `step` read, if it did, which this marks
     /// read. Only the property that reports it reads it this way.
     pub fn at(&self, step: u64) -> Option<Settlement> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter_mut()
-            .rev()
-            .find(|(row, _)| row.step == step)
-            .map(|(row, read)| {
-                *read = true;
-                *row
-            })
+        self.with(|store| {
+            store
+                .rows
+                .iter_mut()
+                .rev()
+                .find(|(row, _)| row.step == step)
+                .map(|(row, read)| {
+                    *read = true;
+                    *row
+                })
+        })
     }
 
     /// Whether a property read the drain of `step`'s settlement.
     pub(super) fn read_at(&self, step: u64) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .rev()
-            .find(|(row, _)| row.step == step)
-            .is_some_and(|(_, read)| *read)
+        self.with(|store| {
+            store
+                .rows
+                .iter()
+                .rev()
+                .find(|(row, _)| row.step == step)
+                .is_some_and(|(_, read)| *read)
+        })
     }
 
     /// Every drain's settlement so far, in order.
     pub fn rows(&self) -> Vec<Settlement> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|(row, _)| *row)
-            .collect()
+        self.with(|store| store.rows.iter().map(|(row, _)| *row).collect())
     }
 
     /// Whether a drain found the stopped reactor's teardown done.
     pub fn settled(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|(row, _)| row.settled)
+        self.with(|store| store.rows.iter().any(|(row, _)| row.settled))
     }
 
     /// Whether any drain found a released round.
     pub fn any_released(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|(row, _)| row.released > 0)
+        self.with(|store| store.rows.iter().any(|(row, _)| row.released > 0))
+    }
+
+    /// The last drain's settlement, if the run ended at rest with a
+    /// released round unsettled and no call that holds its headers still
+    /// pending in storage. Nothing is left that could settle that round
+    /// then, whatever storage still holds for others.
+    pub fn stuck(&self) -> Option<Settlement> {
+        self.with(|store| {
+            store
+                .rows
+                .last()
+                .map(|(row, _)| *row)
+                .filter(|last| store.at_rest && last.stuck > 0)
+        })
     }
 }
 

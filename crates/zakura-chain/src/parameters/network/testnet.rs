@@ -1491,6 +1491,16 @@ impl Default for Parameters {
     }
 }
 
+/// The default Regtest parameters, which `is_regtest` compares against.
+///
+/// Built once: network-kind checks run on hot paths such as address encoding.
+fn default_regtest() -> &'static Parameters {
+    static DEFAULT_REGTEST: OnceLock<Parameters> = OnceLock::new();
+    DEFAULT_REGTEST.get_or_init(|| {
+        Parameters::new_regtest(Default::default()).expect("default regtest parameters are valid")
+    })
+}
+
 impl Parameters {
     /// Creates a new [`ParametersBuilder`].
     pub fn build() -> ParametersBuilder {
@@ -1609,18 +1619,18 @@ impl Parameters {
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
             initial_nsm_value_balance: _,
-        } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
+        } = default_regtest();
 
-        self.network_name == network_name
-            && self.genesis_hash == genesis_hash
-            && self.slow_start_interval == slow_start_interval
-            && self.slow_start_shift == slow_start_shift
-            && self.target_difficulty_limit == target_difficulty_limit
-            && self.disable_pow == disable_pow
+        self.network_name == *network_name
+            && self.genesis_hash == *genesis_hash
+            && self.slow_start_interval == *slow_start_interval
+            && self.slow_start_shift == *slow_start_shift
+            && self.target_difficulty_limit == *target_difficulty_limit
+            && self.disable_pow == *disable_pow
             && self.should_allow_unshielded_coinbase_spends
-                == should_allow_unshielded_coinbase_spends
-            && self.pre_blossom_halving_interval == pre_blossom_halving_interval
-            && self.post_blossom_halving_interval == post_blossom_halving_interval
+                == *should_allow_unshielded_coinbase_spends
+            && self.pre_blossom_halving_interval == *pre_blossom_halving_interval
+            && self.post_blossom_halving_interval == *post_blossom_halving_interval
     }
 
     /// Returns the network name

@@ -32,7 +32,7 @@ from typing import Any, Callable
 # shipped with this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from zakura_monitoring import monitor, nu7, slack  # noqa: E402,F401 - tests patch slack limits
+from zakura_monitoring import difficulty, monitor, nu7, slack  # noqa: E402,F401 - tests patch slack limits
 from zakura_monitoring.delivery import deliver_pending, queue_transitions  # noqa: E402
 from zakura_monitoring.slack import (  # noqa: E402
     bounded_text,
@@ -55,7 +55,7 @@ from zakura_monitoring.suppression import suppression_until  # noqa: E402
 DOWN_HEALTH = {"down", "rpc_error"}
 MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
-RELEASE_STATE_TRANSIENT_GRACE_SECONDS = 180
+RELEASE_STATE_FETCH_GRACE_SECONDS = 3600
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
@@ -113,6 +113,7 @@ class Fleet:
     name: str
     url: str
     dashboard_url: str
+    difficulty_monitor: bool = False
 
 
 @dataclass(frozen=True)
@@ -248,7 +249,11 @@ def load_fleets(config_path: Path) -> list[Fleet]:
 
         url = str(raw["url"])
         dashboard_url = str(raw.get("dashboard_url") or url.removesuffix("/data"))
-        fleets.append(Fleet(name=name, url=url, dashboard_url=dashboard_url))
+        difficulty_monitor = raw.get("difficulty_monitor", False)
+        if type(difficulty_monitor) is not bool or (difficulty_monitor and name != "mainnet"):
+            raise SystemExit("difficulty_monitor must be a boolean enabled only for mainnet")
+        fleets.append(Fleet(name=name, url=url, dashboard_url=dashboard_url,
+                            difficulty_monitor=difficulty_monitor))
 
     if not fleets:
         raise SystemExit(f"no [[fleets]] defined in {config_path}")
@@ -274,7 +279,9 @@ def fetch_json(url: str, timeout: float) -> dict[str, Any]:
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read()
+        body = response.read(4 * 1024 * 1024 + 1)
+    if len(body) > 4 * 1024 * 1024:
+        raise ValueError("monitoring JSON response exceeds 4 MiB")
 
     decoded = json.loads(body.decode("utf-8"))
     if not isinstance(decoded, dict):
@@ -1450,7 +1457,7 @@ class Watchdog:
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
         """Copy only this fleet's state so delivery cannot overwrite another fleet."""
         result = {}
-        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks"):
+        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks", "difficulty"):
             entries = state.get(bucket, {})
             result[bucket] = copy.deepcopy({
                 key: value for key, value in entries.items()
@@ -1488,8 +1495,11 @@ class Watchdog:
             node_rows = validated_fleet_rows(snapshot)
             last_poll = snapshot_last_poll(snapshot)
         except Exception as error:
+            self.observe_difficulty(state, fleet, None, now)
             self.handle_fleet_error(state, fleet, error, now, suppressed)
             return
+
+        self.observe_difficulty(state, fleet, snapshot, now)
 
         if (
             last_poll is not None
@@ -1554,6 +1564,14 @@ class Watchdog:
                 observation.condition == "stalled"
                 and observation.name in (shared_nodes | propagation_nodes),
             )
+
+    def observe_difficulty(self, state, fleet, snapshot, now):
+        """Share this fleet's persisted incident and durable Slack delivery."""
+        if not fleet.difficulty_monitor:
+            return
+        entry = state.setdefault("difficulty", {}).setdefault(fleet.name, {})
+        for message in difficulty.update(entry, snapshot, now):
+            self.notify(message + f"\ndashboard: {slack_dashboard_url(fleet.dashboard_url)}", self.args)
 
     def handle_mac_fork(self, state, fleet, rows, now, suppressed):
         """Alert on proven >10-block divergence against 70% of all other nodes.
@@ -1752,20 +1770,15 @@ class Watchdog:
             condition, detail = release_state_condition(target, pointer, meta, now)
         except Exception as error:
             condition, detail = "unreachable", str(error)
-            if (
-                isinstance(error, TimeoutError)
-                or (isinstance(error, urllib.error.HTTPError) and 500 <= error.code < 600)
-                or (
-                    isinstance(error, urllib.error.URLError)
-                    and isinstance(error.reason, TimeoutError)
-                )
-            ):
-                # A transient fetch failure cannot clear the last notified incident.
-                # Keep it until a readable bundle can establish its next condition.
-                if entry.get("alerting"):
-                    entry["last_seen"] = now
-                    return
-                threshold = RELEASE_STATE_TRANSIENT_GRACE_SECONDS
+            # Every fetch failure waits out the same grace. The edge returns a new kind
+            # of one-poll blip every few weeks (5xx, 429, resets, timeouts), and the
+            # bundle only goes stale after 48 hours, so an hour's delay loses nothing.
+            # A failed fetch also cannot clear the last notified incident. Keep it
+            # until a readable bundle can establish its next condition.
+            if entry.get("alerting"):
+                entry["last_seen"] = now
+                return
+            threshold = RELEASE_STATE_FETCH_GRACE_SECONDS
 
         previous_bad_since = coerce_float(entry.get("bad_since"))
         bad_since = (
@@ -1776,8 +1789,8 @@ class Watchdog:
             else now
         )
 
-        # Only transport timeouts and server errors get a grace period. Invalid,
-        # incomplete, or stale bundles still require immediate attention.
+        # Only fetch failures get a grace period. A readable bundle that is invalid,
+        # incomplete, or stale still requires immediate attention.
         update_alert_state(
             bucket,
             key,

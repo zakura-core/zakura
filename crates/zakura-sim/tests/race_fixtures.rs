@@ -1,6 +1,8 @@
 //! The six race fixtures from `scheduler.md`, run through `Sim` (S4.4).
 //! Every planted variant fails on some input, the fixes never do, and one
-//! worker hides the races inside a poll, as on the bare scheduler.
+//! worker hides the races inside a poll, as on the bare scheduler. Each
+//! fixture's witness test runs one input that reaches the race's trigger
+//! history, on the race and on the fix.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -9,12 +11,13 @@ use support::inputs;
 use zakura_sim::{
     harness::{
         fixtures::{
-            AbBa, AbortWithoutJoin, Fixture, LostUpdate, MissedNotify, Race, Scenario,
-            SnapshotReserve, TimerCancel, Variant,
+            AbBa, AbortWithoutJoin, All, Fixture, LostUpdate, MissedNotify, PickScenario, Race,
+            Scenario, SnapshotReserve, TimerCancel, Variant, Which,
         },
-        run_harness,
+        run_harness, Subsystem,
     },
-    MemorySink, Outcome, PlanInput, RunReport,
+    witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
+    MemorySink, Outcome, Plan, PlanInput, PropertyOutcome, RunReport,
 };
 
 /// Inputs to try when a planted race must be found.
@@ -52,7 +55,15 @@ fn violations<F: Fixture>(variant: Variant, workers: u16, count: usize) -> usize
                     assert_eq!(violation.property, F::NAME);
                     true
                 }
-                None => false,
+                None => {
+                    // A passing run counts only if the check applied.
+                    let held = report.properties.iter().any(|r| {
+                        r.property == F::NAME
+                            && matches!(r.outcome, PropertyOutcome::Held { applicable } if applicable > 0)
+                    });
+                    assert!(held, "{}: {:?}", F::NAME, report.properties);
+                    false
+                }
             }
         })
         .count()
@@ -113,4 +124,216 @@ fn one_worker_hides_races_inside_a_poll() {
     assert_eq!(violations::<SnapshotReserve>(Variant::Base, 1, FIND), 0);
     assert_eq!(violations::<MissedNotify>(Variant::Base, 1, FIND), 0);
     assert!(violations::<TimerCancel>(Variant::Base, 1, FIND) > 0);
+}
+
+/// `F` under `variant` on 2 workers, with fuzz input `input`.
+fn witnessed<F: Fixture>(variant: Variant, input: &[u8]) -> WitnessScenario<Race<F>> {
+    WitnessScenario {
+        scenario: Scenario {
+            variant,
+            workers: 2,
+        },
+        input: Plan::from_fuzz(input),
+    }
+}
+
+/// `F`'s witness test: on `input`, the planted race reaches its trigger
+/// history and violates the property, and the fix reaches it too and holds.
+fn witness_test<F: Fixture>(input: &[u8]) {
+    check_witness(
+        witnessed::<F>(Variant::Base, input),
+        F::NAME,
+        Expect::Violated,
+    );
+    check_witness(
+        witnessed::<F>(Variant::Fixed, input),
+        F::NAME,
+        Expect::Holds,
+    );
+}
+
+// The empty input runs the tasks in round-robin order, which interleaves
+// the first three fixtures' tasks.
+
+#[test]
+fn lost_update_witness() {
+    witness_test::<LostUpdate>(&[]);
+}
+
+#[test]
+fn snapshot_reserve_witness() {
+    witness_test::<SnapshotReserve>(&[]);
+}
+
+#[test]
+fn ab_ba_witness() {
+    witness_test::<AbBa>(&[]);
+}
+
+#[test]
+fn missed_notify_witness() {
+    witness_test::<MissedNotify>(&[
+        0x14, 0xb1, 0x51, 0x74, 0xfe, 0x95, 0x35, 0x0a, 0xef, 0xac, 0xa9, 0x97, 0xb5, 0xca, 0xa1,
+        0xc9, 0x18,
+    ]);
+}
+
+#[test]
+fn timer_cancel_witness() {
+    witness_test::<TimerCancel>(&[0x38, 0x44, 0x6a, 0x3e, 0x1c, 0x9d, 0xd9, 0x80, 0x20]);
+}
+
+#[test]
+fn abort_without_join_witness() {
+    witness_test::<AbortWithoutJoin>(&[0xbd, 0xe4, 0xe8, 0xf2, 0xe1]);
+}
+
+/// An input that runs one incrementer's add before the other reaches its
+/// own holds on the fix without reaching the race, so its witness test
+/// fails.
+#[test]
+fn serialized_increments_lose_the_trigger_history() {
+    assert_eq!(
+        witness(
+            witnessed::<LostUpdate>(Variant::Fixed, &[0x64, 0xac]),
+            LostUpdate::NAME,
+            Expect::Holds
+        ),
+        Err(WitnessError::LostTriggerHistory)
+    );
+}
+
+/// `F` under the planted race on `plan` holds without reaching the trigger
+/// history, so its witness test fails.
+fn harmless_history<F: Fixture>(plan: PlanInput) {
+    let report = run::<F>(Variant::Base, 2, plan.clone());
+    assert_eq!(report.end.violation, None, "{}", F::NAME);
+    let scenario: WitnessScenario<Race<F>> = WitnessScenario {
+        scenario: Scenario {
+            variant: Variant::Base,
+            workers: 2,
+        },
+        input: plan,
+    };
+    assert_eq!(
+        witness(scenario, F::NAME, Expect::Holds),
+        Err(WitnessError::LostTriggerHistory),
+        "{}",
+        F::NAME
+    );
+}
+
+/// The marker stores the flag before the waiter checks it, so the waiter
+/// exits before the notification.
+#[test]
+fn a_waiter_that_saw_the_flag_misses_the_trigger() {
+    harmless_history::<MissedNotify>(Plan::from_fuzz(&[]));
+}
+
+/// One task reserves before the other checks, so the check sees no
+/// capacity.
+#[test]
+fn a_check_after_the_reservation_misses_the_trigger() {
+    let plan = inputs(5, 64).pop().expect("five inputs");
+    harmless_history::<SnapshotReserve>(plan);
+}
+
+/// The cancel lands inside the timer's deciding poll, after the poll read
+/// the token.
+#[test]
+fn a_cancel_inside_the_deciding_poll_misses_the_trigger() {
+    harmless_history::<TimerCancel>(Plan::from_fuzz(&[]));
+}
+
+/// The worker unwinds before the aborter checks the resource.
+#[test]
+fn an_unwind_before_the_check_misses_the_trigger() {
+    let plan = inputs(20, 64)
+        .into_iter()
+        .find(|plan| {
+            run::<AbortWithoutJoin>(Variant::Base, 2, plan.clone())
+                .end
+                .violation
+                .is_none()
+        })
+        .expect("some input unwinds the worker first");
+    harmless_history::<AbortWithoutJoin>(plan);
+}
+
+/// How many of `count` inputs violate a property in `H`'s run of
+/// `scenario`, and every property they violate.
+fn pick_violations<H: zakura_sim::harness::Subsystem<Scenario = PickScenario>>(
+    scenario: PickScenario,
+    count: usize,
+) -> (usize, Vec<String>) {
+    let mut found = Vec::new();
+    let hits = inputs(count, 64)
+        .into_iter()
+        .filter(|plan| {
+            let report =
+                run_harness::<H>(&scenario, plan.clone(), &mut MemorySink::default(), None)
+                    .unwrap_or_else(|error| panic!("{}: {error}", H::NAME));
+            assert_eq!(report.cleanup.leaked, 0, "{scenario:?}");
+            let violated: Vec<String> = report
+                .properties
+                .iter()
+                .filter(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }))
+                .map(|r| r.property.clone())
+                .collect();
+            let hit = !violated.is_empty();
+            found.extend(violated);
+            hit
+        })
+        .count();
+    found.sort();
+    found.dedup();
+    (hits, found)
+}
+
+/// `fixtures::All`, the `race_fixtures` fuzz target's harness, finds each
+/// fixture's planted race under that fixture's own property only, and
+/// `fixtures::Fixed` never fails.
+#[test]
+fn the_picking_harnesses_find_each_race_and_hold_on_the_fix() {
+    for fixture in Which::ALL {
+        let base = PickScenario {
+            fixture,
+            variant: Variant::Base,
+            workers: 2,
+        };
+        let (hits, found) = pick_violations::<All>(base, FIND);
+        assert!(hits > 0, "{fixture:?}: no find in {FIND} inputs");
+        assert_eq!(found, [fixture.property()], "{fixture:?}");
+        let fixed = PickScenario {
+            variant: Variant::Fixed,
+            ..base
+        };
+        assert_eq!(
+            pick_violations::<zakura_sim::harness::fixtures::Fixed>(fixed, 200).0,
+            0,
+            "{fixture:?} fixed"
+        );
+    }
+}
+
+/// `fixtures::Fixed` draws only the fixed variant, whatever the prefix.
+#[test]
+fn the_fixed_harness_draws_only_the_fix() {
+    use zakura_sim::harness::{fixtures::Fixed, Subsystem};
+    for byte in 0..=u8::MAX {
+        assert_eq!(Fixed::draw(&[byte, byte, byte]).variant, Variant::Fixed);
+    }
+    assert!(Variant::ALL
+        .iter()
+        .all(|v| (0..=u8::MAX).any(|b| All::draw(&[0, b, 0]).variant == *v)));
+}
+
+/// `fixtures/all` composes each fixture's own harness and `fixtures/fixed`,
+/// so `race_fixtures` can cover them.
+#[test]
+fn all_composes_every_fixture_and_fixed() {
+    let mut expected: Vec<&str> = Which::ALL.iter().map(|which| which.property()).collect();
+    expected.push(<zakura_sim::harness::fixtures::Fixed as Subsystem>::NAME);
+    assert_eq!(All::COMPOSES, expected.as_slice());
+    assert!(<zakura_sim::harness::fixtures::Fixed as Subsystem>::COMPOSES.is_empty());
 }

@@ -35,7 +35,6 @@ def run(number, conclusion, event="push", attempt=1):
 ALERT_EXCEPTIONS = {
     "PR node image bake": "Has a dedicated failure notification job.",
     "VCT handoff canary": "Has phase-aware alerts with persistent deduplication.",
-    "Upstream PR Triage Pilot": "Intentionally muted until the pilot passes again.",
 }
 
 

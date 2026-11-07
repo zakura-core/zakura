@@ -92,7 +92,7 @@ skip = [
 # dependencies starting at the specified crate, up to a certain depth, which is
 # by default infinite
 skip-tree = [
-    # wait for criterion and bindgen to update itertools
+    # wait for criterion to update itertools
     { name = "itertools", version = "0.13" },
 
     # wait for ordered-map to release a dependency fix

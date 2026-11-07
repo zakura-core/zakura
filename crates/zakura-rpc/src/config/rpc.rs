@@ -64,7 +64,9 @@ pub struct Config {
     ///
     /// Note: The indexer RPC server is disabled by default.
     /// To enable the indexer RPC server, compile `zakurad` with the
-    /// `indexer` feature flag and set a listen address in the config:
+    /// `indexer-rpc` feature flag (on by default) and set a listen address in
+    /// the config. A build without that feature refuses to start when this is
+    /// set:
     /// ```toml
     /// [rpc]
     /// indexer_listen_addr = '127.0.0.1:8230'

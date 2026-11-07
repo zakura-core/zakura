@@ -51,7 +51,7 @@ pub enum Boundary {
 /// Actions outside the scheduler, such as datagrams or storage completions.
 ///
 /// `enabled` and `boundaries` must be pure functions of the source's state, so
-/// a run replays. Only `execute` changes it.
+/// a run replays. Only `execute` and `observe` change it.
 pub trait ActionSource {
     /// Appends each action enabled at `now`, with the index `execute` takes.
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>);
@@ -62,6 +62,16 @@ pub trait ActionSource {
     /// Runs the action `enabled` listed with index `local`, appending what
     /// happened to `log`.
     fn execute(&mut self, local: u64, log: &mut ObservationLog);
+
+    /// Appends what happened inside the source since the last call that no
+    /// action of its own did, such as work a task submitted to it. The run
+    /// calls it after setup and after every step, so each entry lands on the
+    /// step that caused it. An `Err` says the source's evidence is
+    /// incomplete, which ends the run as a harness failure before that
+    /// step's checker runs. The default appends nothing.
+    fn observe(&mut self, _log: &mut ObservationLog) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// What one source offers at one step.
@@ -165,6 +175,7 @@ mod tests {
             At {
                 op: Op::Poll,
                 n: 1,
+                object: None,
                 site: None,
             },
         )

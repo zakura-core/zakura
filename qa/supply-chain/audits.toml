@@ -695,6 +695,12 @@ criteria = "safe-to-deploy"
 version = "0.4.2"
 notes = "Reviewed all production implementations and manifest. No unsafe, build script or ambient operations. Choice constructors preserve 0/1; selection/equality delegate to cmov and slices visit all elements for equal public lengths. CtOption always owns an initialized value even when absent, and conversion to ordinary Option is explicitly variable-time. Caller constraints: custom traits/closures must meet timing contracts; lookup index types must represent the traversal count; signed negation excludes MIN with overflow checks. Source review only; no independent all-platform timing assessment."
 
+[[audits.ctutils]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.4.2 -> 0.4.6"
+notes = "Reviewed the complete 0.4.2-to-0.4.6 package diff. The substantive change is the RUSTSEC-2026-0385 fix: Choice::to_u8/u16/u32/u64/u128_mask now negate to_u8(), which passes the byte through core::hint::black_box, instead of the raw field, so LLVM can no longer turn mask generation into a branch; to_bool and to_u8 become const fn, and the vartime variants are deprecated aliases of them. On 32-bit targets u128 lt/le (and the CtLt/CtGt u128 impls) compare 64-bit halves through opaque per-half predicates instead of a full-width subtraction. The bitle/bitlt/bitnz macros move unchanged into a new public primitives module, which wraps them in black_box only on ARM targets without pointer-width atomics (Thumb-1) and adds borrowing subtraction, overflowing addition and leading/trailing zero counts that use native instructions on x86, x86_64, aarch64, thumb2 and zbb and a fixed-stage masked fallback elsewhere; the formulas match Hacker's Delight and the package's tests compare them with core integer operations at carry and zero boundaries. Choice::and keeps both operands opaque on Thumb-1. The crate still declares forbid(unsafe_code) and build = false, has no ambient I/O, and the manifest only raises rust-version to 1.87 (below this workspace's 1.97) and the optional subtle minimum to 2.6. Zakura reaches ctutils only through universal-hash's Poly1305 tag comparison. Source review only: the package tests were not run, and generated code was not inspected on any target."
+
 [[audits.curve25519-dalek]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3679,6 +3685,12 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.38.1 -> 1.39.0"
 
+[[audits.tokio]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "1.52.3 -> 1.53.3"
+notes = "Reviewed every non-test hunk of the source diff and skimmed the test-only hunks. The headline change is the RUSTSEC-2026-0386 fix from tokio-rs/tokio#8587: AsyncFd gains unsafe register and register_with_interest constructors whose safety contract requires the raw fd to stay open, unchanged, and referring to the same file description for the AsyncFd's lifetime, and the safe new, with_interest, try_new and try_with_interest become deprecated wrappers over them, so the hazard becomes an explicit caller obligation rather than being removed (no Zakura crate uses AsyncFd). Alongside it the I/O driver again refuses to release a ScheduledIo when epoll deregistration fails, preferring a leak to a token epoll could still deliver after free. The other memory-safety fixes are mpsc block reclamation comparing indices with wrapping arithmetic so a block cannot be freed under a slow sender after index wraparound, the batch semaphore marking an Acquire as needing cleanup as soon as permits are assigned so a panicking tracing subscriber cannot leave a linked node or leak permits, and the Windows child dropping its wait registration before closing the process handle. The stable timer moves lazy registration into Sleep, which now holds an optional pinned timer entry created on first poll and replaced in place with Pin::set, whose PinnedDrop removes it from the wheel under the driver lock; wakers are now woken or dropped outside locks in the timer, semaphore close, broadcast, JoinSet, DuplexStream and blocking pool paths. The intrusive LinkedList lost its redundant type parameter and phantom raw-pointer marker without changing its Send and Sync bounds. New unsafe code is limited to FreeBSD and QNX peer-credential getsockopt and getpeereid calls that check length and version before assume_init, a task-header schedule-latency cell that is zero-sized unless the new unstable schedule-latency feature is enabled, and io-uring statx and rename ops plus a fix keeping an op's buffers alive when submission fails after the SQE was pushed; the latter two require tokio_unstable, which this workspace does not set. Acquire::new now asserts the permit count is within MAX_PERMITS, a new panic reachable only on 32-bit targets. No new environment, process or network access was added. The only manifest changes add the empty schedule-latency feature, which the crate rejects without tokio_unstable, and adjust test targets; dependencies and rust-version are unchanged and there is still no build script. Nothing was built or run for this delta."
+
 [[audits.tokio-macros]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -4584,6 +4596,12 @@ criteria = "safe-to-deploy"
 delta = "0.17.4+10.4.2 -> 0.17.5+10.4.2"
 notes = "build.rs defaults ROCKSDB_UNITY_CHUNK to 1 on Windows targets, so Windows compiles one translation unit per RocksDB source (other targets unchanged; the variable still overrides). zakura_minimal.rs is restructured so each edit is an InsertAfter or Replace whose C++ is a raw multi-line string, and normalizes CRLF to LF before matching; the edited sources it generates are byte-for-byte identical to 0.17.4's. No new sources, flags, downloads, or links. Published from fork commit ed52fdf, which passed the fork's CI on Linux, macOS, and Windows, including a build without `full`."
 
+[[audits.zakura-librocksdb-sys]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.5+10.4.2 -> 0.17.7+10.4.2"
+notes = """The bundled RocksDB 10.4.2 and Snappy sources are unchanged, file for file; the package also excludes snappy/third_party (Google benchmark and googletest), which is never compiled. build.rs no longer runs bindgen: src/lib.rs includes the committed src/bindings.rs instead of OUT_DIR/bindings.rs, so bindgen and its libclang loading leave the build, and the bindgen-runtime and bindgen-static features become empty. src/bindings.rs is bindgen 0.72.1 output for rocksdb/include/rocksdb/c.h and contains only declarations: 942 extern "C" functions, opaque #[repr(C)] structs, constants, and type aliases, with no function bodies, #[link] attributes, or includes. build.rs also defines NO_PCLMUL on x86_64 targets without pclmulqdq, since RocksDB's port/lang.h assumes PCLMUL whenever AVX is enabled. Without `full`, zakura_excluded_sources.txt skips 58 RocksDB sources instead of 91, so no compiled code references a skipped source, and zakura_minimal.rs replaces the whole bodies of the disabled entry points (SST ingestion, column family import, remote compaction, tracing and replay) with their NotSupported returns, deletes the remote compaction branch of CompactionJob::ProcessKeyValueCompaction, makes plain table creation return NotSupported, and makes the unreachable WritePreparedSnapshotChecker::CheckInSnapshot abort; every edit still asserts its anchor occurs exactly once. No new sources outside RocksDB, flags beyond NO_PCLMUL, downloads, or links. Published from fork commit cf3bdeb, whose CI links and runs a minimal-build test with GCC 12 to 16, several clang versions, aarch64 Linux, macOS, and MSVC, in release and debug; zakura-state's tests pass against it."""
+
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4611,6 +4629,12 @@ who = "Claude <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 delta = "0.24.1 -> 0.24.2"
 notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.5; the Rust sources are unchanged. The CI workflow adds a build without `full` on each platform."
+
+[[audits.zakura-rocksdb]]
+who = "Claude <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+delta = "0.24.2 -> 0.24.4"
+notes = "Version bump and exact pin to zakura-librocksdb-sys 0.17.7; the library sources under src/ are unchanged. Adds tests/test_zakura_minimal.rs, a test of the RocksDB features Zakura uses, and CI scripts and a workflow that build without `full` across many toolchains and check the archive for undefined RocksDB symbols. README and CHANGELOG document the minimal build and the committed bindings."
 
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

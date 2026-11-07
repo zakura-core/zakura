@@ -35,6 +35,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
+        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_MAX,
+        DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
@@ -52,7 +54,8 @@ mod tests;
 pub use cache_dir::CacheDir;
 
 pub(crate) use cache_dir::{
-    default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
+    default_network_identity_dir, zakura_discovery_sequence_file_path,
+    zakura_node_secret_key_file_path as zakura_secret_key_file_path,
 };
 
 /// A sensitive secret-key override for Zakura P2P node identity.
@@ -354,6 +357,56 @@ pub struct Config {
     /// Enabling this setting reveals peer topology in logs and trace files. Restrict access
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
+
+    /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
+    ///
+    /// The count grows linearly to `advert_window_max` as block size falls to
+    /// `advert_window_small_size_bytes`. Sidecars receive inventory immediately outside
+    /// this group. All remaining peers receive inventory after the configured delay.
+    ///
+    /// Experimental.
+    pub advert_window_min: usize,
+
+    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
+    /// Must be at least `advert_window_min`.
+    ///
+    /// Experimental.
+    pub advert_window_max: usize,
+
+    /// The size at or below which broadcasts use the largest initial group and shortest delay.
+    /// Must be below `advert_window_full_size_bytes`.
+    ///
+    /// Experimental.
+    pub advert_window_small_size_bytes: u64,
+
+    /// The size at or above which broadcasts use the smallest initial group and longest delay.
+    /// Must exceed `advert_window_small_size_bytes`.
+    ///
+    /// Experimental.
+    pub advert_window_full_size_bytes: u64,
+
+    /// The delay before announcing small blocks to peers outside the initial group.
+    ///
+    /// The delay grows linearly to `advert_delay_max` between the configured size thresholds.
+    /// Each broadcast measures this delay once from its start, independently of peer requests
+    /// and uploads. Zero announces to every peer immediately. Defaults to zero.
+    ///
+    /// Experimental.
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    pub advert_delay_min: Duration,
+
+    /// The delay before announcing full-sized or unknown-sized blocks to remaining peers.
+    ///
+    /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
+    /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
+    /// concurrent body writes.
+    /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
+    /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
+    /// announcements to the remaining peers.
+    ///
+    /// Experimental.
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    pub advert_delay_max: Duration,
 }
 
 impl Config {
@@ -400,6 +453,19 @@ impl Config {
     /// at the same time.
     pub fn peerset_total_connection_limit(&self) -> usize {
         self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
+    }
+
+    /// The most bytes that TCP decoders can hold for incomplete messages across every
+    /// allowed connection.
+    ///
+    /// This partition follows from the connection limit, because each connection's
+    /// decoder holds at most one incomplete message. The decoder cannot wait for
+    /// shared capacity, so the connection limit is the enforced bound. Handshaking
+    /// connections have a smaller body limit, so this also covers them.
+    pub fn tcp_ingress_bound_bytes(&self) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        (self.peerset_total_connection_limit() as u64)
+            .saturating_mul(crate::zakura::TCP_INGRESS_BUDGET.receive)
     }
 
     /// Returns the initial seed peer hostnames for the configured network.
@@ -767,6 +833,12 @@ impl Config {
         Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 
+    /// The file that holds the last discovery self-record sequence that
+    /// `node_id` authored, under [`identity_dir`](Self::identity_dir).
+    pub(crate) fn zakura_discovery_sequence_file(&self, node_id: &zakura_quic::NodeId) -> PathBuf {
+        zakura_discovery_sequence_file_path(&self.identity_dir, &self.network, node_id)
+    }
+
     /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer
     /// dialing, and peer crawler on the configured network.
     pub fn legacy_p2p(&self) -> bool {
@@ -782,6 +854,9 @@ impl Config {
 
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to
     /// `p2p_stack`, so the stack is never re-derived from the network's binary defaults.
+    ///
+    /// [`identity_dir`](Self::identity_dir) is a fresh [`test_identity_dir`], so a test
+    /// endpoint never reads or overwrites a real node's identity files.
     ///
     /// Override other fields with struct-update syntax, e.g.
     /// `Config { network, ..Config::for_test(P2pStack::Dual) }`.
@@ -800,6 +875,7 @@ impl Config {
 
         Config {
             p2p_stack,
+            identity_dir: test_identity_dir(),
             zakura: ZakuraConfig {
                 listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
                 ..ZakuraConfig::default()
@@ -807,6 +883,19 @@ impl Config {
             ..Config::default()
         }
     }
+}
+
+/// Returns a new directory path under [`std::env::temp_dir`] for a test node's
+/// identity files. The default `~/.zakura` holds a real node's identity key and
+/// discovery sequence, which a test endpoint would otherwise read and overwrite.
+///
+/// The path is not created: the first write creates it, and it outlives the test.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub(crate) fn test_identity_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "zakura-test-identity-{:016x}",
+        rand_10::random::<u64>()
+    ))
 }
 
 /// Loads a persisted Zakura secret key from `key_file`, or generates, persists, and
@@ -925,6 +1014,12 @@ impl Default for Config {
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
+            advert_window_min: DEFAULT_ADVERT_WINDOW_MIN,
+            advert_window_max: DEFAULT_ADVERT_WINDOW_MAX,
+            advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
+            advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
+            advert_delay_min: Duration::ZERO,
+            advert_delay_max: Duration::ZERO,
         }
     }
 }
@@ -1123,6 +1218,17 @@ struct DConfig {
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
+    /// `None` if the config does not set it, so [`resolve_advert_windows`] can derive it from
+    /// the other bound.
+    advert_window_min: Option<usize>,
+    /// `None` if the config does not set it. See `advert_window_min`.
+    advert_window_max: Option<usize>,
+    advert_window_small_size_bytes: u64,
+    advert_window_full_size_bytes: u64,
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    advert_delay_min: Duration,
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    advert_delay_max: Duration,
 }
 
 impl Default for DConfig {
@@ -1146,6 +1252,12 @@ impl Default for DConfig {
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            advert_window_min: None,
+            advert_window_max: None,
+            advert_window_small_size_bytes: config.advert_window_small_size_bytes,
+            advert_window_full_size_bytes: config.advert_window_full_size_bytes,
+            advert_delay_min: config.advert_delay_min,
+            advert_delay_max: config.advert_delay_max,
         }
     }
 }
@@ -1215,6 +1327,12 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1256,6 +1374,12 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
+            advert_window_min: Some(advert_window_min),
+            advert_window_max: Some(advert_window_max),
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         }
     }
 }
@@ -1283,9 +1407,26 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        let (advert_window_min, advert_window_max) =
+            resolve_advert_windows(advert_window_min, advert_window_max);
+        validate_advert_fanout(
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
+        )
+        .map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {
@@ -1400,10 +1541,15 @@ impl<'de> Deserialize<'de> for Config {
         }
         zakura.quic.validate().map_err(de::Error::custom)?;
         if p2p_stack.resolve(&network).runs_zakura() {
+            zakura
+                .validate_stream_receive_window()
+                .map_err(de::Error::custom)?;
+        }
+        if p2p_stack.resolve(&network).runs_zakura() {
             // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
             // lowers a larger cap after tracing starts so its warning is logged.
             zakura
-                .budgeted_max_connections()
+                .budgeted_max_connections(&network)
                 .map_err(de::Error::custom)?;
         }
 
@@ -1422,8 +1568,58 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         })
     }
+}
+
+/// Resolves omitted initial-group bounds without changing explicitly configured values.
+fn resolve_advert_windows(min: Option<usize>, max: Option<usize>) -> (usize, usize) {
+    match (min, max) {
+        (Some(min), Some(max)) => (min, max),
+        (Some(min), None) => (min, DEFAULT_ADVERT_WINDOW_MAX.max(min)),
+        (None, Some(max)) => (DEFAULT_ADVERT_WINDOW_MIN.min(max), max),
+        (None, None) => (DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_MAX),
+    }
+}
+
+/// Checks the block advert fan-out settings.
+fn validate_advert_fanout(
+    advert_window_min: usize,
+    advert_window_max: usize,
+    advert_window_small_size_bytes: u64,
+    advert_window_full_size_bytes: u64,
+    advert_delay_min: Duration,
+    advert_delay_max: Duration,
+) -> Result<(), String> {
+    if advert_window_min == 0 || advert_window_min > advert_window_max {
+        return Err(format!(
+            "advert_window_min and advert_window_max must satisfy \
+             1 <= advert_window_min <= advert_window_max, \
+             got {advert_window_min} and {advert_window_max}"
+        ));
+    }
+    if advert_window_small_size_bytes >= advert_window_full_size_bytes {
+        return Err(format!(
+            "advert_window_small_size_bytes must be below advert_window_full_size_bytes, \
+             got {advert_window_small_size_bytes} and {advert_window_full_size_bytes}"
+        ));
+    }
+    if advert_delay_min > advert_delay_max {
+        return Err("advert_delay_min must not exceed advert_delay_max".to_owned());
+    }
+    if std::time::Instant::now()
+        .checked_add(advert_delay_max)
+        .is_none()
+    {
+        return Err("advert_delay_max exceeds the monotonic clock range".to_owned());
+    }
+    Ok(())
 }
 
 fn zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(zakura: &ZakuraConfig) -> bool {

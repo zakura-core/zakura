@@ -94,13 +94,8 @@ fn requests(key: &AdapterKey) -> Vec<HeaderRequest> {
     let target = Frontier::new(block::Height(2), block::Hash([2; 32]));
     let scope = owner().header_authority();
     let path = RetainedHeaderPath::from_adapter(key, 7, source, 8, ancestor, target, scope);
-    let permit = Arc::new(zakura_rt::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .expect("a fresh semaphore has a permit");
     vec![
-        HeaderRequest::ContinuationLocator {
-            permit: LocatorReadPermit::new(permit),
-        },
+        HeaderRequest::ContinuationLocator,
         HeaderRequest::VctRepairContext {
             owner: BodyWorkAuthority {
                 header: scope,
@@ -582,4 +577,49 @@ fn an_own_target_seal_keeps_engine_and_fault() {
     assert!(apply
         .fault_reply(&key, Fault::LocalResource, Duration::ZERO)
         .is_ok());
+}
+
+/// A failed prepare's or apply's identity keeps whom its error blamed, so
+/// the simulator can judge the penalty without the logged category growing.
+#[test]
+fn failure_identities_keep_the_attribution() {
+    use zakura_header_chain::{Attribution, EvidenceId, HeaderId, RuleId};
+
+    let key = AdapterKey::new();
+    let source = SourceId::from_digest([6; 32]);
+    let subject = ErrorSubject::Header(HeaderId::new(block::Hash([2; 32])));
+    let invalid = || {
+        HeaderChainError::invalid_header(
+            subject,
+            RuleId::new("LC-VAL-01"),
+            EvidenceId::from_digest([3; 32]),
+            source,
+            None,
+        )
+    };
+    let prepared = HeaderReply::PrepareHeaderTarget(Err(Arc::new(invalid())));
+    assert_eq!(
+        evidence::ResultIdentity::of(&prepared, &key, None, None),
+        evidence::ResultIdentity::PrepareFailed {
+            category: ErrorCategory::InvalidHeader,
+            attribution: Attribution::HeaderPeer(source),
+        }
+    );
+    let applied = HeaderReply::ApplyHeaderTarget(Err(Arc::new(invalid())));
+    assert_eq!(
+        evidence::ResultIdentity::of(&applied, &key, None, None),
+        evidence::ResultIdentity::ApplyFailed {
+            category: ErrorCategory::InvalidHeader,
+            attribution: Attribution::HeaderPeer(source),
+        }
+    );
+    let local =
+        HeaderReply::PrepareHeaderTarget(Err(Arc::new(HeaderChainError::stale_target(subject))));
+    assert_eq!(
+        evidence::ResultIdentity::of(&local, &key, None, None),
+        evidence::ResultIdentity::PrepareFailed {
+            category: ErrorCategory::StaleTargetOrGeneration,
+            attribution: Attribution::None,
+        }
+    );
 }

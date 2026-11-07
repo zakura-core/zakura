@@ -869,7 +869,6 @@ impl From<Vec<pallas::Base>> for NoteCommitmentTree {
 
 #[cfg(test)]
 mod tests {
-    use bitvec::prelude::*;
     use incrementalmerkletree::{frontier::Frontier, Position};
 
     use super::*;
@@ -936,12 +935,19 @@ mod tests {
         left: pallas::Base,
         right: pallas::Base,
     ) -> pallas::Base {
-        let mut s = bitvec![u8, Lsb0;];
+        // The bits of `bytes`, starting with the least-significant bit of `bytes[0]`.
+        fn le_bits(bytes: &[u8]) -> impl Iterator<Item = bool> + '_ {
+            bytes
+                .iter()
+                .flat_map(|byte| (0..8).map(move |i| (byte >> i) & 1 == 1))
+        }
 
         let l = MERKLE_DEPTH - 1 - layer;
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
-        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+        let s: Vec<bool> = le_bits(&[l, 0])
+            .take(10)
+            .chain(le_bits(&left.to_repr()).take(255))
+            .chain(le_bits(&right.to_repr()).take(255))
+            .collect();
 
         match crate::orchard::sinsemilla::sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
             Some(h) => h,

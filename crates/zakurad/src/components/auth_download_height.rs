@@ -14,7 +14,9 @@
 //! coinbase input height, carries the height its header commits to. Any other body cannot be the
 //! block its header names. Only the supplier chose that body, so the supplier is at fault.
 
-use zakura_chain::block::{self, Block, Height};
+#[cfg(test)]
+use zakura_chain::block::Block;
+use zakura_chain::block::{self, BlockRef, Height};
 
 /// Returns whether `block`'s header can authenticate its claimed coinbase `height`.
 ///
@@ -22,8 +24,12 @@ use zakura_chain::block::{self, Block, Height};
 /// transaction, so it runs only when `policy_uses_height` is set: callers set it when the claimed
 /// height would make them drop or pause the block. The verifiers check the Merkle root of every
 /// block they accept, so an honest block in the download window pays for that hashing only once.
-pub(crate) fn height_is_unbound(block: &Block, height: Height, policy_uses_height: bool) -> bool {
-    let Some(coinbase) = block.transactions.first() else {
+pub(crate) fn height_is_unbound(
+    block: &BlockRef,
+    height: Height,
+    policy_uses_height: bool,
+) -> bool {
+    let Some(coinbase) = block.transactions().next() else {
         return true;
     };
 
@@ -38,9 +44,9 @@ pub(crate) fn height_is_unbound(block: &Block, height: Height, policy_uses_heigh
 ///
 /// Duplicate-transaction padding (CVE-2012-2459) leaves the coinbase in place, so it cannot change
 /// the height and the verifiers reject it later.
-fn header_commits_to_transactions(block: &Block) -> bool {
-    let merkle_root: block::merkle::Root = block.transactions.iter().map(|tx| tx.hash()).collect();
-    merkle_root == block.header.merkle_root
+fn header_commits_to_transactions(block: &BlockRef) -> bool {
+    let merkle_root: block::merkle::Root = block.transactions().map(|tx| tx.hash()).collect();
+    merkle_root == block.header().merkle_root
 }
 
 /// Clones `canonical` and rewrites its coinbase input height.

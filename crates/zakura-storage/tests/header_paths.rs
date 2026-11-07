@@ -575,3 +575,37 @@ async fn a_read_sweeps_and_a_served_page_frees_its_slot() {
     assert!(c_waiting.is_released());
     assert_eq!(port.live_leases(), 0);
 }
+
+/// The state digest covers the lease registry as well as the engine. An
+/// acquire and a release each move it while the engine's snapshot stays
+/// put, an acquire-release round trip leaves it moved (the lease counter
+/// advanced), and two registries that differ only in their live lease's
+/// ID digest differently.
+#[test]
+fn the_state_digest_covers_the_lease_registry() {
+    let (port, main, _) = chain();
+    let snapshot = port.snapshot();
+    let start = port.state_digest();
+    let path = acquired(acquire(&port, peer(1), main[1].hash, vec![main[0].hash]));
+    let leased = port.state_digest();
+    assert_ne!(leased, start, "an acquire moves the digest");
+    ready(port.release_header_path(path)).expect("a release succeeds");
+    let released = port.state_digest();
+    assert_ne!(released, leased, "a release moves the digest");
+    assert_ne!(released, start, "the lease counter advanced");
+    assert_eq!(port.snapshot(), snapshot, "the engine never changed");
+
+    // Peer 2 ends up holding lease 2 on one port and lease 1 on the other,
+    // with the counter at 2 on both.
+    let (first, main, _) = chain();
+    let (second, _, _) = chain();
+    let short =
+        |port: &EnginePort, n| acquired(acquire(port, peer(n), main[1].hash, vec![main[0].hash]));
+    let dropped = short(&first, 1);
+    short(&first, 2);
+    ready(first.release_header_path(dropped)).expect("a release succeeds");
+    short(&second, 2);
+    let dropped = short(&second, 1);
+    ready(second.release_header_path(dropped)).expect("a release succeeds");
+    assert_ne!(first.state_digest(), second.state_digest());
+}

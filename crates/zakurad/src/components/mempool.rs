@@ -24,13 +24,19 @@ use std::{
     iter,
     net::IpAddr,
     pin::{pin, Pin},
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, mpsc, oneshot};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneService, Service, ServiceExt};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tower::{
+    buffer::Buffer,
+    timeout::Timeout,
+    util::{BoxCloneService, BoxCloneSyncService},
+    Service, ServiceExt,
+};
 
 use zakura_chain::{
     block::{self, Height},
@@ -119,8 +125,7 @@ fn transaction_error_peer_log_label(
     }
 }
 
-type Outbound =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type Outbound = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;
@@ -134,7 +139,6 @@ type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, Re
 /// mempool and its crawler activate, and at which the mempool starts peer
 /// transaction cooldowns.
 ///
-/// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
 /// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
 /// the gap between the two thresholds keeps the mempool from flapping.
 const MAX_ESTIMATED_DISTANCE_TO_ENABLE: block::HeightDiff = 100;
@@ -426,6 +430,7 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // The verifier failed, or the error does not name the rule that failed.
         Script(_)
         | InternalDowncastError(_)
+        | StateUnavailable(_)
         | Io(_)
         | TryFromSlice(_)
         | Amount(_)
@@ -621,6 +626,10 @@ pub struct Mempool {
     /// The canonical IPs of zcashd-compat sidecars. The mempool never bans,
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
+
+    /// Signalled after each transaction download and verify task finishes.
+    /// Shared with every downloader, and kept across mempool resets.
+    verification_finished: Arc<Notify>,
 }
 
 impl Mempool {
@@ -661,6 +670,7 @@ impl Mempool {
                 .into_iter()
                 .map(|ip| ip.to_canonical())
                 .collect(),
+            verification_finished: Arc::new(Notify::new()),
         };
 
         // Make sure `is_enabled` is accurate.
@@ -668,6 +678,13 @@ impl Mempool {
         service.update_state(None, service.is_caught_up_to_start());
 
         (service, transaction_subscriber)
+    }
+
+    /// Returns the signal that fires after each transaction verification finishes.
+    ///
+    /// A mempool request sent after this signal adds the verified transaction.
+    pub(crate) fn verification_finished(&self) -> Arc<Notify> {
+        self.verification_finished.clone()
     }
 
     /// Is the mempool enabled by a debug config option?
@@ -745,6 +762,7 @@ impl Mempool {
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
             self.peer_cooldowns.clone(),
+            self.verification_finished.clone(),
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -1074,15 +1092,11 @@ impl Service<Request> for Mempool {
 
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
-            }
 
-            // Remove expired transactions from the mempool.
-            //
-            // Lock times never expire, because block times are strictly increasing.
-            // So we don't need to check them here.
-            if let Some(tip_height) = best_tip_height {
-                let expired_transactions = storage.remove_expired_transactions(tip_height);
-                // Remove transactions that are expired from the peers list
+                // Expiry changes only when the chain grows. New transactions
+                // are verified for the next height, and verification is retried
+                // if the tip height changes before insertion.
+                let expired_transactions = storage.remove_expired_transactions(block.height);
                 send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {
@@ -1233,15 +1247,17 @@ impl Service<Request> for Mempool {
                 Request::AwaitOutput(outpoint) => {
                     trace!(?req, "got mempool request");
 
-                    let response_fut = storage.pending_outputs.queue(outpoint);
-
-                    if let Some(output) = storage.created_output(&outpoint) {
-                        storage.pending_outputs.respond(&outpoint, output)
-                    }
+                    // A created output answers immediately, without a waiter slot.
+                    let response_fut = if let Some(output) = storage.created_output(&outpoint) {
+                        storage.pending_outputs.respond(&outpoint, output.clone());
+                        async move { Ok(Response::UnspentOutput(output)) }.boxed()
+                    } else {
+                        storage.pending_outputs.queue(outpoint).boxed()
+                    };
 
                     trace!("answered mempool request");
 
-                    response_fut.boxed()
+                    response_fut
                 }
 
                 Request::FullTransactions => {

@@ -9,6 +9,7 @@ mod support;
 mod provenance;
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -39,8 +40,8 @@ use zakura_sim::{
         TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES,
         MAX_TRACE_BYTES, TRACE_FILE,
     },
-    Checker, HexU64, MemorySink, NoChecks, Outcome, PlanInput, Record, RecordSink, RunConfig,
-    RunReport, Sim, Violation,
+    Checker, HexU64, MemorySink, NoChecks, Observation, Outcome, PlanInput, Record, RecordSink,
+    RunConfig, RunReport, Sim, Violation,
 };
 
 /// Three tasks that share a lock, sleep and yield, so runs take time
@@ -188,6 +189,40 @@ fn real_run_round_trips() {
     assert!(bytes.ends_with(b"\n"));
 }
 
+/// Every lock and release point names the workload's one lock: its first
+/// locker's first object. Other points name none.
+#[test]
+fn lock_points_name_their_lock() {
+    let dir = TempDir::new().unwrap();
+    let report = record_to(dir.path(), &meta(), plan(), &mut NoChecks);
+    let mut named = Vec::new();
+    for entry in report.log.entries() {
+        if let Observation::TaskReached {
+            task, at, object, ..
+        } = &entry.obs
+        {
+            match at.split('#').next() {
+                Some("lock" | "release") => named.push((
+                    task.as_str(),
+                    object
+                        .as_deref()
+                        .unwrap_or_else(|| panic!("{task} at {at} names no object")),
+                )),
+                _ => assert_eq!(*object, None, "{task} at {at}"),
+            }
+        }
+    }
+    let (first, _) = named.first().expect("the run takes the lock");
+    let lock = format!("{first}:object#1");
+    assert!(named.iter().all(|(_, object)| *object == lock), "{named:?}");
+    let tasks: BTreeSet<&str> = named.iter().map(|(task, _)| *task).collect();
+    assert_eq!(
+        tasks.len(),
+        3,
+        "each task's points name the lock: {named:?}"
+    );
+}
+
 #[test]
 fn equal_runs_write_equal_bytes() {
     for plan in inputs(10, 64) {
@@ -274,9 +309,8 @@ fn run_and_read(checker: &mut dyn Checker) -> (RunReport, EndRecord) {
 /// A report for `test/at-end`.
 fn at_end(outcome: PropertyOutcome, holds_since: Option<u64>) -> PropertyReport {
     PropertyReport {
-        property: "test/at-end".into(),
-        outcome,
         holds_since,
+        ..PropertyReport::new("test/at-end", outcome)
     }
 }
 
@@ -305,7 +339,9 @@ fn reports_outside_the_run_are_a_harness_failure() {
         (&[kept.clone()][..], &[kept][..])
     );
 
-    // So does a holds_since past the last step.
+    // So does a holds_since past the last step, and like any harness
+    // failure it leaves a property that didn't apply inconclusive, in the
+    // report and in the end record alike.
     let (run, end) = run_and_read(&mut reports_at_end(|steps| {
         at_end(PropertyOutcome::NotApplicable, Some(steps + 1))
     }));
@@ -317,9 +353,15 @@ fn reports_outside_the_run_are_a_harness_failure() {
         })
     );
     assert_eq!(end.outcome, OutcomeKind::Harness);
+    let inconclusive = at_end(
+        PropertyOutcome::Inconclusive {
+            reason: "harness-failed".into(),
+        },
+        None,
+    );
     assert_eq!(
-        end.properties,
-        [at_end(PropertyOutcome::NotApplicable, None)]
+        (&run.properties[..], &end.properties[..]),
+        (&[inconclusive.clone()][..], &[inconclusive][..])
     );
 
     // References to the run's own steps, including holds_since 0 and the
@@ -655,6 +697,7 @@ fn writer_keeps_to_the_line_limit() {
             offset: None,
             draws: Vec::new(),
             obs: None,
+            machine: None,
         })
     };
     sink.record(Record::Init(InitRecord::default()));
@@ -790,16 +833,31 @@ fn unsupported_format() {
     let dir = recorded(plan());
     // A newer format may add fields, so the version is checked first.
     edit_meta(dir.path(), |meta| {
-        meta["format"] = json!(2);
+        meta["format"] = json!(zakura_sim::record::FORMAT_VERSION + 1);
         meta["requires_hints"] = json!(true);
     });
     assert_eq!(
         invalid(dir.path()),
         Invalid::UnsupportedVersion {
             field: "format",
-            found: 2
+            found: zakura_sim::record::FORMAT_VERSION + 1
         }
     );
+}
+
+#[test]
+fn previous_machine_formats_are_rejected() {
+    for format in 19..zakura_sim::record::FORMAT_VERSION {
+        let dir = recorded(plan());
+        edit_meta(dir.path(), |meta| meta["format"] = json!(format));
+        assert_eq!(
+            invalid(dir.path()),
+            Invalid::UnsupportedVersion {
+                field: "format",
+                found: format
+            }
+        );
+    }
 }
 
 #[test]
@@ -1443,6 +1501,7 @@ fn step() -> impl Strategy<Value = StepRecord> {
                 offset,
                 draws,
                 obs,
+                machine: None,
             },
         )
 }
@@ -1505,9 +1564,8 @@ fn end() -> impl Strategy<Value = EndRecord> {
     let properties = vec(
         (text(), property_outcome(), option::of(edge_u64())).prop_map(
             |(property, outcome, holds_since)| PropertyReport {
-                property,
-                outcome,
                 holds_since,
+                ..PropertyReport::new(property, outcome)
             },
         ),
         0..3,
@@ -1751,6 +1809,7 @@ fn round_trip_edges() {
         offset: None,
         draws: Vec::new(),
         obs: None,
+        machine: None,
     };
     let bare_end = EndRecord {
         outcome: OutcomeKind::Budget,

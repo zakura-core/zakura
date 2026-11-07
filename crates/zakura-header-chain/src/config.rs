@@ -499,6 +499,43 @@ impl Default for EngineLimits {
     }
 }
 
+/// Bytes that a hash-map entry retains beyond its key and value, as a whole
+/// multiple of those. A hash table keeps spare capacity below its maximum load.
+const HASH_TABLE_OVERHEAD_FACTOR: u64 = 2;
+
+/// The size of a value, in the units the retained-memory envelope adds.
+const fn bytes_of<T>() -> u64 {
+    // `usize` fits `u64` on every supported target, and `size_of` is small here.
+    std::mem::size_of::<T>() as u64
+}
+
+/// Upper bound on memory retained at the v1 limits by the header DAG and its references.
+///
+/// This counts each node's inline value, decoded header, height index entry, child index
+/// entry, and eligible-tip entry. It adds auxiliary deliveries and tombstones at their
+/// row limits, and one full hash path for each retained-path reference. These owners
+/// enforce count limits, and their row sizes are fixed, so no byte gauge is needed.
+/// Pressure refuses admission instead of evicting a protected path.
+/// RocksDB rows are durable and belong to the store's own limits.
+pub const RETAINED_HEADER_MEMORY_ENVELOPE_V1_BYTES: u64 = {
+    let hash = bytes_of::<block::Hash>();
+    let indexes = 3 * 2 * hash;
+    let node = (bytes_of::<crate::HeaderNode>() + hash) * HASH_TABLE_OVERHEAD_FACTOR
+        + bytes_of::<block::Header>()
+        + indexes * HASH_TABLE_OVERHEAD_FACTOR;
+    let delivery = (bytes_of::<crate::AuxDelivery>() + bytes_of::<crate::EvidenceId>())
+        * HASH_TABLE_OVERHEAD_FACTOR;
+    let tombstone =
+        (bytes_of::<crate::ConsensusInvalidBodyTombstone>() + hash) * HASH_TABLE_OVERHEAD_FACTOR;
+    let nodes = MAX_NON_FINALIZED_NODES_V1 as u64;
+    nodes * node
+        + MAX_AUX_DELIVERIES_TOTAL_V1 as u64 * delivery
+        + nodes * tombstone
+        + MAX_RETENTION_REFERENCES_V1 as u64 * nodes * hash
+};
+
+const _: () = assert!(RETAINED_HEADER_MEMORY_ENVELOPE_V1_BYTES <= 1024 * 1024 * 1024);
+
 const _: () = assert!(MAX_BLOCK_REORG_HEIGHT == 1_000);
 const _: () = assert!(MAX_CANDIDATE_TIPS_V1 == 11);
 const _: () = assert!(MAX_NON_FINALIZED_NODES_V1 == 65_536);
@@ -519,6 +556,15 @@ mod tests {
         serialization::ZcashDeserialize,
         work::difficulty::U256,
     };
+
+    #[test]
+    fn retained_memory_envelope_funds_each_v1_node_and_its_header() {
+        let per_node = RETAINED_HEADER_MEMORY_ENVELOPE_V1_BYTES
+            / u64::try_from(MAX_NON_FINALIZED_NODES_V1).unwrap();
+        let header = u64::try_from(std::mem::size_of::<block::Header>()).unwrap();
+        let node = u64::try_from(std::mem::size_of::<crate::HeaderNode>()).unwrap();
+        assert!(per_node > header + node);
+    }
 
     #[test]
     fn engine_limits_v1_match_the_frozen_specification() {

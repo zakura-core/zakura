@@ -485,6 +485,33 @@ impl SessionEvidence {
     pub fn facts(&self) -> Vec<SessionFact> {
         self.ledger().facts.clone()
     }
+
+    /// Whether the node's membership is `peer` alone: own-9 has a `Session`
+    /// row for `peer`'s header session, every row is `peer`'s, and the
+    /// reactor admitted only `peer`'s sessions. A row comes before the
+    /// reactor's admission and before any frame its stream reads. `false`
+    /// without own-9's facts.
+    ///
+    /// Only the environment can add another peer, so this stops holding
+    /// only when it does. A session the node ends, refuses, retires or opens
+    /// again, a generation it exits and a connection it tears down all leave
+    /// it holding, since those are the node's own doing. The caller checks
+    /// the environment's other end of the membership, `peer`'s own close.
+    pub fn stable_membership(&self, peer: &str) -> bool {
+        let ledger = self.ledger();
+        let Some(own9) = &ledger.own9 else {
+            return false;
+        };
+        let is_peer = |row: &Row| row.peer.as_deref() == Some(peer);
+        own9.rows
+            .iter()
+            .any(|row| is_peer(row) && row.kind == ZAKURA_STREAM_HEADER_SYNC)
+            && own9.rows.iter().all(is_peer)
+            && ledger.facts.iter().all(|fact| match fact {
+                SessionFact::SessionAdmitted { peer: admitted, .. } => admitted == peer,
+                _ => true,
+            })
+    }
 }
 
 impl SessionLedger {

@@ -605,6 +605,14 @@ pub static COVERAGE: &[Coverage] = &[
             "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
         )),
     },
+    Coverage {
+        property: crate::domain::header_sync_progress::HONEST_PROGRESS,
+        passing: passes(
+            "tests/header_wire_progress.rs",
+            "the_progress_fixture_holds_honest_progress",
+        ),
+        bypass: Bypass::Planted("skipped-apply"),
+    },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its committed input unpatched as a
     // witness test that expects a hold, before it runs the patch.

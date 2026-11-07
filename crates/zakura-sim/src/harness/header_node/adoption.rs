@@ -383,6 +383,24 @@ impl AdoptionEvidence {
         self.store().facts.clone()
     }
 
+    /// The stamps of the facts after stamp `after`, or of every fact with
+    /// `None`, in increasing order. A fact's stamp is its position in
+    /// [`AdoptionEvidence::facts`] from 1, so it orders the facts as the
+    /// reactor reported them.
+    pub fn stamps_after(&self, after: Option<u64>) -> Vec<u64> {
+        let recorded = u64::try_from(self.store().facts.len()).expect("a run keeps few facts");
+        (after.map_or(1, |after| after.saturating_add(1))..=recorded).collect()
+    }
+
+    /// The fact with stamp `stamp` ([`AdoptionEvidence::stamps_after`]).
+    pub fn fact_at(&self, stamp: u64) -> Option<AdoptionFact> {
+        let index = usize::try_from(stamp.checked_sub(1)?).ok()?;
+        self.store()
+            .facts
+            .get(index)
+            .map(|stamped| stamped.fact.clone())
+    }
+
     /// The latest time the run is known to have reached.
     pub fn horizon(&self) -> Duration {
         self.store().horizon

@@ -42,13 +42,15 @@ type Seed = (&'static str, FloodScenario, &'static str, usize);
 
 /// Every committed input. Each Plan is one whose flooded queue competes
 /// with the commit's watch read, and on which the reverted reactor breaks
-/// that queue's rule.
+/// that queue's rule while still adopting the published state before
+/// either queue's third event: through the held read's completion in the
+/// wire fixture, and a churn connect in the lifecycle one.
 const SEEDS: [Seed; 2] = [
     (
         "header-flood-wire",
         FloodScenario::Wire,
         WATCH_OBSERVED_UNDER_FLOOD,
-        4,
+        14,
     ),
     (
         "header-flood-lifecycle",

@@ -2,7 +2,8 @@
 # takes its events. Under the lifecycle churn the `select!`'s lifecycle arm
 # always wins over its watch arm, so the input's commit is never read from
 # the watch, and the reactor takes a third lifecycle event first. Each
-# churn connect still refreshes the snapshot, so the state is adopted.
+# churn connect still refreshes the snapshot within two lifecycle events,
+# so the state is adopted in time.
 input = "crates/zakura-sim/tests/fixtures/header-flood-lifecycle.bin"
 # Besides reactor.rs, which the patch changes, the session receiver and the
 # queues decide how fast lifecycle events arrive and when the commit lands.

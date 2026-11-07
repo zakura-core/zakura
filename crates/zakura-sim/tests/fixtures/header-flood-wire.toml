@@ -3,7 +3,7 @@
 # picks the flood fixture, then come the Plan bytes.
 harness = "header-sync/flood"
 generator = 1
-sha256 = "ec95888b745ae25e9f1667cf229e19630e232d34cff560822efcbd0688c9aecb"
+sha256 = "43bdf80ea4383b2546f51043ad4abe705e7b9cfe7758ed568ab8b5b8e20a1aab"
 scenario_sha256 = "eb19cec52c10af75f1d2e822d4a480d4a116bcd5abcdd14625d1be6fa61a73fc"
 source = "crates/zakura-sim/tests/header_flood_watch.rs"
 

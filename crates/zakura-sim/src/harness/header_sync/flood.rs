@@ -42,10 +42,10 @@ const BUDGET: u64 = 20_000;
 #[serde(rename_all = "kebab-case")]
 pub enum FloodScenario {
     /// 16 mirrors at the node's tip flood its wire queue. A 17th, one
-    /// header ahead, gets a locator read held. Once every flood is linked,
-    /// the node commits two headers past its tip, and right after that the
-    /// held read is released, so its completion refreshes the committed
-    /// snapshot.
+    /// header ahead, gets a locator read held. Once every flood session is
+    /// admitted, the read is released, and as it completes the node commits
+    /// two headers past its tip, so the read's completion refreshes the
+    /// committed snapshot right after the publication.
     Wire,
     /// 16 mirrors at the node's tip churn its lifecycle queue. Once every
     /// churn has started, the node commits two headers past its tip. Each
@@ -73,39 +73,48 @@ impl FloodScenario {
         let mut controls: Vec<ControlStep> = (0..FLOODERS)
             .map(|index| step(format!("mirror-{index}"), action))
             .collect();
-        // The wire fixture commits once the node has admitted every flood
-        // session, its setup link's and its flood's, so their lifecycle
-        // events are mostly behind it.
-        let commit_when = (self == FloodScenario::Wire).then(|| {
-            Trigger::All(
-                (0..FLOODERS)
-                    .map(|index| {
-                        Trigger::Count(
-                            2,
-                            Box::new(Trigger::SessionAdmitted(format!("mirror-{index}"))),
-                        )
-                    })
-                    .collect(),
-            )
-        });
-        controls.push(ControlStep {
+        let commit = |when| ControlStep {
             peer: "node".to_owned(),
             action: ControlAction::Commit { len: COMMIT },
-            when: commit_when,
-        });
+            when,
+        };
         let mut holds = Vec::new();
-        if self == FloodScenario::Wire {
-            mirrors.push(MirrorSpec {
-                chain: Chain::main(NODE_TIP + 1),
-                dialer: Dialer::Mirror,
-            });
-            holds.push(Hold {
-                select: Select::nth(OpKind::Locator, 1),
-                until: Trigger::Released,
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            });
-            controls.push(step("node".to_owned(), ControlAction::Release { hold: 0 }));
+        match self {
+            FloodScenario::Wire => {
+                mirrors.push(MirrorSpec {
+                    chain: Chain::main(NODE_TIP + 1),
+                    dialer: Dialer::Mirror,
+                });
+                let locator = Select::nth(OpKind::Locator, 1);
+                holds.push(Hold {
+                    select: locator.clone(),
+                    until: Trigger::Released,
+                    then: vec![Allow::Engine],
+                    deadline_ms: None,
+                });
+                // The held read is released once the node has admitted
+                // every flood session, its setup link's and its flood's, so
+                // their lifecycle events are mostly behind it. The commit
+                // comes as the read completes, so its queued reply, which
+                // the run loop takes before its events, refreshes the
+                // committed snapshot right after the publication.
+                controls.push(ControlStep {
+                    peer: "node".to_owned(),
+                    action: ControlAction::Release { hold: 0 },
+                    when: Some(Trigger::All(
+                        (0..FLOODERS)
+                            .map(|index| {
+                                Trigger::Count(
+                                    2,
+                                    Box::new(Trigger::SessionAdmitted(format!("mirror-{index}"))),
+                                )
+                            })
+                            .collect(),
+                    )),
+                });
+                controls.push(commit(Some(Trigger::Completed(locator))));
+            }
+            FloodScenario::Lifecycle => controls.push(commit(None)),
         }
         StorageScenario {
             node: Chain::main(NODE_TIP),

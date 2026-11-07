@@ -12,11 +12,9 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
-    clang \
     cmake \
     curl \
     git \
-    libclang-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
@@ -35,7 +33,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/workspace/target \
 #     RUSTFLAGS="${RUSTFLAGS}" \
-    cargo build --locked --release --features "${FEATURES},portable" --package zakura --bin zakurad && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
     install -D target/release/zakurad /out/zakurad
 
 FROM scratch AS artifact

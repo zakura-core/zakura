@@ -133,19 +133,26 @@ where
 
 impl ZcashSerialize for Option<sapling::ShieldedData<sapling::SharedAnchor>> {
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        match self {
-            None => {
-                // Denoted as `nSpendsSapling` in the spec.
-                zcash_serialize_empty_list(writer)?;
-                // Denoted as `nOutputsSapling` in the spec.
-                zcash_serialize_empty_list(writer)?;
-            }
-            Some(sapling_shielded_data) => {
-                sapling_shielded_data.zcash_serialize(writer)?;
-            }
-        }
-        Ok(())
+        serialize_optional_sapling_shielded_data(self.as_ref(), writer)
     }
+}
+
+fn serialize_optional_sapling_shielded_data<W: io::Write + ?Sized>(
+    sapling_shielded_data: Option<&sapling::ShieldedData<sapling::SharedAnchor>>,
+    writer: &mut W,
+) -> Result<(), io::Error> {
+    match sapling_shielded_data {
+        None => {
+            // Denoted as `nSpendsSapling` in the spec.
+            zcash_serialize_empty_list(writer)?;
+            // Denoted as `nOutputsSapling` in the spec.
+            zcash_serialize_empty_list(writer)?;
+        }
+        Some(sapling_shielded_data) => {
+            sapling_shielded_data.zcash_serialize(writer)?;
+        }
+    }
+    Ok(())
 }
 
 impl ZcashSerialize for sapling::ShieldedData<sapling::SharedAnchor> {
@@ -383,12 +390,16 @@ impl ZcashSerialize for Option<orchard::ShieldedData> {
     /// Serializes Orchard shielded data using the pre-Ironwood Orchard flag
     /// rules, where the cross-address bit is reserved.
     fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-        serialize_optional_orchard_shielded_data_with_flags(self, writer, !ALLOW_CROSS_ADDRESS_BIT)
+        serialize_optional_orchard_shielded_data_with_flags(
+            self.as_ref(),
+            writer,
+            !ALLOW_CROSS_ADDRESS_BIT,
+        )
     }
 }
 
 fn serialize_optional_orchard_shielded_data_with_flags<W: io::Write + ?Sized>(
-    orchard_shielded_data: &Option<orchard::ShieldedData>,
+    orchard_shielded_data: Option<&orchard::ShieldedData>,
     writer: &mut W,
     allow_cross_address_bit: bool,
 ) -> Result<(), io::Error> {
@@ -798,13 +809,13 @@ impl ZcashSerialize for Transaction {
                 // `nOutputsSapling`,`vOutputsSapling`, `valueBalanceSapling`, `anchorSapling`,
                 // `vSpendProofsSapling`, `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
-                sapling_shielded_data.zcash_serialize(writer)?;
+                serialize_optional_sapling_shielded_data(sapling_shielded_data.as_deref(), writer)?;
 
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    orchard_shielded_data,
+                    orchard_shielded_data.as_deref(),
                     writer,
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -857,14 +868,14 @@ impl ZcashSerialize for Transaction {
                 // `valueBalanceSapling`, `anchorSapling`, `vSpendProofsSapling`,
                 // `vSpendAuthSigsSapling`, `vOutputProofsSapling` and
                 // `bindingSigSapling`.
-                sapling_shielded_data.zcash_serialize(writer)?;
+                serialize_optional_sapling_shielded_data(sapling_shielded_data.as_deref(), writer)?;
 
                 // A bundle of fields denoted in the spec as `nActionsOrchard`, `vActionsOrchard`,
                 // `flagsOrchard`,`valueBalanceOrchard`, `anchorOrchard`, `sizeProofsOrchard`,
                 // `proofsOrchard`, `vSpendAuthSigsOrchard`, and `bindingSigOrchard`.
                 // V6 Orchard still reserves bit 2; only the Ironwood slot below permits it.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    orchard_shielded_data,
+                    orchard_shielded_data.as_deref(),
                     writer,
                     !ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -874,7 +885,7 @@ impl ZcashSerialize for Transaction {
                 // `anchorIronwood`, `sizeProofsIronwood`, `proofsIronwood`,
                 // `vSpendAuthSigsIronwood`, and `bindingSigIronwood`.
                 serialize_optional_orchard_shielded_data_with_flags(
-                    ironwood_shielded_data,
+                    ironwood_shielded_data.as_ref(),
                     writer,
                     ALLOW_CROSS_ADDRESS_BIT,
                 )?;
@@ -967,7 +978,7 @@ impl ZcashDeserialize for Transaction {
                     lock_time: limited_reader.read_value::<LockTime>()?,
                     // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                     // `joinSplitPubKey` and `joinSplitSig`.
-                    joinsplit_data: limited_reader.read_value::<OptV2Jsd>()?,
+                    joinsplit_data: limited_reader.read_value::<OptV2Jsd>()?.map(Box::new),
                 })
             }
             (3, true) => {
@@ -991,7 +1002,7 @@ impl ZcashDeserialize for Transaction {
                     expiry_height: block::Height(limited_reader.read_u32::<LittleEndian>()?),
                     // A bundle of fields denoted in the spec as `nJoinSplit`, `vJoinSplit`,
                     // `joinSplitPubKey` and `joinSplitSig`.
-                    joinsplit_data: limited_reader.read_value::<OptV3Jsd>()?,
+                    joinsplit_data: limited_reader.read_value::<OptV3Jsd>()?.map(Box::new),
                 })
             }
             (4, true) => {
@@ -1102,8 +1113,8 @@ impl ZcashDeserialize for Transaction {
                     outputs,
                     lock_time,
                     expiry_height,
-                    sapling_shielded_data,
-                    joinsplit_data,
+                    sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                    joinsplit_data: joinsplit_data.map(Box::new),
                 })
             }
             (5, true) => {
@@ -1168,8 +1179,8 @@ impl ZcashDeserialize for Transaction {
                     expiry_height,
                     inputs,
                     outputs,
-                    sapling_shielded_data,
-                    orchard_shielded_data,
+                    sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                    orchard_shielded_data: orchard_shielded_data.map(Box::new),
                 })
             }
             (6, true) => {
@@ -1237,8 +1248,8 @@ impl ZcashDeserialize for Transaction {
                     expiry_height,
                     inputs,
                     outputs,
-                    sapling_shielded_data,
-                    orchard_shielded_data,
+                    sapling_shielded_data: sapling_shielded_data.map(Box::new),
+                    orchard_shielded_data: orchard_shielded_data.map(Box::new),
                     ironwood_shielded_data,
                 })
             }

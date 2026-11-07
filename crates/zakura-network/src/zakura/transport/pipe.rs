@@ -18,8 +18,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use zakura_rt::{sync::CancellationToken, task::JoinHandle};
 
 use super::{Frame, SinkReject};
 use crate::zakura::transport::guard::{Admit, SessionGuard};
@@ -34,6 +33,9 @@ use crate::zakura::ZakuraPeerId;
 #[derive(Clone, Debug)]
 pub(crate) struct CloseCause {
     reason: Arc<OnceLock<&'static str>>,
+    /// The connection's transport observer, attached before registration.
+    #[cfg(any(test, zakura_sim))]
+    tap: Arc<OnceLock<Arc<super::ConnTap>>>,
 }
 
 impl CloseCause {
@@ -41,12 +43,73 @@ impl CloseCause {
     pub(crate) fn new() -> Self {
         Self {
             reason: Arc::new(OnceLock::new()),
+            #[cfg(any(test, zakura_sim))]
+            tap: Arc::new(OnceLock::new()),
         }
     }
 
     /// Record `reason` if no earlier close cause was recorded.
+    ///
+    /// In test and simulator builds, the call that records the first cause
+    /// reports it as `CloseDecided`.
     pub(crate) fn record(&self, reason: &'static str) {
+        #[cfg(not(any(test, zakura_sim)))]
         let _ = self.reason.set(reason);
+        #[cfg(any(test, zakura_sim))]
+        if self.reason.set(reason).is_ok() {
+            if let Some(tap) = self.tap.get() {
+                tap.decide(Some(reason));
+            }
+        }
+    }
+
+    /// Report this connection's close decision and teardown through `tap`.
+    /// Only the first call attaches one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<super::ConnTap>) {
+        let _ = self.tap.set(tap);
+    }
+
+    /// The connection's transport observer, if one is attached.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn tap(&self) -> Option<&Arc<super::ConnTap>> {
+        self.tap.get()
+    }
+
+    /// Report `CloseDecided` with no cause if none was recorded first. The
+    /// first decision wins, so a cause recorded after this isn't reported.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn cancelled_without_cause(&self) {
+        if let (None, Some(tap)) = (self.reason.get(), self.tap.get()) {
+            tap.decide(None);
+        }
+    }
+
+    /// Decide the close with no cause right when `token` is cancelled, by a
+    /// direct cancel or a parent's, unless a cause was recorded first. The
+    /// simulator token's hook runs inside that cancel and adds no scheduling
+    /// point. The test build's token is tokio's, which has no hook.
+    #[cfg(zakura_sim)]
+    pub(crate) fn decide_when_cancelled(&self, token: &zakura_rt::sync::CancellationToken) {
+        let cause = self.clone();
+        token.on_cancel(move || cause.cancelled_without_cause());
+    }
+
+    /// Report `TornDown`, once the connection's workers drained and its peer
+    /// was unregistered. A drain that timed out doesn't call it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn torn_down(&self) {
+        if let Some(tap) = self.tap.get() {
+            tap.emit(super::TransportEvent::TornDown {
+                conn_id: tap.conn_id(),
+            });
+        }
+    }
+
+    /// Return the recorded reason, or `None` when no local path recorded one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn get(&self) -> Option<&'static str> {
+        self.reason.get().copied()
     }
 
     /// Return the recorded reason, or `default` when no local path recorded one.
@@ -310,7 +373,10 @@ compile_error!(
 /// The pipe and hooks are boxed so every service spawns the same task type and
 /// shares one copy of tokio's per-task code. Pipes start once per peer stream, so
 /// the extra allocation is negligible.
+///
+/// `label` names the task for [`zakura_rt::task::spawn_named`].
 pub(crate) fn spawn_supervised_pipe(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     cancel: CancellationToken,
     on_teardown: impl FnOnce() + Send + 'static,
@@ -318,6 +384,7 @@ pub(crate) fn spawn_supervised_pipe(
     pipe: impl Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
     spawn_boxed_pipe(
+        label,
         peer_id,
         cancel,
         Box::new(on_teardown),
@@ -332,14 +399,16 @@ type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// A boxed teardown or panic hook for a supervised task.
 type BoxedHook = Box<dyn FnOnce() + Send>;
 
+/// [`spawn_supervised_pipe`] after boxing.
 fn spawn_boxed_pipe(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     cancel: CancellationToken,
     on_teardown: BoxedHook,
     on_panic: BoxedHook,
     pipe: BoxedTask,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    zakura_rt::task::spawn_named(label, async move {
         let _teardown = PipeTeardown {
             peer_id,
             cancel,
@@ -408,7 +477,10 @@ impl<F: FnOnce(), P: FnOnce()> Drop for PeerTaskTeardown<F, P> {
 /// Like [`spawn_supervised_pipe`], the task and hooks are boxed so every caller
 /// shares one task type. Use [`spawn_supervised_peer_task_unboxed`] for tasks
 /// spawned per request rather than per connection or session.
+///
+/// `label` names the task for [`zakura_rt::task::spawn_named`].
 pub(crate) fn spawn_supervised_peer_task(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     on_teardown: impl FnOnce() + Send + 'static,
     on_panic: impl FnOnce() + Send + 'static,
@@ -417,7 +489,7 @@ pub(crate) fn spawn_supervised_peer_task(
     let on_teardown: BoxedHook = Box::new(on_teardown);
     let on_panic: BoxedHook = Box::new(on_panic);
     let task: BoxedTask = Box::pin(task);
-    spawn_supervised_peer_task_unboxed(peer_id, on_teardown, on_panic, task)
+    spawn_supervised_peer_task_unboxed(label, peer_id, on_teardown, on_panic, task)
 }
 
 /// [`spawn_supervised_peer_task`] without boxing, for tasks spawned per request.
@@ -425,12 +497,13 @@ pub(crate) fn spawn_supervised_peer_task(
 /// Each distinct task type gets its own copy of tokio's per-task code, so use this
 /// only where the extra allocation of the boxed variant would land on a hot path.
 pub(crate) fn spawn_supervised_peer_task_unboxed(
+    label: &'static str,
     peer_id: ZakuraPeerId,
     on_teardown: impl FnOnce() + Send + 'static,
     on_panic: impl FnOnce() + Send + 'static,
     task: impl Future<Output = ()> + Send + 'static,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    zakura_rt::task::spawn_named(label, async move {
         let _teardown = PeerTaskTeardown {
             peer_id,
             on_teardown: Some(on_teardown),
@@ -478,7 +551,7 @@ pub(crate) fn handle_pipe_exit(
 pub mod supervised_spawn_bench {
     use std::future::Future;
 
-    use tokio::task::JoinHandle;
+    use zakura_rt::task::JoinHandle;
 
     use crate::zakura::ZakuraPeerId;
 
@@ -487,7 +560,7 @@ pub mod supervised_spawn_bench {
         peer_id: ZakuraPeerId,
         task: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<()> {
-        super::spawn_supervised_peer_task(peer_id, || {}, || {}, task)
+        super::spawn_supervised_peer_task("bench_peer_task", peer_id, || {}, || {}, task)
     }
 
     /// Spawn `task` through the unboxed path used for per-request serving tasks.
@@ -495,7 +568,7 @@ pub mod supervised_spawn_bench {
         peer_id: ZakuraPeerId,
         task: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<()> {
-        super::spawn_supervised_peer_task_unboxed(peer_id, || {}, || {}, task)
+        super::spawn_supervised_peer_task_unboxed("bench_peer_task", peer_id, || {}, || {}, task)
     }
 }
 
@@ -505,7 +578,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::zakura::transport::guard::ByteBudget;
 
     const SHAPE: PipeShape = PipeShape {
         service: "test",
@@ -549,7 +621,7 @@ mod tests {
 
     fn pass_guard() -> SessionGuard {
         // Allow message type 1, generous size cap, no byte budget.
-        SessionGuard::new(&[1], 1_024, None)
+        SessionGuard::new(&[1], 1_024)
     }
 
     fn frame(message_type: u16) -> Frame {
@@ -577,17 +649,6 @@ mod tests {
     fn run_one_passes_admitted_frame_to_entry() {
         let mut pipe = Pipe::new(peer_id(), (), (), pass_guard(), noop_entry, &SHAPE);
         assert!(matches!(pipe.run_one(frame(1)), Flow::Continue(())));
-    }
-
-    #[test]
-    fn run_one_throttles_when_budget_exhausted() {
-        // A budget that admits one 4-byte payload then throttles the next.
-        let guard = SessionGuard::new(&[1], 1_024, Some(ByteBudget::new(4)));
-        let mut pipe = Pipe::new(peer_id(), (), (), guard, noop_entry, &SHAPE);
-        let mut framed = frame(1);
-        framed.payload = vec![0u8; 4];
-        assert!(matches!(pipe.run_one(framed.clone()), Flow::Continue(())));
-        assert!(matches!(pipe.run_one(framed), Flow::Done));
     }
 
     #[test]
@@ -640,6 +701,7 @@ mod tests {
         // Production drops this handle to detach the task; here we await it to
         // observe the contained panic.
         let handle = spawn_supervised_pipe(
+            "test_pipe",
             peer_id(),
             cancel.clone(),
             move || flag.store(true, Ordering::SeqCst),
@@ -685,6 +747,7 @@ mod tests {
         // Production drops this handle to detach the task; here we await it to
         // observe the contained panic.
         let handle = spawn_supervised_peer_task(
+            "test_peer_task",
             peer_id(),
             move || teardown_flag.store(true, Ordering::SeqCst),
             move || disconnect_flag.store(true, Ordering::SeqCst),
@@ -721,6 +784,7 @@ mod tests {
         let disconnect_flag = disconnected.clone();
 
         let handle = spawn_supervised_peer_task(
+            "test_peer_task",
             peer_id(),
             move || teardown_flag.store(true, Ordering::SeqCst),
             move || disconnect_flag.store(true, Ordering::SeqCst),

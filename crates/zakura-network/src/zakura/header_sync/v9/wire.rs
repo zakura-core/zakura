@@ -28,8 +28,8 @@ use crate::zakura::{
         BlockHash, Bool, BoundedReader, HeightLe, LeU16, LeU32, LeU64, List, Wire, WireError,
         WireMessage, U8,
     },
-    Cadence, Credit, MessageRole, MessageRule, PayloadLen, Stream, StreamQueueDepths,
-    FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
+    Cadence, Credit, LocalRole, MessageRole, MessageRule, PayloadLen, ReactorBudget, Stream,
+    StreamQueueDepths, FRAME_HEADER_BYTES, ZAKURA_CAP_HEADER_SYNC,
 };
 
 /// The header sync stream version this module encodes.
@@ -139,6 +139,7 @@ pub(crate) type OutcomePayload = (LeU64, BlockHash, U8);
 
 /// Each side's frontier and serving caps, sent at most once a second.
 const STATUS: MessageRule = MessageRule {
+    name: "status",
     message_type: message_type::STATUS,
     payload: PayloadLen::of::<StatusPayload>(),
     role: MessageRole::Announcement {
@@ -152,6 +153,7 @@ const STATUS: MessageRule = MessageRule {
 
 /// Opens, renews, and closes a subscription.
 pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
+    name: "subscribe-headers",
     message_type: message_type::SUBSCRIBE_HEADERS,
     payload: PayloadLen::of::<UpdatePayload>(),
     role: MessageRole::Subscription {
@@ -168,6 +170,7 @@ pub(crate) const SUBSCRIBE_HEADERS: MessageRule = MessageRule {
 
 /// Ends a subscription. It spends no credit.
 const HEADERS_OUTCOME: MessageRule = MessageRule {
+    name: "headers-outcome",
     message_type: message_type::HEADERS_OUTCOME,
     payload: PayloadLen::of::<OutcomePayload>(),
     role: MessageRole::Response {
@@ -180,6 +183,7 @@ const HEADERS_OUTCOME: MessageRule = MessageRule {
 /// `header_bytes`. Pages do not end the subscription.
 const fn headers_row(header_bytes: usize) -> MessageRule {
     MessageRule {
+        name: "headers",
         message_type: message_type::HEADERS,
         payload: PayloadLen::between(
             smallest_page(header_bytes, AuxSchema::None),
@@ -244,16 +248,104 @@ const fn largest_page_under(header_bytes: usize, schema: AuxSchema) -> usize {
 }
 
 /// Mainnet and Testnet messages, whose headers take 1,487 bytes.
-pub(crate) type CommonMessage = Message<COMMON_HEADER_BYTES>;
+pub type CommonMessage = Message<COMMON_HEADER_BYTES>;
 
 /// Regtest messages, whose headers take 177 bytes.
-pub(crate) type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
+pub type RegtestMessage = Message<REGTEST_HEADER_BYTES>;
 
 const _: () = Stream::validate_layout(&CommonMessage::LAYOUT);
 const _: () = Stream::validate_layout(&RegtestMessage::LAYOUT);
 
+/// The Mainnet and Testnet header sync share of one connection's memory.
+pub const HEADER_SYNC_BUDGET: ReactorBudget = CommonMessage::BUDGET;
+
+/// The header sync share of one connection's memory on `network`, chosen by
+/// its header size.
+pub fn budget(network: &zakura_chain::parameters::Network) -> ReactorBudget {
+    if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
+        RegtestMessage::BUDGET
+    } else {
+        CommonMessage::BUDGET
+    }
+}
+
+/// The budget of `layout`, the version 9 layout of a network whose headers
+/// take `header_bytes`. [`Message::BUDGET`] explains each term.
+const fn layout_budget(layout: &[Stream], header_bytes: usize) -> ReactorBudget {
+    let subscriber = match Stream::receive_bound(layout, LocalRole::Requester) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("{}", error.rule()),
+    };
+    let Some(receive) = subscriber.checked_add(update_bytes(header_bytes)) else {
+        panic!("the header sync receive share fits u64");
+    };
+    ReactorBudget {
+        receive,
+        output: serve_output_bytes(header_bytes),
+    }
+    .assert_frame_cap(FRAME_CAP)
+}
+
+/// Encoded bytes of the pages that the publisher may hold unwritten for one
+/// subscriber that sends conformant updates.
+///
+/// A page job sizes its page within the unspent credit, and committing the
+/// page spends that credit. A page stays unwritten until the transport writes
+/// it, and only a written page can be acknowledged. So the queued pages and
+/// the page in progress stay within one subscription's window. The window
+/// holds at most `credit.objects` pages, and the largest page covers their
+/// frame headers. Terminal outcomes and `Status` take no serve output.
+const fn serve_output_bytes(header_bytes: usize) -> u64 {
+    let MessageRole::Subscription {
+        max_live, credit, ..
+    } = SUBSCRIBE_HEADERS.role
+    else {
+        panic!("SUBSCRIBE_HEADERS is a subscription row");
+    };
+    // Widening u32 and usize to u64 is lossless on every supported target.
+    let largest = largest_page(header_bytes) as u64;
+    assert!(
+        credit.objects as u64 * FRAME_HEADER_BYTES as u64 <= largest,
+        "the largest page covers a window's frame headers"
+    );
+    max_live as u64 * (credit.bytes as u64 + largest)
+}
+
+/// Payload bytes of the `SubscribeHeaders` updates that a conformant
+/// subscriber may have sent and this node's publisher has not released.
+///
+/// The row declares no cadence, and none would be honest: a subscriber grants
+/// whenever acceptance frees credit, without a timer, so its updates follow
+/// validation, not a rate. So this counts updates instead.
+///
+/// Say the publisher has released every update through `u`. It sends pages
+/// only within the credit granted through `u`, and an update acknowledges
+/// only pages the subscriber received. Every update keeps its granted minus
+/// acknowledged credit within the row's credit. Each `Grant` adds a header, or at least one
+/// smallest page of bytes, which the codec checks. So at most
+/// `credit.objects + credit.bytes / smallest page` grants follow `u`. One
+/// `Close` may follow them. After the terminal outcome, the subscriber's next
+/// `Open` may follow too. That subscription's grants need its pages, which
+/// wait for its `Open`. Each live slot of the row repeats this.
+///
+/// A `Grant` or `Close` carries no locators, so its payload is the row's
+/// minimum. An `Open` may take the row's maximum.
+const fn update_bytes(header_bytes: usize) -> u64 {
+    let MessageRole::Subscription {
+        max_live, credit, ..
+    } = SUBSCRIBE_HEADERS.role
+    else {
+        panic!("SUBSCRIBE_HEADERS is a subscription row");
+    };
+    // Widening u32 and usize to u64 is lossless on every supported target.
+    let smallest = smallest_page(header_bytes, AuxSchema::None) as u64;
+    let grants = credit.objects as u64 + credit.bytes as u64 / smallest;
+    let following = (grants + 1) * SUBSCRIBE_HEADERS.payload.min() as u64;
+    max_live as u64 * (following + SUBSCRIBE_HEADERS.payload.max() as u64)
+}
+
 /// The version 9 rows of a network whose headers take `header_bytes`.
-pub(crate) const fn rows(header_bytes: usize) -> &'static [MessageRule] {
+pub const fn rows(header_bytes: usize) -> &'static [MessageRule] {
     if header_bytes == REGTEST_HEADER_BYTES {
         &RegtestMessage::ROWS
     } else {
@@ -262,7 +354,7 @@ pub(crate) const fn rows(header_bytes: usize) -> &'static [MessageRule] {
 }
 
 /// The version 9 layout for `network`, chosen by its header size.
-pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
+pub fn layout(network: &zakura_chain::parameters::Network) -> &'static [Stream] {
     if super::super::header_sync_header_bytes_for_network(network) == REGTEST_HEADER_BYTES {
         &RegtestMessage::LAYOUT
     } else {
@@ -274,27 +366,27 @@ pub(crate) fn layout(network: &zakura_chain::parameters::Network) -> &'static [S
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Status {
     /// Height of the sender's finality anchor, excluded from the suffix work.
-    pub(crate) work_anchor_height: block::Height,
+    pub work_anchor_height: block::Height,
     /// Hash of the work anchor.
-    pub(crate) work_anchor_hash: block::Hash,
+    pub work_anchor_hash: block::Hash,
     /// Height of the sender's selected header tip.
-    pub(crate) selected_tip_height: block::Height,
+    pub selected_tip_height: block::Height,
     /// Hash of the sender's selected header tip.
-    pub(crate) selected_tip_hash: block::Hash,
+    pub selected_tip_hash: block::Hash,
     /// Work after the anchor through the selected tip.
-    pub(crate) suffix_cumulative_work: U256,
+    pub suffix_cumulative_work: U256,
     /// Lowest height for which the sender retains headers.
-    pub(crate) oldest_retained_height: block::Height,
+    pub oldest_retained_height: block::Height,
     /// Most headers the sender puts in one page, `1..=MAX_HS_RANGE`.
-    pub(crate) max_headers_per_response: u32,
+    pub max_headers_per_response: u32,
     /// Live subscriptions the sender holds per peer, always
     /// [`MAX_HS_SUBSCRIPTIONS`].
-    pub(crate) max_subscriptions: u16,
+    pub max_subscriptions: u16,
     /// Most bytes in one of the sender's pages. It fits a one-header page
     /// under every advertised schema and stays within 2 MiB.
-    pub(crate) max_message_bytes: u32,
+    pub max_message_bytes: u32,
     /// Bit `n - 1` advertises auxiliary schema `n`.
-    pub(crate) tree_aux_schema_mask: u32,
+    pub tree_aux_schema_mask: u32,
 }
 
 /// A `SubscribeHeaders` operation.
@@ -313,55 +405,55 @@ pub enum Operation {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Cursor {
     /// Height of the last accepted header, or of the first locator.
-    pub(crate) height: block::Height,
+    pub height: block::Height,
     /// Hash of that header.
-    pub(crate) hash: block::Hash,
+    pub hash: block::Hash,
     /// Header credit the subscription's pages consumed through this cursor.
-    pub(crate) headers: u64,
+    pub headers: u64,
     /// Byte credit the subscription's pages consumed through this cursor.
-    pub(crate) bytes: u64,
+    pub bytes: u64,
 }
 
 /// One subscription update.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscribeHeaders {
     /// What the update does.
-    pub(crate) operation: Operation,
+    pub operation: Operation,
     /// Nonzero subscription identifier.
-    pub(crate) subscription_id: u64,
+    pub subscription_id: u64,
     /// Zero for `Open`, then one more for each update.
-    pub(crate) update_sequence: u32,
+    pub update_sequence: u32,
     /// The target the subscription's first pages reach.
-    pub(crate) initial_target_tip_hash: block::Hash,
+    pub initial_target_tip_hash: block::Hash,
     /// The start cursor for `Open`, then the last cursor the subscriber
     /// accepted.
-    pub(crate) acknowledged: Cursor,
+    pub acknowledged: Cursor,
     /// `1..=13` unique locator hashes for `Open`, none otherwise.
-    pub(crate) locator_hashes: Vec<block::Hash>,
+    pub locator_hashes: Vec<block::Hash>,
     /// Header credit (`objects`) and byte credit the update adds.
-    pub(crate) added_credit: Credit,
+    pub added_credit: Credit,
     /// The auxiliary schema the subscriber asks for.
-    pub(crate) tree_aux_schema: AuxSchema,
+    pub tree_aux_schema: AuxSchema,
 }
 
 /// One pushed page of headers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Headers {
     /// Nonzero subscription identifier.
-    pub(crate) subscription_id: u64,
+    pub subscription_id: u64,
     /// The subscription's initial target.
-    pub(crate) initial_target_tip_hash: block::Hash,
+    pub initial_target_tip_hash: block::Hash,
     /// Height of the header the page's first header extends.
-    pub(crate) common_ancestor_height: block::Height,
+    pub common_ancestor_height: block::Height,
     /// Hash of the header the page's first header extends.
-    pub(crate) common_ancestor_hash: block::Hash,
+    pub common_ancestor_hash: block::Hash,
     /// Whether the page's last header is the initial target.
-    pub(crate) reaches_initial_target: bool,
+    pub reaches_initial_target: bool,
     /// The auxiliary schema of every entry.
-    pub(crate) tree_aux_schema: AuxSchema,
+    pub tree_aux_schema: AuxSchema,
     /// `1..=MAX_HS_RANGE` headers in ascending order, with their hints and
     /// records.
-    pub(crate) entries: Vec<HeaderEntry>,
+    pub entries: Vec<HeaderEntry>,
 }
 
 /// Why a subscription ended.
@@ -400,25 +492,29 @@ impl HeadersOutcomeCode {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct HeadersOutcome {
     /// Nonzero subscription identifier.
-    pub(crate) subscription_id: u64,
+    pub subscription_id: u64,
     /// The subscription's initial target.
-    pub(crate) initial_target_tip_hash: block::Hash,
+    pub initial_target_tip_hash: block::Hash,
     /// Why the subscription ended.
-    pub(crate) outcome: HeadersOutcomeCode,
+    pub outcome: HeadersOutcomeCode,
 }
 
 /// Every version 9 message on a network whose headers take `HEADER_BYTES`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Message<const HEADER_BYTES: usize> {
+pub enum Message<const HEADER_BYTES: usize> {
+    /// A frontier and serving-caps advertisement.
     Status(Status),
+    /// A subscription update: `Open`, `Grant`, or `Close`.
     SubscribeHeaders(SubscribeHeaders),
+    /// One pushed page of headers.
     Headers(Headers),
+    /// A subscription's terminal outcome.
     HeadersOutcome(HeadersOutcome),
 }
 
 impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     /// The rows of this network's version 9 stream.
-    pub(crate) const ROWS: [MessageRule; 4] = [
+    pub const ROWS: [MessageRule; 4] = [
         STATUS,
         SUBSCRIBE_HEADERS,
         headers_row(HEADER_BYTES),
@@ -426,7 +522,7 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
     ];
 
     /// This network's version 9 stream.
-    pub(crate) const LAYOUT: [Stream; 1] = [Stream {
+    pub const LAYOUT: [Stream; 1] = [Stream {
         kind: ZAKURA_STREAM_HEADER_SYNC,
         version: STREAM_VERSION,
         frame_cap: FRAME_CAP,
@@ -440,6 +536,24 @@ impl<const HEADER_BYTES: usize> Message<HEADER_BYTES> {
         }),
         ..Stream::PERSISTENT
     }];
+
+    /// This network's header sync share of one connection's memory.
+    ///
+    /// The service runs one publisher and one subscriber per session, so the
+    /// receive share counts both sides of [`Self::LAYOUT`]:
+    ///
+    /// - as subscriber, [`Stream::receive_bound`] for
+    ///   [`LocalRole::Requester`]: the peer's `Status` cadence, and one
+    ///   subscription's byte credit plus one more page or outcome;
+    /// - as publisher, the peer's updates that the publisher has not
+    ///   released. The row declares no cadence, so `update_bytes` counts
+    ///   them from the credit window.
+    ///
+    /// The output share is one subscription's byte credit plus one largest
+    /// page, which `serve_output_bytes` derives. The production serving
+    /// limits keep a larger per-peer default until the node composition
+    /// sizes them from this share.
+    pub const BUDGET: ReactorBudget = layout_budget(&Self::LAYOUT, HEADER_BYTES);
 
     /// Check the rules that the payload items cannot express.
     fn check(&self) -> Result<(), WireError> {

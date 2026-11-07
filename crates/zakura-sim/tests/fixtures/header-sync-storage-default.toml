@@ -1,0 +1,9 @@
+# The committed fuzz input `header-sync-storage-default.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its prefix is the
+# action grammar's encoding of the default scenario: one mirror serves the
+# node its chain.
+harness = "header-sync/storage"
+generator = 2
+sha256 = "370e5e5d3715e587443bda3e3205e22a5834d13af0ca94a563f391c344e7bb08"
+scenario_sha256 = "1f5576e258ae10be37512675547a57aaf88a1656ce1df72f786053a7242241b1"
+source = "crates/zakura-sim/tests/header_node.rs"

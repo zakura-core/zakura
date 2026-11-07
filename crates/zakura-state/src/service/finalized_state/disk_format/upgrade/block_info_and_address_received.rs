@@ -98,7 +98,8 @@ impl DiskFormatUpgrade for Upgrade {
                     // Load the block. This is slow since transaction
                     // parsing is slow.
                     let (block, size) = db
-                        .block_and_size(HashOrHeight::Height(height))
+                        .stored_block_and_size(HashOrHeight::Height(height))
+                        .map(|(block, size)| (Arc::new(block), size))
                         .expect("block info should be in the database");
 
                     // Load the utxos for all the transactions inputs in the block.
@@ -110,7 +111,7 @@ impl DiskFormatUpgrade for Upgrade {
                         for input in tx.inputs() {
                             if let Some(outpoint) = input.outpoint() {
                                 let (tx, h, _) = db
-                                    .transaction(outpoint.hash)
+                                    .stored_transaction(outpoint.hash)
                                     .expect("transaction should be in the database");
                                 let output = tx
                                     .outputs()
@@ -306,7 +307,7 @@ impl DiskFormatUpgrade for Upgrade {
         // Collect the set of addresses that received transparent funds in the last query range (last 1000 blocks).
         let tx_loc_range = TransactionLocation::min_for_height(start_height)..;
         let addresses: HashSet<_> = db
-            .transactions_by_location_range(tx_loc_range)
+            .stored_transactions_by_location_range(tx_loc_range)
             .flat_map(|(_, tx)| tx.outputs().to_vec())
             .filter_map(|output| {
                 if output.value != 0 {

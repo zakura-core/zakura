@@ -171,10 +171,13 @@ pub struct HexDebug<T: AsRef<[u8]>>(pub T);
 
 impl<T: AsRef<[u8]>> fmt::Debug for HexDebug<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple(std::any::type_name::<T>())
-            .field(&hex::encode(self.as_ref()))
-            .finish()
+        debug_hex(f, std::any::type_name::<T>(), self.as_ref())
     }
+}
+
+/// The body of `HexDebug<T>`'s `Debug`, kept non-generic so it is compiled once.
+fn debug_hex(f: &mut fmt::Formatter<'_>, name: &str, bytes: &[u8]) -> fmt::Result {
+    f.debug_tuple(name).field(&hex::encode(bytes)).finish()
 }
 
 impl<T: AsRef<[u8]>> ops::Deref for HexDebug<T> {

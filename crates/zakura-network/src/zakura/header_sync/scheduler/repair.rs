@@ -1,11 +1,22 @@
 //! Generation- and branch-owned auxiliary VCT repair work.
 
-use std::collections::HashSet;
-
 use thiserror::Error;
-use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
+
+use super::super::Status;
+
+/// `TargetNotSelected` answers one supplier may give in one repair episode before the
+/// episode stops offering it the target.
+///
+/// A peer chooses its status freely, so a changed status alone does not show that the
+/// supplier now selects the target. The cap bounds the requests one supplier can draw by
+/// refusing and re-advertising.
+pub(in crate::zakura::header_sync) const MAX_TARGET_REFUSALS_PER_SUPPLIER: u8 = 3;
 
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +58,8 @@ pub(in crate::zakura::header_sync) enum RepairPolicyState {
     Assigned {
         /// Exact selected request context.
         context: VctRepairContext,
+        /// The status the supplier advertised when the request was built.
+        advertised: Status,
     },
     /// State admitted the repair and the matching durable signal has not cleared yet.
     Completed,
@@ -79,14 +92,26 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub state: RepairPolicyState,
     /// Failed or abandoned on-wire attempts, saturated only for diagnostics.
     pub attempts: u64,
-    /// Connected suppliers already tried in the current durable episode.
-    /// The configured inbound and outbound peer limits bound this set.
+    /// Suppliers already tried in the current durable episode.
+    /// A supplier's entry survives session replacement and holds after disconnect
+    /// as [`Self::departed_sources`] describes.
     pub tried_sources: HashSet<SourceId>,
     /// Connected suppliers that returned input excluded by this durable episode.
     pub excluded_input_sources: HashSet<SourceId>,
-    /// Suppliers waiting for a later status from their current session after Busy.
-    /// Live peer admission limits bound this set.
-    busy_sources: HashSet<SourceId>,
+    /// Suppliers that answered `TargetNotSelected`, with the status they had advertised then.
+    /// Only a status that differs from the stored one makes the supplier eligible again.
+    /// Live peer admission limits bound this map.
+    busy_sources: HashMap<SourceId, Status>,
+    /// `TargetNotSelected` answers per supplier in this episode, up to
+    /// [`MAX_TARGET_REFUSALS_PER_SUPPLIER`]. Live peer admission limits bound this map.
+    target_refusals: HashMap<SourceId, u8>,
+    /// Suppliers with history in this episode and no live session, with the
+    /// deadline until which a reconnect resumes that history.
+    ///
+    /// Holding history across a disconnect keeps a supplier from clearing its
+    /// failures and refusals by reopening its header stream. The hold and the
+    /// count limit passed to [`Self::retain_connected_sources`] bound this map.
+    departed_sources: HashMap<SourceId, Instant>,
 }
 
 impl RepairRequirement {
@@ -100,7 +125,9 @@ impl RepairRequirement {
             attempts: 0,
             tried_sources: HashSet::new(),
             excluded_input_sources: HashSet::new(),
-            busy_sources: HashSet::new(),
+            busy_sources: HashMap::new(),
+            target_refusals: HashMap::new(),
+            departed_sources: HashMap::new(),
         }
     }
 
@@ -145,11 +172,13 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Bind a resolved task to the actual canonical stream request.
+    /// Bind a resolved task to the actual canonical stream request, built from the
+    /// supplier's `advertised` status.
     pub fn assign(
         &mut self,
         owner: BodyWorkOwner,
         selected_context: VctRepairContext,
+        advertised: Status,
     ) -> Result<(), RepairPolicyError> {
         if owner.header_authority() != self.owner.header_authority() {
             return Err(RepairPolicyError::ScopeMismatch);
@@ -167,6 +196,7 @@ impl RepairRequirement {
         self.owner = owner;
         self.state = RepairPolicyState::Assigned {
             context: selected_context,
+            advertised,
         };
         Ok(())
     }
@@ -183,7 +213,7 @@ impl RepairRequirement {
     /// Return any non-dispatched task to scheduling after one failed supplier attempt.
     pub fn retry(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
         let context = match &self.state {
-            RepairPolicyState::Assigned { context } => context.clone(),
+            RepairPolicyState::Assigned { context, .. } => context.clone(),
             _ => return Err(RepairPolicyError::IllegalState),
         };
         self.attempts = self.attempts.saturating_add(1);
@@ -193,12 +223,36 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Wait for this supplier's next status without blocking other suppliers.
+    /// Wait until this supplier advertises a status other than the one the request was built
+    /// from, without blocking other suppliers.
+    ///
+    /// The supplier did not select the target under that status, so the same status cannot
+    /// make it select the target. The [`MAX_TARGET_REFUSALS_PER_SUPPLIER`]th refusal in this
+    /// episode charges the supplier as [`Self::retry`] does.
     pub fn wait_for_supplier_status(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
-        let RepairPolicyState::Assigned { context } = &self.state else {
+        let RepairPolicyState::Assigned { advertised, .. } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
-        self.busy_sources.insert(source);
+        let advertised = advertised.clone();
+        let refusals = self.target_refusals.entry(source).or_default();
+        *refusals = refusals.saturating_add(1);
+        if *refusals >= MAX_TARGET_REFUSALS_PER_SUPPLIER {
+            return self.retry(source);
+        }
+        self.requeue(source)?;
+        self.busy_sources.insert(source, advertised);
+        Ok(())
+    }
+
+    /// Return assigned work to scheduling without charging its supplier.
+    ///
+    /// Use this when the supplier's session ended before it answered. Honest peers reconnect,
+    /// so a session change alone is not a supplier failure.
+    pub fn requeue(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
+        let RepairPolicyState::Assigned { context, .. } = &self.state else {
+            return Err(RepairPolicyError::IllegalState);
+        };
+        self.busy_sources.remove(&source);
         self.attempts = self.attempts.saturating_add(1);
         self.state = RepairPolicyState::Ready {
             context: context.clone(),
@@ -206,14 +260,21 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Whether a temporary refusal still requires a later status from this session.
+    /// Whether this supplier has not advertised a new status since it refused the target.
     pub fn supplier_is_waiting_for_status(&self, source: SourceId) -> bool {
-        self.busy_sources.contains(&source)
+        self.busy_sources.contains_key(&source)
     }
 
-    /// Release only a Busy wait after the reactor validates the status's session.
-    pub fn observe_supplier_status(&mut self, source: SourceId) {
-        self.busy_sources.remove(&source);
+    /// Release a supplier's wait when its validated `status` differs from the one it refused
+    /// the target under.
+    pub fn observe_supplier_status(&mut self, source: SourceId, status: &Status) {
+        if self
+            .busy_sources
+            .get(&source)
+            .is_some_and(|advertised| advertised != status)
+        {
+            self.busy_sources.remove(&source);
+        }
     }
 
     /// Rotate away from a supplier that returned semantic input excluded by durable state.
@@ -234,32 +295,72 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Forget one supplier's failure history when its session is replaced.
-    ///
-    /// Durable semantic exclusions remain in the repair context and committed state.
-    pub fn forget_source(&mut self, source: SourceId) {
+    /// Forget one supplier's history in this episode.
+    fn forget_source(&mut self, source: SourceId) {
         self.tried_sources.remove(&source);
         self.excluded_input_sources.remove(&source);
         self.busy_sources.remove(&source);
+        self.target_refusals.remove(&source);
+        self.departed_sources.remove(&source);
     }
 
-    /// Forget supplier identities that no longer have a live session.
+    /// Hold the history of suppliers outside `connected_sources` for `hold`
+    /// after `now`, and forget it once the hold ends.
     ///
-    /// Durable state retains rejected and disputed semantic input. The reactor only needs the
-    /// identity sets to prevent repeated requests within a supplier's current session.
-    pub fn retain_connected_sources(&mut self, connected_sources: &HashSet<SourceId>) {
-        self.tried_sources
-            .retain(|source| connected_sources.contains(source));
-        self.excluded_input_sources
-            .retain(|source| connected_sources.contains(source));
-        self.busy_sources
-            .retain(|source| connected_sources.contains(source));
+    /// A supplier that reconnects before its hold ends resumes its history. At
+    /// most `max_departed` departed suppliers keep history; past that, the
+    /// holds that end first end now. A zero `hold` forgets departed suppliers
+    /// at once. Durable state retains rejected and disputed semantic input, so
+    /// forgetting a supplier never forgets the input it sent.
+    pub fn retain_connected_sources(
+        &mut self,
+        connected_sources: &HashSet<SourceId>,
+        now: Instant,
+        hold: std::time::Duration,
+        max_departed: usize,
+    ) {
+        let departed: HashSet<SourceId> = self
+            .tried_sources
+            .iter()
+            .chain(&self.excluded_input_sources)
+            .chain(self.busy_sources.keys())
+            .chain(self.target_refusals.keys())
+            .filter(|source| !connected_sources.contains(*source))
+            .copied()
+            .collect();
+        for source in departed {
+            self.departed_sources.entry(source).or_insert(now + hold);
+        }
+        let mut ended: Vec<SourceId> = self
+            .departed_sources
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(source, _)| *source)
+            .collect();
+        for source in &ended {
+            self.departed_sources.remove(source);
+        }
+        if self.departed_sources.len() > max_departed {
+            let mut holds: Vec<_> = self
+                .departed_sources
+                .iter()
+                .map(|(source, until)| (*until, *source))
+                .collect();
+            holds.sort_unstable();
+            let excess = holds.len() - max_departed;
+            ended.extend(holds.into_iter().take(excess).map(|(_, source)| source));
+        }
+        for source in ended {
+            self.forget_source(source);
+        }
+        self.departed_sources
+            .retain(|source, _| !connected_sources.contains(source));
     }
 
     /// Back off ready or assigned repair work after a local failure.
     pub fn defer_local_retry_until(&mut self, retry_at: Instant) -> Result<(), RepairPolicyError> {
         let context = match &self.state {
-            RepairPolicyState::Ready { context } | RepairPolicyState::Assigned { context } => {
+            RepairPolicyState::Ready { context } | RepairPolicyState::Assigned { context, .. } => {
                 context.clone()
             }
             _ => return Err(RepairPolicyError::IllegalState),
@@ -274,7 +375,7 @@ impl RepairRequirement {
         &mut self,
         state_version: zakura_header_chain::StateVersion,
     ) -> Result<(), RepairPolicyError> {
-        let RepairPolicyState::Assigned { context } = &self.state else {
+        let RepairPolicyState::Assigned { context, .. } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
         self.attempts = self.attempts.saturating_add(1);
@@ -320,6 +421,14 @@ impl RepairRequirement {
                 };
             }
             _ => {}
+        }
+    }
+
+    /// The selected request context, while a shared active target owns this repair.
+    pub fn assigned_context(&self) -> Option<&VctRepairContext> {
+        match &self.state {
+            RepairPolicyState::Assigned { context, .. } => Some(context),
+            _ => None,
         }
     }
 
@@ -384,10 +493,11 @@ impl RepairRequirementSlot {
         scheduled_owner: BodyWorkOwner,
         wire_owner: BodyWorkOwner,
         selected_context: VctRepairContext,
+        advertised: Status,
     ) -> Result<(), RepairPolicyError> {
         self.get_mut(scheduled_owner)
             .ok_or(RepairPolicyError::IllegalState)?
-            .assign(wire_owner, selected_context)
+            .assign(wire_owner, selected_context, advertised)
     }
 
     /// Retire one completed, stale, or canceled task.
@@ -466,6 +576,21 @@ mod tests {
             .bind(6, NonZeroU64::new(7).expect("seven is nonzero"))
     }
 
+    fn advertised(tip: u8) -> Status {
+        Status {
+            work_anchor_height: block::Height(10),
+            work_anchor_hash: hash(1),
+            selected_tip_height: block::Height(20),
+            selected_tip_hash: hash(tip),
+            suffix_cumulative_work: U256::from(10_u8),
+            oldest_retained_height: block::Height(10),
+            max_headers_per_response: 16,
+            max_subscriptions: 1,
+            max_message_bytes: 1 << 20,
+            tree_aux_schema_mask: 1,
+        }
+    }
+
     fn task(snapshot: &EngineSnapshot) -> RepairRequirement {
         RepairRequirement::new(owner(snapshot), block::Height(19), 11)
     }
@@ -496,7 +621,7 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context can resolve");
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("ready work can go on wire");
         assert_eq!(task.retry(source), Ok(()));
         assert_eq!(
@@ -508,7 +633,7 @@ mod tests {
         assert_eq!(task.attempts, 1);
         assert!(task.tried_sources.contains(&source));
 
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("retried work can go on wire");
         task.complete()
             .expect("a matching state admission completes the task");
@@ -518,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn busy_status_wait_preserves_semantic_exclusions() {
+    async fn unselected_supplier_waits_for_a_changed_status() {
         let mut task = task(&snapshot());
         let source = SourceId::from_digest([8; 32]);
         let excluded = SourceId::from_digest([9; 32]);
@@ -526,36 +651,77 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the selected context resolves");
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("the excluded supplier is assigned");
         task.exclude_input(excluded)
             .expect("semantic input is excluded");
 
-        for _ in 0..3 {
-            task.assign(task.owner, context.clone())
-                .expect("the busy supplier is assigned");
+        for tip in 2..=MAX_TARGET_REFUSALS_PER_SUPPLIER {
+            let refused = advertised(tip);
+            task.assign(task.owner, context.clone(), refused.clone())
+                .expect("the unselected supplier is assigned");
             task.wait_for_supplier_status(source)
-                .expect("Busy waits for another status");
+                .expect("TargetNotSelected waits for another status");
             assert_eq!(task.next_deadline(), None);
             tokio::time::advance(std::time::Duration::from_secs(300)).await;
             task.resume_retry(Instant::now());
             assert_eq!(task.next_deadline(), None);
             assert!(task.supplier_is_waiting_for_status(source));
-            task.observe_supplier_status(excluded);
+            task.observe_supplier_status(excluded, &advertised(tip + 1));
             assert!(task.supplier_is_waiting_for_status(source));
-            task.observe_supplier_status(source);
+            task.observe_supplier_status(source, &refused);
+            assert!(
+                task.supplier_is_waiting_for_status(source),
+                "the status the supplier refused under cannot release it"
+            );
+            task.observe_supplier_status(source, &advertised(tip + 1));
             assert!(!task.supplier_is_waiting_for_status(source));
             assert!(!task.tried_sources.contains(&source));
             assert!(task.tried_sources.contains(&excluded));
             assert!(task.excluded_input_sources.contains(&excluded));
         }
-        task.assign(task.owner, context)
+        task.assign(task.owner, context, advertised(1))
             .expect("the supplier can be assigned again");
         task.wait_for_supplier_status(source)
-            .expect("a later Busy restores the wait");
-        task.retain_connected_sources(&[excluded].into_iter().collect());
+            .expect("the capped refusal returns the work");
+        assert!(
+            task.tried_sources.contains(&source),
+            "the capped refusal charges the supplier for the episode"
+        );
+        assert!(!task.supplier_is_waiting_for_status(source));
+        task.retain_connected_sources(
+            &[excluded].into_iter().collect(),
+            Instant::now(),
+            std::time::Duration::ZERO,
+            0,
+        );
         assert!(task.busy_sources.is_empty());
+        assert!(task.target_refusals.is_empty());
         assert!(task.excluded_input_sources.contains(&excluded));
+    }
+
+    #[test]
+    fn requeue_returns_work_without_charging_the_supplier() {
+        let mut task = task(&snapshot());
+        let source = SourceId::from_digest([8; 32]);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the selected context resolves");
+        task.assign(task.owner, context.clone(), advertised(1))
+            .expect("the supplier is assigned");
+        task.wait_for_supplier_status(source)
+            .expect("TargetNotSelected waits for another status");
+        task.assign(task.owner, context.clone(), advertised(2))
+            .expect("the supplier is assigned again after a new status");
+
+        task.requeue(source).expect("assigned work can be requeued");
+
+        assert_eq!(task.state, RepairPolicyState::Ready { context });
+        assert_eq!(task.attempts, 2);
+        assert!(task.tried_sources.is_empty());
+        assert!(!task.supplier_is_waiting_for_status(source));
+        assert_eq!(task.requeue(source), Err(RepairPolicyError::IllegalState));
     }
 
     #[test]
@@ -567,10 +733,10 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("the first supplier goes on wire");
         task.retry(first).expect("the first supplier can fail");
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("the second supplier goes on wire");
         task.retry(second).expect("the second supplier can fail");
         task.resume_retry(Instant::now() + std::time::Duration::from_secs(1));
@@ -597,7 +763,7 @@ mod tests {
             .expect("the exact context resolves");
 
         for byte in 1_u8..=64 {
-            task.assign(task.owner, context.clone())
+            task.assign(task.owner, context.clone(), advertised(1))
                 .expect("ready work can go on wire");
             task.retry(SourceId::from_digest([byte; 32]))
                 .expect("each distinct supplier can fail");
@@ -612,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn supplier_history_releases_disconnected_sources_without_clearing_the_episode() {
+    fn departed_supplier_history_holds_until_its_hold_ends() {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
@@ -632,14 +798,39 @@ mod tests {
             task.record_failed_source(source(index))
                 .expect("ready work can record each supplier");
         }
-        let retained = source(previous_default_capacity - 1);
-        task.excluded_input_sources.insert(retained);
+        let connected = source(previous_default_capacity - 1);
+        task.excluded_input_sources.insert(connected);
+        let reopened = source(previous_default_capacity - 2);
+        let hold = std::time::Duration::from_secs(60);
+        let max_departed = 4;
+        let now = Instant::now();
+        let connected_sources: HashSet<_> = [connected].into_iter().collect();
 
-        let connected_sources = [retained].into_iter().collect();
-        task.retain_connected_sources(&connected_sources);
+        task.retain_connected_sources(&connected_sources, now, hold, max_departed);
+        assert_eq!(
+            task.tried_sources.len(),
+            1 + max_departed,
+            "the departed limit bounds held history"
+        );
+        assert!(task.tried_sources.contains(&connected));
+        assert!(
+            task.tried_sources.contains(&reopened),
+            "an equal hold keeps the highest sources"
+        );
 
+        let reconnected: HashSet<_> = [connected, reopened].into_iter().collect();
+        task.retain_connected_sources(&reconnected, now + hold / 2, hold, max_departed);
+        assert!(
+            task.tried_sources.contains(&reopened),
+            "a reconnect inside the hold resumes the supplier's history"
+        );
+
+        task.retain_connected_sources(&connected_sources, now + hold, hold, max_departed);
+        assert!(task.tried_sources.contains(&reopened), "a new hold starts");
+        task.retain_connected_sources(&connected_sources, now + hold * 2, hold, max_departed);
         assert_eq!(task.tried_sources, connected_sources);
         assert_eq!(task.excluded_input_sources, connected_sources);
+        assert!(task.departed_sources.is_empty());
         assert_eq!(task.state, RepairPolicyState::Ready { context });
     }
 
@@ -650,7 +841,7 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("ready work can go on wire");
         let blocked_at = StateVersion::new(3);
         task.wait_for_state_change(blocked_at)
@@ -756,7 +947,7 @@ mod tests {
             .map(|byte| SourceId::from_digest([byte; 32]))
             .collect();
         for source in &excluded_sources {
-            task.assign(task.owner, context.clone())
+            task.assign(task.owner, context.clone(), advertised(1))
                 .expect("ready work can go on wire");
             task.exclude_input(*source)
                 .expect("durably excluded input rotates its supplier");
@@ -779,7 +970,7 @@ mod tests {
         );
 
         let fourth = SourceId::from_digest([4; 32]);
-        task.assign(task.owner, context.clone())
+        task.assign(task.owner, context.clone(), advertised(1))
             .expect("a later supplier can own the same episode");
         task.exclude_input(fourth)
             .expect("the later supplier remains attributable");
@@ -800,11 +991,11 @@ mod tests {
                 .expect("the exact context resolves");
             let failed_source = SourceId::from_digest([1; 32]);
             if assigned {
-                task.assign(task.owner, context.clone())
+                task.assign(task.owner, context.clone(), advertised(1))
                     .expect("ready work can go on wire");
                 task.retry(failed_source)
                     .expect("one supplier failure updates the current episode");
-                task.assign(task.owner, context.clone())
+                task.assign(task.owner, context.clone(), advertised(1))
                     .expect("another supplier can own the current episode");
             } else {
                 task.tried_sources.insert(failed_source);
@@ -899,7 +1090,10 @@ mod tests {
                 context: context.clone(),
                 state_version: snapshot.state_version,
             },
-            RepairPolicyState::Assigned { context },
+            RepairPolicyState::Assigned {
+                context,
+                advertised: advertised(1),
+            },
             RepairPolicyState::Completed,
         ];
         for state in states {

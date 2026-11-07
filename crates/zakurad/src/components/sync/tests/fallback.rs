@@ -48,6 +48,31 @@ fn genesis_bootstrap_transfers_apply_ownership_once() {
 }
 
 #[test]
+fn genesis_handoff_is_a_no_op_when_startup_began_native() {
+    // Startup begins native when the header runtime is ready before the syncer runs,
+    // which happens when a node restarts on a small existing state.
+    let handoff = crate::commands::start::zakura::SyncCoordinator::new();
+
+    assert_eq!(
+        handoff.finish_legacy_bootstrap_if_pending(),
+        Ok(false),
+        "a native startup has no genesis bootstrap to finish"
+    );
+    assert!(
+        handoff.begin_apply().is_some(),
+        "native Zakura keeps apply ownership after the genesis fetch"
+    );
+
+    let bootstrap = crate::commands::start::zakura::SyncCoordinator::new_legacy_bootstrap();
+    assert_eq!(bootstrap.finish_legacy_bootstrap_if_pending(), Ok(true));
+    assert_eq!(
+        bootstrap.finish_legacy_bootstrap_if_pending(),
+        Ok(false),
+        "the handoff happens once"
+    );
+}
+
+#[test]
 fn completed_legacy_fallback_returns_apply_ownership_to_zakura() {
     let bootstrap_handoff = crate::commands::start::zakura::SyncCoordinator::new_legacy_bootstrap();
     futures::executor::block_on(
@@ -626,12 +651,12 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
 
     let (sync_status, mut recent_syncs) = SyncStatus::new();
     recent_syncs.push_extend_tips_length(
-        zakura_sync_status_length(Some(Height(100)), Some(Height(201)))
+        zakura_sync_status_length(Some(Height(100)), Some(Height(401)))
             .expect("known Zakura tips produce a sync status length"),
     );
     assert!(
         !sync_status.is_close_to_tip(),
-        "a Zakura body/header gap over 100 blocks should keep the existing close-to-tip gate disabled"
+        "a Zakura body/header gap over 300 blocks should keep the existing close-to-tip gate disabled"
     );
 }
 

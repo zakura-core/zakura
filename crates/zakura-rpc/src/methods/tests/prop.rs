@@ -1,5 +1,6 @@
 //! Randomised property tests for RPC methods.
 
+use crate::tests::test_rpc::{TestChainTip, TestRpcImpl};
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
@@ -18,7 +19,7 @@ use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{self, Block, Height},
     chain_sync_status::MockSyncStatus,
-    chain_tip::{mock::MockChainTip, ChainTip, NoChainTip},
+    chain_tip::{mock::MockChainTip, NoChainTip},
     history_tree::HistoryTree,
     parameters::{ConsensusBranchId, Network, NetworkUpgrade},
     serialization::{DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
@@ -31,16 +32,13 @@ use zakura_node_services::mempool;
 use zakura_state::{BoxError, GetBlockTemplateChainInfo};
 use zakura_test::mock_service::MockService;
 
-use crate::methods::{
-    self,
-    types::{
-        get_blockchain_info::GetBlockchainInfoBalance,
-        get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
-    },
+use crate::methods::types::{
+    get_blockchain_info::GetBlockchainInfoBalance,
+    get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
 };
 
 use super::super::{
-    GetAddressBalanceRequest, GetAddressBalanceResponse, NetworkUpgradeStatus, RpcImpl, RpcServer,
+    GetAddressBalanceRequest, GetAddressBalanceResponse, NetworkUpgradeStatus, RpcServer,
     SendRawTransactionResponse,
 };
 
@@ -1040,49 +1038,20 @@ fn mock_services<Tip>(
         zakura_state::ReadResponse,
         zakura_test::mock_service::PropTestAssertion,
     >,
-    methods::RpcImpl<
-        zakura_test::mock_service::MockService<
-            zakura_node_services::mempool::Request,
-            zakura_node_services::mempool::Response,
-            zakura_test::mock_service::PropTestAssertion,
-        >,
-        tower::buffer::Buffer<
-            zakura_state::Request,
-            <zakura_test::mock_service::MockService<
-                zakura_state::Request,
-                zakura_state::Response,
-                zakura_test::mock_service::PropTestAssertion,
-            > as tower::Service<zakura_state::Request>>::Future,
-        >,
-        tower::buffer::Buffer<
-            zakura_state::ReadRequest,
-            <zakura_test::mock_service::MockService<
-                zakura_state::ReadRequest,
-                zakura_state::ReadResponse,
-                zakura_test::mock_service::PropTestAssertion,
-            > as tower::Service<zakura_state::ReadRequest>>::Future,
-        >,
-        Tip,
-        MockAddressBookPeers,
-        zakura_test::mock_service::MockService<
-            zakura_consensus::Request,
-            block::Hash,
-            zakura_test::mock_service::PropTestAssertion,
-        >,
-        MockSyncStatus,
-    >,
+    TestRpcImpl,
     tokio::task::JoinHandle<()>,
 )
 where
-    Tip: ChainTip + Clone + Send + Sync + 'static,
+    Tip: Into<TestChainTip>,
 {
     let mempool = MockService::build().for_prop_tests();
-    let state = MockService::build().for_prop_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_prop_tests();
     let read_state = MockService::build().for_prop_tests();
-    let block_verifier_router = MockService::build().for_prop_tests();
+    let block_verifier_router: MockService<_, _, _, BoxError> =
+        MockService::build().for_prop_tests();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, mempool_tx_queue) = RpcImpl::new(
+    let (rpc, mempool_tx_queue) = TestRpcImpl::new_for_tests(
         network,
         Default::default(),
         Default::default(),

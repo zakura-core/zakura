@@ -531,6 +531,10 @@ fn auxiliary_rows_are_coherent(
 /// Failure at the durable header-chain boundary.
 #[derive(Debug, Error)]
 pub enum HeaderChainStoreError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// Migration or bootstrap has not initialized the database yet.
     #[error("header-chain metadata is not initialized")]
     Uninitialized,

@@ -27,9 +27,19 @@ use crate::{
 mod tests;
 
 /// Read-only access to currently banned peer IP addresses.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct BannedIps {
     inner: Arc<RwLock<BanList>>,
+    changes: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for BannedIps {
+    fn default() -> Self {
+        Self {
+            inner: Default::default(),
+            changes: tokio::sync::watch::channel(()).0,
+        }
+    }
 }
 
 /// A bounded FIFO list of banned peer IP addresses.
@@ -65,6 +75,27 @@ impl BanList {
 }
 
 impl BannedIps {
+    /// Watches authorization changes without polling the ban list.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    /// Applies a ban and notifies readers after releasing the list lock.
+    fn insert(&self, ip: IpAddr) {
+        let changed = {
+            let mut list = self
+                .inner
+                .write()
+                .expect("ban list lock should not be poisoned");
+            let changed = !list.ips.contains(&canonical_ip(ip));
+            list.insert(ip);
+            changed
+        };
+        if changed {
+            self.changes.send_replace(());
+        }
+    }
+
     /// Returns whether `ip` is currently banned.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
@@ -79,10 +110,7 @@ impl BannedIps {
     #[cfg(test)]
     pub(crate) fn with_banned_ip(ip: IpAddr) -> Self {
         let bans = Self::default();
-        bans.inner
-            .write()
-            .expect("ban list lock should not be poisoned")
-            .insert(ip);
+        bans.insert(ip);
         bans
     }
 }
@@ -680,15 +708,7 @@ impl AddressBook {
             if updated.misbehavior() >= constants::MAX_PEER_MISBEHAVIOR_SCORE {
                 // Ban and skip outbound connections with excessively misbehaving peers.
                 let banned_ip = updated.addr.ip();
-                {
-                    let mut bans_by_ip = self
-                        .bans_by_ip
-                        .inner
-                        .write()
-                        .expect("ban list lock should not be poisoned");
-
-                    bans_by_ip.insert(banned_ip);
-                }
+                self.bans_by_ip.insert(banned_ip);
 
                 // `most_recent_by_ip` is only populated when
                 // `max_connections_per_ip == 1`. The ban path runs for any

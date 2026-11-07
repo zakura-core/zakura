@@ -1,4 +1,5 @@
 use chrono::{Duration, Timelike};
+#[cfg(not(zakura_sim))]
 use rayon::prelude::*;
 use zakura_chain::parameters::Network;
 
@@ -11,6 +12,27 @@ use crate::{
     Clock, EngineConfig, HeaderValidationState, PreparedHeader, PreparedHeaderBatch,
     ValidationLease,
 };
+
+/// Iterates a header batch in parallel, or in order on the caller's thread in
+/// the simulator build, where every task shares one OS thread. Both give the
+/// same results, since each stage collects in input order.
+trait Each<T> {
+    #[cfg(not(zakura_sim))]
+    fn each(&self) -> rayon::slice::Iter<'_, T>;
+    #[cfg(zakura_sim)]
+    fn each(&self) -> std::slice::Iter<'_, T>;
+}
+
+impl<T: Sync> Each<T> for [T] {
+    #[cfg(not(zakura_sim))]
+    fn each(&self) -> rayon::slice::Iter<'_, T> {
+        self.par_iter()
+    }
+    #[cfg(zakura_sim)]
+    fn each(&self) -> std::slice::Iter<'_, T> {
+        self.iter()
+    }
+}
 
 /// Immutable authenticated rules used by the pure preparation pipeline.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,7 +124,7 @@ pub fn prepare_headers(
     // Supported encoded version and locally computed header hash.
     let hash_results: Vec<_> = input
         .headers
-        .par_iter()
+        .each()
         .enumerate()
         .map(|(offset, header)| {
             validate_encoding_version_hash(header)
@@ -130,7 +152,7 @@ pub fn prepare_headers(
 
     let context_free: Vec<_> = input
         .headers
-        .par_iter()
+        .each()
         .zip(&hashes)
         .zip(&heights)
         .enumerate()

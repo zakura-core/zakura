@@ -137,9 +137,10 @@ where
 
     let incoming = limited_tcp_incoming(tcp_listener, MAX_CONNECTIONS);
     let server_task: JoinHandle<Result<(), BoxError>> = spawn_erased(async move {
+        // The generated service dispatches on the method path itself, and answers unknown
+        // methods with `Unimplemented`, so a single service needs no tonic router.
         server
-            .add_service(IndexerServer::new(indexer_service))
-            .serve_with_incoming(incoming)
+            .serve_with_incoming(IndexerServer::new(indexer_service), incoming)
             .await?;
 
         Ok(())

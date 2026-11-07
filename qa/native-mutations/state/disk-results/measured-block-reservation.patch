@@ -1,0 +1,11 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -250,7 +250,7 @@ impl ZakuraDb {
+         let reservation = self
+             .read_capacity
+             .memory
+-            .try_reserve(serialized.saturating_mul(MAX_DECODED_BYTES_PER_WIRE_BYTE))?;
++            .try_reserve(0)?;
+         let mut size = 0;
+         let block = self
+             .read_capacity

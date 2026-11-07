@@ -1,18 +1,25 @@
 //! The example reactor serving and downloading through the exchange tools.
 //!
+//! The exchange follows the pure state and IO split. The pure
+//! [`ExchangeState`] in `state` owns the exchange policy: the requested ranges,
+//! each response's outcome, and the watch rules. [`ExchangeIO`] owns the
+//! streams and the regulation tools, runs their prechecks and claims, and
+//! applies the decisions the state returns.
+//!
 //! One function, [`range_cap`], bounds a range's response for both sides: the
 //! server's [`Serve`] reserves output for it, and the client's
 //! [`Reservations`] admit no more than it. The handler is a plain `match` from
-//! message to tool. Nothing in it depends on the layout, so the same node runs
-//! over [`SINGLE`](super::SINGLE) and [`PAIRED`](super::PAIRED).
+//! message to tool and state transition. Nothing in it depends on the layout,
+//! so the same node runs over [`SINGLE`](super::SINGLE) and
+//! [`PAIRED`](super::PAIRED).
 //!
-//! A watch pushes each item above its start as the next page. The node checks
+//! A watch pushes each item above its start as the next page. The state checks
 //! what the tools cannot: each page's height follows the previous one, and
 //! each end reason arrives in its window. One publisher task per session
 //! writes every page and outcome, so a watch's outcome follows its pages.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     sync::{Arc, Mutex, PoisonError},
 };
 
@@ -38,8 +45,11 @@ use crate::zakura::{
 };
 use zakura_chain::block::Height;
 
+mod state;
 #[cfg(test)]
 mod tests;
+
+use state::ExchangeState;
 
 /// The most a range's response may carry: one item per height, then the
 /// ending. Both the server and the client bound the response with it.
@@ -208,33 +218,28 @@ struct Watches {
     superseded: Vec<u32>,
 }
 
-/// A range this node requested, and the items it received so far.
+/// One example node on one connection: the streams, regulation tools, and
+/// publisher task that run [`ExchangeState`]'s decisions.
 #[derive(Debug)]
-struct Download {
-    range: ItemRange,
-    items: Vec<(Height, Vec<u8>)>,
-}
-
-/// One example node on one connection.
-#[derive(Debug)]
-pub(crate) struct ExampleNode {
+pub(crate) struct ExchangeIO {
+    state: ExchangeState,
     layout: &'static [Stream],
     sends: Vec<FramedSend>,
     /// Ranges this node may have outstanding: the request row's limit.
     max_in_flight: usize,
     serve: Serve<Store>,
     reservations: Reservations<Height>,
-    downloads: BTreeMap<Height, Download>,
     status: CadenceSender<ExampleMessage>,
     /// This node's watches on the peer.
     subscriptions: Subscriptions<u32, Height>,
-    next_watch: u32,
     /// Updates recorded but not yet queued, oldest first. They leave in order
     /// once the stream has room.
     unsent: VecDeque<Frame>,
     /// The peer's watches on this node.
     watches: Arc<Mutex<Watches>>,
     publisher: Arc<Notify>,
+    // Delivered results. They stand in for the application that a reactor
+    // hands its results to.
     /// Watched items, in arrival order.
     pub(crate) watched: Vec<(Height, Vec<u8>)>,
     /// How each of this node's watches ended.
@@ -247,7 +252,7 @@ pub(crate) struct ExampleNode {
     pub(crate) peer_status: Option<(Height, Height)>,
 }
 
-impl ExampleNode {
+impl ExchangeIO {
     /// Serve `store` to `peer` and download from it over `layout`.
     pub(crate) fn new(
         layout: &'static [Stream],
@@ -286,15 +291,14 @@ impl ExampleNode {
         ));
         let max_in_flight = usize::try_from(max_in_flight).expect("a small limit fits usize");
         Self {
+            state: ExchangeState::default(),
             layout,
             sends,
             max_in_flight,
             serve,
             reservations: Reservations::new(ExampleMessage::RULES, max_in_flight),
-            downloads: BTreeMap::new(),
             status: CadenceSender::new(),
             subscriptions: Subscriptions::new(limits, ExampleMessage::RULES),
-            next_watch: 0,
             unsent: VecDeque::new(),
             watches,
             publisher,
@@ -313,7 +317,7 @@ impl ExampleNode {
 
     /// Whether every requested range has ended.
     pub(crate) fn idle(&self) -> bool {
-        self.downloads.is_empty()
+        self.state.idle()
     }
 
     /// Reserve `range`'s response, then request it.
@@ -332,13 +336,7 @@ impl ExampleNode {
             self.reservations.retract(&range.start);
             return Err(RequestFailed::QueueFull);
         }
-        self.downloads.insert(
-            range.start,
-            Download {
-                range,
-                items: Vec::new(),
-            },
-        );
+        self.state.requested(range);
         Ok(())
     }
 
@@ -379,46 +377,24 @@ impl ExampleNode {
             ExampleMessage::Status { low, high } => self.peer_status = Some((low, high)),
             ExampleMessage::GetItems(range) => self.serve.admit(range)?,
             ExampleMessage::Item { height, bytes } => {
-                let start = self.range_of(height, frame.message_type)?;
+                let start = self.state.range_of(height, frame.message_type)?;
                 self.reservations
                     .claim_frame(&start, frame.message_type, len)?;
-                self.downloads
-                    .get_mut(&start)
-                    .expect("a live reservation has a download")
-                    .items
-                    .push((height, bytes));
+                self.state.item(start, height, bytes);
             }
             ExampleMessage::ItemsDone { start, returned } => {
                 let ended = self
                     .reservations
                     .claim_end(&start, frame.message_type, len)?;
-                if ended.frames != returned {
-                    return Err(Violation::Count {
-                        reported: returned,
-                        received: ended.frames,
-                    });
-                }
-                let download = self
-                    .downloads
-                    .remove(&start)
-                    .expect("a live reservation has a download");
-                self.received.extend(download.items);
+                let items = self.state.items_done(start, returned, ended.frames)?;
+                self.received.extend(items);
             }
             ExampleMessage::RangeUnavailable(range) => {
                 let ended = self
                     .reservations
                     .claim_end(&range.start, frame.message_type, len)?;
-                if ended.frames != 0 {
-                    return Err(Violation::Count {
-                        reported: 0,
-                        received: ended.frames,
-                    });
-                }
-                let download = self
-                    .downloads
-                    .remove(&range.start)
-                    .expect("a live reservation has a download");
-                self.unavailable.push(download.range);
+                let range = self.state.range_unavailable(range.start, ended.frames)?;
+                self.unavailable.push(range);
             }
             ExampleMessage::Watch(update) => {
                 let mut watches = self.watches.lock().unwrap_or_else(PoisonError::into_inner);
@@ -452,12 +428,7 @@ impl ExampleNode {
                     .subscriptions
                     .received(&id)
                     .ok_or(SubscriptionFault::Unknown)?;
-                if received.next().ok() != Some(height) {
-                    return Err(Violation::Linkage {
-                        received,
-                        got: height,
-                    });
-                }
+                state::follows(received, height)?;
                 self.subscriptions.claim_page(&id, 1, len, height)?;
                 // The handler accepts each item as it arrives.
                 self.watched.push((height, bytes));
@@ -470,14 +441,7 @@ impl ExampleNode {
             }
             ExampleMessage::WatchEnded { id, reason } => {
                 let ended = self.subscriptions.claim_end(&id)?;
-                let in_window = match reason {
-                    EndReason::Unavailable => ended.pages == 0,
-                    EndReason::Superseded => true,
-                    EndReason::Closed => ended.close_sent,
-                };
-                if !in_window {
-                    return Err(Violation::OutcomeWindow(reason));
-                }
+                state::end_in_window(reason, ended.pages, ended.close_sent)?;
                 self.watch_ended.push(reason);
             }
         }
@@ -486,7 +450,7 @@ impl ExampleNode {
 
     /// Watch the peer's items above `from`, with the whole credit window.
     pub(crate) fn watch(&mut self, from: Height) -> Result<u32, WatchFailed> {
-        let id = self.next_watch;
+        let id = self.state.next_watch();
         let MessageRole::Subscription { credit, .. } = WATCH.role else {
             unreachable!("WATCH is a subscription row");
         };
@@ -498,7 +462,7 @@ impl ExampleNode {
                 return Err(error.into());
             }
         };
-        self.next_watch += 1;
+        self.state.watch_opened();
         self.unsent.push_back(frame);
         self.flush();
         Ok(id)
@@ -523,7 +487,7 @@ impl ExampleNode {
         let Some(room) = self.subscriptions.grantable(&id) else {
             return;
         };
-        if room.objects < super::WATCH_ITEMS / 2 {
+        if !state::renews(room) {
             return;
         }
         if let Ok(update) = self.subscriptions.grant(&id, room) {
@@ -559,16 +523,6 @@ impl ExampleNode {
                 return;
             }
         }
-    }
-
-    /// The start of the live download containing `height`.
-    fn range_of(&self, height: Height, message_type: u16) -> Result<Height, ClaimRefused> {
-        self.downloads
-            .range(..=height)
-            .next_back()
-            .filter(|(_, download)| height.0 - download.range.start.0 < download.range.count)
-            .map(|(start, _)| *start)
-            .ok_or(ClaimRefused::Unsolicited { message_type })
     }
 
     /// Open requests on this node's serving session.
@@ -657,16 +611,15 @@ fn end_due(
         .keys()
         .filter_map(|&id| {
             let first = publications.credit(&id)?.consumed().objects == 0;
-            let next = publications.last_sent(&id)?.next();
-            if publications.is_closing(&id) {
-                Some((id, EndReason::Closed))
-            } else if watches.superseded.contains(&id) {
-                Some((id, EndReason::Superseded))
-            } else if first && next.is_ok_and(|next| next < store.low) {
-                Some((id, EndReason::Unavailable))
-            } else {
-                None
-            }
+            let next = publications.last_sent(&id)?.next().ok();
+            let reason = state::end_reason(
+                publications.is_closing(&id),
+                watches.superseded.contains(&id),
+                first,
+                next,
+                store.low,
+            )?;
+            Some((id, reason))
         })
         .collect();
     due.sort_unstable_by_key(|&(id, _)| id);

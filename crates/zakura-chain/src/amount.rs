@@ -58,10 +58,15 @@ impl<C> fmt::Display for Amount<C> {
 
 impl<C> fmt::Debug for Amount<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple(&format!("Amount<{}>", std::any::type_name::<C>()))
-            .field(&self.0)
-            .finish()
+        debug_amount(f, std::any::type_name::<C>(), self.0)
     }
+}
+
+/// The body of `Amount<C>`'s `Debug`, kept non-generic so it is compiled once.
+fn debug_amount(f: &mut fmt::Formatter<'_>, constraint: &str, zatoshis: i64) -> fmt::Result {
+    f.debug_tuple(&format!("Amount<{constraint}>"))
+        .field(&zatoshis)
+        .finish()
 }
 
 impl Amount<NonNegative> {
@@ -465,7 +470,7 @@ where
 
 /// Errors that can be returned when validating [`Amount`]s.
 #[allow(missing_docs)]
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[derive(thiserror::Error, Clone, PartialEq, Eq)]
 pub enum Error {
     /// input {value} is outside of valid range for zatoshi Amount, valid_range={range:?}
     Constraint {
@@ -494,6 +499,48 @@ pub enum Error {
         partial_sum: i64,
         remaining_items: usize,
     },
+}
+
+// Written out instead of derived: derived `Debug` is `#[inline]`, so every
+// codegen unit that formats this type compiles its own copy. The output
+// matches the derive.
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Constraint { value, range } => f
+                .debug_struct("Constraint")
+                .field("value", value)
+                .field("range", range)
+                .finish(),
+            Error::Convert { value, source } => f
+                .debug_struct("Convert")
+                .field("value", value)
+                .field("source", source)
+                .finish(),
+            Error::MultiplicationOverflow {
+                amount,
+                multiplier,
+                overflowing_result,
+            } => f
+                .debug_struct("MultiplicationOverflow")
+                .field("amount", amount)
+                .field("multiplier", multiplier)
+                .field("overflowing_result", overflowing_result)
+                .finish(),
+            Error::DivideByZero { amount } => f
+                .debug_struct("DivideByZero")
+                .field("amount", amount)
+                .finish(),
+            Error::SumOverflow {
+                partial_sum,
+                remaining_items,
+            } => f
+                .debug_struct("SumOverflow")
+                .field("partial_sum", partial_sum)
+                .field("remaining_items", remaining_items)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Display for Error {

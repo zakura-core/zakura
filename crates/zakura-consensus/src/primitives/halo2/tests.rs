@@ -193,7 +193,7 @@ fn pre_nu6_2_proof_only_verifies_under_pre_nu6_2_key() {
 /// [`lazy_verifier_for`] routes each upgrade to the service that holds the correct
 /// circuit era's key.
 ///
-/// Comparing the `Lazy` handles themselves proves the routing without building
+/// Comparing the `LazyLock` handles themselves proves the routing without building
 /// any verifying key or starting a batch worker.
 #[test]
 fn verifier_routes_each_network_upgrade_to_the_correct_key() {

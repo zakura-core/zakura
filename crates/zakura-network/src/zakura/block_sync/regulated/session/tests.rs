@@ -1,4 +1,5 @@
 use super::*;
+use crate::zakura::block_sync::block_sync_observe::SessionKey;
 use crate::zakura::{
     block_sync::regulated::serving::{Read, ReadResult},
     framed_channel,
@@ -123,6 +124,7 @@ async fn completed_ranges_are_reusable_before_earlier_output_drains() {
     let (send, mut output) = framed_channel(4);
     let mut session = serving.session(
         &ZakuraPeerId::new(vec![61; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -176,6 +178,7 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     let (send, old_output) = framed_channel(4);
     let mut old = serving.session(
         &peer,
+        SessionKey::default(),
         send,
         old_cancel.clone(),
         CancellationToken::new(),
@@ -201,6 +204,10 @@ async fn cancelled_sessions_do_not_complete_replacement_ranges() {
     let (send, mut output) = framed_channel(4);
     let mut new = serving.session(
         &peer,
+        SessionKey {
+            conn_id: 0,
+            generation: 1,
+        },
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -243,6 +250,7 @@ fn ready_session(
     let (send, output) = framed_channel(queue);
     let session = serving.session(
         &ZakuraPeerId::new(vec![peer; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -279,6 +287,59 @@ async fn a_ready_range_is_sent_while_an_earlier_read_is_blocked() {
     assert_eq!(served(&mut output).await, Served::Block(Height(2)));
     assert_eq!(served(&mut output).await, done(2, 1));
     wait_completed(&mut session, Height(2)).await;
+    cancel.cancel();
+}
+
+/// A session's live ranges and its peer's serving leases, read from the range
+/// map and the slot budgets, follow a blocked read: the finished range leaves
+/// both, the blocked one holds one execution slot, and its ending returns
+/// both to empty.
+#[tokio::test]
+async fn live_ranges_and_leases_follow_a_blocked_read() {
+    let source = Arc::new(ControlledSource {
+        blocks: mainnet_blocks(1..=2),
+        ..Default::default()
+    });
+    let blocked = Arc::new(Semaphore::new(0));
+    source
+        .gates
+        .lock()
+        .unwrap()
+        .insert(Height(2), blocked.clone());
+    let peer = ZakuraPeerId::new(vec![65; 32]).unwrap();
+    let (serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    session.admit(Range::new(Height(2), 1).unwrap()).unwrap();
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
+    assert_eq!(served(&mut output).await, Served::Block(Height(1)));
+    assert_eq!(served(&mut output).await, done(1, 1));
+    let settled = |session: &ServingSession, ranges: &[(Height, Height)], slots| {
+        let live: Vec<_> = session
+            .admitted_ranges()
+            .iter()
+            .filter(|range| !range.completed)
+            .map(|range| (range.first, range.last))
+            .collect();
+        live == ranges && serving.leases_held(&peer).0 == slots
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !settled(&session, &[(Height(2), Height(2))], 1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the blocked height 2 read keeps its range and one execution slot");
+
+    blocked.add_permits(1);
+    assert_eq!(served(&mut output).await, Served::Block(Height(2)));
+    assert_eq!(served(&mut output).await, done(2, 1));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !settled(&session, &[], 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the ending releases the range and the slot");
+    assert_eq!(serving.leases_held(&peer), (0, 0));
     cancel.cancel();
 }
 
@@ -369,6 +430,68 @@ async fn a_same_height_replacement_never_precedes_the_old_ranges_output() {
 mod lifecycle;
 mod load;
 
+/// Servers cut every range to the advertised one block, so the largest served
+/// response is one 2 MB body, its tag and the 9-byte ending, in two frames. A
+/// 128-block request gets the same cap from the server.
+#[test]
+fn the_largest_served_response_is_one_advertised_block() {
+    use crate::zakura::{
+        block_sync::{
+            config::BS_BLOCKS_PER_RESPONSE, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES,
+        },
+        regulation::ResponseCap,
+    };
+    assert_eq!(
+        ZakuraBlockSyncConfig::default().advertised_max_blocks_per_response(),
+        BS_BLOCKS_PER_RESPONSE
+    );
+    assert_eq!(
+        LARGEST_SERVED_RESPONSE,
+        ResponseCap {
+            frames: 1,
+            bytes: 2_000_000 + 1 + 9,
+        }
+    );
+    assert_eq!(LARGEST_SERVED_RESPONSE.output_bytes(), 2_000_026);
+    let largest_request = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST).unwrap();
+    assert_eq!(
+        largest_request
+            .truncated(BS_BLOCKS_PER_RESPONSE)
+            .response_cap(MAX_BS_RESPONSE_BYTES),
+        LARGEST_SERVED_RESPONSE
+    );
+}
+
+/// One-block sizing leaves every default limit as the 128-block sizing set it:
+/// both responses fit the 64 MiB peer output floor (twice the send window), and
+/// the node funds that floor on each of its 92 default connections' sessions.
+#[test]
+fn one_block_sizing_keeps_the_default_serving_limits() {
+    use crate::zakura::block_sync::{MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES};
+    let config = ZakuraBlockSyncConfig::default();
+    let limits = serving_limits(&config);
+    let old_largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
+        .unwrap()
+        .response_cap(MAX_BS_RESPONSE_BYTES)
+        .output_bytes();
+    assert_eq!(old_largest, 33_555_601);
+    assert_eq!(
+        limits,
+        ServeLimits {
+            node_execution: NODE_EXECUTION,
+            peer_execution: PEER_EXECUTION,
+            ..sizing::serve_limits(
+                old_largest,
+                sizing::TARGET_RTT,
+                config.block_sync_connections(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
+            )
+        }
+    );
+    assert_eq!(limits.peer_output_bytes, 64 * 1024 * 1024);
+    assert_eq!(limits.node_output_bytes, 92 * (64 << 20));
+    assert_eq!((limits.node_execution, limits.peer_execution), (24, 12));
+}
+
 /// Default peer limits budget 2816 requests, so 512 sessions fill exactly 512 MiB.
 #[test]
 fn the_default_serving_limit_fits_the_bookkeeping_budget() {
@@ -413,8 +536,9 @@ fn the_serving_limit_follows_session_slots_and_configuration() {
 /// Serving enforces the advertised limit: `2 × limit` open requests are served, one more faults.
 #[tokio::test]
 async fn serving_enforces_the_budgeted_limit() {
+    let gate = Arc::new(Semaphore::new(0));
     let source = Arc::new(ControlledSource {
-        default_gate: Some(Arc::new(Semaphore::new(0))),
+        default_gate: Some(gate.clone()),
         ..Default::default()
     });
     let config = ZakuraBlockSyncConfig::default();
@@ -424,6 +548,7 @@ async fn serving_enforces_the_budgeted_limit() {
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
         &ZakuraPeerId::new(vec![62; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -453,6 +578,7 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
     let (send, _output) = framed_channel(4);
     let mut session = serving.session(
         &ZakuraPeerId::new(vec![63; 32]).unwrap(),
+        SessionKey::default(),
         send,
         cancel.clone(),
         CancellationToken::new(),
@@ -489,4 +615,123 @@ async fn adjacent_ranges_are_admitted_and_any_overlap_disconnects() {
     session.admit(Range::new(Height(18), 1).unwrap()).unwrap();
     session.admit(Range::new(Height(1), 4).unwrap()).unwrap();
     cancel.cancel();
+}
+
+/// Review P5a-2: the range snapshot is read-only. A range whose ending is
+/// published stays recorded, marked completed, until the next admission removes
+/// it, and reading the snapshot changes neither the map nor the queue.
+#[tokio::test]
+async fn admitted_ranges_leave_owner_state_unchanged() {
+    let source = Arc::new(ControlledSource {
+        blocks: mainnet_blocks(1..=1),
+        ..Default::default()
+    });
+    let (_serving, mut session, mut output, cancel) = ready_session(&source, 65, 4);
+    session.admit(Range::new(Height(1), 1).unwrap()).unwrap();
+    assert_eq!(served(&mut output).await, Served::Block(Height(1)));
+    assert_eq!(served(&mut output).await, done(1, 1));
+    let ranges = session.ranges.clone();
+    let recorded = session.completed.recorded();
+    let observed = session.admitted_ranges();
+    assert_eq!(session.admitted_ranges(), observed);
+    assert_eq!(session.ranges, ranges);
+    assert_eq!(session.completed.recorded(), recorded);
+    cancel.cancel();
+    assert_eq!(
+        observed,
+        [AdmittedRange {
+            first: Height(1),
+            last: Height(1),
+            completed: true,
+        }]
+    );
+}
+
+/// Peer serving keeps three bounds at once on the production session: the
+/// commitments it accepts, the reads that actually run, and the output it has
+/// granted. Queued requests beyond a peer's execution share spawn no worker and
+/// hold no output grant, and a cancelled session's reads return every slot as
+/// they finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serving_bounds_commitments_workers_and_outputs() {
+    let gate = Arc::new(Semaphore::new(0));
+    let source = Arc::new(ControlledSource {
+        default_gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let config = ZakuraBlockSyncConfig::default();
+    let limit = serving_max_inflight_requests(&config);
+    let limits = serving_limits(&config);
+    let peer = ZakuraPeerId::new(vec![66; 32]).unwrap();
+    let (serving, mut session, _output, cancel) = ready_session(&source, 66, 4);
+    assert!(
+        usize::try_from(2 * limit).unwrap() > limits.peer_execution,
+        "the commitment margin exceeds the workers, so the worker bound is visible"
+    );
+
+    for height in 1..=2 * limit {
+        session
+            .admit(Range::new(Height(height), 1).unwrap())
+            .unwrap();
+    }
+    assert_eq!(session.serve.open(), 2 * limit);
+    assert!(
+        session
+            .admit(Range::new(Height(2 * limit + 1), 1).unwrap())
+            .is_err(),
+        "a commitment past the margin is a violation"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while source.started.load(Ordering::SeqCst) < limits.peer_execution {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the peer's execution share starts reading");
+    // Give an over-limit dispatch time to appear before checking its absence.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(source.started.load(Ordering::SeqCst), limits.peer_execution);
+    let (workers, output_bytes) = serving.leases_held(&peer);
+    assert_eq!(workers, limits.peer_execution);
+    assert!(output_bytes > 0, "each running read holds its output grant");
+    assert!(output_bytes <= limits.peer_output_bytes);
+
+    // A storage read outlives its session, and its lease lasts as long as the read.
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(serving.leases_held(&peer).0, limits.peer_execution);
+    gate.add_permits(limits.peer_execution);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while serving.leases_held(&peer) != (0, 0) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finished reads of a cancelled session return their workers and output grants");
+}
+
+/// Every session that can serve at once can hold a whole peer budget of unsent
+/// responses, so the node's output budget never pauses a conformant peer for another's
+/// reservations.
+#[test]
+fn getblocks_node_output_funds_every_session() {
+    let config = ZakuraBlockSyncConfig::default();
+    let limits = serving_limits(&config);
+    let sessions = config.block_sync_connections(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS);
+    assert_eq!(
+        limits.node_output_bytes,
+        u64::try_from(sessions).unwrap() * limits.peer_output_bytes
+    );
+    assert_eq!(
+        limits.node_output_bytes,
+        92 * (64 << 20),
+        "92 sessions × 64 MiB"
+    );
+
+    let configured = ZakuraBlockSyncConfig {
+        node_serve_output_bytes: Some(1 << 30),
+        ..config
+    };
+    assert_eq!(serving_limits(&configured).node_output_bytes, 1 << 30);
 }

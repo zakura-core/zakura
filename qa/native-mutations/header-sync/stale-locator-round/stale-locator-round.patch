@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index f9ceaf3034..7ad0e5de46 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -122,8 +122,7 @@ impl AdvertisedHeaderTarget {
+     /// Header work deliberately ignores the global state version because unrelated body commits
+     /// can advance it without changing the selected header graph or finality anchor.
+     pub fn is_current(&self, local: &EngineSnapshot) -> bool {
+-        self.scope.header_generation == local.header_generation
+-            && self.scope.branch.anchor_hash == local.frontiers.finalized.hash
++        self.scope.branch.anchor_hash == local.frontiers.finalized.hash
+             && self.scope.branch.target_tip_hash == self.status.selected_tip_hash
+     }
+ 

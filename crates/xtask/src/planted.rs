@@ -60,13 +60,15 @@
 //!
 //! `--shard <index>/<count>` runs only every `count`th case in path order,
 //! starting at position `index`. It picks from the cases that the property
-//! and `--targets` keep, and `--changed-since` filters its pick. The
-//! `count` shards of one count together run every case once. A case's
-//! shard follows from its position, so adding or removing a case moves
-//! every later case to another shard: across that change, a case can run on
-//! two nights in a row, or wait up to `2 * count - 1` nights. The nightly
-//! job runs one shard a night, and a remote host runs the whole catalogue
-//! (qa/fuzz/sim's README, Long runs).
+//! and `--targets` keep, and `--changed-since` or `--cases-changed-since`
+//! filters its pick. The `count` shards of one count together run every
+//! case once. A shard that holds no case fails the run, so a run that
+//! passes ran at least one case. A case's shard follows from its position,
+//! so adding or removing a case moves every later case to another shard.
+//! With `--shard`, a change filter therefore also keeps every case whose
+//! patch sorts after a patch the changes added or removed. The nightly job
+//! runs one shard in full and the changed cases of every other shard, and a
+//! remote host runs the whole catalogue (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
@@ -74,6 +76,12 @@
 //! runner, the simulator that records and judges each run, its scheduler
 //! and runtime, or the build configuration. A renamed file counts as a
 //! change to its old and its new path.
+//!
+//! `--cases-changed-since <rev>` runs only the cases whose own files
+//! changed since `rev`: the patch, the case file, the input and its
+//! sidecar, and the files the patch changes. It leaves out the checks and
+//! the shared machinery, which change on most days and would select most
+//! of the catalogue. A filter that keeps no case passes the run.
 
 use std::{
     collections::BTreeMap,
@@ -174,6 +182,26 @@ impl Shard {
 impl fmt::Display for Shard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.index, self.count)
+    }
+}
+
+/// The changes since a revision that keep a case in the run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Changes {
+    /// `--changed-since`: a change to any path the case's catch watches
+    /// ([`watched`]).
+    Affecting(String),
+    /// `--cases-changed-since`: a change to the case's own files
+    /// ([`own_files`]).
+    OfCases(String),
+}
+
+impl Changes {
+    /// The revision the changes start from.
+    fn rev(&self) -> &str {
+        match self {
+            Changes::Affecting(rev) | Changes::OfCases(rev) => rev,
+        }
     }
 }
 
@@ -357,16 +385,16 @@ impl fmt::Display for Verdict {
 }
 
 /// Runs every planted case, or only `property`'s, and fails unless each is
-/// caught. With `shard`, it runs only that shard's cases, and passes if
-/// the shard has none. With `changed_since`, it runs only the cases a
-/// change since that revision affects, and passes if none is. With
-/// `targets`, it runs only the cases a simulator fuzz target runs, and
-/// confirms each through its target.
+/// caught. With `shard`, it runs only that shard's cases, and fails if the
+/// shard has none. With `changed_since`, it runs only the cases those
+/// changes keep, and passes if they keep none. With `targets`, it runs only
+/// the cases a simulator fuzz target runs, and confirms each through its
+/// target.
 pub(super) fn run(
     repo_root: &Path,
     property: Option<&str>,
     shard: Option<Shard>,
-    changed_since: Option<&str>,
+    changed_since: Option<&Changes>,
     targets: bool,
 ) -> Result<(), BoxError> {
     let mut cases: Vec<Case> = cases(repo_root)?
@@ -406,35 +434,8 @@ pub(super) fn run(
             (None, false) => format!("no planted cases under {PLANTED_DIR}").into(),
         });
     }
-    // The shard picks from the catalogue before `changed_since` does, so a
-    // case's shard doesn't move with the changes.
-    let cases = match shard {
-        Some(shard) => {
-            let picked = shard.select(cases);
-            if picked.is_empty() {
-                println!("no planted case falls in shard {shard}");
-                return Ok(());
-            }
-            picked
-        }
-        None => cases,
-    };
-    let cases = match changed_since {
-        Some(rev) => {
-            let changed = changed_since_rev(repo_root, rev)?;
-            let mut affected = Vec::new();
-            for case in cases {
-                if is_affected(&watched(repo_root, &case)?, &changed) {
-                    affected.push(case);
-                }
-            }
-            if affected.is_empty() {
-                println!("no planted case is affected by the changes since {rev}");
-                return Ok(());
-            }
-            affected
-        }
-        None => cases,
+    let Some(cases) = select(repo_root, cases, shard, changed_since)? else {
+        return Ok(());
     };
     let work = repo_root.join("target").join("planted");
     let worktree = work.join("worktree");
@@ -453,6 +454,66 @@ pub(super) fn run(
         return Err(format!("{failed} of {} planted cases failed", cases.len()).into());
     }
     Ok(())
+}
+
+/// Picks the cases to run from `cases`: `shard`'s, then those that
+/// `changed_since` keeps. The shard picks first, so a case's shard doesn't
+/// move with the changes. Fails if the shard holds no case, and returns
+/// `None` if the changes keep none, which passes the run.
+fn select(
+    repo_root: &Path,
+    cases: Vec<Case>,
+    shard: Option<Shard>,
+    changed_since: Option<&Changes>,
+) -> Result<Option<Vec<Case>>, BoxError> {
+    let total = cases.len();
+    let cases = match shard {
+        Some(shard) => {
+            let picked = shard.select(cases);
+            if picked.is_empty() {
+                return Err(
+                    format!("shard {shard} holds none of the {total} planted cases").into(),
+                );
+            }
+            picked
+        }
+        None => cases,
+    };
+    let Some(changes) = changed_since else {
+        return Ok(Some(cases));
+    };
+    let rev = changes.rev();
+    let changed = changed_since_rev(repo_root, rev)?;
+    // An added or removed case moves every later case to another shard, so
+    // a later case counts as changed.
+    let moved_after = match shard {
+        Some(_) => catalogue_changes(repo_root, rev)?.into_iter().min(),
+        None => None,
+    };
+    let mut kept = Vec::new();
+    for case in cases {
+        let paths = match changes {
+            Changes::Affecting(_) => watched(repo_root, &case)?,
+            Changes::OfCases(_) => own_files(repo_root, &case)?,
+        };
+        let moved = match &moved_after {
+            Some(first) => relative(repo_root, &case.patch)? > *first,
+            None => false,
+        };
+        if moved || is_affected(&paths, &changed) {
+            kept.push(case);
+        }
+    }
+    if kept.is_empty() {
+        match shard {
+            Some(shard) => {
+                println!("no planted case in shard {shard} changed since {rev}");
+            }
+            None => println!("no planted case changed since {rev}"),
+        }
+        return Ok(None);
+    }
+    Ok(Some(kept))
 }
 
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
@@ -518,6 +579,24 @@ fn is_plain_relative(path: &Path) -> bool {
 /// old path and its added new one, so a case watching the old path sees the
 /// rename.
 fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxError> {
+    diff_since(repo_root, rev, &[])
+}
+
+/// The patches under [`PLANTED_DIR`] that were added or removed between
+/// `rev`'s merge base with `HEAD` and `HEAD`, relative to the repository
+/// root. A renamed patch counts as both.
+fn catalogue_changes(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxError> {
+    Ok(diff_since(repo_root, rev, &["--diff-filter=AD"])?
+        .into_iter()
+        .filter(|path| {
+            path.starts_with(PLANTED_DIR) && path.extension().is_some_and(|e| e == "patch")
+        })
+        .collect())
+}
+
+/// The paths `git diff` with `options` reports between `rev`'s merge base
+/// with `HEAD` and `HEAD`, as [`changed_since_rev`] describes.
+fn diff_since(repo_root: &Path, rev: &str, options: &[&str]) -> Result<Vec<PathBuf>, BoxError> {
     // Resolving `rev` first keeps git from reading it as an option, a
     // pathspec or a range.
     let resolved = git(repo_root)
@@ -534,14 +613,9 @@ fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxErr
     }
     let base = String::from_utf8(resolved.stdout)?.trim().to_owned();
     let output = git(repo_root)
-        .args([
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "-z",
-            &format!("{base}...HEAD"),
-            "--",
-        ])
+        .args(["diff", "--name-only", "--no-renames", "-z"])
+        .args(options)
+        .args([&format!("{base}...HEAD"), "--"])
         .output()?;
     if !output.status.success() {
         return Err(format!(
@@ -558,24 +632,34 @@ fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxErr
 }
 
 /// Every path whose change can break `case`'s catch, relative to
-/// `repo_root`: the patch and its case file, the input and its sidecar, the
-/// files the patch changes, the case's checks, and [`SHARED`].
+/// `repo_root`: the case's own files ([`own_files`]), the case's checks, and
+/// [`SHARED`].
 fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
-    let relative = |path: &Path| {
-        path.strip_prefix(repo_root)
-            .map(Path::to_path_buf)
-            .map_err(|_| format!("{} isn't under the repository", path.display()))
-    };
-    let mut watched = vec![
-        relative(&case.patch)?,
-        relative(&case.patch.with_extension("toml"))?,
+    let mut watched = own_files(repo_root, case)?;
+    watched.extend(SHARED.iter().map(PathBuf::from));
+    watched.extend(case.checks.iter().cloned());
+    Ok(watched)
+}
+
+/// `case`'s own files, relative to `repo_root`: the patch and its case
+/// file, the input and its sidecar, and the files the patch changes.
+fn own_files(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
+    let mut own = vec![
+        relative(repo_root, &case.patch)?,
+        relative(repo_root, &case.patch.with_extension("toml"))?,
         case.input.clone(),
         case.input.with_extension("toml"),
     ];
-    watched.extend(SHARED.iter().map(PathBuf::from));
-    watched.extend(patched_files(repo_root, &case.patch)?);
-    watched.extend(case.checks.iter().cloned());
-    Ok(watched)
+    own.extend(patched_files(repo_root, &case.patch)?);
+    Ok(own)
+}
+
+/// `path` relative to `repo_root`.
+fn relative(repo_root: &Path, path: &Path) -> Result<PathBuf, BoxError> {
+    Ok(path
+        .strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .map_err(|_| format!("{} isn't under the repository", path.display()))?)
 }
 
 /// The files `patch` changes, as `git apply --numstat` lists them without
@@ -1540,6 +1624,156 @@ mod tests {
         );
         assert!(is_affected(&[PathBuf::from("a/service.rs")], &changed));
         assert!(is_affected(&[PathBuf::from("b")], &changed));
+    }
+
+    /// Writes a case for each `(property, name)` under `root`'s
+    /// [`PLANTED_DIR`]: a patch that changes `src/<name>.rs`, and a case file
+    /// naming `qa/inputs/<name>.bin`.
+    fn write_cases(root: &Path, cases: &[(&str, &str)]) {
+        for (property, name) in cases {
+            let dir = root.join(PLANTED_DIR).join(property);
+            fs::create_dir_all(&dir).expect("the property directory is created");
+            fs::write(
+                dir.join(format!("{name}.patch")),
+                format!("--- a/src/{name}.rs\n+++ b/src/{name}.rs\n@@ -1 +1 @@\n-fn a() {{}}\n+fn b() {{}}\n"),
+            )
+            .expect("the patch is written");
+            fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("input = \"qa/inputs/{name}.bin\"\n"),
+            )
+            .expect("the case file is written");
+        }
+    }
+
+    /// A repository at `root` with one commit that holds `cases`, a source
+    /// file for each, and a file in the shared machinery.
+    fn case_repo(root: &Path, cases: &[(&str, &str)]) {
+        write_cases(root, cases);
+        fs::create_dir_all(root.join("src")).expect("src is created");
+        for (_, name) in cases {
+            fs::write(root.join(format!("src/{name}.rs")), "fn a() {}\n")
+                .expect("the source is written");
+        }
+        fs::create_dir_all(root.join("crates/xtask")).expect("xtask is created");
+        fs::write(root.join("crates/xtask/lib.rs"), "\n").expect("the runner is written");
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+    }
+
+    /// The cases [`select`] keeps from `root`'s catalogue, as
+    /// `<property>/<name>`.
+    fn kept(root: &Path, shard: Option<Shard>, changes: &Changes) -> Vec<String> {
+        let cases = cases(root).expect("the cases parse");
+        select(root, cases, shard, Some(changes))
+            .expect("the selection runs")
+            .unwrap_or_default()
+            .iter()
+            .map(|case| {
+                let patch =
+                    relative(&root.join(PLANTED_DIR), &case.patch).expect("under qa/planted");
+                patch.with_extension("").display().to_string()
+            })
+            .collect()
+    }
+
+    /// A shard that holds no case fails the run, so a passing run always
+    /// ran a case.
+    #[test]
+    fn an_empty_shard_fails() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        write_cases(repo.path(), &[("a", "one"), ("a", "two")]);
+        let error = super::run(
+            repo.path(),
+            None,
+            Some(Shard { index: 2, count: 7 }),
+            None,
+            false,
+        )
+        .expect_err("shard 2/7 of two cases is empty");
+        assert!(
+            error.to_string().contains("shard 2/7 holds none of the 2"),
+            "{error}"
+        );
+    }
+
+    /// A change filter that keeps no case passes without running one, even
+    /// in a shard.
+    #[test]
+    fn a_filter_that_keeps_no_case_passes() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        case_repo(root, &[("a", "one")]);
+        for changes in [
+            Changes::OfCases("HEAD".to_owned()),
+            Changes::Affecting("HEAD".to_owned()),
+        ] {
+            for shard in [None, Some(Shard { index: 0, count: 1 })] {
+                super::run(root, None, shard, Some(&changes), false).expect("no case changed");
+            }
+        }
+        assert!(!root.join("target").exists(), "a case ran");
+    }
+
+    /// `--cases-changed-since` keeps a case whose patched file or own file
+    /// changed, and leaves out the rest though the shared machinery
+    /// changed, which `--changed-since` counts against every case.
+    #[test]
+    fn case_changes_keep_only_the_changed_cases() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        case_repo(root, &[("a", "one"), ("a", "two"), ("b", "three")]);
+        fs::write(root.join("src/one.rs"), "fn c() {}\n").expect("the source changes");
+        fs::write(
+            root.join(PLANTED_DIR).join("b/three.toml"),
+            "input = \"qa/inputs/x.bin\"\n",
+        )
+        .expect("the case file changes");
+        fs::write(root.join("crates/xtask/lib.rs"), "// changed\n").expect("the runner changes");
+        git_ok(root, &["commit", "-q", "-am", "change"]);
+
+        let of_cases = Changes::OfCases("HEAD^1".to_owned());
+        assert_eq!(kept(root, None, &of_cases), ["a/one", "b/three"]);
+        assert_eq!(
+            kept(root, Some(Shard { index: 1, count: 2 }), &of_cases),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            kept(root, None, &Changes::Affecting("HEAD^1".to_owned())),
+            ["a/one", "a/two", "b/three"]
+        );
+    }
+
+    /// In a shard, a change filter also keeps every case after an added or
+    /// removed case, because the change moved it to another shard. Without
+    /// a shard, nothing moves.
+    #[test]
+    fn an_added_or_removed_case_moves_the_later_cases() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let root = repo.path();
+        case_repo(root, &[("a", "one"), ("b", "two"), ("c", "three")]);
+        write_cases(root, &[("b", "added")]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-q", "-m", "add"]);
+        let all = Some(Shard { index: 0, count: 1 });
+        let since_add = Changes::OfCases("HEAD^1".to_owned());
+        assert_eq!(kept(root, all, &since_add), ["b/added", "b/two", "c/three"]);
+        assert_eq!(kept(root, None, &since_add), ["b/added"]);
+
+        git_ok(
+            root,
+            &[
+                "rm",
+                "-q",
+                "qa/planted/b/two.patch",
+                "qa/planted/b/two.toml",
+            ],
+        );
+        git_ok(root, &["commit", "-q", "-m", "remove"]);
+        let since_remove = Changes::OfCases("HEAD^1".to_owned());
+        assert_eq!(kept(root, all, &since_remove), ["c/three"]);
+        assert_eq!(kept(root, None, &since_remove), Vec::<String>::new());
     }
 
     /// A revision git can't resolve fails the run instead of selecting no

@@ -8,13 +8,16 @@
 
 use std::collections::BTreeSet;
 
+use zakura_network::zakura::{
+    wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
+};
 use zakura_sim::{
     harness::{
         discovery_service::{act_scenario, DiscoveryWire, WireScenario, FAMILY},
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
-    observe::StreamId,
+    observe::{StreamId, TransportFact},
     peer::discovery::{DiscoveryAct, DiscoveryRow, DiscoveryRule},
     table::GeneratedId,
     witness::{judge_report, Expect},
@@ -207,6 +210,16 @@ fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) 
     }
 }
 
+/// The `over-owed` act on `peers`, the one whose witness also checks its
+/// cap ([`over_owed_at_its_cap`]).
+const OVER_OWED: DiscoveryAct = DiscoveryAct::OverOwed {
+    row: DiscoveryRow::Peers,
+};
+
+/// The node's `GetPeers` limit in the over-owed witness, under production's
+/// 32.
+const LIMIT: usize = 1;
+
 /// Runs the witness of each act in [`ACTS`] whose ID names `row`, and
 /// requires its ID to apply and hold there ([`witnessed`]).
 fn apply_on_row(row: DiscoveryRow) {
@@ -216,8 +229,70 @@ fn apply_on_row(row: DiscoveryRow) {
         .collect();
     assert!(!acts.is_empty());
     for act in acts {
-        witnessed(&run(&act_scenario(act)), act, &[reached(act)]);
+        let scenario = act_scenario(act);
+        let report = run(&scenario);
+        witnessed(&report, act, &[reached(act)]);
+        if act == OVER_OWED {
+            over_owed_at_its_cap(&scenario, &report);
+        }
     }
+}
+
+/// #2114's audit: the node checks a `Peers` against its own request's cap,
+/// `peers_cap(limit)`, which is under the row's maximum when its limit is
+/// under 32. In the over-owed witness, a node asking for [`LIMIT`] record
+/// gets a `Peers` one byte over that cap and under the row's maximum. The
+/// peer's models label it `over-owed`, not `Conformant` and not
+/// `long-payload`. The node reads it, its claim of the answer refuses it,
+/// and the node closes the connection with a fault cause.
+///
+/// This fails if the models owe a `Peers` the row's largest ending again.
+fn over_owed_at_its_cap(scenario: &WireScenario, report: &RunReport) {
+    assert_eq!(scenario.node.peer_sample_limit, Some(LIMIT));
+    let peers = <DiscoveryMessage as WireMessage>::RULES
+        .iter()
+        .find(|rule| rule.message_type == u16::from(MSG_DISCOVERY_PEERS))
+        .expect("discovery tables Peers");
+    let cap = peers.payload.min() + LIMIT * MAX_NODE_RECORD_BYTES;
+    assert!(cap < peers.payload.max(), "{cap}");
+    let entries = report.log.entries();
+    let (connection, seq) = entries
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::PeerFrame {
+                connection,
+                quic_stream: Some(_),
+                seq,
+                row: Some(row),
+                label: Label::OverOwed,
+                ..
+            } if row == DiscoveryRow::Peers.name() => Some((*connection, *seq)),
+            _ => None,
+        })
+        .expect("the act's Peers is over-owed");
+    let read = entries.iter().find_map(|entry| match &entry.obs {
+        Observation::Transport {
+            connection: Some(on),
+            event:
+                TransportFact::HeaderRead {
+                    seq: read,
+                    message_type,
+                    payload_len,
+                    ..
+                },
+            ..
+        } if (*on, *read, *message_type) == (connection, seq, u16::from(MSG_DISCOVERY_PEERS)) => {
+            Some(*payload_len)
+        }
+        _ => None,
+    });
+    // A u32 fits usize on every supported target.
+    assert_eq!(read.map(|len| len as usize), Some(cap + 1));
+    let fault = entries.iter().any(|entry| {
+        matches!(&entry.obs, Observation::ConnectionClosed { connection: on, cause }
+            if *on == connection && is_fault_cause(cause))
+    });
+    assert!(fault, "the node admitted a Peers over its cap");
 }
 
 /// The node's fault closes in `report`, by cause.
@@ -283,7 +358,8 @@ fn get_peers_acts_apply_in_their_witnesses() {
 
 /// Each `peers` ID applies and holds in its witness. The `over-owed`
 /// witness's node asks for one record, so its cap is under the row's
-/// maximum (`tests/discovery_wire_table.rs`).
+/// maximum, and its `Peers` is one byte over that cap
+/// ([`over_owed_at_its_cap`]).
 #[test]
 fn peers_acts_apply_in_their_witnesses() {
     apply_on_row(DiscoveryRow::Peers);

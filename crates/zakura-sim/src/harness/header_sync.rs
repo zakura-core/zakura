@@ -1403,10 +1403,9 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
 /// `peer-0` is the node's only membership
 /// ([`SessionEvidence::stable_membership`]) and hasn't closed its own
 /// connection, and every other assumption always, since the scenario
-/// enforces what it declares. Only the environment breaks it: `peer-0`'s
-/// scripted close, or another peer. A node that drops `peer-0` leaves it
-/// holding, so `header-sync/honest-progress` runs to its deadline and is
-/// violated there.
+/// enforces what it declares. Only the environment breaks it
+/// ([`EndedBy`](crate::property::EndedBy)): `peer-0`'s scripted close, or
+/// another peer. A node that drops `peer-0` leaves it holding.
 fn wire_holds(wire: &HeaderWire, assume: Assume) -> bool {
     match assume {
         Assume::StableMembership => {

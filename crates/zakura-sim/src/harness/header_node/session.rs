@@ -495,8 +495,9 @@ impl SessionEvidence {
     /// Only the environment can add another peer, so this stops holding
     /// only when it does. A session the node ends, refuses, retires or opens
     /// again, a generation it exits and a connection it tears down all leave
-    /// it holding, since those are the node's own doing. The caller checks
-    /// the environment's other end of the membership, `peer`'s own close.
+    /// it holding, since those are the node's own ends ([`EndedBy`]). The
+    /// caller checks the environment's other end of the membership, `peer`'s
+    /// own close.
     pub fn stable_membership(&self, peer: &str) -> bool {
         let ledger = self.ledger();
         let Some(own9) = &ledger.own9 else {

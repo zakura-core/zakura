@@ -58,6 +58,17 @@
 //! binaries must embed the patched checkout's source digest. A check that
 //! fails is its own failure, never a catch.
 //!
+//! `--shard <index>/<count>` runs only every `count`th case in path order,
+//! starting at position `index`. It picks from the cases that the property
+//! and `--targets` keep, and `--changed-since` filters its pick. The
+//! `count` shards of one count together run every case once. A shard that
+//! holds no case fails the run, so a run that passes ran at least one case.
+//! A case's shard follows from its position, so adding or removing a case
+//! moves every later case to another shard: across that change, a case can
+//! run on two nights in a row, or wait up to `2 * count - 1` nights. The
+//! nightly job runs one shard a night, and a remote host runs the whole
+//! catalogue (qa/fuzz/sim's README, Long runs).
+//!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
 //! checks changed, or every case if the shared machinery changed: this
@@ -137,6 +148,43 @@ const TARGET_CHILD: Duration = Duration::from_secs(300);
 /// outside the scratch worktree, which each run removes, so later cases,
 /// later runs and CI's cache of `target/` reuse the builds.
 const CONFIRM_BUILDS: &str = "confirm-builds";
+
+/// One part of the catalogue: the cases at positions `index`,
+/// `index + count`, `index + 2 * count` and so on, in path order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Shard {
+    index: usize,
+    count: usize,
+}
+
+impl Shard {
+    /// Reads `<index>/<count>`, where `index` is below `count`.
+    pub(super) fn parse(text: &str) -> Result<Shard, String> {
+        let usage = || format!("expected `<index>/<count>` with index below count, not `{text}`");
+        let (index, count) = text.split_once('/').ok_or_else(usage)?;
+        let index: usize = index.parse().map_err(|_| usage())?;
+        let count: usize = count.parse().map_err(|_| usage())?;
+        if index >= count {
+            return Err(usage());
+        }
+        Ok(Shard { index, count })
+    }
+
+    /// The cases of `cases` in this shard, in their order.
+    fn select<T>(self, cases: Vec<T>) -> Vec<T> {
+        cases
+            .into_iter()
+            .skip(self.index)
+            .step_by(self.count)
+            .collect()
+    }
+}
+
+impl fmt::Display for Shard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.index, self.count)
+    }
+}
 
 /// One retained bypass patch.
 #[derive(Clone, Debug)]
@@ -322,13 +370,15 @@ impl fmt::Display for Verdict {
 }
 
 /// Runs every planted case, or only `property`'s, and fails unless each is
-/// caught. With `changed_since`, it runs only the cases a change since that
-/// revision affects, and passes if none is. With `targets`, it runs only
-/// the cases a simulator fuzz target runs, and confirms each through its
-/// target.
+/// caught. With `shard`, it runs only that shard's cases, and fails if
+/// the shard has none. With `changed_since`, it runs only the cases a
+/// change since that revision affects, and passes if none is. With
+/// `targets`, it runs only the cases a simulator fuzz target runs, and
+/// confirms each through its target.
 pub(super) fn run(
     repo_root: &Path,
     property: Option<&str>,
+    shard: Option<Shard>,
     changed_since: Option<&str>,
     targets: bool,
 ) -> Result<(), BoxError> {
@@ -369,6 +419,21 @@ pub(super) fn run(
             (None, false) => format!("no planted cases under {PLANTED_DIR}").into(),
         });
     }
+    // The shard picks from the catalogue before `changed_since` does, so a
+    // case's shard doesn't move with the changes.
+    let total = cases.len();
+    let cases = match shard {
+        Some(shard) => {
+            let picked = shard.select(cases);
+            if picked.is_empty() {
+                return Err(
+                    format!("shard {shard} holds none of the {total} planted cases").into(),
+                );
+            }
+            picked
+        }
+        None => cases,
+    };
     let cases = match changed_since {
         Some(rev) => {
             let changed = changed_since_rev(repo_root, rev)?;
@@ -596,7 +661,7 @@ fn remove_worktree(repo_root: &Path, worktree: &Path) -> Result<(), BoxError> {
 /// each. Returns how many cases failed.
 fn run_cases(worktree: &Path, work: &Path, cases: &[Case]) -> Result<usize, BoxError> {
     let target = work.join("target");
-    run_command(&mut cargo_sim(worktree, &target, "build"))?;
+    run_command(&mut cargo_sim(worktree, &target))?;
     // The patched builds reuse the target directory, so the baseline keeps
     // its own copy of the binary.
     let baseline = work.join("baseline-zakura-sim");
@@ -647,10 +712,13 @@ fn check_case(
     if let Err(why) = apply(worktree, &case.patch) {
         return Ok(Verdict::PatchDoesntApply(why));
     }
-    let mut patched_sim = cargo_sim(worktree, target, "run");
-    patched_sim.arg("--");
+    if let Err(error) = run_command(&mut cargo_sim(worktree, target)) {
+        return Ok(Verdict::Failed(format!(
+            "the patched build failed: {error}"
+        )));
+    }
     let patched = record(
-        patched_sim,
+        Command::new(target.join(PROFILE).join("zakura-sim")),
         &harness,
         &input,
         &case.property,
@@ -775,7 +843,7 @@ fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
 }
 
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
-/// build in `target`, which recording the committed input built. Each input
+/// build in `target`, which [`check_case`] built. Each input
 /// and its trace go under `dir`.
 fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
     if dir.exists() {
@@ -884,17 +952,21 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
     }
 }
 
-/// `cargo <verb>` for `worktree`'s `zakura-sim` binary, built with
-/// [`PROFILE`] and the simulator's flags in `target`. A `run` takes the
-/// binary's arguments after a `--`.
-fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
+/// `cargo build` for `worktree`'s `zakura-sim` binary, with [`PROFILE`] and
+/// the simulator's flags, in `target`.
+///
+/// A bypass patch can leave the code it bypasses unused, so the build
+/// reports warnings but doesn't fail on them, even where the environment
+/// denies them, as CI's Rust setup does with `CARGO_BUILD_WARNINGS=deny`.
+fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command
         .env("RUSTFLAGS", SIM_RUSTFLAGS)
         .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_BUILD_WARNINGS", "warn")
         .current_dir(worktree)
-        .arg(verb)
+        .arg("build")
         .args([
             "--locked",
             "--profile",
@@ -1291,6 +1363,44 @@ mod tests {
         );
     }
 
+    /// The shards of one count split the cases between them, each case in
+    /// exactly one, and keep path order.
+    #[test]
+    fn shards_split_the_cases() {
+        let cases: Vec<usize> = (0..10).collect();
+        let shards: Vec<Vec<usize>> = (0..3)
+            .map(|index| Shard { index, count: 3 }.select(cases.clone()))
+            .collect();
+        assert_eq!(shards, [vec![0, 3, 6, 9], vec![1, 4, 7], vec![2, 5, 8]]);
+        assert_eq!(Shard { index: 0, count: 1 }.select(cases.clone()), cases);
+        assert!(Shard { index: 4, count: 7 }
+            .select(vec![0, 1, 2])
+            .is_empty());
+    }
+
+    /// Every simulator build warns rather than fails on warnings, so a
+    /// patch that leaves code unused still builds where the environment
+    /// sets `CARGO_BUILD_WARNINGS=deny`.
+    #[test]
+    fn simulator_builds_override_denied_warnings() {
+        let build = cargo_sim(Path::new("worktree"), Path::new("target"));
+        let warnings = build
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_WARNINGS")
+            .and_then(|(_, value)| value);
+        assert_eq!(warnings, Some(std::ffi::OsStr::new("warn")));
+        assert_eq!(build.get_args().next(), Some(std::ffi::OsStr::new("build")));
+    }
+
+    #[test]
+    fn a_shard_parses_only_an_index_below_its_count() {
+        assert_eq!(Shard::parse("2/7"), Ok(Shard { index: 2, count: 7 }));
+        assert_eq!(Shard::parse("0/1"), Ok(Shard { index: 0, count: 1 }));
+        for text in ["7/7", "0/0", "1", "a/2", "1/b", "-1/2", "1/2/3", ""] {
+            assert!(Shard::parse(text).is_err(), "{text}");
+        }
+    }
+
     /// A case is affected by a change to its patch's files, its checks, its
     /// own files, or the runner, and not by an unrelated change.
     #[test]
@@ -1475,6 +1585,46 @@ mod tests {
         );
         assert!(is_affected(&[PathBuf::from("a/service.rs")], &changed));
         assert!(is_affected(&[PathBuf::from("b")], &changed));
+    }
+
+    /// Writes a case for each `(property, name)` under `root`'s
+    /// [`PLANTED_DIR`]: a patch that changes `src/<name>.rs`, and a case file
+    /// naming `qa/inputs/<name>.bin`.
+    fn write_cases(root: &Path, cases: &[(&str, &str)]) {
+        for (property, name) in cases {
+            let dir = root.join(PLANTED_DIR).join(property);
+            fs::create_dir_all(&dir).expect("the property directory is created");
+            fs::write(
+                dir.join(format!("{name}.patch")),
+                format!("--- a/src/{name}.rs\n+++ b/src/{name}.rs\n@@ -1 +1 @@\n-fn a() {{}}\n+fn b() {{}}\n"),
+            )
+            .expect("the patch is written");
+            fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("input = \"qa/inputs/{name}.bin\"\n"),
+            )
+            .expect("the case file is written");
+        }
+    }
+
+    /// A shard that holds no case fails the run, so a passing run always
+    /// ran a case.
+    #[test]
+    fn an_empty_shard_fails() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        write_cases(repo.path(), &[("a", "one"), ("a", "two")]);
+        let error = super::run(
+            repo.path(),
+            None,
+            Some(Shard { index: 2, count: 7 }),
+            None,
+            false,
+        )
+        .expect_err("shard 2/7 of two cases is empty");
+        assert!(
+            error.to_string().contains("shard 2/7 holds none of the 2"),
+            "{error}"
+        );
     }
 
     /// A revision git can't resolve fails the run instead of selecting no

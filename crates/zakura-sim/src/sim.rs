@@ -5,10 +5,15 @@
 //! ends at a violation, when nothing is enabled, or after its step budget and
 //! a bounded drain.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use zakura_scheduler::{
-    CleanupReport, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
+    At, CleanupReport, ObjectId, RunOutcome, Scheduler, SchedulerConfig, SimInstant, Status, TaskId,
 };
 
 use crate::{
@@ -16,6 +21,7 @@ use crate::{
     check::{Checker, Phase, PropertyOutcome, PropertyReport, StepCtx, Violation},
     draws::{self, Choices, Failure, Owner},
     end::{Drain, HarnessFailure, IdleStatus, Outcome, RunEnd},
+    evidence::{Checkpoint, EvidenceId, Mark},
     observe::{Exit, Observation},
     record::{
         digest, CleanupRecord, EndRecord, InitRecord, OutcomeKind, Record, RecordSink, StepRecord,
@@ -23,6 +29,10 @@ use crate::{
     },
     Identity, ObservationLog, Plan, PlanInput,
 };
+
+/// The next run's ID. IDs are never serialized, so their values don't
+/// affect replay.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
 /// The property a run violates when it spins at one instant too long.
 pub const NO_LIVELOCK: &str = "sim/no-livelock";
@@ -56,6 +66,19 @@ impl Default for RunConfig {
     }
 }
 
+/// A harness rule that keeps ready tasks out of the enabled set, so a run
+/// can pause a task at a chosen point, as a busy thread would pause it.
+///
+/// A held task sits out only while something else is enabled. When only
+/// held tasks are ready, the clock can still move, as it would for a slow
+/// thread. When nothing else is enabled at all, every held task is enabled
+/// again, so a hold never ends a run.
+pub trait TaskHold {
+    /// True if `task`, which resumes at `at`, sits out the next pick. The
+    /// run asks after each step's observations, once per ready task.
+    fn holds(&self, task: TaskId, at: &At) -> bool;
+}
+
 /// One step's pick, for tests and reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pick {
@@ -86,6 +109,14 @@ pub struct RunReport {
     pub resolved: Plan,
 }
 
+impl RunReport {
+    /// The `end` record the run wrote, or would have written to a sink that
+    /// keeps records.
+    pub(crate) fn end_record(&self) -> EndRecord {
+        end_record(&self.end, &self.properties, self.cleanup, &self.picks)
+    }
+}
+
 /// One simulated run.
 pub struct Sim {
     /// `None` once shut down.
@@ -94,7 +125,38 @@ pub struct Sim {
     choices: Rc<RefCell<Choices>>,
     failure: Failure,
     sources: Vec<Box<dyn ActionSource>>,
+    /// Each evidence checkpoint the run holds, with its index among its
+    /// kind's, in registration order.
+    evidence: Vec<(u64, Checkpoint)>,
+    /// This run's ID, unique within the process.
+    run_id: u64,
     config: RunConfig,
+    /// The harness's task holds.
+    holds: Vec<Box<dyn TaskHold>>,
+    /// Run once the log freezes, before the scheduler shuts down.
+    on_frozen: Vec<Box<dyn FnOnce()>>,
+    /// Run with the run's final end, reports and log, after `on_frozen`.
+    on_end: Vec<EndHook>,
+    /// The tasks stopped mid-poll at the boundary the sources observe now.
+    mid_poll: MidPoll,
+}
+
+/// A [`Sim::on_end`] hook.
+type EndHook = Box<dyn FnOnce(&RunEnd, &[PropertyReport], &ObservationLog)>;
+
+/// The tasks stopped mid-poll at the boundary a run's sources are
+/// observing: each is partway through synchronous code that yielded at a
+/// preemption point. A task that isn't can't be between a change it makes
+/// and a report that follows it in the same poll. Cloning shares it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MidPoll(Rc<RefCell<BTreeSet<TaskId>>>);
+
+impl MidPoll {
+    /// Whether `task` is stopped mid-poll at the boundary being observed.
+    /// Read it only while observing.
+    pub(crate) fn contains(&self, task: TaskId) -> bool {
+        self.0.borrow().contains(&task)
+    }
 }
 
 impl Sim {
@@ -116,8 +178,46 @@ impl Sim {
             choices,
             failure,
             sources: Vec::new(),
+            evidence: Vec::new(),
+            run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             config,
+            holds: Vec::new(),
+            on_frozen: Vec::new(),
+            on_end: Vec::new(),
+            mid_poll: MidPoll::default(),
         }
+    }
+
+    /// The tasks stopped mid-poll at each boundary the sources observe, as
+    /// [`MidPoll`] says.
+    pub(crate) fn mid_poll(&self) -> MidPoll {
+        self.mid_poll.clone()
+    }
+
+    /// Runs `hook` once the run's log freezes, before the scheduler shuts
+    /// down. Shutdown still resumes the run's suspended tasks, so evidence a
+    /// harness keeps beside the log freezes here too, and what cleanup
+    /// reports can't change what the run ended with.
+    pub(crate) fn on_frozen(&mut self, hook: impl FnOnce() + 'static) {
+        self.on_frozen.push(Box::new(hook));
+    }
+
+    /// Runs `hook` with the run's end, property reports and log once they're
+    /// final, after the [`on_frozen`](Self::on_frozen) hooks and before the
+    /// scheduler shuts down, so it sees what the run ended with and nothing
+    /// shutdown does. A harness failure the hook raises still ends the run
+    /// at it, unless the run already ended at one.
+    pub(crate) fn on_end(
+        &mut self,
+        hook: impl FnOnce(&RunEnd, &[PropertyReport], &ObservationLog) + 'static,
+    ) {
+        self.on_end.push(Box::new(hook));
+    }
+
+    /// Keeps the ready tasks `hold` names out of each step's enabled set,
+    /// as [`TaskHold`] describes. A trace replays only with the same holds.
+    pub fn hold_tasks(&mut self, hold: Box<dyn TaskHold>) {
+        self.holds.push(hold);
     }
 
     /// The run's scheduler, for setup such as spawning the tasks under test.
@@ -132,11 +232,42 @@ impl Sim {
         SourceId(self.sources.len() - 1)
     }
 
+    /// The run's harness failure cell, which a source sets for a failure
+    /// it finds while observing. The run checks it after every step.
+    pub(crate) fn failure(&self) -> Failure {
+        self.failure.clone()
+    }
+
+    /// Holds `checkpoint` for an evidence source being created. At setup
+    /// and after every step, the run ends with
+    /// [`HarnessFailure::SourceEvidence`] unless it names that step and the
+    /// run's own log holds exactly the entries it records, however the
+    /// source was wrapped or added, or if it never was. Returns the
+    /// source's identity, whose index counts the run's earlier sources of
+    /// the same kind, and which binds it to this run.
+    pub(crate) fn register(&mut self, checkpoint: Checkpoint) -> EvidenceId {
+        let index = self
+            .evidence
+            .iter()
+            .filter(|(_, held)| held.kind().same_space(checkpoint.kind()))
+            .count();
+        let id = EvidenceId {
+            run: self.run_id,
+            // usize always fits in u64 on supported targets.
+            index: index as u64,
+        };
+        self.evidence.push((id.index, checkpoint));
+        id
+    }
+
     /// Runs to the end, then checks the end with `checker`, freezes the log,
     /// and shuts the scheduler down. Emits the run's records to `sink`: `init`,
-    /// each step, then `end`.
+    /// each step, then `end`. A sink that doesn't want steps
+    /// ([`RecordSink::wants_steps`]) gets only `init` and `end`, and the run
+    /// skips each step's `obs` digest.
     pub fn run(mut self, checker: &mut dyn Checker, sink: &mut dyn RecordSink) -> RunReport {
         let mut state = State::default();
+        state.log.set_run(self.run_id);
         let draws = {
             let mut choices = self.choices.borrow_mut();
             // The sink is harness code, so a draw inside it is a failure.
@@ -144,24 +275,73 @@ impl Sim {
             choices.take_draws()
         };
         sink.record(Record::Init(InitRecord { draws }));
-        let end = match self.failure.take() {
+        // A checker's failure from setup, such as a missing source, ends the
+        // run before its first step.
+        let end = match self.failure.take().or_else(|| checker.harness_failure()) {
             Some(failure) => state.end_harness(failure),
             None => self.drive(checker, &mut state, sink),
         };
+        // A trace replay that ended before its record did diverged.
+        let unreached = match end.outcome {
+            Outcome::Harness => None,
+            _ => self.choices.borrow().decider.finish().err(),
+        };
         // A failure the last step's code left behind outranks the outcome,
-        // and so does evidence that names a step the run didn't take.
-        let end = match self.failure.take().or_else(|| evidence_outside_run(&end)) {
+        // and so do an unreached trace record and evidence that names a step
+        // the run didn't take.
+        let end = match self
+            .failure
+            .take()
+            .or_else(|| unreached.map(HarnessFailure::Plan))
+            .or_else(|| evidence_outside_run(&end))
+        {
+            Some(failure) => state.end_harness(failure),
+            None => end,
+        };
+        // An evidence source the last step's checker or sink dropped after
+        // it observed fails the run before its properties are reported.
+        let end = match self.end_evidence(&end, &state) {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
         // The checker is harness code, so the owner stays Harness for it.
         let properties = checker.at_end(&end, &state.log);
         let (properties, bad_report) = checked_reports(properties, end.steps);
+        // Read even when a failure is already recorded. One `at_end` or its
+        // reports caused still replaces the outcome, as before, and a source
+        // `at_end` dropped ends the run only if nothing else did.
+        let dropped = self.check_evidence(&state).err();
         let end = match self.failure.take().or(bad_report) {
             Some(failure) => state.end_harness(failure),
             None => end,
         };
+        let end = match dropped {
+            Some(failure) if end.outcome != Outcome::Harness => state.end_harness(failure),
+            _ => end,
+        };
+        // Last, so it covers every way the run ended at a harness failure,
+        // which the checker may have reported before it knew. The report and
+        // the end record both take these.
+        let properties = match end.outcome {
+            Outcome::Harness => after_harness_failure(properties),
+            _ => properties,
+        };
         state.log.freeze();
+        for hook in std::mem::take(&mut self.on_frozen) {
+            hook();
+        }
+        for hook in std::mem::take(&mut self.on_end) {
+            hook(&end, &properties, &state.log);
+        }
+        // A failure an end hook raised, such as a draw outside a step, still
+        // fails the run.
+        let (end, properties) = match self.failure.take() {
+            Some(failure) if end.outcome != Outcome::Harness => (
+                state.end_harness(failure),
+                after_harness_failure(properties),
+            ),
+            _ => (end, properties),
+        };
         let cleanup = self.shut_down();
         sink.record(Record::End(end_record(
             &end,
@@ -221,6 +401,11 @@ impl Sim {
     ) -> RunEnd {
         // Draws are harness failures except while a step runs.
         self.choices.borrow_mut().set_owner(Owner::Harness);
+        // Read once, so a run never emits only some of its steps.
+        let record_steps = sink.wants_steps();
+        if let Err(failure) = self.observe_sources(st) {
+            return st.end_harness(failure);
+        }
         let mut ready = match self.ready(st) {
             Ok(ready) => ready,
             Err(failure) => return st.end_harness(failure),
@@ -251,12 +436,34 @@ impl Sim {
             if let Some(failure) = self.failure.take() {
                 return st.end_harness(failure);
             }
+            // Held tasks sit out, unless nothing else is enabled. With only
+            // held tasks ready, the clock can move, as for a slow thread.
+            let free: Option<Vec<(Identity, TaskId)>> = (!st.held.is_empty()).then(|| {
+                ready
+                    .iter()
+                    .filter(|(_, task)| !st.held.contains(task))
+                    .cloned()
+                    .collect()
+            });
             let enabled = match enabled_set(&EnabledInputs {
                 phase,
                 now,
-                ready: &ready,
+                ready: free.as_deref().unwrap_or(&ready),
                 next_deadline: self.sched().next_deadline(),
                 offers: &offers,
+            })
+            .and_then(|enabled| {
+                if enabled.is_empty() && free.is_some() {
+                    enabled_set(&EnabledInputs {
+                        phase,
+                        now,
+                        ready: &ready,
+                        next_deadline: self.sched().next_deadline(),
+                        offers: &offers,
+                    })
+                } else {
+                    Ok(enabled)
+                }
             }) {
                 Ok(enabled) => enabled,
                 Err(identity) => {
@@ -281,7 +488,7 @@ impl Sim {
                 let mut choices = self.choices.borrow_mut();
                 match phase {
                     Phase::Live => choices.decider.pick(&identities),
-                    Phase::Drain => Ok(choices.decider.pick_round_robin(&identities)),
+                    Phase::Drain => choices.decider.pick_round_robin(&identities),
                 }
             };
             let decision = match decision {
@@ -308,25 +515,38 @@ impl Sim {
                 _ => Owner::NoTask,
             };
             self.choices.borrow_mut().set_owner(owner);
-            self.execute(chosen.action, st);
+            let executed = self.execute(chosen.action, st);
             let draws = {
                 let mut choices = self.choices.borrow_mut();
                 choices.set_owner(Owner::Harness);
                 choices.take_draws()
             };
+            let observed = match chosen.action {
+                // `execute` observed right after the task ran, and nothing
+                // has run since.
+                Action::RunTask(_) => executed,
+                _ => executed.and_then(|()| self.observe_sources(st)),
+            };
 
             let next = self.ready(st);
-            sink.record(Record::Step(StepRecord {
-                step: st.step,
-                pick: chosen.identity.to_string(),
-                key: None,
-                options: enabled.len(),
-                by: decision.by,
-                offset: decision.offset,
-                draws,
-                obs: Some(digest(st.log.of_step(st.step))),
-            }));
+            if record_steps {
+                sink.record(Record::Step(StepRecord {
+                    step: st.step,
+                    pick: chosen.identity.to_string(),
+                    key: None,
+                    options: enabled.len(),
+                    by: decision.by,
+                    offset: decision.offset,
+                    draws,
+                    obs: Some(digest(st.log.of_step(st.step))),
+                    machine: None,
+                }));
+            }
             if let Some(failure) = self.failure.take() {
+                return st.end_harness(failure);
+            }
+            // Ends before the checker, which would read incomplete evidence.
+            if let Err(failure) = observed {
                 return st.end_harness(failure);
             }
             ready = match next {
@@ -350,25 +570,36 @@ impl Sim {
                 log: &st.log,
             };
             let violation = checker.after_step(&cx);
-            if let Some(failure) = self.failure.take() {
+            if let Some(failure) = self.failure.take().or_else(|| checker.harness_failure()) {
                 return st.end_harness(failure);
             }
-            let violation = violation.or_else(|| {
-                let spinning = phase == Phase::Live
-                    && self.config.enforce_no_livelock
-                    && at_instant > self.config.max_steps_per_instant
-                    && !self.nothing_enabled(&ready);
-                spinning.then(|| Violation {
-                    property: NO_LIVELOCK.to_owned(),
-                    step: st.step,
-                    witness: vec![st.step],
-                    expected: format!(
-                        "at most {} steps before the clock moves",
-                        self.config.max_steps_per_instant
-                    ),
-                    actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
-                })
+            // Steps taken while the checker suspends the limit don't count.
+            if !checker.bounds_livelock() {
+                at_instant = 0;
+            }
+            // Checked even when the checker found a violation, so a spin at
+            // the same step still reaches the checker.
+            let spinning = phase == Phase::Live
+                && self.config.enforce_no_livelock
+                && at_instant > self.config.max_steps_per_instant
+                && !self.nothing_enabled(&ready);
+            let livelock = spinning.then(|| Violation {
+                property: NO_LIVELOCK.to_owned(),
+                step: st.step,
+                witness: vec![st.step],
+                expected: format!(
+                    "at most {} steps before the clock moves",
+                    self.config.max_steps_per_instant
+                ),
+                actual: format!("{at_instant} steps at {} ns", now.since_start().as_nanos()),
             });
+            let violation = match (violation, livelock) {
+                (Some(violation), Some(livelock)) => {
+                    checker.step_loop_violation(&livelock);
+                    Some(violation)
+                }
+                (violation, livelock) => violation.or(livelock),
+            };
             if let Some(violation) = violation {
                 let mut end = st.end(Outcome::Violation);
                 end.violation = Some(violation);
@@ -399,15 +630,138 @@ impl Sim {
         .is_ok_and(|enabled| enabled.is_empty())
     }
 
-    /// Runs `action` and records what it did.
-    fn execute(&mut self, action: Action, st: &mut State) {
+    /// Lets every source append what happened inside it to the current
+    /// step, then requires every evidence source's checkpoint to name it.
+    /// A source that fails doesn't stop the later ones observing, so a
+    /// failure one of them records in the run's failure cell, such as a
+    /// reactor port panic, still outranks it. The first failure is returned.
+    fn observe_sources(&mut self, st: &mut State) -> Result<(), HarnessFailure> {
+        *self.mid_poll.0.borrow_mut() = self.sched().mid_poll();
+        let mut failed = None;
+        for (index, source) in self.sources.iter_mut().enumerate() {
+            if let Err(detail) = source.observe(&mut st.log) {
+                failed.get_or_insert(HarnessFailure::SourceEvidence {
+                    source: format!("source {index}"),
+                    detail,
+                });
+            }
+        }
+        match failed {
+            Some(failure) => Err(failure),
+            None => self.check_evidence(st),
+        }
+    }
+
+    /// The evidence failure that ends a run which `end` didn't already end
+    /// at a harness failure, if any of its evidence sources was dropped, or skipped
+    /// a boundary, after its last observation. A run that ended idle or at its
+    /// budget also fails if a source's evidence is unfinished, such as a stop the
+    /// harness began that hasn't ended. A violation ends a run early on purpose,
+    /// so it skips that check. Checked before the log freezes, so the run's own
+    /// shutdown, after it, never fails here.
+    fn end_evidence(&self, end: &RunEnd, st: &State) -> Option<HarnessFailure> {
+        match end.outcome {
+            Outcome::Harness => None,
+            Outcome::Violation => self.check_evidence(st).err(),
+            Outcome::Budget | Outcome::Idle { .. } => self
+                .check_evidence(st)
+                .err()
+                .or_else(|| self.unfinished_evidence(end)),
+        }
+    }
+
+    /// The first evidence source whose evidence is unfinished at `end`
+    /// ([`LiveEvidence::unfinished`]), as a failure.
+    fn unfinished_evidence(&self, end: &RunEnd) -> Option<HarnessFailure> {
+        self.evidence.iter().find_map(|(instance, checkpoint)| {
+            let detail = checkpoint.live()?.unfinished(end)?;
+            Some(HarnessFailure::SourceEvidence {
+                source: checkpoint.kind().source(*instance),
+                detail: detail.to_owned(),
+            })
+        })
+    }
+
+    /// Requires every evidence checkpoint to name the current step, with
+    /// its publisher healthy and the run's own log holding exactly what it
+    /// records.
+    fn check_evidence(&self, st: &State) -> Result<(), HarnessFailure> {
+        for (instance, checkpoint) in &self.evidence {
+            let kind = checkpoint.kind();
+            let words = kind.words();
+            let detail = match checkpoint.get() {
+                Mark::NotObserved => {
+                    "NotObserved: the setup observation never completed".to_owned()
+                }
+                Mark::Dropped => {
+                    format!("Dropped: the {} was dropped during the run", words.source)
+                }
+                Mark::Observed(delivered) if delivered.step != st.step => format!(
+                    "BoundarySkipped: the last observation was at step {}, not {}",
+                    delivered.step, st.step
+                ),
+                Mark::Observed(delivered) => {
+                    // The publisher is read live, since activity after the
+                    // last observation leaves the mark as it was.
+                    let live = checkpoint.live();
+                    let last = live.as_ref().map_or(0, |live| live.last_seq());
+                    // Exactly what the source delivered, payloads and order
+                    // included, so the checker reads what the source checked.
+                    let logged = kind.entries(st.log.of_step(st.step), *instance);
+                    if live.as_ref().is_some_and(|live| live.refused_outside_run()) {
+                        format!("RefusedOutsideRun: {}", words.refused)
+                    } else if let Some(health) = live.as_ref().and_then(|live| live.health()) {
+                        health.to_owned()
+                    } else if last > delivered.through_seq {
+                        format!(
+                            "Unobserved: the {} published {} {}..={last} after its last \
+                             observation",
+                            words.publisher,
+                            words.entries,
+                            delivered.through_seq + 1
+                        )
+                    } else if logged.iter().copied().eq(&delivered.observations) {
+                        continue;
+                    } else {
+                        let differs = logged
+                            .iter()
+                            .zip(&delivered.observations)
+                            .position(|(logged, sent)| *logged != sent)
+                            .unwrap_or(logged.len().min(delivered.observations.len()));
+                        format!(
+                            "Undelivered: at step {} the run log holds {} {} entries and \
+                             {} delivered {}, first differing at entry {differs}",
+                            st.step,
+                            logged.len(),
+                            words.source,
+                            words.source,
+                            delivered.observations.len()
+                        )
+                    }
+                }
+            };
+            return Err(HarnessFailure::SourceEvidence {
+                source: kind.source(*instance),
+                detail,
+            });
+        }
+        Ok(())
+    }
+
+    /// Runs `action` and records what it did. A task's outcome is pushed
+    /// after the sources are drained, so what it made a source do comes
+    /// first in the step.
+    fn execute(&mut self, action: Action, st: &mut State) -> Result<(), HarnessFailure> {
         match action {
             Action::RunTask(task) => {
                 let name = st.names[&task].clone();
-                let obs = match self.sched_mut().run(task) {
+                let outcome = self.sched_mut().run(task);
+                self.observe_sources(st)?;
+                let obs = match outcome {
                     RunOutcome::Reached(at) => Observation::TaskReached {
                         task: name,
                         at: at.to_string(),
+                        object: at.object.map(|object| self.object_name(st, object)),
                         site: at.site.map(|s| format!("{}:{}", s.file(), s.line())),
                     },
                     RunOutcome::Waiting => Observation::TaskWaiting { task: name },
@@ -428,14 +782,36 @@ impl Sim {
             }
             Action::Source { source, local } => self.sources[source.0].execute(local, &mut st.log),
         }
+        Ok(())
+    }
+
+    /// `object` as `<creator>:object#<n>`. The creator is the creating task's
+    /// name, or `setup` outside any task. A name survives unrelated code
+    /// changes, and a `TaskId` doesn't.
+    fn object_name(&self, st: &State, object: ObjectId) -> String {
+        let creator = match object.creator {
+            // A task makes objects only while it runs, so it was offered and
+            // named first.
+            Some(task) => st
+                .names
+                .get(&task)
+                .cloned()
+                .unwrap_or_else(|| self.sched().task_name(task)),
+            None => "setup".to_owned(),
+        };
+        format!("{creator}:object#{}", object.ordinal)
     }
 
     /// The scheduler's ready tasks with their identities. Records each task
-    /// seen for the first time as spawned.
+    /// seen for the first time as spawned, and which ones the harness holds.
     fn ready(&self, st: &mut State) -> Result<Vec<(Identity, TaskId)>, HarnessFailure> {
         let ready = self.sched().ready();
         let mut out = Vec::with_capacity(ready.len());
+        st.held.clear();
         for r in ready {
+            if self.holds.iter().any(|hold| hold.holds(r.task, &r.at)) {
+                st.held.insert(r.task);
+            }
             let name = match st.names.get(&r.task) {
                 Some(name) => name.clone(),
                 None => {
@@ -460,6 +836,8 @@ impl Sim {
 struct State {
     step: u64,
     names: BTreeMap<TaskId, String>,
+    /// The ready tasks the harness holds this step.
+    held: BTreeSet<TaskId>,
     log: ObservationLog,
     picks: Vec<Pick>,
 }
@@ -491,6 +869,17 @@ impl State {
             ..self.end(Outcome::Harness)
         }
     }
+}
+
+/// `reports` of a run that ended at a harness failure.
+fn after_harness_failure(reports: Vec<PropertyReport>) -> Vec<PropertyReport> {
+    reports
+        .into_iter()
+        .map(|report| PropertyReport {
+            outcome: report.outcome.after_harness_failure(),
+            ..report
+        })
+        .collect()
 }
 
 /// What `source` offers at `now`.
@@ -534,8 +923,8 @@ fn evidence_outside_run(end: &RunEnd) -> Option<HarnessFailure> {
 }
 
 /// `reports` with each step the run didn't take removed from their
-/// `Violated` evidence and `holds_since`, so the `end` record stays readable,
-/// and the failure for the first one removed.
+/// violations' evidence and `holds_since`, so the `end` record stays
+/// readable, and the failure for the first one removed.
 fn checked_reports(
     mut reports: Vec<PropertyReport>,
     steps: u64,
@@ -560,6 +949,18 @@ fn checked_reports(
             }
             witness.retain(in_run);
         }
+        // A violation at a step the run didn't take is dropped whole.
+        report.violations.retain_mut(|violation| {
+            let mut steps = std::iter::once(&violation.step).chain(&violation.witness);
+            if let Some(&step) = steps.find(|step| !in_run(step)) {
+                failure.get_or_insert_with(|| HarnessFailure::EvidenceOutsideRun {
+                    property: report.property.clone(),
+                    step,
+                });
+            }
+            violation.witness.retain(in_run);
+            in_run(&violation.step)
+        });
     }
     (reports, failure)
 }
@@ -597,7 +998,15 @@ fn end_record(
         drain: end.drain,
         harness: end.harness.as_ref().map(ToString::to_string),
         cleanup: CleanupRecord::from(cleanup),
-        properties: properties.to_vec(),
+        // The record holds what the trace writes, which leaves out each
+        // report's violations, so a replay compares like with like.
+        properties: properties
+            .iter()
+            .map(|report| PropertyReport {
+                violations: Vec::new(),
+                ..report.clone()
+            })
+            .collect(),
     }
 }
 

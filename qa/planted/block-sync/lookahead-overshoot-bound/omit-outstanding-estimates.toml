@@ -1,0 +1,11 @@
+# Drops the outstanding above-floor estimates from admission's look-ahead
+# charge, so admission counts only retained bodies against `L`. The
+# input's mirrors withhold every height above the commit window, so no
+# above-window body arrives, and the node keeps requesting above-window
+# heights until their estimates pass `L + H + (W + 1)·k·B`.
+input = "crates/zakura-sim/tests/fixtures/block-sync-above-window.bin"
+# Besides admission.rs, which the patch changes, the rest of block sync
+# decides how fast the commit window fills. A change there can slow the
+# sync past the input's step budget. The case takes about a minute, so
+# changes elsewhere, such as to the transport, don't rerun it.
+checks = ["crates/zakura-network/src/zakura/block_sync"]

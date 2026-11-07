@@ -47,7 +47,7 @@ pub fn preempt(point: Point) {
             }
             s.stuck.insert(task);
         } else {
-            s.advance_point(task, point.op, Some(point.site));
+            s.advance_point(task, point.op, point.object, Some(point.site));
         }
         Some(s.tasks[task.index()].yielder)
     })
@@ -57,7 +57,8 @@ pub fn preempt(point: Point) {
     }
 }
 
-/// Parks the current task until [`unpark_all`] on `wait`, keeping its worker.
+/// Parks the current task until [`unpark_all`] on `wait`, keeping its worker
+/// if it holds one.
 ///
 /// `held_by` names the task holding `wait`, if known, so the scheduler can
 /// tell a lock cycle from starved workers. Returns false without parking
@@ -115,6 +116,20 @@ pub(crate) fn spawn_boxed(label: &'static str, task: BoxTask) -> TaskId {
     queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
 }
 
+/// [`spawn_boxed`] for a blocking job. The job never holds a worker, so it
+/// can run, and park, while every worker is busy. Aborts reach it only at a
+/// poll boundary, as for any task.
+#[cfg(zakura_sim)]
+pub(crate) fn spawn_blocking_boxed(label: &'static str, task: BoxTask) -> TaskId {
+    let queued = with_run(|s| {
+        s.queue_spawn(label, task).inspect(|id| {
+            s.tasks[id.index()].blocking = true;
+        })
+    })
+    .expect("zakura-rt spawns only while this run's executor is installed, and the run state outlives that");
+    queued.unwrap_or_else(|rejected| RunState::reject_spawn(rejected))
+}
+
 /// [`spawn_boxed`], but returns `None` past the run's task limit, or outside
 /// a run, instead of panicking. The rejected task is dropped unpolled.
 #[cfg(zakura_sim)]
@@ -150,6 +165,12 @@ pub(crate) fn request_abort(task: TaskId) {
 /// The current virtual time, or `None` outside a run.
 pub fn now() -> Option<SimInstant> {
     with_run(|s| s.now)
+}
+
+/// How `task` of the current run ended, or `None` while it runs or outside
+/// a run.
+pub fn task_exit(task: TaskId) -> Option<TaskExit> {
+    with_run(|s| s.done.get(&task).copied()).flatten()
 }
 
 /// Registers `waker` to fire when time reaches `deadline`.

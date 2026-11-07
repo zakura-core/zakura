@@ -97,6 +97,18 @@ pub mod task {
         tokio::spawn(future)
     }
 
+    /// Runs `f` as [`spawn_blocking`] does. `label` names the task in the
+    /// simulator build's task identities, and production ignores it.
+    #[track_caller]
+    pub fn spawn_blocking_named<F, R>(label: &'static str, f: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let _ = label;
+        tokio::task::spawn_blocking(f)
+    }
+
     /// Adds a labeled spawn to [`JoinSet`].
     pub trait JoinSetExt<T> {
         /// Spawns `task` into the set as `JoinSet::spawn` does. `label` names

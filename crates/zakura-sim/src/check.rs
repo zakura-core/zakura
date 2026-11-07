@@ -3,11 +3,16 @@
 //! The property registry, [`crate::property::RegistryChecker`], builds on
 //! these hooks. M1 ships [`NoChecks`] and [`FnChecker`] for tests.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
 
 use crate::{
-    end::RunEnd, observe::Observation, property::CheckEvent, Enabled, Identity, ObservationLog,
+    end::{HarnessFailure, RunEnd},
+    observe::Observation,
+    property::CheckEvent,
+    Enabled, Identity, ObservationLog,
 };
 
 /// A property that failed, and the steps its failure depends on.
@@ -39,8 +44,9 @@ pub enum PropertyOutcome {
     },
     /// No evaluation applied.
     NotApplicable,
-    /// An obligation was still open at run end, within its bound, or the
-    /// property's assumptions never held.
+    /// An obligation was still open at run end, within its bound, the
+    /// property's assumptions never held, or a harness failure ended the
+    /// run.
     Inconclusive {
         /// Which of the two.
         reason: String,
@@ -50,6 +56,22 @@ pub enum PropertyOutcome {
         /// The steps the violation depends on.
         witness: Vec<u64>,
     },
+}
+
+impl PropertyOutcome {
+    /// This outcome once a harness failure ended the run: one that held or
+    /// never applied is inconclusive, since the run's evidence may be
+    /// incomplete. A violation found before the failure stands.
+    pub(crate) fn after_harness_failure(self) -> Self {
+        match self {
+            PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable => {
+                PropertyOutcome::Inconclusive {
+                    reason: crate::property::Inconclusive::HarnessFailed.to_string(),
+                }
+            }
+            outcome => outcome,
+        }
+    }
 }
 
 /// A property's ID and its run outcome.
@@ -64,6 +86,40 @@ pub struct PropertyReport {
     /// until properties declare assumptions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holds_since: Option<u64>,
+    /// Why the harness doesn't run the property: the excluded source it
+    /// needs and the exclusion's reason. Set only with `NotApplicable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<String>,
+    /// Each quantity's largest value over the run, as the property's check
+    /// measured it, such as the most bytes a resource bound's allowance
+    /// held. Empty for a property that measures none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peaks: BTreeMap<String, u64>,
+    /// Every violation, in the order the run found them. `Violated`'s
+    /// witness is the first one's. A `Known` or `Draft` property can fail
+    /// again after its first violation, and one step can expire several
+    /// obligations, so the first alone can hide the rest.
+    ///
+    /// The trace's `end` record leaves them out: their number grows with the
+    /// run, and a record has a size limit. A replay of the trace finds every
+    /// one again, in `ReplayReport::properties`.
+    #[serde(skip)]
+    pub violations: Vec<Violation>,
+}
+
+impl PropertyReport {
+    /// A report of `outcome` for `property`, with no `holds_since`, peaks,
+    /// exclusion, or retained violations.
+    pub fn new(property: impl Into<String>, outcome: PropertyOutcome) -> Self {
+        PropertyReport {
+            property: property.into(),
+            outcome,
+            holds_since: None,
+            excluded: None,
+            peaks: BTreeMap::new(),
+            violations: Vec::new(),
+        }
+    }
 }
 
 /// Which part of the run a step belongs to.
@@ -120,6 +176,28 @@ pub trait Checker {
     /// Receives the events of a checker that runs before this one in a
     /// [`crate::property::Tee`].
     fn observe_events(&mut self, _events: &[CheckEvent]) {}
+
+    /// A harness failure the checker found, such as a source a property
+    /// needs that the harness lacks, or a stale view. The run calls it
+    /// before the first step and after every step, and ends at the first
+    /// failure.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        None
+    }
+
+    /// Whether the step loop's livelock limit applies after this step. A
+    /// checker returns false while a scenario's `BoundedAdversary`
+    /// assumption doesn't hold. The step loop then restarts its count, so
+    /// the limit covers only steps taken while the assumption holds.
+    fn bounds_livelock(&mut self) -> bool {
+        true
+    }
+
+    /// The step loop also found `violation`, at the step where this
+    /// checker's own violation ends the run. `end.violation` keeps the
+    /// checker's, so a checker that reports the step loop's properties
+    /// records this one itself.
+    fn step_loop_violation(&mut self, _violation: &Violation) {}
 }
 
 /// A checker that checks nothing.
@@ -174,5 +252,42 @@ where
 
     fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
         (self.end)(end, log)
+    }
+}
+
+impl<C: Checker + ?Sized> Checker for Box<C> {
+    /// Forwards to the checker.
+    fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
+        (**self).after_step(cx)
+    }
+
+    /// Forwards to the checker.
+    fn at_end(&mut self, end: &RunEnd, log: &ObservationLog) -> Vec<PropertyReport> {
+        (**self).at_end(end, log)
+    }
+
+    /// Forwards to the checker.
+    fn events(&mut self) -> Vec<CheckEvent> {
+        (**self).events()
+    }
+
+    /// Forwards to the checker.
+    fn observe_events(&mut self, events: &[CheckEvent]) {
+        (**self).observe_events(events);
+    }
+
+    /// Forwards to the checker.
+    fn harness_failure(&mut self) -> Option<HarnessFailure> {
+        (**self).harness_failure()
+    }
+
+    /// Forwards to the checker.
+    fn bounds_livelock(&mut self) -> bool {
+        (**self).bounds_livelock()
+    }
+
+    /// Forwards to the checker.
+    fn step_loop_violation(&mut self, violation: &Violation) {
+        (**self).step_loop_violation(violation);
     }
 }

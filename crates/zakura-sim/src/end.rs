@@ -54,6 +54,54 @@ pub enum HarnessFailure {
         /// The step it names.
         step: u64,
     },
+    /// A property needs a source that the harness neither observes nor
+    /// excludes.
+    MissingSource {
+        /// The property.
+        property: String,
+        /// The source, such as `Frames`.
+        source: String,
+    },
+    /// A property's check found its declared source missing evidence it
+    /// requires.
+    MissingEvidence {
+        /// The property.
+        property: String,
+        /// The step whose boundary the check ran at.
+        step: u64,
+        /// What was missing.
+        detail: String,
+    },
+    /// A property that reads the view would have read state captured before
+    /// the step's boundary.
+    StaleView {
+        /// The property.
+        property: String,
+        /// The step whose boundary the check needed.
+        step: u64,
+        /// The step whose boundary the view showed, or `None` if it had no
+        /// snapshot.
+        captured: Option<u64>,
+    },
+    /// A source's evidence was incomplete: its facts disagreed with its
+    /// state, didn't reach the log, or it skipped a boundary.
+    SourceEvidence {
+        /// The source: `source <index>` for one whose `observe` failed, or
+        /// the name of a checkpoint the run holds, such as `storage:header`.
+        source: String,
+        /// What was wrong, led by the failure's name, such as
+        /// `BoundarySkipped`.
+        detail: String,
+    },
+    /// A tapped reactor caught one of its port calls panicking, which no
+    /// run expects. It outranks any evidence failure of the same step,
+    /// since the panic leaves the call's storage receipt unpaired.
+    ReactorPortPanicked {
+        /// The tap, such as `reactor:node#0`.
+        source: String,
+        /// The call's number.
+        call: u64,
+    },
 }
 
 impl fmt::Display for HarnessFailure {
@@ -90,6 +138,37 @@ impl fmt::Display for HarnessFailure {
                     f,
                     "{property} holds since step {step}, which the run didn't take"
                 )
+            }
+            HarnessFailure::MissingSource { property, source } => write!(
+                f,
+                "{property} needs {source}, which the harness neither observes nor excludes"
+            ),
+            HarnessFailure::MissingEvidence {
+                property,
+                step,
+                detail,
+            } => write!(f, "{property} lacks evidence after step {step}: {detail}"),
+            HarnessFailure::StaleView {
+                property,
+                step,
+                captured: Some(captured),
+            } => write!(
+                f,
+                "{property} needs the view after step {step}, but it shows step {captured}"
+            ),
+            HarnessFailure::StaleView {
+                property,
+                step,
+                captured: None,
+            } => write!(
+                f,
+                "{property} needs the view after step {step}, but it has no snapshot"
+            ),
+            HarnessFailure::SourceEvidence { source, detail } => {
+                write!(f, "{source}'s evidence failed: {detail}")
+            }
+            HarnessFailure::ReactorPortPanicked { source, call } => {
+                write!(f, "{source}'s port call {call} panicked")
             }
         }
     }

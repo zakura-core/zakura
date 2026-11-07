@@ -1,0 +1,9 @@
+# Drops the lease removal from `PeerWorkQueue::release_capacity`, so the
+# queue keeps its own clones of a removed round's leases. The input's node
+# releases rounds whose pages it staged, and each release reports the
+# headers the queue still holds.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides peer_work.rs, which the patch changes, the reactor decides when
+# rounds stage and retire. A change there can move the input off a staged
+# round's release.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

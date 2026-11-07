@@ -97,12 +97,13 @@ impl Choices {
         let n = self.ordinals.entry((owner.clone(), kind)).or_insert(0);
         *n = n.saturating_add(1);
         let ordinal = *n;
+        let identity = format!("{owner}:{kind}#{ordinal}");
         let answer = self
             .decider
-            .draw(draw.bound, ordinal)
+            .draw(&identity, draw.bound, ordinal)
             .map_err(HarnessFailure::Plan)?;
         self.draws.push(DrawRecord {
-            draw: format!("{owner}:{kind}#{ordinal}"),
+            draw: identity,
             bound: HexU64(draw.bound),
             value: HexU64(answer.value),
             by: answer.by,
@@ -111,8 +112,8 @@ impl Choices {
     }
 }
 
-/// The first harness failure a draw hit. The loop checks it after setup and
-/// after every step.
+/// The first harness failure a draw, or a source's observation, hit. The
+/// loop checks it after setup and after every step.
 pub(crate) type Failure = Rc<RefCell<Option<HarnessFailure>>>;
 
 /// Installs the callback that answers `sched`'s draws from `choices`.

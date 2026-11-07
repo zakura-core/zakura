@@ -227,11 +227,11 @@ the remaining service sandbox still applies. Verify actual `/v1/miner`
 
 Keep the existing staging-to-public-Testnet switch. An optional `mainnet`
 configuration adds the next destination without changing the Testnet profile.
-Omit it until reviewed Mainnet artifacts are available. No live Mainnet sources
-or activation height are added by this PR, and Mainnet is never armed implicitly.
+The checked-in Mainnet artifacts below supply the production destination;
+Mainnet is never armed implicitly.
 
 The `mainnet` object uses the same `manifest`, `identityCheckpoint`, three
-`nodes`, independent `reference`, and `capabilities` fields as `public`. It also
+`nodes`, and `capabilities` fields as `public`, without a separate reference. It also
 requires an absolute `protocolReferenceFile` path and an explicit `armed` boolean
 (default false). Its manifest must use standard `Mainnet` configuration, magic
 `24e92764`, the NU7 branch, and the actual approved activation height. Derive its
@@ -240,8 +240,9 @@ constants, difficulty exceptions, checkpoint hashes, or joining configuration.
 A Mainnet snapshot must declare `networkId: mainnet`. Faucet capability is null.
 
 While Testnet remains selected, an armed Mainnet destination must show active
-NU7 at least two blocks after activation. Two managed nodes and the independent
-reference must agree on the activation block and a subsequent common hash.
+NU7 at least two blocks after activation. All three managed validators must
+agree on the activation block and a subsequent common hash. If one validator is
+unavailable or disagrees, Mainnet selection waits.
 Three consecutive fresh passes with a complete matching parameter table select
 Mainnet. Restart or disagreement resets unfinished confirmation. Missing or
 mismatched protocol data prevents selection. Missing Mainnet configuration after
@@ -258,3 +259,59 @@ publication watcher must refuse backwards network changes. Mainnet uses ZEC and
 Mainnet joining details, and hides Testnet faucet and internal-miner controls.
 The synthetic Mainnet fixtures test switching and response shape only; they are
 not production activation parameters or evidence of Mainnet activation.
+
+## Mainnet runtime profile
+
+The checked-in `nu7-mainnet-profile.json` is disarmed by default. It uses only
+`us-0`, `us-west-0`, and `canada-0` from the Mainnet status dashboard. All three
+must verify its checkpoint, NU7 schedule, and an advancing common chain before
+arming. The existing Testnet reference remains separate and unchanged.
+`nu7-mainnet-protocol-reference.json` records the deployed Mainnet source
+revision and parameters; it does not reuse Testnet difficulty exceptions.
+Its NSM reissuance height is derived from that revision's Mainnet schedule.
+Snapshot and faucet capabilities are intentionally null.
+
+### Install directly, then qualify and arm
+
+Run the focused NU7 tests before installation. Use an exact committed candidate
+and retain its checksums. On `zakura-testnet-1`, back up
+`/etc/zakura/nu7-activation.json`, the installed collector module and qualifier,
+and the **whole** `/var/lib/zakura-nu7-activation` directory before changing the
+service. Stop only `nu7-activation.service` while making the state backup so its
+saved generation is coherent. Never reset or edit its selection.
+
+Copy the collector module, qualifier, Mainnet profile and protocol reference
+through a verified SSH connection into `/opt/zakura-nu7-status`. Merge only the
+Mainnet destination:
+
+```sh
+jq --slurpfile profile /opt/zakura-nu7-status/nu7-mainnet-profile.json \
+  '.mainnet = $profile[0] | .dispatch = false' \
+  /etc/zakura/nu7-activation.json > /etc/zakura/nu7-activation.next.json
+mv /etc/zakura/nu7-activation.next.json /etc/zakura/nu7-activation.json
+systemctl restart nu7-activation.service
+python3 /opt/zakura-nu7-status/nu7-qualify.py --profile mainnet
+```
+
+Repeat qualification after source progress. Require `prepared` and
+`sourceRevisionsMatch`, and verify the common height advances. Each source's
+`expectedRevision` pins its deployed build separately from the joining manifest
+during rolling upgrades. Verify protocol compatibility before updating a source
+pin. `manifestRevisionMatches` continues to report whether all sources use the
+joining build. Qualification exits nonzero if any of the three sources is
+unavailable, disagrees, or reports an unexpected build; pending NU7 before
+activation is expected. Qualification never opens or rewrites the selector
+state. The default Testnet qualifier remains available without `--profile`.
+
+After successful qualification, atomically set only `.mainnet.armed = true`,
+restart the collector, and verify Mainnet remains armed while Testnet stays
+selected. Keep `dispatch=false`; the existing website watcher publishes the
+selected Mainnet generation. Record source/service health and verify a fresh
+public `/v1/dashboard` response with browser CORS. No node binary or database
+restart is required. Before actual activation, test rollover only with isolated
+state and simulated chain observations, never by forcing production selection.
+
+For rollback before Mainnet selection, restore the backed-up configuration,
+collector module and qualifier, retain the current selection directory, and
+restart only the collector. After Mainnet has been selected, keep its profile
+and protocol data: removing them must fail closed rather than restore Testnet.

@@ -20,7 +20,7 @@ use zakura_rt::{
     sim,
     sync::{
         atomic::{AtomicU64 as RtAtomicU64, Ordering as RtOrdering},
-        Mutex as RtMutex, Notify, Semaphore,
+        CancellationToken, Mutex as RtMutex, Notify, Semaphore,
     },
     task::{self, JoinSet},
     time::{self, Instant},
@@ -691,6 +691,52 @@ fn mutex_kept_across_runs_gets_a_fresh_identity() {
     let fresh_id = parked_on(&mut s, wait_fresh);
     let kept_id = parked_on(&mut s, wait_kept);
     assert_ne!(fresh_id, kept_id);
+}
+
+#[test]
+fn mutex_points_name_their_mutex() {
+    use zakura_scheduler::{
+        At, Op,
+        RunOutcome::{Parked, Reached},
+    };
+    let reach = |s: &mut Scheduler, task: zakura_scheduler::JoinHandle| match s.run(task.task()) {
+        Reached(at) => at,
+        other => panic!("expected a point, got {other:?}"),
+    };
+    let shared = Arc::new(RtMutex::new(()));
+    let own = Arc::new(RtMutex::new(()));
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let held = shared.clone();
+    let holder = s.spawn_root("holder", async move {
+        #[allow(clippy::await_holding_lock)]
+        {
+            let _guard = held.lock().unwrap();
+            pending::<()>().await;
+        }
+    });
+    let waiter = s.spawn_root("waiter", async move { drop(shared.lock().unwrap()) });
+    let other = s.spawn_root("other", async move { drop(own.lock().unwrap()) });
+    assert!(
+        s.ready().iter().all(|r| r.at.object.is_none()),
+        "the top of a coroutine touches no object"
+    );
+
+    let at = reach(&mut s, holder);
+    assert_eq!((at.op, at.n), (Op::Lock, 1));
+    let shared_id = at.object.expect("a lock point names its mutex");
+    run_until_waiting(&mut s, holder.task());
+
+    let at = reach(&mut s, waiter);
+    assert_eq!((at.op, at.object), (Op::Lock, Some(shared_id)));
+    let offered: Vec<At> = s.ready().iter().map(|r| r.at).collect();
+    assert!(offered.contains(&at), "ready() offers the same point");
+    assert_eq!(s.run(waiter.task()), Parked(shared_id));
+
+    let lock = reach(&mut s, other);
+    let own_id = lock.object.expect("a lock point names its mutex");
+    assert_ne!(own_id, shared_id);
+    let release = reach(&mut s, other);
+    assert_eq!((release.op, release.object), (Op::Release, Some(own_id)));
 }
 
 /// Runs one task that draws an `rng()` value and builds a map, with `seed`
@@ -1380,6 +1426,132 @@ fn rt_join_returns_the_output_when_completion_races_abort() {
     );
 }
 
+/// One worker. `holder` keeps a `zakura-rt` mutex across a `yield_now`, and
+/// a blocking job parks on it. If the parked job held the only worker,
+/// `holder` could never run to release the lock.
+#[test]
+fn blocking_job_holds_no_worker() {
+    let contended = |s: &mut Scheduler| -> Check {
+        let lock = Arc::new(RtMutex::new(()));
+        let held = lock.clone();
+        s.spawn_root("holder", async move {
+            #[allow(clippy::await_holding_lock)]
+            {
+                let _guard = held.lock().unwrap();
+                task::yield_now().await;
+            }
+        });
+        let joined = shared(Cell::new(None));
+        let out = joined.clone();
+        s.spawn_root("joiner", async move {
+            let job = task::spawn_blocking_named("job", move || {
+                drop(lock.lock().unwrap());
+                7
+            });
+            out.set(Some(job.await.unwrap()));
+        });
+        Box::new(move |r| {
+            (r.status != Status::Quiescent || joined.get() != Some(7))
+                .then(|| format!("{:?}, joined {:?}", r.status, joined.get()))
+        })
+    };
+    assert_eq!(first_violation(1, CLEAN, contended), None);
+}
+
+#[test]
+fn blocking_job_ignores_abort_after_it_starts() {
+    use zakura_scheduler::RunOutcome::Reached;
+    for started in [false, true] {
+        let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+        let job = task::spawn_blocking_named("job", || {
+            point();
+            5u32
+        });
+        if started {
+            let id = s.ready()[0].task;
+            while !matches!(s.run(id), Reached(at) if at.op == zakura_scheduler::Op::Yield) {}
+        }
+        job.abort();
+        let joined = shared(RefCell::new(None));
+        let out = joined.clone();
+        s.spawn_root("joiner", async move {
+            *out.borrow_mut() = Some(job.await.map_err(|error| error.is_cancelled()));
+        });
+        let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+        assert_eq!(status, Status::Quiescent, "started {started}");
+        let expected = if started { Ok(5) } else { Err(true) };
+        assert_eq!(*joined.borrow(), Some(expected), "started {started}");
+    }
+}
+
+/// Block-sync serving's shape, with one worker: a blocking job checks a
+/// cancellation token before each of four items, while another task cancels
+/// it. The canceller runs while the job is in flight, so the job can stop
+/// after any number of items, not only before the first or after the last.
+#[test]
+fn blocking_job_sees_cancel_between_items() {
+    let mut stopped_after = std::collections::BTreeSet::new();
+    for seed in 0..64 {
+        let pushed_count = shared(Cell::new(None));
+        let count = pushed_count.clone();
+        let (_, violation) = run_fixture(1, seed, |s| {
+            let token = CancellationToken::new();
+            let items = Arc::new(RtMutex::new(Vec::new()));
+            let pushed = items.clone();
+            let canceller = token.clone();
+            s.spawn_root("canceller", async move {
+                // A few points first spread the cancel across the job's
+                // items, so these seeds reach every stop.
+                for _ in 0..4 {
+                    point();
+                }
+                canceller.cancel();
+            });
+            drop(task::spawn_blocking_named("job", move || {
+                for item in 0..4 {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    pushed.lock().unwrap().push(item);
+                }
+            }));
+            Box::new(move |r| {
+                count.set(Some(items.lock().unwrap().len()));
+                (r.status != Status::Quiescent).then(|| format!("{:?}", r.status))
+            })
+        });
+        assert_eq!(violation, None, "seed {seed}");
+        stopped_after.insert(pushed_count.get().expect("the check ran"));
+    }
+    assert_eq!(stopped_after, (0..=4).collect());
+}
+
+#[test]
+fn blocking_job_panic_reaches_the_join() {
+    let (result, violation) = run_fixture(1, 0, |s| {
+        let payload = shared(Cell::new(None));
+        let out = payload.clone();
+        s.spawn_root("root", async move {
+            let error = task::spawn_blocking_named("job", || -> u32 { panic!("boom") })
+                .await
+                .unwrap_err();
+            out.set(Some(*error.into_panic().downcast::<&str>().unwrap()));
+        });
+        Box::new(move |_| (payload.get() != Some("boom")).then(|| format!("{:?}", payload.get())))
+    });
+    assert_eq!(violation, None);
+    assert_eq!(result.panics, ["boom"]);
+}
+
+#[test]
+fn blocking_job_carries_its_label() {
+    let s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    drop(task::spawn_blocking_named("block_sync_serve_encode", || ()));
+    drop(task::spawn_blocking(|| ()));
+    let names: Vec<String> = s.ready().iter().map(|t| s.task_name(t.task)).collect();
+    assert_eq!(names, ["block_sync_serve_encode.1", "blocking.1"]);
+}
+
 /// Counts drops of a task-owned resource.
 struct DropCount(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1625,4 +1797,159 @@ fn rt_a_start_past_the_utc_range_panics_at_construction() {
         message.as_deref().is_some_and(|m| m.contains("utc_origin")),
         "{message:?}"
     );
+}
+
+/// Inside a boundary read, dropping a `zakura-rt` mutex guard while a task
+/// is parked on it panics before the waiter becomes ready. A guard dropped
+/// outside one wakes the waiter as usual.
+///
+/// This fails if the guard's release doesn't check the mark.
+#[test]
+fn a_read_that_releases_a_contended_mutex_panics() {
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let lock = Arc::new(RtMutex::new(()));
+    let guard = lock.lock().unwrap();
+    let l = lock.clone();
+    let waiter = s.spawn_root("waiter", async move {
+        drop(l.lock().unwrap());
+    });
+    assert!(matches!(s.run(waiter.task()), Reached(_)), "at its lock");
+    assert!(
+        matches!(s.run(waiter.task()), Parked(_)),
+        "parked on the guard"
+    );
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim::boundary_read(|| drop(guard));
+    }));
+    assert!(refused.is_err());
+    assert!(
+        s.ready().iter().all(|ready| ready.task != waiter.task()),
+        "the waiter wasn't woken"
+    );
+    drop(lock.lock().unwrap());
+    assert!(
+        s.ready().iter().any(|ready| ready.task == waiter.task()),
+        "a release outside a read wakes it"
+    );
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
+}
+
+/// A boundary read that calls a waiting task's captured `Waker`, with no
+/// other runtime call, panics before the task becomes ready. A wake
+/// outside one makes it ready as usual.
+///
+/// This fails if the scheduler's waker doesn't check the mark, even with
+/// every `zakura-rt` check in place.
+#[test]
+fn a_direct_wake_inside_a_read_panics() {
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let waker: Rc<RefCell<Option<std::task::Waker>>> = shared(RefCell::new(None));
+    let woken = shared(Cell::new(false));
+    let (slot, done) = (waker.clone(), woken.clone());
+    let task = s.spawn_root("waits", async move {
+        std::future::poll_fn(|cx| {
+            if done.get() {
+                return std::task::Poll::Ready(());
+            }
+            *slot.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await;
+    });
+    assert_eq!(s.run(task.task()), zakura_scheduler::RunOutcome::Waiting);
+    let waker = waker.borrow_mut().take().expect("the task left its waker");
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim::boundary_read(|| waker.wake_by_ref());
+    }));
+    assert!(refused.is_err());
+    assert!(
+        s.ready().iter().all(|ready| ready.task != task.task()),
+        "the task wasn't woken"
+    );
+    woken.set(true);
+    waker.wake();
+    assert!(s.ready().iter().any(|ready| ready.task == task.task()));
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
+}
+
+/// Inside a boundary read, dropping an already-polled `Sleep`, which would
+/// cancel its timer, and drawing from the run's RNG both panic before the
+/// scheduler's timers or draws change.
+///
+/// This fails if executor calls that reach no preemption point skip the
+/// mark.
+#[test]
+fn a_read_that_moves_a_timer_or_draws_panics() {
+    use std::future::Future;
+
+    use rand_10::RngExt;
+
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let draws = shared(Cell::new(0));
+    let counted = draws.clone();
+    s.set_draws(move |_| {
+        counted.set(counted.get() + 1);
+        0
+    });
+    let mut sleep = Box::pin(time::sleep(Duration::from_secs(10)));
+    let waker = std::task::Waker::noop();
+    assert!(sleep
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(waker))
+        .is_pending());
+    let deadline = s.next_deadline().expect("the sleep registered its timer");
+    let refused = |read: &mut dyn FnMut()| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim::boundary_read(read))).is_err()
+    };
+    let mut sleep = Some(sleep);
+    assert!(refused(&mut || drop(sleep.take())));
+    assert_eq!(
+        s.next_deadline(),
+        Some(deadline),
+        "the timer is still there"
+    );
+    assert!(refused(&mut || {
+        let _: u64 = zakura_rt::rand::rng().random();
+    }));
+    assert_eq!(draws.get(), 0, "no draw was taken");
+}
+
+/// A boundary read that calls the scheduler's `unpark_all` hook directly
+/// for a parked task, with no `zakura-rt` call, panics before the task
+/// becomes ready. The same call outside a read makes it ready.
+///
+/// This fails if the scheduler's hooks reach the run's state without
+/// checking the mark.
+#[test]
+fn a_direct_unpark_inside_a_read_panics() {
+    use zakura_scheduler::RunOutcome::{Parked, Reached};
+
+    let mut s = Scheduler::new(SchedulerConfig::default(), SimInstant::ZERO);
+    let lock = Arc::new(RtMutex::new(()));
+    let guard = lock.lock().unwrap();
+    let l = lock.clone();
+    let waiter = s.spawn_root("waiter", async move {
+        drop(l.lock().unwrap());
+    });
+    assert!(matches!(s.run(waiter.task()), Reached(_)), "at its lock");
+    let Parked(object) = s.run(waiter.task()) else {
+        panic!("the waiter parks on the guard");
+    };
+    let refused = std::panic::catch_unwind(|| {
+        sim::boundary_read(|| zakura_scheduler::hooks::unpark_all(object));
+    });
+    assert!(refused.is_err());
+    assert!(
+        s.ready().iter().all(|ready| ready.task != waiter.task()),
+        "the waiter wasn't woken"
+    );
+    zakura_scheduler::hooks::unpark_all(object);
+    assert!(s.ready().iter().any(|ready| ready.task == waiter.task()));
+    drop(guard);
+    let status = drive(&mut s, 0, &mut Vec::new(), &mut Vec::new());
+    assert_eq!(status, Status::Quiescent);
 }

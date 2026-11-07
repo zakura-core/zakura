@@ -4,7 +4,7 @@
 
 use std::future::pending;
 
-use zakura_rt::task::{JoinSet, JoinSetExt};
+use zakura_rt::task::{self, JoinSet, JoinSetExt};
 
 #[tokio::test]
 async fn join_set_spawn_named_spawns_into_the_set() {
@@ -24,4 +24,13 @@ async fn join_set_spawn_named_spawns_into_the_set() {
     }
     assert_eq!(joined, [1]);
     assert_eq!(aborted, 1);
+}
+
+#[tokio::test]
+async fn spawn_blocking_named_runs_off_the_runtime() {
+    let runtime_thread = std::thread::current().id();
+    let job_thread = task::spawn_blocking_named("job", || std::thread::current().id())
+        .await
+        .unwrap();
+    assert_ne!(job_thread, runtime_thread);
 }

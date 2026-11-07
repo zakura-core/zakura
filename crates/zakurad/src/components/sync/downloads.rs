@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures::{
-    future::{FutureExt, TryFutureExt},
+    future::{BoxFuture, FutureExt, TryFutureExt},
     ready,
     stream::{FuturesUnordered, Stream},
 };
@@ -34,6 +34,7 @@ use zakura_state as zs;
 
 use crate::components::{
     auth_download_height::tip_child_mismatch,
+    download_work::has_sufficient_work,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -161,6 +162,16 @@ pub enum BlockDownloadVerifyError {
 
     #[error("downloaded block was too far behind the chain tip: {height:?} {hash:?}")]
     BehindTipHeightLimit {
+        height: block::Height,
+        hash: block::Hash,
+    },
+
+    /// A downloaded header claims a target easier than the Mainnet admission floor.
+    /// This is an unscored resource-policy rejection, not a consensus verdict.
+    #[error(
+        "downloaded block target is easier than the Mainnet admission floor: {height:?} {hash:?}"
+    )]
+    BelowMinimumWork {
         height: block::Height,
         hash: block::Hash,
     },
@@ -309,6 +320,32 @@ impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
     }
 }
 
+/// Waits for a block to commit, returning `false` if the state gives up or rejects it first.
+#[derive(Clone)]
+pub struct ParentWait(pub Arc<dyn Fn(block::Hash) -> BoxFuture<'static, bool> + Send + Sync>);
+
+impl std::fmt::Debug for ParentWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParentWait")
+    }
+}
+
+/// Returns the parent that a failed verification needs before its authorizing data binding can
+/// be confirmed.
+fn unconfirmed_parent(verification: &Result<block::Hash, BoxError>) -> Option<block::Hash> {
+    match verification
+        .as_ref()
+        .err()?
+        .downcast_ref::<zakura_consensus::router::RouterError>()?
+    {
+        zakura_consensus::router::RouterError::Block { source } => match **source {
+            zakura_consensus::VerifyBlockError::AuthDataUnconfirmed { parent, .. } => Some(parent),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
 #[pin_project]
 #[derive(Debug)]
@@ -335,6 +372,10 @@ where
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
+
+    /// Waits for a parent before verifying again a block whose authorizing data binding was
+    /// unconfirmed.
+    parent_wait: ParentWait,
 
     // Configuration
     //
@@ -466,6 +507,7 @@ where
         network: ZN,
         verifier: ZV,
         latest_chain_tip: ZSTip,
+        parent_wait: ParentWait,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
         chain_network: Network,
@@ -479,6 +521,7 @@ where
             network,
             verifier,
             latest_chain_tip,
+            parent_wait,
             lookahead_limit,
             chain_network,
             max_checkpoint_height,
@@ -606,6 +649,7 @@ where
 
         let mut verifier = self.verifier.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
+        let parent_wait = self.parent_wait.clone();
 
         let lookahead_limit = self.lookahead_limit;
         let chain_network = self.chain_network.clone();
@@ -737,7 +781,7 @@ where
                 // discard a height-rewritten body as a benign old block: unattributed,
                 // unscored, and not requeued. See `crate::components::auth_download_height`.
                 if let Some(expected_height) = tip_child_mismatch(
-                    block.header.previous_block_hash,
+                    block.header().previous_block_hash,
                     block_height,
                     best_tip,
                 ) {
@@ -773,7 +817,30 @@ where
 
                 if block_height > lookahead_drop_height {
                     Err(BlockDownloadVerifyError::AboveLookaheadHeightLimit { height: block_height, hash, advertiser_addr })?;
-                } else if block_height > lookahead_pause_height {
+                }
+
+                if block_height < min_accepted_height {
+                    debug!(
+                        ?hash,
+                        ?block_height,
+                        ?tip_height,
+                        ?min_accepted_height,
+                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+                        "synced block height behind the finalized tip: dropped downloaded block"
+                    );
+                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+                    Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
+                }
+
+                // Admission must precede shared flow-control changes: a rejected
+                // body must not pause or resume downloads using its claimed height.
+                if !has_sufficient_work(&chain_network, tip_height, block_height, block.header().difficulty_threshold) {
+                    metrics::counter!("sync.insufficient_work.dropped.block.count").increment(1);
+                    return Err(BlockDownloadVerifyError::BelowMinimumWork { height: block_height, hash });
+                }
+
+                if block_height > lookahead_pause_height {
                     // This log can be very verbose, usually hundreds of blocks are dropped.
                     // So we only log at info level for the first above-height block.
                     if !past_lookahead_limit_receiver.cloned_watch_data() {
@@ -818,71 +885,85 @@ where
                     metrics::counter!("sync.max.height.limit.reset.attempt.count").increment(1);
                 }
 
-                if block_height < min_accepted_height {
-                    debug!(
-                        ?hash,
-                        ?block_height,
-                        ?tip_height,
-                        ?min_accepted_height,
-                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                        "synced block height behind the finalized tip: dropped downloaded block"
+                // A body that fails before its parent commits can't be attributed yet, so wait for
+                // the parent once and verify the same body again. The task keeps its lookahead slot
+                // while it waits, and stays cancellable.
+                let mut verify_start;
+                // Measured before any parent wait, so the metric only covers verification.
+                let mut verify_elapsed;
+                let mut waited_for_parent = false;
+                let verification = loop {
+                    // Wait for the verifier service to be ready.
+                    let readiness = verifier.ready();
+                    // Prefer the cancel handle if both are ready.
+                    let verifier = tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => {
+                            trace!("task cancelled waiting for verifier service readiness");
+                            metrics::counter!("sync.cancelled.verify.ready.count").increment(1);
+                            return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
+                        }
+                        verifier = readiness => verifier,
+                    };
+                    Self::transition_task(
+                        &task_states,
+                        &trace,
+                        hash,
+                        "verifying",
+                        Some(block_height),
                     );
-                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
 
-                    Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
-                }
+                    // Verify the block.
+                    verify_start = std::time::Instant::now();
+                    let mut rsp = verifier
+                        .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
+                        .call(zakura_consensus::Request::Commit(block.clone())).boxed();
 
-                // Wait for the verifier service to be ready.
-                let readiness = verifier.ready();
-                // Prefer the cancel handle if both are ready.
-                let verifier = tokio::select! {
-                    biased;
-                    _ = &mut cancel_rx => {
-                        trace!("task cancelled waiting for verifier service readiness");
-                        metrics::counter!("sync.cancelled.verify.ready.count").increment(1);
-                        return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash })
+                    // Add a shorter timeout to workaround a known bug (#5125)
+                    let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);
+                    // The final checkpoint can wait for its entire range; only fully verified blocks
+                    // need the short timeout. Preserve the error type for the sync retry handler.
+                    if block_height > max_checkpoint_height && block_height <= short_timeout_max {
+                        rsp = timeout(FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, rsp)
+                            .map_err(BoxError::from)
+                            .map(|nested_result| nested_result.and_then(convert::identity)).boxed();
                     }
-                    verifier = readiness => verifier,
-                };
-                Self::transition_task(
-                    &task_states,
-                    &trace,
-                    hash,
-                    "verifying",
-                    Some(block_height),
-                );
 
-                // Verify the block.
-                let verify_start = std::time::Instant::now();
-                let mut rsp = verifier
-                    .map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error })?
-                    .call(zakura_consensus::Request::Commit(block)).boxed();
+                    let verification = tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => {
+                            trace!("task cancelled prior to verification");
+                            metrics::counter!("sync.cancelled.verify.count").increment(1);
+                            metrics::histogram!("sync.block.verify.duration_seconds", "result" => "cancelled")
+                                .record(verify_start.elapsed().as_secs_f64());
+                            return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash })
+                        }
+                        verification = rsp => verification,
+                    };
+                    verify_elapsed = verify_start.elapsed();
 
-                // Add a shorter timeout to workaround a known bug (#5125)
-                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);
-                // The final checkpoint can wait for its entire range; only fully verified blocks
-                // need the short timeout. Preserve the error type for the sync retry handler.
-                if block_height > max_checkpoint_height && block_height <= short_timeout_max {
-                    rsp = timeout(FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, rsp)
-                        .map_err(BoxError::from)
-                        .map(|nested_result| nested_result.and_then(convert::identity)).boxed();
-                }
-
-                let verification = tokio::select! {
-                    biased;
-                    _ = &mut cancel_rx => {
-                        trace!("task cancelled prior to verification");
-                        metrics::counter!("sync.cancelled.verify.count").increment(1);
-                        metrics::histogram!("sync.block.verify.duration_seconds", "result" => "cancelled")
-                            .record(verify_start.elapsed().as_secs_f64());
-                        return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash })
+                    if !waited_for_parent {
+                        if let Some(parent) = unconfirmed_parent(&verification) {
+                            waited_for_parent = true;
+                            let committed = tokio::select! {
+                                biased;
+                                _ = &mut cancel_rx => {
+                                    trace!("task cancelled waiting for the parent of an unconfirmed binding");
+                                    return Err(BlockDownloadVerifyError::CancelledDuringVerification { height: block_height, hash })
+                                }
+                                committed = (parent_wait.0)(parent) => committed,
+                            };
+                            if committed {
+                                continue;
+                            }
+                        }
                     }
-                    verification = rsp => verification,
+                    break verification;
                 };
 
                 let verify_result = if verification.is_ok() { "success" } else { "failure" };
                 metrics::histogram!("sync.block.verify.duration_seconds", "result" => verify_result)
-                    .record(verify_start.elapsed().as_secs_f64());
+                    .record(verify_elapsed.as_secs_f64());
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);

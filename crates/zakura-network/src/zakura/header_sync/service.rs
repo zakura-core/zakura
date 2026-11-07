@@ -8,13 +8,12 @@ use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken, Mutex as StdMutex, MutexGuard, PoisonError},
     task::JoinHandle,
-    time::Instant,
 };
 
 use super::{
     config::{header_sync_header_bytes_for_network, COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
     events::*,
-    pipe::run_peer,
+    peer::run_peer,
     v9::{
         CommonMessage, Cursor, LeaseOwner, Publisher, RegtestMessage, SubscribeError,
         SubscribeHeaders, Subscriber,
@@ -33,15 +32,14 @@ use crate::zakura::{
         SessionTable, WriterFence,
     },
     spawn_supervised_pipe,
-    transport::{GuardedFrameSlot, GuardedReserveError},
+    transport::{sim_arg, GuardedFrameSlot, GuardedReserveError},
     wire_codec::encode_frame,
     BoxRunFuture, CloseCause, Frame, FramedRecv, FramedSend, OrderedSendError, Peer, Service,
     ServicePeerDirection, SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream,
     ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
-
-/// Conservative re-offer delay when header sync publishes no peer backoff deadline.
-const HEADER_SYNC_ADVISORY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::{RegulationTap, SessionOrigin};
 
 #[cfg(test)]
 mod stream_tests {
@@ -138,6 +136,9 @@ pub struct PeerSession {
     session_id: u64,
     direction: ServicePeerDirection,
     inner: Arc<PeerSessionInner>,
+    /// Where the transport got this session, from its [`Peer`].
+    #[cfg(any(test, zakura_sim))]
+    origin: Option<SessionOrigin>,
 }
 
 #[derive(Debug)]
@@ -190,7 +191,21 @@ impl PeerSession {
                 open_writer: StdMutex::new(None),
                 status,
             }),
+            #[cfg(any(test, zakura_sim))]
+            origin: None,
         }
+    }
+
+    /// This session, reporting `origin` as where the transport got it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn with_origin(self, origin: Option<SessionOrigin>) -> Self {
+        Self { origin, ..self }
+    }
+
+    /// Where the transport got this session, if its [`Peer`] said.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn origin(&self) -> Option<SessionOrigin> {
+        self.origin
     }
 
     #[cfg(test)]
@@ -445,9 +460,7 @@ impl PeerSession {
             .try_reserve_guarded()
             .map_err(|error| match error {
                 GuardedReserveError::Full => OrderedSendError::Full,
-                GuardedReserveError::Closed | GuardedReserveError::Unsupported => {
-                    OrderedSendError::Closed
-                }
+                GuardedReserveError::Closed => OrderedSendError::Closed,
             })
     }
 }
@@ -527,7 +540,7 @@ pub(crate) async fn drive_header_sync_actions(
 
 /// Native header-sync service.
 #[derive(Debug)]
-pub(crate) struct HeaderSyncService {
+pub struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
     /// Each peer's current session, with its connection direction.
     sessions: Arc<SessionTable<ServicePeerDirection>>,
@@ -541,7 +554,9 @@ pub(crate) struct HeaderSyncService {
 }
 
 impl HeaderSyncService {
-    pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
+    /// Builds the service that admits header-sync sessions for the reactor
+    /// behind `header_sync`, with no sync-lifecycle gate.
+    pub fn new(header_sync: HeaderSyncHandle) -> Self {
         Self {
             header_sync,
             sessions: Arc::default(),
@@ -622,15 +637,30 @@ impl Service for HeaderSyncService {
         let Some(node_id) = header_peer_node_id(peer) else {
             return SessionDemand::Retire;
         };
-        if self
-            .header_sync
-            .candidate_state()
+        let mut candidates = self.header_sync.subscribe_candidate_state();
+        if candidates
+            .borrow_and_update()
             .backed_off_node_ids
-            .contains(&node_id)
+            .binary_search(&node_id)
+            .is_ok()
         {
-            // The reactor publishes the backed-off set without per-node deadlines.
-            // The service re-offers each target after one conservative backoff window.
-            return SessionDemand::RetryAt(Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF);
+            // The reactor republishes the set when a cooldown ends, so re-check
+            // then rather than after a fixed delay from this check.
+            return SessionDemand::WaitForChange(Box::pin(async move {
+                loop {
+                    if candidates.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    if candidates
+                        .borrow_and_update()
+                        .backed_off_node_ids
+                        .binary_search(&node_id)
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }));
         }
 
         SessionDemand::OpenNow
@@ -664,6 +694,8 @@ impl Service for HeaderSyncService {
     }
 
     fn add_peer(&self, mut peer: Peer) {
+        #[cfg(any(test, zakura_sim))]
+        let origin = peer.origin(ZAKURA_STREAM_HEADER_SYNC);
         let Some((session_id, stream_version, recv, send)) =
             peer.take_versioned_stream_with_session_id(ZAKURA_STREAM_HEADER_SYNC)
         else {
@@ -727,6 +759,10 @@ impl Service for HeaderSyncService {
         // The reader checks each page and outcome header against the
         // subscription before it reads the payload.
         let subscriber = Subscriber::new(header_bytes, fence, &recv);
+        // The subscriber takes its credit tap before its lock exists, since
+        // a simulated lock is a scheduling point release builds don't have.
+        #[cfg(any(test, zakura_sim))]
+        let subscriber = subscriber.observed_by(self.header_sync.credit_tap(&peer_id, session_id));
         let session = PeerSession::new(
             peer_id.clone(),
             session_id,
@@ -738,14 +774,16 @@ impl Service for HeaderSyncService {
             subscriber,
             status,
         );
-        let (publisher, publishing) = spawn_publisher(
+        #[cfg(any(test, zakura_sim))]
+        let session = session.with_origin(origin);
+        let (publisher, publishing) = sim_arg!(spawn_publisher(
             &self.header_sync,
             header_bytes,
             &peer_id,
             session_id,
             send,
             service_cancel_token.clone(),
-        );
+        ); recv.stream_tap().map(|tap| RegulationTap::new(tap.clone(), |id| *id)));
 
         let admitted = self.header_sync.connect_session(session.clone());
         let handle = self.header_sync.clone();
@@ -879,6 +917,7 @@ fn spawn_publisher(
     session_id: u64,
     send: FramedSend,
     cancel: CancellationToken,
+    #[cfg(any(test, zakura_sim))] tap: Option<RegulationTap<u64>>,
 ) -> (Publisher, JoinHandle<()>) {
     let port = header_sync.port.clone();
     let push = header_sync.serving.push(peer);
@@ -888,9 +927,9 @@ fn spawn_publisher(
     };
     let limits = header_sync.page_limits;
     if header_bytes == REGTEST_HEADER_BYTES {
-        Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel)
+        sim_arg!(Publisher::spawn::<REGTEST_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
     } else {
-        Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel)
+        sim_arg!(Publisher::spawn::<COMMON_HEADER_BYTES>(port, push, send, owner, limits, cancel); tap)
     }
 }
 

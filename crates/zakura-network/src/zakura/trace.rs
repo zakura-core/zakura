@@ -3,10 +3,14 @@
 //! `closed.punitive` is reserved in the schema until Zakura has a punitive close
 //! path and matching metric. `closed.neutral` carries a bounded `reason` label
 //! describing the teardown cause (for example `idle_timeout`, `accept_failed`,
-//! `outbound_closed`, `bad_response`, or `cancelled`). Connection admission
-//! rejects use `rejected.admission` with a bounded `reason` label rather than
-//! one event name per rejection metric, so readers should pivot by `event` plus
-//! `reason` for those rows.
+//! `outbound_closed`, `bad_response`, or `cancelled`). A frame-read error
+//! records `ordered_read_rejected` or `request_read_rejected` for a peer fault,
+//! and the neutral `ordered_read_timeout`, `request_read_timeout`,
+//! `ordered_read_transport`, or `request_read_transport` otherwise. Readers
+//! can match the `ordered_read_` and `request_read_` prefixes. Connection
+//! admission rejects use `rejected.admission` with a bounded `reason` label
+//! rather than one event name per rejection metric, so readers should pivot by
+//! `event` plus `reason` for those rows.
 
 use std::sync::Arc;
 
@@ -255,7 +259,9 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Body range request sent to a peer.
+    /// Queue admission funded a block request's retained run.
+    pub const BLOCK_REQUEST_FUNDED: &str = "block_request_funded";
+    /// A published body range request entered the peer's transport queue.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted a decoded inbound block-sync wire message.
     pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";
@@ -332,6 +338,10 @@ pub mod discovery_trace {
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
     /// The discovery reader rejected a peer's frame and closed the connection.
     pub const DISCOVERY_VIOLATION: &str = "discovery_violation";
+    /// Phase of one claimed query answer.
+    pub const DISCOVERY_ANSWER: &str = "discovery_answer";
+    /// Phase of one candidate dial attempt.
+    pub const DISCOVERY_DIAL_PHASE: &str = "discovery_dial_phase";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

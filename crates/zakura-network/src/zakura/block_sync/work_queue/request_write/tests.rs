@@ -1,16 +1,14 @@
 use super::*;
+use crate::zakura::block_sync::block_sync_observe::{
+    BlockEvent, BlockSyncObserver, ObserverSlot, RequestStep,
+};
+use crate::zakura::transport::{callback_waker, ByteBudget};
 use crate::zakura::{
     block_sync::{test_work_scope, BlockSizeEstimate},
     transport::worker_framed_channel,
     Frame, FramedSend,
 };
 use std::{num::NonZeroU64, time::Duration};
-
-impl RequestWriteStatus {
-    pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)))
-    }
-}
 
 thread_local! {
     static BEFORE_RESET_HEIGHT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -36,14 +34,14 @@ fn settlement_observes_write_status_while_last_owner_is_dropping() {
     for started in [false, true] {
         let mut f = Fixture::new();
         let claim = f.take(1);
-        assert!(claim.publish(|| {}));
+        let claim = claim.publish(|_| {}).unwrap();
         if started {
             assert!(claim.try_start());
         }
         let weak = Arc::downgrade(&claim);
         let owner = claim.owner();
         let work = f.work.clone();
-        let mut budget = f.budget.clone();
+
         // Arbitrate expiry after the last strong reference is gone, before Drop
         // acquires the work lock to return the request's remaining heights.
         BEFORE_DROP_CLEANUP.with_borrow_mut(|hook| {
@@ -56,7 +54,6 @@ fn settlement_observes_write_status_while_last_owner_is_dropping() {
                 assert_eq!(outcome.request_was_unwritten, !started);
                 assert_eq!(outcome.returned_count, 1);
                 assert_eq!(outcome.released_bytes, 100);
-                budget.release(outcome.released_bytes);
             }));
         });
         drop(claim);
@@ -67,17 +64,91 @@ fn settlement_observes_write_status_while_last_owner_is_dropping() {
     }
 }
 
+#[tokio::test]
+async fn funded_receipt_survives_reset_and_replacement() {
+    let mut f = Fixture::new();
+    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let claim = f.take(1);
+    let owner = claim.owner();
+    let claim = claim.publish(|_| {}).unwrap();
+    assert!(claim.try_start());
+    claim.written();
+    drop(claim);
+    assert!(f.work.lock().request_writes.is_empty());
+    assert_eq!(f.budget.reserved(), 217, "funding outlives the writer");
+
+    let observed_budget = f.budget.clone();
+    let capacity = observed_budget.subscribe_capacity().notified();
+    tokio::pin!(capacity);
+    capacity.as_mut().enable();
+    let receipt = f
+        .work
+        .begin_receipt_for_owner(owner, block::Height(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.funding.bytes(), 100);
+    assert_eq!(f.work.reserved_bytes(), 100);
+    assert_eq!(
+        f.budget.reserved(),
+        217,
+        "receipt transfers without releasing"
+    );
+    assert!(futures::poll!(&mut capacity).is_pending());
+
+    f.reset();
+    assert!(
+        futures::poll!(&mut capacity).is_ready(),
+        "reset wakes capacity waiters"
+    );
+    assert_eq!(f.work.reserved_bytes(), 0);
+    assert_eq!(
+        f.budget.reserved(),
+        117,
+        "reset releases only the unreceived height"
+    );
+    f.refill();
+    let replacement = f.take(2);
+    let replacement = replacement.publish(|_| {}).unwrap();
+    assert_eq!(f.budget.reserved(), 317);
+    f.expire(owner);
+    assert_eq!(
+        f.budget.reserved(),
+        317,
+        "the old owner cannot settle replacement work"
+    );
+    drop(receipt);
+    assert_eq!(
+        f.budget.reserved(),
+        217,
+        "receipt cancellation preserves replacement funding"
+    );
+    drop(replacement);
+    assert_eq!(f.budget.reserved(), 17);
+    drop(unrelated);
+    assert_eq!(f.budget.reserved(), 0);
+}
+
+#[test]
+fn owned_overdraft_rejects_counter_overflow_without_charging() {
+    let budget = ByteBudget::new(u64::MAX);
+    let full = budget.reserve_owned(u64::MAX).unwrap();
+    assert!(budget.charge_owned(1).is_none());
+    assert_eq!(budget.reserved(), u64::MAX);
+    drop(full);
+    assert_eq!(budget.reserved(), 0);
+}
+
 #[test]
 fn reset_drops_unaffected_last_claim_after_unlocking() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let reset = std::thread::spawn(move || {
         let mut f = Fixture::new();
         let claim = f.take(1);
-        assert!(claim.publish(|| {}));
+        let claim = claim.publish(|_| {}).unwrap();
         // Release the writer's reference after reset upgrades the weak reference,
         // but before it rejects this claim at or below the new floor.
         BEFORE_RESET_HEIGHT_CHECK.with_borrow_mut(|hook| *hook = Some(Box::new(|| drop(claim))));
-        assert_eq!(f.work.reset_above(block::Height(2)), 0);
+        f.work.reset_above(block::Height(2));
         assert_eq!(f.budget.reserved(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
         assert_eq!(f.work.pending_len(), 0);
@@ -99,9 +170,23 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_queue(WorkQueue::new(block::Height(0), ByteBudget::new(1000)))
+    }
+
+    /// A fixture whose queue reports each request step to the returned log.
+    fn observed() -> (Self, StepLog) {
+        let log = StepLog::default();
+        let observer = ObserverSlot(Some(Arc::new(log.clone())));
+        let fixture = Self::with_queue(
+            WorkQueue::new(block::Height(0), ByteBudget::new(1000)).with_observer(observer),
+        );
+        (fixture, log)
+    }
+
+    fn with_queue(work: WorkQueue) -> Self {
         let fixture = Self {
-            work: Arc::new(WorkQueue::new(block::Height(0))),
-            budget: ByteBudget::new(1000),
+            budget: work.budget.clone(),
+            work: Arc::new(work),
             cancel: CancellationToken::new(),
         };
         fixture.work.set_estimate_floor_for_tests(1);
@@ -127,8 +212,8 @@ impl Fixture {
         );
     }
 
-    fn take(&mut self, id: u64) -> Arc<RequestWrite> {
-        let items = self.work.take_for_request(
+    fn take(&mut self, id: u64) -> UnpublishedRequest {
+        let taken = self.work.take_request(
             block::Height(1),
             block::Height(2),
             2,
@@ -136,29 +221,20 @@ impl Fixture {
             7,
             NonZeroU64::new(id).unwrap(),
         );
-        assert_eq!(items.len(), 2);
-        assert!(self.budget.try_reserve(200));
-        RequestWrite::new(
-            items[0].1.owner.unwrap(),
-            items,
-            self.work.clone(),
-            self.budget.clone(),
-            self.cancel.clone(),
-        )
+        assert_eq!(taken.items().len(), 2);
+        taken.admit(block::Height(0), self.cancel.clone()).unwrap()
     }
 
     fn expire(&mut self, owner: BodyWorkOwner) {
-        let outcome = self
-            .work
+        self.work
             .release_reserved_and_return_items_detailed_for_owner(
                 owner,
                 [block::Height(1), block::Height(2)],
             );
-        self.budget.release(outcome.released_bytes);
     }
 
     fn reset(&mut self) {
-        self.budget.release(self.work.reset_above(block::Height(0)));
+        self.work.reset_above(block::Height(0));
     }
 }
 
@@ -184,7 +260,7 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
     };
 
     assert!(retained(candidates(owner)).is_empty(), "unpublished work");
-    assert!(claim.publish(|| {}));
+    let _claim = claim.publish(|_| {}).unwrap();
     assert_eq!(
         retained(candidates(owner)),
         vec![
@@ -193,9 +269,10 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
         ],
     );
 
-    f.budget.release(
+    drop(
         f.work
-            .release_active_reserved_height_for_owner(owner, block::Height(1))
+            .begin_receipt_for_owner(owner, block::Height(1))
+            .unwrap()
             .unwrap(),
     );
     assert_eq!(
@@ -209,7 +286,7 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
     assert!(retained(candidates(owner)).is_empty(), "reset work");
     let replacement = f.take(2);
     assert!(retained(candidates(replacement.owner())).is_empty());
-    assert!(replacement.publish(|| {}));
+    let replacement = replacement.publish(|_| {}).unwrap();
     let mut mixed = candidates(owner);
     mixed.insert(0, (block::Height(2), (replacement.owner(), 22)));
     assert_eq!(
@@ -219,18 +296,20 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
     );
 }
 
-fn publish(claim: &Arc<RequestWrite>, sender: &FramedSend) {
+fn publish(claim: UnpublishedRequest, sender: &FramedSend) -> Arc<RequestWrite> {
     let slot = sender.try_reserve_guarded().unwrap();
-    assert!(claim.publish(|| {
-        assert!(slot.send_request(
-            Frame {
-                message_type: 2,
-                flags: 0,
-                payload: vec![0; 9]
-            },
-            claim.clone()
-        ));
-    }));
+    claim
+        .publish(|claim| {
+            assert!(slot.send_request(
+                Frame {
+                    message_type: 2,
+                    flags: 0,
+                    payload: vec![0; 9]
+                },
+                claim.clone()
+            ));
+        })
+        .unwrap()
 }
 
 #[tokio::test]
@@ -238,8 +317,8 @@ async fn expiry_before_writer_claim_skips_the_entire_frame() {
     let mut f = Fixture::new();
     let (sender, mut receiver) = worker_framed_channel(1);
     let claim = f.take(1);
+    let claim = publish(claim, &sender);
     let status = claim.status();
-    publish(&claim, &sender);
     f.expire(claim.owner());
     drop(claim);
     receiver
@@ -264,9 +343,9 @@ async fn started_request_finishes_after_expiry_without_releasing_its_replacement
     let mut f = Fixture::new();
     let (sender, mut receiver) = worker_framed_channel(1);
     let claim = f.take(1);
-    let status = claim.status();
     let owner = claim.owner();
-    publish(&claim, &sender);
+    let claim = publish(claim, &sender);
+    let status = claim.status();
     drop(claim);
     let queued = receiver.recv().await.unwrap();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -287,7 +366,7 @@ async fn started_request_finishes_after_expiry_without_releasing_its_replacement
     );
     assert_eq!(f.budget.reserved(), 0);
     let replacement = f.take(2);
-    publish(&replacement, &sender);
+    let replacement = publish(replacement, &sender);
     assert!(
         !f.cancel.is_cancelled(),
         "expiry alone lets the started frame finish"
@@ -313,7 +392,7 @@ async fn aborting_a_partial_write_cancels_the_session_and_returns_work() {
     let mut f = Fixture::new();
     let (sender, mut receiver) = worker_framed_channel(1);
     let claim = f.take(1);
-    publish(&claim, &sender);
+    let claim = publish(claim, &sender);
     drop(claim);
     let queued = receiver.recv().await.unwrap();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -339,12 +418,13 @@ fn reset_before_publication_cannot_return_a_replacement_take() {
     f.reset();
     f.refill();
     let replacement = f.take(2);
-    assert!(!old.publish(|| panic!("reset invalidated this take")));
-    drop(old);
+    assert!(old
+        .publish(|_| panic!("reset invalidated this take"))
+        .is_none());
     assert_eq!(f.budget.reserved(), 200);
     assert_eq!(f.work.in_flight_len(), 2);
     let (sender, receiver) = worker_framed_channel(1);
-    publish(&replacement, &sender);
+    let replacement = publish(replacement, &sender);
     assert_eq!(
         f.work.owner_for_height(block::Height(1)),
         Some(replacement.owner())
@@ -354,13 +434,40 @@ fn reset_before_publication_cannot_return_a_replacement_take() {
     assert_eq!(f.budget.reserved(), 0);
 }
 
+#[tokio::test]
+async fn queued_expiry_wakes_waiters_after_commit_settles_every_byte() {
+    let mut f = Fixture::new();
+    let claim = f.take(1);
+    let claim = claim.publish(|_| {}).unwrap();
+    assert_eq!(f.budget.reserved(), 200);
+    f.work.advance_floor(block::Height(2));
+    assert_eq!(f.budget.reserved(), 0);
+
+    let available = f.work.subscribe_available().notified();
+    tokio::pin!(available);
+    available.as_mut().enable();
+    let outcome = f
+        .work
+        .release_reserved_and_return_items_detailed_for_owner(claim.owner(), []);
+    assert!(outcome.request_was_unwritten);
+    assert_eq!(outcome.released_bytes, 0);
+    assert_eq!(outcome.returned_count, 0);
+    tokio::time::timeout(Duration::from_secs(1), available)
+        .await
+        .expect("expiring the queued frame wakes waiters even without returned work or bytes");
+    assert!(!claim.try_start());
+    drop(claim);
+    assert_eq!(f.budget.reserved(), 0);
+    assert_eq!(f.work.reserved_bytes(), 0);
+}
+
 #[test]
 fn reset_cancels_a_started_request_but_only_skips_a_queued_request() {
     for started in [false, true] {
         let mut f = Fixture::new();
         let (sender, receiver) = worker_framed_channel(1);
         let claim = f.take(1);
-        publish(&claim, &sender);
+        let claim = publish(claim, &sender);
         if started {
             assert!(claim.try_start());
         }
@@ -378,10 +485,11 @@ fn queue_failure_after_receipt_preserves_the_received_height() {
     let mut f = Fixture::new();
     let (sender, receiver) = worker_framed_channel(1);
     let claim = f.take(1);
-    publish(&claim, &sender);
-    f.budget.release(
+    let claim = publish(claim, &sender);
+    drop(
         f.work
-            .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+            .begin_receipt_for_owner(claim.owner(), block::Height(1))
+            .unwrap()
             .unwrap(),
     );
     drop(receiver);
@@ -400,16 +508,18 @@ fn receiver_closing_after_slot_reservation_settles_publication_once() {
     let claim = f.take(1);
     drop(receiver);
     let mut delivered = true;
-    assert!(claim.publish(|| {
-        delivered = slot.send_request(
-            Frame {
-                message_type: 2,
-                flags: 0,
-                payload: vec![],
-            },
-            claim.clone(),
-        );
-    }));
+    let claim = claim
+        .publish(|claim| {
+            delivered = slot.send_request(
+                Frame {
+                    message_type: 2,
+                    flags: 0,
+                    payload: vec![],
+                },
+                claim.clone(),
+            );
+        })
+        .unwrap();
     assert!(!delivered);
     claim.delivery_failed();
     drop(claim);
@@ -428,28 +538,31 @@ fn reset_cannot_interleave_outstanding_publication_and_enqueue() {
     let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
     let work = f.work.clone();
     std::thread::scope(|scope| {
-        let claim = claim.clone();
         scope.spawn(move || {
             let (sender, receiver) = worker_framed_channel(1);
             let slot = sender.try_reserve_guarded().unwrap();
-            assert!(claim.publish(|| {
-                entered_tx.send(()).unwrap();
-                finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                assert!(slot.send_request(
-                    Frame {
-                        message_type: 2,
-                        flags: 0,
-                        payload: vec![]
-                    },
-                    claim.clone()
-                ));
-            }));
+            let claim = claim
+                .publish(|claim| {
+                    entered_tx.send(()).unwrap();
+                    finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    assert!(slot.send_request(
+                        Frame {
+                            message_type: 2,
+                            flags: 0,
+                            payload: vec![]
+                        },
+                        claim.clone()
+                    ));
+                })
+                .unwrap();
             drop(receiver);
+            drop(claim);
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         scope.spawn(move || {
             attempt_tx.send(()).unwrap();
-            reset_tx.send(work.reset_above(block::Height(0))).unwrap();
+            work.reset_above(block::Height(0));
+            reset_tx.send(()).unwrap();
         });
         attempt_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(
@@ -457,10 +570,8 @@ fn reset_cannot_interleave_outstanding_publication_and_enqueue() {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
         finish_tx.send(()).unwrap();
-        f.budget
-            .release(reset_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        reset_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     });
-    drop(claim);
     assert_eq!(f.budget.reserved(), 0);
     assert_eq!(f.work.reserved_bytes(), 0);
 }
@@ -476,13 +587,13 @@ async fn partial_queued_expiry_returns_the_whole_request_before_queue_drain() {
         let (sender, mut receiver) = worker_framed_channel(2);
         let claim = f.take(1);
         let owner = claim.owner();
+        let claim = publish(claim, &sender);
         let status = claim.status();
-        publish(&claim, &sender);
         drop(claim);
         let outcome = f
             .work
             .release_reserved_and_return_items_detailed_for_owner(owner, heights);
-        f.budget.release(outcome.released_bytes);
+
         assert!(status.was_skipped());
         assert_eq!(outcome.returned_count, 2);
         assert_eq!(outcome.min_height, Some(block::Height(1)));
@@ -494,7 +605,7 @@ async fn partial_queued_expiry_returns_the_whole_request_before_queue_drain() {
         assert_eq!(f.work.reserved_bytes(), 0);
 
         let replacement = f.take(2);
-        publish(&replacement, &sender);
+        let replacement = publish(replacement, &sender);
         let stale = f
             .work
             .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
@@ -528,12 +639,12 @@ fn partial_started_expiry_keeps_the_other_height_reserved() {
     let mut f = Fixture::new();
     let (sender, receiver) = worker_framed_channel(1);
     let claim = f.take(1);
-    publish(&claim, &sender);
+    let claim = publish(claim, &sender);
     assert!(claim.try_start());
     let outcome = f
         .work
         .release_reserved_and_return_items_detailed_for_owner(claim.owner(), [block::Height(1)]);
-    f.budget.release(outcome.released_bytes);
+
     assert!(!claim.status().was_skipped());
     assert_eq!(outcome.returned_count, 1);
     assert_eq!(outcome.released_bytes, 100);
@@ -560,19 +671,26 @@ fn receipt_retires_only_unwritten_requests_and_preserves_the_body() {
             let mut f = Fixture::new();
             let (sender, receiver) = worker_framed_channel(1);
             let claim = f.take(1);
-            publish(&claim, &sender);
+            let claim = publish(claim, &sender);
             if started {
                 assert!(claim.try_start());
             }
-            let released = if claim_received {
-                f.work
-                    .claim_received_for_owner(claim.owner(), block::Height(1))
+            let before = f.budget.reserved();
+            if claim_received {
+                drop(
+                    f.work
+                        .claim_receipt_for_owner(claim.owner(), block::Height(1))
+                        .unwrap(),
+                );
             } else {
-                f.work
-                    .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
-                    .unwrap()
-            };
-            f.budget.release(released);
+                drop(
+                    f.work
+                        .begin_receipt_for_owner(claim.owner(), block::Height(1))
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            let released = before - f.budget.reserved();
             assert_eq!(released, if started { 100 } else { 200 });
             assert_eq!(claim.status().was_skipped(), !started);
             assert_eq!(f.budget.reserved(), if started { 100 } else { 0 });
@@ -588,7 +706,7 @@ fn receipt_retires_only_unwritten_requests_and_preserves_the_body() {
                 claim.owner(),
                 [block::Height(2)],
             );
-            f.budget.release(outcome.released_bytes);
+
             assert_eq!(outcome.returned_count, u64::from(started));
             assert_eq!(outcome.released_bytes, if started { 100 } else { 0 });
             if started {
@@ -609,22 +727,20 @@ fn queued_expiry_racing_reset_settles_each_reservation_once() {
         let mut f = Fixture::new();
         let (sender, receiver) = worker_framed_channel(1);
         let claim = f.take(1);
-        publish(&claim, &sender);
+        let claim = publish(claim, &sender);
         let owner = claim.owner();
         let barrier = std::sync::Barrier::new(2);
         let work = f.work.clone();
         std::thread::scope(|scope| {
             let barrier = &barrier;
-            let mut budget = f.budget.clone();
+
             scope.spawn(move || {
                 barrier.wait();
-                budget.release(work.reset_above(block::Height(0)));
+                work.reset_above(block::Height(0));
             });
             barrier.wait();
-            let outcome = f
-                .work
+            f.work
                 .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
-            f.budget.release(outcome.released_bytes);
         });
         assert_eq!(f.budget.reserved(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
@@ -643,21 +759,22 @@ fn expiry_after_forward_reset_discards_committed_heights() {
         let mut f = Fixture::new();
         let (sender, receiver) = worker_framed_channel(1);
         let claim = f.take(1);
-        publish(&claim, &sender);
+        let claim = publish(claim, &sender);
         if received {
             // Receipt retires queued requests immediately. A written request can
             // retain both a received prefix and an unreceived suffix until reset.
             assert!(claim.try_start());
             claim.written();
-            f.budget.release(
+            drop(
                 f.work
-                    .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+                    .begin_receipt_for_owner(claim.owner(), block::Height(1))
+                    .unwrap()
                     .unwrap(),
             );
         }
         // Reset retains heights at or below its new floor. Cleanup must discard
         // that prefix instead of offering already-committed work to another peer.
-        f.budget.release(f.work.reset_above(block::Height(2)));
+        f.work.reset_above(block::Height(2));
         let outcome = f.work.release_reserved_and_return_items_detailed_for_owner(
             claim.owner(),
             [block::Height(1), block::Height(2)],
@@ -665,7 +782,7 @@ fn expiry_after_forward_reset_discards_committed_heights() {
         assert_eq!(outcome.committed_count, 2);
         assert_eq!(outcome.returned_count, 0);
         assert_eq!(outcome.released_bytes, if received { 100 } else { 200 });
-        f.budget.release(outcome.released_bytes);
+
         assert_eq!(f.work.pending_len(), 0);
         assert_eq!(f.work.in_flight_len(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
@@ -689,7 +806,7 @@ async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
         let mut f = Fixture::new();
         let (sender, mut receiver) = worker_framed_channel(1);
         let claim = f.take(1);
-        publish(&claim, &sender);
+        let claim = publish(claim, &sender);
         drop(claim);
         let cause = OrderedStreamFailureCause::default();
         let result = receiver
@@ -712,4 +829,1012 @@ async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
         assert_eq!(f.work.reserved_bytes(), 0);
         assert_eq!(f.budget.reserved(), 0);
     }
+}
+
+/// Both budget-ledger gauges equal sums over the work queue's owners after
+/// each charge, transfer, and release path. No check calls a publication
+/// helper, so each gauge must follow its ledger on its own.
+#[test]
+fn budget_ledger_gauges_follow_work_owners() {
+    use crate::zakura::block_sync::{
+        tests::gauge_recorder::GaugeRecorder, work_queue::WorkItemPlace,
+    };
+
+    let recorder = GaugeRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let mut f = Fixture::new();
+    // Returns the work and budget gauges after checking them against the owners.
+    let check = |f: &Fixture, label: &str| {
+        let owners = f.work.ownership_snapshot();
+        let reserved: u64 = owners.iter().map(|item| item.reserved_bytes).sum();
+        let provisional: u64 = owners
+            .iter()
+            .filter(|item| item.place == WorkItemPlace::Provisional)
+            .map(|item| item.estimated_bytes)
+            .sum();
+        let work_gauge = recorder.bytes("sync.block.work.reserved_bytes");
+        let budget_gauge = recorder.bytes("sync.block.budget.reserved_bytes");
+        assert_eq!(work_gauge, reserved, "work gauge after {label}");
+        assert_eq!(
+            budget_gauge,
+            reserved + provisional,
+            "budget gauge after {label}"
+        );
+        for floor in [block::Height(0), block::Height(1)] {
+            let above: u64 = owners
+                .iter()
+                .filter(|item| item.place == WorkItemPlace::InFlight && item.height > floor)
+                .map(|item| item.reserved_bytes)
+                .sum();
+            assert_eq!(
+                f.work.reserved_above(floor).0,
+                above,
+                "reservations above {floor:?} after {label}"
+            );
+        }
+        (work_gauge, budget_gauge)
+    };
+
+    assert_eq!(check(&f, "start"), (0, 0));
+
+    // The budget funds a provisional take before the queue charges it.
+    let claim = f.take(1);
+    assert_eq!(check(&f, "provisional take"), (0, 200));
+    drop(claim);
+    assert_eq!(check(&f, "unpublished drop"), (0, 0));
+
+    let claim = f.take(2);
+    let claim = claim.publish(|_| {}).unwrap();
+    assert_eq!(check(&f, "publication"), (200, 200));
+    drop(
+        f.work
+            .begin_receipt_for_owner(claim.owner(), block::Height(1))
+            .unwrap()
+            .unwrap(),
+    );
+    assert!(check(&f, "receipt").0 < 200);
+    f.reset();
+    drop(claim);
+    assert_eq!(check(&f, "reset after receipt"), (0, 0));
+
+    f.refill();
+    let claim = f.take(3);
+    let claim = claim.publish(|_| {}).unwrap();
+    f.expire(claim.owner());
+    assert_eq!(check(&f, "timeout"), (0, 0));
+    drop(claim);
+    assert_eq!(check(&f, "drop after timeout"), (0, 0));
+
+    let claim = f.take(4);
+    let claim = claim.publish(|_| {}).unwrap();
+    f.reset();
+    assert_eq!(check(&f, "reset"), (0, 0));
+    drop(claim);
+
+    f.refill();
+    let claim = f.take(5);
+    let claim = claim.publish(|_| {}).unwrap();
+    assert_eq!(check(&f, "last publication"), (200, 200));
+    drop(claim);
+    assert_eq!(check(&f, "published drop"), (0, 0));
+}
+
+/// Review P5a-2: a body that answers a competing request carries the charge
+/// of the request its release settles. Another routine can retire the old
+/// request and publish a replacement with a new estimate between a separate
+/// charge read and the release, so the charge comes from the release.
+#[test]
+fn answered_elsewhere_returns_the_settled_requests_charge() {
+    let height = block::Height(1);
+    let hash = block::Hash([1; 32]);
+    let budget = ByteBudget::new(10_000);
+    let work = Arc::new(WorkQueue::new(block::Height(0), budget.clone()));
+    work.extend(
+        test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(2_000))],
+    );
+    let cancel = CancellationToken::new();
+    let take = |id, bytes| {
+        let taken = work.take_request(height, height, 1, 10_000, 7, NonZeroU64::new(id).unwrap());
+        assert_eq!(taken.items().len(), 1);
+        let request = taken.admit(block::Height(0), cancel.clone()).unwrap();
+        assert_eq!(request.bytes(), bytes);
+        request.publish(|_| {}).unwrap()
+    };
+    let old = take(1, 2_000);
+    assert_eq!(work.reserved_in_flight_charge(height), Some(2_000));
+    work.release_reserved_and_return_items_detailed_for_owner(old.owner(), [height]);
+    work.refresh_size_estimates(
+        test_work_scope(),
+        [(height, hash, BlockSizeEstimate::Confirmed(1_500))],
+    );
+    let replacement = take(2, 1_500);
+    let ended = work
+        .begin_competing_receipt(replacement.owner(), height)
+        .unwrap()
+        .expect("replacement owns the reserved height");
+    assert_eq!(ended.charge, 1_500);
+    assert_eq!(ended.funding.bytes(), 1_500);
+    drop(ended);
+    assert_eq!(budget.reserved(), 0);
+}
+
+/// The request steps a queue reported, in order.
+#[derive(Clone, Debug, Default)]
+struct StepLog(Arc<std::sync::Mutex<Vec<RequestStep>>>);
+
+impl StepLog {
+    /// Takes the steps reported since the last call.
+    fn take(&self) -> Vec<RequestStep> {
+        std::mem::take(&mut self.0.lock().unwrap())
+    }
+}
+
+impl BlockSyncObserver for StepLog {
+    fn observe(&self, event: BlockEvent) {
+        if let BlockEvent::Request { step, .. } = event {
+            self.0.lock().unwrap().push(step);
+        }
+    }
+}
+
+#[test]
+fn each_write_outcome_reports_its_steps() {
+    use RequestStep::*;
+    use RequestWritePhase as Phase;
+
+    // Transport writes the frame.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    let claim = claim.publish(|_| {}).unwrap();
+    assert!(claim.try_start());
+    claim.written();
+    drop(claim);
+    assert_eq!(
+        log.take(),
+        [Funded, Published, Started, Written, Dropped(Phase::Written)]
+    );
+
+    // The queue lost its receiver during publication.
+    let (mut f, log) = Fixture::observed();
+    let (sender, receiver) = worker_framed_channel(1);
+    let slot = sender.try_reserve_guarded().unwrap();
+    let claim = f.take(1);
+    drop(receiver);
+    let claim = claim
+        .publish(|claim| {
+            assert!(!slot.send_request(
+                Frame {
+                    message_type: 2,
+                    flags: 0,
+                    payload: vec![],
+                },
+                claim.clone(),
+            ));
+        })
+        .unwrap();
+    claim.delivery_failed();
+    drop(claim);
+    assert_eq!(
+        log.take(),
+        [
+            Funded,
+            Published,
+            DeliveryFailed,
+            Expired,
+            Dropped(Phase::Skipped)
+        ]
+    );
+
+    // A queued request expires, so transport skips it.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    let claim = claim.publish(|_| {}).unwrap();
+    f.expire(claim.owner());
+    assert!(!claim.try_start());
+    drop(claim);
+    assert_eq!(
+        log.take(),
+        [Funded, Published, Expired, Dropped(Phase::Skipped)]
+    );
+
+    // A routine expires a queued request through the status it kept, as its
+    // timeout and retirement paths do.
+    let (mut f, log) = Fixture::observed();
+    let claim = f.take(1);
+    let claim = claim.publish(|_| {}).unwrap();
+    let status = claim.status();
+    assert!(status.expire_unwritten());
+    assert!(!status.expire_unwritten(), "only the transition reports");
+    drop(claim);
+    assert_eq!(
+        log.take(),
+        [Funded, Published, Expired, Dropped(Phase::Skipped)]
+    );
+
+    // A reset retires a queued request and a started one. Only the queued
+    // request expires.
+    for started in [false, true] {
+        let (mut f, log) = Fixture::observed();
+        let claim = f.take(1);
+        let claim = claim.publish(|_| {}).unwrap();
+        if started {
+            assert!(claim.try_start());
+        }
+        f.reset();
+        drop(claim);
+        let expected: &[RequestStep] = if started {
+            &[Funded, Published, Started, Reset, Dropped(Phase::Started)]
+        } else {
+            &[Funded, Published, Reset, Expired, Dropped(Phase::Skipped)]
+        };
+        assert_eq!(log.take(), expected);
+    }
+
+    // A take that never publishes drops unpublished.
+    let (mut f, log) = Fixture::observed();
+    drop(f.take(1));
+    assert_eq!(log.take(), [Funded, Dropped(Phase::Unpublished)]);
+}
+
+#[test]
+fn dropping_unpolled_publication_returns_work_and_funding() {
+    let mut f = Fixture::new();
+    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let request = f.take(1);
+    let publication = async move { request.publish(|_| panic!("future was never polled")) };
+    assert_eq!(f.budget.reserved(), 217);
+    drop(publication);
+    assert_eq!(f.budget.reserved(), 17);
+    assert_eq!(f.work.pending_len(), 2);
+    assert_eq!(f.work.in_flight_len(), 0);
+    assert!(f.work.lock().request_writes.is_empty());
+    drop(unrelated);
+}
+
+#[test]
+fn cancelled_publication_returns_work_and_funding() {
+    let mut f = Fixture::new();
+    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let request = f.take(1);
+    f.cancel.cancel();
+    assert!(request
+        .publish(|_| panic!("cancelled request cannot publish"))
+        .is_none());
+    assert_eq!(f.budget.reserved(), 17);
+    assert_eq!(f.work.pending_len(), 2);
+    assert_eq!(f.work.in_flight_len(), 0);
+    assert!(f.work.lock().request_writes.is_empty());
+    drop(unrelated);
+}
+
+#[test]
+fn publication_unwind_settles_after_unlocking() {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut f = Fixture::new();
+        let unrelated = f.budget.reserve_owned(17).unwrap();
+        let request = f.take(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            request.publish(|_| panic!("publication interrupted"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(f.budget.reserved(), 17);
+        assert_eq!(f.work.pending_len(), 2);
+        assert_eq!(f.work.in_flight_len(), 0);
+        assert!(f.work.lock().request_writes.is_empty());
+        drop(unrelated);
+        done_tx.send(()).unwrap();
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("unwind releases the work lock before claim cleanup");
+    worker.join().unwrap();
+}
+
+#[test]
+fn dropping_unfunded_take_returns_work_without_charging() {
+    let f = Fixture::new();
+    let taken = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(1).unwrap(),
+    );
+    let admission = async move { taken.admit(block::Height(0), CancellationToken::new()) };
+    assert_eq!(f.work.in_flight_len(), 2);
+    assert_eq!(f.budget.reserved(), 0);
+    drop(admission);
+    assert_eq!(f.work.in_flight_len(), 0);
+    assert_eq!(f.work.pending_len(), 2);
+    assert_eq!(f.budget.reserved(), 0);
+}
+
+#[test]
+fn filtered_take_derives_funding_and_priority_from_retained_items() {
+    let f = Fixture::new();
+    f.work.extend(
+        test_work_scope(),
+        [(
+            block::Height(3),
+            block::Hash([3; 32]),
+            BlockSizeEstimate::Confirmed(300),
+        )],
+    );
+    let mut taken = f.work.take_request(
+        block::Height(1),
+        block::Height(3),
+        3,
+        500,
+        7,
+        NonZeroU64::new(1).unwrap(),
+    );
+    assert_eq!(taken.items().len(), 3);
+    taken.retain_range(1..2);
+    assert!(f.work.pending_contains(block::Height(1)));
+    assert!(f.work.pending_contains(block::Height(3)));
+    let request = taken.admit(block::Height(0), f.cancel.clone()).unwrap();
+    assert_eq!(request.items().len(), 1);
+    assert_eq!(request.items()[0].0, block::Height(2));
+    assert_eq!(request.priority(), RequestPriority::AboveFloor);
+    assert_eq!(request.bytes(), 100);
+    assert_eq!(f.budget.reserved(), 100);
+    let claim = request.publish(|_| {}).unwrap();
+    assert_eq!(f.work.reserved_bytes(), 100);
+    drop(claim);
+    assert_eq!(f.budget.reserved(), 0);
+    assert_eq!(f.work.pending_len(), 3);
+}
+
+#[test]
+fn full_budget_refuses_speculation_but_funds_only_the_owned_floor() {
+    let f = Fixture::new();
+    let unrelated = f.budget.reserve_owned(1000).unwrap();
+    let above = f.work.take_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        100,
+        7,
+        NonZeroU64::new(1).unwrap(),
+    );
+    assert_eq!(
+        above.admit(block::Height(0), f.cancel.clone()).unwrap_err(),
+        AdmitRefusal::Capacity
+    );
+    assert!(f.work.pending_contains(block::Height(2)));
+    assert_eq!(f.budget.reserved(), 1000);
+    let floor = f
+        .work
+        .take_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            1,
+            7,
+            NonZeroU64::new(2).unwrap(),
+        )
+        .admit(block::Height(0), f.cancel.clone())
+        .unwrap();
+    assert_eq!(floor.bytes(), 100);
+    assert_eq!(floor.priority(), RequestPriority::Floor);
+    assert_eq!(f.budget.reserved(), 1100);
+    let duplicate = f.work.take_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        1,
+        8,
+        NonZeroU64::new(3).unwrap(),
+    );
+    assert_eq!(
+        duplicate
+            .admit(block::Height(0), f.cancel.clone())
+            .unwrap_err(),
+        AdmitRefusal::Empty
+    );
+    assert_eq!(f.budget.reserved(), 1100);
+    drop(floor);
+    assert_eq!(f.budget.reserved(), 1000);
+    drop(unrelated);
+}
+
+#[test]
+fn stale_take_cannot_fund_or_return_replacement_work() {
+    let f = Fixture::new();
+    let old = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(1).unwrap(),
+    );
+    f.work.reset_above(block::Height(0));
+    f.refill();
+    let replacement = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(2).unwrap(),
+    );
+    assert_eq!(
+        old.admit(block::Height(0), f.cancel.clone()).unwrap_err(),
+        AdmitRefusal::StaleClaim
+    );
+    assert_eq!(f.budget.reserved(), 0);
+    assert_eq!(f.work.in_flight_len(), 2);
+    assert_eq!(f.work.pending_len(), 0);
+    let request = replacement
+        .admit(block::Height(0), f.cancel.clone())
+        .unwrap();
+    assert_eq!(f.budget.reserved(), 200);
+    drop(request);
+    assert_eq!(f.budget.reserved(), 0);
+    assert_eq!(f.work.pending_len(), 2);
+}
+
+#[test]
+fn capacity_release_wakes_after_unlocking_the_work_queue() {
+    use std::{future::Future, task::Context};
+    use zakura_rt::sync::atomic::{AtomicBool, AtomicUsize};
+
+    for operation in 0..4 {
+        let mut f = Fixture::new();
+        let request = f.take(1);
+        let owner = request.owner();
+        let claim = request.publish(|_| {}).unwrap();
+        assert!(claim.try_start());
+        claim.written();
+        drop(claim);
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = callback_waker({
+            let (work, unlocked, wakes) = (f.work.clone(), unlocked.clone(), wakes.clone());
+            move || {
+                unlocked.store(work.inner.try_lock().is_ok(), Ordering::SeqCst);
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let mut context = Context::from_waker(&waker);
+        let mut notified = Box::pin(f.budget.subscribe_capacity().notified());
+        assert!(notified.as_mut().poll(&mut context).is_pending());
+        match operation {
+            0 => {
+                f.work.release_reserved_heights_for_owner(
+                    owner,
+                    [block::Height(1), block::Height(2)],
+                );
+            }
+            1 => {
+                f.work.release_reserved_and_return_items_detailed_for_owner(
+                    owner,
+                    [block::Height(1), block::Height(2)],
+                );
+            }
+            2 => {
+                f.work.advance_floor(block::Height(2));
+            }
+            3 => {
+                f.work.reset_above(block::Height(0));
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(f.budget.reserved(), 0, "operation {operation}");
+        assert_eq!(wakes.load(Ordering::SeqCst), 1, "operation {operation}");
+        assert!(
+            unlocked.load(Ordering::SeqCst),
+            "operation {operation} woke under the work lock"
+        );
+    }
+}
+
+#[test]
+fn funding_drift_closes_publication_and_survives_reset() {
+    for close_budget in [false, true] {
+        let f = Fixture::new();
+        let take_height = |raw, request| {
+            f.work
+                .take_request(
+                    block::Height(raw),
+                    block::Height(raw),
+                    1,
+                    100,
+                    7,
+                    NonZeroU64::new(request).unwrap(),
+                )
+                .admit(block::Height(0), f.cancel.clone())
+                .unwrap()
+        };
+        let claim = take_height(1, 1).publish(|_| {}).unwrap();
+        let request = take_height(2, 2);
+        assert!(
+            f.work.audit_funding(),
+            "unpublished funding may exceed the ledger"
+        );
+        if close_budget {
+            f.budget.close(BudgetClosure::Funding {
+                logical: 200,
+                funded: 199,
+            });
+        } else {
+            // Inject an untracked owner without changing the logical ledger.
+            f.work
+                .lock()
+                .funding
+                .merge(&mut f.budget.reserve_owned(1).unwrap())
+                .unwrap();
+            assert!(!f.work.audit_funding());
+        }
+        assert!(f.budget.is_closed());
+        assert_eq!(
+            f.budget.available(),
+            0,
+            "closed admission has no available capacity"
+        );
+        assert!(request
+            .publish(|_| panic!("closed queue published"))
+            .is_none());
+        assert!(!claim.try_start(), "closed owner authorized a writer");
+        drop(claim);
+        assert_eq!(f.budget.reserved(), if close_budget { 0 } else { 1 });
+        if !close_budget {
+            // Remove the injected owner so reset exercises a consistent drained queue.
+            drop(f.work.lock().funding.split(1).unwrap());
+        }
+        f.work.reset_above(block::Height(0));
+        assert_eq!(f.budget.reserved(), 0);
+        assert!(!f.work.audit_funding(), "reset must preserve closure");
+    }
+}
+
+#[test]
+fn accounting_closure_wakes_its_waiter() {
+    use std::{future::Future, task::Context};
+    use zakura_rt::sync::atomic::AtomicUsize;
+
+    for operation in 0..6 {
+        let mut f = Fixture::new();
+        let reader = f.budget.reader();
+        let mut closed = Box::pin(reader.closed());
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = callback_waker({
+            let wakes = wakes.clone();
+            move || {
+                wakes.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let mut cx = Context::from_waker(&waker);
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        drop(f.budget.reserve_owned(17).unwrap());
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            0,
+            "normal release must not signal closure"
+        );
+        let mut held = Vec::new();
+        let mut claims = Vec::new();
+        match operation {
+            0 => {
+                f.work
+                    .lock()
+                    .funding
+                    .merge(&mut f.budget.reserve_owned(1).unwrap())
+                    .unwrap();
+                assert!(!f.work.audit_funding());
+            }
+            1 | 2 => {
+                let claim = f.take(1).publish(|_| {}).unwrap();
+                assert!(claim.try_start());
+                held.push(f.work.lock().funding.split(150).unwrap());
+                if operation == 1 {
+                    assert!(f
+                        .work
+                        .begin_receipt_for_owner(claim.owner(), block::Height(1))
+                        .is_err());
+                } else {
+                    f.work.reset_above(block::Height(0));
+                }
+                claims.push(claim);
+            }
+            3 => {
+                let mut request = f.take(1);
+                held.push(request.funding.split(1).unwrap());
+                assert!(request
+                    .publish(|_| panic!("underfunded request published"))
+                    .is_none());
+            }
+            4 => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _lock = f.work.lock();
+                    f.budget.close(BudgetClosure::Funding {
+                        logical: 1,
+                        funded: 0,
+                    });
+                    panic!("interrupted accounting failure");
+                }));
+                assert!(result.is_err());
+            }
+            5 => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _inner = f.work.lock();
+                    panic!("interrupt the queue before accounting closure");
+                }));
+                assert!(result.is_err());
+                assert!(!f.work.audit_funding(), "poison closes admission");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            wakes.load(Ordering::SeqCst) > 0,
+            "closure did not wake its waiter: {operation}"
+        );
+        assert!(closed.as_mut().poll(&mut cx).is_ready());
+        assert!(
+            Box::pin(reader.closed()).as_mut().poll(&mut cx).is_ready(),
+            "late registration observes closure"
+        );
+        drop(claims);
+        drop(held);
+    }
+}
+
+#[test]
+fn funding_drift_refuses_normal_and_floor_admission() {
+    for floor in [block::Height(0), block::Height(1)] {
+        let f = Fixture::new();
+        let taken = f.work.take_request(
+            block::Height(1),
+            block::Height(2),
+            2,
+            200,
+            7,
+            NonZeroU64::new(1).unwrap(),
+        );
+        f.work
+            .lock()
+            .funding
+            .merge(&mut f.budget.reserve_owned(1).unwrap())
+            .unwrap();
+        assert!(!f.work.audit_funding());
+        assert_eq!(
+            taken.admit(floor, f.cancel.clone()).unwrap_err(),
+            AdmitRefusal::AccountingClosed
+        );
+        assert_eq!(f.budget.reserved(), 1);
+        assert_eq!(f.work.pending_len(), 2);
+    }
+}
+
+#[test]
+fn funding_audit_checks_the_actual_counter_and_allows_held_receipts() {
+    let mut f = Fixture::new();
+    let claim = f.take(1).publish(|_| {}).unwrap();
+    assert!(claim.try_start());
+    assert!(f.work.audit_funding());
+    let receipt = f
+        .work
+        .begin_receipt_for_owner(claim.owner(), block::Height(1))
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.work.audit_funding(),
+        "a held receipt remains charged outside the pool"
+    );
+    drop(receipt);
+    assert!(f.work.audit_funding());
+
+    // Replace the pool's remaining charge with funding from another budget.
+    // Its logical and funded totals still agree, but its actual counter does not.
+    let other = ByteBudget::new(1_000);
+    let funded = f.work.lock().funding.bytes();
+    assert!(funded > 0);
+    let original = std::mem::replace(
+        &mut f.work.lock().funding,
+        other.reserve_owned(funded).unwrap(),
+    );
+    drop(original);
+    assert_eq!(f.work.reserved_bytes(), funded);
+    assert_eq!(f.budget.reserved(), 0);
+    assert!(
+        !f.work.audit_funding(),
+        "an actual counter shortfall closes admission"
+    );
+    assert!(f.budget.is_closed());
+    assert_eq!(f.budget.available(), 0);
+    // Settlement only meets funding from its own budget.
+    let foreign = std::mem::replace(&mut f.work.lock().funding, f.budget.empty_reservation());
+    drop(claim);
+    f.work.reset_above(block::Height(0));
+    assert!(
+        !f.work.audit_funding(),
+        "reset cannot reopen a corrupt generation"
+    );
+    assert_eq!(f.budget.reserved(), 0);
+    drop(foreign);
+    assert_eq!(other.reserved(), 0);
+}
+
+#[test]
+fn failed_receipt_transfer_preserves_funding_and_reports_error() {
+    let mut f = Fixture::new();
+    let claim = f.take(1).publish(|_| {}).unwrap();
+    let retained = f.work.lock().funding.split(150).unwrap();
+    let outcome = f
+        .work
+        .begin_receipt_for_owner(claim.owner(), block::Height(1));
+    assert!(matches!(
+        outcome,
+        Err(crate::zakura::transport::ReservationError::Amount)
+    ));
+    assert!(f.budget.is_closed());
+    assert_eq!(f.work.lock().funding.bytes(), 50);
+    assert_eq!(f.budget.reserved(), 200);
+    assert!(!claim.try_start());
+    drop(claim);
+    f.work.reset_above(block::Height(0));
+    assert_eq!(
+        f.budget.reserved(),
+        200,
+        "reset retains quarantined funding"
+    );
+    let budget = f.budget.clone();
+    drop(f);
+    assert_eq!(budget.reserved(), 150);
+    drop(retained);
+    assert_eq!(budget.reserved(), 0);
+    assert!(budget.is_closed());
+}
+
+#[test]
+fn failed_settlement_retains_pool_without_poisoning_queue() {
+    for operation in 0..3 {
+        let mut f = Fixture::new();
+        let claim = f.take(1).publish(|_| {}).unwrap();
+        assert!(claim.try_start());
+        claim.written();
+        let retained = f.work.lock().funding.split(150).unwrap();
+        match operation {
+            0 => f.work.reset_above(block::Height(0)),
+            1 => f.work.advance_floor(block::Height(2)),
+            2 => f
+                .work
+                .release_reserved_heights_for_owner(claim.owner(), [block::Height(1)]),
+            _ => unreachable!(),
+        }
+        assert!(f.budget.is_closed());
+        assert_eq!(f.work.lock().funding.bytes(), 50);
+        assert_eq!(f.budget.reserved(), 200);
+        drop(claim);
+        drop(retained);
+        assert_eq!(f.budget.reserved(), 50);
+    }
+}
+
+#[test]
+fn rejected_publication_releases_funding_after_unlock() {
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, Ordering},
+        task::Context,
+    };
+    let mut f = Fixture::new();
+    let request = f.take(1);
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let waker = callback_waker({
+        let (work, unlocked) = (f.work.clone(), unlocked.clone());
+        move || unlocked.store(work.inner.try_lock().is_ok(), Ordering::SeqCst)
+    });
+    let mut context = Context::from_waker(&waker);
+    let mut released = Box::pin(f.budget.subscribe_capacity().notified());
+    assert!(released.as_mut().poll(&mut context).is_pending());
+    f.cancel.cancel();
+    assert!(request
+        .publish(|_| panic!("cancelled request published"))
+        .is_none());
+    assert_eq!(f.budget.reserved(), 0);
+    assert!(
+        unlocked.load(Ordering::SeqCst),
+        "rejected funding woke under the queue lock"
+    );
+    assert_eq!(f.work.reserved_bytes(), 0);
+    assert_eq!(f.work.pending_len(), 2);
+}
+
+#[test]
+fn publication_amount_mismatch_quarantines_funding() {
+    let mut f = Fixture::new();
+    let mut request = f.take(1);
+    let retained = request.funding.split(1).unwrap();
+    assert!(request
+        .publish(|_| panic!("underfunded request published"))
+        .is_none());
+    assert!(f.budget.is_closed());
+    assert_eq!(f.work.lock().funding.bytes(), 199);
+    assert_eq!(f.budget.reserved(), 200);
+    f.work.reset_above(block::Height(0));
+    assert_eq!(f.budget.reserved(), 200);
+    drop(retained);
+    assert_eq!(f.budget.reserved(), 199);
+}
+
+impl WorkQueue {
+    pub(in crate::zakura::block_sync) fn retain_funding_for_test(
+        &self,
+        bytes: u64,
+    ) -> crate::zakura::transport::ByteReservation {
+        self.lock().funding.split(bytes).unwrap()
+    }
+
+    /// Take `heights` for one owner and publish their estimates, without a writer.
+    /// The owner's session is the lowest height, so separate ranges get separate owners.
+    pub(in crate::zakura::block_sync) fn publish_fixture(
+        &self,
+        heights: std::ops::RangeInclusive<u32>,
+    ) -> BodyWorkOwner {
+        let (low, high) = (*heights.start(), *heights.end());
+        let mut inner = self.lock();
+        let items = inner.state.take_budgeted(
+            block::Height(low),
+            block::Height(high),
+            usize::MAX,
+            u64::MAX,
+            (u64::from(low), NonZeroU64::MIN),
+        );
+        assert_eq!(
+            items.len(),
+            heights.count(),
+            "the fixture's heights are pending and contiguous"
+        );
+        let bytes = inner
+            .state
+            .publish_claim(&items)
+            .expect("the fixture just took these items");
+        let mut funding = self
+            .budget
+            .charge_owned(bytes)
+            .expect("fixture charges fit the open budget counter");
+        inner
+            .funding
+            .merge(&mut funding)
+            .expect("fixture charges fit the queue pool");
+        items[0].1.owner.expect("a request take binds an owner")
+    }
+
+    /// End `owner`'s reservation at receipt and release its funding. Returns the
+    /// released bytes, or `None` when `owner` holds no reservation on `height`.
+    pub(in crate::zakura::block_sync) fn receive_fixture(
+        &self,
+        owner: BodyWorkOwner,
+        height: block::Height,
+    ) -> Option<u64> {
+        self.begin_receipt_for_owner(owner, height)
+            .expect("fixture funding matches the queue")
+            .map(|ended| ended.funding.bytes())
+    }
+
+    /// Every queued item with its owner and byte quantities, read from the queue
+    /// maps rather than from the maintained tallies.
+    pub(in crate::zakura::block_sync) fn ownership_snapshot(
+        &self,
+    ) -> Vec<super::super::WorkItemOwnership> {
+        self.lock().state.ownership()
+    }
+}
+
+/// Exercise destructor unwinding in a child so a regression cannot abort the test runner.
+#[test]
+fn poisoned_queue_owner_unwind_does_not_abort() {
+    const CHILD: &str = "ZAKURA_POISONED_QUEUE_OWNER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = format!(
+            "{}::poisoned_queue_owner_unwind_does_not_abort",
+            module_path!().strip_prefix("zakura_network::").unwrap()
+        );
+        for phase in ["taken", "admitted", "queued", "started"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, phase)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "owner {phase} aborted or failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        return;
+    }
+
+    fn unwind_owner<T>(owner: T, work: &WorkQueue) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owner = owner;
+            let _inner = work.lock();
+            panic!("interrupt a queue transition while retaining its request owner");
+        }));
+        assert!(result.is_err());
+    }
+
+    let phase = std::env::var(CHILD).unwrap();
+    let mut f = Fixture::new();
+    let unrelated = f.budget.reserve_owned(17).unwrap();
+    let original = f.take(1).publish(|_| {}).unwrap();
+    assert!(original.try_start());
+    original.written();
+    let receipt = f
+        .work
+        .begin_receipt_for_owner(original.owner(), block::Height(1))
+        .unwrap()
+        .unwrap();
+    f.reset();
+    drop(original);
+    assert_eq!(f.budget.reserved(), 117, "retained receipt survives reset");
+    f.refill();
+    let taken = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(2).unwrap(),
+    );
+    if phase == "taken" {
+        unwind_owner(taken, &f.work);
+    } else {
+        let admitted = taken.admit(block::Height(0), f.cancel.clone()).unwrap();
+        assert_eq!(f.budget.reserved(), 317);
+        if phase == "admitted" {
+            unwind_owner(admitted, &f.work);
+        } else {
+            let request = admitted.publish(|_| {}).unwrap();
+            if phase == "started" {
+                assert!(request.try_start());
+            }
+            unwind_owner(request, &f.work);
+        }
+    }
+    assert!(
+        f.work.inner.is_poisoned(),
+        "the interrupted lock remains poisoned"
+    );
+    assert!(
+        f.budget.is_closed(),
+        "poison must close admission during owner cleanup"
+    );
+    assert_eq!(f.budget.available(), 0);
+    assert_eq!(
+        f.budget.reserved(),
+        117,
+        "cleanup preserves unrelated and old receipt funding"
+    );
+    assert_eq!(f.work.reserved_bytes(), 0);
+    assert!(f.work.lock().request_writes.is_empty());
+    let replacement = f.work.take_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        200,
+        7,
+        NonZeroU64::new(3).unwrap(),
+    );
+    assert!(matches!(
+        replacement.admit(block::Height(0), CancellationToken::new()),
+        Err(AdmitRefusal::AccountingClosed)
+    ));
+    f.reset();
+    assert!(
+        !f.work.audit_funding(),
+        "reset never reopens a poisoned generation"
+    );
+    assert_eq!(f.budget.reserved(), 117);
+    drop(receipt);
+    assert_eq!(f.budget.reserved(), 17);
+    drop(unrelated);
+    assert_eq!(f.budget.reserved(), 0);
 }

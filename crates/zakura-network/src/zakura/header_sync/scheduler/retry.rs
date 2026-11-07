@@ -95,7 +95,7 @@ pub struct BodyRetryEpisode {
 
 impl BodyRetryEpisode {
     /// Start a fresh episode using an injected authoritative clock.
-    pub fn new<C: Clock>(
+    pub fn new<C: Clock + ?Sized>(
         branch: BranchId,
         generation: HeaderGeneration,
         header: Frontier,
@@ -158,7 +158,7 @@ impl BodyRetryEpisode {
     }
 
     /// Start a new episode after an explicit operator retry command.
-    pub fn restart<C: Clock>(&mut self, clock: &C) {
+    pub fn restart<C: Clock + ?Sized>(&mut self, clock: &C) {
         *self = Self::new(
             self.branch,
             self.generation,
@@ -169,7 +169,7 @@ impl BodyRetryEpisode {
     }
 
     /// Record one failed supplier attempt and return its bounded scheduling consequence.
-    pub fn record_failure<C: Clock, J: RetryJitter>(
+    pub fn record_failure<C: Clock + ?Sized, J: RetryJitter>(
         &mut self,
         supplier: SourceId,
         clock: &C,

@@ -15,10 +15,13 @@ mod verdict;
 use serde::{Deserialize, Serialize};
 
 pub use assume::{Assume, AssumeRecord, Assumptions};
-pub use cx::{CheckCtx, HasView};
+pub use cx::{Capture, CheckCtx, EndViolation, HasView};
 pub use id::{BadId, PropertyId};
-pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Tee};
-pub use verdict::{Inconclusive, LivenessBound, Obligation, ObligationKey, Subject, Verdict};
+pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};
+pub use verdict::{
+    Cardinality, FactAnswer, FactDischarge, Inconclusive, LivenessBound, Obligation, ObligationKey,
+    Subject, Verdict,
+};
 
 use crate::ObservationLog;
 
@@ -41,8 +44,26 @@ pub struct Property<S: HasView> {
     /// Checks a committed regression's trigger history: the identities and
     /// order of the steps the bug needs. `None` for a property with no
     /// committed regression.
-    pub witness: Option<fn(&ObservationLog) -> bool>,
+    pub witness: Option<TriggerHistory<S>>,
 }
+
+/// A committed regression's trigger history check, over what the run left.
+pub enum TriggerHistory<S: HasView> {
+    /// Reads the observation log.
+    Log(fn(&ObservationLog) -> bool),
+    /// Reads the harness's view at the run's end and the log, for a trigger
+    /// made of view-side facts.
+    View(fn(&S::View, &ObservationLog) -> bool),
+}
+
+impl<S: HasView> Clone for TriggerHistory<S> {
+    /// Copies the function.
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: HasView> Copy for TriggerHistory<S> {}
 
 /// What kind of claim a property makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,8 +100,10 @@ pub enum Unit {
 }
 
 /// An observation source a check reads (properties.md, Tiers). A harness
-/// names the sources it observes, and a property that needs one it lacks is
-/// `NotApplicable`.
+/// names the sources it observes and the ones its tier excludes, as
+/// [`Sources`]. A property that needs an excluded source is `NotApplicable`,
+/// and its report names the exclusion. One that needs a source the harness
+/// neither observes nor excludes fails the run as a harness failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Source {

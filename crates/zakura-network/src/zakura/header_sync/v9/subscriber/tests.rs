@@ -12,19 +12,66 @@ use super::*;
 use crate::zakura::{
     framed_channel,
     header_sync::{
-        config::REGTEST_HEADER_BYTES,
+        config::{COMMON_HEADER_BYTES, REGTEST_HEADER_BYTES},
         v9::{
-            entry_bytes,
+            entry_bytes, largest_page, message_type,
+            publisher::is_legal,
+            smallest_page,
             test_support::{record, HeaderTree, OUTCOME_CODES},
-            Message, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
+            CommonMessage, Message, Operation, RegtestMessage, HEADERS_RESPONSE_FIXED_BYTES,
         },
         wire::HeaderEntry,
     },
     regulation::{PrecheckSlot, Publications},
     wire_codec::{decode_frame, encode_frame},
-    CloseCause, Frame, FrameRejection,
+    CloseCause, Credit, Frame, FrameRejection, MessageRole,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::zakura::{
+    header_sync::observe::{CreditKind, HeaderSyncObserver, ReactorEvent},
+    ZakuraPeerId,
+};
+
+impl Admitted {
+    /// `page` as admitted, for a reactor test that seeds work without a
+    /// session subscriber. Production admits pages only through
+    /// [`Subscriber::receive_page`].
+    pub(crate) fn seeded(page: &Headers) -> Self {
+        let count = u32::try_from(page.entries.len()).expect("a page fits u32");
+        let last = page.entries.last().expect("a page has a header");
+        Self {
+            id: page.subscription_id,
+            parent: Frontier::new(page.common_ancestor_height, page.common_ancestor_hash),
+            cursor: Cursor {
+                height: block::Height(page.common_ancestor_height.0 + count),
+                hash: last.header.hash(),
+                headers: u64::from(count),
+                bytes: 0,
+            },
+            reaches_target: page.reaches_initial_target,
+            after_close: false,
+            frame: None,
+            seal: Seal,
+        }
+    }
+}
+
+impl Ended {
+    /// Subscription `id` as ended by `outcome` with no pages, for a reactor
+    /// test that seeds work without a session subscriber. Production ends
+    /// subscriptions only through [`Subscriber::receive_outcome`].
+    pub(crate) fn seeded(id: u64, outcome: HeadersOutcomeCode, accepted: Cursor) -> Self {
+        Self {
+            id,
+            outcome,
+            pages: 0,
+            reached: false,
+            accepted,
+            seal: Seal,
+        }
+    }
+}
 
 /// Regtest header bytes, so pages stay small.
 const HB: usize = REGTEST_HEADER_BYTES;
@@ -440,6 +487,57 @@ fn the_frame_header_check_runs_before_decode() {
     assert_eq!(reader.check(frame.message_type, len), Ok(()));
 }
 
+/// `header-sync/credit-fits-window`, checked at the transport reader: with the
+/// largest credit and validation paused, the reader queues Mainnet pages until
+/// they spend the whole window, then refuses the next page. The queued bytes
+/// fit the header sync receive share beside its `Status` and update terms.
+///
+/// The simulator witness also needs the per-connection receive window, which
+/// the node composition wires later.
+#[test]
+fn the_largest_credit_fits_the_receive_budget() {
+    const MAINNET: usize = COMMON_HEADER_BYTES;
+    let slot = PrecheckSlot::default();
+    let (_, recv) = framed_channel(1);
+    let recv = recv.with_precheck(slot.clone());
+    let fence = WriterFence::new(CancellationToken::new(), CloseCause::default());
+    let mut sub = Sub::new(MAINNET, fence, &recv);
+    let reader = slot.get().expect("the subscriber attaches its check");
+    let tip = Frontier::new(block::Height(1_000_000), block::Hash([1; 32]));
+    let start = Frontier::new(block::Height(0), block::Hash([2; 32]));
+    let status = super::super::test_support::status::<MAINNET>(tip);
+    let (open, _) = sub
+        .open(&status, &[start], AuxSchema::V1, u32::MAX)
+        .expect("the first Open is recorded");
+    // Widening u32 to u64 is lossless.
+    let window = u64::from(open.added_credit.bytes);
+    assert_eq!(window, 4_000 * smallest_page(MAINNET, AuxSchema::V1) as u64);
+
+    // Largest pages first, then smaller ones, until one-byte pages spend the
+    // last bytes. No page is admitted, so every charge stays queued.
+    let mut queued = 0;
+    for len in [
+        largest_page(MAINNET),
+        smallest_page(MAINNET, AuxSchema::V1),
+        1,
+    ] {
+        while reader.check(message_type::HEADERS, len).is_ok() {
+            // Widening usize to u64 is lossless on supported targets.
+            queued += len as u64;
+        }
+    }
+    assert_eq!(queued, window, "the reader queues exactly the window");
+    assert!(reader.check(message_type::HEADERS, 1).is_err());
+
+    let MessageRole::Subscription { credit, .. } = SUBSCRIBE_HEADERS.role else {
+        panic!("SUBSCRIBE_HEADERS is a subscription row");
+    };
+    // Widening u32 and usize to u64 is lossless on supported targets.
+    let subscription = u64::from(credit.bytes) + largest_page(MAINNET) as u64;
+    assert!(queued <= subscription);
+    assert!(queued + 602 * 122 + 999_154 <= CommonMessage::BUDGET.receive);
+}
+
 /// Path pages start at the highest sent locator on the target's chain, carry
 /// the marker on exactly the page that ends at the target, and pushes extend
 /// the receive cursor.
@@ -772,7 +870,7 @@ fn outcomes_fault_outside_their_window() {
                     .expect("the target page");
             }
             assert_eq!(
-                fixture.sub.live.as_ref().map(|live| live.reached),
+                fixture.sub.state.live.as_ref().map(|live| live.reached),
                 Some(reached)
             );
             if close {
@@ -963,8 +1061,8 @@ fn an_outcome_racing_validation_reports_only_accepted_pages() {
 fn grants_refill_half_window_prefixes() {
     let (tree, chain) = chain(20);
     let mut fixture = Fixture::open(tree, chain[20], &[chain[0]], 8);
-    assert_eq!(Sub::prefix(8), 4);
-    assert_eq!(Sub::prefix(2), 1);
+    assert_eq!(state::SubscriberState::prefix(8), 4);
+    assert_eq!(state::SubscriberState::prefix(2), 1);
     let id = fixture.id;
     // One-header pages, and each page's cursor, by height.
     let receive = |fixture: &mut Fixture, heights: std::ops::RangeInclusive<usize>| {
@@ -1031,6 +1129,77 @@ fn grants_refill_half_window_prefixes() {
     assert_eq!(grant.update_sequence, 3);
     assert_eq!(grant.acknowledged, cursors[11]);
     assert_eq!(grant.added_credit.objects, 6);
+}
+
+/// Records each event it's handed.
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Recorded {
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .push(event);
+    }
+}
+
+/// An observed subscriber reports each credit it gives as it records it,
+/// with its peer, session and subscription: the `Open`'s whole window, a
+/// grant through acceptance, and a grant through `grant_due`.
+#[test]
+fn observed_credit_reports_each_open_and_grant() {
+    let (tree, chain) = chain(20);
+    let recorded = Arc::new(Recorded::default());
+    let peer = ZakuraPeerId::new(vec![9; 32]).expect("32 bytes is a valid peer ID");
+    let mut sub = subscriber().observed_by(Some(CreditTap {
+        observer: recorded.clone(),
+        peer: peer.clone(),
+        session_id: 7,
+    }));
+    let (open, _) = sub
+        .open(&status(chain[20]), &[chain[0]], AuxSchema::None, 8)
+        .expect("the first Open is recorded");
+    let id = open.subscription_id;
+    let mut fixture = Fixture {
+        tree,
+        sub,
+        id,
+        target: chain[20],
+        schema: AuxSchema::None,
+    };
+    let mut grants = vec![(CreditKind::Open, open.added_credit)];
+    let cursors: Vec<_> = (1..=8)
+        .map(|height| {
+            fixture
+                .page(chain[height - 1], &chain[height..=height], false)
+                .expect("a one-header page")
+                .cursor
+        })
+        .collect();
+    let grant = fixture
+        .sub
+        .accept_through(id, &cursors[3], 8)
+        .expect("a received cursor")
+        .expect("four headers reach the prefix");
+    grants.push((CreditKind::Grant, grant.added_credit));
+    assert_eq!(fixture.sub.accept_through(id, &cursors[7], 2), Ok(None));
+    let grant = fixture.sub.grant_due(8).expect("a larger budget refills");
+    grants.push((CreditKind::Grant, grant.added_credit));
+
+    let reported: Vec<_> = std::mem::take(&mut *recorded.0.lock().expect("unpoisoned"));
+    let expected: Vec<_> = grants
+        .into_iter()
+        .map(|(kind, credit)| ReactorEvent::CreditIssued {
+            kind,
+            peer: peer.clone(),
+            session_id: 7,
+            subscription: id,
+            objects: credit.objects,
+            bytes: credit.bytes,
+        })
+        .collect();
+    assert_eq!(reported, expected);
 }
 
 /// Updates acknowledge only cursors the reactor accepted: a cursor with a
@@ -1460,12 +1629,12 @@ impl Session {
         if update.operation == Operation::Grant {
             let tools = self.sub.tools.lock();
             let credit = tools.credit(&update.subscription_id).expect("live");
-            let window = self.sub.window(self.staging, update.tree_aux_schema);
+            let window = self.sub.state.window(self.staging, update.tree_aux_schema);
             assert!(
                 credit.granted().objects - update.acknowledged.headers <= u64::from(window.objects),
                 "a Grant keeps the window within the staging budget"
             );
-            let live = self.sub.live.as_ref().expect("live");
+            let live = self.sub.state.live.as_ref().expect("live");
             if !live.reached {
                 let unspent = credit.unspent();
                 let page = u64::try_from(smallest_page(HB, live.schema)).expect("fits");
@@ -1686,4 +1855,72 @@ proptest! {
     fn conformant_sessions_never_fault(ops in prop::collection::vec(op(), 1..60)) {
         run(ops);
     }
+}
+
+/// [`SubscriberState`] runs on plain subscription tools, with no lock and no
+/// fence. Recording an `Open`, its send rejection, page receipt, and outcome
+/// receipt are separate transitions, and a page for a replaced subscription
+/// is unsolicited.
+#[test]
+fn subscriber_state_runs_on_plain_tools() {
+    let mut tree = HeaderTree::new();
+    let genesis = tree.genesis;
+    let chain = tree.extend(genesis, 4);
+    let status = status(chain[3]);
+    let limits = SubscriptionLimits::from_rule(&SUBSCRIBE_HEADERS)
+        .expect("SUBSCRIBE_HEADERS is a subscription row");
+    let mut tools = Subscriptions::new(limits, &RegtestMessage::ROWS);
+    let mut state = state::SubscriberState::new(HB);
+
+    // A rejected send retracts the `Open` from both owners.
+    let plan = state
+        .plan_open(&status, &[genesis], AuxSchema::None, 8)
+        .expect("the Open is conformant");
+    let update = tools
+        .open(plan.id, plan.window, plan.start)
+        .expect("the tools record the Open");
+    let first = state.opened(plan, update).subscription_id;
+    assert!(state.retract(&mut tools, first));
+    assert_eq!((state.live(), tools.len()), (None, 0));
+
+    // A replacement receives its page and its outcome.
+    let plan = state
+        .plan_open(&status, &[genesis], AuxSchema::None, 8)
+        .expect("the Open is conformant");
+    let update = tools
+        .open(plan.id, plan.window, plan.start)
+        .expect("the tools record the Open");
+    let second = state.opened(plan, update).subscription_id;
+    assert_ne!(first, second);
+    let frame = page_frame(
+        &tree,
+        second,
+        chain[3].hash,
+        genesis,
+        &chain[..2],
+        false,
+        AuxSchema::None,
+    );
+    let (page, len) = decode_page(&frame);
+    let admitted = state
+        .receive_page(&mut tools, false, &page, len)
+        .expect("the page is conformant");
+    assert_eq!((admitted.id, admitted.cursor.hash), (second, chain[1].hash));
+    let ended = state
+        .receive_outcome(
+            &mut tools,
+            &HeadersOutcome {
+                subscription_id: second,
+                initial_target_tip_hash: chain[3].hash,
+                outcome: HeadersOutcomeCode::SubscriptionSuperseded,
+            },
+        )
+        .expect("the outcome is in its window");
+    assert_eq!((ended.id, ended.pages), (second, 1));
+
+    // A late page of the ended subscription is unsolicited.
+    assert_eq!(
+        state.receive_page(&mut tools, false, &page, len),
+        Err(SubscriberFault::Subscription(SubscriptionFault::Unknown))
+    );
 }

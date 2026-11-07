@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/block_sync/admission.rs b/crates/zakura-network/src/zakura/block_sync/admission.rs
+index f04f77e0c..3347fc8bd 100644
+--- a/crates/zakura-network/src/zakura/block_sync/admission.rs
++++ b/crates/zakura-network/src/zakura/block_sync/admission.rs
+@@ -155,7 +155,7 @@ pub(super) fn request_deadline(
+ /// This is a fixed consensus-derived bound, not `config.submitted_apply_limit()`,
+ /// because the configured submit window can be much larger and would weaken the
+ /// memory gate.
+-const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
++const COMMIT_WINDOW_EXEMPT_SPAN_BLOCKS: u32 = 4 * MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u32;
+ 
+ /// Hard block-count cap on speculative look-ahead bookkeeping.
+ ///

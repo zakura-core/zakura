@@ -59,6 +59,9 @@ pub struct HeaderSyncStartup {
     pub shutdown: CancellationToken,
     /// Private fatal notifications consumed by the node root.
     pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
+    /// Receives the reactor's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::observe::ObserverSlot,
 }
 
 impl HeaderSyncStartup {
@@ -94,6 +97,8 @@ impl HeaderSyncStartup {
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
             fatal_events: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: super::observe::ObserverSlot::default(),
         }
     }
 
@@ -230,9 +235,30 @@ pub struct HeaderSyncHandle {
     pub(super) serving: ServeCapacity,
     /// The serving limits this node advertises in its `Status`.
     pub(super) page_limits: PageLimits,
+    /// The reactor observer's capacity handle, which each session's
+    /// subscriber reports its credit to. Never the observer itself, since
+    /// the service keeps this handle past the reactor and the observer
+    /// marks the reactor's lifetime.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) credit_observer: Option<Arc<dyn super::observe::HeaderSyncObserver>>,
 }
 
 impl HeaderSyncHandle {
+    /// Where `peer`'s session `session_id` reports the credit its
+    /// subscriber gives, if the reactor's observer named a capacity handle.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn credit_tap(
+        &self,
+        peer: &ZakuraPeerId,
+        session_id: u64,
+    ) -> Option<super::v9::CreditTap> {
+        Some(super::v9::CreditTap {
+            observer: self.credit_observer.clone()?,
+            peer: peer.clone(),
+            session_id,
+        })
+    }
+
     /// Send an event to the reactor.
     pub async fn send(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
         self.events.send(event).await

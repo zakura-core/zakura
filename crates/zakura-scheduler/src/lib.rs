@@ -242,13 +242,17 @@ impl Point {
 /// Where a ready task will resume: its `n`-th point of kind `op`.
 ///
 /// A task at the top of its coroutine is at `poll#n`, where `n` counts its
-/// polls. Displayed as `kind#n`, the form traces use.
+/// polls. Displayed as `kind#n`, the form traces use. The display leaves
+/// out `object` and `site`, so they never change a pick's identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct At {
     /// The operation the task stopped before.
     pub op: Op,
     /// How many points of this kind the task has reached, this one included.
     pub n: u32,
+    /// The object the operation touches, if the primitive reports one.
+    /// `None` at the top of the coroutine.
+    pub object: Option<ObjectId>,
     /// The point's source location. `None` at the top of the coroutine.
     pub site: Option<&'static Location<'static>>,
 }
@@ -266,7 +270,8 @@ pub struct ReadyTask {
     pub task: TaskId,
     /// Where it will resume.
     pub at: At,
-    /// True if it stopped mid-poll, so it already holds a worker.
+    /// True if it stopped mid-poll, so it already holds a worker, unless
+    /// it's a blocking job, which never holds one.
     pub mid_poll: bool,
 }
 
@@ -278,7 +283,7 @@ pub enum RunOutcome {
     /// The task's future returned `Pending`. It waits for its `Waker` and
     /// released its worker.
     Waiting,
-    /// The task parked on a sync wait and keeps its worker.
+    /// The task parked on a sync wait and keeps its worker, if it holds one.
     Parked(ObjectId),
     /// The task finished.
     Completed,
@@ -323,8 +328,10 @@ pub enum Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedulerConfig {
     /// Simulated runtime workers. A task holds one from the start of a poll
-    /// until the poll returns. At least 1. One worker hides every race inside
-    /// a single poll, so scenarios should use 2 or more.
+    /// until the poll returns. A blocking job, from
+    /// `zakura_rt::task::spawn_blocking`, holds none, as on tokio's blocking
+    /// pool. At least 1. One worker hides every race inside a single poll,
+    /// so scenarios should use 2 or more.
     pub workers: u16,
     /// The most tasks one run may spawn. A spawn past it panics in the
     /// spawning task.

@@ -64,6 +64,18 @@ pub enum AwaitBlockInfoError {
     },
 }
 
+/// The block that a block header read identifies is not in the best chain.
+///
+/// The read handler returns this error when the hash or the height does not identify a block in
+/// the best chain. RPC methods use this type to tell a missing block from a failure of the state
+/// service.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("block hash or height not found")]
+pub struct BlockHeaderNotFound {
+    /// The block that the request identifies.
+    pub hash_or_height: HashOrHeight,
+}
+
 /// The finalized database has blocks but no persisted Sprout tip frontier.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("missing Sprout note commitment tree at finalized tip {tip:?}")]
@@ -152,6 +164,14 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
+    /// The configured read limits cannot fund their workers and one legal result.
+    #[error("invalid read capacity configuration: {0}")]
+    ReadCapacity(#[from] crate::config::ReadCapacityError),
+
     /// The configured historical frontier artifact could not be read or decoded.
     ///
     /// Only nodes that derive historical trees reach this. A node that does not derive ignores an
@@ -546,6 +566,10 @@ impl From<ValidateContextError> for CommitCheckpointVerifiedError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum InvalidateError {
+    /// The fallback finalized tip could not acquire disk-result capacity.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The state is currently checkpointing blocks and cannot accept invalidation requests.
     #[error("cannot invalidate blocks while still committing checkpointed blocks")]
     ProcessingCheckpointedBlocks,
@@ -579,6 +603,10 @@ pub enum InvalidateError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ReconsiderError {
+    /// The fallback finalized tip could not acquire disk-result capacity.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The block is not found in the list of invalidated blocks.
     #[error("Block with hash {0} was not previously invalidated")]
     MissingInvalidatedBlock(block::Hash),
@@ -971,6 +999,14 @@ pub enum ValidateContextError {
 }
 
 impl ValidateContextError {
+    /// Reports an output spent by multiple transactions in the same block.
+    pub fn duplicate_transparent_spend_in_block(outpoint: transparent::OutPoint) -> Self {
+        Self::DuplicateTransparentSpend {
+            outpoint,
+            location: "the same block",
+        }
+    }
+
     /// Classify contextual validation without conflating peer data and local availability.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         use zakura_chain::block::CommitmentError;
@@ -1348,13 +1384,10 @@ mod tests {
             BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
         );
         assert_eq!(
-            ValidateContextError::DuplicateTransparentSpend {
-                outpoint: transparent::OutPoint {
-                    hash: [3; 32].into(),
-                    index: 0,
-                },
-                location: "test chain",
-            }
+            ValidateContextError::duplicate_transparent_spend_in_block(transparent::OutPoint {
+                hash: [3; 32].into(),
+                index: 0,
+            })
             .body_verification_class(),
             BodyVerificationClass::ConsensusInvalid(zakura_header_chain::BodyRuleId::new(
                 "context.duplicate_transparent_spend"

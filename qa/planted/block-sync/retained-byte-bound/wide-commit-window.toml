@@ -1,0 +1,10 @@
+# Widens the commit window that skips the look-ahead gates from one
+# checkpoint range to four, as a window sized from a large configured submit
+# window would. The input's only mirror withholds height 3, so nothing
+# commits, and the node keeps more bodies than `L + 401·b + Q·b` allows.
+input = "crates/zakura-sim/tests/fixtures/block-sync-stuck-floor.bin"
+# Besides admission.rs, which the patch changes, the rest of block sync
+# decides how fast the window fills. A change there can slow the sync past
+# the input's step budget. The case takes minutes, so changes elsewhere,
+# such as to the transport, don't rerun it.
+checks = ["crates/zakura-network/src/zakura/block_sync"]

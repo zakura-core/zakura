@@ -20,12 +20,17 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
+    /// Wake consumers whenever the synchronizer's distance estimate changes.
+    pub(super) async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.latest_sync_length.changed().await
+    }
+
     /// The threshold that determines if the synchronization is at the chain
     /// tip.
     ///
-    /// This uses a strict less-than check, so 101 means Zebra is close to the
-    /// tip when the average recent sync length is at most 100 blocks.
-    const MIN_DIST_FROM_TIP: usize = 101;
+    /// This uses a strict less-than check, so 301 means Zebra is close to the
+    /// tip when the average recent sync length is at most 300 blocks.
+    const MIN_DIST_FROM_TIP: usize = 301;
 
     /// Create an instance of [`SyncStatus`] for a specific network.
     ///

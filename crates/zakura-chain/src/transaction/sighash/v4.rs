@@ -179,11 +179,13 @@ impl V4Sighash {
                 ..
             } => {
                 let value_balance = sapling_shielded_data
-                    .as_ref()
+                    .as_deref()
                     .map_or(0, |data| data.value_balance.zatoshis());
-                let sapling_spends = sapling_shielded_data.as_ref().and_then(sapling_spends_hash);
+                let sapling_spends = sapling_shielded_data
+                    .as_deref()
+                    .and_then(sapling_spends_hash);
                 let sapling_outputs = sapling_shielded_data
-                    .as_ref()
+                    .as_deref()
                     .and_then(sapling_outputs_hash);
 
                 Some(Self {
@@ -205,7 +207,7 @@ impl V4Sighash {
                     sequence: sequence_hash(inputs),
                     outputs: outputs_hash(outputs),
                     single_outputs: outputs.iter().take(inputs.len()).map(output_hash).collect(),
-                    joinsplits: joinsplits_hash(joinsplit_data.as_ref()),
+                    joinsplits: joinsplits_hash(joinsplit_data.as_deref()),
                     value_balance,
                     sapling_spends,
                     sapling_outputs,

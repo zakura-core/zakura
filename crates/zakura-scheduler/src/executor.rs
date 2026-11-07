@@ -51,6 +51,11 @@ impl rt::Executor for SchedulerExecutor {
         hooks::try_spawn_boxed(label, task).map(task_to_rt)
     }
 
+    /// Spawns `task` as a blocking job, which holds no simulated worker.
+    fn spawn_blocking(&self, label: &'static str, task: rt::BoxTask) -> rt::TaskId {
+        task_to_rt(hooks::spawn_blocking_boxed(label, task))
+    }
+
     fn abort(&self, task: rt::TaskId) {
         hooks::request_abort(task_from_rt(task));
     }
@@ -185,6 +190,13 @@ fn task_to_rt(task: TaskId) -> rt::TaskId {
 /// The scheduler task id behind a `zakura-rt` one.
 fn task_from_rt(task: rt::TaskId) -> TaskId {
     TaskId(u32::try_from(task.get()).expect("zakura-rt only holds ids this scheduler handed out"))
+}
+
+impl From<rt::TaskId> for TaskId {
+    /// The scheduler task behind `task`, an id this scheduler handed out.
+    fn from(task: rt::TaskId) -> Self {
+        task_from_rt(task)
+    }
 }
 
 /// A scheduler object id as `zakura-rt` sees it.

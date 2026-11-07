@@ -14,19 +14,20 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, BlockHandle};
 
 use futures::{
     future::{FutureExt, TryFutureExt},
     Stream,
 };
 use tokio::sync::oneshot::{self, error::TryRecvError};
-use tower::{buffer::Buffer, timeout::Timeout, Service, ServiceExt};
+use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneSyncService, Service, ServiceExt};
 
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state::{self as zs};
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     parameters::Network,
     serialization::ZcashSerialize,
     transaction::UnminedTxId,
@@ -100,8 +101,7 @@ pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
      requiring this block cannot continue syncing. Restore zcashd from a newer snapshot, or use \
      archive storage on Zakura side https://zakura.com/snapshots/ .";
 
-type BlockDownloadPeerSet =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type BlockDownloadPeerSet = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type Mempool = Buffer<
@@ -227,9 +227,9 @@ async fn block_by_hash_or_pending(
     mut state: State,
     pending_blocks: PendingBlockRegistry,
     hash: block::Hash,
-) -> Result<Option<Arc<Block>>, zn::BoxError> {
+) -> Result<Option<BlockHandle>, zn::BoxError> {
     if let Some(block) = pending_blocks.get(hash) {
-        return Ok(Some(block));
+        return Ok(Some(block.into()));
     }
 
     let response = state
@@ -562,9 +562,13 @@ impl Service<zn::Request> for Inbound {
                             ));
                         }
 
-                        // The outcome, including a replacement refused by the queue bounds, is
-                        // logged by `retry_poisoned` itself.
-                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        // A failed parent recovery is left to the syncer. A re-request would
+                        // leave the recovery bounds, because it is an ordinary download.
+                        if !mismatch.parent_recovery {
+                            // The outcome, including a replacement refused by the queue bounds,
+                            // is logged by `retry_poisoned` itself.
+                            let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        }
                         continue;
                     }
 
@@ -670,7 +674,7 @@ impl Service<zn::Request> for Inbound {
                 let state = state.clone();
 
                 async move {
-                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut blocks: Vec<InventoryResponse<(BlockHandle, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
                     let mut total_size = 0;
                     let mut state_lookup_bytes = 0;
                     let mut lookup_results = Vec::new();
@@ -680,13 +684,18 @@ impl Service<zn::Request> for Inbound {
                             break;
                         }
 
-                        let block = block_by_hash_or_pending(
+                        let block = match block_by_hash_or_pending(
                             state.clone(),
                             pending_blocks.clone(),
                             hash,
                         )
-                        .await?;
-                        if let Some(block) = &block {
+                        .await
+                        {
+                            Ok(block) => Some(block),
+                            Err(error) if is_read_capacity_refusal(&*error) => None,
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(Some(block)) = &block {
                             state_lookup_bytes = state_lookup_bytes
                                 .saturating_add(block.zcash_serialized_size());
                         }
@@ -702,6 +711,12 @@ impl Service<zn::Request> for Inbound {
                         //
                         // If there was a database error, return the error,
                         // and stop processing further chunks.
+                        let Some(block) = block else {
+                            // The state refused the read for lack of capacity. Peers cannot
+                            // rely on `notfound`, but it lets them retry elsewhere sooner.
+                            blocks.push(Missing(hash));
+                            continue;
+                        };
                         match block {
                             Some(block) => {
                                 // If checking the serialized size of the block performs badly,
@@ -845,7 +860,7 @@ impl Service<zn::Request> for Inbound {
                     .map_ok(|_resp| zn::Response::Nil)
                     .boxed()
             }
-            zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+            zn::Request::AdvertiseBlock(zn::AdvertisedBlock { hash, .. }, Some(zn::PeerSource::Zakura(peer_id))) => {
                 debug!(
                     ?hash,
                     ?peer_id,
@@ -854,14 +869,13 @@ impl Service<zn::Request> for Inbound {
                 metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
-            zn::Request::AdvertiseBlock(hash, advertiser) => {
-                block_downloads.download_and_verify(hash, advertiser);
+            zn::Request::AdvertiseBlock(block, advertiser) => {
+                block_downloads.download_and_verify(block.hash, advertiser);
                 async { Ok(zn::Response::Nil) }.boxed()
             }
             // The size of this response is limited by the `Connection` state machine in the network layer
             zn::Request::MempoolTransactionIds => {
                 mempool.clone().oneshot(mempool::Request::TransactionIds).map_ok(|resp| match resp {
-                    mempool::Response::TransactionIds(transaction_ids) if transaction_ids.is_empty() => zn::Response::Nil,
                     mempool::Response::TransactionIds(transaction_ids) => zn::Response::TransactionIds(transaction_ids.into_iter().collect()),
                     _ => unreachable!("Mempool component should always respond to a `TransactionIds` request with a `TransactionIds` response"),
                 })

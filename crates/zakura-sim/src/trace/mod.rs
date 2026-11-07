@@ -3,7 +3,9 @@
 //! A trace directory holds `trace.jsonl`, whose line 1 is `meta`, line 2 is
 //! `init`, then one line per step and `end` last. Beside it, `input.bin`
 //! holds the fuzz input that produced the run, if bytes did, and `blobs/`
-//! holds fixtures by SHA-256.
+//! holds fixtures by SHA-256. [`replay`] reruns a trace Exact on an
+//! equivalent build, and [`shrink`] reduces a failing trace to fewer
+//! non-default picks.
 //!
 //! A trace directory isn't a security boundary. The reader bounds what it
 //! allocates (see [`MAX_TRACE_BYTES`] and the limits beside it), and refuses
@@ -14,12 +16,29 @@
 //! own ancestors are followed, and on Windows a path can change between the
 //! check and the open.
 
+pub mod confirm;
+pub mod explain;
+pub mod failure;
 pub mod meta;
 pub mod read;
+pub mod replay;
+pub mod shrink;
+mod verify;
 pub mod write;
 
+pub use confirm::{confirm, ConfirmStatus, Confirmation, CONFIRMATION_FILE};
+pub use failure::{
+    artifacts_root, record_failure, ARTIFACTS_VAR, DIVERGENCE_FILE, FIRST_END_FILE,
+    NONDETERMINISTIC_DIR, PROPERTIES_FILE, RECORDING_DIR, REPLAY_DIR, TRACES_DIR,
+};
 pub use meta::{BuildInfo, MetaRecord};
 pub use read::{Invalid, Missing, ReadError, Refusal, Trace, TraceReader};
+pub use replay::{
+    replay, replay_explained, replay_explained_with, replay_with, ReplayError, ReplayOptions,
+    ReplayReport, OBSERVATIONS_FILE,
+};
+pub use shrink::{shrink, shrink_with, Candidate, ShrinkBudget, ShrinkError, ShrinkReport};
+pub(crate) use verify::trace_difference;
 pub use write::{BlobStore, FileSink};
 
 /// The records, one JSON object per line.

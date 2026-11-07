@@ -104,6 +104,9 @@ pub(crate) async fn run_scenario(
         },
         (initial_header, initial_header_hash),
         committed_views,
+        (scenario.config.clone())
+            .decoded_block_pool(10_000)
+            .expect("fixture decoded allowance fits"),
         scenario.config.clone(),
     );
     startup.trace = trace.clone();
@@ -302,7 +305,7 @@ fn spawn_action_driver(
                     let height = block
                         .coinbase_height()
                         .expect("synthetic submitted block has height");
-                    let outcome = apply.apply(block.as_ref());
+                    let outcome = apply.apply(block.view());
                     if outcome.result == BlockApplyResult::Committed {
                         let _ = committed_tx.send(outcome.frontiers.verified_block_tip);
                     }

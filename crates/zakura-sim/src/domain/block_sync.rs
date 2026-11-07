@@ -1099,8 +1099,9 @@ where
     const NEEDS: &'static [Source] = &[Source::View];
     const WITNESS: fn(&ObservationLog) -> bool = commit_window_filled;
     type Terms = ();
+    type Peaks = [(&'static str, u64); 2];
 
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<()> {
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<(), Self::Peaks> {
         let (retained, limit, peaks, gap) = cx.view().read_owners(|owners| {
             (
                 owners.retained(),
@@ -1115,7 +1116,7 @@ where
         Reading::Measured(Measured {
             quantity: retained,
             limit,
-            peaks: vec![
+            peaks: [
                 ("retained-wire-bytes", peaks.retained),
                 ("input-queue-wire-bytes", peaks.queued),
             ],
@@ -1123,7 +1124,7 @@ where
         })
     }
 
-    fn violation(measured: &Measured<()>) -> (String, String) {
+    fn violation(measured: &Measured<(), Self::Peaks>) -> (String, String) {
         (
             format!(
                 "the sequencer retains at most L + 401·b + Q·b = {} wire bytes",
@@ -1158,8 +1159,9 @@ where
     const NEEDS: &'static [Source] = &[Source::View];
     const WITNESS: fn(&ObservationLog) -> bool = budget_charged;
     type Terms = ReservedTerms;
+    type Peaks = [(&'static str, u64); 3];
 
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<ReservedTerms> {
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<ReservedTerms, Self::Peaks> {
         let status = cx.status;
         let (reserved, handoffs, open, peaks, limits, gap) = cx.view().read_owners(|owners| {
             (
@@ -1177,7 +1179,7 @@ where
         Reading::Measured(Measured {
             quantity: reserved,
             limit: limits.reserved_bound(handoffs),
-            peaks: vec![
+            peaks: [
                 ("reserved-estimate-bytes", peaks.reserved),
                 (
                     "past-budget-estimate-bytes",
@@ -1193,7 +1195,7 @@ where
         })
     }
 
-    fn violation(measured: &Measured<ReservedTerms>) -> (String, String) {
+    fn violation(measured: &Measured<ReservedTerms, Self::Peaks>) -> (String, String) {
         let ReservedTerms {
             limits,
             handoffs,
@@ -1282,8 +1284,9 @@ where
     const NEEDS: &'static [Source] = &[Source::View, Source::Schedule];
     const WITNESS: fn(&ObservationLog) -> bool = above_window_requested;
     type Terms = LookaheadTerms;
+    type Peaks = [(&'static str, u64); 4];
 
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<LookaheadTerms> {
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<LookaheadTerms, Self::Peaks> {
         if !at_rest(cx.status) {
             return Reading::Unjudged;
         }
@@ -1302,7 +1305,7 @@ where
         Reading::Measured(Measured {
             quantity: total,
             limit: limits.lookahead_bound(hint_error),
-            peaks: vec![
+            peaks: [
                 ("above-window-wire-bytes", retained),
                 ("above-window-estimate-bytes", estimated),
                 ("hint-error-bytes", hint_error),
@@ -1315,7 +1318,7 @@ where
         })
     }
 
-    fn violation(measured: &Measured<LookaheadTerms>) -> (String, String) {
+    fn violation(measured: &Measured<LookaheadTerms, Self::Peaks>) -> (String, String) {
         let LookaheadTerms { limits, quantities } = &measured.terms;
         (
             format!(

@@ -3,7 +3,7 @@
 //! A bound claims that a quantity stays within a limit at each of its
 //! boundaries. Each instance implements [`Bound`]: its ID and claim, its
 //! unit, its boundary, its quantity reader, its limit and the limit's
-//! terms, its peak names and its violation text. [`bound`] builds the
+//! terms, its peaks and its violation text. [`bound`] builds the
 //! property. Its check is the part every instance shares, and each
 //! [`Reading`] variant says how the check judges it.
 
@@ -29,18 +29,22 @@ pub trait Bound<S: HasView> {
     const WITNESS: fn(&ObservationLog) -> bool;
     /// What the violation text names besides the quantity and its limit.
     type Terms;
+    /// The values the check records as peaks, by name. An array, such as
+    /// `[(&'static str, u64); 2]`, lets a step record them without
+    /// allocating.
+    type Peaks: AsRef<[(&'static str, u64)]>;
 
     /// What the instance gives after a step.
-    fn read(cx: &CheckCtx<'_, S>) -> Reading<Self::Terms>;
+    fn read(cx: &CheckCtx<'_, S>) -> Reading<Self::Terms, Self::Peaks>;
 
     /// The expected and actual texts of a quantity past its limit. The
     /// expected text names the limit and its terms, and the actual text
     /// gives the quantity.
-    fn violation(measured: &Measured<Self::Terms>) -> (String, String);
+    fn violation(measured: &Measured<Self::Terms, Self::Peaks>) -> (String, String);
 }
 
 /// What a bound's instance gives after a step.
-pub enum Reading<T> {
+pub enum Reading<T, P> {
     /// The step isn't one of the bound's boundaries. The check is
     /// `NotApplicable`.
     Unjudged,
@@ -50,17 +54,17 @@ pub enum Reading<T> {
     /// The quantity at this boundary. The check records every peak. It
     /// holds while the quantity is within its limit, and is violated past
     /// it.
-    Measured(Measured<T>),
+    Measured(Measured<T, P>),
 }
 
 /// A bound's quantity at one boundary.
-pub struct Measured<T> {
+pub struct Measured<T, P> {
     /// The quantity.
     pub quantity: u64,
     /// The limit the quantity must stay within.
     pub limit: u64,
-    /// The values to record as peaks, by name.
-    pub peaks: Vec<(&'static str, u64)>,
+    /// The instance's [`Bound::Peaks`].
+    pub peaks: P,
     /// The instance's [`Bound::Terms`].
     pub terms: T,
 }
@@ -88,7 +92,7 @@ fn check<S: HasView, B: Bound<S>>(cx: &mut CheckCtx<'_, S>) -> Verdict {
             Verdict::NotApplicable
         }
         Reading::Measured(measured) => {
-            for &(name, value) in &measured.peaks {
+            for &(name, value) in measured.peaks.as_ref() {
                 cx.peak(name, value);
             }
             if measured.quantity <= measured.limit {
@@ -114,10 +118,13 @@ mod tests {
 
     /// A harness whose view is the next reading, which the test sets.
     #[derive(Default)]
-    struct Scripted(RefCell<Option<Reading<&'static str>>>);
+    struct Scripted(RefCell<Option<ScriptedReading>>);
+
+    /// The scripted bound's reading: terms text and one peak.
+    type ScriptedReading = Reading<&'static str, [(&'static str, u64); 1]>;
 
     impl HasView for Scripted {
-        type View = Option<Reading<&'static str>>;
+        type View = Option<ScriptedReading>;
 
         fn view(&self) -> Self::View {
             self.0.borrow_mut().take()
@@ -138,12 +145,13 @@ mod tests {
         const NEEDS: &'static [Source] = &[Source::View];
         const WITNESS: fn(&ObservationLog) -> bool = no_witness;
         type Terms = &'static str;
+        type Peaks = [(&'static str, u64); 1];
 
-        fn read(cx: &CheckCtx<'_, Scripted>) -> Reading<&'static str> {
+        fn read(cx: &CheckCtx<'_, Scripted>) -> ScriptedReading {
             cx.view().expect("each check reads one scripted reading")
         }
 
-        fn violation(measured: &Measured<&'static str>) -> (String, String) {
+        fn violation(measured: &Measured<&'static str, Self::Peaks>) -> (String, String) {
             (
                 format!("at most {} ({})", measured.limit, measured.terms),
                 format!("{}", measured.quantity),
@@ -159,7 +167,7 @@ mod tests {
     }
 
     /// The shared check's verdict on `reading`, and what it left behind.
-    fn judge(reading: Reading<&'static str>) -> Judged {
+    fn judge(reading: ScriptedReading) -> Judged {
         let harness = Scripted(RefCell::new(Some(reading)));
         let registered = [bound::<Scripted, ScriptedBound>()];
         let log = ObservationLog::default();
@@ -183,11 +191,11 @@ mod tests {
         }
     }
 
-    fn measured(quantity: u64, limit: u64) -> Reading<&'static str> {
+    fn measured(quantity: u64, limit: u64) -> ScriptedReading {
         Reading::Measured(Measured {
             quantity,
             limit,
-            peaks: vec![("quantity", quantity)],
+            peaks: [("quantity", quantity)],
             terms: "terms",
         })
     }

@@ -483,6 +483,8 @@ struct RevokedCandidates;
 
 /// Announces to sidecars and the initial group immediately, then all remaining peers at
 /// `delayed_at`. Delivery tracking never gates another peer's announcement.
+/// Succeeds if an attempted send succeeds, or every candidate is skipped. Skips cannot
+/// hide a failed send or authorization revocation.
 pub(crate) fn broadcast_block(
     peers: Vec<BlockGossipPeer>,
     hash: block::Hash,
@@ -513,13 +515,19 @@ pub(crate) fn broadcast_block(
         // Poll the initial group first, including sidecars, without waiting for delivery.
         let sends = futures::stream::select(advertise(initial), delayed);
         futures::pin_mut!(sends);
-        let mut succeeded = skipped > 0;
+        let mut skipped = skipped > 0;
+        let mut succeeded = false;
+        let mut failed = false;
         let mut revoked = false;
         while let Some(outcome) = sends.next().await {
-            succeeded |= matches!(outcome, AdvertOutcome::Sent | AdvertOutcome::Skipped);
-            revoked |= matches!(outcome, AdvertOutcome::Revoked);
+            match outcome {
+                AdvertOutcome::Sent => succeeded = true,
+                AdvertOutcome::Skipped => skipped = true,
+                AdvertOutcome::Revoked => revoked = true,
+                AdvertOutcome::Failed => failed = true,
+            }
         }
-        if succeeded {
+        if succeeded || (skipped && !failed && !revoked) {
             Ok(Response::Nil)
         } else if revoked {
             Err(Box::new(RevokedCandidates) as BoxError)
@@ -2357,9 +2365,8 @@ mod tests {
         assert!(writes.try_recv().is_err());
     }
 
-    /// Both broadcasts are already running when the second peer announces the block.
-    /// Once the first peer releases their windows, neither broadcast creates an upload
-    /// claim or writes inventory to the second peer.
+    /// Both broadcasts are running when the second peer announces the block. At the delayed
+    /// group's absolute deadline, neither creates an upload claim or writes inventory to it.
     #[tokio::test(start_paused = true)]
     async fn overlapping_broadcasts_skip_an_announcement_before_the_delayed_group() {
         timeout(Duration::from_secs(10), async {
@@ -2416,7 +2423,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_announcer_counts_as_success_when_other_sends_fail() {
+    async fn an_announcer_does_not_hide_other_send_failures() {
         let hash = block::Hash([38; 32]);
         let (announcer, mut receiver) = peer();
         announcer.announced.record([hash]);
@@ -2425,9 +2432,49 @@ mod tests {
         assert!(
             broadcast_block(vec![announcer, failed], hash, 1, Instant::now())
                 .await
-                .is_ok()
+                .is_err()
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_announcers_preserve_failed_and_revoked_outcomes() {
+        for announce_before_selection in [false, true] {
+            for revoked in [false, true] {
+                let registry = PeerRegistry::default();
+                let mut guards = Vec::new();
+                let mut peers = measured_peers(&registry, &mut guards, [Some(1), Some(2)]);
+                let (first_tx, mut first_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+                let (later_tx, mut later_rx) = mpsc::channel(BLOCK_ADVERT_QUEUE);
+                peers[0].sender = first_tx;
+                peers[1].sender = later_tx;
+                let later = peers[1].clone();
+                let hash = block::Hash([41; 32]);
+                if announce_before_selection {
+                    later.announced.record([hash]);
+                }
+                let delayed_at = Instant::now() + Duration::from_millis(500);
+                let mut broadcast = broadcast_block(peers, hash, 1, delayed_at);
+                assert!((&mut broadcast).now_or_never().is_none());
+                let first = first_rx.try_recv().unwrap();
+                if !announce_before_selection {
+                    later.announced.record([hash]);
+                }
+                if revoked {
+                    first
+                        .result
+                        .send(Err(BlockAdvertError::AuthorizationRevoked))
+                        .unwrap();
+                } else {
+                    drop(first);
+                }
+                let error = broadcast
+                    .await
+                    .expect_err("a skipped peer cannot hide a failed send");
+                assert_eq!(error.is::<RevokedCandidates>(), revoked);
+                assert!(later_rx.try_recv().is_err());
+            }
+        }
     }
 
     #[test]

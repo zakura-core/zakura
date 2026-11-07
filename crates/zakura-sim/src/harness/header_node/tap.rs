@@ -48,6 +48,13 @@
 //! refuses. The tap keeps them, with the time of each and of each admission,
 //! in a [`CooldownEvidence`] that the harness's view reads.
 //!
+//! A broken claim rule, a rule a production bug alone can break and a
+//! property's claim names ([`super::claim`]), doesn't fail the run at once.
+//! The tap records it in its [`ClaimEvidence`] at the drain that found it,
+//! for the owning property to report at that step. A break no property
+//! reported fails the run at the next drain, or at the run's end, as any
+//! other rule does, so a harness without that property never drops it.
+//!
 //! A tap made with a [`CapacityEvidence`] also reads the reactor's resource
 //! probe after each drain, and checks it against the ownership check's
 //! accounting, as [`super::capacity`] describes. The reactor hands the probe
@@ -70,8 +77,9 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase, HeaderWorkLedger,
-        PortCall, ReactorEvent, RefusalCause, RequestRef, StorageCallKind, WaitCause,
+        CallEnd, ClaimBreak, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase,
+        HeaderWorkLedger, PortCall, ReactorEvent, RefusalCause, RequestRef, StorageCallKind,
+        WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
@@ -81,7 +89,8 @@ use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
-    capacity::{self, CapacityEvidence, CapacityReading, Expected},
+    capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
+    claim::{Claim, ClaimEvidence, ClaimRecord},
     fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
     policy::LinkEffect,
@@ -94,7 +103,7 @@ use crate::{
     observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
     sim::MidPoll,
     storage::{body_owner, hash, hex, point, scope, work_owner},
-    ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Outcome, Sim,
 };
 
 /// The run's reader of one reactor's events. Dropping it while the run is
@@ -151,6 +160,8 @@ struct TapState {
     off_reactor: Mutex<Option<TaskId>>,
     /// The reactor's cooldowns, refusals and admissions, for the view.
     cooldowns: CooldownEvidence,
+    /// The claim rules its drains found broken, for the view.
+    claims: ClaimEvidence,
 }
 
 /// The resource probe a tap was handed.
@@ -165,11 +176,13 @@ enum ProbeSlot {
     Replaced,
 }
 
-/// The tap's ownership check, and the first rule a history broke.
+/// The tap's ownership check, the first integrity rule a history broke,
+/// and the claim breaks not yet drained.
 #[derive(Default)]
 struct WorkCheck {
     ledger: HeaderWorkLedger,
     broken: Option<String>,
+    claims: Vec<ClaimBreak>,
 }
 
 /// Events recorded and not yet drained.
@@ -191,12 +204,39 @@ impl TapState {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Feeds `event` to the ownership check, keeping the first broken rule.
+    /// Feeds `event` to the ownership check, keeping the first broken
+    /// integrity rule and every claim break.
     fn check_work(&self, event: &ReactorEvent) {
         let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         if work.broken.is_none() {
             work.broken = work.ledger.observe(event).err();
+            let claims = work.ledger.take_claims();
+            work.claims.extend(claims);
         }
+    }
+
+    /// Fails with the first claim break an earlier drain found that no
+    /// property reported, then records the claim breaks since the last drain
+    /// as the drain of `step` found them.
+    fn drain_claims(&self, step: u64) -> Result<(), String> {
+        if let Some(record) = self.claims.unreported(Some(step)) {
+            return Err(record.detail);
+        }
+        let claims = mem::take(
+            &mut self
+                .work
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .claims,
+        );
+        for broken in claims {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::of(broken.rule),
+                detail: broken.detail,
+            });
+        }
+        Ok(())
     }
 
     /// The first rule this run's history broke.
@@ -585,6 +625,7 @@ impl ReactorTap {
                 capacity,
                 off_reactor: Mutex::default(),
                 cooldowns,
+                claims: ClaimEvidence::default(),
             }))
         });
         let state = observer.0.clone();
@@ -596,6 +637,26 @@ impl ReactorTap {
             live,
         );
         let id = sim.register(checkpoint.clone());
+        // A claim break no property reported by the run's end fails it, as
+        // a later drain would have.
+        sim.on_end({
+            let claims = state.claims.clone();
+            let failure = sim.failure();
+            let source = checkpoint.kind().source(id.index);
+            move |end, _, _| {
+                if end.outcome == Outcome::Harness {
+                    return;
+                }
+                if let Some(record) = claims.unreported(None) {
+                    failure
+                        .borrow_mut()
+                        .get_or_insert(HarnessFailure::SourceEvidence {
+                            source,
+                            detail: record.detail,
+                        });
+                }
+            }
+        });
         let tap = ReactorTap {
             state,
             checkpoint,
@@ -630,6 +691,12 @@ impl ReactorTap {
         self.state.cooldowns.clone()
     }
 
+    /// The claim rules the tap's drains found broken, which it fills as
+    /// they happen.
+    pub fn claims(&self) -> ClaimEvidence {
+        self.state.claims.clone()
+    }
+
     /// The notice the harness gives this tap when it stops the reactor.
     pub fn shutdown(&self) -> TapShutdown {
         TapShutdown(self.state.clone())
@@ -647,7 +714,10 @@ impl ReactorTap {
     /// the ownership check's accounting. Once a reactor the harness stopped
     /// is gone, every read is a teardown read. A reactor that unwound, or
     /// went away unstopped, left its counts mid-change and fails the run on
-    /// its own, so its reads aren't checked.
+    /// its own, so its reads aren't checked. A read that finds the budget's
+    /// lock held is noted unread, with whether the reactor was stopped
+    /// mid-poll, and a claim break goes to the tap's [`ClaimEvidence`] as
+    /// the module doc says.
     fn read_capacity(&self, step: u64) -> Result<(), String> {
         let Some(evidence) = &self.state.capacity else {
             return Ok(());
@@ -689,7 +759,16 @@ impl ReactorTap {
                 TaskId::from(probe.task()).index()
             ));
         }
+        let mid_poll = self.mid_poll.contains(TaskId::from(probe.task()));
         let Some(read) = zakura_rt::sim::boundary_read(|| probe.read()) else {
+            evidence.unread(
+                step,
+                if mid_poll {
+                    BoundaryRead::UnreadMidPoll
+                } else {
+                    BoundaryRead::UnreadQuiet
+                },
+            );
             return Ok(());
         };
         let expected = if gone {
@@ -701,9 +780,8 @@ impl ReactorTap {
                     .map_or(0, |port| port.owner_state().permits.len()),
             }
         } else {
-            let quiet = !self.mid_poll.contains(TaskId::from(probe.task()));
             Expected::Live {
-                accounted: quiet.then(|| self.state.accounted()),
+                accounted: (!mid_poll).then(|| self.state.accounted()),
             }
         };
         evidence.record(CapacityReading {
@@ -714,7 +792,18 @@ impl ReactorTap {
             compared: matches!(expected, Expected::Live { accounted: Some(_) }),
             teardown: gone,
         });
-        capacity::check(&probe, read, expected)
+        match capacity::check(&probe, read, expected) {
+            Ok(()) => Ok(()),
+            Err(Broken::Claim(claim, detail)) => {
+                self.state.claims.record(ClaimRecord {
+                    step,
+                    claim,
+                    detail,
+                });
+                Ok(())
+            }
+            Err(Broken::Integrity(detail)) => Err(detail),
+        }
     }
 
     /// Takes the reservations and admissions recorded since the last call,
@@ -1015,6 +1104,7 @@ impl ActionSource for ReactorTap {
         // The run checks its own log against this, since the log this tap
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
+        self.state.drain_claims(log.step())?;
         if let Some(rule) = self
             .state
             .broken_work_rule()

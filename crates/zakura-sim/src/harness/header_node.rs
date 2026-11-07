@@ -18,6 +18,7 @@
 
 pub mod adoption;
 pub mod capacity;
+pub mod claim;
 pub mod fault;
 mod pair;
 pub mod policy;

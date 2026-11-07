@@ -59,6 +59,7 @@ impl Recorder {
                         | ReactorEvent::HeadroomWait { .. }
                         | ReactorEvent::CachedPassDeferred { .. }
                         | ReactorEvent::EventTaken { .. }
+                        | ReactorEvent::WatchObserved { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }
@@ -2082,6 +2083,8 @@ async fn adopted_state_and_its_publications_are_observed() {
         header_best: snapshot.frontiers.header_best,
         suffix_work: snapshot.header_best_score.suffix_work.as_u256(),
         oldest_retained: snapshot.oldest_retained_height,
+        verified_generation: snapshot.verified_generation,
+        verified_best: snapshot.frontiers.verified_best,
     };
     let published = |tip: zakura_header_chain::Frontier, delivered| ReactorEvent::TipPublished {
         height: tip.height,

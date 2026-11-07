@@ -6127,6 +6127,7 @@ async fn a_rejection_is_recorded_on_the_parent_it_validated() {
     let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);

@@ -297,13 +297,20 @@ fn coinbase_tag_and_limit() {
     let max_tag = ExtraCoinbaseData::try_from("x".repeat(MAX_USER_COINBASE_DATA_LEN))
         .expect("maximum-length tag is valid");
     let max_params = params(Some(max_tag)).expect("maximum-length tag fits miner params");
-    let max_coinbase =
-        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero(), None)
-            .expect("maximum-length tag fits a coinbase transaction")
-            .data()
-            .as_ref()
-            .zcash_deserialize_into::<Transaction>()
-            .expect("maximum-length coinbase transaction deserializes");
+    let max_coinbase = TransactionTemplate::new_coinbase(
+        &net,
+        Height::MAX,
+        &max_params,
+        Amount::zero(),
+        // NU7 is active at the maximum height, so the ZIP 234 subsidy needs a
+        // parent NSM value balance.
+        Some(Amount::zero()),
+    )
+    .expect("maximum-length tag fits a coinbase transaction")
+    .data()
+    .as_ref()
+    .zcash_deserialize_into::<Transaction>()
+    .expect("maximum-length coinbase transaction deserializes");
     let coinbase_script = max_coinbase.inputs()[0]
         .coinbase_script()
         .expect("built coinbase input has a canonical script");

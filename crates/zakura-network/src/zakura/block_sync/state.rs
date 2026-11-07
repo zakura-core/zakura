@@ -1,8 +1,11 @@
+use zakura_node_services::block_memory::DecodedBlockPool;
+use zakura_rt::sync::{atomic::AtomicU64, Mutex};
+
 use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
     request::*,
-    work_queue::{RequestWriteStatus, WorkQueue},
+    work_queue::WorkQueue,
     *,
 };
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
@@ -10,7 +13,10 @@ use std::num::NonZeroU64;
 
 mod outstanding;
 
-pub(super) use outstanding::{OutstandingRequests, RequestKey};
+pub(super) use outstanding::OutstandingRequests;
+pub use outstanding::RequestKey;
+#[cfg(any(test, zakura_sim))]
+pub use outstanding::{RequestOwnership, RequestedHeight};
 
 /// Hard ceiling on outbound block-range requests kept in flight to one peer.
 ///
@@ -54,6 +60,8 @@ pub struct BlockSyncStartup {
         Option<watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>>,
     /// Local stream-6 configuration.
     pub config: ZakuraBlockSyncConfig,
+    /// Shared native decoded retention through the last driver or backend holder.
+    pub decoded_pool: DecodedBlockPool,
     /// Shared shutdown signal owned by the embedding endpoint or test harness.
     pub shutdown: CancellationToken,
     /// Enables query actions for state-backed metadata.
@@ -64,6 +72,9 @@ pub struct BlockSyncStartup {
     /// above it is capped at `BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES` of
     /// decoded blocks. `None` keeps the count-only window.
     pub max_checkpoint_height: Option<block::Height>,
+    /// Receives block sync's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl BlockSyncStartup {
@@ -74,10 +85,12 @@ impl BlockSyncStartup {
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
         header_tip: watch::Receiver<(block::Height, block::Hash)>,
+        decoded_pool: DecodedBlockPool,
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
             body_retention: None,
+            decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers,
             best_header_tip,
@@ -88,6 +101,8 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
@@ -98,10 +113,12 @@ impl BlockSyncStartup {
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
         committed_views: watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+        decoded_pool: DecodedBlockPool,
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
             body_retention: None,
+            decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers,
             best_header_tip,
@@ -112,6 +129,8 @@ impl BlockSyncStartup {
             state_queries_enabled: true,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
         }
     }
 
@@ -139,9 +158,13 @@ impl BlockSyncStartup {
         self
     }
 
-    pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
-        Self {
+    pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Result<Self, BlockSyncStartError> {
+        let decoded_pool = config
+            .decoded_block_pool(0)
+            .map_err(BlockSyncStartError::InvalidConfig)?;
+        Ok(Self {
             body_retention: None,
+            decoded_pool,
             range_source: Arc::new(super::source::EmptyBlockRangeSource),
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
@@ -156,7 +179,9 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
             max_checkpoint_height: None,
-        }
+            #[cfg(any(test, zakura_sim))]
+            observer: Default::default(),
+        })
     }
 }
 
@@ -188,6 +213,7 @@ impl BodyRetention {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
+    pub(super) accounting: crate::zakura::transport::BudgetReader,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
@@ -200,29 +226,133 @@ pub struct BlockSyncHandle {
     pub(super) routine_wiring: Option<RoutineWiring>,
 }
 
+/// What a detached [`BlockSyncHandle`] sends, for a test that stands in for
+/// the reactor. Control events and query failures arrive on separate
+/// channels, as they do at the reactor.
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+#[derive(Debug)]
+pub struct DetachedHandleEvents {
+    accounting: ByteBudget,
+    lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
+    needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
+    // Held so the handle's bounded queue and watches stay open.
+    _events: mpsc::Receiver<BlockSyncEvent>,
+    _peers: watch::Sender<ServicePeerSnapshot>,
+    _status: watch::Sender<BlockSyncStatus>,
+    _candidates: watch::Sender<ZakuraBlockSyncCandidateState>,
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl DetachedHandleEvents {
+    /// Inject a local accounting failure through the real budget closure signal.
+    pub fn fail_accounting(&self) {
+        self.accounting
+            .close(crate::zakura::transport::BudgetClosure::Funding {
+                logical: 1,
+                funded: 0,
+            });
+    }
+
+    /// The next control event sent with [`BlockSyncHandle::send_control`],
+    /// if one is waiting.
+    pub fn try_next_control(&mut self) -> Option<BlockSyncEvent> {
+        self.lifecycle.try_recv().ok()
+    }
+
+    /// The next needed-blocks query failure, with its query and scope, if
+    /// one is waiting.
+    pub fn try_next_query_failure(
+        &mut self,
+    ) -> Option<(NonZeroU64, zakura_header_chain::BodyWorkAuthority)> {
+        self.needed_query_failures
+            .try_recv()
+            .ok()
+            .map(|failure| (failure.query_id, failure.scope))
+    }
+}
+
+#[cfg(any(test, zakura_sim, feature = "zakura-testkit"))]
+impl BlockSyncHandle {
+    /// A handle with no reactor behind it, and the receiver of what it
+    /// sends. Peers added through it get no routines.
+    pub fn detached() -> (Self, DetachedHandleEvents) {
+        let config = ZakuraBlockSyncConfig::default();
+        let (events, events_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
+        let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+        let (needed_query_failures, needed_query_failures_rx) = mpsc::unbounded_channel();
+        let (peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+        let (status_tx, status) = watch::channel(config.initial_status());
+        let (candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+        let accounting = ByteBudget::new(config.inflight_block_bytes());
+        let handle = BlockSyncHandle {
+            accounting: accounting.reader(),
+            events,
+            lifecycle,
+            needed_query_failures,
+            peers,
+            status,
+            candidates,
+            routine_wiring: None,
+        };
+        let receiver = DetachedHandleEvents {
+            accounting,
+            lifecycle: lifecycle_rx,
+            needed_query_failures: needed_query_failures_rx,
+            _events: events_rx,
+            _peers: peers_tx,
+            _status: status_tx,
+            _candidates: candidates_tx,
+        };
+        (handle, receiver)
+    }
+}
+
 /// The shared download primitives a per-peer pipe-routine is constructed with.
 /// Created once in `spawn_block_sync_reactor` and threaded through the handle to
 /// `service::add_peer`.
 #[derive(Clone, Debug)]
 pub(super) struct RoutineWiring {
+    pub(super) decoded_pool: DecodedBlockPool,
     pub(super) request_pool: crate::zakura::regulation::ReservationPool,
     pub(super) serving: Arc<super::regulated::session::Serving>,
     pub(super) config: ZakuraBlockSyncConfig,
-    pub(super) budget: ByteBudget,
     pub(super) work: Arc<WorkQueue>,
     pub(super) registry: Arc<super::peer_registry::PeerRegistry>,
-    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
     pub(super) sequencer_input: mpsc::Sender<super::sequencer_task::SequencedBody>,
-    pub(super) sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
-    pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) sequencer_input_bytes: Arc<AtomicU64>,
+    pub(super) sequencer_input_decoded_attributed_memory_bytes: Arc<AtomicU64>,
     #[cfg(test)]
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
     pub(super) trace: ZakuraTrace,
+    #[cfg(any(test, zakura_sim))]
+    pub(super) observer: super::block_sync_observe::ObserverSlot,
 }
 
 impl BlockSyncHandle {
+    /// Wait for request or decoded-retention accounting to close admission.
+    /// The driver must not replace capacity while old owners retain resources.
+    pub async fn accounting_closed(&self) {
+        let Some(wiring) = self.routine_wiring.as_ref() else {
+            return self.accounting.closed().await;
+        };
+        zakura_rt::select! {
+            () = self.accounting.closed() => {},
+            () = wiring.decoded_pool.closed() => {},
+        }
+    }
+
+    /// Whether an accounting failure has closed request or decoded admission.
+    pub fn is_accounting_closed(&self) -> bool {
+        self.accounting.is_closed()
+            || self
+                .routine_wiring
+                .as_ref()
+                .is_some_and(|wiring| wiring.decoded_pool.is_closed())
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,
@@ -296,7 +426,7 @@ impl BlockSyncHandle {
             .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
         wiring
             .registry
-            .park_peer_until(peer, std::time::Instant::now() + cooldown);
+            .park_peer_until(peer, Instant::now() + cooldown);
     }
 
     /// Park this connection's session exactly as its no-progress routine does.
@@ -313,7 +443,7 @@ impl BlockSyncHandle {
             .expect("a handle from spawn_block_sync_reactor always carries routine wiring");
         wiring
             .registry
-            .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
+            .park_session_for_test(peer, conn_id, Instant::now() + cooldown);
     }
 
     /// Return the reactor's current local serving status, independent of peer delivery.
@@ -332,14 +462,10 @@ impl BlockSyncHandle {
     }
 }
 
+/// The reactor's peer sessions and its handles to the shared download owners.
+/// The reactor's logical state lives in its `ReactorState`.
 #[derive(Debug)]
 pub(super) struct BlockSyncState {
-    pub(super) finalized_height: block::Height,
-    pub(super) verified_block_hash: block::Hash,
-    pub(super) servable_high: block::Height,
-    pub(super) servable_hash: block::Hash,
-    pub(super) best_header_tip: block::Height,
-    pub(super) best_header_hash: block::Hash,
     /// Thin per-peer handles the reactor keeps for demux/serving/admission. The
     /// per-peer *download* state moved into the spawned [`PeerRoutine`](super::peer_routine)
     /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
@@ -352,43 +478,28 @@ pub(super) struct BlockSyncState {
     /// `Arc` so the state stays cheaply `Clone` and the queue is shared with the
     /// Sequencer task and the per-peer routines.
     pub(super) work_queue: Arc<WorkQueue>,
-    pub(super) budget: ByteBudget,
-    pub(super) needed_heights: Vec<block::Height>,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
     /// throughput it separates a download-limited sync from a commit-limited one.
-    pub(super) received_throughput: Arc<std::sync::Mutex<ThroughputMeter>>,
+    pub(super) received_throughput: Arc<Mutex<ThroughputMeter>>,
 }
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
+        let budget = ByteBudget::new(startup.config.inflight_block_bytes());
+        #[cfg(any(test, zakura_sim))]
+        let budget = budget.with_observer(startup.observer.budget_observer());
+        let work_queue = WorkQueue::new(startup.frontiers.verified_block_tip, budget)
+            .with_owner_cap(startup.config.owner_reservation_cap());
+        #[cfg(any(test, zakura_sim))]
+        let work_queue = work_queue.with_observer(startup.observer.clone());
+        let work_queue = Arc::new(work_queue);
         Self {
-            finalized_height: startup.frontiers.finalized_height,
-            verified_block_hash: startup.frontiers.verified_block_hash,
-            servable_high: startup.frontiers.verified_block_tip,
-            servable_hash: startup.frontiers.verified_block_hash,
-            best_header_tip: startup.best_header_tip.0,
-            best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
-            work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
-            budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
-            needed_heights: Vec::new(),
-            received_throughput: Arc::new(std::sync::Mutex::new(ThroughputMeter::new(
-                Instant::now(),
-            ))),
-        }
-    }
-
-    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
-        BlockSyncStatus {
-            servable_low: block::Height::MIN,
-            servable_high: self.servable_high,
-            tip_hash: self.servable_hash,
-            max_blocks_per_response: config.advertised_max_blocks_per_response(),
-            max_inflight_requests: config.advertised_max_inflight_requests(),
-            max_response_bytes: config.advertised_max_response_bytes(),
+            work_queue,
+            received_throughput: Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
         }
     }
 
@@ -424,6 +535,9 @@ pub(super) struct DownloadWindow {
     pub(super) startup_request_cap: usize,
     /// Deadline by which an active peer must send another accepted full block.
     pub(super) block_liveness_deadline: Option<Instant>,
+    /// Whether the current no-progress episode already spent its one congestion
+    /// grace. Block progress and disarm start a new episode.
+    liveness_grace_used: bool,
     /// Last time this peer was sent a block-body request.
     pub(super) last_request_at: Option<Instant>,
     /// Last time this peer sent an accepted full block body.
@@ -454,6 +568,7 @@ impl DownloadWindow {
                 .unwrap_or(usize::MAX)
                 .max(1),
             block_liveness_deadline: None,
+            liveness_grace_used: false,
             last_request_at: None,
             last_block_at: None,
             requests_without_block_progress: 0,
@@ -594,6 +709,7 @@ impl DownloadWindow {
         self.bbr.reliability_permille()
     }
 
+    #[cfg(test)]
     pub(super) fn available_slots(&self) -> usize {
         self.available_slots_at(Instant::now())
     }
@@ -604,7 +720,7 @@ impl DownloadWindow {
 
     /// Available headroom allowing `bonus` extra in-flight requests beyond the BBR cwnd,
     /// still clamped to the peer's advertised hard cap. `bonus == 0` is the normal
-    /// (above-floor) capacity used by [`Self::available_slots`]; a small positive `bonus` is
+    /// (above-floor) capacity used by [`Self::available_slots_at`]; a small positive `bonus` is
     /// the floor bypass — it lets the lowest missing height be fetched even when the
     /// peer is saturated at its cwnd, without ever exceeding the advertised inflight.
     ///
@@ -773,6 +889,7 @@ impl DownloadWindow {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
         self.outstanding.clear_liveness_charges();
+        self.liveness_grace_used = false;
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
@@ -787,14 +904,20 @@ impl DownloadWindow {
                 (Some(request_at), Some(block_at)) if block_at >= request_at
             )
         {
-            self.block_liveness_deadline = None;
+            self.disarm_liveness();
         }
     }
 
     pub(super) fn clear_liveness_if_idle(&mut self) {
         if self.outstanding.is_empty() {
-            self.block_liveness_deadline = None;
+            self.disarm_liveness();
         }
+    }
+
+    /// End the no-progress episode, so the next one may spend a fresh grace.
+    fn disarm_liveness(&mut self) {
+        self.block_liveness_deadline = None;
+        self.liveness_grace_used = false;
     }
 
     /// Clear the probe streak after we return requests on our own initiative,
@@ -805,23 +928,16 @@ impl DownloadWindow {
         self.clear_liveness_if_idle();
     }
 
-    /// Retire attempts that never reached the wire, refunding only their own
-    /// probe charges. Keep unanswered requests from this peer accountable.
-    pub(super) fn discard_skipped_requests(&mut self) -> Vec<OutstandingBlockRange> {
-        self.outstanding
-            .skipped()
-            .into_iter()
-            .filter_map(|key| self.retire_locally(key))
-            .collect()
-    }
-
-    /// End a locally retired obligation before discarding its write status. If
-    /// transport has not started, it must skip the frame and refund this probe.
-    pub(super) fn retire_locally(&mut self, key: RequestKey) -> Option<OutstandingBlockRange> {
+    /// End a locally retired obligation whose write settled as `write`. A
+    /// request that never reached the wire refunds its own probe charge.
+    pub(super) fn retire_locally(
+        &mut self,
+        key: RequestKey,
+        write: WriteOutcome,
+    ) -> Option<OutstandingBlockRange> {
         let charged = self.outstanding.is_charged_for_liveness(key);
         let outstanding = self.outstanding.remove(key)?;
-        outstanding.write_status.expire_unwritten();
-        if outstanding.write_status.was_skipped() && charged {
+        if write == WriteOutcome::Skipped && charged {
             self.requests_without_block_progress =
                 self.requests_without_block_progress.saturating_sub(1);
         }
@@ -832,9 +948,16 @@ impl DownloadWindow {
     }
 
     /// Give a briefly congested writer time to deliver our queued request before
-    /// parking the peer for not answering it. The caller bounds this grace.
+    /// parking the peer for not answering it. This spends the episode's one grace;
+    /// the caller bounds its length.
     pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
         self.block_liveness_deadline = Some(now + timeout);
+        self.liveness_grace_used = true;
+    }
+
+    /// Whether the current no-progress episode has not yet spent its grace.
+    pub(super) fn liveness_grace_available(&self) -> bool {
+        !self.liveness_grace_used
     }
 
     pub(super) fn check_liveness(&self, now: Instant) -> LivenessOutcome {
@@ -882,23 +1005,29 @@ impl DownloadWindow {
 pub(super) struct PeerBlockState {
     pub(super) session: BlockSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
-    pub(super) status_delivery: super::status::StatusDelivery,
 }
 
 impl PeerBlockState {
     pub(super) fn new(session: BlockSyncPeerSession) -> Self {
         Self {
             direction: session.direction(),
-            status_delivery: super::status::StatusDelivery::new(Instant::now()),
             session,
         }
     }
 }
 
+/// How a published request's frame write settled.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum WriteOutcome {
+    /// Transport skipped the frame, or will skip it, so the peer never saw it.
+    Skipped,
+    /// Transport started writing the frame, so the peer may owe a response.
+    Started,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
-    pub(super) write_status: RequestWriteStatus,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,
@@ -1051,7 +1180,7 @@ pub(super) struct RateMeter {
 impl RateMeter {
     pub(super) fn new(interval: Duration) -> Self {
         Self {
-            next_allowed: tokio::time::Instant::now().into_std(),
+            next_allowed: Instant::now(),
             interval,
         }
     }

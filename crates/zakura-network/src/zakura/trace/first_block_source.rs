@@ -1,10 +1,7 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{collections::VecDeque, fmt, sync::Arc};
 
 use zakura_chain::block;
+use zakura_rt::{collections::HashMap, sync::Mutex};
 
 /// Keep enough hashes to cover ordinary sync and live propagation races while
 /// bounding memory if peers advertise an unbounded stream of distinct blocks.

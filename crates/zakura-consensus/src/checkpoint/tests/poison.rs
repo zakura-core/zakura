@@ -32,6 +32,7 @@ use zakura_chain::{
     transaction::{LockTime, Transaction},
     transparent,
 };
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_state as zs;
 
 use crate::checkpoint::{CheckpointVerifier, VerifyCheckpointError};
@@ -143,7 +144,7 @@ impl PoisonFixture {
             let child = Arc::new(child);
             history_tree.push(
                 &chain_network,
-                child.clone(),
+                &child,
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
@@ -205,7 +206,7 @@ impl PoisonFixture {
 
     /// Opens a real state, using the production checkpoint concurrency default.
     async fn state(&self) -> Result<StateBuffer, Report> {
-        let (state, _, _, _) = zs::init(
+        let zs::InitializedState { state, .. } = zs::init(
             zs::Config::ephemeral(),
             &self.network,
             self.max_checkpoint_height(),
@@ -289,13 +290,13 @@ where
 
 async fn submit<V>(verifier: &mut V, block: Arc<Block>) -> V::Future
 where
-    V: Service<Arc<Block>, Response = block::Hash, Error = VerifyCheckpointError>,
+    V: Service<BlockHandle, Response = block::Hash, Error = VerifyCheckpointError>,
 {
     verifier
         .ready()
         .await
         .expect("the checkpoint verifier is always ready")
-        .call(block)
+        .call(block.into())
 }
 
 /// A same-hash forged body gets every descendant answered, and the honest resubmission commits.
@@ -603,7 +604,7 @@ async fn spawn_submit<V>(
     block: Arc<Block>,
 ) -> tokio::task::JoinHandle<Result<block::Hash, VerifyCheckpointError>>
 where
-    V: Service<Arc<Block>, Response = block::Hash, Error = VerifyCheckpointError>,
+    V: Service<BlockHandle, Response = block::Hash, Error = VerifyCheckpointError>,
     V::Future: Send + 'static,
 {
     tokio::spawn(submit(verifier, block).await)

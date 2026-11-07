@@ -136,9 +136,10 @@ fn regtest_first_halving_follows_the_target_spacing() {
 #[test]
 fn halving_test() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
-    // Exercise the historical two-era schedule; NU7 is covered separately.
+    // Exercise the historical two-era schedule, using the Mainnet heights without
+    // the scheduled NU7; the ZIP 218 halvings after NU7 are covered separately.
     for network in [
-        Network::Mainnet,
+        zip218_funding_streams::mainnet_with_nu7(None),
         testnet_with_nu7(None)
             .to_network()
             .expect("the historical Testnet schedule is valid"),
@@ -269,9 +270,10 @@ fn halving_for_network(network: &Network) -> Result<(), Report> {
 fn block_subsidy_test() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
 
-    // Exercise the historical two-era schedule; NU7 is covered separately.
+    // Exercise the historical two-era schedule, using the Mainnet heights without
+    // the scheduled NU7; the ZIP 218 subsidy after NU7 is covered separately.
     for network in [
-        Network::Mainnet,
+        zip218_funding_streams::mainnet_with_nu7(None),
         testnet_with_nu7(None)
             .to_network()
             .expect("the historical Testnet schedule is valid"),
@@ -764,7 +766,7 @@ fn nsm_reissuance_requires_nu7_and_a_crossing() {
         ..Default::default()
     });
 
-    for network in [Network::Mainnet, configured, regtest] {
+    for network in [configured, regtest] {
         assert_eq!(nsm_reissuance_height(&network), None, "{network:?}");
         assert!(!is_zip234_active(&network, Height::MAX), "{network:?}");
     }
@@ -1090,52 +1092,35 @@ fn nsm_reissuance_crossing_uses_the_post_nu7_schedule() {
     }
 }
 
-/// The proposed Mainnet schedule places the direct crossing in February 2031.
+/// The ZIP 259 Mainnet schedule places the direct crossing in February 2031.
 ///
-/// The NU7 height and timestamp are the estimates from the 2026-09-17 NU7 timeline,
-/// not consensus constants. This test checks the calendar interpretation of the
-/// spacing-aware equation without activating reissuance.
+/// The NU7 activation height is the ZIP 259 consensus constant; the activation
+/// timestamp is still the estimate from the 2026-09-17 NU7 timeline. This test
+/// checks the calendar interpretation of the spacing-aware equation.
 #[test]
-fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
+fn mainnet_nsm_crossing_estimated_for_february_2031() {
     use chrono::{Datelike, Duration, TimeZone, Utc};
 
     use crate::parameters::{
         constants::activation_heights::mainnet, subsidy::nsm_reissuance_crossing_height,
     };
 
-    const ESTIMATED_NU7_HEIGHT: u32 = 3_543_000;
-
     let _init_guard = zakura_test::init();
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            before_overwinter: Some(mainnet::BEFORE_OVERWINTER.0),
-            overwinter: Some(mainnet::OVERWINTER.0),
-            sapling: Some(mainnet::SAPLING.0),
-            blossom: Some(mainnet::BLOSSOM.0),
-            heartwood: Some(mainnet::HEARTWOOD.0),
-            canopy: Some(mainnet::CANOPY.0),
-            nu5: Some(mainnet::NU5.0),
-            nu6: Some(mainnet::NU6.0),
-            nu6_1: Some(mainnet::NU6_1.0),
-            nu6_2: Some(mainnet::NU6_2.0),
-            nu6_3: Some(mainnet::NU6_3.0),
-            nu7: Some(ESTIMATED_NU7_HEIGHT),
-        })
-        .expect("the estimated Mainnet activation schedule is ordered")
-        .clear_funding_streams()
-        .to_network()
-        .expect("the Mainnet subsidy schedule is valid");
+    let network = Network::Mainnet;
+    let nu7_height = NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("ZIP 259 schedules NU7 on Mainnet");
 
     assert_eq!(
         height_for_halving(2, &network),
         Some(mainnet::NU6),
-        "the configured network reproduces Mainnet's second halving"
+        "NU7 leaves Mainnet's second halving in place"
     );
 
     let crossing = nsm_reissuance_crossing_height(&network)
         .expect("crossing arithmetic is valid")
-        .expect("the estimated Mainnet schedule has a crossing");
-    assert_eq!(crossing, Height(8_940_474));
+        .expect("the Mainnet schedule has a crossing");
+    assert_eq!(crossing, Height(8_939_664));
     assert_eq!(
         crate::parameters::subsidy::nsm_reissuance_height(&network),
         Some(crossing)
@@ -1145,7 +1130,7 @@ fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
         .with_ymd_and_hms(2026, 11, 5, 12, 0, 0)
         .single()
         .expect("the estimated NU7 timestamp is valid");
-    let post_nu7_blocks = i64::from(crossing.0 - ESTIMATED_NU7_HEIGHT);
+    let post_nu7_blocks = i64::from(crossing.0 - nu7_height.0);
     let crossing_time = estimated_nu7_time
         + Duration::seconds(post_nu7_blocks * NetworkUpgrade::Nu7.target_spacing().num_seconds());
 
@@ -1201,12 +1186,6 @@ fn nsm_reissuance_crossing_can_be_absent() {
     use crate::parameters::subsidy::nsm_reissuance_crossing_height;
 
     let _init_guard = zakura_test::init();
-    assert_eq!(
-        nsm_reissuance_crossing_height(&Network::Mainnet).expect("valid arithmetic"),
-        None,
-        "Mainnet has no NU7 height yet"
-    );
-
     let regtest = Network::new_regtest(
         ConfiguredActivationHeights {
             nu7: Some(1),
@@ -1729,8 +1708,10 @@ fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
 fn spacing_schedule_preserves_existing_halving_and_subsidy() {
     use crate::parameters::{subsidy::constants::MAX_BLOCK_SUBSIDY, testnet};
     let _init_guard = zakura_test::init();
+    // Networks without NU7, where the spacing-aware schedule must reproduce the
+    // historical halvings and subsidies.
     let mut networks = vec![
-        Network::Mainnet,
+        zip218_funding_streams::mainnet_with_nu7(None),
         testnet_with_nu7(None)
             .to_network()
             .expect("the historical Testnet schedule is valid"),

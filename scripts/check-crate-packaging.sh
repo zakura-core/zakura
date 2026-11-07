@@ -52,6 +52,7 @@ PUBLISH_ORDER=(
   zakura-test
   zakura-jsonl-trace
   zakura-quic
+  zakura-rt
   zakura-mmr-tree
   zakura-chain
   zakura-header-chain

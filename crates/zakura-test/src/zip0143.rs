@@ -1,5 +1,6 @@
 //! Contains test vectors for ZIP-0143 data (signature hashes).
-use lazy_static::lazy_static;
+
+use std::sync::LazyLock;
 
 /// A ZIP-143 test vector with the transaction input and expected sighash.
 pub struct TestVector {
@@ -19,10 +20,10 @@ pub struct TestVector {
     pub sighash: [u8; 32],
 }
 
-lazy_static! {
-    /// Array of ZIP-143 test vectors.
-    // From https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/zip_0143.py
-    pub static ref TEST_VECTORS: Vec<TestVector> = vec![
+/// Array of ZIP-143 test vectors.
+// From https://github.com/zcash-hackworks/zcash-test-vectors/blob/master/zip_0143.py
+pub static TEST_VECTORS: LazyLock<Vec<TestVector>> = LazyLock::new(|| {
+    vec![
         TestVector {
             tx: vec![
                 0x03, 0x00, 0x00, 0x80, 0x70, 0x82, 0xc4, 0x03, 0x00, 0x02, 0xe7, 0x71, 0x98, 0x11,
@@ -1697,5 +1698,5 @@ lazy_static! {
                 0x6a, 0x4e, 0x7d, 0x37,
             ],
         },
-    ];
-}
+    ]
+});

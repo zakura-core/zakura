@@ -1,15 +1,17 @@
 //! Status cadence and the latest received advertisement live with the connection.
 
+use zakura_rt::{
+    sync::{Mutex, PoisonError},
+    time::Instant,
+};
+
 use super::wire::Message;
 use crate::zakura::{
-    block_sync::{BlockSyncStatus, MSG_BS_STATUS},
+    block_sync::{state::RateMeter, BlockSyncStatus, MSG_BS_STATUS},
     regulation::{CadenceSendError, CadenceSender, RowSend},
     FramedSend, OrderedSendError,
 };
-use std::{
-    sync::{Mutex, PoisonError},
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 /// What one attempt did with the latest local Status.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -24,11 +26,45 @@ pub(crate) enum StatusSend {
     QueueFull,
 }
 
+/// How a connection paces the Status frames it receives. A stream-6
+/// replacement resumes this pacing, so a reopened stream gets no fresh
+/// Status allowance.
+#[derive(Clone, Debug)]
+pub(in crate::zakura::block_sync) struct InboundStatusPacing {
+    /// Paces Status application, with one extra range change per window.
+    pub(in crate::zakura::block_sync) apply_meter: RateMeter,
+    /// Paces our Status replies.
+    pub(in crate::zakura::block_sync) reply_meter: RateMeter,
+    /// Whether the current window still allows one immediate range change.
+    pub(in crate::zakura::block_sync) range_bypass_available: bool,
+    /// The latest received Status that the apply meter deferred.
+    pub(in crate::zakura::block_sync) pending: Option<BlockSyncStatus>,
+}
+
+/// The inbound Status state that outlives one stream-6 session.
+#[derive(Clone, Debug)]
+pub(in crate::zakura::block_sync) struct ReceivedStatus {
+    /// The last Status that a routine applied. It was paced when it arrived,
+    /// so a replacement routine applies it again without spending a meter.
+    pub(in crate::zakura::block_sync) applied: BlockSyncStatus,
+    pub(in crate::zakura::block_sync) pacing: InboundStatusPacing,
+}
+
 #[derive(Debug)]
 pub(crate) struct StatusSender {
     sender: Mutex<CadenceSender<Message>>,
-    received: Mutex<Option<BlockSyncStatus>>,
+    received: Mutex<StoredStatus>,
     max_inflight_requests: u32,
+}
+
+/// The stored inbound Status state and the routine generation that owns it.
+#[derive(Debug, Default)]
+struct StoredStatus {
+    /// The newest routine generation that read or wrote the state. A
+    /// replacement cancels its predecessor without waiting for it, so the
+    /// state refuses writes from an older generation.
+    owner: u64,
+    status: Option<ReceivedStatus>,
 }
 
 impl StatusSender {
@@ -41,7 +77,7 @@ impl StatusSender {
             .expect("the Status row declares a cadence");
         Self {
             sender: Mutex::new(sender),
-            received: Mutex::new(None),
+            received: Mutex::new(StoredStatus::default()),
             max_inflight_requests,
         }
     }
@@ -54,12 +90,42 @@ impl StatusSender {
         }
     }
 
-    pub(crate) fn record_received(&self, status: BlockSyncStatus) {
-        *self.received.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
+    /// Store this connection's inbound Status pacing for a later stream-6
+    /// session, with the Status just applied, if any. Pacing without an
+    /// applied Status has nothing to resume, so it is not kept. A write from
+    /// a `generation` older than the state's owner changes nothing, so a
+    /// cancelled routine cannot restore pacing its replacement already spent.
+    pub(in crate::zakura::block_sync) fn record_received(
+        &self,
+        generation: u64,
+        applied: Option<BlockSyncStatus>,
+        pacing: InboundStatusPacing,
+    ) {
+        let mut stored = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        if generation < stored.owner {
+            return;
+        }
+        stored.owner = generation;
+        match (applied, stored.status.as_mut()) {
+            (Some(applied), _) => stored.status = Some(ReceivedStatus { applied, pacing }),
+            (None, Some(received)) => received.pacing = pacing,
+            (None, None) => {}
+        }
     }
 
-    pub(crate) fn received(&self) -> Option<BlockSyncStatus> {
-        *self.received.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The inbound Status state that an earlier stream-6 session stored.
+    /// Reading makes `generation` the owner, so later writes from older
+    /// routines are refused. An older `generation` reads nothing.
+    pub(in crate::zakura::block_sync) fn received(
+        &self,
+        generation: u64,
+    ) -> Option<ReceivedStatus> {
+        let mut stored = self.received.lock().unwrap_or_else(PoisonError::into_inner);
+        if generation < stored.owner {
+            return None;
+        }
+        stored.owner = generation;
+        stored.status.clone()
     }
 
     /// Replace the pending Status and queue it if the cadence allows.
@@ -74,7 +140,7 @@ impl StatusSender {
             .map_err(|error| OrderedSendError::Encode(error.into()))?;
         match sender.send_row(u16::from(MSG_BS_STATUS), send) {
             Ok(RowSend::Queued) => Ok(StatusSend::Queued),
-            Ok(RowSend::DeferredUntil(at)) => Ok(StatusSend::Deferred(at.into_std())),
+            Ok(RowSend::DeferredUntil(at)) => Ok(StatusSend::Deferred(at)),
             Ok(RowSend::Unwritten) => Ok(StatusSend::Unwritten),
             Ok(RowSend::QueueFull) => Ok(StatusSend::QueueFull),
             Ok(RowSend::Idle) => unreachable!("the Status row was updated above"),
@@ -99,7 +165,7 @@ mod tests {
             servable_high: block::Height(10),
             ..BlockSyncStatus::default()
         };
-        let sent_at = tokio::time::Instant::now().into_std();
+        let sent_at = Instant::now();
         assert_eq!(
             sender.try_send(original, &old_send).unwrap(),
             StatusSend::Queued
@@ -175,7 +241,7 @@ mod tests {
         ] {
             let sender = StatusSender::new(u32::MAX, configured);
             let (send, mut recv) = framed_channel(4);
-            let sent_at = tokio::time::Instant::now().into_std();
+            let sent_at = Instant::now();
             let status = BlockSyncStatus::default();
             assert_eq!(sender.try_send(status, &send).unwrap(), StatusSend::Queued);
             recv.recv().await.unwrap();

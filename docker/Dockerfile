@@ -33,12 +33,6 @@ SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 # Make the build platform available as a variable
 ARG BUILDPLATFORM
 
-# Install zebra build deps
-RUN apt-get -qq update && \
-    apt-get -qq install -y --no-install-recommends \
-    libclang-dev \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
-
 # Build arguments and variables
 ARG CARGO_INCREMENTAL
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
@@ -107,12 +101,10 @@ COPY --link --chown=${UID}:${GID} ./ ${HOME}
 # Build Zebra test binaries using nextest, but don't run them.
 # This also copies the necessary binaries to /usr/local/bin.
 RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
     cargo nextest run --locked --release --no-run --features "${FEATURES}" && \
     # Copy binaries to standard location
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin && \
     # Only copy zakura-checkpoints if the feature is enabled
     if echo "${FEATURES}" | grep -q "zakura-checkpoints"; then \
         cp ${CARGO_TARGET_DIR}/release/zakura-checkpoints /usr/local/bin; \
@@ -130,13 +122,14 @@ CMD [ "cargo", "test" ]
 #
 # It also adds `cache mounts` as this stage is completely independent from the
 # `test` stage. The resulting binaries are used in the `runtime` stage.
-# Always use portable Pasta arithmetic here, including with custom FEATURES.
 # Release archives and both runtime image variants inherit these binaries.
+# Default Cargo features enable BMI2/ADX Pasta assembly on x86-64.
+# Use FEATURES="default-release-binaries,portable" for older x86-64 CPUs.
 FROM deps AS release
 
 ARG SHORT_SHA
 ARG FEATURES
-ENV FEATURES=${FEATURES},portable
+ENV FEATURES=${FEATURES}
 # Compress debug sections with zlib, roughly 275 MB -> 110 MB on disk.
 # Not zstd: std's backtrace symbolizer only reads zlib, and file:line would be lost.
 ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib"
@@ -158,9 +151,13 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=bind,source=crates/zakura-network,target=crates/zakura-network \
     --mount=type=bind,source=crates/zakura-node-services,target=crates/zakura-node-services \
     --mount=type=bind,source=crates/zakura-quic,target=crates/zakura-quic \
+    --mount=type=bind,source=crates/zakura-rt,target=crates/zakura-rt \
     --mount=type=bind,source=crates/zakura-rpc,target=crates/zakura-rpc \
+    --mount=type=bind,source=crates/zakura-scheduler,target=crates/zakura-scheduler \
+    --mount=type=bind,source=crates/zakura-sim,target=crates/zakura-sim \
     --mount=type=bind,source=crates/zakura-script,target=crates/zakura-script \
     --mount=type=bind,source=crates/zakura-state,target=crates/zakura-state \
+    --mount=type=bind,source=crates/zakura-storage,target=crates/zakura-storage \
     --mount=type=bind,source=crates/zakura-test,target=crates/zakura-test \
     --mount=type=bind,source=crates/zakura-utils,target=crates/zakura-utils \
     --mount=type=bind,source=crates/zakurad,target=crates/zakurad \
@@ -169,10 +166,8 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
-    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
+    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin
 
 # This stage starts from scratch using Debian and copies the built Zebra binaries
 # from the `release` stage along with other binaries and files.
@@ -226,8 +221,6 @@ RUN chown -R ${UID}:${GID} ${HOME}
 # setpriv is part of util-linux, already included in debian:trixie-slim.
 
 COPY --link --from=release /usr/local/bin/zakurad /usr/local/bin/
-COPY --link --from=release /usr/local/bin/zakura-rollback-state /usr/local/bin/
-COPY --link --from=release /usr/local/bin/zakura-prune-state /usr/local/bin/
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT [ "entrypoint.sh" ]

@@ -42,17 +42,19 @@ mod tests;
 pub use config::{
     check_and_delete_old_databases, check_and_delete_old_state_databases,
     database_format_version_on_disk, state_database_format_version_on_disk, Config, PruningConfig,
-    StorageMode,
+    StorageMode, DEFAULT_READ_RESULT_CEILING_BYTES, DEFAULT_READ_RESULT_PEERS,
+    READ_RESULT_BLOCKS_PER_PEER,
 };
 pub use constants::{
     state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
     MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
-    AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
-    CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
-    HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
-    PreciousError, StateInitError, TransparentIndexesUnavailable, ValidateContextError,
+    AwaitBlockInfoError, BlockHeaderNotFound, BoxError, CloneError, CommitBlockError,
+    CommitCheckpointVerifiedError, CommitSemanticallyVerifiedError, DuplicateNullifierError,
+    HistoricalSubtreeUnavailable, HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable,
+    MissingSproutTipTree, PreciousError, StateInitError, TransparentIndexesUnavailable,
+    ValidateContextError,
 };
 pub use header_chain::*;
 pub use request::{
@@ -66,13 +68,14 @@ pub use request::{
 pub use request::Spend;
 
 pub use response::{
-    AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility,
-    ReadResponse, Response,
+    AnyTx, AuthDataCommitment, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock,
+    MinedTx, NonFinalizedBlock, NonFinalizedBlocksListener, ParentInputs,
+    PreparedMinedRelayEligibility, ReadResponse, Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 pub use service::{
+    block_announcements::{BlockAnnouncements, BlockOrigin, CommittedBlockAnnouncement},
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
     finalized_state::FinalizedState,
@@ -80,7 +83,7 @@ pub use service::{
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
-    OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
+    InitializedState, OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
 };
 
 // Allow use in the scanner and external tests
@@ -119,6 +122,8 @@ pub use service::finalized_state::{
     produce_final_frontiers_bytes, produce_settled_final_frontiers_bytes,
     validate_final_frontiers_bytes, FinalFrontiersGenerationError, FinalFrontiersValidationError,
 };
+#[cfg(feature = "internal-bench")]
+pub use service::non_finalized_state::{benchmark_height_map, HeightMapBenchmarkSample};
 pub use service::read::{
     derive_historical_frontiers, ChainTipInfo, ChainTipStatus, DerivedFrontiers,
     HistoricalTreeCache, MAX_CACHED_FRONTIERS,

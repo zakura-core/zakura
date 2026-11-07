@@ -31,9 +31,9 @@
 //! | The last owner's drop returns every slot and wakes waiters | `an_abandoned_setup_returns_capacity_and_wakes_demand` |
 //! | `available` agrees with `reserve` | `minimal_setup_limits_keep_outbound_and_inbound_only_modes` |
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use zakura_rt::sync::{watch, Mutex, OwnedSemaphorePermit, PoisonError, Semaphore};
 
 use crate::zakura::{
     ServicePeerDirection, ServicePeerLimits, SessionDemand, SessionFull, SessionResources,

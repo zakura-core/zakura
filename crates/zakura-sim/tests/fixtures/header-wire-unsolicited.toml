@@ -1,0 +1,9 @@
+# The committed fuzz input `header-wire-unsolicited.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `unsolicited` scenario, and
+# `header-wire-unsolicited.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "6c61cdf3b4da10bf478ff9c8457b638b1d5ae1f740bbd12cab792986c7167341"
+scenario_sha256 = "190b6ce0005f2e0fe67f2fe1c422a208400a0d48c28f868b88a0e348638c2c77"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

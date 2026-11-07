@@ -1,0 +1,31 @@
+name: Simulator fuzzing
+
+on:
+  # Run a two-minute smoke of each target daily. qa/suite.toml gives Sunday's
+  # run the same length, since fuzz-campaign.yml takes a weekly schedule.
+  # Long campaigns run on a remote host instead (qa/fuzz/sim/README.md).
+  schedule:
+    - cron: "58 5 * * 1-6"
+    - cron: "58 5 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/fuzz-campaign.yml
+    with:
+      package: sim
+      label: sim
+      weekly_cron: "58 5 * * 0"
+      timeout_minutes: 45
+      nightly: nightly-2026-07-15
+      # Without this flag the package fails with a `compile_error!`.
+      rustflags: --cfg zakura_sim

@@ -4,7 +4,7 @@ use std::fmt;
 
 use zakura_chain::{chain_tip::ChainTip, parameters::Network};
 
-use crate::protocol::external::types::Version;
+use crate::{protocol::external::types::Version, BoxError};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod tests;
@@ -66,6 +66,19 @@ where
     pub fn current(&mut self) -> Version {
         self.update();
         self.current_minimum
+    }
+
+    /// Waits for the next minimum supported peer version change, and returns the new version.
+    ///
+    /// Chain tip changes that keep the minimum version are skipped. Returns an error once the
+    /// chain tip can no longer change.
+    pub async fn wait_for_change(&mut self) -> Result<Version, BoxError> {
+        loop {
+            self.chain_tip.best_tip_changed().await?;
+            if let Some(version) = self.changed() {
+                return Ok(version);
+            }
+        }
     }
 
     /// Check the current chain tip height to determine the minimum peer version, and detect if it

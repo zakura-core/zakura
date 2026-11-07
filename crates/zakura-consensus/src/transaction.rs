@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -35,6 +34,7 @@ use zakura_chain::{
     transparent,
 };
 
+pub use zakura_node_services::block_memory::TransactionHandle;
 use zakura_node_services::mempool;
 use zakura_script::{CachedFfiTransaction, Sigops};
 use zakura_state as zs;
@@ -74,14 +74,6 @@ const MAX_CONCURRENT_UTXO_LOOKUPS: usize = 64;
 /// This is how long Zebra will wait for an output to be added to the mempool before verification
 /// of the transaction that spends it will fail.
 const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long to wait after responding to a mempool request with a transaction that creates new
-/// transparent outputs before polling the mempool service so that it will try adding the verified
-/// transaction and responding to any potential `AwaitOutput` requests.
-///
-/// This should be long enough for the mempool service's `Downloads` to finish processing the
-/// response from the transaction verifier.
-const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
 /// Number of blocks after NU6.3 activation during which a NU6.2 branch ID
 /// does not count as peer misbehavior.
@@ -211,14 +203,22 @@ impl
 pub enum Request {
     /// Verify the supplied transaction as part of a block.
     Block {
-        /// The transaction hash.
-        transaction_hash: transaction::Hash,
+        /// The unmined ID of `transaction`, which the caller must compute from it.
+        ///
+        /// It carries both the mined ID and, from v5, the authorizing-data digest, so the
+        /// block verifier hashes each transaction's ZIP-244 tree once for both.
+        transaction_id: UnminedTxId,
         /// The transaction itself.
-        transaction: Arc<Transaction>,
+        transaction: TransactionHandle,
         /// Set of transaction hashes that create new transparent outputs.
         known_outpoint_hashes: Arc<HashSet<transaction::Hash>>,
         /// Additional UTXOs which are known at the time of verification.
         known_utxos: Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>,
+        /// Outputs the block verifier already read as unspent at the block's parent.
+        ///
+        /// Inputs found here skip the state lookup. Outputs created in the same block stay in
+        /// `known_utxos`, which is checked first. See `zakura_state::ParentInputs::Unspent`.
+        parent_utxos: Arc<HashMap<transparent::OutPoint, transparent::Utxo>>,
         /// The height of the block containing this transaction.
         height: block::Height,
         /// The time that the block was mined.
@@ -304,10 +304,10 @@ impl From<VerifiedUnminedTx> for Response {
 
 impl Request {
     /// The transaction to verify that's in this request.
-    pub fn transaction(&self) -> Arc<Transaction> {
+    pub fn transaction(&self) -> TransactionHandle {
         match self {
             Request::Block { transaction, .. } => transaction.clone(),
-            Request::Mempool { transaction, .. } => transaction.transaction().clone(),
+            Request::Mempool { transaction, .. } => transaction.transaction().clone().into(),
         }
     }
 
@@ -321,17 +321,29 @@ impl Request {
 
     /// The unmined transaction ID for the transaction in this request.
     ///
-    /// The shielded verification cache keys its entries on this ID, so it must always be derived
-    /// from the transaction carried here. A witnessed ID's authorizing-data digest is what commits
-    /// the key to the proofs and signatures; keying on a mined ID instead would let a transaction
-    /// be answered from the cached verification of a differently-signed twin. Both arms below
-    /// recompute the ID, and the `Request::Block::transaction_hash` field the caller supplies is
-    /// deliberately not used.
+    /// The shielded verification cache keys its entries on this ID, so it must commit to the
+    /// transaction carried here, including its proofs and signatures. Keying on a mined ID alone
+    /// would let a transaction be answered from the cached verification of a differently-signed
+    /// twin.
+    ///
+    /// A block request reuses the ID its caller supplies, which the block verifier computes from
+    /// this same transaction just before building the request. A pre-v5 mined ID already
+    /// commits to the whole transaction, signatures included. A mempool request carries the ID
+    /// computed when the transaction was received.
     pub fn tx_id(&self) -> UnminedTxId {
         match self {
-            // TODO: get the precalculated ID from the block verifier. It must be a full unmined
-            // ID recomputed from the transaction, for the reason given above.
-            Request::Block { transaction, .. } => transaction.unmined_id(),
+            Request::Block {
+                transaction,
+                transaction_id,
+                ..
+            } => {
+                debug_assert_eq!(
+                    transaction.unmined_id(),
+                    *transaction_id,
+                    "block transaction requests carry the ID of their own transaction"
+                );
+                *transaction_id
+            }
             Request::Mempool { transaction, .. } => transaction.id(),
         }
     }
@@ -339,9 +351,7 @@ impl Request {
     /// The mined transaction ID for the transaction in this request.
     pub fn tx_mined_id(&self) -> transaction::Hash {
         match self {
-            Request::Block {
-                transaction_hash, ..
-            } => *transaction_hash,
+            Request::Block { transaction_id, .. } => transaction_id.mined_id(),
             Request::Mempool { transaction, .. } => transaction.id().mined_id(),
         }
     }
@@ -350,6 +360,14 @@ impl Request {
     pub fn known_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>> {
         match self {
             Request::Block { known_utxos, .. } => known_utxos.clone(),
+            Request::Mempool { .. } => HashMap::new().into(),
+        }
+    }
+
+    /// The outputs already read as unspent at the parent of this request's block, if any.
+    fn parent_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::Utxo>> {
+        match self {
+            Request::Block { parent_utxos, .. } => parent_utxos.clone(),
             Request::Mempool { .. } => HashMap::new().into(),
         }
     }
@@ -390,19 +408,6 @@ impl Request {
     /// Returns true if the request is a mempool request.
     pub fn is_mempool(&self) -> bool {
         matches!(self, Request::Mempool { .. })
-    }
-
-    /// Returns the block verifier batch flush key, if this is a block request.
-    fn block_verifier_batch_flush_key(&self) -> Option<primitives::BlockVerifierBatchFlushKey> {
-        match self {
-            Request::Block {
-                known_outpoint_hashes,
-                ..
-            } => Some(primitives::block_verifier_batch_flush_key(
-                known_outpoint_hashes,
-            )),
-            Request::Mempool { .. } => None,
-        }
     }
 }
 
@@ -486,11 +491,22 @@ where
             UnminedTxId::Legacy(_) => None,
         };
         let span = tracing::debug_span!("tx", ?tx_id);
+        // Taken before the future first runs, so a delayed poll still holds the block's flush.
+        let queueing = match &req {
+            Request::Block {
+                known_outpoint_hashes,
+                ..
+            } if tx.has_shielded_data() => {
+                primitives::flush::Queueing::for_transaction(known_outpoint_hashes)
+            }
+            Request::Block { .. } | Request::Mempool { .. } => None,
+        };
 
         async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
             // Do quick checks first
+            check::version_has_a_verifier(&tx)?;
             check::has_inputs_and_outputs(&tx)?;
             check::has_enough_orchard_flags(&tx)?;
             check::has_enough_ironwood_flags(&tx)?;
@@ -505,6 +521,10 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
+            // This is the only check on Sapling `cv` encodings before proof
+            // verification: librustzcash keeps `cv` as bytes when it parses, so
+            // `to_librustzcash` no longer rejects an invalid one. Keep it here,
+            // ahead of every conversion and proof.
             check::sapling_point_encodings_are_valid(&tx)?;
 
             // A transaction whose own shielded counts exceed a per-block ZIP 218
@@ -632,6 +652,19 @@ where
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
+
+                // Reject unknown anchors and already-spent nullifiers before dispatching
+                // cryptographic work to the verifiers shared with block verification.
+                let response = state
+                    .clone()
+                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
+                        unmined_tx.clone(),
+                    ))
+                    .await?;
+                assert!(
+                    response == zs::Response::ValidBestChainTipNullifiersAndAnchors,
+                    "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
+                );
             }
 
             let nu = req.upgrade(&network);
@@ -640,10 +673,10 @@ where
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
-            let mut async_checks = match tx.as_ref() {
+            // Built inside the block flush scope, so each batch request takes a flush guard.
+            let build_checks = || match tx.as_ref() {
                 Transaction::V1 { .. } | Transaction::V2 { .. } | Transaction::V3 { .. } => {
-                    tracing::debug!(?tx, "got transaction with wrong version");
-                    return Err(TransactionError::WrongVersion);
+                    unreachable!("the version quick check rejects v1 to v3 transactions before any lookup")
                 }
                 Transaction::V4 {
                     joinsplit_data,
@@ -653,9 +686,9 @@ where
                     &network,
                     script_verifier,
                     cached_ffi_transaction.clone(),
-                    joinsplit_data,
+                    joinsplit_data.as_deref(),
                     tx_id,
-                )?,
+                ),
                 Transaction::V5 {
                     ..
                 } => Self::verify_v5_transaction(
@@ -664,7 +697,7 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v5 transaction has a witnessed transaction ID"),
-                )?,
+                ),
                 Transaction::V6 {
                     ..
                 } => Self::verify_v6_transaction(
@@ -673,32 +706,17 @@ where
                     script_verifier,
                     cached_ffi_transaction.clone(),
                     wtx_id.expect("a v6 transaction has a witnessed transaction ID"),
-                )?,
+                ),
             };
-
-            if let Some(unmined_tx) = mempool_transaction {
-                let check_anchors_and_revealed_nullifiers_query = state
-                    .clone()
-                    .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
-                        unmined_tx,
-                    ))
-                    .map(|res| {
-                        assert!(
-                            res? == zs::Response::ValidBestChainTipNullifiersAndAnchors,
-                            "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
-                        );
-                        Ok(())
-                    }
-                    );
-
-                async_checks.push(check_anchors_and_revealed_nullifiers_query);
-            }
-
-            let block_batch_flush_key = req.block_verifier_batch_flush_key();
+            let async_checks = match queueing.as_ref() {
+                Some(queueing) => queueing.scope(build_checks),
+                None => build_checks(),
+            }?;
+            drop(queueing);
 
             tracing::trace!(?tx_id, "awaiting async checks...");
 
-            async_checks.check(block_batch_flush_key).await?;
+            async_checks.check().await?;
 
             tracing::trace!(?tx_id, "finished async checks");
 
@@ -736,20 +754,6 @@ where
                         cached_ffi_transaction.p2sh_sigops(),
                         spent_outputs.into(),
                     )?;
-
-                    if let Some(mut mempool) = mempool {
-                        tokio::spawn(async move {
-                            // Best-effort poll of the mempool to provide a timely response to
-                            // `sendrawtransaction` RPC calls or `AwaitOutput` mempool calls.
-                            tokio::time::sleep(POLL_MEMPOOL_DELAY).await;
-                            let _ = mempool
-                                .ready()
-                                .await
-                                .expect("mempool poll_ready() method should not return an error")
-                                .call(mempool::Request::CheckForVerifiedTransactions)
-                                .await;
-                        });
-                    }
 
                     Response::Mempool { transaction, spent_mempool_outpoints }
                 },
@@ -821,7 +825,7 @@ where
     /// - vec of `Output`s in the same order as the matching inputs in the `tx`,
     /// - vec of `Outpoint`s spent by a mempool `tx` that were not found in the best chain's utxo set.
     async fn spent_utxos(
-        tx: Arc<Transaction>,
+        tx: TransactionHandle,
         req: Request,
         state: Timeout<ZS>,
         mempool: Option<Timeout<Mempool>>,
@@ -837,6 +841,7 @@ where
         // Additional UTXOs known at the time of validation,
         // i.e., from previous transactions in the block.
         let known_utxos = req.known_utxos();
+        let parent_utxos = req.parent_utxos();
 
         let inputs = tx.inputs();
         let mut spent_utxos = HashMap::new();
@@ -853,14 +858,24 @@ where
                 let utxo = if let Some(output) = known_utxos.get(outpoint) {
                     tracing::trace!("UXTO in known_utxos, discarding query");
                     output.utxo.clone()
+                } else if let Some(utxo) = parent_utxos.get(outpoint) {
+                    utxo.clone()
                 } else if is_mempool {
                     let query = state
                         .clone()
                         .oneshot(zs::Request::UnspentBestChainUtxo(*outpoint));
 
-                    let zakura_state::Response::UnspentBestChainUtxo(utxo) = query
-                        .await
-                        .map_err(|_| TransactionError::TransparentInputNotFound)?
+                    // A lookup failure other than a timeout, such as a read capacity
+                    // refusal, is not a verdict on the transaction.
+                    let zakura_state::Response::UnspentBestChainUtxo(utxo) =
+                        query.await.map_err(|boxed_error| {
+                            match boxed_error.downcast::<Elapsed>() {
+                                Ok(_) => TransactionError::TransparentInputNotFound,
+                                Err(boxed_error) => {
+                                    TransactionError::StateUnavailable(boxed_error.to_string())
+                                }
+                            }
+                        })?
                     else {
                         unreachable!("UnspentBestChainUtxo always responds with Option<Utxo>")
                     };
@@ -1024,8 +1039,8 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
-        joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         tx_id: UnminedTxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let tx = request.transaction();
@@ -1034,6 +1049,15 @@ where
         Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
+        if joinsplit_data.is_none() && sapling_bundle.is_none() {
+            // Only shielded data signs the transaction-wide sighash, so a transparent-only
+            // transaction never needs it; its inputs compute their own sighashes.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1138,7 +1162,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
@@ -1148,6 +1172,15 @@ where
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1218,7 +1251,7 @@ where
         request: &Request,
         network: &Network,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
         wtx_id: transaction::WtxId,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
@@ -1229,6 +1262,15 @@ where
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
         let orchard_bundle = cached_ffi_transaction.sighasher().orchard_bundle();
         let ironwood_bundle = cached_ffi_transaction.sighasher().ironwood_bundle();
+        if sapling_bundle.is_none() && orchard_bundle.is_none() && ironwood_bundle.is_none() {
+            // See `verify_v4_transaction`: a transparent-only transaction never needs the
+            // transaction-wide sighash.
+            return Self::verify_transparent_inputs_and_outputs(
+                request,
+                script_verifier,
+                cached_ffi_transaction,
+            );
+        }
 
         let sighash = cached_ffi_transaction
             .sighasher()
@@ -1280,7 +1322,7 @@ where
     fn verify_transparent_inputs_and_outputs(
         request: &Request,
         script_verifier: script::Verifier,
-        cached_ffi_transaction: Arc<CachedFfiTransaction>,
+        cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
     ) -> Result<AsyncChecks, TransactionError> {
         let transaction = request.transaction();
 
@@ -1309,7 +1351,7 @@ where
 
     /// Verifies a transaction's Sprout shielded join split data.
     fn verify_sprout_shielded_data(
-        joinsplit_data: &Option<transaction::JoinSplitData<Groth16Proof>>,
+        joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         shielded_sighash: &SigHash,
     ) -> Result<AsyncChecks, TransactionError> {
         let mut checks = AsyncChecks::new();
@@ -1363,11 +1405,18 @@ where
             //
             // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
             // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-            let ed25519_verifier = primitives::ed25519::VERIFIER.clone();
+            let mut ed25519_verifier = primitives::ed25519::VERIFIER.clone();
             let ed25519_item =
                 (joinsplit_data.pub_key, joinsplit_data.sig, shielded_sighash).into();
 
-            checks.push(ed25519_verifier.oneshot(ed25519_item));
+            let queueing = primitives::flush::Queueing::for_request();
+            checks.push(async move {
+                let response = ed25519_verifier.ready().await?.call(ed25519_item);
+                if let Some(queueing) = queueing {
+                    queueing.enqueued(primitives::flush::Verifier::Ed25519);
+                }
+                response.await
+            });
         }
 
         Ok(checks)
@@ -1432,10 +1481,12 @@ where
         //
         // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
         if let Some(bundle) = bundle {
+            // Called now rather than through `oneshot`, so the cache takes its block flush guard
+            // while this transaction's checks are built. Its `poll_ready` is always ready.
             async_checks.push(
                 primitives::sapling::VERIFIER
                     .clone()
-                    .oneshot(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
+                    .call(primitives::sapling::Item::new(bundle, *sighash, tx_id)),
             );
         }
 
@@ -1487,10 +1538,11 @@ where
             // bundles only under the fixed key, and NU6.3-onward bundles only
             // under the NU6.3 key (which enforces the Orchard cross-address
             // restriction even in v5 transactions).
+            // Called now rather than through `oneshot`. See `verify_sapling_bundle`.
             async_checks.push(
                 primitives::halo2::verifier_for(network_upgrade)
                     .clone()
-                    .oneshot(primitives::halo2::Item::new_with_wtx_id(
+                    .call(primitives::halo2::Item::new_with_wtx_id(
                         bundle, *sighash, wtx_id,
                     )),
             );
@@ -1531,49 +1583,18 @@ impl AsyncChecks {
     /// while that work is still running. A caller that bounds its compute on this response reads
     /// completion literally, and the wait costs nothing extra: the batches are already queued, and
     /// the batch verifiers flush them on their own latency bound at the latest.
-    async fn check(
-        mut self,
-        block_batch_flush_key: Option<primitives::BlockVerifierBatchFlushKey>,
-    ) -> Result<(), BoxError> {
-        let mut needs_block_batch_flush = block_batch_flush_key.is_some();
-        let mut block_batch_flush = match block_batch_flush_key {
-            Some(key) => async move {
-                tokio::task::yield_now().await;
-                primitives::start_block_transaction_async_checks(key);
-            }
-            .boxed(),
-            None => futures::future::pending().boxed(),
-        };
-
-        // Wait for all asynchronous checks to complete
-        // successfully, or fail verification if they error.
+    async fn check(mut self) -> Result<(), BoxError> {
         let mut first_error = None;
-        loop {
-            tokio::select! {
-                biased;
-
-                check = self.0.next() => {
-                    let Some(check) = check else {
-                        if needs_block_batch_flush {
-                            block_batch_flush.await;
-                        }
-
-                        return match first_error {
-                            Some(error) => Err(error),
-                            None => Ok(()),
-                        };
-                    };
-
-                    tracing::trace!(?check, remaining = self.0.len());
-                    if let Err(error) = check {
-                        first_error.get_or_insert(error);
-                    }
-                }
-
-                () = &mut block_batch_flush, if needs_block_batch_flush => {
-                    needs_block_batch_flush = false;
-                }
+        while let Some(check) = self.0.next().await {
+            tracing::trace!(?check, remaining = self.0.len());
+            if let Err(error) = check {
+                first_error.get_or_insert(error);
             }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }

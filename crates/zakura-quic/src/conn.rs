@@ -4,13 +4,13 @@
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex, PoisonError},
+    sync::Arc,
     time::Duration,
 };
 
 use bytes::Bytes;
 use quinn_proto::{ConnectionError, ConnectionStats, StreamId, VarInt};
-use tokio::sync::oneshot;
+use zakura_rt::sync::{oneshot, Mutex, PoisonError};
 
 use crate::{
     driver::{ConnCmd, ConnRef},
@@ -138,6 +138,13 @@ impl ConnLimits {
     /// Sets how many bidirectional streams the peer may have open.
     pub fn with_max_bidi_streams(mut self, streams: u32) -> Self {
         self.max_bidi_streams = Some(streams);
+        self
+    }
+
+    /// Sets the connection-level receive window, before credit holds
+    /// (API-10).
+    pub fn with_receive_window(mut self, bytes: u64) -> Self {
+        self.receive_window = Some(bytes);
         self
     }
 }

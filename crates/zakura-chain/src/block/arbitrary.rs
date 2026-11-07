@@ -499,7 +499,7 @@ impl Block {
                         history_tree
                             .push(
                                 &current.network,
-                                Arc::new(block.clone()),
+                                &*block,
                                 &sapling_tree.root(),
                                 &orchard_tree.root(),
                                 &ironwood_tree.root(),

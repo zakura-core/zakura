@@ -1,6 +1,6 @@
 //! Testnet-specific constants for block subsidies.
 
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 use crate::parameters::{
     constants::activation_heights,
@@ -198,18 +198,18 @@ pub(crate) const POST_NU6_1_FUNDING_STREAM_FPF_ADDRESSES: [&str;
     POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES] =
     ["t2HifwjUj9uyxr9bknR8LFuQbc98c3vkXtu"; POST_NU6_1_FUNDING_STREAMS_NUM_ADDRESSES];
 
-lazy_static! {
-    /// The funding streams for Testnet as described in:
-    /// - [protocol specification §7.10.1][7.10.1]
-    /// - [ZIP-1015](https://zips.z.cash/zip-1015)
-    /// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
-    ///
-    /// ZIP 218 moves the third halving, so the heights listed here are the heights
-    /// before ZIP 218. The Testnet parameters builder moves the end of the Revision 2
-    /// streams there, see [`FundingStreams::with_nu7_adjusted_end_height`].
-    ///
-    /// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
-    pub(crate) static ref FUNDING_STREAMS: Vec<FundingStreams> = vec![
+/// The funding streams for Testnet as described in:
+/// - [protocol specification §7.10.1][7.10.1]
+/// - [ZIP-1015](https://zips.z.cash/zip-1015)
+/// - [ZIP-214#funding-streams](https://zips.z.cash/zip-0214#funding-streams)
+///
+/// ZIP 218 moves the third halving, so the heights listed here are the heights
+/// before ZIP 218. The Testnet parameters builder moves the end of the Revision 2
+/// streams there, see [`FundingStreams::with_nu7_adjusted_end_height`].
+///
+/// [7.10.1]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
+pub(crate) static FUNDING_STREAMS: LazyLock<Vec<FundingStreams>> = LazyLock::new(|| {
+    vec![
         FundingStreams {
             height_range: Height(1_028_500)..Height(2_796_000),
             recipients: [
@@ -259,5 +259,5 @@ lazy_static! {
             .into_iter()
             .collect(),
         },
-    ];
-}
+    ]
+});

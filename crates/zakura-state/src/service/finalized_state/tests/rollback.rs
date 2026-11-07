@@ -146,7 +146,7 @@ fn assert_equivalent(
 
     // Transparent indexes and shielded nullifiers in the retained range must match a fresh sync.
     for block in retained {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             let tx_hash = transaction.hash();
 
             for (index, output) in transaction.outputs().iter().enumerate() {
@@ -195,7 +195,7 @@ fn assert_equivalent(
             block.hash
         );
 
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             for nullifier in transaction.sprout_nullifiers() {
                 assert!(
                     !rolled.contains_sprout_nullifier(nullifier),
@@ -226,7 +226,7 @@ fn count_reversible_features(blocks: &[SemanticallyVerifiedBlock]) -> (usize, us
     let mut shielded_nullifiers = 0;
 
     for block in blocks {
-        for transaction in &block.block.transactions {
+        for transaction in block.block.view().transactions() {
             transparent_spends += transaction
                 .inputs()
                 .iter()
@@ -537,10 +537,13 @@ pub(super) fn spend_tx(
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block(
+    parent: &zakura_chain::block::BlockRef,
+    transactions: Vec<Arc<Transaction>>,
+) -> Arc<Block> {
     let header = block::Header {
         previous_block_hash: parent.hash(),
-        ..*parent.header
+        ..*parent.header()
     };
     Arc::new(Block {
         header: Arc::new(header),
@@ -582,12 +585,12 @@ fn sprout_joinsplit_tx() -> Arc<Transaction> {
         outputs: Vec::new(),
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
-        joinsplit_data: Some(zakura_chain::transaction::JoinSplitData {
+        joinsplit_data: Some(Box::new(zakura_chain::transaction::JoinSplitData {
             first: joinsplit,
             rest: Vec::new(),
             pub_key: zakura_chain::primitives::ed25519::VerificationKeyBytes::from([0; 32]),
             sig: zakura_chain::primitives::ed25519::Signature::from([0; 64]),
-        }),
+        })),
         sapling_shielded_data: None,
     })
 }
@@ -635,7 +638,7 @@ pub(super) fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwo
 }
 
 pub(super) fn child_block_with_history_commitment(
-    parent: &Block,
+    parent: &zakura_chain::block::BlockRef,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
     previous_history_tree: &zakura_chain::history_tree::HistoryTree,

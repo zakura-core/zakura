@@ -161,7 +161,7 @@ impl PoisonFixture {
             let child = Arc::new(child);
             history_tree.push(
                 &chain_network,
-                child.clone(),
+                &child,
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
@@ -278,7 +278,7 @@ impl FixturePeers {
                     } else {
                         self.blocks[height as usize].clone()
                     };
-                    blocks.push(InventoryResponse::Available((block, None)));
+                    blocks.push(InventoryResponse::Available((block.into(), None)));
                 }
                 Ok(zn::Response::Blocks(blocks))
             }
@@ -328,7 +328,11 @@ async fn run_scenario(
     } else {
         block::Height::MAX
     };
-    let (state, _, latest_chain_tip, _) = zs::init(
+    let zs::InitializedState {
+        state,
+        latest_chain_tip,
+        ..
+    } = zs::init(
         zs::Config::ephemeral(),
         &fixture.network,
         state_max_checkpoint,
@@ -640,7 +644,7 @@ impl SybilPeers {
                         self.blocks[height as usize].clone()
                     };
                     blocks.push(InventoryResponse::Available((
-                        block,
+                        block.into(),
                         Some(Self::addr(peer)),
                     )));
                 }
@@ -694,7 +698,11 @@ async fn run_sybil_scenario(sybils: usize) -> Result<SybilOutcome, Report> {
         "the forged block is in the final checkpoint window",
     );
 
-    let (state, _, latest_chain_tip, _) = zs::init(
+    let zs::InitializedState {
+        state,
+        latest_chain_tip,
+        ..
+    } = zs::init(
         zs::Config::ephemeral(),
         &fixture.network,
         final_checkpoint,

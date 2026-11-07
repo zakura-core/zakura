@@ -1,4 +1,5 @@
 pub(crate) mod candidate_set;
+mod driver;
 mod initialize;
 mod inventory_registry;
 mod legacy_peer_trace;

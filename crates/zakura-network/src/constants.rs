@@ -83,27 +83,11 @@ pub const OUTBOUND_PEER_LIMIT_DIVISOR: usize = 2;
 ///       connections to an IP.
 pub const DEFAULT_MAX_CONNS_PER_IP: usize = 1;
 
-/// The default advert window of a block at or above the full size.
-///
-/// This will be used as `Config.advert_window_min` if it is not configured. It equals
-/// [`DEFAULT_ADVERT_WINDOW_MAX`], so by default every block is advertised to up to 1000 peers at
-/// once, whatever its size.
-pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 1000;
+/// The default initial peer count for a full-sized or unknown-sized block.
+pub const DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
 
-/// The default advert window of a block at or below the small size.
-///
-/// This will be used as `Config.advert_window_max` if it is not configured.
-pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 1000;
-
-/// The `advert_window_min` default before it became [`DEFAULT_ADVERT_WINDOW_MIN`].
-///
-/// `zakurad generate` wrote it into config files, so a loaded config treats it as unset.
-pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_MIN: usize = 32;
-
-/// The `advert_window_max` default before it became [`DEFAULT_ADVERT_WINDOW_MAX`].
-///
-/// `zakurad generate` wrote it into config files, so a loaded config treats it as unset.
-pub(crate) const LEGACY_DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
+/// The default initial peer count for a small block.
+pub const DEFAULT_ADVERT_WINDOW_MAX: usize = 64;
 
 /// The default block size that gets the maximum advert window, 100 KiB.
 ///
@@ -139,6 +123,9 @@ pub const PEERSET_BUFFER_SIZE: usize = 3;
 /// The timeout for sending a message to a remote peer,
 /// and receiving a response from a remote peer.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Bounds a daemon block broadcast, including peer discovery and delivery tracking.
+pub const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The timeout for connections and handshakes when connecting to new peers.
 ///

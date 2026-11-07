@@ -1232,11 +1232,33 @@ impl ZakuraEndpoint {
         }
     }
 
-    /// Whether discovery has an admission permit and can start an address
-    /// attempt while preserving inbound capacity (zakura-quic ADM-12).
-    /// Multi-address dials still reserve all their slots in the transport.
-    pub(crate) fn has_discovery_admission_capacity(&self) -> bool {
-        self.handler.admission.available_permits() > 0 && self.quic.has_discovery_capacity()
+    /// How many address attempts discovery can start now while preserving
+    /// inbound capacity (zakura-quic ADM-12): none without an admission
+    /// permit, otherwise the transport's free discovery slots. A dial claims
+    /// a slot for every address it tries, or fails with none claimed.
+    pub(crate) fn discovery_admission_capacity(&self) -> usize {
+        if self.handler.admission.available_permits() == 0 {
+            return 0;
+        }
+        self.quic.discovery_capacity()
+    }
+
+    /// How many dials discovery can start now: the handler's free admission
+    /// permits. Each dial holds one permit from its start, or fails as a
+    /// local limit without one.
+    pub(crate) fn discovery_dial_permits(&self) -> usize {
+        self.handler.admission.available_permits()
+    }
+
+    /// Holds `count` of the handler's admission permits until the returned
+    /// permit drops.
+    #[cfg(test)]
+    pub(crate) fn hold_admission_permits(&self, count: u32) -> OwnedSemaphorePermit {
+        self.handler
+            .admission
+            .clone()
+            .try_acquire_many_owned(count)
+            .expect("the test holds free permits")
     }
 
     /// Stop accepting, close every native connection and drain background tasks.
@@ -2074,18 +2096,15 @@ impl ZakuraSupervisorHandle {
     /// per-IP cap, counting `in_flight_count` dials this caller already has in
     /// flight to that IP. Used by the discovery dialer to reserve per-IP slots
     /// before launching a candidate dial.
-    pub(crate) async fn can_accept_remote_ip_with_in_flight(
+    pub(crate) fn can_accept_remote_ip_with_in_flight(
         &self,
         remote_ip: IpAddr,
         in_flight_count: usize,
     ) -> bool {
-        let remote_ip = canonical_ip(remote_ip);
-        let state = self.inner.lock().await;
-        state
-            .ip_slots
-            .registered(remote_ip)
+        self.ip_slots
+            .registered(canonical_ip(remote_ip))
             .saturating_add(in_flight_count)
-            < state.max_connections_per_ip
+            < self.max_connections_per_ip
     }
 }
 
@@ -5212,9 +5231,9 @@ pub(crate) enum DialRegistration {
 
 /// The channels on which a discovery or maintained dial reports its progress.
 pub(crate) struct DialReport {
-    /// Receives the IP whose handshake TLS authenticated, before the control
-    /// handshake starts.
-    pub(crate) admitted_ip: oneshot::Sender<IpAddr>,
+    /// Receives the address whose handshake TLS authenticated, before the
+    /// control handshake starts.
+    pub(crate) admitted_addr: oneshot::Sender<SocketAddr>,
     /// Receives how registration ended. The dial drops it unsent when it ends
     /// before registration, or when this node refuses the peer for a reason
     /// other than a local limit.
@@ -5292,7 +5311,7 @@ pub(crate) async fn serve_reported_native_dial_connection(
     };
     let registration_report = report.map(|report| {
         // The receiver is gone when the caller stopped waiting for the result.
-        let _ = report.admitted_ip.send(connection.admitted_ip());
+        let _ = report.admitted_addr.send(connection.admitted_addr());
         report.registration
     });
     let remote_node_id = connection.remote_id();
@@ -5878,6 +5897,26 @@ fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
     )
 }
 
+/// Runs a request's service call until it answers, the connection closes or
+/// the requester stops the response stream, and returns `None` for a close or
+/// a stop.
+///
+/// The select polls the call before the stop. A call that returns its protocol
+/// rejection before its first `Pending` therefore reports it even when the
+/// stop is already recorded.
+async fn call_until_stopped<T>(
+    connection_token: &CancellationToken,
+    call: impl future::Future<Output = T>,
+    stopped: std::pin::Pin<&mut impl future::Future>,
+) -> Option<T> {
+    zakura_rt::select! {
+        biased;
+        _ = connection_token.cancelled() => None,
+        response = call => Some(response),
+        _ = stopped => None,
+    }
+}
+
 async fn request_stream_worker(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -5960,25 +5999,57 @@ async fn request_stream_worker(
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
         return;
     };
+    // A requester that gives up stops the response stream. The stop ends the
+    // output wait and the service's call, so the abandoned request releases
+    // its funding and no longer runs its backend work. The connection task
+    // already answered the stop with RESET_STREAM.
+    //
+    // A stop gives up the answer, not the protocol: a request the service
+    // would reject as protocol-invalid still closes the connection. A stop
+    // during the output wait runs the service's checks on the frame. A stop
+    // during the call can win only after the call's first `Pending`, because
+    // the select polls the call first, and a service returns its protocol
+    // rejections before then (`RequestResponseService::request_frame`).
+    let stopped = send.stopped();
+    zakura_rt::pin!(stopped);
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         output = context.resources.output.admit(bound.bytes) => output,
+        stop = &mut stopped => {
+            if stop.is_ok() {
+                if let Err(SinkReject::Protocol(error)) =
+                    registry.check_request(prelude.stream_kind, &frame)
+                {
+                    debug!(
+                        ?error,
+                        "Zakura inbound sink rejected a stopped protocol-invalid request"
+                    );
+                    context.close_cause.record("request_protocol_reject");
+                    context.connection_token.cancel();
+                }
+            }
+            return;
+        }
     };
 
     // The raw frame's grant ends with the service's call, which cancelling the
-    // connection also ends.
-    let response = zakura_rt::select! {
-        biased;
-        _ = context.connection_token.cancelled() => return,
-        response = registry.request(
+    // connection or stopping the stream also ends.
+    let Some(response) = call_until_stopped(
+        &context.connection_token,
+        registry.request(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
             response_frame_cap,
             context.limits.max_message_bytes,
             frame,
-        ) => response,
+        ),
+        stopped,
+    )
+    .await
+    else {
+        return;
     };
     drop(raw_grant);
     let response_frames = match response {
@@ -9276,7 +9347,7 @@ mod tests {
         })
         .await?
         .expect("v2_p2p is enabled in test config");
-        assert!(endpoint.has_discovery_admission_capacity());
+        assert!(endpoint.discovery_admission_capacity() > 0);
 
         // Three dials to a socket that never answers hold every live slot.
         let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -9296,7 +9367,7 @@ mod tests {
         }
 
         assert!(endpoint.handler.admission.available_permits() > 0);
-        assert!(!endpoint.has_discovery_admission_capacity());
+        assert_eq!(endpoint.discovery_admission_capacity(), 0);
         for dial in dials {
             dial.abort();
         }
@@ -10107,9 +10178,7 @@ mod tests {
 
         for alias in [ipv4, mapped, compatible, six_to_four, teredo, nat64] {
             assert!(
-                !supervisor
-                    .can_accept_remote_ip_with_in_flight(alias, 0)
-                    .await,
+                !supervisor.can_accept_remote_ip_with_in_flight(alias, 0),
                 "{alias} must share the occupied IPv4 identity bucket"
             );
         }

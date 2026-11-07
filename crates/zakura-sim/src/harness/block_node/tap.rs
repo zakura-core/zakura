@@ -459,6 +459,13 @@ impl BlockTap {
                 }
                 .to_owned(),
             },
+            BlockEvent::StaleScope {
+                body: held,
+                scope_epoch,
+            } => BlockSyncFact::StaleScope {
+                body: body(held),
+                scope_epoch: scope_epoch.map(|epoch| epoch.get()),
+            },
             BlockEvent::ServingLease {
                 peer: requesting,
                 conn_id,

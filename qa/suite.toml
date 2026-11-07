@@ -138,6 +138,18 @@ run = false
 reason = "a tool, not a test: it rewrites the committed seeds"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_reset_mid_flight_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_capacity_frontier_first_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed frontier-first input"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_release_wake.rs"
 test = "regenerate_release_wake_seeds"
 run = false
@@ -220,9 +232,12 @@ seconds = 900
 weekly-seconds = 3600
 rss-mb = 2048
 
+# The simulator's scheduled run is a smoke: it shows each target still builds
+# and runs, and isn't meant to find bugs. Sunday's run is the same smoke. Long
+# campaigns run on a remote host, as qa/fuzz/sim's README says under Long runs.
 [campaign.sim]
-seconds = 900
-weekly-seconds = 3600
+seconds = 120
+weekly-seconds = 120
 rss-mb = 4096
 
 # The header-chain targets. Their `args` also set their campaign's limits.

@@ -350,12 +350,16 @@ pub fn request(request: &RequestIdentity) -> StorageRequest {
             common_ancestor,
             target,
             headers,
+            work,
+            first,
         } => StorageRequest::PrepareHeaderTarget {
             owner: work_owner(*owner),
             source: peer(*source),
             common_ancestor: point(*common_ancestor),
             target: point(*target),
             headers: *headers,
+            work: work.map(|work| work.as_u256().to_string()),
+            first: first.map(point),
         },
         RequestIdentity::ApplyHeaderTarget {
             owner,

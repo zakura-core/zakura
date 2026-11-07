@@ -22,6 +22,7 @@ use zakura_chain::{
     work::{difficulty::ExpandedDifficulty, equihash},
 };
 use zakura_header_chain::{CompactTargetError, PowPolicy};
+use zakura_state::ValidateContextError;
 
 use crate::{error::*, funding_stream_address};
 
@@ -56,16 +57,24 @@ impl UnmatchedCoinbaseOutputs {
     }
 }
 
+/// Facts established by the coinbase-position check without another transaction pass.
+#[derive(Debug)]
+pub(super) struct CoinbaseSummary<'a> {
+    pub coinbase_tx: &'a transaction::Transaction,
+    /// Whether a non-coinbase transaction spends a transparent output.
+    pub has_transparent_spends: bool,
+}
+
 /// Checks if there is exactly one coinbase transaction in `Block`,
 /// and if that coinbase transaction is the first transaction in the block.
-/// Returns a borrowed coinbase transaction on success.
+/// Returns the borrowed coinbase and whether any other transaction has transparent inputs.
 ///
 /// > A transaction that has a single transparent input with a null prevout field,
 /// > is called a coinbase transaction. Every block has a single coinbase
 /// > transaction as the first transaction in the block.
 ///
 /// <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-pub fn coinbase_is_first(block: &BlockRef) -> Result<&transaction::Transaction, BlockError> {
+pub(super) fn coinbase_is_first(block: &BlockRef) -> Result<CoinbaseSummary<'_>, BlockError> {
     // # Consensus
     //
     // > A block MUST have at least one transaction
@@ -84,18 +93,48 @@ pub fn coinbase_is_first(block: &BlockRef) -> Result<&transaction::Transaction, 
     // > field, is called a coinbase transaction.
     //
     // <https://zips.z.cash/protocol/protocol.pdf#coinbasetransactions>
-    let mut rest = block.transactions().skip(1);
+    let rest = block.transactions().skip(1);
     if !first.is_coinbase() {
         Err(TransactionError::CoinbasePosition)?;
     }
     // > A transparent input in a non-coinbase transaction MUST NOT have a null prevout
     //
     // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
-    if !rest.all(|tx| tx.is_valid_non_coinbase()) {
-        Err(TransactionError::CoinbaseAfterFirst)?;
+    let mut has_transparent_spends = false;
+    for tx in rest {
+        if !tx.is_valid_non_coinbase() {
+            Err(TransactionError::CoinbaseAfterFirst)?;
+        }
+        has_transparent_spends |= tx.has_transparent_inputs();
     }
 
-    Ok(first)
+    Ok(CoinbaseSummary {
+        coinbase_tx: first,
+        has_transparent_spends,
+    })
+}
+
+/// Rejects transparent outputs spent by different transactions in the same block.
+///
+/// This depends only on transaction IDs, so callers must establish the block's Merkle
+/// binding before attributing a failure to its header. Duplicate inputs within one
+/// transaction remain the transaction verifier's responsibility and retain its error
+/// classification. Coinbase inputs do not reference outputs and are skipped.
+pub(super) fn transparent_spends_are_unique(block: &BlockRef) -> Result<(), ValidateContextError> {
+    let mut spent = HashSet::new();
+    for transaction in block.transactions() {
+        for outpoint in transaction.spent_outpoints() {
+            if spent.contains(&outpoint) {
+                return Err(ValidateContextError::duplicate_transparent_spend_in_block(
+                    outpoint,
+                ));
+            }
+        }
+        // Insert only after checking this transaction, so an internal duplicate does
+        // not become a cross-transaction failure with a different peer penalty.
+        spent.extend(transaction.spent_outpoints());
+    }
+    Ok(())
 }
 
 /// Returns `Ok(ExpandedDifficulty)` if the`difficulty_threshold` of `header` is at least as difficult as

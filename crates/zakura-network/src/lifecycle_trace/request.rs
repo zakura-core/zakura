@@ -19,7 +19,7 @@
 //! not stamped, so they are not counted while queued, but a ping being served is reported as
 //! the active request.
 
-use std::{sync::atomic::Ordering, time::Instant};
+use std::{fmt, sync::atomic::Ordering, time::Instant};
 
 use serde::Serialize;
 use zakura_chain::{block, transaction};
@@ -253,6 +253,28 @@ impl ConnectionTrace {
     ///
     /// A request that is not `canceled` becomes the connection's active request.
     pub(crate) fn dequeued(&self, trace: &RequestTrace, request: &Request, canceled: bool) {
+        let result = canceled.then_some("canceled");
+        self.dequeue_row(trace, request, result, None);
+    }
+
+    /// Records a pending request that the failed connection answered with `error`.
+    pub(crate) fn flushed(
+        &self,
+        trace: &RequestTrace,
+        request: &Request,
+        error: &dyn fmt::Display,
+    ) {
+        self.dequeue_row(trace, request, Some("error"), Some(error));
+    }
+
+    /// Emits a `dequeue` row. A request with no `result` becomes the active request.
+    fn dequeue_row(
+        &self,
+        trace: &RequestTrace,
+        request: &Request,
+        result: Option<&'static str>,
+        error: Option<&dyn fmt::Display>,
+    ) {
         let Some(state) = self.requests() else {
             return;
         };
@@ -275,7 +297,7 @@ impl ConnectionTrace {
             None => (None, RequestDesc::new(request), None),
         };
 
-        if !canceled {
+        if result.is_none() {
             *state.lock(&state.active) = Some(ActiveRequest {
                 request_id,
                 desc,
@@ -287,7 +309,8 @@ impl ConnectionTrace {
         state.emitter.emit_event(|| RequestRow {
             queued: Some(queued),
             queue_us,
-            result: canceled.then_some("canceled"),
+            result,
+            error: error.map(ToString::to_string),
             ..state.request_row(self.id, "dequeue", request_id, desc)
         });
     }

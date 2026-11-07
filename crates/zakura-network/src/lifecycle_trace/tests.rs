@@ -302,6 +302,29 @@ fn request_rows_show_the_request_a_selected_connection_is_already_serving() {
 }
 
 #[test]
+fn requests_flushed_by_a_failed_connection_record_its_error() {
+    let (trace, mut rx) = capture(JsonlTraceTables::all());
+    let conn = trace.connection(false, "failed");
+    let request = Request::BlocksByHash([hash(5)].into_iter().collect());
+
+    conn.dispatched(1, &request, "advertised", 1);
+    let stamped = conn.stamp_dispatched(&request);
+    conn.enqueued(&stamped);
+    conn.flushed(&stamped, &request, &"connection closed");
+    conn.dispatched(2, &Request::Peers, "p2c", 1);
+
+    let rows = rows(&drain(&mut rx), tables::P2P_REQUEST);
+    let flushed = &rows[2];
+    assert_eq!(flushed["event"], "dequeue");
+    assert_eq!(flushed["request_id"], "1");
+    assert_eq!(flushed["result"], "error");
+    assert_eq!(flushed["error"], "connection closed");
+    assert_eq!(flushed["queued"], "0");
+    // A flushed request never becomes the connection's active request.
+    assert!(rows[3]["active_request"].is_empty());
+}
+
+#[test]
 fn unstamped_requests_are_active_but_not_queued() {
     let (trace, mut rx) = capture(JsonlTraceTables::all());
     let conn = trace.connection(false, "pinged");

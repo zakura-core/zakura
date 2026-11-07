@@ -2009,7 +2009,7 @@ where
             trace,
         }) = self.client_rx.close_and_flush_next()
         {
-            self.trace.dequeued(&trace, &request, true);
+            self.trace.flushed(&trace, &request, &error);
             trace!(
                 parent: &span,
                 %error,

@@ -958,6 +958,11 @@ where
     prepared_block.height = height;
     prepared_block.receipt_order = receipt_order;
     prepared_block.origin = origin;
+    // The cached root was computed from the cached body. The commitment check believes the root
+    // it is given over the block in front of it, so the cache comparison must not be what
+    // decides whether the two belong together: compute this commit's root from the body being
+    // committed. One pass over an already-verified body, shared by the relay preflight below.
+    prepared_block.auth_data_root = Some(prepared_block.block.view().auth_data_digests().root);
 
     if source == PreparedCandidateSource::ServerTemplate
         && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?

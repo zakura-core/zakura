@@ -4303,3 +4303,248 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     .await
     .expect("duplicate receipt regression must finish");
 }
+
+/// A pool can rewrite its coinbase's authorizing data without changing any transaction ID, so
+/// the block's Merkle root and every transaction ID stay the same while its authorizing-data
+/// root changes. The reported submission is the last case here: the node prepared a template,
+/// the pool changed the coinbase and recomputed `hashBlockCommitments` for it, and submitted.
+///
+/// Each case runs against a real state service and the production semantic verifier, with and
+/// without the prepared candidate for the template, and with and without a first submission
+/// that still carries the template's commitment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changed_coinbase_auth_data_commits_with_its_own_commitment() {
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        for warm_cache in [false, true] {
+            for submit_stale_commitment_first in [false, true] {
+                let case =
+                    format!("warm_cache={warm_cache} stale_first={submit_stale_commitment_first}");
+                let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+                let zakura_state::InitializedState {
+                    state,
+                    latest_chain_tip: tip,
+                    ..
+                } = zs::init_test_services(&network).await;
+                let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                    .zcash_deserialize_into()
+                    .unwrap();
+                state
+                    .clone()
+                    .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                        genesis.clone().into(),
+                    ))
+                    .await
+                    .unwrap();
+
+                // The template the node hands the pool.
+                let mut candidate = nu5_prepared_test_block(&network, None);
+                let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                    &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+                    &candidate.auth_data_root(),
+                );
+                let header = Arc::make_mut(&mut candidate.header);
+                header.previous_block_hash = genesis.hash();
+                header.time = genesis.header.time + chrono::Duration::seconds(150);
+                header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+                let candidate = Arc::new(candidate);
+
+                // Transaction signatures are outside this reproduction. Commitment validation
+                // runs in the real state service.
+                let transaction = service_fn(|request| async move {
+                    Ok::<_, BoxError>(accept_block_transaction(request))
+                });
+                let mut verifier = SemanticBlockVerifier::new(
+                    &network,
+                    crate::transaction::boxed_state(state.clone()),
+                    crate::transaction::boxed_transaction_verifier(transaction),
+                );
+                if warm_cache {
+                    // Preparing the template also leaves the state's prepared-chain result,
+                    // which a solved block matches by parent hash and transaction IDs.
+                    prepare_for_test(&mut verifier, candidate.clone()).await;
+                    assert!(verifier
+                        .prepared_candidates
+                        .lookup(&candidate, &network)
+                        .is_some());
+                }
+
+                // The pool rewrites the coinbase's extra data.
+                let mut submitted = candidate.as_ref().clone();
+                let Transaction::V5 { inputs, .. } = Arc::make_mut(&mut submitted.transactions[0])
+                else {
+                    unreachable!("the fixture has a v5 coinbase")
+                };
+                let transparent::Input::Coinbase { data, .. } = &mut inputs[0] else {
+                    unreachable!("the fixture input is a coinbase input")
+                };
+                data.extend_from_slice(b"pool-extranonce");
+                assert_eq!(
+                    candidate.transaction_hashes().as_ref(),
+                    submitted.transaction_hashes().as_ref(),
+                    "{case}: the coinbase ID must not cover its authorizing data"
+                );
+                assert_eq!(candidate.header.merkle_root, submitted.header.merkle_root);
+                assert_ne!(candidate.auth_data_root(), submitted.auth_data_root());
+                assert!(
+                    verifier
+                        .prepared_candidates
+                        .lookup(&submitted, &network)
+                        .is_none(),
+                    "{case}: changed authorizing data must miss the prepared candidate"
+                );
+
+                if submit_stale_commitment_first {
+                    // The same body under the template's commitment is invalid.
+                    let stale = verifier
+                        .ready()
+                        .await
+                        .unwrap()
+                        .call(Request::CommitMined {
+                            size: submitted.zcash_serialized_size(),
+                            block: Arc::new(submitted.clone()).into(),
+                            admission: zs::BlockAdmission::pending(),
+                        })
+                        .await
+                        .expect_err("a changed coinbase under the old commitment must fail");
+                    assert!(
+                        format!("{stale:?}").contains("InvalidChainHistoryBlockTxAuthCommitment"),
+                        "{case}: {stale:?}"
+                    );
+                }
+
+                // The pool recomputes `hashBlockCommitments` for its own coinbase.
+                let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                    &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+                    &submitted.auth_data_root(),
+                );
+                Arc::make_mut(&mut submitted.header).commitment_bytes =
+                    <[u8; 32]>::from(commitment).into();
+                let expected = submitted.hash();
+                let size = submitted.zcash_serialized_size();
+                let accepted = verifier
+                    .ready()
+                    .await
+                    .unwrap()
+                    .call(Request::CommitMined {
+                        size,
+                        block: Arc::new(submitted).into(),
+                        admission: zs::BlockAdmission::pending(),
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{case}: the changed coinbase and its commitment must commit: {error:?}")
+                    });
+                assert_eq!(accepted, expected, "{case}");
+                assert_eq!(tip.best_tip_hash(), Some(expected), "{case}");
+            }
+        }
+    })
+    .await
+    .expect("the changed-coinbase reproduction must finish");
+}
+
+/// A prepared verification carrying a root from a different body must not decide this block's
+/// commitment check. The fast path recomputes the root from the body it commits, so the only
+/// thing a cache hit contributes is verification work, never the commitment verdict.
+///
+/// Before that, the forwarded root was believed over the submitted body, and this valid block
+/// was rejected with the same error as a submission whose header carries a stale commitment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prepared_root_from_another_body_does_not_decide_the_commitment() {
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let zakura_state::InitializedState {
+            state,
+            latest_chain_tip: tip,
+            ..
+        } = zs::init_test_services(&network).await;
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        state
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                genesis.clone().into(),
+            ))
+            .await
+            .unwrap();
+
+        // The template body, whose root becomes the one that does not belong.
+        let mut template = nu5_prepared_test_block(&network, None);
+        let foreign_root = template.auth_data_root();
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &foreign_root,
+        );
+        let header = Arc::make_mut(&mut template.header);
+        header.previous_block_hash = genesis.hash();
+        header.time = genesis.header.time + chrono::Duration::seconds(150);
+        header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+
+        // The submitted block: the same body with a rewritten coinbase, committed to correctly.
+        let mut submitted = template.clone();
+        let Transaction::V5 { inputs, .. } = Arc::make_mut(&mut submitted.transactions[0]) else {
+            unreachable!("the fixture has a v5 coinbase")
+        };
+        let transparent::Input::Coinbase { data, .. } = &mut inputs[0] else {
+            unreachable!("the fixture input is a coinbase input")
+        };
+        data.extend_from_slice(b"pool-extranonce");
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &submitted.auth_data_root(),
+        );
+        Arc::make_mut(&mut submitted.header).commitment_bytes = <[u8; 32]>::from(commitment).into();
+        let submitted = Arc::new(submitted);
+        assert_ne!(foreign_root, submitted.auth_data_root());
+
+        let transaction =
+            service_fn(
+                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
+            );
+        let mut verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state.clone()),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
+
+        // A prepared verification of exactly this body, carrying the other body's root. The
+        // transaction comparison that makes a hit safe cannot see the difference, because
+        // authorizing data is not part of a transaction ID.
+        let mut prepared = zs::SemanticallyVerifiedBlock::from(submitted.clone());
+        prepared.auth_data_root = Some(foreign_root);
+        verifier.prepared_candidates.insert(
+            PreparedCandidateSource::ClientProposal,
+            prepared,
+            &network,
+        );
+        assert!(verifier
+            .prepared_candidates
+            .lookup(&submitted, &network)
+            .is_some());
+
+        let committed = verifier
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::CommitMined {
+                size: submitted.zcash_serialized_size(),
+                block: submitted.clone().into(),
+                admission: zs::BlockAdmission::pending(),
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a valid body must not be judged against another body's root: {error:?}")
+            });
+        assert_eq!(committed, submitted.hash());
+        assert_eq!(tip.best_tip_hash(), Some(submitted.hash()));
+    })
+    .await
+    .expect("the forwarded-root test must finish");
+}

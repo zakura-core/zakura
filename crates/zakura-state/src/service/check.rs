@@ -321,6 +321,14 @@ pub(crate) fn auth_data_commitment(
 
 /// Check that `block` is contextually valid for `network`, using
 /// the `history_tree` up to and including the previous block.
+///
+/// `precomputed_auth_data_root` must be the authorizing-data root of `block`'s own
+/// transactions. This check cannot verify that cheaply, which is the whole point of accepting
+/// it, so a caller that pairs a root with a different body makes a valid block look like one
+/// whose header does not commit to it. The failure is closed, not open: a wrong root rejects
+/// the block rather than admitting it, which `block_commitment_uses_the_precomputed_auth_data_root`
+/// covers. Every caller computes the root from the block it passes here, in the same place it
+/// pairs the two, so no comparison made elsewhere decides this verdict.
 #[tracing::instrument(skip(block, history_tree))]
 pub(crate) fn block_commitment_is_valid_for_chain_history(
     block: BlockHandle,

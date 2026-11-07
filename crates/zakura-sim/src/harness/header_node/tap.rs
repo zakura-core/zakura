@@ -482,6 +482,17 @@ impl TapState {
         if in_run {
             state.sessions.reactor(&event);
         }
+        // Budget changes, credit and causes stay out of the log, whose
+        // format pinned Plans fix, and a teardown's returns after the run
+        // are expected.
+        if matches!(
+            event,
+            ReactorEvent::BudgetChanged { .. }
+                | ReactorEvent::CreditIssued { .. }
+                | ReactorEvent::CauseSet { .. }
+        ) {
+            return;
+        }
         let at = zakura_scheduler::hooks::now()
             .filter(|_| in_run)
             .map(|now| now.since_start());

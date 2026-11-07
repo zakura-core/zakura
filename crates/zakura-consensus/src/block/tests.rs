@@ -4548,3 +4548,114 @@ async fn a_prepared_root_from_another_body_does_not_decide_the_commitment() {
     .await
     .expect("the forwarded-root test must finish");
 }
+
+/// A body its header does not commit to must not be committed, whatever root a prepared
+/// candidate carries.
+///
+/// This is the severity ceiling of a forwarded authorizing-data root. From NU5 a transaction ID
+/// covers a transaction's effects and not its scriptSigs, so rewriting a coinbase leaves every
+/// transaction ID, and therefore the transaction Merkle root, unchanged. The header's only
+/// commitment to the rewritten data is `hashBlockCommitments`. If the commitment check believes a
+/// root handed to it rather than deriving one from the body in front of it, then a body swapped
+/// for another that differs only in authorizing data would pass every check, and the chain would
+/// commit content its own header does not commit to.
+///
+/// That does not happen, and this test holds whether or not the committing caller derives the
+/// root itself: a candidate is reused only for a body equal to the one that was prepared, so a
+/// delivered body that differs takes full verification and is judged against its own authorizing
+/// data. Forwarding a root from another body can therefore only reject a block the header does
+/// commit to, never admit one it does not. This test keeps that bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_its_header_does_not_commit_to_is_rejected() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let zakura_state::InitializedState { state, .. } = zs::init_test_services(&network).await;
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        state
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                genesis.clone().into(),
+            ))
+            .await
+            .unwrap();
+
+        // The body the header commits to.
+        let mut prepared_body = nu5_prepared_test_block(&network, None);
+        let header = Arc::make_mut(&mut prepared_body.header);
+        header.previous_block_hash = genesis.hash();
+        header.time = genesis.header.time + chrono::Duration::seconds(150);
+        let committed_root = prepared_body.auth_data_root();
+        let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+            &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+            &committed_root,
+        );
+        Arc::make_mut(&mut prepared_body.header).commitment_bytes =
+            <[u8; 32]>::from(commitment).into();
+        let prepared_body = Arc::new(prepared_body);
+
+        // The body actually delivered: the same transaction IDs, different authorizing data,
+        // under the very same header. Only `hashBlockCommitments` tells the two apart.
+        let mut delivered = (*prepared_body).clone();
+        let Transaction::V5 { inputs, .. } = Arc::make_mut(&mut delivered.transactions[0]) else {
+            unreachable!("the fixture has a v5 coinbase")
+        };
+        let transparent::Input::Coinbase { data, .. } = &mut inputs[0] else {
+            unreachable!("the fixture input is a coinbase input")
+        };
+        data.extend_from_slice(b"someone-elses-extranonce");
+        let delivered = Arc::new(delivered);
+
+        assert_eq!(
+            delivered.transaction_hashes(),
+            prepared_body.transaction_hashes(),
+            "a coinbase rewrite must leave every transaction ID unchanged, or this test \
+             is not exercising the authorizing-data commitment"
+        );
+        assert_eq!(
+            delivered.header.merkle_root, prepared_body.header.merkle_root,
+            "the transaction Merkle root must not tell the two bodies apart"
+        );
+        assert_ne!(
+            delivered.auth_data_root(),
+            committed_root,
+            "the two bodies must differ in authorizing data"
+        );
+
+        let transaction =
+            service_fn(
+                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
+            );
+        let mut verifier = SemanticBlockVerifier::new(
+            &network,
+            crate::transaction::boxed_state(state.clone()),
+            crate::transaction::boxed_transaction_verifier(transaction),
+        );
+
+        // A prepared candidate for the committed body, with its own correct root.
+        let mut prepared = zs::SemanticallyVerifiedBlock::from(prepared_body.clone());
+        prepared.auth_data_root = Some(committed_root);
+        verifier.prepared_candidates.insert(
+            PreparedCandidateSource::ClientProposal,
+            prepared,
+            &network,
+        );
+
+        let error = verifier
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::CommitMined {
+                size: delivered.zcash_serialized_size(),
+                block: delivered.clone().into(),
+                admission: zs::BlockAdmission::pending(),
+            })
+            .await
+            .expect_err("a body the header does not commit to must not be committed");
+        tracing::info!(?error, "delivered body verdict");
+    })
+    .await
+    .expect("the uncommitted-body test must finish");
+}

@@ -2,7 +2,7 @@
 
 use futures::{FutureExt, Sink, SinkExt};
 
-use zakura_chain::serialization::{SerializationError, ZcashSerialize};
+use zakura_chain::serialization::SerializationError;
 
 use crate::{
     constants::REQUEST_TIMEOUT,
@@ -81,8 +81,11 @@ where
         else {
             return false;
         };
-        // A block's encoded size is far below `u64::MAX`.
-        let message_len = (block.zcash_serialized_size() + HEADER_LEN) as u64;
+        // The traced send already cached the block's size.
+        let Some(block_len) = self.trace.p2p_block_size(block) else {
+            return false;
+        };
+        let message_len = block_len.saturating_add(HEADER_LEN as u64);
         let Some(watch) = progress.start(message_len) else {
             return false;
         };

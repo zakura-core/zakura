@@ -220,6 +220,14 @@ fn block_hash(item: &InventoryHash) -> Option<block::Hash> {
 }
 
 impl ConnectionTrace {
+    /// Returns the serialized size of `block` from the shared block size cache.
+    ///
+    /// Returns `None` when the tracer does not write the `p2p` table.
+    pub(crate) fn p2p_block_size(&self, block: &block::Block) -> Option<u64> {
+        let state = self.p2p()?;
+        Some(state.block_sizes.get_or_compute(block.hash(), block))
+    }
+
     /// Records that the connection task is about to write `msg`.
     ///
     /// Returns `None` when the tracer does not write the `p2p` table.

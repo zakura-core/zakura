@@ -1,15 +1,16 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-index d2597dd51e..bac4bc0900 100644
+index 7aa1720809..d8befcbf9c 100644
 --- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
-@@ -515,44 +515,8 @@ impl HeaderSyncReactor {
+@@ -515,45 +515,8 @@ impl HeaderSyncReactor {
                  };
                  self.handle_port_completion(completion);
              }
 -            // Inspect watches on every turn, even when peer queues never become empty.
 -            // `changed` delivers a final unseen value before reporting channel closure.
+-            // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
 -            if let Some(snapshots) = committed_snapshots.as_mut() {
--                match snapshots.changed().now_or_never() {
+-                match coop::unconstrained(snapshots.changed()).now_or_never() {
 -                    Some(Ok(())) => {
 -                        let snapshot = snapshots.borrow_and_update().clone();
 -                        if let Some(snapshot) = snapshot {
@@ -31,7 +32,7 @@ index d2597dd51e..bac4bc0900 100644
 -                }
 -            }
 -            if let Some(repairs) = vct_root_repairs.as_mut() {
--                match repairs.changed().now_or_never() {
+-                match coop::unconstrained(repairs.changed()).now_or_never() {
 -                    Some(Ok(())) => {
 -                        let status = *repairs.borrow_and_update();
 -                        caused!(

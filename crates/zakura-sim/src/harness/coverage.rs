@@ -236,15 +236,16 @@ const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass
     }
 }
 
-/// The honest exchange, and the check that the witnesses list every ID.
+/// The honest exchange, with the node's own sender IDs, and the check that
+/// the witnesses list every ID.
 const DISCOVERY_EVERY: &str = "every_discovery_property_applies_in_its_witness";
 /// The `undeclared-type` and `hello` act witnesses.
 const HELLO_ACTS: &str = "hello_acts_apply_in_their_witnesses";
-/// The `get-peers` act witnesses.
+/// The `get-peers` act witnesses, and the node's `peers` answers.
 const GET_PEERS_ACTS: &str = "get_peers_acts_apply_in_their_witnesses";
 /// The `peers` act witnesses.
 const PEERS_ACTS: &str = "peers_acts_apply_in_their_witnesses";
-/// The `get-services` act witnesses.
+/// The `get-services` act witnesses, and the node's `services` answers.
 const GET_SERVICES_ACTS: &str = "get_services_acts_apply_in_their_witnesses";
 /// The `services` act witnesses.
 const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
@@ -734,6 +735,41 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/services/bad-content-closes",
         SERVICES_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/sender-cadence",
+        DISCOVERY_EVERY,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/sender-within-limit",
+        DISCOVERY_EVERY,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/sender-cadence",
+        DISCOVERY_EVERY,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/sender-ends-once",
+        GET_PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/sender-within-limit",
+        DISCOVERY_EVERY,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/sender-cadence",
+        DISCOVERY_EVERY,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/services/sender-ends-once",
+        GET_SERVICES_ACTS,
         DISCOVERY_GUARD,
     ),
     Coverage {

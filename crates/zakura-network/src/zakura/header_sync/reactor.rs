@@ -115,12 +115,47 @@ pub fn spawn_header_sync_reactor(
     HeaderSyncStartError,
 > {
     let (handle, actions, reactor) = build_header_sync_reactor(startup)?;
+    #[cfg(zakura_sim)]
+    let probe = reactor.startup.observer.0.clone().map(|observer| {
+        let targets = super::scheduler::peer_work::ProbeTargets::of(
+            &reactor.peer_work_queue,
+            &reactor.locator_capacity,
+            zakura_header_chain::MAX_STAGED_TARGETS_V1,
+        );
+        (observer, targets)
+    });
     Ok((
         handle,
         actions,
-        spawn_erased_named("header_sync_reactor", reactor.run()),
+        hand_over_probe!(
+            spawn_erased_named("header_sync_reactor", reactor.run()),
+            probe
+        ),
     ))
 }
+
+/// The spawned reactor task `$task`, once `$probe`'s observer, if any, has
+/// taken a probe stamped with its id. Only a simulated run schedules the
+/// task, so outside one nothing is handed over.
+#[cfg(zakura_sim)]
+macro_rules! hand_over_probe {
+    ($task:expr, $probe:ident) => {{
+        let task = $task;
+        if let (Some((observer, targets)), Some(id)) = ($probe, task.task_id()) {
+            observer.resource_probe(targets.on(id));
+        }
+        task
+    }};
+}
+
+/// `$task` alone: release builds have no probe.
+#[cfg(not(zakura_sim))]
+macro_rules! hand_over_probe {
+    ($task:expr, $probe:ident) => {
+        $task
+    };
+}
+use hand_over_probe;
 
 fn build_header_sync_reactor(
     mut startup: HeaderSyncStartup,
@@ -232,6 +267,10 @@ fn build_header_sync_reactor(
         peer_work_queue: PeerWorkQueue::default(),
         last_snapshot_refresh_trace_at: Cell::new(None),
     };
+    #[cfg(any(test, zakura_sim))]
+    reactor
+        .peer_work_queue
+        .observed_by(&reactor.startup.observer);
     if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
         observe!(reactor, ReactorEvent::adopted(snapshot));
         reactor.emit_snapshot_observed(None, snapshot);
@@ -731,6 +770,13 @@ impl HeaderSyncReactor {
         self.refresh_committed_snapshot();
         let peer = session.peer_id().clone();
         if self.state.readmission_refused(&peer, Instant::now()) {
+            observe!(
+                self,
+                ReactorEvent::SessionRefused {
+                    peer: peer.clone(),
+                    session_id: session.session_id(),
+                }
+            );
             session.cancel_token().cancel();
             metrics::counter!("sync.header.peer.readmission_refused.total").increment(1);
             return;
@@ -1295,12 +1341,17 @@ impl HeaderSyncReactor {
             active.matches_response_page(response.initial_target_tip_hash, returned_ancestor)
         });
         if !page_matches
-            || !self.peer_work_queue.stage_page(
+            || !sim_arg!(self.peer_work_queue.stage_page(
                 &peer,
                 returned_ancestor,
                 response.entries,
                 admitted.cursor,
-            )
+            ); observe::PageArrival {
+                from_peer: peer.clone(),
+                from_session: session_id,
+                subscription: admitted.id,
+                frame: admitted.frame,
+            })
         {
             self.reject_page(peer, session_id);
             return;
@@ -1517,7 +1568,6 @@ impl HeaderSyncReactor {
             self.retire_peer_work(peer, HeaderRequestTerminal::StagingRefused);
             return;
         }
-        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let Some(session) = self
             .sessions
             .get(peer)
@@ -2142,7 +2192,6 @@ impl HeaderSyncReactor {
             self.defer_ordinary_target(&peer);
             return;
         }
-        observe!(self, ReactorEvent::ReservationOpened { peer: peer.clone() });
         let source = source_id_from_peer(&peer);
         let (sent, locator) = match resumed {
             Some((id, _, accepted, _)) => {
@@ -2385,6 +2434,10 @@ impl HeaderSyncReactor {
             .retain_current(snapshot.header_generation, snapshot.frontiers.finalized);
         for active in self.peer_work_queue.retire_obsolete_active(snapshot) {
             self.state.clear_request_deadline(&active.peer);
+            observe!(
+                self,
+                ReactorEvent::retired(&active, HeaderRequestTerminal::SnapshotObsolete)
+            );
             self.emit_request_terminal(&active, HeaderRequestTerminal::SnapshotObsolete);
             self.cancel_active_request(&active);
         }
@@ -2451,6 +2504,11 @@ impl HeaderSyncReactor {
 
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
+        // Pruned before the fatal check, since the cooldowns are maintenance
+        // deadlines and an expired one would otherwise wake the loop again.
+        if self.state.prune_readmission_cooldowns(now) {
+            self.publish_peer_state();
+        }
         if self.report_fatal_vct_local_operation(now) {
             return;
         }
@@ -2459,9 +2517,6 @@ impl HeaderSyncReactor {
         self.state.prune_pruned_peers(now);
         self.retry_pending_closes(now);
         self.retire_unanswered_closes(now);
-        if self.state.prune_readmission_cooldowns(now) {
-            self.publish_peer_state();
-        }
         let peers: Vec<_> = self
             .sessions
             .iter()
@@ -2789,6 +2844,7 @@ impl HeaderSyncReactor {
         let reserved = self.peer_work_queue.reserved_header_count(peer);
         let owned = self.peer_work_queue.owned_header_count(peer);
         if let Some(active) = self.peer_work_queue.remove(peer) {
+            observe!(self, ReactorEvent::retired(&active, terminal_outcome));
             self.emit_request_terminal(&active, terminal_outcome);
             self.cancel_active_request(&active);
         }
@@ -2988,7 +3044,8 @@ impl HeaderSyncReactor {
     ///
     /// In test and simulator builds, it reports `Misbehavior` with `owner`'s
     /// session as the origin, or else `reported`, the session of the message
-    /// that showed the violation.
+    /// that showed the violation, then `CooldownStarted` if it installed a
+    /// cooldown.
     fn dispatch_misbehavior(
         &mut self,
         peer: ZakuraPeerId,
@@ -3041,11 +3098,34 @@ impl HeaderSyncReactor {
             );
         });
         if owner.is_some() {
+            let now = Instant::now();
+            #[cfg(any(test, zakura_sim))]
+            let installed = self.state.cooldowns_installed;
             self.state.start_readmission_cooldown(
                 &peer,
-                Instant::now(),
+                now,
                 self.startup.config.unproductive_peer_cooldown,
             );
+            #[cfg(any(test, zakura_sim))]
+            if let Some(owner) = owner.filter(|_| self.state.cooldowns_installed != installed) {
+                // The entry actually installed for `peer`, not the configured
+                // length, so a wrong deadline shows.
+                let cooldown = self
+                    .state
+                    .unproductive_peer_cooldowns
+                    .get(&peer)
+                    .map_or(std::time::Duration::ZERO, |until| {
+                        until.saturating_duration_since(now)
+                    });
+                observe!(
+                    self,
+                    ReactorEvent::CooldownStarted {
+                        peer: peer.clone(),
+                        origin: owner.session_id(),
+                        cooldown,
+                    }
+                );
+            }
             if faulted.is_none() {
                 // No disconnect follows to publish the cooldown, and the service
                 // would keep reopening a session the reactor refuses.

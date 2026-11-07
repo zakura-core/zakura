@@ -137,6 +137,12 @@ test = "regenerate_storage_seeds"
 run = false
 reason = "a tool, not a test: it rewrites the committed seeds"
 
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_reset_mid_flight_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
+
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
 # `zakura_sim release` and `zakura_sim asan` jobs make. The ASan lane needs
@@ -214,9 +220,12 @@ seconds = 900
 weekly-seconds = 3600
 rss-mb = 2048
 
+# The simulator's scheduled run is a smoke: it shows each target still builds
+# and runs, and isn't meant to find bugs. Sunday's run is the same smoke. Long
+# campaigns run on a remote host, as qa/fuzz/sim's README says under Long runs.
 [campaign.sim]
-seconds = 900
-weekly-seconds = 3600
+seconds = 120
+weekly-seconds = 120
 rss-mb = 4096
 
 # The header-chain targets. Their `args` also set their campaign's limits.
@@ -301,18 +310,6 @@ reason = "no target yet; `cargo xtask sim-targets` checks one once its table ent
 # then the check fails until its row here goes.
 [[pending]]
 id = "header-sync/stale-completion-inert"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/chunk-budget-bound"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/teardown-returns-baseline"
 kind = "property"
 owner = "P4a"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"

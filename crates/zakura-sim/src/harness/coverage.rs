@@ -337,6 +337,33 @@ pub static COVERAGE: &[Coverage] = &[
         )),
     },
     Coverage {
+        property: super::super::domain::header_sync::CHUNK_BUDGET_BOUND,
+        passing: passes(
+            "tests/header_node_capacity.rs",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
+        bypass: Bypass::Planted("uncapped-secondary-reservation"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/header_teardown.rs",
+            "the_close_relink_input_holds_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("kept-queue-lease"),
+    },
+    Coverage {
+        property: super::header_sync::HEADER_FAULT_PENALIZED,
+        passing: passes(
+            "tests/header_wire_prepare_fault.rs",
+            "a_disconnect_mid_prepare_is_still_penalized",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/header_wire_prepare_fault.rs",
+            "hidden_cooldowns_violate_the_penalty_rule",
+        )),
+    },
+    Coverage {
         property: super::block_sync::OPERATION_IDS,
         passing: passes("tests/block_node.rs", "honest_sync_reaches_the_fixture_tip"),
         bypass: Bypass::Test(sim_test(

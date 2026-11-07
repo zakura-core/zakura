@@ -39,7 +39,6 @@ use crate::{
         DEFAULT_ADVERT_WINDOW_SMALL_BLOCK, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        LEGACY_DEFAULT_ADVERT_WINDOW_FULL_BLOCK, LEGACY_DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
@@ -48,11 +47,13 @@ use crate::{
 };
 
 mod cache_dir;
+mod unconditional_peers;
 
 #[cfg(test)]
 mod tests;
 
 pub use cache_dir::CacheDir;
+pub use unconditional_peers::UnconditionalPeers;
 
 pub(crate) use cache_dir::{
     default_network_identity_dir, zakura_discovery_sequence_file_path,
@@ -359,43 +360,81 @@ pub struct Config {
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
 
-    /// The number of peers that one legacy block broadcast advertises to at once when the block
-    /// is at least `advert_window_full_size_bytes`, or its size is unknown. At least 1.
+    /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
     ///
-    /// The window grows linearly as the block size falls from `advert_window_full_size_bytes`
-    /// to `advert_window_small_size_bytes`.
-    /// Concurrent uploads share one uplink, so a large block goes to fewer peers at a time.
-    /// Set `advert_window_full_block` and `advert_window_small_block` to the same value for a
-    /// fixed window.
+    /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
+    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// Zakura ignores misbehavior reports for these peers, so their
+    /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
+    /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
+    /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
     ///
-    /// The previous name `advert_window_min` still loads. The previous defaults, 32 here and 64
-    /// for `advert_window_small_block`, are read as unset, so config files generated before the
-    /// defaults changed get the current ones.
+    /// This setting exempts peers from misbehavior scores, bans, and mempool
+    /// cooldowns and their disconnects. Zakura still applies connection limits to these
+    /// peers, and still disconnects them on protocol
+    /// errors or inbound overload.
     ///
-    /// Configured block gossip sidecars are always advertised first, outside this window.
+    /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
+    /// IPv4-mapped IPv6 form of the same address. The default is empty.
+    ///
+    /// # Security
+    ///
+    /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
+    /// Only list peers you trust.
+    pub unconditional_peers: UnconditionalPeers,
+    /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
+    ///
+    /// The count grows linearly to `advert_window_small_block` as block size falls to
+    /// `advert_window_small_size_bytes`. Sidecars receive inventory immediately outside
+    /// this group. All remaining peers receive inventory after the configured delay.
+    ///
+    /// The previous name `advert_window_min` still loads.
     ///
     /// Experimental.
     pub advert_window_full_block: usize,
 
-    /// The number of peers that one legacy block broadcast advertises to at once when the block
-    /// is at or below `advert_window_small_size_bytes`. At least `advert_window_full_block`.
+    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
+    /// Must be at least `advert_window_full_block`.
     ///
     /// The previous name `advert_window_max` still loads.
     ///
     /// Experimental.
     pub advert_window_small_block: usize,
 
-    /// The block size in bytes at and below which a legacy block broadcast uses
-    /// `advert_window_small_block`. Must be below `advert_window_full_size_bytes`.
+    /// The size at or below which broadcasts use the largest initial group and shortest delay.
+    /// Must be below `advert_window_full_size_bytes`.
     ///
     /// Experimental.
     pub advert_window_small_size_bytes: u64,
 
-    /// The block size in bytes at and above which a legacy block broadcast uses
-    /// `advert_window_full_block`. Must exceed `advert_window_small_size_bytes`.
+    /// The size at or above which broadcasts use the smallest initial group and longest delay.
+    /// Must exceed `advert_window_small_size_bytes`.
     ///
     /// Experimental.
     pub advert_window_full_size_bytes: u64,
+
+    /// The delay before announcing small blocks to peers outside the initial group.
+    ///
+    /// The delay grows linearly to `advert_delay_max` between the configured size thresholds.
+    /// Each broadcast measures this delay once from its start, independently of peer requests
+    /// and uploads. Zero announces to every peer immediately. Defaults to zero.
+    ///
+    /// Experimental.
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    pub advert_delay_min: Duration,
+
+    /// The delay before announcing full-sized or unknown-sized blocks to remaining peers.
+    ///
+    /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
+    /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
+    /// concurrent body writes.
+    /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
+    /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
+    /// announcements to the remaining peers.
+    ///
+    /// Experimental.
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    pub advert_delay_max: Duration,
 }
 
 impl Config {
@@ -1003,10 +1042,13 @@ impl Default for Config {
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
+            unconditional_peers: UnconditionalPeers::default(),
             advert_window_full_block: DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
             advert_window_small_block: DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
+            advert_delay_min: Duration::ZERO,
+            advert_delay_max: Duration::ZERO,
         }
     }
 }
@@ -1205,6 +1247,7 @@ struct DConfig {
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
+    unconditional_peers: UnconditionalPeers,
     /// `None` if the config does not set it, so [`resolve_advert_windows`] can derive it from
     /// the other bound.
     #[serde(alias = "advert_window_min")]
@@ -1214,6 +1257,10 @@ struct DConfig {
     advert_window_small_block: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    advert_delay_min: Duration,
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    advert_delay_max: Duration,
 }
 
 impl Default for DConfig {
@@ -1237,10 +1284,13 @@ impl Default for DConfig {
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            unconditional_peers: config.unconditional_peers,
             advert_window_full_block: None,
             advert_window_small_block: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
+            advert_delay_min: config.advert_delay_min,
+            advert_delay_max: config.advert_delay_max,
         }
     }
 }
@@ -1310,10 +1360,13 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
             advert_window_full_block,
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1355,10 +1408,13 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
+            unconditional_peers,
             advert_window_full_block: Some(advert_window_full_block),
             advert_window_small_block: Some(advert_window_small_block),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         }
     }
 }
@@ -1386,10 +1442,13 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
             advert_window_full_block,
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
@@ -1400,6 +1459,8 @@ impl<'de> Deserialize<'de> for Config {
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         )
         .map_err(de::Error::custom)?;
 
@@ -1543,31 +1604,29 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
             advert_window_full_block,
             advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         })
     }
 }
 
-/// Returns the `(advert_window_full_block, advert_window_small_block)` of a config that sets them
-/// to `full_block` and `small_block`, or `None` if it leaves them out.
-///
-/// Config files written by `zakurad generate` before the defaults changed hold
-/// [`LEGACY_DEFAULT_ADVERT_WINDOW_FULL_BLOCK`] and [`LEGACY_DEFAULT_ADVERT_WINDOW_SMALL_BLOCK`],
-/// so those values count as left out. A window that is left out takes its default, limited by
-/// the other window when that one is set, so `advert_window_full_block <=
-/// advert_window_small_block` still holds. For example, a config that sets only
-/// `advert_window_small_block = 200` gets a full-block window of 200, not the default.
+/// Resolves omitted initial-group windows without changing explicitly configured values.
 fn resolve_advert_windows(full_block: Option<usize>, small_block: Option<usize>) -> (usize, usize) {
-    let full_block = full_block.filter(|&full| full != LEGACY_DEFAULT_ADVERT_WINDOW_FULL_BLOCK);
-    let small_block =
-        small_block.filter(|&small| small != LEGACY_DEFAULT_ADVERT_WINDOW_SMALL_BLOCK);
     match (full_block, small_block) {
-        (Some(full), Some(small)) => (full, small),
-        (Some(full), None) => (full, DEFAULT_ADVERT_WINDOW_SMALL_BLOCK.max(full)),
-        (None, Some(small)) => (DEFAULT_ADVERT_WINDOW_FULL_BLOCK.min(small), small),
+        (Some(full_block), Some(small_block)) => (full_block, small_block),
+        (Some(full_block), None) => (
+            full_block,
+            DEFAULT_ADVERT_WINDOW_SMALL_BLOCK.max(full_block),
+        ),
+        (None, Some(small_block)) => (
+            DEFAULT_ADVERT_WINDOW_FULL_BLOCK.min(small_block),
+            small_block,
+        ),
         (None, None) => (
             DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
             DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
@@ -1581,6 +1640,8 @@ fn validate_advert_fanout(
     advert_window_small_block: usize,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
+    advert_delay_min: Duration,
+    advert_delay_max: Duration,
 ) -> Result<(), String> {
     if advert_window_full_block == 0 || advert_window_full_block > advert_window_small_block {
         return Err(format!(
@@ -1594,6 +1655,15 @@ fn validate_advert_fanout(
             "advert_window_small_size_bytes must be below advert_window_full_size_bytes, \
              got {advert_window_small_size_bytes} and {advert_window_full_size_bytes}"
         ));
+    }
+    if advert_delay_min > advert_delay_max {
+        return Err("advert_delay_min must not exceed advert_delay_max".to_owned());
+    }
+    if std::time::Instant::now()
+        .checked_add(advert_delay_max)
+        .is_none()
+    {
+        return Err("advert_delay_max exceeds the monotonic clock range".to_owned());
     }
     Ok(())
 }

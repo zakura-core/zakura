@@ -133,7 +133,7 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
+        EarlyMinedBlock, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
         SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
         SubmitSolutionParameters, SubmitSolutionResponse,
     },
@@ -1390,7 +1390,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -1851,6 +1851,7 @@ where
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone().into(),
+            size,
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -1880,7 +1881,8 @@ where
                         && optimistic_block_inventory
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = MinedBlockEvent::Early {
+                            let event = EarlyMinedBlock {
+                                admission: admission.clone(),
                                 hash: block_hash,
                                 height,
                                 size,
@@ -1907,24 +1909,7 @@ where
                 );
             }
 
-            if verification_result.is_ok() {
-                if mined_block_sender
-                    .send(MinedBlockEvent::Committed {
-                        hash: block_hash,
-                        height,
-                        size,
-                    })
-                    .is_err()
-                {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
-                    tracing::warn!(
-                        ?block_hash,
-                        ?height,
-                        "could not send the final mined-block event"
-                    );
-                }
-            } else if early_sent {
+            if verification_result.is_err() && early_sent {
                 metrics::counter!("mining.optimistic_inventory.post_admission_failures")
                     .increment(1);
                 tracing::warn!(

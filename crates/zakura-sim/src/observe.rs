@@ -469,7 +469,27 @@ pub enum StorageFact {
         /// The operation.
         id: u64,
     },
-    /// The run completed the operation.
+    /// The run committed an apply and kept its reply for a later
+    /// `completed`.
+    Committed {
+        /// The operation.
+        id: u64,
+        /// The engine's header generation after the commit.
+        generation: u64,
+        /// A digest of the service's state after the commit.
+        state: String,
+    },
+    /// The run reset the node's header selection with an operator event.
+    Reset {
+        /// `invalidate` or `reconsider`.
+        kind: String,
+        /// The header it named.
+        target: String,
+        /// The engine's header generation after it.
+        generation: u64,
+    },
+    /// The run completed the operation, or delivered a committed apply's
+    /// reply.
     Completed {
         /// The operation.
         id: u64,
@@ -815,6 +835,13 @@ pub enum StorageRequest {
         target: StoragePoint,
         /// How many headers.
         headers: u32,
+        /// The headers' summed block work, in decimal: the target's work
+        /// above `common_ancestor`. `None` if a header's target has no
+        /// work.
+        work: Option<String>,
+        /// The first header, `common_ancestor`'s child on the target's
+        /// branch. `None` for a request with no headers.
+        first: Option<StoragePoint>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {
@@ -1397,6 +1424,16 @@ pub enum BlockSyncFact {
         holder: BlockSyncHolder,
         /// `retained` or `released`.
         change: String,
+    },
+    /// The sequencer refused a body it took from its input as stale: the
+    /// body's owner names a body work epoch other than the one the
+    /// sequencer applied.
+    StaleScope {
+        /// The refused body.
+        body: BlockSyncBody,
+        /// The body work epoch the sequencer applied when it judged the
+        /// body, or `None` before it had one.
+        scope_epoch: Option<u64>,
     },
     /// A serving response took its execution lease, or released it.
     ServingLease {

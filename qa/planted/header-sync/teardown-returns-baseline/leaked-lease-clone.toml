@@ -1,0 +1,8 @@
+# Dropping a call's retained headers ends their ownership but forgets one
+# clone of the call's first lease, so that lease never returns once the
+# call is handled. The input's node prepares and applies staged headers.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides peer_work.rs, which the patch changes, the rest of header sync
+# decides when the node prepares and applies. A change there can move the
+# input off those calls.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

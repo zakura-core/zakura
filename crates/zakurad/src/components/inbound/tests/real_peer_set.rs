@@ -37,7 +37,7 @@ use zakura_network::{
     Response, SharedPeerError,
 };
 use zakura_node_services::mempool;
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::EarlyMinedBlockChannel;
 use zakura_state::{Config as StateConfig, PruningConfig, StorageMode};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -45,7 +45,7 @@ use crate::{
     components::{
         inbound::{downloads::MAX_INBOUND_CONCURRENCY, Inbound, InboundSetupData},
         mempool::{run_mempool_transaction_id_gossip, Config as MempoolConfig, Mempool},
-        sync::{self, BlockGossipError, SyncStatus},
+        sync::{self, BlockGossipError, RecentSyncLengths, SyncStatus},
     },
     BoxError,
 };
@@ -95,6 +95,7 @@ async fn inbound_peers_empty_address_book() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
+        _syncer,
     ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     // yield and sleep until the address book lock is released.
@@ -184,6 +185,7 @@ async fn dual_stack_node_coexists_with_legacy_tcp_peer() -> Result<(), crate::Bo
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
+        _syncer,
     ) = setup(
         Some(Response::Peers(Vec::new())),
         P2pStack::Dual,
@@ -254,6 +256,7 @@ async fn inbound_block_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     let test_block = block::Hash([0x11; 32]);
@@ -351,6 +354,7 @@ async fn inbound_pruned_block_is_not_advertised_and_getdata_logs_error(
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(
         None,
         P2pStack::Legacy,
@@ -517,6 +521,7 @@ async fn inbound_tx_empty_state_notfound() -> Result<(), crate::BoxError> {
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(None, P2pStack::Legacy, StateConfig::ephemeral(), None).await;
 
     let test_tx = UnminedTxId::from_legacy_id(TxHash([0x22; 32]));
@@ -649,6 +654,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(
         Some(unrelated_response),
         P2pStack::Legacy,
@@ -804,6 +810,7 @@ async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> 
         tx_gossip_task_handle,
         // real open socket addresses
         _listen_addr,
+        _syncer,
     ) = setup(
         Some(repeated_response),
         P2pStack::Legacy,
@@ -937,6 +944,7 @@ async fn setup(
     JoinHandle<Result<(), BoxError>>,
     // real open socket addresses
     SocketAddr,
+    RecentSyncLengths,
 ) {
     let _init_guard = zakura_test::init();
 
@@ -973,10 +981,15 @@ async fn setup(
 
     // State
     // UTXO verification doesn't matter for these tests.
-    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-        zakura_state::init(state_config, &network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let zakura_state::InitializedState {
+        state: state_service,
+        read_state: read_only_state_service,
+        latest_chain_tip,
+        chain_tip_change,
+        block_announcements,
+    } = zakura_state::init(state_config, &network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
@@ -1055,6 +1068,7 @@ async fn setup(
         chain_tip_change.clone(),
         misbehavior_sender.clone(),
         Vec::new(),
+        zakura_network::UnconditionalPeers::default(),
     );
 
     // Enable the mempool
@@ -1069,7 +1083,7 @@ async fn setup(
         block_verifier: buffered_block_verifier,
         mempool: mempool_service.clone(),
         state: state_service.clone(),
-        latest_chain_tip,
+        latest_chain_tip: latest_chain_tip.clone(),
         network: network.clone(),
         misbehavior_sender,
     };
@@ -1077,11 +1091,12 @@ async fn setup(
     // We can't expect or unwrap because the returned Result does not implement Debug
     assert!(r.is_ok(), "unexpected setup channel send failure");
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
 
     let block_gossip_task_handle = tokio::spawn(sync::gossip_best_tip_block_hashes(
         sync_status.clone(),
-        chain_tip_change,
+        latest_chain_tip.clone(),
+        block_announcements,
         peer_set.clone(),
         read_only_state_service,
         Some(submitblock_channel.receiver()),
@@ -1140,6 +1155,7 @@ async fn setup(
         tx_gossip_task_handle,
         // real open socket addresses
         listen_addr,
+        recent_syncs,
     )
 }
 
@@ -1148,7 +1164,7 @@ mod submitblock_test {
 
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
-    use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
+    use zakura_rpc::{EarlyMinedBlock, EarlyMinedBlockChannel};
 
     use super::*;
 
@@ -1177,10 +1193,15 @@ mod submitblock_test {
 
         // State
         let state_config = StateConfig::ephemeral();
-        let (_state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-            zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
-                .await
-                .expect("ephemeral state initialization succeeds");
+        let zakura_state::InitializedState {
+            state: _state_service,
+            read_state: read_only_state_service,
+            latest_chain_tip,
+            block_announcements,
+            ..
+        } = zakura_state::init(state_config, &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
         let config_listen_addr = "127.0.0.1:0".parse().unwrap();
 
@@ -1215,21 +1236,26 @@ mod submitblock_test {
         )
         .await;
 
-        // Start the block gossip task with a SubmitBlockChannel
-        let submitblock_channel = SubmitBlockChannel::new();
+        // Start the block gossip task with a EarlyMinedBlockChannel
+        let submitblock_channel = EarlyMinedBlockChannel::new();
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send(MinedBlockEvent::Committed {
+            .send(EarlyMinedBlock {
+                admission: zakura_state::BlockAdmission::pending(),
                 hash: block::Hash([1; 32]),
                 height: block::Height(1),
                 size: 1_000,
+                submitted_at: std::time::Instant::now(),
+                submission: zakura_rpc::MinedBlockSubmission::FullBlock,
+                pending: zakura_rpc::PendingBlockSignal::valid_for_tests(),
             })
             .unwrap();
         let gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
-                chain_tip_change,
+                latest_chain_tip,
+                block_announcements,
                 peer_set.clone(),
                 read_only_state_service,
                 Some(submitblock_channel.receiver()),
@@ -1243,8 +1269,7 @@ mod submitblock_test {
                 let next_log = log_written.notified();
                 let sent_mined_block = {
                     let captured_logs = logs.lock().unwrap();
-                    String::from_utf8_lossy(&captured_logs)
-                        .contains("sending committed mined block broadcast")
+                    String::from_utf8_lossy(&captured_logs).contains("sending block announcement")
                 };
 
                 if sent_mined_block {
@@ -1264,7 +1289,8 @@ mod submitblock_test {
         };
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending committed mined block broadcast"));
+        assert!(log_output.contains("sending block announcement"));
+        assert!(log_output.contains("is_block_submission=true"));
 
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle

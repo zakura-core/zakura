@@ -28,8 +28,8 @@ use zakura_sim::{
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest},
-    property::{HasView, Property, Sources},
-    MemorySink, Observation, PlanInput, RunConfig, RunEnd, RunReport, Sim,
+    property::{EndViolation, HasView, Property, Sources},
+    MemorySink, Observation, ObservationLog, PlanInput, RunConfig, RunEnd, RunReport, Sim,
 };
 
 /// The last view a run's checks read, with how many adoption facts it held
@@ -71,6 +71,11 @@ impl HasView for Adopting {
     /// The storage harness's record of the run's end.
     fn ended(&self, end: &RunEnd) {
         self.storage.ended(end);
+    }
+
+    /// The storage harness's end-of-run violations.
+    fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
+        self.storage.end_violations(log)
     }
 }
 
@@ -229,6 +234,7 @@ fn grow_witness() -> StorageScenario {
             ControlAction::Grow { len: 2 },
             Trigger::Submitted(locator()),
         )],
+        weights: Default::default(),
     }
 }
 
@@ -420,6 +426,7 @@ fn a_single_tip_change_is_published_by_a_settled_end() {
         }],
         policy: Policy::converging(),
         controls: Vec::new(),
+        weights: Default::default(),
     };
     for input in inputs(16, 256) {
         let run = run(&scenario, input);

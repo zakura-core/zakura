@@ -25,6 +25,19 @@ const PLAN_BYTES: usize = 1_024;
 /// A seed's file stem and scenario.
 type Seed = (&'static str, fn() -> StorageScenario);
 
+/// The witness each seed carries, by stem: a property its run holds, which a
+/// planted case's patch on the same input violates.
+const WITNESSES: [(&str, &str); 2] = [
+    (
+        "header-storage-close-relink",
+        "header-sync/chunk-budget-bound",
+    ),
+    (
+        "header-storage-close-relink",
+        "header-sync/teardown-returns-baseline",
+    ),
+];
+
 /// Every seed.
 const SEEDS: [Seed; 5] = [
     ("header-storage-default", StorageScenario::default),
@@ -109,7 +122,7 @@ fn regenerate_storage_seeds() {
         let input = input(index, &scenario);
         let base = fixtures().join(stem);
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
-        let sidecar = format!(
+        let mut sidecar = format!(
             "# The committed fuzz input `{stem}.bin`: the harness that runs it, the\n\
              # generator version it was built for, and its SHA-256. Its 344-byte\n\
              # prefix is the scenario's canonical encoding, then 1,024 Plan bytes.\n\
@@ -125,6 +138,11 @@ fn regenerate_storage_seeds() {
                 &serde_json::to_value(&scenario).expect("scenarios serialize")
             ),
         );
+        for (_, property) in WITNESSES.iter().filter(|(seed, _)| seed == stem) {
+            sidecar.push_str(&format!(
+                "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n"
+            ));
+        }
         fs::write(base.with_extension("toml"), sidecar).expect("the fixture directory exists");
     }
 }

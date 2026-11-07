@@ -501,6 +501,22 @@ impl ServiceRegistry {
             .await
     }
 
+    /// The protocol checks [`request`](Self::request) would run on `frame`,
+    /// without the service's work.
+    pub fn check_request(&self, stream_kind: u16, frame: &Frame) -> Result<(), SinkReject> {
+        let Some(service) = self.service_for_kind(stream_kind) else {
+            return Err(SinkReject::protocol(
+                "request stream kind is not registered",
+            ));
+        };
+        let Some(handler) = service.as_request_response() else {
+            return Err(SinkReject::protocol(
+                "service does not accept request frames",
+            ));
+        };
+        handler.check_request(stream_kind, frame)
+    }
+
     /// Fan a newly connected peer out to every service enabled by its negotiated capabilities.
     pub fn add_peer(&self, peer: Peer) {
         let (

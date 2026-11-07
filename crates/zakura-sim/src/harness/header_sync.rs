@@ -5,11 +5,14 @@
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1), checked by header sync's generated table properties
 //! and `session/honest-never-punished` (P3d). `header-sync/release-wake`
-//! runs `header-sync/storage` on the wake fixture alone.
+//! runs `header-sync/storage` on the wake fixtures alone, and
+//! `header-sync/flood` on the flood fixtures.
 
+mod flood;
 pub mod grammar;
 mod release_wake;
 
+pub use flood::{Flood, FloodScenario, FLOODERS};
 pub use release_wake::{ReleaseWake, WakeScenario};
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
@@ -54,7 +57,7 @@ use crate::{
     domain::{
         header_sync::{
             chunk_budget_bound, stale_completion_inert, teardown_end_violations,
-            teardown_returns_baseline, BudgetView, StaleView, TeardownView, WakeView,
+            teardown_returns_baseline, AdoptionView, BudgetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -605,6 +608,13 @@ impl StaleView for StorageView {
     /// [`StorageView::stale_calls`].
     fn stale_calls(&self) -> &StaleEvidence {
         &self.stale_calls
+    }
+}
+
+impl AdoptionView for StorageView {
+    /// [`StorageView::adoption`].
+    fn adoption(&self) -> &AdoptionEvidence {
+        &self.adoption
     }
 }
 

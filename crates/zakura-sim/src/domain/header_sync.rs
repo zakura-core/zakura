@@ -4,8 +4,11 @@
 //! trait, so a shared property can take the check over later by
 //! registering it against another view.
 
+use zakura_network::zakura::observe::EventQueue;
+
 use crate::{
     harness::header_node::{
+        adoption::{AdoptionEvidence, WatchRead},
         capacity::{BoundaryRead, CapacityEvidence},
         claim::{Claim, ClaimEvidence, SettlementEvidence},
         stale::StaleEvidence,
@@ -390,6 +393,130 @@ fn wake_answer<V: WakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAn
 /// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a release opened a wake.
 fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
     view.wake().any_opened()
+}
+
+/// Under a wire flood, the run loop reads each externally published
+/// committed state from its watch before it takes a third wire event.
+pub const WATCH_OBSERVED_UNDER_FLOOD: &str = "header-sync/watch-observed-under-flood";
+
+/// Under lifecycle churn, the run loop reads each externally published
+/// committed state from its watch before it takes a third lifecycle event.
+pub const WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD: &str =
+    "header-sync/watch-observed-under-lifecycle-flood";
+
+/// What the flood checks read: one reactor's adoption evidence, which
+/// keeps publications, watch reads and taken events in order.
+pub trait AdoptionView {
+    /// The reactor's adoption evidence.
+    fn adoption(&self) -> &AdoptionEvidence;
+}
+
+/// [`WATCH_OBSERVED_UNDER_FLOOD`], as a harness whose view is an
+/// [`AdoptionView`] registers it.
+pub fn watch_observed_under_flood<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    watch_observed(
+        WATCH_OBSERVED_UNDER_FLOOD,
+        "the run loop reads each externally published committed state from its watch \
+         before it takes a third wire event",
+        check_watch_under_flood::<S>,
+        published_under_wire_flood::<S::View>,
+    )
+}
+
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`], as a harness whose view is an
+/// [`AdoptionView`] registers it.
+pub fn watch_observed_under_lifecycle_flood<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    watch_observed(
+        WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+        "the run loop reads each externally published committed state from its watch \
+         before it takes a third lifecycle event",
+        check_watch_under_lifecycle_flood::<S>,
+        published_under_lifecycle_flood::<S::View>,
+    )
+}
+
+/// One watch property: `id`, claiming `claim`, checked by `check`, with
+/// trigger history `triggered`. A view check that marks its own open
+/// obligations, since the registry's bounds can't count taken events.
+fn watch_observed<S: HasView>(
+    id: &'static str,
+    claim: &'static str,
+    check: fn(&mut CheckCtx<'_, S>) -> Verdict,
+    triggered: fn(&S::View, &ObservationLog) -> bool,
+) -> Property<S> {
+    Property {
+        id: PropertyId::new(id),
+        claim,
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check,
+        witness: Some(TriggerHistory::View(triggered)),
+    }
+}
+
+/// Checks [`WATCH_OBSERVED_UNDER_FLOOD`] after each step.
+fn check_watch_under_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    check_watch_read(cx, EventQueue::Wire)
+}
+
+/// Checks [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`] after each step.
+fn check_watch_under_lifecycle_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    check_watch_read(cx, EventQueue::Lifecycle)
+}
+
+/// Checks the watch rule for `queue` over the view's adoption evidence
+/// ([`AdoptionEvidence::watch_read`]). It applies once a state is
+/// published. A publication still waiting for its read or its third event
+/// leaves the run inconclusive if it ends there.
+fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    match cx.view().adoption().watch_read(queue) {
+        WatchRead::Nothing => Verdict::NotApplicable,
+        WatchRead::Holds => Verdict::Holds,
+        WatchRead::Open => {
+            cx.unsettled(Inconclusive::ObligationOpen);
+            Verdict::Holds
+        }
+        WatchRead::Broken(why) => cx.violated(
+            "each published state is read from the committed watch before a third event \
+             from the flooded queue",
+            why,
+        ),
+    }
+}
+
+/// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state
+/// whose wire queue competed with its watch read
+/// ([`AdoptionEvidence::published_into_flood`]).
+fn published_under_wire_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
+    view.adoption().published_into_flood(EventQueue::Wire)
+}
+
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
+/// state whose lifecycle queue competed with its watch read.
+fn published_under_lifecycle_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
+    view.adoption().published_into_flood(EventQueue::Lifecycle)
 }
 
 /// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended

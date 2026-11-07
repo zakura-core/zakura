@@ -276,6 +276,24 @@ pub struct Stamped {
     pub fact: AdoptionFact,
 }
 
+/// The most events a correct run loop takes from one queue between a
+/// committed-state change and its next watch read
+/// ([`AdoptionEvidence::watch_read`]).
+pub const WATCH_READ_EVENTS: usize = 2;
+
+/// What [`AdoptionEvidence::watch_read`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchRead {
+    /// Nothing was published.
+    Nothing,
+    /// Every publication was read in time.
+    Holds,
+    /// A publication is still waiting for its read or its third event.
+    Open,
+    /// The loop took too many events before reading a publication.
+    Broken(String),
+}
+
 /// What a check found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Acceptance {
@@ -374,6 +392,77 @@ impl AdoptionEvidence {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The watch rule under a flood of `queue`: after each `Published`
+    /// state `v`, the run loop reads a state at or past `v` from its
+    /// committed watch before it takes a third event from `queue`. Each turn
+    /// checks the watch before taking at most one event from each queue
+    /// with `try_recv`, and its `select!` takes at most one more, so a
+    /// correct loop takes at most two events from either queue between a
+    /// change and its next watch check.
+    ///
+    /// A publication that neither a read nor a third event has answered yet
+    /// is [`WatchRead::Open`].
+    pub fn watch_read(&self, queue: EventQueue) -> WatchRead {
+        let store = self.store();
+        let mut found = WatchRead::Nothing;
+        for (index, published) in store.facts.iter().enumerate() {
+            let AdoptionFact::Published { state_version, .. } = published.fact else {
+                continue;
+            };
+            let mut taken = 0;
+            let mut answered = false;
+            for later in &store.facts[index + 1..] {
+                match &later.fact {
+                    AdoptionFact::WatchObserved {
+                        state_version: read,
+                    } if *read >= state_version => {
+                        answered = true;
+                        break;
+                    }
+                    AdoptionFact::EventTaken { queue: from, .. } if *from == queue => {
+                        taken += 1;
+                        if taken == WATCH_READ_EVENTS + 1 {
+                            return WatchRead::Broken(format!(
+                                "the reactor took {taken} {queue:?} events after state \
+                                 {state_version:?} was published, with no watch read of it"
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found = match (answered, found) {
+                (false, _) | (_, WatchRead::Open) => WatchRead::Open,
+                (true, _) => WatchRead::Holds,
+            };
+        }
+        found
+    }
+
+    /// Whether some published state had `queue` compete with its watch
+    /// read: the run loop took an event from `queue` after the publication
+    /// and before any read of it. That's [`AdoptionEvidence::watch_read`]'s
+    /// trigger history: every break of the rule takes such an event first,
+    /// and a quiet run, whose watch read comes first, never does.
+    pub fn published_into_flood(&self, queue: EventQueue) -> bool {
+        let store = self.store();
+        store.facts.iter().enumerate().any(|(index, published)| {
+            let AdoptionFact::Published { state_version, .. } = published.fact else {
+                return false;
+            };
+            store.facts[index + 1..]
+                .iter()
+                .find_map(|later| match &later.fact {
+                    AdoptionFact::WatchObserved {
+                        state_version: read,
+                    } if *read >= state_version => Some(false),
+                    AdoptionFact::EventTaken { queue: from, .. } if *from == queue => Some(true),
+                    _ => None,
+                })
+                .unwrap_or(false)
+        })
     }
 
     /// The generation rule: every `Started` and locator `Dispatched` after an
@@ -695,6 +784,113 @@ mod tests {
             tip,
             delivered: true,
         }
+    }
+
+    /// A wire take at `point` leaving `queued`.
+    fn wire(point: TakePoint, queued: usize) -> AdoptionFact {
+        AdoptionFact::EventTaken {
+            queue: EventQueue::Wire,
+            point,
+            queued,
+        }
+    }
+
+    /// State `version` published by a commit.
+    fn commit(version: u64) -> AdoptionFact {
+        AdoptionFact::Published {
+            state_version: StateVersion::new(version),
+            header_generation: HeaderGeneration::new(version),
+        }
+    }
+
+    /// A watch read of state `version`.
+    fn read(version: u64) -> AdoptionFact {
+        AdoptionFact::WatchObserved {
+            state_version: StateVersion::new(version),
+        }
+    }
+
+    /// The watch rule over `facts`, all at time 0.
+    fn watch(facts: Vec<AdoptionFact>) -> WatchRead {
+        evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0).watch_read(EventQueue::Wire)
+    }
+
+    /// Two wire events and then a read of a later state answer a
+    /// publication. A third wire event before any read breaks the rule, a
+    /// read of an earlier state doesn't count, lifecycle events don't
+    /// count against the wire rule, and a publication with no answer yet is
+    /// open. No publication is nothing.
+    #[test]
+    fn the_watch_rule_counts_one_queue_after_each_publication() {
+        use TakePoint::{Select, TurnStart};
+        let lifecycle = AdoptionFact::EventTaken {
+            queue: EventQueue::Lifecycle,
+            point: TurnStart,
+            queued: 3,
+        };
+        assert_eq!(
+            watch(vec![wire(TurnStart, 4), AdoptionFact::Pass]),
+            WatchRead::Nothing
+        );
+        assert_eq!(
+            watch(vec![
+                commit(2),
+                wire(TurnStart, 4),
+                wire(Select, 3),
+                lifecycle.clone(),
+                lifecycle.clone(),
+                lifecycle,
+                read(3),
+            ]),
+            WatchRead::Holds
+        );
+        assert!(matches!(
+            watch(vec![
+                commit(2),
+                read(1),
+                wire(TurnStart, 4),
+                wire(Select, 3),
+                wire(TurnStart, 2),
+                read(2),
+            ]),
+            WatchRead::Broken(_)
+        ));
+        assert_eq!(
+            watch(vec![commit(2), wire(TurnStart, 4), wire(Select, 3)]),
+            WatchRead::Open
+        );
+        assert_eq!(
+            watch(vec![commit(2), read(2), commit(3), wire(TurnStart, 4)]),
+            WatchRead::Open
+        );
+    }
+
+    /// A publication whose queue delivers an event before its watch read
+    /// is published into a flood. One read first, or with no later event,
+    /// isn't, and a lifecycle event doesn't count for the wire queue.
+    #[test]
+    fn a_publication_read_before_any_event_is_not_into_a_flood() {
+        let flooded = |facts: Vec<AdoptionFact>| {
+            evidence(facts.into_iter().map(|fact| (0, fact)).collect(), 0)
+                .published_into_flood(EventQueue::Wire)
+        };
+        let lifecycle = AdoptionFact::EventTaken {
+            queue: EventQueue::Lifecycle,
+            point: TakePoint::TurnStart,
+            queued: 1,
+        };
+        assert!(flooded(vec![
+            commit(2),
+            wire(TakePoint::TurnStart, 1),
+            read(2)
+        ]));
+        assert!(!flooded(vec![
+            commit(2),
+            read(2),
+            wire(TakePoint::TurnStart, 5)
+        ]));
+        assert!(!flooded(vec![wire(TakePoint::TurnStart, 5), commit(2)]));
+        assert!(!flooded(vec![commit(2), lifecycle, read(2)]));
     }
 
     /// Whether `outcome` is a violation naming `rule`.

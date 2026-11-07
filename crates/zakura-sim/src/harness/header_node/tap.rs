@@ -101,6 +101,7 @@ use super::{
     policy::LinkEffect,
     reservation::ReservationEvidence,
     session::SessionEvidence,
+    stale::{StaleCheck, StaleEvidence},
 };
 use crate::{
     draws::Failure,
@@ -175,6 +176,9 @@ struct TapState {
     teardown_claims: Mutex<Vec<Claim>>,
     /// The released rounds each drain found, for the view.
     rounds: SettlementEvidence,
+    /// Checks each stale call's handler as its facts arrive, keeping the
+    /// stale calls it finds for the view.
+    stale: Mutex<StaleCheck>,
 }
 
 /// The resource probe a tap was handed.
@@ -252,6 +256,18 @@ impl TapState {
                 detail: broken.detail,
             });
         }
+        let stale = self
+            .stale
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(step);
+        for detail in stale {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::StaleCompletionEffect,
+                detail,
+            });
+        }
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         self.rounds.record(Settlement {
             step,
@@ -276,15 +292,31 @@ impl TapState {
         let Some(task) = zakura_scheduler::hooks::current_task() else {
             return;
         };
-        let reactor = match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
-            ProbeSlot::Held(probe) => TaskId::from(probe.task()),
-            ProbeSlot::Missing | ProbeSlot::Replaced => return,
+        let Some(reactor) = self.reactor_task() else {
+            return;
         };
         if task != reactor {
             self.off_reactor
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get_or_insert(task);
+        }
+    }
+
+    /// The reactor's task, as the probe it handed over names it.
+    fn reactor_task(&self) -> Option<TaskId> {
+        match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
+            ProbeSlot::Held(probe) => Some(TaskId::from(probe.task())),
+            ProbeSlot::Missing | ProbeSlot::Replaced => None,
+        }
+    }
+
+    /// Whether the task reporting now is the reactor's. Without a probe, or
+    /// outside a task, the tap can't tell, and takes it as the reactor's.
+    fn on_reactor(&self) -> bool {
+        match (zakura_scheduler::hooks::current_task(), self.reactor_task()) {
+            (Some(task), Some(reactor)) => task == reactor,
+            _ => true,
         }
     }
 
@@ -482,6 +514,12 @@ impl TapState {
         // so no second list here can drift from them.
         if in_run {
             state.sessions.reactor(&event);
+            let on_reactor = state.on_reactor();
+            state
+                .stale
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .observe(&event, on_reactor);
         }
         // Budget changes, credit and causes stay out of the log, whose
         // format pinned Plans fix, and a teardown's returns after the run
@@ -625,12 +663,14 @@ impl ReactorTap {
 
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
     /// also kept in `reservations`, its resource probe read, checked and
-    /// kept in `capacity`, and its released rounds at each drain kept in
-    /// `rounds`.
+    /// kept in `capacity`, its released rounds at each drain kept in
+    /// `rounds`, and its stale prepare and apply calls kept in
+    /// `stale_calls`.
     ///
     /// # Panics
     ///
     /// As [`ReactorTap::with_sessions`] does.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_evidence(
         sim: &mut Sim,
         port: &Arc<ControlledPort>,
@@ -639,6 +679,7 @@ impl ReactorTap {
         reservations: ReservationEvidence,
         capacity: CapacityEvidence,
         rounds: SettlementEvidence,
+        stale_calls: StaleEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         ReactorTap::tapped(
             sim,
@@ -646,7 +687,7 @@ impl ReactorTap {
             node,
             sessions,
             reservations,
-            (Some(capacity), rounds),
+            (Some(capacity), rounds, stale_calls),
         )
     }
 
@@ -669,7 +710,11 @@ impl ReactorTap {
             node,
             sessions,
             ReservationEvidence::default(),
-            (None, SettlementEvidence::default()),
+            (
+                None,
+                SettlementEvidence::default(),
+                StaleEvidence::default(),
+            ),
         )
     }
 
@@ -680,7 +725,11 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
-        (capacity, rounds): (Option<CapacityEvidence>, SettlementEvidence),
+        (capacity, rounds, stale_calls): (
+            Option<CapacityEvidence>,
+            SettlementEvidence,
+            StaleEvidence,
+        ),
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
@@ -720,6 +769,7 @@ impl ReactorTap {
                 settled: AtomicBool::new(false),
                 teardown_claims: Mutex::default(),
                 rounds,
+                stale: Mutex::new(StaleCheck::new(stale_calls)),
             }))
         });
         let state = observer.0.clone();

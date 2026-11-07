@@ -63,7 +63,7 @@ mod tests {
     use super::ReservationEvidence;
     use crate::harness::header_node::{
         capacity::CapacityEvidence, claim::SettlementEvidence, session::SessionEvidence,
-        tap::ReactorTap,
+        stale::StaleEvidence, tap::ReactorTap,
     };
 
     /// A tap keeps every accounting fact it's handed, through its capacity
@@ -84,6 +84,7 @@ mod tests {
             evidence.clone(),
             CapacityEvidence::default(),
             SettlementEvidence::default(),
+            StaleEvidence::default(),
         );
         let capacity = observer
             .capacity_observer()

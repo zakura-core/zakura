@@ -300,6 +300,7 @@ impl HasView for Planted {
             capacity: Default::default(),
             claims: Default::default(),
             rounds: Default::default(),
+            stale_calls: Default::default(),
         }
     }
 }

@@ -353,6 +353,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("kept-queue-lease"),
     },
     Coverage {
+        property: super::super::domain::header_sync::STALE_COMPLETION_INERT,
+        passing: passes(
+            "tests/header_stale.rs",
+            "the_stale_prepare_input_holds_stale_completion_inert",
+        ),
+        bypass: Bypass::Planted("stale-release"),
+    },
+    Coverage {
         property: super::header_sync::HEADER_FAULT_PENALIZED,
         passing: passes(
             "tests/header_wire_prepare_fault.rs",

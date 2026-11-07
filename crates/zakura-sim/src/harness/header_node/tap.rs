@@ -90,7 +90,7 @@ use zakura_storage::header::controlled::ControlledPort;
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
-    claim::{Claim, ClaimEvidence, ClaimRecord},
+    claim::{Claim, ClaimEvidence, ClaimRecord, RoundEvidence, Rounds},
     fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
     policy::LinkEffect,
@@ -162,6 +162,8 @@ struct TapState {
     cooldowns: CooldownEvidence,
     /// The claim rules its drains found broken, for the view.
     claims: ClaimEvidence,
+    /// The released rounds each drain found, for the view.
+    rounds: RoundEvidence,
 }
 
 /// The resource probe a tap was handed.
@@ -217,7 +219,8 @@ impl TapState {
 
     /// Fails with the first claim break an earlier drain found that no
     /// property reported, then records the claim breaks since the last drain
-    /// as the drain of `step` found them.
+    /// as the drain of `step` found them, and the released rounds the ledger
+    /// holds now.
     fn drain_claims(&self, step: u64) -> Result<(), String> {
         if let Some(record) = self.claims.unreported(Some(step)) {
             return Err(record.detail);
@@ -236,6 +239,13 @@ impl TapState {
                 detail: broken.detail,
             });
         }
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        self.rounds.record(Rounds {
+            step,
+            released: work.ledger.released_rounds(),
+            unsettled: work.ledger.unsettled_rounds(),
+            stuck: work.ledger.stuck_rounds(),
+        });
         Ok(())
     }
 
@@ -542,8 +552,9 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
-    /// also kept in `reservations`, and its resource probe read, checked and
-    /// kept in `capacity`.
+    /// also kept in `reservations`, its resource probe read, checked and
+    /// kept in `capacity`, and its released rounds at each drain kept in
+    /// `rounds`.
     ///
     /// # Panics
     ///
@@ -555,8 +566,16 @@ impl ReactorTap {
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
         capacity: CapacityEvidence,
+        rounds: RoundEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
-        ReactorTap::tapped(sim, port, node, sessions, reservations, Some(capacity))
+        ReactorTap::tapped(
+            sim,
+            port,
+            node,
+            sessions,
+            reservations,
+            (Some(capacity), rounds),
+        )
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
@@ -578,7 +597,7 @@ impl ReactorTap {
             node,
             sessions,
             ReservationEvidence::default(),
-            None,
+            (None, RoundEvidence::default()),
         )
     }
 
@@ -589,7 +608,7 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
-        capacity: Option<CapacityEvidence>,
+        (capacity, rounds): (Option<CapacityEvidence>, RoundEvidence),
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
@@ -626,6 +645,7 @@ impl ReactorTap {
                 off_reactor: Mutex::default(),
                 cooldowns,
                 claims: ClaimEvidence::default(),
+                rounds,
             }))
         });
         let state = observer.0.clone();

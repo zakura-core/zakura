@@ -1,0 +1,8 @@
+# Forgets every storage completion that carries retained headers, so it's
+# never handled and its round's leases never return. The input's node
+# releases rounds whose calls then end, and the run comes to rest with
+# those rounds unsettled and nothing left that could settle them.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides reactor.rs, which the patch changes, the queue decides when
+# rounds release. A change there can move the input off a released round.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

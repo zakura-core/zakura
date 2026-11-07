@@ -252,8 +252,8 @@ fn the_harness_registers_the_generated_header_ids() {
         .map(|property| property.id.to_string())
         .collect();
     expected.push(HONEST_NEVER_PUNISHED.to_owned());
-    assert_eq!(registered[3], HEADER_FAULT_PENALIZED);
-    assert_eq!(registered[4..], expected[..]);
+    assert_eq!(registered[4], HEADER_FAULT_PENALIZED);
+    assert_eq!(registered[5..], expected[..]);
 }
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`,

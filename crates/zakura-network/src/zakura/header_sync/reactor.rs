@@ -1138,7 +1138,23 @@ impl HeaderSyncReactor {
                 }
                 metrics::counter!("sync.header.target.already_active").increment(1);
             }
-            OfferDecision::HeldBack => self.peer_work_queue.remove_unstarted(&peer),
+            OfferDecision::HeldBack => {
+                // `HeldBack` also covers a paused discovery, which isn't a
+                // wait for room.
+                #[cfg(any(test, zakura_sim))]
+                if !self.ordinary_discovery_paused() {
+                    observe!(
+                        self,
+                        ReactorEvent::HeadroomWait {
+                            peer: peer.clone(),
+                            session_id,
+                            target_tip_hash,
+                            target_height: target.status.selected_tip_height,
+                        }
+                    );
+                }
+                self.peer_work_queue.remove_unstarted(&peer)
+            }
             OfferDecision::AwaitSubscription => self.close_subscription(&peer),
             OfferDecision::Stage => self.stage_offer(peer, target, work_order),
         }
@@ -1234,6 +1250,16 @@ impl HeaderSyncReactor {
             return;
         }
         if !self.state.take_cached_pass(Instant::now()) {
+            observe!(
+                self,
+                ReactorEvent::CachedPassDeferred {
+                    refill_in: self
+                        .state
+                        .cached_pass_budget
+                        .next_refill()
+                        .saturating_duration_since(Instant::now()),
+                }
+            );
             return;
         }
         let peers = self.sessions.len();
@@ -2264,6 +2290,15 @@ impl HeaderSyncReactor {
                 .peer_work_queue
                 .reserve_request(&peer, max_header_count)
         {
+            observe!(
+                self,
+                ReactorEvent::HeadroomWait {
+                    peer: peer.clone(),
+                    session_id,
+                    target_tip_hash,
+                    target_height: target.status.selected_tip_height,
+                }
+            );
             self.defer_ordinary_target(&peer);
             return;
         }

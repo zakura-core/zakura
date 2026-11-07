@@ -521,14 +521,16 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .observe(&event, on_reactor);
         }
-        // Budget changes, credit and causes stay out of the log, whose
-        // format pinned Plans fix, and a teardown's returns after the run
-        // are expected.
+        // Budget changes, credit, causes, headroom waits and deferred passes
+        // stay out of the log, whose format pinned Plans fix, and a
+        // teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
                 | ReactorEvent::CreditIssued { .. }
                 | ReactorEvent::CauseSet { .. }
+                | ReactorEvent::HeadroomWait { .. }
+                | ReactorEvent::CachedPassDeferred { .. }
         ) {
             return;
         }

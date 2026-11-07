@@ -59,9 +59,14 @@
 //! fails is its own failure, never a catch.
 //!
 //! `--shard <index>/<count>` runs only every `count`th case in path order,
-//! starting at position `index`. The `count` shards of one count together
-//! run every case once. The nightly job runs one shard a night, and a
-//! remote host runs the whole catalogue (qa/fuzz/sim's README, Long runs).
+//! starting at position `index`. It picks from the cases that the property
+//! and `--targets` keep, and `--changed-since` filters its pick. The
+//! `count` shards of one count together run every case once. A case's
+//! shard follows from its position, so adding or removing a case moves
+//! every later case to another shard: across that change, a case can run on
+//! two nights in a row, or wait up to `2 * count - 1` nights. The nightly
+//! job runs one shard a night, and a remote host runs the whole catalogue
+//! (qa/fuzz/sim's README, Long runs).
 //!
 //! `--changed-since <rev>` runs only the cases a change since `rev` can
 //! affect: those whose patch, case file, input, patched files or listed
@@ -1326,6 +1331,20 @@ mod tests {
         assert!(Shard { index: 4, count: 7 }
             .select(vec![0, 1, 2])
             .is_empty());
+    }
+
+    /// Every simulator build warns rather than fails on warnings, so a
+    /// patch that leaves code unused still builds where the environment
+    /// sets `CARGO_BUILD_WARNINGS=deny`.
+    #[test]
+    fn simulator_builds_override_denied_warnings() {
+        let build = cargo_sim(Path::new("worktree"), Path::new("target"));
+        let warnings = build
+            .get_envs()
+            .find(|(name, _)| *name == "CARGO_BUILD_WARNINGS")
+            .and_then(|(_, value)| value);
+        assert_eq!(warnings, Some(std::ffi::OsStr::new("warn")));
+        assert_eq!(build.get_args().next(), Some(std::ffi::OsStr::new("build")));
     }
 
     #[test]

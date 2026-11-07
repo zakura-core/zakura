@@ -513,7 +513,9 @@ jobs:
   # case rebuilds the patched simulator and runs a campaign of fuzz inputs,
   # which takes minutes, so the whole catalogue outgrew this job's limit.
   # The job runs one of seven shards, picked by the UTC weekday, so each
-  # case runs once a week. It runs nightly and on manual dispatch, never on
+  # case runs once a week. A case's shard follows from its position, so
+  # adding or removing a case can move a later case's run by up to six
+  # nights. It runs nightly and on manual dispatch, never on
   # pull requests or pushes. scripts/sim-long-runs.sh runs the whole
   # catalogue on a remote host.
   sim-planted:

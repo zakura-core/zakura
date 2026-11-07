@@ -706,7 +706,8 @@ fn a_locator_with_no_room_reports_its_headroom_wait() {
 }
 
 /// A wanted cached-offer pass the pass budget refuses reports
-/// `CachedPassDeferred` with the time to the budget's next refill.
+/// `CachedPassDeferred` with the time left to the budget's next refill, a
+/// whole interval just after a refill and less once part of it has passed.
 #[tokio::test(start_paused = true)]
 async fn a_refused_cached_pass_reports_its_refill() {
     let (mut reactor, _actions, _snapshot) = offers_reactor();
@@ -715,11 +716,19 @@ async fn a_refused_cached_pass_reports_its_refill() {
     reactor.state.cached_pass_budget.passes = 0;
     reactor.state.cached_pass_budget.refilled_at = Instant::now();
     reactor.schedule_cached_statuses();
+    let elapsed = state::CACHED_PASS_REFILL / 4;
+    time::advance(elapsed).await;
+    reactor.schedule_cached_statuses();
     assert_eq!(
         recorder.waits(),
-        [observe::ReactorEvent::CachedPassDeferred {
-            refill_in: state::CACHED_PASS_REFILL,
-        }]
+        [
+            observe::ReactorEvent::CachedPassDeferred {
+                refill_in: state::CACHED_PASS_REFILL,
+            },
+            observe::ReactorEvent::CachedPassDeferred {
+                refill_in: state::CACHED_PASS_REFILL - elapsed,
+            },
+        ]
     );
 }
 

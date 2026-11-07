@@ -19,10 +19,11 @@
 //! `discovery/wire` (disc-2.3) is the [`Subsystem`] that runs the node and
 //! its peers. A committed input's two-byte prefix picks one of its
 //! [`SavedPlan`]s, as `header-sync/wire`'s does. It registers discovery's
-//! generated receiver properties ([`wire_properties`], disc-3.1), each a
-//! `Draft` until its planted case lands. A peer's
+//! generated receiver and sender properties ([`wire_properties`],
+//! disc-3.1), each a `Draft` until its planted case lands. A peer's
 //! [`PeerAction::Discover`](crate::peer::PeerAction::Discover) acts reach
-//! them ([`act_scenario`]).
+//! the receiver ones ([`act_scenario`]), and the node's own exchange
+//! reaches the sender ones.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -55,7 +56,7 @@ use crate::{
         NODE_ADDR,
     },
     property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status},
-    table::table_properties,
+    table::{sender_properties, table_properties},
     RunConfig, Sim,
 };
 
@@ -487,8 +488,8 @@ pub const STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// `discovery/wire`'s properties: discovery's generated receiver
-/// properties, 31 IDs, each a `Draft` until its planted case lands
-/// (disc-3.2, disc-3.3).
+/// properties, 31 IDs, then its sender properties, 7 IDs, each a `Draft`
+/// until its planted case lands (disc-3.2, disc-3.3).
 ///
 /// A `bad-content-closes` ID's generated check accepts a fault close or a
 /// `Misbehavior`, and discovery's node answers bad content with a fault
@@ -499,11 +500,16 @@ pub const STREAMS: [Stream; 1] = [Stream {
 /// none of the node's serving, work or output, so they would claim coverage
 /// that doesn't exist. They follow disc-1's full-service observations.
 pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
-    table_properties(FAMILY, &STREAMS)
+    let receiver = table_properties(FAMILY, &STREAMS)
         .into_iter()
         .map(|property| Property {
-            status: Status::Draft,
             needs: &[Source::Frames, Source::Closes],
+            ..property
+        });
+    receiver
+        .chain(sender_properties(FAMILY, &STREAMS))
+        .map(|property| Property {
+            status: Status::Draft,
             ..property
         })
         .collect()

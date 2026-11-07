@@ -45,9 +45,11 @@ use zakura_rt::{
 
 mod adversary;
 mod content;
+mod sender;
 
 pub use self::adversary::{DiscoveryAct, DiscoveryRow, DiscoveryRule};
 use self::content::DiscoveryContent;
+pub(crate) use self::sender::DiscoverySender;
 use super::{evidence::RecordBody, frame_bytes, Outgoing};
 use crate::{
     model::{

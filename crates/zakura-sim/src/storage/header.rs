@@ -3,7 +3,8 @@
 //! [`HeaderStorage`] offers each pending operation of a
 //! [`ControlledPort`] as `storage:header:<id>:<outcome>` actions, one per
 //! outcome its contract allows now, so the `Plan` picks when and how each
-//! completes. At every observation it drains the port's facts, checks them
+//! completes. A committed apply whose reply the port holds is offered as
+//! `storage:header:<id>:deliver`. At every observation it drains the port's facts, checks them
 //! and the port's actual owner state against an [`OwnerModel`], logs each
 //! fact as [`Observation::Storage`] and the state as
 //! [`Observation::StorageState`], and then reads the log back to confirm
@@ -26,7 +27,7 @@ use std::{
 use zakura_header_chain::{Attribution, HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId},
+    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
     evidence::{
         CallerPresence, CapacityClass, LeaseFact, LeaseKey, OperationStage, OwnerModel, OwnerState,
         PathPosition, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
@@ -56,13 +57,31 @@ const OUTCOMES: [Outcome; 5] = [
     Outcome::Rejected,
 ];
 
-/// Action indices hold the operation ID times this, plus the outcome code.
+/// Action indices hold the operation ID times this, plus the outcome code
+/// or [`DELIVER`].
 const CODES: u64 = 8;
 
-/// The operation and outcome that action index `local` names.
-pub(crate) fn decode(local: u64) -> (OpId, Outcome) {
-    // Indices come from `enabled`, so the code is in range.
-    (OpId(local / CODES), OUTCOMES[(local % CODES) as usize])
+/// The code of a committed apply's delivery, past every outcome's.
+// Widening the outcome count, a small usize, to u64 is lossless.
+const DELIVER: u64 = OUTCOMES.len() as u64;
+
+/// What a storage action does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageAction {
+    /// Completes a pending operation with an outcome.
+    Complete(OpId, Outcome),
+    /// Delivers a committed apply's reply.
+    Deliver(OpId),
+}
+
+/// The action that action index `local` names.
+pub(crate) fn decode(local: u64) -> StorageAction {
+    let id = OpId(local / CODES);
+    match local % CODES {
+        DELIVER => StorageAction::Deliver(id),
+        // Indices come from `enabled`, so the code is in range.
+        code => StorageAction::Complete(id, OUTCOMES[code as usize]),
+    }
 }
 
 /// Header storage driven by the run. Dropping it shuts the port down, which
@@ -331,12 +350,16 @@ pub fn request(request: &RequestIdentity) -> StorageRequest {
             common_ancestor,
             target,
             headers,
+            work,
+            first,
         } => StorageRequest::PrepareHeaderTarget {
             owner: work_owner(*owner),
             source: peer(*source),
             common_ancestor: point(*common_ancestor),
             target: point(*target),
             headers: *headers,
+            work: work.map(|work| work.as_u256().to_string()),
+            first: first.map(point),
         },
         RequestIdentity::ApplyHeaderTarget {
             owner,
@@ -494,6 +517,28 @@ fn observation(fact: Fact, instance: u64) -> Observation {
         FactKind::CallerDropped { id } => StorageFact::CallerDropped { id: id.0 },
         FactKind::ReplyTaken { id } => StorageFact::ReplyTaken { id: id.0 },
         FactKind::ReplyDropped { id } => StorageFact::ReplyDropped { id: id.0 },
+        FactKind::Committed {
+            id,
+            generation,
+            state_digest,
+        } => StorageFact::Committed {
+            id: id.0,
+            generation: generation.get(),
+            state: hex(&state_digest),
+        },
+        FactKind::Reset {
+            kind,
+            target,
+            generation,
+        } => StorageFact::Reset {
+            kind: match kind {
+                ResetKind::Invalidate => "invalidate",
+                ResetKind::Reconsider => "reconsider",
+            }
+            .to_owned(),
+            target: hash(target),
+            generation: generation.get(),
+        },
         FactKind::Completed(completion) => StorageFact::Completed {
             id: completion.id.0,
             outcome: completion.outcome.name().to_owned(),
@@ -537,6 +582,9 @@ fn state(state: &OwnerState) -> StorageState {
                         ("pending", Some(*caller_waiting), None)
                     }
                     OperationStage::Running => ("running", None, None),
+                    OperationStage::Committed { caller_waiting } => {
+                        ("committed", Some(*caller_waiting), None)
+                    }
                     OperationStage::Replied { result: stored } => {
                         ("replied", None, Some(result(stored)))
                     }
@@ -599,6 +647,12 @@ impl ActionSource for HeaderStorage {
                 ));
             }
         }
+        for op in self.port.committed() {
+            out.push((
+                Identity::storage(&self.label, op.id.0, "deliver"),
+                op.id.0 * CODES + DELIVER,
+            ));
+        }
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
@@ -616,10 +670,18 @@ impl ActionSource for HeaderStorage {
     }
 
     fn execute(&mut self, local: u64, _: &mut ObservationLog) {
-        let (id, outcome) = decode(local);
-        self.port
-            .complete(id, outcome)
-            .expect("`enabled` offered this completion at this step");
+        match decode(local) {
+            StorageAction::Complete(id, outcome) => {
+                self.port
+                    .complete(id, outcome)
+                    .expect("`enabled` offered this completion at this step");
+            }
+            StorageAction::Deliver(id) => {
+                self.port
+                    .deliver(id)
+                    .expect("`enabled` offered this delivery at this step");
+            }
+        }
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {

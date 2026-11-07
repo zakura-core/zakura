@@ -26,7 +26,7 @@ use zakura_state::{LatestChainTip, ReadState as ReadStateService, State as State
 use crate::{
     config,
     methods::{LoggedLastEvent, RpcImpl},
-    MinedBlockEvent,
+    EarlyMinedBlock,
 };
 
 /// The boxed mempool service used by [`TestRpcImpl`].
@@ -72,7 +72,7 @@ impl TestRpcImpl {
         latest_chain_tip: impl Into<TestChainTip>,
         address_book: MockAddressBookPeers,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> (Self, JoinHandle<()>) {
         RpcImpl::new(
             network,

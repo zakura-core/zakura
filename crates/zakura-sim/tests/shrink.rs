@@ -21,7 +21,7 @@ use zakura_scheduler::{SchedulerConfig, SimInstant};
 use zakura_sim::{
     action::Boundary,
     harness::{self, entry, run_harness, HarnessEntry, RecordInput, Subsystem},
-    property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, Verdict},
+    property::{CheckCtx, HasView, Kind, Property, PropertyId, Status, TriggerHistory, Verdict},
     record::{DrawRecord, Record, StepRecord},
     trace::{
         replay_explained_with, replay_with,
@@ -278,7 +278,7 @@ fn stale_properties<S: Subsystem>() -> Vec<Property<S>> {
         needs: &[],
         status: Status::Active,
         check,
-        witness: Some(witness),
+        witness: Some(TriggerHistory::Log(witness)),
     };
     vec![
         property(
@@ -884,7 +884,7 @@ impl Subsystem for PlantedClock {
             needs: &[],
             status: Status::Active,
             check: no_clock_read,
-            witness: Some(any_run),
+            witness: Some(TriggerHistory::Log(any_run)),
         }]
     }
 
@@ -1118,7 +1118,7 @@ impl Subsystem for LeakingFailure {
                     Verdict::Holds
                 }
             },
-            witness: Some(any_run),
+            witness: Some(TriggerHistory::Log(any_run)),
         }]
     }
 

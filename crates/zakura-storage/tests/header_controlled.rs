@@ -26,7 +26,10 @@ use zakura_rt::sync::Semaphore;
 #[cfg(not(zakura_sim))]
 use zakura_storage::header::controlled::BindError;
 use zakura_storage::header::{
-    controlled::{Commit, CompleteError, Completion, ControlledPort, Fact, FactKind, OpId},
+    controlled::{
+        Commit, CompleteError, Completion, ControlledPort, Fact, FactKind, OpId, ResetKind,
+        ResetRequest,
+    },
     evidence::{
         CallerPresence, CapacityClass, ClassWaiters, ContinuationState, LeaseFact, LeaseKey,
         LeaseState, OperationStage, OwnerModel, PathPosition, RequestIdentity, ResultIdentity,
@@ -788,6 +791,145 @@ fn a_commit_that_installs_nothing_completes_at_once() {
     drop(membership);
 }
 
+/// An invalidation of the selected tip moves selection to its parent and
+/// advances the header generation, and its reconsideration restores the
+/// tip. Each is its own transaction with one `Reset` fact, and the watch
+/// sees both.
+#[test]
+fn a_reset_invalidates_and_reconsiders_the_tip() {
+    let (port, chain) = chain(3);
+    let mut watch = port.selected_chain();
+    watch.borrow_and_update();
+    let before = port.engine().snapshot().header_generation;
+
+    let invalidated = port
+        .reset(ResetRequest::Invalidate { depth: 0 })
+        .expect("the invalidation commits")
+        .expect("the tip is above the anchor");
+    let after = port.engine().snapshot();
+    assert_eq!(after.frontiers.header_best, chain[1]);
+    assert_ne!(after.header_generation, before);
+    assert!(watch
+        .has_changed()
+        .expect("the engine port holds the sender"));
+    assert_eq!(
+        invalidated,
+        FactKind::Reset {
+            kind: ResetKind::Invalidate,
+            target: chain[2].hash,
+            generation: after.header_generation,
+        }
+    );
+
+    let reconsidered = port
+        .reset(ResetRequest::Reconsider)
+        .expect("the reconsideration commits")
+        .expect("an invalidation is in force");
+    let restored = port.engine().snapshot();
+    assert_eq!(restored.frontiers.header_best, chain[2]);
+    assert!(matches!(
+        reconsidered,
+        FactKind::Reset {
+            kind: ResetKind::Reconsider,
+            target,
+            ..
+        } if target == chain[2].hash
+    ));
+    assert_eq!(
+        port.reset(ResetRequest::Reconsider),
+        Ok(None),
+        "nothing is left to reconsider"
+    );
+    assert_eq!(kinds(&port), [invalidated, reconsidered]);
+}
+
+/// A deep invalidation is clamped to the lowest header above the anchor,
+/// and a reset with the tip at the anchor, or after shutdown, does nothing
+/// and publishes nothing.
+#[test]
+fn a_reset_clamps_its_depth_and_skips_what_it_cant_do() {
+    let (port, chain) = chain(2);
+    let fact = port
+        .reset(ResetRequest::Invalidate { depth: 9 })
+        .expect("the invalidation commits")
+        .expect("the tip is above the anchor");
+    assert!(matches!(fact, FactKind::Reset { target, .. } if target == chain[0].hash));
+    let anchor = HeaderFixture::regtest().anchor();
+    assert_eq!(port.engine().snapshot().frontiers.header_best, anchor);
+    assert_eq!(
+        port.reset(ResetRequest::Invalidate { depth: 0 }),
+        Ok(None),
+        "the tip is the anchor"
+    );
+    assert_eq!(kinds(&port).len(), 1);
+
+    port.shut_down();
+    port.take_facts();
+    assert_eq!(port.reset(ResetRequest::Reconsider), Ok(None));
+    assert!(port.take_facts().is_empty());
+}
+
+/// Retention can evict an invalidated branch, and its operator reason goes
+/// with it. A reconsider then has nothing in force to remove, so it does
+/// nothing rather than name the evicted header.
+#[test]
+fn a_reconsider_skips_an_evicted_invalidation() {
+    let (port, chain) = chain(2);
+    port.reset(ResetRequest::Invalidate { depth: 0 })
+        .expect("the invalidation commits")
+        .expect("the tip is above the anchor");
+    port.take_facts();
+    let fixture = HeaderFixture::regtest();
+    let anchor = fixture.anchor();
+    // More longer forks than the engine keeps candidate tips, so the
+    // invalidated branch is evicted.
+    for branch in 1..=12 {
+        let fork = fixture.extend(anchor, 3, branch);
+        let request = fixture.target_request(&port.engine().snapshot(), anchor, &fork, 10);
+        let prepared =
+            ready(port.engine().prepare_header_target(request)).expect("a fork prepares");
+        ready(port.engine().apply_header_target(prepared)).expect("a fork applies");
+    }
+    assert!(
+        matches!(
+            ready(port.engine().selected_chain_contains(chain[1].hash)),
+            Ok(SelectedChainMembership::NotRetained)
+        ),
+        "the invalidated tip is evicted"
+    );
+    assert_eq!(port.reset(ResetRequest::Reconsider), Ok(None));
+    assert!(port.take_facts().is_empty());
+}
+
+/// A reset between a commit and its delivery shows in the delivery: its
+/// `Completed` carries the generation after the reset, while `Committed`
+/// keeps the commit's.
+#[test]
+fn a_delivery_after_a_reset_reports_the_new_generation() {
+    let (port, chain) = chain(1);
+    let next = HeaderFixture::regtest().extend(chain[0], 1, 0);
+    let mut apply = port.apply_header_target(prepared(&port, chain[0], &next, 2));
+    submit(&mut apply);
+    let Ok(Commit::Held { generation, .. }) = port.commit(OpId(1)) else {
+        panic!("the apply commits and holds its reply");
+    };
+    let Some(FactKind::Reset {
+        generation: reset, ..
+    }) = port
+        .reset(ResetRequest::Invalidate { depth: 0 })
+        .expect("the invalidation commits")
+    else {
+        panic!("the tip is above the anchor");
+    };
+    assert_ne!(reset, generation);
+    let completion = port.deliver(OpId(1)).expect("the reply is delivered");
+    assert_eq!(completion.generation, reset);
+    assert!(matches!(
+        ready(apply),
+        Ok(ApplyHeaderTargetOutcome::Applied)
+    ));
+}
+
 /// ST3.3: a read and a release from an old session, completing after the
 /// same peer's new session took a lease, leave the new lease alone.
 #[test]
@@ -1392,6 +1534,12 @@ fn completions_carry_typed_identities() {
             common_ancestor: chain[2],
             target: Frontier::new(block::Height(4), next[0].hash()),
             headers: 1,
+            work: HeaderFixture::regtest()
+                .genesis_header()
+                .difficulty_threshold
+                .to_work()
+                .map(Into::into),
+            first: Some(Frontier::new(block::Height(4), next[0].hash())),
         }
     );
     assert_eq!(prepare.result, ResultIdentity::Prepared);
@@ -1431,6 +1579,51 @@ fn completions_carry_typed_identities() {
         .complete(id, Outcome::Rejected)
         .expect("a foreign handle is rejected");
     assert_eq!(rejected.result, ResultIdentity::Rejected);
+}
+
+/// A prepare's identity sums each header's work from its own target: two
+/// headers at weight 2 then one unweighted header, as a weighted fork that
+/// grew, log both weights' work. A header whose target has no work leaves
+/// the sum unknown.
+#[test]
+fn a_prepares_work_is_summed_from_its_targets() {
+    let (port, chain) = chain(1);
+    let fixture = HeaderFixture::regtest().with_weight(1, 2);
+    let prepare = |headers: &[Arc<block::Header>], request_id| {
+        let request =
+            fixture.target_request(&port.engine().snapshot(), chain[0], headers, request_id);
+        run(&port, port.prepare_header_target(request)).1.request
+    };
+    let mut headers = fixture.extend(chain[0], 2, 1);
+    let fork_tip = Frontier::new(block::Height(3), headers[1].hash());
+    headers.extend(fixture.extend(fork_tip, 1, 0));
+    let RequestIdentity::PrepareHeaderTarget { work, first, .. } = prepare(&headers, 2) else {
+        panic!("a prepare has a prepare identity");
+    };
+    let work_of = |branch| {
+        fixture
+            .target(branch)
+            .to_work()
+            .expect("fixture targets have work")
+            .as_u256()
+    };
+    assert_ne!(work_of(1), work_of(0));
+    assert_eq!(
+        work.map(|work| work.as_u256()),
+        Some(work_of(1) * 2 + work_of(0))
+    );
+    assert_eq!(
+        first,
+        Some(Frontier::new(block::Height(2), headers[0].hash()))
+    );
+
+    let mut workless = *fixture.extend(chain[0], 1, 2)[0];
+    workless.difficulty_threshold = zakura_chain::work::difficulty::INVALID_COMPACT_DIFFICULTY;
+    let RequestIdentity::PrepareHeaderTarget { work, .. } = prepare(&[Arc::new(workless)], 3)
+    else {
+        panic!("a prepare has a prepare identity");
+    };
+    assert_eq!(work, None);
 }
 
 /// B2: a `CapacityBusy` refusal names the signal it handed out, read from

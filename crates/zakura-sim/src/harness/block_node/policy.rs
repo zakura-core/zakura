@@ -186,6 +186,7 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
     let found = trigger.find(&|trigger| match trigger {
         policy::Trigger::Handled(_)
         | policy::Trigger::Committed(_)
+        | policy::Trigger::Released
         | policy::Trigger::ReservationOpened(_)
         | policy::Trigger::SessionAdmitted(_) => true,
         policy::Trigger::ReplyTaken(select) => {
@@ -197,6 +198,10 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         policy::Trigger::Handled(_) => format!(
             "a block scenario can't wait for {found:?}: nothing the block node records \
              witnesses block sync handling a reply"
+        ),
+        policy::Trigger::Released => format!(
+            "a block scenario can't wait for {found:?}: only a header scenario's control \
+             steps release a hold"
         ),
         policy::Trigger::Committed(_) => format!(
             "a block scenario can't wait for {found:?}: block storage commits and replies in \

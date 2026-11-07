@@ -574,6 +574,12 @@ impl OwnerModel {
                 }
                 op.committed = true;
             }
+            // A reset changes the engine's selection, which no owner holds.
+            FactKind::Reset { .. } => {
+                if self.shut_down {
+                    return Err(HeadError::Unexpected);
+                }
+            }
             FactKind::Completed(completion) => {
                 self.complete(txn, completion, &mut kinds, &mut lease_facts)?;
             }

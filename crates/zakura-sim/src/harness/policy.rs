@@ -28,7 +28,11 @@
 //! that hold shut: `header_node::policy::undriven` and
 //! `block_node::policy::undriven` say which.
 
-use std::{collections::BTreeMap, fmt::Debug, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::SimInstant;
@@ -156,11 +160,14 @@ pub enum Trigger<K> {
     /// test counts once its engine switches its header tip, before it
     /// commits any new body.
     Grown(String),
-    /// This actor's chain switched to a fork: a `Control` reset committed
-    /// the fork's tip and published it on the actor's watch. A block-sync
-    /// mirror counts once it holds the fork's bodies too. The block-sync
-    /// node under test counts once its engine switches its header tip to
-    /// the fork, before its verified chain resets.
+    /// This actor's chain was reset by a `Control` step. In block sync, a
+    /// reset switches the chain to a fork: it counts once the fork's tip is
+    /// committed and published on the actor's watch, for a mirror once it
+    /// holds the fork's bodies too, and for the node under test once its
+    /// engine switches its header tip, before its verified chain resets.
+    /// In header sync, only the node under test resets, through an operator
+    /// invalidation or reconsideration, and it counts each one that
+    /// committed, whichever way selection moved.
     Reset(String),
     /// This actor prepared a `Control` chain change's headers, which it
     /// applies in a later step. Only the block-sync node under test takes a
@@ -177,6 +184,11 @@ pub enum Trigger<K> {
     /// peer, as its tap reports: once per admission, the setup link's
     /// included, so a replacement is the second. Never holds without a tap.
     SessionAdmitted(String),
+    /// A `Release` control step named the hold whose trigger this is.
+    /// Holds only in a hold's own `until`, and a release opens its hold
+    /// whatever the trigger says, so `until: released` opens only through
+    /// a release.
+    Released,
     /// This many milliseconds after the held operation's submission, or
     /// after the run's start in a control step. Time stops there.
     VirtualTime(u64),
@@ -303,6 +315,8 @@ struct Call<K, Key> {
 struct Context<Key> {
     /// The held operation, for [`Select::held`].
     held: Option<Key>,
+    /// The hold whose trigger this is, for [`Trigger::Released`].
+    hold: Option<usize>,
     /// Time since the held operation's submission, or since the run's start.
     since: Duration,
 }
@@ -334,6 +348,8 @@ pub struct Predicates<F: Family> {
     /// Each handled call, in order.
     handled: Vec<u64>,
     links: Vec<(LinkEffect, String)>,
+    /// The holds a `Release` step opened.
+    released: BTreeSet<usize>,
 }
 
 impl<F: Family> Predicates<F> {
@@ -348,6 +364,7 @@ impl<F: Family> Predicates<F> {
             events: Vec::new(),
             handled: Vec::new(),
             links: Vec::new(),
+            released: BTreeSet::new(),
         }
     }
 
@@ -445,6 +462,12 @@ impl<F: Family> Predicates<F> {
         self.handled.push(call);
     }
 
+    /// Opens hold `hold` for a `Release` step. Releasing it again does
+    /// nothing.
+    pub fn release(&mut self, hold: usize) {
+        self.released.insert(hold);
+    }
+
     /// Counts one link effect on the link to `peer`.
     pub fn record_link(&mut self, effect: LinkEffect, peer: &str) {
         self.links.push((effect, peer.to_owned()));
@@ -521,7 +544,7 @@ impl<F: Family> Predicates<F> {
             Trigger::Prepared(peer) => links(LinkEffect::Prepared, peer),
             Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
             Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
-            Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
+            Trigger::Released | Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }
         }
@@ -530,6 +553,7 @@ impl<F: Family> Predicates<F> {
     /// Whether `trigger` holds in `cx`.
     fn holds_in(&self, trigger: &Trigger<F::Kind>, cx: Context<F::Key>) -> bool {
         match trigger {
+            Trigger::Released => cx.hold.is_some_and(|hold| self.released.contains(&hold)),
             Trigger::VirtualTime(ms) => cx.since >= Duration::from_millis(*ms),
             Trigger::Count(n, inner) => self.count(inner, cx) >= *n as usize, // u32 fits usize
             Trigger::All(all) => all.iter().all(|inner| self.holds_in(inner, cx)),
@@ -544,6 +568,7 @@ impl<F: Family> Predicates<F> {
             trigger,
             Context {
                 held: None,
+                hold: None,
                 since: now.since_start(),
             },
         )
@@ -575,6 +600,7 @@ impl<F: Family> Predicates<F> {
             &self.holds[hold],
             Context {
                 held: Some(key),
+                hold: Some(hold),
                 since,
             },
         ))
@@ -591,9 +617,14 @@ impl<F: Family> Predicates<F> {
     ) -> Option<bool> {
         let (hold, cx) = self.hold_on(key, since)?;
         Some(
-            self.holds_in(&hold.until, cx)
+            (self.is_released(cx) || self.holds_in(&hold.until, cx))
                 && hold.then.iter().any(|allow| F::allows(*allow, outcome)),
         )
+    }
+
+    /// Whether a `Release` step opened the hold `cx` judges.
+    fn is_released(&self, cx: Context<F::Key>) -> bool {
+        cx.hold.is_some_and(|hold| self.released.contains(&hold))
     }
 
     /// The reply hold on operation `key`'s current stage, and the context
@@ -604,6 +635,7 @@ impl<F: Family> Predicates<F> {
             &self.reply_holds[hold],
             Context {
                 held: Some(key),
+                hold: None,
                 since,
             },
         ))
@@ -653,11 +685,14 @@ impl<F: Family> Predicates<F> {
         out: &mut Vec<Boundary>,
     ) {
         let by = |d: Duration| Boundary::Deadline(after(now, d.saturating_sub(since)));
-        let Some((hold, _)) = self.hold_on(key, since) else {
+        let Some((hold, cx)) = self.hold_on(key, since) else {
             out.extend(bound.map(by));
             return;
         };
-        opens(&hold.until, since, now, out);
+        // A released hold is open, so its trigger's times no longer matter.
+        if !self.is_released(cx) {
+            opens(&hold.until, since, now, out);
+        }
         out.extend(hold.deadline_ms.map(Duration::from_millis).map(by));
     }
 }

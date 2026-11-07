@@ -100,6 +100,7 @@ fn worked_example(policy: Policy) -> StorageScenario {
         ],
         policy,
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 
@@ -679,6 +680,7 @@ fn node_at_a3(
             ..Policy::converging()
         },
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 

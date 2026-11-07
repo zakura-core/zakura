@@ -1,8 +1,8 @@
 //! Track the blocks a connection's peer has announced to us.
 //!
-//! Block gossip skips a peer that already told us about the block: it has the block, so it
-//! would never request it, and its advert would occupy a window entry until
-//! [`BLOCK_REQUEST_WAIT`](super::block_gossip::BLOCK_REQUEST_WAIT) expires.
+//! Block gossip skips a peer that already told us about the block, unless a broadcast still
+//! tracks its upload. This avoids sending redundant inventory and waiting for a request
+//! from a peer that already claims to have the block.
 //!
 //! Each connection records only its own peer's announcements, so one peer cannot change
 //! whether another peer is advertised to.

@@ -12,10 +12,11 @@
 use std::{fmt, str::FromStr};
 
 use crate::{
-    harness::{self, run_prepared, HarnessError, Subsystem},
-    property::Status,
+    harness::{self, run_reading, HarnessError, Subsystem},
+    property::{HasView, Status, TriggerHistory},
     record::Record,
-    MemorySink, Outcome, PlanInput, PropertyOutcome, RecordSink, RunReport,
+    MemorySink, ObservationLog, Outcome, PlanInput, PropertyOutcome, PropertyReport, RecordSink,
+    RunEnd, RunReport,
 };
 
 /// What a witness test expects of its property.
@@ -92,6 +93,10 @@ pub enum WitnessError {
     /// The verdict fits, but the run didn't reach the property's trigger
     /// history.
     LostTriggerHistory,
+    /// The property's trigger history reads the harness's view, and the
+    /// judge has no view showing the run's end, as when it has only the
+    /// run's report.
+    NoView,
     /// A reduction reached a different machine failure.
     ChangedFailure,
     /// A `Known` property that the test expects violated holds.
@@ -121,6 +126,9 @@ impl fmt::Display for WitnessError {
             WitnessError::Unrelated { property } => write!(f, "{property} was violated"),
             WitnessError::LostTriggerHistory => {
                 f.write_str("witness test lost its trigger history")
+            }
+            WitnessError::NoView => {
+                f.write_str("the trigger history reads the view, and no view shows the run's end")
             }
             WitnessError::Fixed { issue } => write!(
                 f,
@@ -188,10 +196,17 @@ pub fn witness_prepared<S: Subsystem>(
     expect: Expect,
     sink: &mut dyn RecordSink,
 ) -> Result<(), WitnessError> {
-    let registered = Registered::of::<S>(property, expect)?;
+    let registered = Registered::<S>::of(property, expect)?;
     let mut sink = EndSeen { sink, ended: false };
-    let report = match run_prepared::<S>(scenario, prepared, input, &mut sink, None) {
-        Ok(report) => report,
+    // Judged once the run's end is final and before shutdown, which can
+    // still change the view.
+    let id = property.to_owned();
+    let judge =
+        move |harness: &S, end: &RunEnd, reports: &[PropertyReport], log: &ObservationLog| {
+            registered.judge(end, reports, log, Some(harness), &id, expect)
+        };
+    let (_, judged) = match run_reading::<S, _>(scenario, prepared, input, &mut sink, None, judge) {
+        Ok(run) => run,
         Err(HarnessError::Run { failure, .. }) => {
             return Err(WitnessError::HarnessEnd(failure.to_string()))
         }
@@ -200,29 +215,37 @@ pub fn witness_prepared<S: Subsystem>(
     if !sink.ended {
         return Err(WitnessError::NoEnd);
     }
-    registered.judge(&report, property, expect)
+    judged
 }
 
 /// Checks `report`, a complete run of `S`, against `expect` for
 /// `property`, with the rule [`witness`] applies after its run. A test that
-/// judges several properties on one run calls it once for each.
+/// judges several properties on one run calls it once for each. A property
+/// whose trigger history reads the view fails with [`WitnessError::NoView`].
 pub fn judge_report<S: Subsystem>(
     report: &RunReport,
     property: &str,
     expect: Expect,
 ) -> Result<(), WitnessError> {
-    Registered::of::<S>(property, expect)?.judge(report, property, expect)
+    Registered::<S>::of(property, expect)?.judge(
+        &report.end,
+        &report.properties,
+        &report.log,
+        None,
+        property,
+        expect,
+    )
 }
 
 /// What a witness test reads from a property's registration.
-struct Registered {
+struct Registered<S: HasView> {
     status: Status,
-    trigger_history: Option<fn(&crate::ObservationLog) -> bool>,
+    trigger_history: Option<TriggerHistory<S>>,
 }
 
-impl Registered {
+impl<S: Subsystem> Registered<S> {
     /// `property`'s registration in `S`, if `expect` can judge it.
-    fn of<S: Subsystem>(property: &str, expect: Expect) -> Result<Self, WitnessError> {
+    fn of(property: &str, expect: Expect) -> Result<Self, WitnessError> {
         let registry = harness::registry::<S>();
         let registered = registry
             .properties()
@@ -238,18 +261,35 @@ impl Registered {
         })
     }
 
-    /// Checks `report` against `expect`, then the trigger history, if the
-    /// property has one.
+    /// Checks the run's `end` and `reports` against `expect`, then the
+    /// trigger history, if the property has one, over the final `log` and,
+    /// for a view trigger, the `harness`'s view. The view is read only once
+    /// the report fits, so only on a run a check could read it in, and only
+    /// if it shows the run's last step.
     fn judge(
         &self,
-        report: &RunReport,
+        end: &RunEnd,
+        reports: &[PropertyReport],
+        log: &ObservationLog,
+        harness: Option<&S>,
         property: &str,
         expect: Expect,
     ) -> Result<(), WitnessError> {
-        judge(report, property, self.status, expect)?;
-        match self.trigger_history {
-            Some(history) if !history(&report.log) => Err(WitnessError::LostTriggerHistory),
-            _ => Ok(()),
+        judge_end(end, reports, property, self.status, expect)?;
+        let reached = match self.trigger_history {
+            None => true,
+            Some(TriggerHistory::Log(history)) => history(log),
+            Some(TriggerHistory::View(history)) => match harness {
+                Some(harness) if harness.captured().fresh_at(end.steps) => {
+                    history(&harness.view(), log)
+                }
+                _ => return Err(WitnessError::NoView),
+            },
+        };
+        if reached {
+            Ok(())
+        } else {
+            Err(WitnessError::LostTriggerHistory)
         }
     }
 }
@@ -280,16 +320,25 @@ pub(crate) fn judge(
     status: Status,
     expect: Expect,
 ) -> Result<(), WitnessError> {
-    if report.end.outcome == Outcome::Harness {
-        let failure = report
-            .end
+    judge_end(&report.end, &report.properties, property, status, expect)
+}
+
+/// [`judge`] on a run's `end` and property `reports`.
+fn judge_end(
+    end: &RunEnd,
+    reports: &[PropertyReport],
+    property: &str,
+    status: Status,
+    expect: Expect,
+) -> Result<(), WitnessError> {
+    if end.outcome == Outcome::Harness {
+        let failure = end
             .harness
             .as_ref()
             .map_or_else(String::new, ToString::to_string);
         return Err(WitnessError::HarnessEnd(failure));
     }
-    let outcome = &report
-        .properties
+    let outcome = &reports
         .iter()
         .find(|r| r.property == property)
         .ok_or(WitnessError::MissingReport)?
@@ -297,13 +346,11 @@ pub(crate) fn judge(
     // Another property's violation is unrelated to this one: one that
     // stopped the run fails every expectation, and one that didn't fails
     // all but `Applicable`.
-    let unrelated = report
-        .properties
+    let unrelated = reports
         .iter()
         .filter(|r| r.property != property)
         .find(|r| matches!(r.outcome, PropertyOutcome::Violated { .. }));
-    let stopped_by = report
-        .end
+    let stopped_by = end
         .violation
         .as_ref()
         .map(|v| v.property.as_str())

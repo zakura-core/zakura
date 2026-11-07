@@ -16,7 +16,7 @@ use zakura_sim::{
     harness::{entry, HarnessEntry, Subsystem, NO_TASK_PANIC},
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, HasView, Kind, Property, PropertyId, Source,
-        Sources, Status, Verdict,
+        Sources, Status, TriggerHistory, Verdict,
     },
     trace::{confirm, ConfirmStatus, Confirmation, TraceReader, CONFIRMATION_FILE},
     Observation, ObservationLog, RunConfig, Sim,
@@ -178,7 +178,7 @@ fn planted(
         needs: &[Source::View, Source::Schedule],
         status: Status::Active,
         check,
-        witness: Some(triggered),
+        witness: Some(TriggerHistory::Log(triggered)),
     }
 }
 

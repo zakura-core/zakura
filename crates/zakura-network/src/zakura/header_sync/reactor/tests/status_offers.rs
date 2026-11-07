@@ -1958,8 +1958,8 @@ impl observe::HeaderSyncObserver for FloodPublisher {
 }
 
 /// Runs a reactor on the test's Tokio runtime with its wire queue kept full
-/// until [`FloodPublisher`] has changed `watched` `publications` times, and
-/// returns the steps in order.
+/// until [`FloodPublisher`] has changed `watched` `publications` times and
+/// the loop has read the last change, and returns the steps in order.
 async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<FloodStep> {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
@@ -2005,7 +2005,9 @@ async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<
     reactor.startup.observer.0 = Some(publisher.clone());
     let task = tokio::spawn(reactor.run());
     for _ in 0..100_000 {
-        if publisher.left.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        if publisher.left.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && every_change_read(&publisher.steps.lock().expect("no test panics holding it"))
+        {
             break;
         }
         tokio::task::yield_now().await;
@@ -2026,11 +2028,21 @@ async fn flooded_watch_steps(watched: FloodedWatch, publications: usize) -> Vec<
         publications,
         "every publication ran before shutdown"
     );
+    assert!(every_change_read(&steps), "the last change was read");
     assert!(
         spent_with_a_change_unread(&steps),
         "the flood used up the loop's cooperative budget with a change unread"
     );
     steps
+}
+
+/// Whether a watch read follows the last watch change.
+fn every_change_read(steps: &[FloodStep]) -> bool {
+    steps
+        .iter()
+        .rev()
+        .find(|step| matches!(step, FloodStep::Published | FloodStep::Read))
+        .is_none_or(|step| *step == FloodStep::Read)
 }
 
 /// Whether the budget ran out on a wire take that came after some watch
@@ -2048,9 +2060,7 @@ fn spent_with_a_change_unread(steps: &[FloodStep]) -> bool {
 }
 
 /// The most wire events the loop took after any watch change and before its
-/// next watch read, or the end of the run. Once the publications stop, the
-/// loop drains the full queue, so a change still unread then shows as more
-/// than two takes.
+/// next watch read.
 fn most_taken_before_a_read(steps: &[FloodStep]) -> usize {
     steps
         .iter()

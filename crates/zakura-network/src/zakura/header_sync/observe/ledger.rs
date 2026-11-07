@@ -1810,6 +1810,37 @@ mod tests {
         settled.finish().expect("nothing stays reserved or owned");
     }
 
+    /// A released round is stuck once no call that holds its headers is
+    /// still unended, whatever another round's calls do: round 1's prepare
+    /// ended and was never handled, while round 2's prepare is still out,
+    /// so only round 1 is stuck until round 2's ends too.
+    #[test]
+    fn each_released_round_is_stuck_by_its_own_calls() {
+        let mut events = after(&[(1, 1), (2, 2)], Vec::new());
+        for (call, byte) in [(1, 1), (2, 2)] {
+            let incarnation = u64::from(byte);
+            events.extend([
+                dispatched(call, prepare_of(byte, owner(), 5)),
+                held(call, StorageCallKind::Prepare, byte, incarnation),
+                released(byte, incarnation),
+                retired(byte, incarnation),
+            ]);
+        }
+        events.push(ReactorEvent::CallEnded {
+            call: 1,
+            end: CallEnd::Replied,
+        });
+        let ledger = fold(events.clone()).expect("both rounds release while their calls hold them");
+        assert_eq!(ledger.unsettled_rounds(), 2);
+        assert_eq!(ledger.stuck_rounds(), 1);
+        events.push(ReactorEvent::CallEnded {
+            call: 2,
+            end: CallEnd::Replied,
+        });
+        let ledger = fold(events).expect("the second call ends");
+        assert_eq!(ledger.stuck_rounds(), 2);
+    }
+
     /// A reservation fits its round's request limit: a 401-header repair for
     /// a 401-header request passes, one of 402 doesn't, and neither does a
     /// continuation above its round's limit.

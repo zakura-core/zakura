@@ -75,6 +75,8 @@ use super::{
     rows, Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Status, SubscribeHeaders,
     SUBSCRIBE_HEADERS,
 };
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::{header_sync::observe::HeaderSyncObserver, ZakuraPeerId};
 use crate::zakura::{
     header_sync::wire::AuxSchema,
     regulation::{
@@ -217,6 +219,10 @@ pub struct Admitted {
     pub(crate) reaches_target: bool,
     /// Whether this node sent `Close` before the page arrived.
     pub(crate) after_close: bool,
+    /// The page's position among its stream's reads, as the transport's
+    /// `PageClaimed` reports it, when a transport reader admitted it.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) frame: Option<u64>,
     seal: Seal,
 }
 
@@ -253,6 +259,15 @@ pub(crate) struct Subscriber {
     state: SubscriberState,
 }
 
+/// Who a [`Subscriber`]'s credit reports to, and for which peer and session.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+pub(crate) struct CreditTap {
+    pub(crate) observer: Arc<dyn HeaderSyncObserver>,
+    pub(crate) peer: ZakuraPeerId,
+    pub(crate) session_id: u64,
+}
+
 /// The reader's tap for this session's subscription tables, if it has one.
 /// The reader waits for the precheck the caller attaches next, so tagging
 /// starts before it reads the first frame.
@@ -284,6 +299,14 @@ impl Subscriber {
             fence,
             state: SubscriberState::new(header_bytes),
         }
+    }
+
+    /// This subscriber, reporting the credit it gives through `tap`, if
+    /// there is one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observed_by(mut self, tap: Option<CreditTap>) -> Self {
+        self.state.credit = tap;
+        self
     }
 
     /// The encoded header size of the subscriber's network.

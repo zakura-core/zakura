@@ -6,7 +6,11 @@
 
 use std::sync::Arc;
 
+#[cfg(any(test, zakura_sim))]
+use zakura_chain::block;
 use zakura_header_chain::{EngineSnapshot, Frontier, HeaderSyncWorkOwner, SourceId};
+#[cfg(any(test, zakura_sim))]
+use zakura_rt::sync::counter;
 use zakura_rt::{
     collections::HashMap,
     sync::{
@@ -16,6 +20,8 @@ use zakura_rt::{
 };
 
 mod policy;
+#[cfg(zakura_sim)]
+mod probe;
 
 pub(in crate::zakura::header_sync) use policy::{
     decide_offer, page_next, repair_page, OfferDecision, OfferFacts, OfferedPeerWork, PageFacts,
@@ -27,16 +33,54 @@ pub use policy::{
     HeaderWorkEnd, StorageCallKind, WorkIncarnation,
 };
 use policy::{HeaderChunkUsage, StageDecision, WorkPolicy};
+#[cfg(zakura_sim)]
+pub(in crate::zakura::header_sync) use probe::ProbeTargets;
+#[cfg(zakura_sim)]
+pub use probe::{HeaderResourceProbe, HeaderResources};
 
 #[cfg(any(test, zakura_sim))]
-use super::super::observe::{ObserverSlot, ReactorEvent};
+use super::super::observe::{
+    BudgetOwner, HeaderSyncObserver, ObserverSlot, PageArrival, ReactorEvent, RequestRef,
+    ReservationEnd, ReservationPurpose,
+};
 use super::super::{events::HeaderPortOperation, v9::Cursor, HeaderEntry, ZakuraPeerId};
+use crate::zakura::transport::sim_arg;
 
 #[derive(Debug)]
 struct HeaderChunkBudgetInner {
     capacity: usize,
     usage: Mutex<HeaderChunkUsage>,
     released: watch::Sender<u64>,
+    #[cfg(any(test, zakura_sim))]
+    last_reservation: ReservationNumbers,
+    #[cfg(any(test, zakura_sim))]
+    observer: BudgetObserver,
+}
+
+/// Where the budget reports each change: its queue's capacity handle. It
+/// prints nothing, so an observed budget prints as an unobserved one does.
+#[cfg(any(test, zakura_sim))]
+#[derive(Default)]
+struct BudgetObserver(ObserverSlot);
+
+#[cfg(any(test, zakura_sim))]
+impl std::fmt::Debug for BudgetObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BudgetObserver")
+    }
+}
+
+/// The last reservation number handed out, 0 before any. It prints nothing,
+/// so an observed budget prints as an unobserved one does.
+#[cfg(any(test, zakura_sim))]
+#[derive(Default)]
+struct ReservationNumbers(counter::AtomicU64);
+
+#[cfg(any(test, zakura_sim))]
+impl std::fmt::Debug for ReservationNumbers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReservationNumbers")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +92,10 @@ impl Default for HeaderChunkBudget {
             capacity: HEADER_CHUNK_BUDGET_CAPACITY_V1,
             usage: Mutex::new(HeaderChunkUsage::default()),
             released: watch::channel(0).0,
+            #[cfg(any(test, zakura_sim))]
+            last_reservation: ReservationNumbers::default(),
+            #[cfg(any(test, zakura_sim))]
+            observer: BudgetObserver::default(),
         }))
     }
 }
@@ -65,46 +113,119 @@ impl HeaderChunkBudget {
         self.usage().claimed()
     }
 
-    fn reserve(&self, count: usize) -> Option<HeaderCountReservation> {
+    /// Reserve `count` headers, reporting the reservation as `opening` says.
+    fn reserve(
+        &self,
+        count: usize,
+        #[cfg(any(test, zakura_sim))] opening: Opening<'_>,
+    ) -> Option<HeaderCountReservation> {
         let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(any(test, zakura_sim))]
+        let before = *usage;
         *usage = usage.reserve(self.0.capacity, count)?;
         self.publish(*usage);
+        #[cfg(any(test, zakura_sim))]
+        let after = *usage;
         drop(usage);
+        #[cfg(any(test, zakura_sim))]
+        let tag = opening.open(&self.0.last_reservation, count);
+        #[cfg(any(test, zakura_sim))]
+        self.report(
+            before,
+            after,
+            tag.as_ref().map(|tag| BudgetOwner::Reservation(tag.id)),
+        );
         Some(HeaderCountReservation(Arc::new(
             HeaderCountReservationInner {
                 budget: self.clone(),
                 remaining: AtomicUsize::new(count),
+                #[cfg(any(test, zakura_sim))]
+                tag,
             },
         )))
     }
 
-    fn consume(&self, reserved: usize, owned: usize) -> Result<Option<HeaderCapacityLease>, ()> {
+    /// Move `reserved` headers out of the reserved count and charge `owned`
+    /// as owned, returning a lease of the owned headers if there are any.
+    /// The change reports as `reservation`'s, and the lease names it.
+    fn consume(
+        &self,
+        reserved: usize,
+        owned: usize,
+        #[cfg(any(test, zakura_sim))] reservation: Option<u64>,
+    ) -> Result<Option<HeaderCapacityLease>, ()> {
         let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(any(test, zakura_sim))]
+        let before = *usage;
         *usage = usage.consume(reserved, owned).ok_or(())?;
         self.publish(*usage);
+        #[cfg(any(test, zakura_sim))]
+        let after = *usage;
         drop(usage);
+        #[cfg(any(test, zakura_sim))]
+        self.report(before, after, reservation.map(BudgetOwner::Reservation));
         Ok((owned != 0).then(|| {
             HeaderCapacityLease(Arc::new(HeaderCapacityLeaseInner {
                 budget: self.clone(),
                 count: owned,
+                #[cfg(any(test, zakura_sim))]
+                reservation,
+                #[cfg(any(test, zakura_sim))]
+                tag: None,
             }))
         }))
     }
 
-    /// Return `count` headers through `released`, and wake waiters when any return.
+    /// Return `count` headers through `released`, reporting the return as
+    /// `owner`'s, and wake waiters when any return.
     fn release(
         &self,
         count: usize,
         released: impl FnOnce(HeaderChunkUsage, usize) -> HeaderChunkUsage,
+        #[cfg(any(test, zakura_sim))] owner: Option<BudgetOwner>,
     ) {
         let mut usage = self.0.usage.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(any(test, zakura_sim))]
+        let before = *usage;
         *usage = released(*usage, count);
         self.publish(*usage);
+        // Under the lock, so the report comes before the wake below.
+        #[cfg(any(test, zakura_sim))]
+        self.report(before, *usage, owner);
         if count != 0 {
             self.0
                 .released
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
+    }
+
+    /// Reports the change from `before` to `after` as `owner`'s, unless
+    /// nothing observes the budget or the thread is unwinding, since an
+    /// unwinding reactor reports nothing, as `HeaderSyncObserver` says.
+    #[cfg(any(test, zakura_sim))]
+    fn report(
+        &self,
+        before: HeaderChunkUsage,
+        after: HeaderChunkUsage,
+        owner: Option<BudgetOwner>,
+    ) {
+        let Some(observer) = self.0.observer.0 .0.as_ref() else {
+            return;
+        };
+        if std::thread::panicking() {
+            return;
+        }
+        let delta = |before: usize, after: usize| {
+            let count = |count: usize| {
+                i64::try_from(count).expect("a budget count is at most its 4,000 capacity")
+            };
+            count(after) - count(before)
+        };
+        observer.observe(ReactorEvent::BudgetChanged {
+            owner,
+            reserved_delta: delta(before.reserved, after.reserved),
+            owned_delta: delta(before.owned, after.owned),
+        });
     }
 
     fn publish(&self, usage: HeaderChunkUsage) {
@@ -124,6 +245,64 @@ struct HeaderCountReservation(Arc<HeaderCountReservationInner>);
 struct HeaderCountReservationInner {
     budget: HeaderChunkBudget,
     remaining: AtomicUsize,
+    /// What its end reports, once the queue opened it with an observer.
+    #[cfg(any(test, zakura_sim))]
+    tag: Option<ReservationTag>,
+}
+
+/// Who a new reservation is for, which the budget reports it with.
+#[cfg(any(test, zakura_sim))]
+struct Opening<'a> {
+    /// Where to report it, if anywhere.
+    observer: &'a ObserverSlot,
+    peer: &'a ZakuraPeerId,
+    purpose: ReservationPurpose,
+    /// The running round a continuation extends.
+    request: Option<RequestRef>,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl Opening<'_> {
+    /// An opening nothing observes, for a test that seeds capacity directly.
+    #[cfg(test)]
+    fn unobserved(peer: &ZakuraPeerId) -> Opening<'_> {
+        static NONE: ObserverSlot = ObserverSlot(None);
+        Opening {
+            observer: &NONE,
+            peer,
+            purpose: ReservationPurpose::Ordinary,
+            request: None,
+        }
+    }
+
+    /// Numbers a reservation of `headers` from `last`, reports it, and
+    /// returns its tag, or nothing when no observer is installed.
+    fn open(self, last: &ReservationNumbers, headers: usize) -> Option<ReservationTag> {
+        let observer = self.observer.0.clone()?;
+        let id = last.0.fetch_add(1, counter::Ordering::Relaxed) + 1;
+        observer.observe(ReactorEvent::ReservationOpened {
+            reservation: id,
+            peer: self.peer.clone(),
+            purpose: self.purpose,
+            headers,
+            request: self.request,
+        });
+        Some(ReservationTag {
+            id,
+            observer,
+            end: ReservationEnd::Dropped,
+        })
+    }
+}
+
+/// An observed reservation's identity, the headers it still holds, and why
+/// it will end.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct ReservationTag {
+    id: u64,
+    observer: Arc<dyn HeaderSyncObserver>,
+    end: ReservationEnd,
 }
 
 impl HeaderCountReservation {
@@ -135,7 +314,8 @@ impl HeaderCountReservation {
     /// stays reserved for the pages that its credit still authorizes.
     fn consume(&self, owned: usize) -> Result<Option<HeaderCapacityLease>, ()> {
         let rest = policy::reservation_after_page(self.remaining(), owned).ok_or(())?;
-        let lease = self.0.budget.consume(owned, owned)?;
+        let budget = &self.0.budget;
+        let lease = sim_arg!(budget.consume(owned, owned); self.0.tag.as_ref().map(|tag| tag.id))?;
         self.0.remaining.store(rest, AtomicOrdering::SeqCst);
         Ok(lease)
     }
@@ -150,11 +330,22 @@ impl PartialEq for HeaderCountReservation {
 impl Eq for HeaderCountReservation {}
 
 impl Drop for HeaderCountReservationInner {
+    /// Returns the unstaged headers, then reports the end if it's observed.
     fn drop(&mut self) {
         let remaining = self.remaining.swap(0, AtomicOrdering::SeqCst);
         if remaining != 0 {
-            self.budget
-                .release(remaining, HeaderChunkUsage::release_reserved);
+            let budget = &self.budget;
+            sim_arg!(budget.release(remaining, HeaderChunkUsage::release_reserved);
+                self.tag.as_ref().map(|tag| BudgetOwner::Reservation(tag.id)));
+        }
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tag) = self.tag.as_ref().filter(|_| !std::thread::panicking()) {
+            // An unwinding reactor reports nothing, as `HeaderSyncObserver` says.
+            tag.observer.observe(ReactorEvent::ReservationEnded {
+                reservation: tag.id,
+                released: remaining,
+                cause: tag.end,
+            });
         }
     }
 }
@@ -166,6 +357,21 @@ pub(in crate::zakura::header_sync) struct HeaderCapacityLease(Arc<HeaderCapacity
 struct HeaderCapacityLeaseInner {
     budget: HeaderChunkBudget,
     count: usize,
+    /// The observed reservation its headers came from.
+    #[cfg(any(test, zakura_sim))]
+    reservation: Option<u64>,
+    /// What its return reports, once the queue staged it with an observer.
+    #[cfg(any(test, zakura_sim))]
+    tag: Option<LeaseTag>,
+}
+
+/// An observed lease's round.
+#[cfg(any(test, zakura_sim))]
+#[derive(Debug)]
+struct LeaseTag {
+    peer: ZakuraPeerId,
+    incarnation: u64,
+    observer: Arc<dyn HeaderSyncObserver>,
 }
 
 impl PartialEq for HeaderCapacityLease {
@@ -177,9 +383,23 @@ impl PartialEq for HeaderCapacityLease {
 impl Eq for HeaderCapacityLease {}
 
 impl Drop for HeaderCapacityLeaseInner {
+    /// Returns the lease's headers, then reports the return if it's observed.
     fn drop(&mut self) {
-        self.budget
-            .release(self.count, HeaderChunkUsage::release_owned);
+        let budget = &self.budget;
+        sim_arg!(budget.release(self.count, HeaderChunkUsage::release_owned);
+        self.reservation.map(|reservation| BudgetOwner::Lease {
+            reservation,
+            round: self.tag.as_ref().map(|tag| (tag.peer.clone(), tag.incarnation)),
+        }));
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tag) = self.tag.take().filter(|_| !std::thread::panicking()) {
+            // An unwinding reactor reports nothing, as `HeaderSyncObserver` says.
+            tag.observer.observe(ReactorEvent::LeaseReturned {
+                peer: tag.peer,
+                incarnation: tag.incarnation,
+                headers: self.count,
+            });
+        }
     }
 }
 
@@ -266,6 +486,11 @@ impl RetainedHeaders {
                 peer: self.peer.clone(),
                 incarnation: self.incarnation.get(),
                 headers: self.headers(),
+                leases: self
+                    .leases
+                    .iter()
+                    .filter_map(|lease| lease.0.tag.as_ref().map(|tag| tag.incarnation))
+                    .collect(),
             });
         }
     }
@@ -300,6 +525,51 @@ pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     budget: HeaderChunkBudget,
     request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
     staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
+    #[cfg(any(test, zakura_sim))]
+    observing: QueueObservation,
+}
+
+/// What the queue needs to report its reservations, pages and leases.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Default)]
+struct QueueObservation {
+    /// Where the queue reports them: the observer's capacity handle.
+    observer: ObserverSlot,
+    /// The arrival of the page [`PeerWorkQueue::stage_page`] is staging.
+    arriving: Option<PageArrival>,
+    /// The staging that page's capacity took, reported once the page is in
+    /// its round.
+    staged: Option<StagedPage>,
+    /// The reservation that page spent to the end, whose own end reports
+    /// after the page's staging.
+    exhausted: Option<HeaderCountReservation>,
+    /// The observer itself. This struct is the queue's last field, so this
+    /// drops after the queue's reservations and leases, and an observer
+    /// that reads the reactor's lifetime from its handles sees their ends
+    /// first.
+    lifetime: ObserverSlot,
+}
+
+/// A page's capacity staging, as [`PeerWorkQueue::stage_page`] reports it
+/// once the page is in its round.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Debug)]
+struct StagedPage {
+    observer: Arc<dyn HeaderSyncObserver>,
+    arrival: PageArrival,
+    request: RequestRef,
+    reservation: u64,
+    headers: usize,
+    reserved_left: usize,
+}
+
+/// Prints nothing of the observation, so an observed queue prints as an
+/// unobserved one does.
+#[cfg(any(test, zakura_sim))]
+impl std::fmt::Debug for QueueObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("QueueObservation")
+    }
 }
 
 /// Reads see the value-only policy. Every mutation goes through the queue, which
@@ -365,6 +635,8 @@ impl PeerWorkQueue {
 
     /// Drop `peer`'s reservation and the queue's clones of its leases.
     fn release_capacity(&mut self, peer: &ZakuraPeerId) {
+        #[cfg(any(test, zakura_sim))]
+        self.end_as(peer, ReservationEnd::Released);
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
     }
@@ -394,7 +666,14 @@ impl PeerWorkQueue {
 
     pub(in crate::zakura::header_sync) fn start(&mut self, request: ActiveHeaderRequest) -> bool {
         let reserved = self.request_reservations.contains_key(&request.peer);
-        self.policy.start(request, reserved)
+        #[cfg(any(test, zakura_sim))]
+        let peer = request.peer.clone();
+        let started = self.policy.start(request, reserved);
+        #[cfg(any(test, zakura_sim))]
+        if started {
+            self.report_bound(&peer);
+        }
+        started
     }
 
     /// Start one repair request and bind its durable evidence episode to its private queue state.
@@ -432,6 +711,8 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
     ) -> Option<ActiveHeaderRequest> {
         self.release_capacity(peer);
+        #[cfg(any(test, zakura_sim))]
+        self.report_released(peer);
         self.policy.remove(peer)
     }
 
@@ -468,11 +749,23 @@ impl PeerWorkQueue {
         ancestor: Frontier,
         entries: Vec<HeaderEntry>,
         cursor: Cursor,
+        #[cfg(any(test, zakura_sim))] arrival: PageArrival,
     ) -> bool {
+        #[cfg(any(test, zakura_sim))]
+        let hashes: Vec<block::Hash> = {
+            self.observing.arriving = Some(arrival);
+            entries.iter().map(|entry| entry.header.hash()).collect()
+        };
         if !self.policy.is_receiving(peer) || !self.consume_response_capacity(peer, entries.len()) {
+            #[cfg(any(test, zakura_sim))]
+            {
+                self.observing.arriving = None;
+            }
             return false;
         }
         self.policy.stage_page(peer, ancestor, entries, cursor);
+        #[cfg(any(test, zakura_sim))]
+        self.report_staged(peer, hashes);
         debug_assert_eq!(
             self.owned_header_count(peer),
             self.policy
@@ -521,7 +814,8 @@ impl PeerWorkQueue {
         count: u32,
     ) -> bool {
         let count = usize::try_from(count).unwrap_or(usize::MAX);
-        count <= MAX_HEADER_CHUNK_RESERVATION_V1 && self.reserve(peer, count)
+        count <= MAX_HEADER_CHUNK_RESERVATION_V1
+            && sim_arg!(self.reserve(peer, count); ReservationPurpose::Ordinary)
     }
 
     /// Reserve aggregate capacity for one selected auxiliary repair range.
@@ -530,15 +824,22 @@ impl PeerWorkQueue {
         peer: &ZakuraPeerId,
         count: u32,
     ) -> bool {
-        self.reserve(peer, usize::try_from(count).unwrap_or(usize::MAX))
+        sim_arg!(self.reserve(peer, usize::try_from(count).unwrap_or(usize::MAX)); ReservationPurpose::Repair)
     }
 
-    /// Give `peer`, which holds no reservation, one of `count` headers.
-    fn reserve(&mut self, peer: &ZakuraPeerId, count: usize) -> bool {
+    /// Give `peer`, which holds no reservation, one of `count` headers for
+    /// `purpose`.
+    fn reserve(
+        &mut self,
+        peer: &ZakuraPeerId,
+        count: usize,
+        #[cfg(any(test, zakura_sim))] purpose: ReservationPurpose,
+    ) -> bool {
         if self.request_reservations.contains_key(peer) {
             return false;
         }
-        let Some(reservation) = self.budget.reserve(count) else {
+        let Some(reservation) = sim_arg!(self.budget.reserve(count); self.opening(peer, purpose))
+        else {
             return false;
         };
         self.request_reservations.insert(peer.clone(), reservation);
@@ -550,6 +851,8 @@ impl PeerWorkQueue {
         &mut self,
         peer: &ZakuraPeerId,
     ) {
+        #[cfg(any(test, zakura_sim))]
+        self.end_as(peer, ReservationEnd::Cancelled);
         self.request_reservations.remove(peer);
     }
 
@@ -566,6 +869,37 @@ impl PeerWorkQueue {
         let Ok(lease) = reservation.consume(returned) else {
             return false;
         };
+        #[cfg(any(test, zakura_sim))]
+        let lease = {
+            let (lease, staged) = staged_page(
+                &self.policy,
+                peer,
+                reservation,
+                lease,
+                returned,
+                self.observing.arriving.take(),
+            );
+            self.observing.staged = staged;
+            lease
+        };
+        // The report takes what the reservation keeps from the queue's own
+        // single read of it, so it adds no read and no scheduling point.
+        #[cfg(any(test, zakura_sim))]
+        {
+            let remaining = reservation.remaining();
+            if let Some(staged) = &mut self.observing.staged {
+                staged.reserved_left = remaining;
+            }
+            if remaining == 0 {
+                self.end_as(peer, ReservationEnd::Staged);
+                // Its end reports after the page's staging, which spent it.
+                let exhausted = self.request_reservations.remove(peer);
+                if self.observing.staged.is_some() {
+                    self.observing.exhausted = exhausted;
+                }
+            }
+        }
+        #[cfg(not(any(test, zakura_sim)))]
         if reservation.remaining() == 0 {
             self.request_reservations.remove(peer);
         }
@@ -690,7 +1024,7 @@ impl PeerWorkQueue {
         if staged != 0 {
             let reservation = self
                 .budget
-                .reserve(staged)
+                .reserve(staged, Opening::unobserved(peer))
                 .expect("the test staged count fits the aggregate budget");
             let lease = reservation
                 .consume(staged)
@@ -701,11 +1035,158 @@ impl PeerWorkQueue {
         if reserved != 0 {
             let reservation = self
                 .budget
-                .reserve(reserved)
+                .reserve(reserved, Opening::unobserved(peer))
                 .expect("the test request count fits remaining capacity");
             self.request_reservations.insert(peer.clone(), reservation);
         }
     }
+}
+
+/// The queue's reports to its observer.
+#[cfg(any(test, zakura_sim))]
+impl PeerWorkQueue {
+    /// Report the page staged last, with its `hashes` and the headers its
+    /// round now holds, as the policy has it. Its spent reservation's end
+    /// reports after.
+    fn report_staged(&mut self, peer: &ZakuraPeerId, hashes: Vec<block::Hash>) {
+        if let Some(staged) = self.observing.staged.take() {
+            let entries = self
+                .policy
+                .active(peer)
+                .map_or(&[][..], |active| &active.entries[..]);
+            let staged_total = entries.len();
+            let stored = entries[staged_total.saturating_sub(staged.headers)..]
+                .iter()
+                .map(|entry| entry.header.hash())
+                .collect();
+            staged.observer.observe(ReactorEvent::PageStaged {
+                from_peer: staged.arrival.from_peer,
+                from_session: staged.arrival.from_session,
+                request: staged.request,
+                reservation: staged.reservation,
+                subscription: staged.arrival.subscription,
+                frame: staged.arrival.frame,
+                headers: staged.headers,
+                reserved_left: staged.reserved_left,
+                hashes,
+                stored,
+                staged_total,
+            });
+        }
+        self.observing.exhausted = None;
+    }
+
+    /// Report reservations, staged pages, lease returns, round releases and
+    /// budget changes from now on, to `observer`'s
+    /// [`capacity_observer`](HeaderSyncObserver::capacity_observer).
+    pub(in crate::zakura::header_sync) fn observed_by(&mut self, observer: &ObserverSlot) {
+        self.observing.lifetime = observer.clone();
+        self.observing.observer = ObserverSlot(observer.0.as_ref().map(|observer| {
+            observer
+                .capacity_observer()
+                .unwrap_or_else(|| observer.clone())
+        }));
+        Arc::get_mut(&mut self.budget.0)
+            .expect(
+                "the reactor observes its queue as it builds it, before anything shares its budget",
+            )
+            .observer = BudgetObserver(self.observing.observer.clone());
+    }
+
+    /// How a reservation for `peer` and `purpose` reports: an ordinary one
+    /// names `peer`'s running round, which only a continuation has.
+    fn opening<'a>(&'a self, peer: &'a ZakuraPeerId, purpose: ReservationPurpose) -> Opening<'a> {
+        Opening {
+            observer: &self.observing.observer,
+            peer,
+            purpose,
+            request: match purpose {
+                ReservationPurpose::Ordinary => self.policy.active(peer).map(RequestRef::of),
+                ReservationPurpose::Repair => None,
+            },
+        }
+    }
+
+    /// Record that `peer`'s reservation, which the queue is about to drop,
+    /// ends as `end`. A handle someone else still shares keeps its end.
+    fn end_as(&mut self, peer: &ZakuraPeerId, end: ReservationEnd) {
+        if let Some(tag) = self
+            .request_reservations
+            .get_mut(peer)
+            .and_then(|reservation| Arc::get_mut(&mut reservation.0))
+            .and_then(|inner| inner.tag.as_mut())
+        {
+            tag.end = end;
+        }
+    }
+
+    /// Report that the queue is removing `peer`'s started round, if it has
+    /// one, with the headers its own lease clones still hold for `peer`.
+    /// Called after the removal's capacity release, whatever that did.
+    fn report_released(&self, peer: &ZakuraPeerId) {
+        if let (Some(observer), Some(active)) =
+            (&self.observing.observer.0, self.policy.active(peer))
+        {
+            observer.observe(ReactorEvent::RoundReleased {
+                peer: peer.clone(),
+                incarnation: active.incarnation().get(),
+                queue_owned: self.owned_header_count(peer),
+            });
+        }
+    }
+
+    /// Report that `peer`'s reservation backs the round that just started.
+    fn report_bound(&self, peer: &ZakuraPeerId) {
+        let tag = self
+            .request_reservations
+            .get(peer)
+            .and_then(|reservation| reservation.0.tag.as_ref());
+        let (Some(tag), Some(active)) = (tag, self.policy.active(peer)) else {
+            return;
+        };
+        tag.observer.observe(ReactorEvent::ReservationBound {
+            reservation: tag.id,
+            request: RequestRef::of(active),
+            max_headers: usize::try_from(active.max_header_count).unwrap_or(usize::MAX),
+        });
+    }
+}
+
+/// Record the capacity a page of `headers` that `arrival` brought took from
+/// `reservation` for `peer`'s round, to report once the page is in the round,
+/// and tag its `lease` with that round so its return reports too. The caller
+/// fills in what the reservation keeps from its own read of it. A page
+/// staged without an arrival or on an unobserved reservation records nothing.
+#[cfg(any(test, zakura_sim))]
+fn staged_page(
+    policy: &WorkPolicy,
+    peer: &ZakuraPeerId,
+    reservation: &HeaderCountReservation,
+    mut lease: Option<HeaderCapacityLease>,
+    headers: usize,
+    arrival: Option<PageArrival>,
+) -> (Option<HeaderCapacityLease>, Option<StagedPage>) {
+    let (Some(tag), Some(active), Some(arrival)) =
+        (reservation.0.tag.as_ref(), policy.active(peer), arrival)
+    else {
+        return (lease, None);
+    };
+    if let Some(inner) = lease.as_mut().and_then(|lease| Arc::get_mut(&mut lease.0)) {
+        inner.tag = Some(LeaseTag {
+            peer: peer.clone(),
+            incarnation: active.incarnation().get(),
+            observer: tag.observer.clone(),
+        });
+    }
+    let staged = StagedPage {
+        observer: tag.observer.clone(),
+        arrival,
+        request: RequestRef::of(active),
+        reservation: tag.id,
+        headers,
+        reserved_left: 0,
+    };
+    (lease, Some(staged))
 }
 
 #[cfg(test)]
@@ -1137,7 +1618,10 @@ mod tests {
     fn header_chunk_leases_release_unused_and_owned_capacity_exactly_once() {
         let budget = HeaderChunkBudget::default();
         let reservation = budget
-            .reserve(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .reserve(
+                MAX_HEADER_CHUNK_RESERVATION_V1,
+                Opening::unobserved(&fixtures::peer(1)),
+            )
             .expect("the fair share fits an empty budget");
         assert_eq!(
             budget.usage(),
@@ -1173,7 +1657,10 @@ mod tests {
         assert_eq!(budget.usage(), HeaderChunkUsage::default());
 
         let empty = budget
-            .reserve(MAX_HEADER_CHUNK_RESERVATION_V1)
+            .reserve(
+                MAX_HEADER_CHUNK_RESERVATION_V1,
+                Opening::unobserved(&fixtures::peer(1)),
+            )
             .expect("released capacity can be reserved again");
         assert!(empty
             .consume(0)
@@ -1183,10 +1670,371 @@ mod tests {
         assert_eq!(budget.usage(), HeaderChunkUsage::default());
     }
 
+    /// The queue keeps its observer until its own reservations have
+    /// reported their ends, so an observer that reads the reactor's lifetime
+    /// from its handles outlives them, even when its capacity handle is a
+    /// separate one.
+    #[test]
+    fn the_queue_keeps_its_observer_until_its_capacity_ends() {
+        /// The observer whose drop marks the end of the reactor.
+        #[derive(Debug)]
+        struct Lifetime {
+            alive: Arc<counter::AtomicU64>,
+            seen: Arc<counter::AtomicU64>,
+        }
+        impl Drop for Lifetime {
+            fn drop(&mut self) {
+                self.alive.store(0, counter::Ordering::Relaxed);
+            }
+        }
+        impl HeaderSyncObserver for Lifetime {
+            fn observe(&self, _: ReactorEvent) {}
+            fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
+                Some(Arc::new(Capacity {
+                    alive: self.alive.clone(),
+                    seen: self.seen.clone(),
+                }))
+            }
+        }
+        /// The capacity handle, which counts the ends it sees while the
+        /// lifetime observer lives.
+        #[derive(Debug)]
+        struct Capacity {
+            alive: Arc<counter::AtomicU64>,
+            seen: Arc<counter::AtomicU64>,
+        }
+        impl HeaderSyncObserver for Capacity {
+            fn observe(&self, event: ReactorEvent) {
+                if matches!(event, ReactorEvent::ReservationEnded { .. })
+                    && self.alive.load(counter::Ordering::Relaxed) == 1
+                {
+                    self.seen.fetch_add(1, counter::Ordering::Relaxed);
+                }
+            }
+        }
+
+        let alive = Arc::new(counter::AtomicU64::new(1));
+        let seen = Arc::new(counter::AtomicU64::new(0));
+        let mut queue = PeerWorkQueue::default();
+        queue.observed_by(&ObserverSlot(Some(Arc::new(Lifetime {
+            alive: alive.clone(),
+            seen: seen.clone(),
+        }))));
+        assert!(queue.reserve_request(&peer(1), 5));
+        drop(queue);
+        assert_eq!(seen.load(counter::Ordering::Relaxed), 1);
+        assert_eq!(alive.load(counter::Ordering::Relaxed), 0);
+    }
+
+    /// Records every event, in order.
+    #[derive(Debug, Default)]
+    struct Recorded(Mutex<Vec<ReactorEvent>>);
+
+    impl HeaderSyncObserver for Recorded {
+        fn observe(&self, event: ReactorEvent) {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    impl Recorded {
+        /// The events recorded since the last call.
+        fn take(&self) -> Vec<ReactorEvent> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    /// The budget change `owner` made, by `reserved` and `owned` headers.
+    fn changed(owner: BudgetOwner, reserved: i64, owned: i64) -> ReactorEvent {
+        ReactorEvent::BudgetChanged {
+            owner: Some(owner),
+            reserved_delta: reserved,
+            owned_delta: owned,
+        }
+    }
+
+    /// A queue reporting to a new recorder, with `peer(1)`'s target staged,
+    /// and the observer slot that recorder sits in.
+    fn observed_queue() -> (PeerWorkQueue, Arc<Recorded>, ObserverSlot) {
+        let recorder = Arc::new(Recorded::default());
+        let observer = ObserverSlot(Some(recorder.clone()));
+        let mut queue = PeerWorkQueue::default();
+        queue.observed_by(&observer);
+        assert_eq!(
+            queue.stage(peer(1), advertisement(1), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        (queue, recorder, observer)
+    }
+
+    /// A page entry whose header `version` sets its hash apart.
+    fn versioned_entry(version: u32) -> HeaderEntry {
+        let mut header = *regtest_genesis_block().header;
+        header.version = version;
+        HeaderEntry {
+            header: Arc::new(header),
+            body_size: 0,
+            tree_aux: None,
+        }
+    }
+
+    /// Stages `entries` on `peer(1)`'s round as a page that frame `frame` of
+    /// subscription 3 brought on session 7.
+    fn stage_arrival(queue: &mut PeerWorkQueue, entries: Vec<HeaderEntry>, frame: u64) -> bool {
+        queue.stage_page(
+            &peer(1),
+            snapshot().frontiers.finalized,
+            entries,
+            Cursor {
+                height: block::Height(0),
+                hash: hash(0),
+                headers: 0,
+                bytes: 0,
+            },
+            PageArrival {
+                from_peer: peer(1),
+                from_session: 7,
+                subscription: 3,
+                frame: Some(frame),
+            },
+        )
+    }
+
+    /// An observed round reports its reservation's opening, binding and end,
+    /// each page it stages with that page's values, a continuation's
+    /// reservation and cancellation, the rounds of the leases a call holds,
+    /// the round's release, and each lease's return once its last holder
+    /// drops, in that order. Each budget change reports as it happens,
+    /// naming the reservation it charges, moves or returns, or the lease it
+    /// returns with that lease's reservation and round.
+    #[test]
+    fn an_observed_round_reports_its_capacity_in_order() {
+        let (mut queue, recorder, observer) = observed_queue();
+        let entries = [11, 12, 13].map(versioned_entry);
+        let [first, second, third] = entries.each_ref().map(|entry| entry.header.hash());
+
+        assert!(queue.reserve_request(&peer(1), 3));
+        assert_eq!(
+            recorder.take(),
+            [
+                ReactorEvent::ReservationOpened {
+                    reservation: 1,
+                    peer: peer(1),
+                    purpose: ReservationPurpose::Ordinary,
+                    headers: 3,
+                    request: None,
+                },
+                changed(BudgetOwner::Reservation(1), 3, 0),
+            ]
+        );
+
+        assert!(queue.start(active_request(1, advertisement(1), &snapshot(), Vec::new())));
+        let round = RequestRef::of(queue.active(&peer(1)).expect("the round started"));
+        let incarnation = round.incarnation;
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::ReservationBound {
+                reservation: 1,
+                request: round.clone(),
+                max_headers: 1_000,
+            }]
+        );
+
+        let staged = |hashes: Vec<block::Hash>, reserved_left, staged_total, frame| {
+            ReactorEvent::PageStaged {
+                from_peer: peer(1),
+                from_session: 7,
+                request: round.clone(),
+                reservation: 1,
+                subscription: 3,
+                frame: Some(frame),
+                headers: hashes.len(),
+                reserved_left,
+                stored: hashes.clone(),
+                hashes,
+                staged_total,
+            }
+        };
+        assert!(stage_arrival(
+            &mut queue,
+            vec![entries[0].clone(), entries[1].clone()],
+            9
+        ));
+        assert_eq!(
+            recorder.take(),
+            [
+                changed(BudgetOwner::Reservation(1), -2, 2),
+                staged(vec![first, second], 1, 2, 9),
+            ]
+        );
+
+        // The page that spends the reservation reports before its end.
+        assert!(stage_arrival(&mut queue, vec![entries[2].clone()], 10));
+        assert_eq!(
+            recorder.take(),
+            [
+                changed(BudgetOwner::Reservation(1), -1, 1),
+                staged(vec![third], 0, 3, 10),
+                ReactorEvent::ReservationEnded {
+                    reservation: 1,
+                    released: 0,
+                    cause: ReservationEnd::Staged,
+                },
+            ]
+        );
+
+        // A continuation names the running round, and its cancellation
+        // returns every header it held.
+        assert!(queue.reserve_request(&peer(1), 2));
+        queue.cancel_request_reservation(&peer(1));
+        assert_eq!(
+            recorder.take(),
+            [
+                ReactorEvent::ReservationOpened {
+                    reservation: 2,
+                    peer: peer(1),
+                    purpose: ReservationPurpose::Ordinary,
+                    headers: 2,
+                    request: Some(round.clone()),
+                },
+                changed(BudgetOwner::Reservation(2), 2, 0),
+                changed(BudgetOwner::Reservation(2), -2, 0),
+                ReactorEvent::ReservationEnded {
+                    reservation: 2,
+                    released: 2,
+                    cause: ReservationEnd::Cancelled,
+                },
+            ]
+        );
+
+        let call = StorageCall {
+            number: 1,
+            kind: StorageCallKind::Prepare,
+        };
+        let mut held = queue
+            .retain_headers(&peer(1), call)
+            .expect("the round started");
+        held.observed_by(&observer);
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::HeadersHeld {
+                call: 1,
+                kind: StorageCallKind::Prepare,
+                peer: peer(1),
+                incarnation,
+                headers: 3,
+                leases: vec![incarnation, incarnation],
+            }]
+        );
+
+        // The call still holds both leases, so the release returns neither.
+        assert!(queue.remove(&peer(1)).is_some());
+        assert_eq!(
+            recorder.take(),
+            [ReactorEvent::RoundReleased {
+                peer: peer(1),
+                incarnation,
+                queue_owned: 0,
+            }]
+        );
+
+        drop(held);
+        let returned = |headers| ReactorEvent::LeaseReturned {
+            peer: peer(1),
+            incarnation,
+            headers,
+        };
+        let lease = BudgetOwner::Lease {
+            reservation: 1,
+            round: Some((peer(1), incarnation)),
+        };
+        assert_eq!(
+            recorder.take(),
+            [
+                ReactorEvent::HeadersEnded {
+                    call: 1,
+                    incarnation,
+                    headers: 3,
+                    end: HeaderWorkEnd::Dropped,
+                },
+                changed(lease.clone(), 0, -2),
+                returned(2),
+                changed(lease, 0, -1),
+                returned(1),
+            ]
+        );
+    }
+
+    /// Removing a round ends its reservation as released and returns the
+    /// leases only the queue held before it reports the release, and the
+    /// queue's own drop ends a reservation it still holds.
+    #[test]
+    fn a_removed_round_returns_its_capacity_before_its_release_reports() {
+        let (mut queue, recorder, _observer) = observed_queue();
+        assert!(queue.reserve_request(&peer(1), 2));
+        assert!(queue.start(active_request(1, advertisement(1), &snapshot(), Vec::new())));
+        let incarnation = queue
+            .active(&peer(1))
+            .expect("the round started")
+            .incarnation()
+            .get();
+        assert!(stage_arrival(&mut queue, vec![versioned_entry(11)], 9));
+        assert!(queue.reserve_request(&peer(2), 4));
+        recorder.take();
+
+        assert!(queue.remove(&peer(1)).is_some());
+        assert_eq!(
+            recorder.take(),
+            [
+                changed(BudgetOwner::Reservation(1), -1, 0),
+                ReactorEvent::ReservationEnded {
+                    reservation: 1,
+                    released: 1,
+                    cause: ReservationEnd::Released,
+                },
+                changed(
+                    BudgetOwner::Lease {
+                        reservation: 1,
+                        round: Some((peer(1), incarnation)),
+                    },
+                    0,
+                    -1,
+                ),
+                ReactorEvent::LeaseReturned {
+                    peer: peer(1),
+                    incarnation,
+                    headers: 1,
+                },
+                ReactorEvent::RoundReleased {
+                    peer: peer(1),
+                    incarnation,
+                    queue_owned: 0,
+                },
+            ]
+        );
+
+        drop(queue);
+        assert_eq!(
+            recorder.take(),
+            [
+                changed(BudgetOwner::Reservation(2), -4, 0),
+                ReactorEvent::ReservationEnded {
+                    reservation: 2,
+                    released: 4,
+                    cause: ReservationEnd::Dropped,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn malformed_overreturn_preserves_reservation_until_terminal_cleanup() {
         let budget = HeaderChunkBudget::default();
-        let reservation = budget.reserve(1).expect("one header fits the budget");
+        let reservation = budget
+            .reserve(1, Opening::unobserved(&fixtures::peer(1)))
+            .expect("one header fits the budget");
         assert!(reservation.consume(2).is_err());
         assert_eq!(
             budget.usage(),

@@ -26,7 +26,9 @@ fn recorded(
 }
 
 /// Starts a round for `peer` in the preparing phase, one header owned and one
-/// reserved, and reports its `Started`, which the seed does not.
+/// reserved, and reports its `Started`, which the queue does not. The header
+/// is staged through the queue from the round's own reservation, so the
+/// ledger sees the round's whole accounting.
 fn seed_preparing(
     reactor: &mut HeaderSyncReactor,
     snapshot: &zakura_header_chain::EngineSnapshot,
@@ -34,15 +36,55 @@ fn seed_preparing(
     peer: &ZakuraPeerId,
     session_id: u64,
 ) -> ActiveHeaderRequest {
-    seed_applying_request(reactor, snapshot, peer.clone(), session_id);
-    let round = reactor
-        .peer_work_queue
-        .active_mut(peer)
-        .expect("the seed started this round");
+    let (advertised, mut request) = super::applying_request(snapshot, peer.clone(), session_id);
+    let queue = &mut reactor.peer_work_queue;
+    assert_eq!(
+        queue.stage(peer.clone(), advertised, PeerWorkPriority::Normal),
+        QueueWorkResult::NeedsLocator
+    );
+    assert!(queue.reserve_request(peer, 2));
+    let entries = std::mem::take(&mut request.entries);
+    let target = request.target.status.selected_tip_hash;
+    let ancestor = request
+        .common_ancestor
+        .expect("the request names its ancestor");
+    let subscription = request.request_id.get();
+    request.phase = HeaderTargetPhase::Receiving;
+    // The round asks for both headers it reserves.
+    request.max_header_count = 2;
+    assert!(queue.start(request));
+    recorder.observe(ReactorEvent::started(
+        queue.active(peer).expect("the round just started"),
+    ));
+    let cursor = v9::Cursor {
+        height: ancestor
+            .height
+            .next()
+            .expect("the fixture has a next height"),
+        hash: target,
+        headers: 1,
+        bytes: 0,
+    };
+    let arrival = observe::PageArrival {
+        from_peer: peer.clone(),
+        from_session: session_id,
+        subscription,
+        frame: None,
+    };
+    assert!(queue.stage_page(peer, ancestor, entries, cursor, arrival));
+    let round = queue.active_mut(peer).expect("the seed started this round");
     round.phase = HeaderTargetPhase::Preparing;
-    let round = round.clone();
-    recorder.observe(ReactorEvent::started(&round));
-    round
+    round.clone()
+}
+
+/// `events`, then everything the reactor reports as it tears down.
+fn torn_down(
+    reactor: HeaderSyncReactor,
+    recorder: &Recorder,
+    events: Vec<ReactorEvent>,
+) -> Vec<ReactorEvent> {
+    drop(reactor);
+    events.into_iter().chain(recorder.take_all()).collect()
 }
 
 /// The prepare call for `round`, with its own entries.
@@ -106,7 +148,20 @@ fn ledger_accepts(events: &[ReactorEvent]) -> HeaderWorkLedger {
             .observe(event)
             .unwrap_or_else(|broken| panic!("{broken}\n{events:#?}"));
     }
+    let claims = ledger.take_claims();
+    assert!(claims.is_empty(), "{claims:?}\n{events:#?}");
     ledger
+}
+
+/// Folds `events` through the ledger as a torn-down reactor's, runs its
+/// teardown check, and requires both clean, claim breaks included.
+fn ledger_settles(events: &[ReactorEvent]) {
+    let mut ledger = ledger_accepts(events);
+    ledger
+        .finish()
+        .unwrap_or_else(|broken| panic!("{broken}\n{events:#?}"));
+    let claims = ledger.take_claims();
+    assert!(claims.is_empty(), "{claims:?}\n{events:#?}");
 }
 
 /// A sealed prepare hands its headers to its apply: nothing releases between
@@ -159,6 +214,7 @@ async fn a_prepare_hands_its_headers_to_its_apply_without_a_release() {
         peer: peer.clone(),
         incarnation: round.incarnation().get(),
         headers: 1,
+        leases: vec![round.incarnation().get()],
     }));
 
     gate.add_permits(1);
@@ -167,7 +223,7 @@ async fn a_prepare_hands_its_headers_to_its_apply_without_a_release() {
     let applied = recorder.take_all();
     assert_eq!(ownership(&applied), vec![(2, Some(HeaderWorkEnd::Settled))]);
     let history: Vec<_> = handed.into_iter().chain(applied).collect();
-    ledger_accepts(&history).finish().expect("every call ended");
+    ledger_settles(&torn_down(reactor, &recorder, history));
 }
 
 /// A call from an earlier round cannot settle a later round with the same owner,
@@ -224,11 +280,13 @@ async fn an_earlier_rounds_prepare_cannot_settle_a_later_round_with_the_same_own
             (2, Some(HeaderWorkEnd::PrepareFailed)),
         ]
     );
-    ledger_accepts(&events).finish().expect("every call ended");
     assert_eq!(reactor.peer_work_queue.chunk_budget_usage(), (0, 0));
+    ledger_settles(&torn_down(reactor, &recorder, events));
 }
 
 /// A prepare the reactor answers itself still ends the headers it held.
+/// Here that prepare is hand-built too large to submit, so the ledger, which
+/// checks a prepare sends exactly its round's headers, refuses it.
 #[tokio::test]
 async fn a_prepare_that_storage_never_sees_ends_its_headers() {
     let (mut reactor, snapshot, recorder) = recorded(Arc::new(ScriptedPort::default()));
@@ -257,7 +315,14 @@ async fn a_prepare_that_storage_never_sees_ends_its_headers() {
         ownership(&events),
         vec![(1, None), (1, Some(HeaderWorkEnd::PrepareFailed))]
     );
-    ledger_accepts(&events).finish().expect("every call ended");
+    // The oversized prepare isn't the round's own payload, which the ledger
+    // also catches.
+    let mut ledger = HeaderWorkLedger::default();
+    let broken = events
+        .iter()
+        .find_map(|event| ledger.observe(event).err())
+        .expect("the ledger refuses the hand-built prepare");
+    assert!(broken.starts_with("WrongPayload"), "{broken}");
 }
 
 /// A panic before or after submission ends the call's headers as panicked.
@@ -284,8 +349,8 @@ async fn a_panicking_call_ends_its_headers() {
             vec![(1, None), (1, Some(HeaderWorkEnd::Panicked))],
             "{panic:?}"
         );
-        ledger_accepts(&events).finish().expect("every call ended");
         assert_eq!(reactor.peer_work_queue.chunk_budget_usage(), (0, 0));
+        ledger_settles(&torn_down(reactor, &recorder, events));
     }
 }
 
@@ -331,7 +396,7 @@ async fn teardown_ends_each_unfinished_call_and_its_headers() {
         )) < position(|event| matches!(event, ReactorEvent::HeadersEnded { .. })),
         "the call's end comes before anything its future holds drops"
     );
-    ledger_accepts(&events).finish().expect("every call ended");
+    ledger_settles(&events);
 }
 
 /// A completion with no committed snapshot to check it against has no authority.

@@ -621,7 +621,7 @@ where
                         &network,
                         block.clone(),
                         hash,
-                        (height, receipt_order),
+                        (height, receipt_order, request.origin()),
                         admission,
                     )
                     .await?
@@ -649,13 +649,13 @@ where
                 let quick_checks: Result<_, VerifyBlockError> = (|| {
                     check::time_is_valid_at(block.header(), now, &height, &hash)
                         .map_err(VerifyBlockError::Time)?;
-                    let coinbase_tx = check::coinbase_is_first(&block)?;
+                    let coinbase = check::coinbase_is_first(&block)?;
                     check::shielded_action_limits_are_valid(
                         block.view().transactions(),
                         height,
                         &network,
                     )?;
-                    Ok(coinbase_tx)
+                    Ok(coinbase)
                 })();
                 let quick_checks = match quick_checks {
                     Err(error) if request.is_proposal() => return Err(error),
@@ -667,7 +667,17 @@ where
                 // header, or fails a cheap rule, never has its proofs and signatures hashed.
                 let transaction_hashes = block.view().transaction_hashes();
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
-                let coinbase_tx = quick_checks?;
+                let check::CoinbaseSummary {
+                    coinbase_tx,
+                    has_transparent_spends,
+                } = quick_checks?;
+                if has_transparent_spends {
+                    check::transparent_spends_are_unique(&block).map_err(|error| {
+                        VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(
+                            Box::new(error),
+                        ))
+                    })?;
+                }
 
                 // Hash each transaction's authorizing data once, for the transaction requests
                 // and the state's authorizing-data check.
@@ -931,6 +941,7 @@ where
 
                 // Finally, submit the block for contextual verification.
                 let prepared_block = zs::SemanticallyVerifiedBlock {
+                    origin: request.origin(),
                     block,
                     hash,
                     height,
@@ -1017,7 +1028,7 @@ async fn try_prepared_fast_path<S>(
     network: &Network,
     block: BlockHandle,
     hash: block::Hash,
-    (height, receipt_order): (block::Height, Option<u64>),
+    (height, receipt_order, origin): (block::Height, Option<u64>, zs::BlockOrigin),
     admission: &zs::BlockAdmission,
 ) -> Result<Option<block::Hash>, VerifyBlockError>
 where
@@ -1054,6 +1065,7 @@ where
     prepared_block.hash = hash;
     prepared_block.height = height;
     prepared_block.receipt_order = receipt_order;
+    prepared_block.origin = origin;
 
     if source == PreparedCandidateSource::ServerTemplate
         && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?

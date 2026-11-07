@@ -95,7 +95,7 @@ use zakura_chain::block::{self, genesis::regtest_genesis_block};
 use zakura_consensus::router::BackgroundTaskHandles;
 use zakura_network::types::PeerServices;
 use zakura_node_services::task::{spawn_buffer, spawn_erased};
-use zakura_rpc::SubmitBlockChannel;
+use zakura_rpc::EarlyMinedBlockChannel;
 use zakura_state::StorageMode;
 
 use zakura::{
@@ -449,10 +449,13 @@ impl StartCmd {
         let state_config = config.mirrored_state_config();
 
         let (
-            mut state_service,
-            read_only_state_service,
-            latest_chain_tip,
-            chain_tip_change,
+            zakura_state::InitializedState {
+                state: mut state_service,
+                read_state: read_only_state_service,
+                latest_chain_tip,
+                chain_tip_change,
+                block_announcements,
+            },
             header_chain_body_evidence,
         ) = zakura_state::init_with_header_chain_body_evidence(
             state_config,
@@ -537,6 +540,16 @@ impl StartCmd {
         let mut node_tasks = NodeTasks::default();
         // Cancel detached tasks before dropping the state services, whose teardown blocks.
         let _shutdown_on_drop = shutdown.clone().drop_guard();
+
+        if let Some(task) = crate::components::tracing::raw_endpoint::init(
+            config.tracing.raw_endpoint_addr,
+            config.network.zakura.trace_dir.clone(),
+            shutdown.clone(),
+        )
+        .await?
+        {
+            node_tasks.track(&task);
+        }
 
         info!("initializing network");
         // The service that our node uses to respond to requests by peers. The
@@ -695,6 +708,7 @@ impl StartCmd {
             chain_tip_change.clone(),
             misbehavior_sender.clone(),
             zcashd_compat_block_gossip_peer_ips.clone(),
+            config.network.unconditional_peers.clone(),
         );
         let mempool_verification_finished = mempool.verification_finished();
         let mempool = spawn_buffer(
@@ -725,7 +739,7 @@ impl StartCmd {
         tokio::task::yield_now().await;
 
         // Create a channel to send mined blocks to the gossip task
-        let submit_block_channel = SubmitBlockChannel::new();
+        let submit_block_channel = EarlyMinedBlockChannel::new();
 
         // Launch RPC server
         let (rpc_impl, mut rpc_tx_queue_handle) = zakura_rpc::node::new_rpc_impl(
@@ -848,7 +862,8 @@ impl StartCmd {
         let block_gossip_task_handle = spawn_erased(
             sync::gossip_best_tip_block_hashes(
                 sync_status.clone(),
-                chain_tip_change.clone(),
+                latest_chain_tip.clone(),
+                block_announcements,
                 block_adverts.clone(),
                 read_only_state_service.clone(),
                 Some(submit_block_channel.receiver()),
@@ -2142,15 +2157,23 @@ mod zakura_header_sync_driver_tests {
         ];
 
         if phase.as_deref() == Some("persist") {
-            let (mut state_service, read_state, latest_tip, tip_change, header_chain_authority) =
-                zakura_state::init_with_header_chain_body_evidence(
-                    state_config.clone(),
-                    &network,
-                    block::Height(0),
-                    2,
-                )
-                .await
-                .expect("persistent test state initialization succeeds");
+            let (
+                zakura_state::InitializedState {
+                    state: mut state_service,
+                    read_state,
+                    latest_chain_tip: latest_tip,
+                    chain_tip_change: tip_change,
+                    ..
+                },
+                header_chain_authority,
+            ) = zakura_state::init_with_header_chain_body_evidence(
+                state_config.clone(),
+                &network,
+                block::Height(0),
+                2,
+            )
+            .await
+            .expect("persistent test state initialization succeeds");
             let committed = state_service
                 .ready()
                 .await
@@ -2235,15 +2258,23 @@ mod zakura_header_sync_driver_tests {
         }
 
         if phase.as_deref() == Some("reopen") {
-            let (mut state_service, read_state, latest_tip, tip_change, header_chain_authority) =
-                zakura_state::init_with_header_chain_body_evidence(
-                    state_config,
-                    &network,
-                    block::Height(0),
-                    2,
-                )
-                .await
-                .expect("persistent test state reopens");
+            let (
+                zakura_state::InitializedState {
+                    state: mut state_service,
+                    read_state,
+                    latest_chain_tip: latest_tip,
+                    chain_tip_change: tip_change,
+                    ..
+                },
+                header_chain_authority,
+            ) = zakura_state::init_with_header_chain_body_evidence(
+                state_config,
+                &network,
+                block::Height(0),
+                2,
+            )
+            .await
+            .expect("persistent test state reopens");
             state_service
                 .ready()
                 .await
@@ -5645,8 +5676,12 @@ mod zakura_header_sync_driver_tests {
         let checkpoint_hash = chain[CHECKPOINT_HEIGHT as usize].1.hash();
 
         let network = zakura_chain::parameters::Network::Mainnet;
-        let (write_state, read_state, _latest_tip, _tip_change) =
-            zakura_state::init_test_services(&network).await;
+        let zakura_state::InitializedState {
+            state: write_state,
+            read_state,
+            latest_chain_tip,
+            ..
+        } = zakura_state::init_test_services(&network).await;
 
         // A low checkpoint at height 10 turns the 11-block range into one checkpoint batch.
         let mut checkpoint_verifier = zakura_consensus::CheckpointVerifier::from_list(
@@ -5705,7 +5740,7 @@ mod zakura_header_sync_driver_tests {
         .spawn(
             action_rx,
             block_sync,
-            _latest_tip,
+            latest_chain_tip,
             read_state.clone(),
             verifier,
         );
@@ -5804,8 +5839,12 @@ mod zakura_header_sync_driver_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn legacy_fallback_transfers_full_commit_waiting_for_parent() {
         let network = zakura_chain::parameters::Network::Mainnet;
-        let (write_state, read_state, latest_tip, _tip_change) =
-            zakura_state::init_test_services(&network).await;
+        let zakura_state::InitializedState {
+            state: write_state,
+            read_state,
+            latest_chain_tip: latest_tip,
+            ..
+        } = zakura_state::init_test_services(&network).await;
 
         let barrier_state = write_state.clone();
         let submitted_count = Arc::new(AtomicUsize::new(0));
@@ -5929,8 +5968,12 @@ mod zakura_header_sync_driver_tests {
         let second_checkpoint_hash = chain[SECOND_CHECKPOINT_HEIGHT as usize].1.hash();
 
         let network = zakura_chain::parameters::Network::Mainnet;
-        let (write_state, read_state, latest_tip, _tip_change) =
-            zakura_state::init_test_services(&network).await;
+        let zakura_state::InitializedState {
+            state: write_state,
+            read_state,
+            latest_chain_tip: latest_tip,
+            ..
+        } = zakura_state::init_test_services(&network).await;
 
         let checkpoint_verifier = zakura_consensus::CheckpointVerifier::from_list(
             [
@@ -6048,8 +6091,11 @@ mod zakura_header_sync_driver_tests {
         let best_header_tip = (block::Height(20), block::Hash([20; 32]));
 
         let network = zakura_chain::parameters::Network::Mainnet;
-        let (write_state, read_state, _latest_tip, _tip_change) =
-            zakura_state::init_test_services(&network).await;
+        let zakura_state::InitializedState {
+            state: write_state,
+            read_state,
+            ..
+        } = zakura_state::init_test_services(&network).await;
 
         // Start a live reactor from the stale genesis frontier, with headers
         // already above the checkpoint.

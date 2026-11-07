@@ -17,7 +17,10 @@
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
-//! [`super::stage`]), `ConnectionClosed` for a close decided with a cause,
+//! [`super::stage`]), or for a page carrying a header the peer's fixture
+//! made invalid, once the node's storage has run the preparation of that
+//! header for the page's session (hdr-4 ask 4, option (b)), so a page the
+//! node never prepares is never judged, `ConnectionClosed` for a close decided with a cause,
 //! and `Misbehavior` for the connection of the session a reactor
 //! misbehavior names. A misbehavior with no origin session is a harness
 //! failure, and so is a frame the reader reached with no `PeerFrame`, or a
@@ -31,7 +34,9 @@ use std::{
     time::Duration,
 };
 
+use zakura_chain::block;
 use zakura_network::zakura::{v9::RegtestMessage, Frame, MessageRole, MessageRule};
+use zakura_storage::header::Outcome;
 
 use super::{
     adapter::SenderAdapter,
@@ -39,7 +44,11 @@ use super::{
 };
 use crate::{
     model::{FrameHeader, Label},
-    observe::{PeerCredit, ReactorFact, StreamId, TransitionFact, TransportFact},
+    observe::{
+        PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
+        TransportFact,
+    },
+    storage::{hash, HEADER_SERVICE},
     Observation, ObservationLog,
 };
 
@@ -83,6 +92,10 @@ pub(crate) enum RecordBody {
         exhausted: bool,
         exchange: Option<u64>,
         payload: u64,
+        /// The header the peer's fixture made invalid, if this page carries
+        /// it. The node judges such a page when it prepares that header,
+        /// not when it reads it. Not logged.
+        prepares: Option<InvalidPage>,
     },
     /// [`Observation::PeerWritten`].
     Written { seq: u64 },
@@ -100,6 +113,16 @@ pub(crate) enum RecordBody {
     },
 }
 
+/// A page carrying a header the peer's fixture made invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InvalidPage {
+    /// The header.
+    pub(crate) header: block::Hash,
+    /// The page's subscription. The node opens each subscription under its
+    /// request's ID, so a preparation's owner names it.
+    pub(crate) subscription: u64,
+}
+
 /// The identity map as the log has it, and the labels logged so far.
 #[derive(Debug, Default)]
 pub(crate) struct WireEvidence {
@@ -114,6 +137,8 @@ pub(crate) struct WireEvidence {
     streams: BTreeMap<(u64, u64), StreamId>,
     /// Each admitted session's connection, by session ID.
     sessions: BTreeMap<u64, u64>,
+    /// Each admitted session's QUIC stream, by session ID.
+    session_streams: BTreeMap<u64, u64>,
     /// Each logged `PeerFrame`'s label, by connection, QUIC stream and
     /// `seq`.
     labels: BTreeMap<(u64, u64, u64), Label>,
@@ -127,6 +152,17 @@ pub(crate) struct WireEvidence {
     views: BTreeMap<(u64, u64), NodeView>,
     /// Frames whose header the reader has, not judged yet.
     waiting: BTreeMap<FrameKey, Waiting>,
+    /// Each placed page that carries an invalid header.
+    invalid: BTreeMap<FrameKey, InvalidPage>,
+    /// Pages carrying an invalid header that the reader has decided,
+    /// waiting for its preparation.
+    unprepared: BTreeMap<FrameKey, InvalidPage>,
+    /// Each preparation the node's storage was asked for: its target's hash
+    /// as the log writes it, and its work's session and request, by
+    /// operation ID.
+    prepares: BTreeMap<u64, (String, u64, u64)>,
+    /// Judgements a preparation made, for the entry being projected.
+    late: Vec<Observation>,
     /// Labels the node's frames.
     sender: SenderAdapter,
 }
@@ -196,6 +232,7 @@ impl WireEvidence {
                     };
                     self.streams.insert((*connection, *quic_stream), stream);
                     self.sessions.insert(*session_id, *connection);
+                    self.session_streams.insert(*session_id, *quic_stream);
                 }
                 _ => {}
             }
@@ -226,6 +263,7 @@ impl WireEvidence {
             if let Some(obs) = self.project(&entry.obs)? {
                 projected.push(obs);
             }
+            projected.append(&mut self.late);
         }
         for obs in placed.into_iter().chain(projected) {
             log.push(obs);
@@ -268,8 +306,12 @@ impl WireEvidence {
                 exhausted,
                 exchange,
                 payload,
+                prepares,
             } => {
                 self.labels.insert((connection, quic_stream, seq), label);
+                if let Some(page) = prepares {
+                    self.invalid.insert((connection, quic_stream, seq), page);
+                }
                 Observation::PeerFrame {
                     connection,
                     stream,
@@ -377,7 +419,7 @@ impl WireEvidence {
                     match self.waiting.get(&key).map(|waiting| waiting.stage) {
                         Some(Stage::Frame) => {
                             self.waiting.remove(&key);
-                            Some(self.judged(key)?)
+                            self.judged(key)?
                         }
                         Some(Stage::Checkpoint) => {
                             return Err(format!(
@@ -415,8 +457,74 @@ impl WireEvidence {
                     connection: *connection,
                 })
             }
+            Observation::Storage {
+                service,
+                instance: 0,
+                fact,
+                ..
+            } if service == HEADER_SERVICE => {
+                self.prepared(fact)?;
+                None
+            }
             _ => None,
         })
+    }
+
+    /// Follows the node's preparations. Once its storage has run one, a
+    /// completion with the engine's outcome whatever it returned, every
+    /// decided page of that work's request, on its session's connection and
+    /// QUIC stream and its subscription, carrying the target, the header the
+    /// fixture made invalid, is judged. Each judgement is appended as it
+    /// is found, in frame order.
+    fn prepared(&mut self, fact: &StorageFact) -> Result<(), String> {
+        match fact {
+            StorageFact::Submitted {
+                id,
+                request: StorageRequest::PrepareHeaderTarget { owner, target, .. },
+                ..
+            } => {
+                self.prepares.insert(
+                    *id,
+                    (target.hash.clone(), owner.session_id, owner.request_id),
+                );
+            }
+            StorageFact::Completed { id, outcome, .. } => {
+                let Some((target, session_id, request_id)) = self.prepares.remove(id) else {
+                    return Ok(());
+                };
+                if outcome != Outcome::Engine.name() {
+                    return Ok(());
+                }
+                let (Some(connection), Some(stream)) = (
+                    self.sessions.get(&session_id).copied(),
+                    self.session_streams.get(&session_id).copied(),
+                ) else {
+                    return Ok(());
+                };
+                // The session's own stream and the request's own
+                // subscription: a header stream reopened on the same
+                // connection is another session, and an earlier request's
+                // page carrying the same header another request, whose pages
+                // their own preparations judge.
+                let judged: Vec<FrameKey> = self
+                    .unprepared
+                    .iter()
+                    .filter(|((on, quic, _), page)| {
+                        (*on, *quic) == (connection, stream)
+                            && page.subscription == request_id
+                            && hash(page.header) == target
+                    })
+                    .map(|(key, _)| *key)
+                    .collect();
+                for key in judged {
+                    self.unprepared.remove(&key);
+                    let judged = self.frame_judged(key)?;
+                    self.late.push(judged);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The node's reader has `header` for frame `key`: judges it now if
@@ -452,7 +560,7 @@ impl WireEvidence {
                     },
                 );
             }
-            return self.judged(key).map(Some);
+            return self.judged(key);
         }
         self.waiting.insert(
             key,
@@ -500,7 +608,7 @@ impl WireEvidence {
         }
         if decided {
             self.waiting.remove(&key);
-            return self.judged(key).map(Some);
+            return self.judged(key);
         }
         self.waiting.insert(
             key,
@@ -526,8 +634,22 @@ impl WireEvidence {
             })
     }
 
+    /// `FrameJudged` for frame `key` now that the reader decided it, or
+    /// `None` for a page carrying an invalid header, which waits for that
+    /// header's preparation ([`WireEvidence::prepared`]).
+    fn judged(&mut self, key: FrameKey) -> Result<Option<Observation>, String> {
+        if let Some(page) = self.invalid.get(&key) {
+            self.unprepared.insert(key, *page);
+            return Ok(None);
+        }
+        self.frame_judged(key).map(Some)
+    }
+
     /// `FrameJudged` for frame `key`.
-    fn judged(&self, (connection, quic_stream, seq): FrameKey) -> Result<Observation, String> {
+    fn frame_judged(
+        &self,
+        (connection, quic_stream, seq): FrameKey,
+    ) -> Result<Observation, String> {
         Ok(Observation::FrameJudged {
             connection,
             stream: self.stream(connection, quic_stream)?,
@@ -691,6 +813,7 @@ mod tests {
                 exhausted: false,
                 exchange: None,
                 payload: 0,
+                prepares: None,
             },
         }));
         let mut evidence = WireEvidence::default();
@@ -815,5 +938,108 @@ mod tests {
             assert!(error.starts_with("AliasedRemote"), "{outcome:?}: {error}");
             assert_eq!(records.borrow().len(), waiting, "nothing was placed");
         }
+    }
+
+    /// A preparation the node's storage ran judges only the pages of its own
+    /// request: a header stream reopened on the same connection is another
+    /// session, and an earlier subscription on the same stream another
+    /// request, whose pages wait for their own preparations. A faulted one
+    /// judges nothing.
+    #[test]
+    fn a_preparation_judges_only_its_own_requests_pages() {
+        use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
+
+        let header = block::Hash([0x11; 32]);
+        let invalid = hash(header);
+        let prepare = |id, session_id, request_id| StorageFact::Submitted {
+            id,
+            request: StorageRequest::PrepareHeaderTarget {
+                owner: WorkOwner {
+                    kind: "header".to_owned(),
+                    scope: WorkScope {
+                        header_generation: 1,
+                        branch: StorageBranch {
+                            anchor: String::new(),
+                            target: String::new(),
+                        },
+                    },
+                    verified_generation: None,
+                    body_work_epoch: None,
+                    session_id,
+                    request_id,
+                },
+                source: String::new(),
+                common_ancestor: StoragePoint {
+                    height: 0,
+                    hash: String::new(),
+                },
+                target: StoragePoint {
+                    height: 1,
+                    hash: invalid.clone(),
+                },
+                headers: 1,
+                work: None,
+                first: None,
+            },
+            digest: String::new(),
+            call: None,
+        };
+        let completed = |id, outcome: Outcome| StorageFact::Completed {
+            id,
+            outcome: outcome.name().to_owned(),
+            result: crate::observe::StorageResult::PrepareFailed {
+                category: "invalid_header".to_owned(),
+            },
+            delivered: true,
+            generation: 0,
+            state: String::new(),
+        };
+        let mut evidence = WireEvidence::default();
+        // Sessions 10 and 20 on connection 1's QUIC streams 4 and 8, each
+        // with a decided page of subscription 7 carrying the invalid header,
+        // and on stream 4 an earlier one of subscription 6.
+        let page = |subscription| InvalidPage {
+            header,
+            subscription,
+        };
+        for (session, quic) in [(10, 4), (20, 8)] {
+            let stream = StreamId {
+                kind: 5,
+                version: 9,
+            };
+            evidence.streams.insert((1, quic), stream);
+            evidence.sessions.insert(session, 1);
+            evidence.session_streams.insert(session, quic);
+            evidence.unprepared.insert((1, quic, 1), page(7));
+        }
+        evidence.unprepared.insert((1, 4, 0), page(6));
+        let judged = |evidence: &mut WireEvidence| -> Vec<(u64, u64)> {
+            std::mem::take(&mut evidence.late)
+                .into_iter()
+                .map(|obs| match obs {
+                    Observation::FrameJudged {
+                        connection,
+                        quic_stream,
+                        ..
+                    } => (connection, quic_stream.expect("a QUIC stream")),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        evidence.prepared(&prepare(1, 10, 7)).unwrap();
+        evidence.prepared(&completed(1, Outcome::Engine)).unwrap();
+        assert_eq!(judged(&mut evidence), vec![(1, 4)]);
+        assert!(evidence.unprepared.contains_key(&(1, 4, 0)));
+        evidence.prepared(&prepare(2, 20, 7)).unwrap();
+        evidence
+            .prepared(&completed(
+                2,
+                Outcome::Fault(zakura_storage::header::Fault::LocalResource),
+            ))
+            .unwrap();
+        assert_eq!(judged(&mut evidence), Vec::new());
+        evidence.prepared(&prepare(3, 20, 7)).unwrap();
+        evidence.prepared(&completed(3, Outcome::Engine)).unwrap();
+        assert_eq!(judged(&mut evidence), vec![(1, 8)]);
     }
 }

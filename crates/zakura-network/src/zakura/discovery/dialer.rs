@@ -4,12 +4,17 @@ use std::{net::SocketAddr, str::FromStr};
 
 use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::{NodeAddr, NodeId};
-use zakura_rt::{collections::HashMap, task::JoinHandle};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{oneshot, CancellationToken},
+    task::JoinHandle,
+};
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
-    handler::DialReport, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits,
-    DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF, DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
+    handler::{DialRegistration, DialReport},
+    ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
+    DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
 
 /// Spawn supervised dials for configured native bootstrap peers.
@@ -42,7 +47,14 @@ pub(crate) fn spawn_native_bootstrap_dialer(
         let endpoint = endpoint.clone();
         let limits = limits.clone();
         tasks.push(spawn_erased_named("bootstrap_dial", async move {
-            native_dial_supervised(endpoint, node_addr, limits, policy).await
+            native_dial_supervised(
+                endpoint,
+                node_addr,
+                limits,
+                policy,
+                CancellationToken::new(),
+            )
+            .await;
         }));
     }
     tasks
@@ -81,16 +93,33 @@ fn grouped_remote_bootstrap_peers(
         .collect()
 }
 
+/// Dials and serves a maintained connection, and reports on `registration`
+/// how its registration ended.
 pub(crate) async fn native_bootstrap_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
 ) -> Result<(), ZakuraHandlerError> {
-    crate::zakura::handler::serve_native_dial_connection(endpoint, node_addr, limits).await
+    // Only discovery uses the admitted address, to settle per-IP reservations
+    // and confirm the record address the dial reached.
+    let (admitted_addr, _) = oneshot::channel();
+    let report = DialReport {
+        admitted_addr,
+        registration,
+    };
+    crate::zakura::handler::serve_reported_native_dial_connection(
+        endpoint,
+        node_addr,
+        limits,
+        Some(report),
+        crate::zakura::handler::NativeDialKind::Maintained,
+    )
+    .await
 }
 
-/// Dials a discovery candidate and reports on `report` the IP whose handshake
-/// TLS authenticated and how registration ended.
+/// Dials a discovery candidate and reports on `report` the address whose
+/// handshake TLS authenticated and how registration ended.
 pub(crate) async fn native_discovery_dial(
     endpoint: &ZakuraEndpoint,
     node_addr: NodeAddr,
@@ -151,11 +180,11 @@ mod tests {
                 [silent.local_addr()?],
             );
             let endpoint = node.endpoint();
-            assert!(!endpoint.has_discovery_admission_capacity());
-            let (admitted_ip, _admitted_rx) = tokio::sync::oneshot::channel();
+            assert_eq!(endpoint.discovery_admission_capacity(), 0);
+            let (admitted_addr, _admitted_rx) = tokio::sync::oneshot::channel();
             let (registration, _registration_rx) = tokio::sync::oneshot::channel();
             let report = DialReport {
-                admitted_ip,
+                admitted_addr,
                 registration,
             };
             let result = tokio::time::timeout(

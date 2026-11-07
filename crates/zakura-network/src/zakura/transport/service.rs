@@ -260,6 +260,9 @@ pub(crate) struct ServiceStream {
     pub(crate) recv: FramedRecv,
     pub(crate) send: FramedSend,
     pub(crate) cancel_token: CancellationToken,
+    /// Where the stream's session came from, if its builder said.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) origin: Option<SessionOrigin>,
 }
 
 impl ServiceStream {
@@ -276,6 +279,8 @@ impl ServiceStream {
             recv,
             send,
             cancel_token,
+            #[cfg(any(test, zakura_sim))]
+            origin: None,
         }
     }
 }
@@ -292,6 +297,20 @@ impl CloseCauseReader {
     pub fn get(&self) -> Option<&'static str> {
         self.0.get()
     }
+}
+
+/// Where a service session came from: its connection, QUIC stream and
+/// service generation. It travels with the session apart from the session ID
+/// the service is handed, so a simulator check can compare the two.
+#[cfg(any(test, zakura_sim))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionOrigin {
+    /// The connection that carries the session.
+    pub connection: ZakuraConnId,
+    /// The session's QUIC stream ID, or `None` on an in-memory link.
+    pub quic_stream: Option<u64>,
+    /// The service generation the transport installed for it.
+    pub generation: u64,
 }
 
 /// Per-peer transport state handed to a service when a peer connects.
@@ -505,6 +524,24 @@ impl Peer {
             service_cancel_token,
             close_cause,
         }
+    }
+
+    /// This peer, with every stream it carries reporting `origin` as where
+    /// its session came from. An in-memory peer from [`Peer::new_versioned`]
+    /// carries one stream, so its one session takes `origin`.
+    #[cfg(any(test, zakura_sim))]
+    pub fn with_origin(mut self, origin: SessionOrigin) -> Self {
+        for stream in self.streams.values_mut() {
+            stream.origin = Some(origin);
+        }
+        self
+    }
+
+    /// Where the session of this peer's `kind` stream came from, if its
+    /// builder said.
+    #[cfg(any(test, zakura_sim))]
+    pub fn origin(&self, kind: u16) -> Option<SessionOrigin> {
+        self.streams.get(&kind).and_then(|stream| stream.origin)
     }
 
     /// Take ownership of a stream's receive and send handles for `kind`.
@@ -723,6 +760,11 @@ pub trait RequestResponseService: Service {
     /// is the peer's negotiated full-message cap. Responders must size outbound
     /// frame payloads against the smaller of the two so the peer never receives
     /// a frame larger than its accepted message cap.
+    ///
+    /// The future must return every [`SinkReject::Protocol`] before its first
+    /// `Pending`. The request worker drops a call whose requester stopped the
+    /// response stream, and it sees the stop only after the call is pending,
+    /// so a later protocol rejection would go unreported.
     fn request_frame<'a>(
         &'a self,
         peer_id: ZakuraPeerId,
@@ -732,6 +774,19 @@ pub trait RequestResponseService: Service {
         max_message_bytes: u32,
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>>;
+
+    /// Runs the protocol checks `request_frame` runs on `frame`, without its
+    /// work, and returns the same [`SinkReject::Protocol`] for a frame that
+    /// breaks the protocol.
+    ///
+    /// The request worker calls this when the requester stops the response
+    /// stream before `request_frame` is polled, so a stop never hides a
+    /// protocol fault. It must not start backend work or allocate a response.
+    /// A service whose `request_frame` can return `SinkReject::Protocol` must
+    /// override it with the same checks. The default accepts every frame.
+    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
+        Ok(())
+    }
 }
 
 /// A per-stream reader owned by a service.

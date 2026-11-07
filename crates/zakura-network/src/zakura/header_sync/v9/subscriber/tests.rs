@@ -28,6 +28,11 @@ use crate::zakura::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::zakura::{
+    header_sync::observe::{CreditKind, HeaderSyncObserver, ReactorEvent},
+    ZakuraPeerId,
+};
+
 impl Admitted {
     /// `page` as admitted, for a reactor test that seeds work without a
     /// session subscriber. Production admits pages only through
@@ -46,6 +51,7 @@ impl Admitted {
             },
             reaches_target: page.reaches_initial_target,
             after_close: false,
+            frame: None,
             seal: Seal,
         }
     }
@@ -1123,6 +1129,77 @@ fn grants_refill_half_window_prefixes() {
     assert_eq!(grant.update_sequence, 3);
     assert_eq!(grant.acknowledged, cursors[11]);
     assert_eq!(grant.added_credit.objects, 6);
+}
+
+/// Records each event it's handed.
+#[derive(Debug, Default)]
+struct Recorded(std::sync::Mutex<Vec<ReactorEvent>>);
+
+impl HeaderSyncObserver for Recorded {
+    fn observe(&self, event: ReactorEvent) {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .push(event);
+    }
+}
+
+/// An observed subscriber reports each credit it gives as it records it,
+/// with its peer, session and subscription: the `Open`'s whole window, a
+/// grant through acceptance, and a grant through `grant_due`.
+#[test]
+fn observed_credit_reports_each_open_and_grant() {
+    let (tree, chain) = chain(20);
+    let recorded = Arc::new(Recorded::default());
+    let peer = ZakuraPeerId::new(vec![9; 32]).expect("32 bytes is a valid peer ID");
+    let mut sub = subscriber().observed_by(Some(CreditTap {
+        observer: recorded.clone(),
+        peer: peer.clone(),
+        session_id: 7,
+    }));
+    let (open, _) = sub
+        .open(&status(chain[20]), &[chain[0]], AuxSchema::None, 8)
+        .expect("the first Open is recorded");
+    let id = open.subscription_id;
+    let mut fixture = Fixture {
+        tree,
+        sub,
+        id,
+        target: chain[20],
+        schema: AuxSchema::None,
+    };
+    let mut grants = vec![(CreditKind::Open, open.added_credit)];
+    let cursors: Vec<_> = (1..=8)
+        .map(|height| {
+            fixture
+                .page(chain[height - 1], &chain[height..=height], false)
+                .expect("a one-header page")
+                .cursor
+        })
+        .collect();
+    let grant = fixture
+        .sub
+        .accept_through(id, &cursors[3], 8)
+        .expect("a received cursor")
+        .expect("four headers reach the prefix");
+    grants.push((CreditKind::Grant, grant.added_credit));
+    assert_eq!(fixture.sub.accept_through(id, &cursors[7], 2), Ok(None));
+    let grant = fixture.sub.grant_due(8).expect("a larger budget refills");
+    grants.push((CreditKind::Grant, grant.added_credit));
+
+    let reported: Vec<_> = std::mem::take(&mut *recorded.0.lock().expect("unpoisoned"));
+    let expected: Vec<_> = grants
+        .into_iter()
+        .map(|(kind, credit)| ReactorEvent::CreditIssued {
+            kind,
+            peer: peer.clone(),
+            session_id: 7,
+            subscription: id,
+            objects: credit.objects,
+            bytes: credit.bytes,
+        })
+        .collect();
+    assert_eq!(reported, expected);
 }
 
 /// Updates acknowledge only cursors the reactor accepted: a cursor with a

@@ -27,6 +27,8 @@ pub enum Request {
     CommitMined {
         /// The solved block.
         block: BlockHandle,
+        /// Serialized size computed by the submitter, used only to pace block announcements.
+        size: usize,
         /// State write-queue admission notification.
         admission: BlockAdmission,
     },
@@ -44,6 +46,15 @@ pub enum Request {
 }
 
 impl Request {
+    /// Origin carried to state after successful verification.
+    pub fn origin(&self) -> zakura_state::BlockOrigin {
+        if let Self::CommitMined { size, .. } = self {
+            zakura_state::BlockOrigin::LocalSubmission { size: *size }
+        } else {
+            zakura_state::BlockOrigin::Network
+        }
+    }
+
     /// Returns inner block
     pub fn block(&self) -> BlockHandle {
         match self {

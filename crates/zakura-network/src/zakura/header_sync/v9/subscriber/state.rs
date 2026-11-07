@@ -18,6 +18,9 @@ use super::{
     },
     Admitted, Ended, Seal, SubscribeError, SubscriberFault,
 };
+#[cfg(any(test, zakura_sim))]
+use crate::zakura::header_sync::observe::{CreditKind, ReactorEvent};
+use crate::zakura::transport::sim_chain;
 use crate::zakura::{
     header_sync::{scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1, wire::AuxSchema},
     regulation::{SubscribeRefused, SubscriptionFault, Subscriptions, Update},
@@ -91,6 +94,10 @@ pub(super) struct SubscriberState {
     next_id: u64,
     /// The network's encoded header size, which fixes the smallest page.
     header_bytes: usize,
+    /// Where the credit this subscriber gives reports, once the reactor
+    /// admitted its session with an observer.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) credit: Option<super::CreditTap>,
 }
 
 impl SubscriberState {
@@ -101,6 +108,23 @@ impl SubscriberState {
             live: None,
             next_id: 1,
             header_bytes,
+            #[cfg(any(test, zakura_sim))]
+            credit: None,
+        }
+    }
+
+    /// Report the credit `update` gives, if anything observes it.
+    #[cfg(any(test, zakura_sim))]
+    fn report_credit(&self, kind: CreditKind, update: &SubscribeHeaders) {
+        if let Some(tap) = &self.credit {
+            tap.observer.observe(ReactorEvent::CreditIssued {
+                kind,
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                subscription: update.subscription_id,
+                objects: update.added_credit.objects,
+                bytes: update.added_credit.bytes,
+            });
         }
     }
 
@@ -233,6 +257,8 @@ impl SubscriberState {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let message = plan.live.message(Operation::Open, update);
         self.live = Some(plan.live);
+        #[cfg(any(test, zakura_sim))]
+        self.report_credit(CreditKind::Open, &message);
         message
     }
 
@@ -370,6 +396,8 @@ impl SubscriberState {
             cursor,
             reaches_target: page.reaches_initial_target,
             after_close: live.close_sent,
+            #[cfg(any(test, zakura_sim))]
+            frame: transport_admits.then(|| tools.serving_frame()).flatten(),
             seal: Seal,
         })
     }
@@ -489,7 +517,9 @@ impl SubscriberState {
             bytes: u32::try_from(bytes).expect("the room is within the byte window"),
         };
         let update = tools.grant(&live.id, added).ok()?;
-        Some(live.message(Operation::Grant, update))
+        // A tail expression in release builds, as before the report.
+        sim_chain!(Some(live.message(Operation::Grant, update))
+            => inspect(|message| self.report_credit(CreditKind::Grant, message)))
     }
 
     /// Record a `Close` in `tools` and return it to write.

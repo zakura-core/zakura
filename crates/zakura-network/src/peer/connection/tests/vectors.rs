@@ -162,6 +162,56 @@ async fn connection_shutdown_times_out_stalled_peer_tx_close() {
     );
 }
 
+/// A stalled writer close cannot turn a failed connection into a successful advertisement.
+#[tokio::test(start_paused = true)]
+async fn failed_connection_notifies_gossip_before_writer_close() {
+    use crate::peer::block_gossip::{BlockGossipPeer, BLOCK_ADVERT_QUEUE, BLOCK_REQUEST_WAIT};
+
+    let _init_guard = zakura_test::init();
+    for written in [false, true] {
+        let mut active = ActiveConnectionCounter::new_counter();
+        let (mut connection, _client, error) =
+            super::new_never_closing_test_connection::<crate::BoxError>(active.track_connection());
+        let (sender, receiver) = tokio::sync::mpsc::channel(BLOCK_ADVERT_QUEUE);
+        connection.block_advert_rx = receiver;
+        let gossip = BlockGossipPeer {
+            sender,
+            address: None,
+            uploads: connection.block_uploads.clone(),
+            registry: None,
+            version: crate::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
+            sidecar: false,
+            early_block_relay: false,
+        };
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let connection_task = tokio::spawn(connection.run(peer_rx));
+        let hash = block::Hash([81; 32]);
+        let advert = tokio::spawn(gossip.clone().advertise(hash));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(gossip.sender.capacity(), BLOCK_ADVERT_QUEUE);
+        assert!(!advert.is_finished());
+        if written {
+            gossip.uploads.requested(hash);
+            gossip.uploads.written(hash);
+            tokio::task::yield_now().await;
+        }
+
+        drop(peer_tx);
+        tokio::task::yield_now().await;
+        assert!(error.try_get_error().is_some());
+        tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+        assert!(!advert.await.unwrap(), "shutdown must fail upload tracking");
+        assert!(gossip.sender.is_closed());
+        assert!(
+            !connection_task.is_finished(),
+            "writer close is still pending"
+        );
+        tokio::time::advance(REQUEST_TIMEOUT).await;
+        connection_task.await.unwrap();
+    }
+}
+
 /// Test that the connection run loop works as a spawned task with messages in and out
 #[tokio::test]
 async fn connection_run_loop_message_ok() {
@@ -1315,9 +1365,9 @@ fn new_protected_test_connection() -> (
     super::new_protected_test_connection()
 }
 
-/// Inventory completion cannot release a gossip slot before the actual block write.
+/// Delivery tracking waits for the actual block write and its drain allowance.
 #[tokio::test(start_paused = true)]
-async fn block_gossip_slot_tracks_connection_write() {
+async fn block_gossip_tracks_connection_write() {
     use crate::{peer::block_gossip::BlockGossipPeer, InventoryResponse};
     use std::sync::Arc;
     use zakura_chain::serialization::ZcashDeserializeInto;
@@ -1342,8 +1392,8 @@ async fn block_gossip_slot_tracks_connection_write() {
         .zcash_deserialize_into()
         .unwrap();
     let hash = block.hash();
-    let slots = crate::peer::block_gossip::BlockUploadSlots::new(1);
-    let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
+
+    let advertisement = tokio::spawn(gossip.advertise(hash));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])
@@ -1363,16 +1413,14 @@ async fn block_gossip_slot_tracks_connection_write() {
     // The zero-capacity sink cannot flush its block until we read it below.
     tokio::time::advance(Duration::from_secs(4)).await;
     tokio::task::yield_now().await;
-    assert_eq!(slots.available_uploads(), 0);
     assert!(!advertisement.is_finished());
     assert_eq!(outbound.next().await.unwrap(), Message::Block(block.into()));
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(749)).await;
     tokio::task::yield_now().await;
-    assert_eq!(slots.available_uploads(), 0);
+    assert!(!advertisement.is_finished());
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(advertisement.await.unwrap());
-    assert_eq!(slots.available_uploads(), 1);
     connection_task.abort();
 }
 
@@ -1435,9 +1483,9 @@ async fn tcp_headers_response_holds_read_admission_through_the_send() {
     connection_task.abort();
 }
 
-/// A block the inbound service leaves out of its response cannot hold a gossip slot.
+/// A missing block in the inbound response fails delivery tracking.
 #[tokio::test(start_paused = true)]
-async fn truncated_block_request_releases_gossip_slot() {
+async fn truncated_block_request_fails_gossip_tracking() {
     use crate::peer::block_gossip::BlockGossipPeer;
 
     let _init_guard = zakura_test::init();
@@ -1458,8 +1506,8 @@ async fn truncated_block_request_releases_gossip_slot() {
     let connection_task = tokio::spawn(connection.run(peer_rx));
     let decoy = block::Hash([1; 32]);
     let hash = block::Hash([2; 32]);
-    let slots = crate::peer::block_gossip::BlockUploadSlots::new(1);
-    let advertisement = tokio::spawn(gossip.advertise(hash, slots.clone()));
+
+    let advertisement = tokio::spawn(gossip.advertise(hash));
     assert_eq!(
         outbound.next().await.unwrap(),
         Message::Inv(vec![hash.into()])
@@ -1473,7 +1521,6 @@ async fn truncated_block_request_releases_gossip_slot() {
         .await
         .respond(Response::Blocks(Vec::new()));
     assert!(!advertisement.await.unwrap());
-    assert_eq!(slots.available_uploads(), 1);
     connection_task.abort();
 }
 

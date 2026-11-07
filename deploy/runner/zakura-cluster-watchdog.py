@@ -55,7 +55,7 @@ from zakura_monitoring.suppression import suppression_until  # noqa: E402
 DOWN_HEALTH = {"down", "rpc_error"}
 MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
-RELEASE_STATE_TRANSIENT_GRACE_SECONDS = 180
+RELEASE_STATE_FETCH_GRACE_SECONDS = 3600
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
@@ -80,6 +80,9 @@ STALL_PIPELINE_METRICS = (
     ("oldest missing", "sync_header_work_oldest_missing_height"),
     ("header in flight", "sync_header_work_in_flight_count"),
     ("block applying", "sync_block_applying"),
+    ("apply operations", "sync_zakura_apply_operations"),
+    ("apply in flight", "sync_zakura_apply_in_flight"),
+    ("oldest apply seconds", "sync_zakura_apply_oldest_seconds"),
     ("block header tip", "sync_block_best_header_tip_height"),
     ("block verified tip", "sync_block_verified_tip_height"),
     ("block fill stop", "sync_block_fill_stop"),
@@ -392,6 +395,10 @@ def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
     )
     metrics, available = alert_metrics(row)
     pipeline = named_metrics(metrics, STALL_PIPELINE_METRICS)
+    phase = coerce_float(metrics.get("sync_zakura_apply_phase"))
+    phase_name = {0: "bootstrap", 1: "native", 2: "draining", 3: "fallback", 4: "failed"}.get(phase)
+    if phase_name:
+        pipeline = " | ".join(value for value in (pipeline, f"apply phase {phase_name}") if value)
     repair = named_metrics(metrics, STALL_REPAIR_METRICS)
 
     lines = []
@@ -1770,20 +1777,15 @@ class Watchdog:
             condition, detail = release_state_condition(target, pointer, meta, now)
         except Exception as error:
             condition, detail = "unreachable", str(error)
-            if (
-                isinstance(error, TimeoutError)
-                or (isinstance(error, urllib.error.HTTPError) and 500 <= error.code < 600)
-                or (
-                    isinstance(error, urllib.error.URLError)
-                    and isinstance(error.reason, TimeoutError)
-                )
-            ):
-                # A transient fetch failure cannot clear the last notified incident.
-                # Keep it until a readable bundle can establish its next condition.
-                if entry.get("alerting"):
-                    entry["last_seen"] = now
-                    return
-                threshold = RELEASE_STATE_TRANSIENT_GRACE_SECONDS
+            # Every fetch failure waits out the same grace. The edge returns a new kind
+            # of one-poll blip every few weeks (5xx, 429, resets, timeouts), and the
+            # bundle only goes stale after 48 hours, so an hour's delay loses nothing.
+            # A failed fetch also cannot clear the last notified incident. Keep it
+            # until a readable bundle can establish its next condition.
+            if entry.get("alerting"):
+                entry["last_seen"] = now
+                return
+            threshold = RELEASE_STATE_FETCH_GRACE_SECONDS
 
         previous_bad_since = coerce_float(entry.get("bad_since"))
         bad_since = (
@@ -1794,8 +1796,8 @@ class Watchdog:
             else now
         )
 
-        # Only transport timeouts and server errors get a grace period. Invalid,
-        # incomplete, or stale bundles still require immediate attention.
+        # Only fetch failures get a grace period. A readable bundle that is invalid,
+        # incomplete, or stale still requires immediate attention.
         update_alert_state(
             bucket,
             key,

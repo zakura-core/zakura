@@ -58,6 +58,23 @@ impl PeerTable {
         self.peers.get_mut(peer)
     }
 
+    /// Record `outbound` as `generation`'s outbound queue probe, if that
+    /// generation is current.
+    pub(super) fn attach_outbound(
+        &mut self,
+        peer: &ZakuraPeerId,
+        generation: u64,
+        outbound: crate::zakura::regulation::SlotBudget,
+    ) {
+        if let Some(entry) = self
+            .peers
+            .get_mut(peer)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.outbound = Some(outbound);
+        }
+    }
+
     /// Suppliers whose published status can serve `height`.
     pub(super) fn eligible_sources(&self, height: block::Height) -> BTreeSet<SourceId> {
         self.peers

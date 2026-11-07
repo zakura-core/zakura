@@ -8,8 +8,9 @@
 //! request expiry and write grace do not control announcement timing or limit body writes.
 //! A newer block does not cancel an older broadcast: peers can still need its parent.
 //!
-//! Peers that announced the block are skipped unless a broadcast still tracks their upload.
-//! An announcement cannot replace that upload's outcome.
+//! Peers that announced the block are skipped unless this connection's upload registry already
+//! determines the outcome: a broadcast still tracking the upload, or an advert already delivered.
+//! An announcement cannot replace either outcome.
 
 use std::{
     collections::HashMap,
@@ -186,14 +187,22 @@ struct UploadRegistry {
 pub(crate) struct BlockUploads(Arc<Mutex<UploadRegistry>>);
 
 impl BlockUploads {
-    /// Whether a broadcast still owns this peer's upload outcome for `hash`.
-    fn is_tracked(&self, hash: block::Hash) -> bool {
-        self.0
-            .lock()
-            .expect("block upload mutex is never poisoned")
+    /// Whether this registry already determines the peer's outcome for `hash`.
+    ///
+    /// A broadcast that still owns the upload has to publish its own outcome, and an advert
+    /// this connection already delivered stays a success. An announcement can suppress a new
+    /// advert, but it cannot override either of those.
+    fn determines_outcome(&self, hash: block::Hash) -> bool {
+        let uploads = self.0.lock().expect("block upload mutex is never poisoned");
+        uploads
             .active
             .get(&hash)
             .is_some_and(|upload| upload.strong_count() > 0)
+            || uploads
+                .successful
+                .get(&hash)
+                // `register` applies the same bound when it prunes the history.
+                .is_some_and(|completed| completed.elapsed() < SUCCESSFUL_ADVERT_RETENTION)
     }
 
     fn register(&self, hash: block::Hash) -> (watch::Receiver<UploadState>, Option<UploadClaim>) {
@@ -351,7 +360,7 @@ pub(crate) struct BlockGossipPeer {
 impl BlockGossipPeer {
     /// An announcement can suppress a new advert, but cannot replace an upload's outcome.
     fn can_skip_advert(&self, hash: block::Hash) -> bool {
-        self.announced.announced(hash) && !self.uploads.is_tracked(hash)
+        self.announced.announced(hash) && !self.uploads.determines_outcome(hash)
     }
 
     pub(crate) fn rtt(&self) -> Option<Duration> {
@@ -369,7 +378,9 @@ impl BlockGossipPeer {
 
     /// Advertises the block and distinguishes authorization revocation from delivery failure.
     ///
-    /// An announcement may suppress a new advert but cannot replace an active upload's outcome.
+    /// An announcement may suppress a new advert but cannot replace an active upload's outcome
+    /// or one this connection already delivered. A retry after a joined upload failed still
+    /// advertises: the peer's claim does not satisfy the delivery this broadcast owes.
     async fn advertise_outcome(self, hash: block::Hash) -> AdvertOutcome {
         if self.can_skip_advert(hash) {
             metrics::counter!("peer.block_gossip.advert_skipped", "when" => "fan_out").increment(1);
@@ -2420,6 +2431,33 @@ mod tests {
         })
         .await
         .expect("overlapping broadcasts finish within their request wait");
+    }
+
+    /// A delivered advert stays a success: a later announcement from the same peer must not
+    /// weaken it into a skip, or a broadcast that reached this peer reports failure when a
+    /// different peer's send fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_delivered_advert_outranks_a_later_announcement() {
+        let hash = block::Hash([42; 32]);
+
+        let (delivered, mut receiver) = peer();
+        let early = broadcast_block(vec![delivered.clone()], hash, 1, Instant::now());
+        let early = tokio::spawn(early);
+        accept(&mut receiver, hash).await;
+        tokio::time::advance(BLOCK_REQUEST_WAIT).await;
+        assert!(early.await.unwrap().is_ok(), "the advert was delivered");
+
+        // The peer now echoes the block it already received from us.
+        delivered.announced.record([hash]);
+        let (failed, failed_receiver) = peer();
+        drop(failed_receiver);
+        assert!(
+            broadcast_block(vec![delivered, failed], hash, 1, Instant::now())
+                .await
+                .is_ok(),
+            "an echo turned a delivered advert into a failed broadcast"
+        );
+        assert!(receiver.try_recv().is_err(), "no duplicate inventory");
     }
 
     #[tokio::test(start_paused = true)]

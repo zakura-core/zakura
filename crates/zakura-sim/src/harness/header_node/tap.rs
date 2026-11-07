@@ -244,7 +244,7 @@ impl TapState {
             step,
             released: work.ledger.released_rounds(),
             unsettled: work.ledger.unsettled_rounds(),
-            pending: work.ledger.pending_unsettled_calls(),
+            stuck: work.ledger.stuck_rounds(),
         });
         Ok(())
     }

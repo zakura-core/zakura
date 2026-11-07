@@ -204,6 +204,7 @@ fn regenerate_reset_mid_flight_input() {
     regenerate(
         "block-sync-reset-mid-flight",
         RESET_MID_FLIGHT_TAG,
+        1,
         reset_mid_flight_shortfall,
     );
 }
@@ -211,17 +212,15 @@ fn regenerate_reset_mid_flight_input() {
 /// Rewrites the committed input `name` under `tests/fixtures` with the
 /// first of [`REGENERATE_CANDIDATES`] fuzz inputs, after the scenario tag
 /// `tag`, for which `shortfall` finds nothing, and its sidecar's SHA-256 to
-/// match. It runs as many candidates at once as the machine has cores, and
-/// still picks the first in order, so the result doesn't depend on the
-/// machine. It prints each candidate's shortfall, and panics if every
-/// candidate falls short.
+/// match. It runs `width` candidates at once, and still picks the first in
+/// order, so the result doesn't depend on `width`. It prints each
+/// candidate's shortfall, and panics if every candidate falls short.
 #[allow(clippy::print_stdout)]
-fn regenerate(name: &str, tag: [u8; 2], shortfall: fn(&[u8]) -> Result<(), String>) {
+fn regenerate(name: &str, tag: [u8; 2], width: usize, shortfall: fn(&[u8]) -> Result<(), String>) {
     let candidates: Vec<Vec<u8>> = byte_inputs(REGENERATE_CANDIDATES, 16_384)
         .into_iter()
         .map(|plan| [&tag[..], &plan].concat())
         .collect();
-    let width = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let mut chosen = None;
     for (batch, inputs) in candidates.chunks(width).enumerate() {
         let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
@@ -394,9 +393,12 @@ fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
 #[test]
 #[ignore = "rewrites the committed input"]
 fn regenerate_capacity_frontier_first_input() {
+    // A capacity-release run takes about 6 minutes and peaks near 1.4 GB,
+    // so four candidates at once stay near 6 GB.
     regenerate(
         "block-sync-capacity-frontier-first",
         CAPACITY_RELEASE_TAG,
+        4,
         capacity_frontier_first_shortfall,
     );
 }

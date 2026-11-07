@@ -372,8 +372,9 @@ pub enum ReactorEvent {
         target_height: block::Height,
     },
     /// The cached-offer pass the reactor wanted was refused by its pass
-    /// budget, and runs at the budget's next refill, `refill_in` from now,
-    /// which the reactor arms as a deadline.
+    /// budget. The budget's next refill is `refill_in` from now, and the
+    /// reactor arms it as a deadline. A later change can clear that wait
+    /// before the pass runs, as a discovery pause does.
     CachedPassDeferred {
         /// How long until the next refill.
         refill_in: std::time::Duration,

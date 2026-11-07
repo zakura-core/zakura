@@ -35,7 +35,8 @@ use zakura_network::zakura::{
     MessageRole, Service, ServiceSummaryEnvelope, Services, Stream, ZakuraDiscoveryConfig,
     ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraNodeRecord,
     ZakuraNodeRecordBody, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
-    MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
+    MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_GET_PEERS, MSG_DISCOVERY_GET_SERVICES,
+    MSG_DISCOVERY_PEERS,
 };
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::{
@@ -695,7 +696,10 @@ impl Request {
 
     /// The request's message type.
     fn message_type(self) -> u16 {
-        self.message().message_type()
+        u16::from(match self {
+            Request::GetPeers => MSG_DISCOVERY_GET_PEERS,
+            Request::GetServices => MSG_DISCOVERY_GET_SERVICES,
+        })
     }
 }
 

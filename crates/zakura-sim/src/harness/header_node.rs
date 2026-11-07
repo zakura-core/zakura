@@ -55,12 +55,12 @@ use zakura_storage::header::{
 
 use self::{
     adoption::SessionLife,
-    policy::{Hold, LinkEffect, Predicates, Trigger},
+    policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
-    storage::{FaultAttributions, HeaderStorage, HEADER_SERVICE},
+    storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -193,6 +193,11 @@ pub struct Policy {
     /// picks it.
     #[serde(default)]
     pub holds: Vec<Hold>,
+    /// Applies whose replies are held after they commit, each by the first
+    /// reply hold that picks it. Left out of a scenario that has none, so
+    /// older scenarios keep their encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_holds: Vec<ReplyHold>,
 }
 
 impl Policy {
@@ -202,6 +207,7 @@ impl Policy {
             base: Base::SuccessOnly,
             bound_ms: Some(5_000),
             holds: Vec::new(),
+            reply_holds: Vec::new(),
         }
     }
 }
@@ -232,8 +238,10 @@ pub struct Effects {
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
-/// pure. With a [`ReactorTap`], it logs the node's reactor events after its
-/// storage facts, paired with them, and its predicates count both.
+/// pure. An engine completion of a reply-held apply commits it, and its
+/// delivery is offered once its reply hold opens. With a [`ReactorTap`], it
+/// logs the node's reactor events after its storage facts, paired with them,
+/// and its predicates count both.
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
@@ -260,7 +268,9 @@ impl PolicySource {
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
-            predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
+            predicates: Rc::new(RefCell::new(
+                Predicates::new(policy.holds).with_reply_holds(policy.reply_holds),
+            )),
             effects,
             linked: 0,
             closed: BTreeSet::new(),
@@ -292,15 +302,21 @@ impl PolicySource {
 impl ActionSource for PolicySource {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
         let pending = self.port.pending();
+        let committed = self.port.committed();
         let predicates = self.predicates.borrow();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
-            let (id, outcome) = crate::storage::decode(*local);
-            pending
-                .iter()
-                .find(|op| op.id == id)
-                .is_some_and(|op| predicates.offers(self.base, op, outcome))
+            match crate::storage::decode(*local) {
+                StorageAction::Complete(id, outcome) => pending
+                    .iter()
+                    .find(|op| op.id == id)
+                    .is_some_and(|op| predicates.offers(self.base, op, outcome)),
+                StorageAction::Deliver(id) => committed
+                    .iter()
+                    .find(|op| op.id == id)
+                    .is_some_and(|op| predicates.delivers(op)),
+            }
         }));
     }
 
@@ -310,10 +326,22 @@ impl ActionSource for PolicySource {
         for op in self.port.pending() {
             predicates.boundaries(self.bound, &op, now, out);
         }
+        for op in self.port.committed() {
+            predicates.reply_boundaries(&op, now, out);
+        }
     }
 
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
-        self.storage.execute(local, log);
+        match crate::storage::decode(local) {
+            StorageAction::Complete(id, Outcome::Engine)
+                if self.predicates.borrow().holds_reply(id) =>
+            {
+                self.port
+                    .commit(id)
+                    .expect("`enabled` offered this completion at this step");
+            }
+            _ => self.storage.execute(local, log),
+        }
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {

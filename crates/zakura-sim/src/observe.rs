@@ -469,7 +469,18 @@ pub enum StorageFact {
         /// The operation.
         id: u64,
     },
-    /// The run completed the operation.
+    /// The run committed an apply and kept its reply for a later
+    /// `completed`.
+    Committed {
+        /// The operation.
+        id: u64,
+        /// The engine's header generation after the commit.
+        generation: u64,
+        /// A digest of the service's state after the commit.
+        state: String,
+    },
+    /// The run completed the operation, or delivered a committed apply's
+    /// reply.
     Completed {
         /// The operation.
         id: u64,

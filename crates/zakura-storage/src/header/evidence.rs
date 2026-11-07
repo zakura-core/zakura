@@ -555,6 +555,11 @@ pub enum OperationStage {
     },
     /// Being completed by the run. Never seen at a step boundary.
     Running,
+    /// Committed by the run, with a reply it hasn't delivered yet.
+    Committed {
+        /// Whether the port still holds the caller's waker.
+        caller_waiting: bool,
+    },
     /// Completed, with a reply its caller hasn't taken, and that reply's
     /// identity as captured when it was made.
     Replied {

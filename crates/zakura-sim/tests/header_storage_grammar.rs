@@ -247,6 +247,7 @@ fn hand_built_scenarios_round_trip() {
                 ControlAction::Close,
                 Some(Trigger::Handled(Select::nth(OpKind::Prepare, 2))),
             )],
+            weights: Default::default(),
         },
     ];
     for scenario in &scenarios {

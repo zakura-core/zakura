@@ -29,11 +29,13 @@ use super::{
     header_node::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
+        claim::{ClaimEvidence, SettlementEvidence},
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         reservation::ReservationEvidence,
         session::SessionEvidence,
+        stale::StaleEvidence,
         tap::ReactorTap,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
         Policy, PolicySource, Topology,
@@ -44,7 +46,13 @@ use super::{
     NetScenario, Subsystem,
 };
 use crate::{
-    domain::session::{honest_never_punished, HonestPeers},
+    domain::{
+        header_sync::{
+            chunk_budget_bound, stale_completion_inert, teardown_end_violations,
+            teardown_returns_baseline, BudgetView, StaleView, TeardownView,
+        },
+        session::{honest_never_punished, HonestPeers},
+    },
     observe::StorageFact,
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
@@ -179,6 +187,42 @@ pub struct MirrorSpec {
     pub dialer: Dialer,
 }
 
+/// How much more work each header of fork branches 1 and 2 carries. A
+/// branch at weight `w`, 0 to [`MAX_WEIGHT`], has the genesis target shifted
+/// right by `w` bits, so each header has about `2^w` times the work. See
+/// [`HeaderFixture::with_weight`].
+///
+/// [`MAX_WEIGHT`]: zakura_storage::header::fixture::MAX_WEIGHT
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Weights {
+    /// Branch 1's weight.
+    #[serde(default)]
+    pub branch_1: u8,
+    /// Branch 2's weight.
+    #[serde(default)]
+    pub branch_2: u8,
+}
+
+impl Weights {
+    /// Whether every branch keeps the genesis target.
+    pub fn is_unweighted(&self) -> bool {
+        *self == Weights::default()
+    }
+
+    /// The Regtest fixture with these weights.
+    ///
+    /// # Panics
+    ///
+    /// If a weight is above
+    /// [`MAX_WEIGHT`](zakura_storage::header::fixture::MAX_WEIGHT).
+    pub fn fixture(self) -> HeaderFixture {
+        HeaderFixture::regtest()
+            .with_weight(1, self.branch_1)
+            .with_weight(2, self.branch_2)
+    }
+}
+
 /// The `header-sync/storage` scenario. A fuzz input's prefix encodes it as
 /// [`grammar`] describes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +232,10 @@ pub struct StorageScenario {
     pub node: Chain,
     /// The mirror peers, each linked once to the node at setup.
     pub mirrors: Vec<MirrorSpec>,
+    /// The weights of fork branches 1 and 2, which every chain in the run
+    /// shares.
+    #[serde(default, skip_serializing_if = "Weights::is_unweighted")]
+    pub weights: Weights,
     /// How the run completes the node's storage operations.
     pub policy: Policy,
     /// Link actions the `Plan` may take, in order.
@@ -206,6 +254,7 @@ impl Default for StorageScenario {
             }],
             policy: Policy::converging(),
             controls: Vec::new(),
+            weights: Weights::default(),
         }
     }
 }
@@ -453,6 +502,7 @@ impl StorageScenario {
                     })),
                 ),
             ],
+            weights: Weights::default(),
         }
     }
 }
@@ -490,6 +540,12 @@ pub struct Ports {
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
+    /// The node's released rounds at each drain, which its tap keeps during
+    /// the run.
+    pub rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, which its tap finds during
+    /// the run.
+    pub stale_calls: StaleEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -499,6 +555,14 @@ pub struct Storage {
     dispatch: DispatchFlag,
     /// The node's adoption facts, from its tap.
     adoption: AdoptionEvidence,
+    /// The node's probe reads, from its tap.
+    capacity: CapacityEvidence,
+    /// The claim rules the node's tap found broken.
+    claims: ClaimEvidence,
+    /// The node's released rounds, from its tap.
+    rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, from its tap.
+    stale_calls: StaleEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -525,6 +589,52 @@ pub struct StorageView {
     /// Whom the node's storage failures blamed, for the penalty rule
     /// ([`FaultEvidence::penalized`]).
     pub faults: FaultEvidence,
+    /// The node's header budget probe reads, and how each boundary's read
+    /// went.
+    pub capacity: CapacityEvidence,
+    /// The claim rules the node's tap found broken, at the step that found
+    /// each.
+    pub claims: ClaimEvidence,
+    /// The node's released rounds at each drain.
+    pub rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls.
+    pub stale_calls: StaleEvidence,
+}
+
+impl BudgetView for StorageView {
+    /// [`StorageView::capacity`].
+    fn capacity(&self) -> &CapacityEvidence {
+        &self.capacity
+    }
+
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+}
+
+impl TeardownView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::rounds`].
+    fn rounds(&self) -> &SettlementEvidence {
+        &self.rounds
+    }
+}
+
+impl StaleView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::stale_calls`].
+    fn stale_calls(&self) -> &StaleEvidence {
+        &self.stale_calls
+    }
 }
 
 impl HonestPeers for StorageView {
@@ -547,19 +657,26 @@ impl HasView for Storage {
             adoption: self.adoption.clone(),
             sessions: self.topology.sessions(),
             faults: self.faults.clone(),
+            capacity: self.capacity.clone(),
+            claims: self.claims.clone(),
+            rounds: self.rounds.clone(),
+            stale_calls: self.stale_calls.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence, for
-    /// the tip and penalty rules.
+    /// Records the run's end in the node's adoption, fault and round
+    /// evidence, for the tip, penalty and teardown rules.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
+        self.rounds.end(end);
     }
 
-    /// [`fault_end_violations`].
+    /// [`fault_end_violations`] and [`teardown_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        fault_end_violations(&self.faults, log)
+        let mut found = fault_end_violations(&self.faults, log);
+        found.extend(teardown_end_violations(&self.rounds));
+        found
     }
 }
 
@@ -629,7 +746,7 @@ impl Subsystem for Storage {
         {
             panic!("{step:?} releases a hold the policy's {holds} holds don't have");
         }
-        let fixture = HeaderFixture::regtest();
+        let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
         preload(node.engine(), &fixture, &scenario.node);
         let mirrors = scenario
@@ -648,6 +765,8 @@ impl Subsystem for Storage {
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
+            rounds: SettlementEvidence::default(),
+            stale_calls: StaleEvidence::default(),
         }
     }
 
@@ -672,8 +791,12 @@ impl Subsystem for Storage {
             ports.sessions.clone(),
             ports.reservations.clone(),
             ports.capacity.clone(),
+            ports.rounds.clone(),
+            ports.stale_calls.clone(),
         );
         let adoption = tap.adoption();
+        let claims = tap.claims();
+
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -737,6 +860,10 @@ impl Subsystem for Storage {
             port: ports.node,
             dispatch,
             adoption,
+            capacity: ports.capacity,
+            claims,
+            rounds: ports.rounds,
+            stale_calls: ports.stale_calls,
             faults,
             topology,
         }
@@ -838,6 +965,12 @@ pub struct WirePorts {
     /// The node's resource probe reads, which its tap checks and keeps
     /// during the run.
     pub capacity: CapacityEvidence,
+    /// The node's released rounds at each drain, which its tap keeps during
+    /// the run.
+    pub rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, which its tap finds during
+    /// the run.
+    pub stale_calls: StaleEvidence,
 }
 
 impl WirePorts {
@@ -866,6 +999,14 @@ pub struct HeaderWire {
     honest: Rc<BTreeSet<usize>>,
     /// The node's adoption facts, from its tap.
     adoption: AdoptionEvidence,
+    /// The node's probe reads, from its tap.
+    capacity: CapacityEvidence,
+    /// The claim rules the node's tap found broken.
+    claims: ClaimEvidence,
+    /// The node's released rounds, from its tap.
+    rounds: SettlementEvidence,
+    /// The node's stale prepare and apply calls, from its tap.
+    stale_calls: StaleEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -890,21 +1031,28 @@ impl HasView for HeaderWire {
             adoption: self.adoption.clone(),
             sessions: Vec::new(),
             faults: self.faults.clone(),
+            capacity: self.capacity.clone(),
+            claims: self.claims.clone(),
+            rounds: self.rounds.clone(),
+            stale_calls: self.stale_calls.clone(),
         }
     }
 
-    /// Records the run's end in the node's adoption and fault evidence and
-    /// its session view, for the tip and penalty rules and the own-9 end
-    /// check.
+    /// Records the run's end in the node's adoption, fault and round
+    /// evidence and its session view, for the tip, penalty and teardown
+    /// rules and the own-9 end check.
     fn ended(&self, end: &RunEnd) {
         self.adoption.end(end);
         self.faults.end(end);
         self.sessions.end(end);
+        self.rounds.end(end);
     }
 
-    /// [`fault_end_violations`].
+    /// [`fault_end_violations`] and [`teardown_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
-        fault_end_violations(&self.faults, log)
+        let mut found = fault_end_violations(&self.faults, log);
+        found.extend(teardown_end_violations(&self.rounds));
+        found
     }
 
     /// The node's adoption facts after `after`
@@ -989,6 +1137,8 @@ impl Subsystem for HeaderWire {
             records: PeerRecords::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
+            rounds: SettlementEvidence::default(),
+            stale_calls: StaleEvidence::default(),
         }
     }
 
@@ -1024,8 +1174,12 @@ impl Subsystem for HeaderWire {
             ports.sessions.clone(),
             ports.reservations.clone(),
             ports.capacity.clone(),
+            ports.rounds.clone(),
+            ports.stale_calls.clone(),
         );
         let adoption = tap.adoption();
+        let claims = tap.claims();
+
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
         sim.add_source(Box::new(storage.with_tap(tap)));
@@ -1099,6 +1253,10 @@ impl Subsystem for HeaderWire {
             dispatch,
             honest: Rc::new(scenario.honest_peers()),
             adoption,
+            capacity: ports.capacity,
+            claims,
+            rounds: ports.rounds,
+            stale_calls: ports.stale_calls,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),
@@ -1285,9 +1443,15 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     properties
 }
 
-/// The storage harness's properties, [`OPERATION_IDS`] then
-/// [`DIRECT_DISPATCH`], both active. A test harness that wraps
-/// [`Storage`] with its view registers them too.
+/// The storage harness's properties, [`OPERATION_IDS`],
+/// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
+/// [`TEARDOWN_RETURNS_BASELINE`] and [`STALE_COMPLETION_INERT`], all
+/// active. A test harness that wraps [`Storage`] with its view registers
+/// them too.
+///
+/// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
+/// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
+/// [`STALE_COMPLETION_INERT`]: crate::domain::header_sync::STALE_COMPLETION_INERT
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1311,6 +1475,9 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
             check: check_direct_dispatch::<S>,
             witness: None,
         },
+        chunk_budget_bound(),
+        teardown_returns_baseline(),
+        stale_completion_inert(),
     ]
 }
 

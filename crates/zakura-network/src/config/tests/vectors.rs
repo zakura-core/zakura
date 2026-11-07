@@ -1,6 +1,11 @@
 //! Fixed test vectors for zakura-network configuration.
 
-use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use zakura_chain::{
     amount::Amount,
@@ -22,7 +27,7 @@ use crate::{
         DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BUDGETED_CONNECTIONS,
         DEFAULT_ZAKURA_LISTEN_ADDR, DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
-    CacheDir, Config, P2pStack,
+    CacheDir, Config, P2pStack, UnconditionalPeers,
 };
 
 use super::super::load_or_generate_zakura_secret_key;
@@ -1503,6 +1508,101 @@ fn regtest_accepts_checkpoints_covering_delayed_canopy() {
     );
 }
 
+#[test]
+fn unconditional_peers_default_to_empty() {
+    assert!(Config::default().unconditional_peers.is_empty());
+
+    let config: Config = toml::from_str("").unwrap();
+    assert!(config.unconditional_peers.is_empty());
+}
+
+#[test]
+fn unconditional_peers_parse_ips_and_cidr_ranges_and_roundtrip() {
+    let config: Config = toml::from_str(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8::1', '2001:db8:1::/48']",
+    )
+    .expect("IP addresses and CIDR ranges parse");
+
+    assert_eq!(config.unconditional_peers.len(), 4);
+
+    let serialized = toml::to_string(&config).expect("config serializes");
+    assert!(
+        serialized.contains(
+            r#"unconditional_peers = ["192.0.2.1", "198.51.100.0/24", "2001:db8::1", "2001:db8:1::/48"]"#
+        ),
+        "plain IP addresses serialize without a prefix length:\n{serialized}"
+    );
+
+    let roundtrip: Config = toml::from_str(&serialized).expect("serialized config parses");
+    assert_eq!(roundtrip.unconditional_peers, config.unconditional_peers);
+}
+
+#[test]
+fn unconditional_peers_reject_invalid_entries() {
+    for entry in [
+        "not an ip",
+        "zakura.example.com",
+        "192.0.2.1:8233",
+        "192.0.2.0/33",
+        "192.0.2.5/24",
+        "2001:db8::1/32",
+        "::ffff:192.0.2.5/120",
+        "",
+    ] {
+        let error = toml::from_str::<Config>(&format!("unconditional_peers = ['{entry}']"))
+            .expect_err("invalid unconditional peer entries must fail config load");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid network.unconditional_peers entry"),
+            "unexpected error for {entry:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unconditional_peers_match_addresses_in_configured_ranges() {
+    let peers: UnconditionalPeers = toml::from_str::<Config>(
+        "unconditional_peers = ['192.0.2.1', '198.51.100.0/24', '2001:db8:1::/48']",
+    )
+    .unwrap()
+    .unconditional_peers;
+
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    assert!(peers.contains(ip("192.0.2.1")));
+    assert!(!peers.contains(ip("192.0.2.2")));
+
+    assert!(peers.contains(ip("198.51.100.0")));
+    assert!(peers.contains(ip("198.51.100.255")));
+    assert!(!peers.contains(ip("198.51.101.0")));
+
+    assert!(peers.contains(ip("2001:db8:1:ffff::1")));
+    assert!(!peers.contains(ip("2001:db8:2::1")));
+}
+
+#[test]
+fn unconditional_peers_match_ipv4_mapped_ipv6_forms() {
+    let ip = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+    let ipv4_entry: Config = toml::from_str("unconditional_peers = ['192.0.2.0/24']").unwrap();
+    assert!(ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.7")));
+    assert!(!ipv4_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.3.7")));
+
+    let mapped_entry: Config =
+        toml::from_str("unconditional_peers = ['::ffff:192.0.2.1']").unwrap();
+    assert!(mapped_entry.unconditional_peers.contains(ip("192.0.2.1")));
+    assert!(mapped_entry
+        .unconditional_peers
+        .contains(ip("::ffff:192.0.2.1")));
+    assert!(!mapped_entry.unconditional_peers.contains(ip("192.0.2.2")));
+}
+
 /// The deployer's rendered NU7 fork node config, kept in sync with the renderer by
 /// `deploy/nu7-fork/test_fork.py`. Loading it here proves zakurad accepts the shape
 /// the deployer writes, which a TOML parser alone cannot.
@@ -1720,8 +1820,8 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 
     let config: Config = toml::from_str("").expect("empty config parses");
-    assert_eq!(config.advert_window_min, 1000);
-    assert_eq!(config.advert_window_max, 1000);
+    assert_eq!(config.advert_window_min, 32);
+    assert_eq!(config.advert_window_max, 64);
     assert_eq!(config.advert_window_small_size_bytes, 102_400);
     assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
 
@@ -1751,44 +1851,47 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     assert_eq!(config.advert_window_small_size_bytes, 0);
 }
 
-/// Advert windows left at the previous defaults by a generated config load as the current
-/// defaults. Other values are kept, and a bound that is left out or at its previous default
-/// stays within the configured one.
+/// Explicit values survive config loading; omitted bounds respect the configured bound.
 #[test]
-fn legacy_default_advert_windows_load_as_current_defaults() {
+fn advert_windows_preserve_explicit_values() {
     let _init_guard = zakura_test::init();
-
-    let windows = |toml: &str| {
-        let config: Config = toml::from_str(toml).expect("advert windows parse");
-        (config.advert_window_min, config.advert_window_max)
-    };
-    for (toml, expected) in [
-        // A config generated before the defaults changed.
+    for (text, expected) in [
+        ("", (32, 64)),
+        ("advert_window_min = 32\nadvert_window_max = 64", (32, 64)),
         (
-            "advert_window_min = 32\nadvert_window_max = 64",
+            "advert_window_min = 1000\nadvert_window_max = 1000",
             (1000, 1000),
         ),
-        ("advert_window_min = 32", (1000, 1000)),
-        ("advert_window_max = 64", (1000, 1000)),
-        // Other values are the operator's.
-        ("advert_window_min = 33\nadvert_window_max = 65", (33, 65)),
-        ("advert_window_min = 16\nadvert_window_max = 64", (16, 1000)),
-        (
-            "advert_window_min = 2000\nadvert_window_max = 64",
-            (2000, 2000),
-        ),
-        // A legacy minimum does not exceed a configured maximum.
-        (
-            "advert_window_min = 32\nadvert_window_max = 200",
-            (200, 200),
-        ),
-        // Neither does a minimum that is left out, so a config that loaded before still loads.
-        ("advert_window_max = 128", (128, 128)),
-        ("advert_window_max = 999", (999, 999)),
-        ("advert_window_min = 1", (1, 1000)),
+        ("advert_window_min = 16\nadvert_window_max = 64", (16, 64)),
+        ("advert_window_max = 16", (16, 16)),
         ("advert_window_min = 1001", (1001, 1001)),
     ] {
-        assert_eq!(windows(toml), expected, "{toml:?}");
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            (config.advert_window_min, config.advert_window_max),
+            expected
+        );
+    }
+}
+
+#[test]
+fn advert_delays_roundtrip_and_validate() {
+    let _init_guard = zakura_test::init();
+    let config: Config =
+        toml::from_str("advert_delay_min = '25ms'\nadvert_delay_max = '500ms'").unwrap();
+    assert_eq!(config.advert_delay_min, Duration::from_millis(25));
+    assert_eq!(config.advert_delay_max, Duration::from_millis(500));
+    let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(config, roundtrip);
+    let default: Config = toml::from_str("").unwrap();
+    assert_eq!(default.advert_delay_min, Duration::ZERO);
+    assert_eq!(default.advert_delay_max, Duration::ZERO);
+    for text in [
+        "advert_delay_min = '1s'\nadvert_delay_max = '500ms'",
+        "advert_delay_min = '-1s'",
+        "advert_delay_max = '-1s'",
+    ] {
+        assert!(toml::from_str::<Config>(text).is_err(), "{text}");
     }
 }
 

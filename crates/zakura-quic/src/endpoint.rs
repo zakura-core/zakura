@@ -407,7 +407,16 @@ impl QuicEndpoint {
     /// Whether discovery can reserve an address attempt while leaving one
     /// live slot below the inbound refusal threshold (ADM-12).
     pub fn has_discovery_capacity(&self) -> bool {
-        self.inner.shared.connections.live() < self.inner.shared.connections.discovery_limit()
+        self.discovery_capacity() > 0
+    }
+
+    /// How many address attempts discovery can reserve now while leaving one
+    /// live slot below the inbound refusal threshold (ADM-12).
+    pub fn discovery_capacity(&self) -> usize {
+        let connections = &self.inner.shared.connections;
+        connections
+            .discovery_limit()
+            .saturating_sub(connections.live())
     }
 
     /// Network changes the endpoint has passed to its connections (SOCK-12).

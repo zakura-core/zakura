@@ -277,6 +277,7 @@ fn rollback_seed_history(network: Network) {
             state
                 .db
                 .block(Height(height).into())
+                .unwrap()
                 .expect("every committed block is readable")
         })
         .collect();

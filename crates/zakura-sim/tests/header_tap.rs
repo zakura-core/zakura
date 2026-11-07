@@ -36,12 +36,10 @@ fn tap_config() -> RunConfig {
     config
 }
 
-/// A `Handled` event for `call`, the simplest event to emit by hand.
-fn handled(call: u64) -> ReactorEvent {
-    ReactorEvent::Handled {
-        call,
-        panicked: false,
-    }
+/// A `StorageJoined` event for `call`, the simplest event to emit by hand: the
+/// tap's ownership check keeps no state for it, so it needs no dispatched call.
+fn joined(call: u64) -> ReactorEvent {
+    ReactorEvent::StorageJoined { call }
 }
 
 /// What a [`tap_run`] does beyond emitting its events.
@@ -79,7 +77,7 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(ReactorTap) -> Box<dyn ActionSource>)
             } else {
                 drop(port);
             }
-            observer.observe(handled(1));
+            observer.observe(joined(1));
             if !twist.drop_observer {
                 kept = Some(observer.clone());
             }
@@ -97,8 +95,8 @@ fn tap_run(twist: Twist, wrap: impl FnOnce(ReactorTap) -> Box<dyn ActionSource>)
 fn spawn_emitter(sim: &mut Sim, observer: Arc<dyn HeaderSyncObserver>) {
     sim.scheduler().spawn_root("reactor", async move {
         for call in 2..=4 {
-            observer.observe(handled(call));
-            observer.observe(handled(call + 100));
+            observer.observe(joined(call));
+            observer.observe(joined(call + 100));
             zakura_rt::task::yield_now().await;
         }
     });
@@ -452,7 +450,7 @@ fn two_tap_run(divert: Option<u64>) -> RunReport {
             for (instance, node) in [(0, "node"), (1, "mirror-0")] {
                 let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
                 let (observer, tap) = ReactorTap::new(sim, &port, node);
-                observer.observe(handled(1));
+                observer.observe(joined(1));
                 kept.push((port, observer));
                 if divert == Some(instance) {
                     sim.add_source(Box::new(Divert {
@@ -582,7 +580,7 @@ impl zakura_sim::Checker for AtEnd {
         match self.late {
             Late::Nothing => {}
             Late::DropReader => drop(self.shared.borrow_mut().take()),
-            Late::Emit => self.observer.observe(handled(50)),
+            Late::Emit => self.observer.observe(joined(50)),
             Late::EmitOutside => emit_outside_the_run(&self.observer),
         }
         Vec::new()
@@ -593,7 +591,7 @@ impl zakura_sim::Checker for AtEnd {
 fn emit_outside_the_run(observer: &Arc<dyn HeaderSyncObserver>) {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| observer.observe(handled(60)))
+            .spawn(|| observer.observe(joined(60)))
             .join()
             .expect("a refused emission doesn't panic");
     });
@@ -605,7 +603,7 @@ fn late_run(late: Late) -> RunReport {
     let mut sim = Sim::new(tap_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
     let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
-    observer.observe(handled(1));
+    observer.observe(joined(1));
     spawn_emitter(&mut sim, observer.clone());
     let shared: Shared = Rc::new(RefCell::new(Some(tap)));
     sim.add_source(Box::new(SharedSource(shared.clone())));
@@ -697,7 +695,7 @@ fn an_emission_outside_the_run_fails_it() {
         .iter()
         .filter_map(|entry| match &entry.obs {
             Observation::Reactor {
-                event: ReactorFact::Handled { call, .. },
+                event: ReactorFact::StorageJoined { call },
                 ..
             } => Some(*call),
             _ => None,
@@ -833,6 +831,8 @@ fn event_kinds(report: &RunReport) -> BTreeSet<&'static str> {
                 ReactorFact::Dispatched { .. } => "dispatched",
                 ReactorFact::CallEnded { .. } => "call-ended",
                 ReactorFact::Handled { .. } => "handled",
+                ReactorFact::StorageJoined { .. } => "storage-joined",
+                ReactorFact::StorageRefused { .. } => "storage-refused",
                 ReactorFact::Started { .. } => "started",
                 ReactorFact::Retired { .. } => "retired",
                 ReactorFact::OfferWaiting { .. } => "offer-waiting",

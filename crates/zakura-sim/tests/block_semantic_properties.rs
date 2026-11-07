@@ -8,11 +8,11 @@
 
 mod support;
 
-use support::inputs;
+use support::{byte_inputs, inputs};
 use zakura_sim::{
     domain::block_sync_semantic::{
         CAPACITY_RELEASE_WAKES, DETACHED_SUBMISSION_BOUNDED, INPUT_DECODED_BOUND,
-        STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
+        REACTOR_QUERY_LIFECYCLE, STALE_COMPLETION_INERT, SUBMIT_ONLY_REQUESTED,
     },
     harness::{
         block_node::{
@@ -21,9 +21,11 @@ use zakura_sim::{
             view::PairingKind,
             Policy,
         },
+        block_semantic::RESET_MID_FLIGHT_TAG,
         block_sync::{BlockScenario, Ports, Storage},
         run_prepared, Subsystem,
     },
+    seed::sha256,
     witness::{witness_prepared, Expect, WitnessScenario},
     MemorySink, Plan, PlanInput, PropertyOutcome, RunReport,
 };
@@ -68,25 +70,29 @@ fn committed(input: &[u8]) -> WitnessScenario<Storage> {
 
 /// Checks `witness` as a witness test of `property` that expects `expect`,
 /// and checks that the run paired every block storage operation. Returns
-/// the run's ports.
-fn witnessed(witness: WitnessScenario<Storage>, property: &str, expect: Expect) -> Ports {
+/// the run's ports, or why either check failed.
+fn witnessed(
+    witness: WitnessScenario<Storage>,
+    property: &str,
+    expect: Expect,
+) -> Result<Ports, String> {
     let ports = Storage::prepare(&witness.scenario);
-    if let Err(error) = witness_prepared::<Storage>(
+    witness_prepared::<Storage>(
         &witness.scenario,
         ports.clone(),
         witness.input,
         property,
         expect,
         &mut MemorySink::default(),
-    ) {
-        panic!("{property}: {error}");
+    )
+    .map_err(|error| format!("{property}: {error}"))?;
+    {
+        let view = ports.view.borrow();
+        if !view.pairing.is_empty() {
+            return Err(format!("{:?}", view.pairing));
+        }
     }
-    assert!(
-        ports.view.borrow().pairing.is_empty(),
-        "{:?}",
-        ports.view.borrow().pairing
-    );
-    ports
+    Ok(ports)
 }
 
 /// Runs `scenario` under `input`, and returns the report with the ports,
@@ -146,27 +152,95 @@ fn each_committed_input_draws_its_scenario() {
 /// through first-completion-wins, and each names the request that fetched
 /// it. With `height-only.patch`, the sequencer adopts an old-epoch body
 /// into the new epoch's work, and the same input violates the property.
-/// The test counts each kind of submission, so a change that drops one
-/// fails here instead of weakening the planted case.
+/// The test counts each kind of submission and checks that the sequencer
+/// refuses an old-epoch body after it applies the reset, so a change that
+/// drops one fails here instead of weakening the planted case.
 #[test]
 fn the_reset_mid_flight_input_holds_submit_only_requested() {
-    let ports = witnessed(
-        committed(RESET_MID_FLIGHT_INPUT),
-        SUBMIT_ONLY_REQUESTED,
-        Expect::Holds,
-    );
+    if let Err(shortfall) = reset_mid_flight_shortfall(RESET_MID_FLIGHT_INPUT) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Checks that `input` fills the reset-mid-flight input's role, or returns
+/// why it falls short. Its run must be a witness that holds
+/// `submit-only-requested` and pairs every block storage operation. It must
+/// submit bodies of an old and a new epoch, and credit a submission through
+/// first-completion-wins. And the sequencer must refuse an old epoch's body
+/// as stale after it applied a newer epoch: that is the body
+/// `height-only.patch` adopts.
+fn reset_mid_flight_shortfall(input: &[u8]) -> Result<(), String> {
+    let ports = witnessed(committed(input), SUBMIT_ONLY_REQUESTED, Expect::Holds)?;
     let view = ports.view.borrow();
     let model = view.semantic.borrow();
     // Each key counts at least one submission.
     let epochs = &model.submission_epochs;
-    assert!(
-        epochs.len() >= 2 && !epochs.contains_key(&None),
-        "submissions by epoch, which needs an old and a new one: {epochs:?}"
+    if epochs.len() < 2 || epochs.contains_key(&None) {
+        return Err(format!(
+            "submissions by epoch, which needs an old and a new one: {epochs:?}"
+        ));
+    }
+    if model.credited_elsewhere == 0 {
+        return Err("no first-completion-wins credit".to_owned());
+    }
+    if !model.saw_old_epoch_body_refused {
+        return Err("the sequencer refused no old-epoch body under a newer epoch".to_owned());
+    }
+    Ok(())
+}
+
+/// How many fuzz inputs [`regenerate_reset_mid_flight_input`] tries.
+const RESET_MID_FLIGHT_CANDIDATES: usize = 64;
+
+/// Rewrites the committed reset-mid-flight input with the first of
+/// [`RESET_MID_FLIGHT_CANDIDATES`] fuzz inputs that fills the input's role
+/// ([`reset_mid_flight_shortfall`]), and its sidecar's SHA-256 to match. A
+/// block-sync change that moves the input off the crossing needs only this
+/// run, then `cargo xtask planted block-sync/submit-only-requested` to show
+/// that `height-only.patch` is still caught.
+#[test]
+#[ignore = "rewrites the committed input"]
+fn regenerate_reset_mid_flight_input() {
+    let bytes = byte_inputs(RESET_MID_FLIGHT_CANDIDATES, 16_384)
+        .into_iter()
+        .map(|plan| [&RESET_MID_FLIGHT_TAG[..], &plan].concat())
+        .find(|input| reset_mid_flight_shortfall(input).is_ok())
+        .expect("some candidate reaches the crossing");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/block-sync-reset-mid-flight"
     );
-    assert!(
-        model.credited_elsewhere > 0,
-        "no first-completion-wins credit"
-    );
+    std::fs::write(format!("{fixture}.bin"), &bytes).expect("the fixture directory exists");
+    let sidecar = format!("{fixture}.toml");
+    let text = std::fs::read_to_string(&sidecar).expect("the input has a sidecar");
+    let text: String = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("sha256 = ") {
+                format!("sha256 = \"{}\"\n", sha256(&bytes))
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&sidecar, text).expect("the sidecar is writable");
+}
+
+/// The reset-mid-flight input's reset supersedes the reactor's query state,
+/// and storage takes each accepted query under its exact identity. This input
+/// isn't known to fill or close the action channel, so the test makes no claim
+/// about refusals.
+#[test]
+fn the_reset_mid_flight_input_holds_reactor_query_lifecycle() {
+    let ports = witnessed(
+        committed(RESET_MID_FLIGHT_INPUT),
+        REACTOR_QUERY_LIFECYCLE,
+        Expect::Holds,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let view = ports.view.borrow();
+    let model = view.semantic.borrow();
+    assert!(model.reactor_queries.saw_query_at_storage);
 }
 
 /// The stale-beside-current input's stale verdict releases only its own
@@ -179,7 +253,8 @@ fn the_stale_beside_current_input_holds_stale_completion_inert() {
         committed(STALE_BESIDE_CURRENT_INPUT),
         STALE_COMPLETION_INERT,
         Expect::Holds,
-    );
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 /// Under stalled storage, with no `BoundedStorage` assumption, the reset
@@ -192,7 +267,8 @@ fn the_stalled_reset_input_holds_detached_submission_bounded() {
         committed(STALLED_RESET_INPUT),
         DETACHED_SUBMISSION_BOUNDED,
         Expect::Holds,
-    );
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 /// Under stalled storage, the mirror's bodies keep entering the
@@ -206,7 +282,8 @@ fn the_stalled_reset_input_holds_input_decoded_bound() {
         committed(STALLED_RESET_INPUT),
         INPUT_DECODED_BOUND,
         Expect::Holds,
-    );
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     let view = ports.view.borrow();
     let model = view.semantic.borrow();
     assert!(model.saw_decoded_queued);
@@ -227,7 +304,8 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
         committed(DECODED_INPUT_STALL_INPUT),
         INPUT_DECODED_BOUND,
         Expect::Holds,
-    );
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     let view = ports.view.borrow();
     let model = view.semantic.borrow();
     assert!(model.saw_decoded_queued);
@@ -250,7 +328,8 @@ fn the_frontier_first_input_holds_capacity_release_wakes() {
         committed(CAPACITY_FRONTIER_FIRST_INPUT),
         CAPACITY_RELEASE_WAKES,
         Expect::Holds,
-    );
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 /// The capacity-release input whose plan handles the detached commit's

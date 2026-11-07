@@ -2,10 +2,16 @@
 # that runs it, the generator version it was built for, and its SHA-256. Its
 # first two bytes, `ff 0c`, pick the reset-mid-flight scenario: two mirrors
 # serve sixteen bodies, and the chain resets to a fork from height 8 once the
-# node submits its third body.
+# node submits its third body. The rest is Plan bytes from the simulator
+# tests' fuzz inputs: `regenerate_reset_mid_flight_input` in
+# block_semantic_properties.rs writes the first one whose run submits bodies
+# of an old and a new body-work epoch, where first-completion-wins credits a
+# submission whose body crossed in another request's exchange, and where the
+# sequencer refuses an old-epoch body after it applied a newer epoch. Rerun
+# it when a block-sync change moves the input off that crossing.
 harness = "block-sync/storage"
 generator = 2
-sha256 = "fc591c33d3cc19cf3b7773e48e4431229c8ea36911f432912f12966cb88cf427"
+sha256 = "db878ab38107f578cd10dfc9ded692e63676cfa3032707cae19e6dbd0a089933"
 scenario_sha256 = "ef7a2693943a5f576cfab7e8029e9ceef242b4bd6c02d7d5b726c360bf127914"
 source = "crates/zakura-sim/tests/block_semantic_properties.rs"
 

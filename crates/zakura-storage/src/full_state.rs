@@ -45,13 +45,15 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     AuxDelivery, AuxDelta, BodySizeHint, BodySizeHintBatch, BodyWorkEpoch, ChangeSet,
-    CommittedHeaderChainView, CommittedTransitionError, EngineSnapshot, EvidenceId,
-    FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry, StateVersion, StoreError,
+    CommittedHeaderChainView, CommittedTransitionError, EligibilityReason, EngineSnapshot,
+    EvidenceId, FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry,
+    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError,
     TransitionEffect, TransitionEvent, TransitionFailure, TransitionFingerprint, TransitionRequest,
     ValidationLease, VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause,
     VerifiedHeaderRef,
 };
 use zakura_network::zakura::{BlockSizeEstimate, BlockSyncBlockMeta};
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_rt::sync::watch;
 
 /// The most headers one page or one bounded path covers, and the most
@@ -105,7 +107,7 @@ impl From<CommittedTransitionError> for StateError {
 /// One committed block.
 #[derive(Clone, Debug)]
 struct Committed {
-    block: Arc<block::Block>,
+    block: BlockHandle,
     /// The block's hash, kept so lookups don't rehash its header.
     hash: block::Hash,
     height: block::Height,
@@ -148,7 +150,7 @@ impl VerifiedChain {
         VerifiedChain {
             genesis: Committed {
                 hash: genesis.hash(),
-                block: genesis,
+                block: genesis.into(),
                 height,
                 receipt: 0,
             },
@@ -167,7 +169,7 @@ impl VerifiedChain {
     }
 
     /// The committed block `hash`, finalized or not.
-    pub fn block(&self, hash: block::Hash) -> Option<&Arc<block::Block>> {
+    pub fn block(&self, hash: block::Hash) -> Option<&BlockHandle> {
         self.get(hash).map(|committed| &committed.block)
     }
 
@@ -195,7 +197,7 @@ impl VerifiedChain {
         let parents: BTreeSet<[u8; 32]> = self
             .blocks
             .values()
-            .map(|committed| committed.block.header.previous_block_hash.0)
+            .map(|committed| committed.block.header().previous_block_hash.0)
             .collect();
         // The map is keyed by hash bytes, so this is already sorted.
         self.blocks
@@ -241,7 +243,7 @@ impl VerifiedChain {
         let mut current = self.blocks.get(&hash.0)?;
         loop {
             path.push(current);
-            let parent = current.block.header.previous_block_hash;
+            let parent = current.block.header().previous_block_hash;
             if parent == self.genesis.hash {
                 break;
             }
@@ -285,7 +287,7 @@ impl VerifiedChain {
     ) -> Option<block::Hash> {
         let mut current = self.get(tip.hash).filter(|tip| tip.height >= height)?;
         while current.height > height {
-            current = self.get(current.block.header.previous_block_hash)?;
+            current = self.get(current.block.header().previous_block_hash)?;
         }
         Some(current.hash)
     }
@@ -307,12 +309,7 @@ impl VerifiedChain {
     /// If the best chain would hold more than `MAX_BLOCK_REORG_HEIGHT`
     /// blocks. Production finalizes there, and full state here never does,
     /// so a scenario must stay within that window.
-    pub(crate) fn with(
-        &self,
-        block: Arc<block::Block>,
-        height: block::Height,
-        receipt: u64,
-    ) -> Self {
+    pub(crate) fn with(&self, block: BlockHandle, height: block::Height, receipt: u64) -> Self {
         let mut after = self.clone();
         let inserted = block.hash();
         after.blocks.insert(
@@ -351,11 +348,11 @@ impl VerifiedChain {
     fn evict_branch(&mut self, tip: block::Hash) {
         let mut current = tip;
         while let Some(committed) = self.blocks.remove(&current.0) {
-            let parent = committed.block.header.previous_block_hash;
+            let parent = committed.block.header().previous_block_hash;
             let shared = self
                 .blocks
                 .values()
-                .any(|other| other.block.header.previous_block_hash == parent);
+                .any(|other| other.block.header().previous_block_hash == parent);
             if shared {
                 break;
             }
@@ -372,11 +369,11 @@ fn header_ref(committed: &Committed) -> VerifiedHeaderRef {
     VerifiedHeaderRef {
         height: committed.height,
         hash: committed.hash,
-        header: committed.block.header.clone(),
+        header: Arc::new(*committed.block.header()),
     }
 }
 
-fn serialized_size(block: &block::Block) -> u32 {
+fn serialized_size(block: &BlockHandle) -> u32 {
     use zakura_chain::serialization::ZcashSerialize;
     u32::try_from(block.zcash_serialized_size()).expect("a block fits MAX_BLOCK_BYTES")
 }
@@ -468,6 +465,91 @@ fn classify_verified_change<'a>(
     } else {
         (VerifiedChangeCause::Reset, new_path)
     }
+}
+
+/// The operator invalidation of `target`, or with `invalidate` false its
+/// reconsideration, against `engine`'s snapshot and `chain`'s best path, as
+/// zakura-state's `commit_operator_change` builds it. A reconsideration
+/// names the evidence of the invalidation in force on `target`, or `None`.
+pub(crate) fn operator_request(
+    engine: &HeaderChainEngine,
+    chain: &VerifiedChain,
+    target: block::Hash,
+    invalidate: bool,
+) -> TransitionRequest {
+    let snapshot = engine.snapshot();
+    let path = chain.best_path();
+    let evidence = full_state_evidence(
+        if invalidate {
+            b"operator-invalidate"
+        } else {
+            b"operator-reconsider"
+        },
+        snapshot.state_version,
+        target,
+        &path,
+    );
+    let (id, operator_reason_digest) = operator_identity(target);
+    let event = if invalidate {
+        TransitionEvent::OperatorInvalidate(OperatorInvalidate {
+            target,
+            id,
+            operator_reason_digest,
+            evidence,
+        })
+    } else {
+        TransitionEvent::OperatorReconsider(OperatorReconsider {
+            target,
+            id,
+            invalidation_evidence: invalidation_evidence(engine, target),
+            evidence,
+        })
+    };
+    TransitionRequest {
+        expected_version: snapshot.state_version,
+        event,
+    }
+}
+
+/// The evidence of the operator invalidation in force on `target`, or
+/// `None` if there's none, as zakura-state's
+/// `operator_invalidation_evidence` reads it. Retention that evicts the
+/// header ends its reasons with it.
+pub(crate) fn invalidation_evidence(
+    engine: &HeaderChainEngine,
+    target: block::Hash,
+) -> Option<EvidenceId> {
+    let (id, _) = operator_identity(target);
+    engine.graph().header_node(target).and_then(|node| {
+        node.eligibility
+            .direct_reasons
+            .iter()
+            .find_map(|reason| match reason {
+                EligibilityReason::OperatorInvalid {
+                    id: existing,
+                    evidence,
+                    ..
+                } if *existing == id => Some(*evidence),
+                _ => None,
+            })
+    })
+}
+
+/// zakura-state's `operator_identity`: the invalidation ID and reason
+/// digest for `target`.
+fn operator_identity(target: block::Hash) -> (OperatorInvalidationId, [u8; 32]) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-operator-invalidation-id-v1");
+    hasher.update(target.0);
+    let id_digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0; 16];
+    id.copy_from_slice(&id_digest[..16]);
+    let id = OperatorInvalidationId::new(id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-operator-invalidation-v1");
+    hasher.update(target.0);
+    hasher.update(id.bytes());
+    (id, hasher.finalize().into())
 }
 
 /// zakura-state's `full_state_evidence`.

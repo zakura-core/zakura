@@ -7,7 +7,15 @@
 //! And it's unclear if these assumptions match the `zcashd` implementation.
 //! It should be refactored into a cleaner set of request/response pairs (#1515).
 
-use std::{borrow::Cow, collections::HashSet, fmt, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use zakura_node_services::block_memory::BlockHandle;
 
 use futures::{future::Either, prelude::*};
 use rand_10::{rng as thread_rng, seq::SliceRandom, RngExt};
@@ -16,7 +24,7 @@ use tower::{Service, ServiceExt};
 use tracing::Instrument;
 
 use zakura_chain::{
-    block::{self, Block},
+    block::{self},
     chain_tip::{ChainTip, NoChainTip},
     serialization::SerializationError,
     transaction::{UnminedTx, UnminedTxId},
@@ -27,9 +35,10 @@ use crate::{
         self, MAX_ADDRS_IN_MESSAGE, MAX_OVERLOAD_DROP_PROBABILITY, MIN_OVERLOAD_DROP_PROBABILITY,
         OVERLOAD_PROTECTION_INTERVAL, PEER_ADDR_RESPONSE_LIMIT,
     },
+    inbound_resources::{vec_retained_bytes, InboundBudget, InboundCharge},
     meta_addr::MetaAddr,
     peer::{
-        block_gossip::{BlockAdvert, BlockAdvertError},
+        block_gossip::{BlockAdvert, BlockAdvertError, BLOCK_REQUEST_WAIT},
         connection::peer_tx::PeerTx,
         error::AlreadyErrored,
         ClientRequest, ClientRequestReceiver, ConnectionInfo, ErrorSlot, InProgressClientRequest,
@@ -64,7 +73,7 @@ pub(super) enum Handler {
     FindHeaders,
     BlocksByHash {
         pending_hashes: HashSet<block::Hash>,
-        blocks: Vec<Arc<Block>>,
+        blocks: Vec<BlockHandle>,
     },
     TransactionsById {
         pending_ids: HashSet<UnminedTxId>,
@@ -428,7 +437,12 @@ impl Handler {
                 Handler::Finished(Ok(response))
             }
             (Handler::FindHeaders, Message::Headers(headers)) => {
-                Handler::Finished(Ok(Response::BlockHeaders(headers)))
+                Handler::Finished(Ok(Response::BlockHeaders(
+                    headers
+                        .into_iter()
+                        .map(|counted| counted.header.into())
+                        .collect(),
+                )))
             }
 
             (Handler::MempoolTransactionIds, Message::Inv(items))
@@ -560,6 +574,21 @@ impl From<Request> for InboundMessage {
     }
 }
 
+/// How long peer messages can keep a queued block advert waiting before the advert goes ahead of
+/// the next peer message.
+///
+/// Peer messages normally precede adverts, so a response to the peer's request goes out before an
+/// unsolicited `inv`. A peer that has a message ready at every turn, whether it floods or answers
+/// a large request of ours, would otherwise keep an advert queued past the advertiser's wait
+/// ([`BLOCK_REQUEST_WAIT`]). A third of that wait leaves the advert time to be written and the
+/// peer time to request the block.
+///
+/// The wait is checked between messages, so one message whose handling outlasts the
+/// advertiser's wait still expires the advert. The response to a `getdata` writes each block
+/// inline under [`REQUEST_TIMEOUT`](crate::constants::REQUEST_TIMEOUT) per block, so a peer that
+/// reads slowly can hold its connection's loop for minutes with one message.
+const WAITING_ADVERT_PRIORITY_DELAY: Duration = BLOCK_REQUEST_WAIT.checked_div(3).unwrap();
+
 /// Where a connection reads our requests from, and the authorization it rechecks before
 /// writing a block advert.
 pub(crate) struct ConnectionRequests<C> {
@@ -612,6 +641,12 @@ where
     /// Receives block adverts independently of the current request's response.
     pub(super) block_advert_rx: tokio::sync::mpsc::Receiver<BlockAdvert>,
 
+    /// When the loop first saw a block advert waiting in a queue that has not drained since.
+    ///
+    /// Adverts queued behind one that became due are written in the turns right after it, so a
+    /// burst of adverts to one connection does not wait the delay once each.
+    advert_waiting_since: Option<tokio::time::Instant>,
+
     /// Live authorization, rechecked immediately before advert writes.
     minimum_peer_version: MinimumPeerVersion<C>,
     bans: BannedIps,
@@ -630,6 +665,9 @@ where
 
     /// Reports requested blocks and completed framed writes to gossip schedulers.
     pub(super) block_uploads: super::block_gossip::BlockUploads,
+
+    /// Tells the client and peer set whether this connection is free to write a new request.
+    pub(super) request_slot: super::client::RequestSlot,
 
     /// A connection tracker that reduces the open connection count when dropped.
     /// Used to limit the number of open connections in Zebra.
@@ -654,6 +692,12 @@ where
     /// service to a request from this connection,
     /// or None if this connection hasn't yet received an overload error.
     last_overload_time: Option<Instant>,
+
+    /// Funds decoded TCP payloads across this node's connections.
+    pub(super) inbound_budget: InboundBudget,
+
+    /// Funds the payloads of the current client request's response until its handoff.
+    response_charge: Option<InboundCharge>,
 }
 
 impl<S, Tx, C> fmt::Debug for Connection<S, Tx, C>
@@ -672,6 +716,50 @@ where
             .field("last_metrics_state", &self.last_metrics_state)
             .field("last_overload_time", &self.last_overload_time)
             .finish()
+    }
+}
+
+/// Convert retained headers into their TCP wire form, and return the bytes this copies.
+///
+/// A shared header has no read admission to keep, so its wire form shares its
+/// allocation. A header with read admission keeps its slot for the original, and the
+/// returned bytes cover only the new allocations. No allocation is charged twice.
+fn wire_headers(
+    headers: &[zakura_node_services::block_memory::HeaderHandle],
+) -> (Vec<block::CountedHeader>, u64) {
+    use zakura_node_services::block_memory::HeaderHandle;
+
+    let mut copied_headers = 0u64;
+    let wire: Vec<_> = headers
+        .iter()
+        .map(|handle| {
+            let header = match handle {
+                HeaderHandle::Shared(header) => header.clone(),
+                HeaderHandle::Block(_) | HeaderHandle::Standalone(_) => {
+                    copied_headers = copied_headers.saturating_add(1);
+                    Arc::new(**handle)
+                }
+            };
+            block::CountedHeader { header }
+        })
+        .collect();
+    let copied_bytes = copied_headers
+        .saturating_mul(COPIED_HEADER_BYTES)
+        .saturating_add(vec_retained_bytes(&wire));
+    (wire, copied_bytes)
+}
+
+/// The bytes of one `Arc<Header>` allocation: the header and its two reference counts.
+// Widening usize to u64 is lossless on supported targets.
+const COPIED_HEADER_BYTES: u64 =
+    (std::mem::size_of::<block::Header>() + 2 * std::mem::size_of::<usize>()) as u64;
+
+/// The decoded bytes a `block` or `tx` message retains while a handler holds it.
+fn decoded_payload_bytes(message: &Message) -> u64 {
+    match message {
+        Message::Block(block) => block.decoded_bytes(),
+        Message::Tx(transaction) => transaction.transaction().retained_memory_size_bytes(),
+        _ => 0,
     }
 }
 
@@ -695,6 +783,7 @@ where
         connection_info: Arc<ConnectionInfo>,
         addr_label: String,
         initial_cached_addrs: Vec<MetaAddr>,
+        inbound_budget: InboundBudget,
     ) -> Self {
         Connection {
             connection_info,
@@ -704,15 +793,19 @@ where
             svc: inbound_service,
             client_rx: client_rx.into(),
             block_advert_rx,
+            advert_waiting_since: None,
             minimum_peer_version,
             bans,
             error_slot,
             peer_tx: peer_tx.into(),
             block_uploads: Default::default(),
+            request_slot: Default::default(),
             connection_tracker,
             addr_label,
             last_metrics_state: None,
             last_overload_time: None,
+            inbound_budget,
+            response_charge: None,
         }
     }
 }
@@ -756,6 +849,23 @@ where
         loop {
             self.update_state_metrics(None);
 
+            // Each way out of a client request reaches this point before the next one
+            // starts, so one place ends the charge for its response's payloads.
+            if !matches!(self.state, State::AwaitingResponse { .. }) {
+                self.response_charge = None;
+            }
+
+            // Every state change returns here before the next await, so the slot is current
+            // whenever this task is waiting.
+            self.request_slot
+                .set_busy(!matches!(self.state, State::AwaitingRequest));
+
+            // A block advert that peer messages have kept waiting goes before the next one.
+            self.note_waiting_advert();
+            // The turn's one decision: a due advert goes before the next peer message, and the
+            // write counts it as such with the wait decided on here.
+            let overdue_advert_wait = self.overdue_advert_wait();
+            let advert_due = overdue_advert_wait.is_some();
             match self.state {
                 State::AwaitingRequest => {
                     trace!("awaiting client request or peer message");
@@ -798,12 +908,19 @@ where
                     // Zebra services might be temporarily delayed until the peer times out, if a
                     // request to that peer is sent by the service, and the service blocks until
                     // the request completes (or times out).
+                    //
+                    // The one exception is a block advert that peer messages have kept waiting
+                    // for [`WAITING_ADVERT_PRIORITY_DELAY`]: it goes before the next peer message,
+                    // so a peer with a message ready at every turn cannot keep it queued. That
+                    // peer may then take our one-hash `inv` as the response to a `getblocks` it
+                    // has already sent, which is also possible when its `getblocks` is still on
+                    // the wire, and which costs it one unsolicited `inv` later.
                     let incoming = tokio::select! {
                         biased;
-                        msg = peer_rx.next() => Either::Left(msg),
+                        msg = peer_rx.next(), if !advert_due => Either::Left(msg),
                         // A closed advert channel disables only this branch.
                         Some(advert) = self.block_advert_rx.recv() => {
-                            self.send_block_advert(advert).await;
+                            self.send_block_advert(advert, overdue_advert_wait).await;
                             continue;
                         }
                         req = self.client_rx.next() => Either::Right(req),
@@ -833,6 +950,8 @@ where
                             break;
                         }
                         Either::Right(Some(req)) => {
+                            // The request may wait for the peer writer before the state changes.
+                            self.request_slot.set_busy(true);
                             let span = req.span.clone();
                             self.handle_client_request(req).instrument(span).await
                         }
@@ -877,17 +996,20 @@ where
                     // This makes sure a peer can't block disconnection or timeouts by sending too
                     // many messages. It also avoids doing work to process messages after a
                     // connection has failed.
-                    // Peer messages precede adverts to preserve response ordering, as above.
+                    // Peer messages precede adverts to preserve response ordering, as above,
+                    // except an advert that a run of peer messages has held back.
                     let peer_msg = tokio::select! {
                         biased;
                         _ = tx.cancellation() => {
                             // The client receiver was dropped, so we don't need to send on `tx` here.
                             trace!(parent: &span, "client request was cancelled");
+                            self.record_unanswered_block_request();
                             self.state = State::AwaitingRequest;
                             continue;
                         }
                         _ = timer_ref => {
                             trace!(parent: &span, "client request timed out");
+                            self.record_unanswered_block_request();
                             let e = PeerError::ConnectionReceiveTimeout;
 
                             // Replace the state with a temporary value,
@@ -918,9 +1040,9 @@ where
                             };
                             continue;
                         }
-                        msg = peer_rx.next().instrument(span.clone()) => msg,
+                        msg = peer_rx.next().instrument(span.clone()), if !advert_due => msg,
                         Some(advert) = self.block_advert_rx.recv() => {
-                            self.send_block_advert(advert).await;
+                            self.send_block_advert(advert, overdue_advert_wait).await;
                             continue;
                         }
                     };
@@ -929,6 +1051,7 @@ where
                         Some(Err(e)) => self.fail_with(e).await,
                         Some(Ok(peer_msg)) => {
                             self.update_state_metrics(format!("Out::Rsp::{}", peer_msg.command()));
+                            let payload_bytes = decoded_payload_bytes(&peer_msg);
 
                             // Try to process the message using the handler.
                             // This extremely awkward construction avoids
@@ -950,6 +1073,11 @@ where
 
                             self.update_state_metrics(None);
 
+                            // The handler retains a consumed payload until its handoff.
+                            if request_msg.is_none() {
+                                self.charge_response_payload(payload_bytes);
+                            }
+
                             // A message can finish the response and still need inbound handling:
                             // a one-block inv can also be an announcement, and an unsolicited
                             // transaction ends the pending transaction batch. Deliver the reply
@@ -964,6 +1092,9 @@ where
                                 )
                             {
                                 self.deliver_finished_response();
+                                // The client now holds the payloads, so the inbound handling
+                                // below must not keep their charge.
+                                self.response_charge = None;
                             }
 
                             // If the handler returned the message, check whether it can also
@@ -1020,11 +1151,39 @@ where
         self.shutdown_async(error).await;
     }
 
+    /// Notes a block advert waiting in its queue, from the first turn of the loop that could
+    /// have sent it, so a message handled meanwhile counts towards its wait. The wait ends only
+    /// when the queue is empty: an advert written or skipped leaves the ones behind it as overdue
+    /// as it was.
+    fn note_waiting_advert(&mut self) {
+        if self.block_advert_rx.is_empty() {
+            self.advert_waiting_since = None;
+        } else {
+            self.advert_waiting_since
+                .get_or_insert_with(tokio::time::Instant::now);
+        }
+    }
+
+    /// Returns how long peer messages have kept the waiting block adverts queued, once that is
+    /// at least [`WAITING_ADVERT_PRIORITY_DELAY`]: the next advert then goes before the next
+    /// peer message. `None` while the queue is empty or its wait is shorter.
+    fn overdue_advert_wait(&self) -> Option<Duration> {
+        if self.block_advert_rx.is_empty() {
+            return None;
+        }
+        self.advert_waiting_since
+            .map(|since| since.elapsed())
+            .filter(|waited| *waited >= WAITING_ADVERT_PRIORITY_DELAY)
+    }
+
     /// Writes a block advert's `inv`, after rechecking the peer's live authorization, and
     /// acknowledges it once the local write completes.
     ///
+    /// `overdue_wait` is how long the queue had waited when this turn decided that the advert
+    /// goes before the next peer message, or `None` when it goes out in a gap between them.
+    ///
     /// Does not change the state of any request that is awaiting its response.
-    async fn send_block_advert(&mut self, advert: BlockAdvert) {
+    async fn send_block_advert(&mut self, advert: BlockAdvert, overdue_wait: Option<Duration>) {
         if advert.result.is_closed() {
             metrics::counter!("peer.canceled").increment(1);
             metrics::counter!(
@@ -1033,6 +1192,14 @@ where
             )
             .increment(1);
             return;
+        }
+
+        if let Some(queue_waited) = overdue_wait {
+            metrics::counter!("peer.block_gossip.advert_priority_writes").increment(1);
+            debug!(
+                ?queue_waited,
+                "writing a block advert ahead of the peer's messages"
+            );
         }
 
         metrics::counter!(
@@ -1288,6 +1455,12 @@ where
 
         use InboundMessage::*;
 
+        let Some(_unsolicited_charge) = self.charge_unsolicited(&msg) else {
+            metrics::counter!("zcash.net.in.discarded", "reason" => "inbound_budget").increment(1);
+            debug!("TCP inbound bytes exhausted: dropping unsolicited transaction");
+            return None;
+        };
+
         let req = match msg {
             Message::Ping(nonce) => {
                 trace!(?nonce, "responding to heartbeat");
@@ -1371,7 +1544,7 @@ where
                 // We don't expect to be advertised multiple blocks at a time,
                 // so we ignore any advertisements of multiple blocks.
                 [InventoryHash::Block(hash)] => Request::AdvertiseBlock(
-                    *hash,
+                    (*hash).into(),
                     self.connection_info
                         .connected_addr
                         .get_transient_addr()
@@ -1498,12 +1671,65 @@ where
         }
     }
 
+    /// Charge a payload that the pending request's handler keeps until its handoff.
+    ///
+    /// A response to this node's own request never refuses, or the conformant peer
+    /// sending it would time out.
+    fn charge_response_payload(&mut self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let charge = self.inbound_budget.charge_committed(bytes);
+        match &mut self.response_charge {
+            Some(retained) => retained.merge(charge),
+            None => self.response_charge = Some(charge),
+        }
+    }
+
+    /// Charge an unsolicited message until its handler ends, or refuse it.
+    ///
+    /// Only a transaction carries a charge. An unsolicited block has no retained owner.
+    /// Nothing waits for unsolicited work, so a saturated budget refuses it, as a full
+    /// queue does.
+    fn charge_unsolicited(&self, msg: &Message) -> Option<InboundCharge> {
+        let bytes = match msg {
+            Message::Tx(_) => decoded_payload_bytes(msg),
+            _ => 0,
+        };
+        self.inbound_budget.try_charge(bytes)
+    }
+
     /// Sends the finished response of the pending client request to the client, and makes the
     /// connection idle.
     ///
     /// # Panics
     ///
     /// If the state is not `AwaitingResponse` with a `Finished` handler.
+    /// Records a block request that ends after spending at least half of its timeout unanswered.
+    ///
+    /// Block routing stops preferring this connection until the peer delivers a requested block.
+    fn record_unanswered_block_request(&self) {
+        let State::AwaitingResponse {
+            handler: Handler::BlocksByHash { .. },
+            ..
+        } = self.state
+        else {
+            return;
+        };
+
+        // Block downloaders apply their own timeout, so they usually cancel just before the
+        // connection's timer fires. An early cancellation says nothing about the peer.
+        let spent_half_of_timeout = self.request_timer.as_ref().is_some_and(|timer| {
+            timer
+                .deadline()
+                .saturating_duration_since(tokio::time::Instant::now())
+                <= constants::REQUEST_TIMEOUT / 2
+        });
+        if spent_half_of_timeout {
+            self.request_slot.set_block_request_unanswered(true);
+        }
+    }
+
     fn deliver_finished_response(&mut self) {
         // Replace the state with a temporary value,
         // so we can take ownership of the response sender.
@@ -1530,6 +1756,10 @@ where
                 .increment(1);
             } else {
                 debug!(error = ?response, "error in peer response to Zakura request");
+            }
+
+            if matches!(response, Ok(Response::Blocks(_))) {
+                self.request_slot.set_block_request_unanswered(false);
             }
 
             let _ = tx.send(response.map_err(Into::into));
@@ -1702,7 +1932,15 @@ where
                 }
             }
             Response::BlockHeaders(headers) => {
-                if let Err(e) = self.peer_tx.send(Message::Headers(headers)).await {
+                // The handles keep their read admission until the send ends. The budget
+                // funds only the copies. This response answers a request the node
+                // already accepted, so its copies never refuse.
+                let (wire, copied_bytes) = wire_headers(&headers);
+                let copies = self.inbound_budget.charge_committed(copied_bytes);
+                let sent = self.peer_tx.send(Message::Headers(wire)).await;
+                drop(copies);
+                drop(headers);
+                if let Err(e) = sent {
                     self.fail_with(e).await
                 }
             }
@@ -1926,6 +2164,9 @@ where
 
         // Close channels first, so other tasks can start shutting down.
         self.client_rx.close();
+        self.block_advert_rx.close();
+        self.block_uploads.disconnected();
+        self.request_slot.set_busy(true);
 
         // Update the shared error slot
         //
@@ -1997,7 +2238,6 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn drop(&mut self) {
-        self.block_uploads.disconnected();
         self.shutdown(PeerError::ConnectionDropped);
 
         self.erase_state_metrics();

@@ -36,7 +36,7 @@ use tracing::{instrument, Instrument, Span};
 use tower::buffer::Buffer;
 
 use zakura_chain::{
-    block::{self, CountedHeader, HeightDiff},
+    block::{self, HeightDiff},
     diagnostic::CodeTimer,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{Network, NetworkUpgrade},
@@ -76,6 +76,7 @@ use crate::{
     SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
+pub(crate) mod block_announcements;
 pub mod block_iter;
 mod block_range;
 pub mod chain_tip;
@@ -106,15 +107,23 @@ use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, 
 
 pub use self::traits::{ReadState, State};
 
-fn finalized_chain_tip(db: &ZakuraDb) -> Option<ChainTipBlock> {
-    let (height, hash) = db.tip()?;
-    if let Some(block) = db.tip_block() {
-        return Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(block)));
+fn finalized_chain_tip(
+    db: &ZakuraDb,
+) -> Result<Option<ChainTipBlock>, zakura_node_services::block_memory::AdmissionFailure> {
+    let Some((height, hash)) = db.tip() else {
+        return Ok(None);
+    };
+    if let Some(block) = db.chain_tip_block()? {
+        return Ok(Some(ChainTipBlock::from(CheckpointVerifiedBlock::from(
+            block,
+        ))));
     }
 
-    let header = db.block_header(height.into())?;
-    (header.hash() == hash)
-        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header))
+    let Some(header) = db.block_header(height.into()) else {
+        return Ok(None);
+    };
+    Ok((header.hash() == hash)
+        .then(|| ChainTipBlock::from_pruned_finalized_header(hash, height, header)))
 }
 
 /// A read-write service for Zebra's cached blockchain state.
@@ -415,8 +424,7 @@ impl StateService {
     /// Uses the `max_checkpoint_height` and `checkpoint_verify_concurrency_limit`
     /// to work out when it is near the final checkpoint.
     ///
-    /// Returns the read-write and read-only state services,
-    /// and read-only watch channels for its best chain tip.
+    /// Returns the state services and update receivers in [`InitializedState`].
     ///
     /// # Errors
     ///
@@ -427,7 +435,7 @@ impl StateService {
         network: &Network,
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
-    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+    ) -> Result<InitializedState<Self>, StateInitError> {
         let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -455,7 +463,7 @@ impl StateService {
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
-                let finalized_tip = finalized_chain_tip(&finalized_state.db);
+                let finalized_tip = finalized_chain_tip(&finalized_state.db)?;
                 let historical_trees = load_historical_frontier_artifact(
                     &network,
                     &config,
@@ -515,6 +523,7 @@ impl StateService {
 
         let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
             ChainTipSender::new(initial_tip, network);
+        let (chain_tip_sender, block_announcements) = chain_tip_sender.with_block_announcements();
 
         let finalized_state_for_writing = finalized_state.clone();
         let should_use_finalized_block_write_sender = non_finalized_state.is_chain_set_empty();
@@ -638,6 +647,11 @@ impl StateService {
                 &state.network,
                 MAX_LEGACY_CHAIN_BLOCKS,
             ) {
+                if let Some(admission) =
+                    error.downcast_ref::<zakura_node_services::block_memory::AdmissionFailure>()
+                {
+                    return Err(StateInitError::BlockAdmission(*admission));
+                }
                 let legacy_db_path = state.read_service.db.path().to_path_buf();
                 panic!(
                     "Cached state contains a legacy chain.\n\
@@ -663,7 +677,13 @@ impl StateService {
             }
         });
 
-        Ok((state, read_service, latest_chain_tip, chain_tip_change))
+        Ok(InitializedState {
+            state,
+            read_state: read_service,
+            latest_chain_tip,
+            chain_tip_change,
+            block_announcements,
+        })
     }
 
     /// Call read only state service to log rocksdb database metrics.
@@ -683,7 +703,7 @@ impl StateService {
         // This method must not block, access the database, or perform CPU-intensive tasks,
         // because it is called directly from the tokio executor's Future threads.
 
-        let queued_prev_hash = checkpoint_verified.block.header.previous_block_hash;
+        let queued_prev_hash = checkpoint_verified.block.header().previous_block_hash;
         let queued_height = checkpoint_verified.height;
 
         // If we're close to the final checkpoint, make the block's UTXOs available for
@@ -1039,7 +1059,7 @@ impl StateService {
         admission: Option<BlockAdmission>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
-        let parent_hash = semantically_verified.block.header.previous_block_hash;
+        let parent_hash = semantically_verified.block.header().previous_block_hash;
         let hash = semantically_verified.hash;
 
         // Drop hashes of any blocks the write task has rejected before checking
@@ -1293,15 +1313,22 @@ impl StateService {
                     self.non_finalized_block_write_sent_hashes
                         .add(&queued_child.0);
                     let admission = queued_child.2.clone();
-                    let candidate_parent = queued_child.0.block.header.previous_block_hash;
+                    let candidate_parent = queued_child.0.block.header().previous_block_hash;
                     let optimistic_relay_still_authorized = self
                         .optimistic_relay_still_authorized(admission.as_ref(), candidate_parent);
-                    let send_result =
+                    let send = || {
                         non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
                             queued: queued_child,
                             queued_at: Instant::now(),
                             write_slot,
-                        });
+                        })
+                    };
+                    let send_result = match &admission {
+                        Some(admission) => {
+                            admission.admit_with(optimistic_relay_still_authorized, send)
+                        }
+                        None => send(),
+                    };
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
                         send_result
@@ -1316,10 +1343,6 @@ impl StateService {
 
                         return;
                     };
-
-                    if let Some(admission) = admission {
-                        admission.admit(optimistic_relay_still_authorized);
-                    }
 
                     new_parents.push(hash);
                 }
@@ -2746,7 +2769,7 @@ where
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
-            finalized_state::serve_block_roots(db, height..=height)
+            finalized_state::serve_block_roots(db, height..=height)?
                 .into_iter()
                 .next()
         } else if let Some(chain) = chain
@@ -2891,6 +2914,14 @@ impl Service<ReadRequest> for ReadStateService {
             .boxed();
         };
 
+        let workers = match &req {
+            ReadRequest::Tip
+            | ReadRequest::FinalizedTip
+            | ReadRequest::Depth(_)
+            | ReadRequest::BestChainNextMedianTimePast => self.db.control_read_worker_capacity(),
+            _ => self.db.read_worker_capacity(),
+        };
+
         if let ReadRequest::AcquireRetainedHeaderPath {
             peer,
             session_id,
@@ -2908,7 +2939,7 @@ impl Service<ReadRequest> for ReadStateService {
                 }
                 .boxed();
             };
-            let acquisition = timed_span.spawn_blocking(move || {
+            let acquisition = timed_span.spawn_blocking(workers, move || {
                 let outcome = reader.acquire_retained_path(
                     peer,
                     session_id,
@@ -2989,17 +3020,17 @@ impl Service<ReadRequest> for ReadStateService {
                 state.latest_best_chain(),
                 &state.db,
                 hash_or_height,
-            ))),
+            )?)),
 
             ReadRequest::AnyChainBlock(hash_or_height) => Ok(ReadResponse::Block(read::any_block(
                 state.latest_non_finalized_state().chain_iter(),
                 &state.db,
                 hash_or_height,
-            ))),
+            )?)),
 
             // Used by the get_block (raw) RPC and the StateService.
             ReadRequest::BlockAndSize(hash_or_height) => Ok(ReadResponse::BlockAndSize(
-                read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height),
+                read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height)?,
             )),
 
             // Used by the get_block (verbose) RPC and the StateService.
@@ -3022,7 +3053,7 @@ impl Service<ReadRequest> for ReadStateService {
                 let next_block_hash =
                     read::find::hash_by_height(best_chain.clone(), &state.db, next_height);
 
-                let header = read::block_header(best_chain, &state.db, height.into())
+                let header = read::block_header_result(best_chain, &state.db, height.into())?
                     .ok_or(BlockHeaderNotFound { hash_or_height })?;
 
                 Ok(ReadResponse::BlockHeader {
@@ -3035,7 +3066,7 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_raw_transaction RPC and the StateService.
             ReadRequest::Transaction(hash) => Ok(ReadResponse::Transaction(
-                read::mined_transaction(state.latest_best_chain(), &state.db, hash),
+                read::mined_transaction(state.latest_best_chain(), &state.db, hash)?,
             )),
 
             ReadRequest::AnyChainTransaction(hash) => {
@@ -3043,7 +3074,7 @@ impl Service<ReadRequest> for ReadStateService {
                     state.latest_non_finalized_state().chain_iter(),
                     &state.db,
                     hash,
-                )))
+                )?))
             }
 
             // Used by the getblock (verbose) RPC.
@@ -3119,18 +3150,15 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // Used by the StateService.
-            ReadRequest::FindBlockHeaders { known_blocks, stop } => Ok(ReadResponse::BlockHeaders(
-                read::find_chain_headers(
+            ReadRequest::FindBlockHeaders { known_blocks, stop } => {
+                Ok(ReadResponse::BlockHeaders(read::find_chain_headers(
                     state.latest_best_chain(),
                     &state.db,
                     known_blocks,
                     stop,
                     MAX_FIND_BLOCK_HEADERS_RESULTS,
-                )
-                .into_iter()
-                .map(|header| CountedHeader { header })
-                .collect(),
-            )),
+                )?))
+            }
 
             ReadRequest::HeaderLocator { permit: _permit } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
@@ -3282,19 +3310,16 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::BlocksByHeightRange { start, count } => {
                 let snapshot = state.block_range_snapshot()?;
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                snapshot
-                                    .block_and_size(&state.db, height)
-                                    .map(|(block, size)| (height, block, size))
-                            })
-                    })
-                    .collect();
+                let mut blocks = Vec::new();
+                for offset in 0..count {
+                    let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+                        break;
+                    };
+                    let Some((block, size)) = snapshot.block_and_size(&state.db, height)? else {
+                        break;
+                    };
+                    blocks.push((height, block, size));
+                }
 
                 Ok(ReadResponse::Blocks(blocks))
             }
@@ -3302,20 +3327,18 @@ impl Service<ReadRequest> for ReadStateService {
             // Used by the indexer gRPC server.
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { start, count } => {
-                let blocks = (0..count)
-                    .map_while(|offset| {
-                        start
-                            .0
-                            .checked_add(offset)
-                            .map(block::Height)
-                            .and_then(|height| {
-                                state
-                                    .db
-                                    .raw_block_bytes(height.into())
-                                    .map(|bytes| (height, bytes))
-                            })
-                    })
-                    .collect();
+                // A short response means the chain ended, so capacity refusal
+                // fails the whole read instead of returning a prefix.
+                let mut blocks = Vec::new();
+                for offset in 0..count {
+                    let Some(height) = start.0.checked_add(offset).map(block::Height) else {
+                        break;
+                    };
+                    let Some(bytes) = state.db.raw_block_result(height.into())? else {
+                        break;
+                    };
+                    blocks.push((height, bytes));
+                }
 
                 Ok(ReadResponse::RawBlocks(blocks))
             }
@@ -3661,7 +3684,7 @@ impl Service<ReadRequest> for ReadStateService {
                     );
                 };
 
-                if semantically_verified.block.header.previous_block_hash != best_tip_hash {
+                if semantically_verified.block.header().previous_block_hash != best_tip_hash {
                     return Err("proposal is not based on the current best chain tip: \
                                     previous block hash must be the best chain tip"
                         .into());
@@ -3673,7 +3696,7 @@ impl Service<ReadRequest> for ReadStateService {
                 //
                 // TODO: Convert `CommitSemanticallyVerifiedError` to a new `ValidateProposalError`?
                 latest_non_finalized_state.disable_metrics();
-                latest_non_finalized_state.record_proposal_spends();
+                latest_non_finalized_state.record_proposal_results();
 
                 write::validate_and_commit_non_finalized(
                     &state.db,
@@ -3685,23 +3708,18 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::TipBlockSize => {
-                // Respond with the length of the obtained block if any.
-                Ok(ReadResponse::TipBlockSize(
-                    state
-                        .best_tip()
-                        .and_then(|(tip_height, _)| {
-                            read::block_info(
-                                state.latest_best_chain(),
-                                &state.db,
-                                tip_height.into(),
-                            )
-                        })
-                        .map(|info| info.size().try_into().expect("u32 should fit in usize"))
-                        .or_else(|| {
-                            find::tip_block(state.latest_best_chain(), &state.db)
-                                .map(|b| b.zcash_serialized_size())
-                        }),
-                ))
+                let size = state
+                    .best_tip()
+                    .and_then(|(height, _)| {
+                        read::block_info(state.latest_best_chain(), &state.db, height.into())
+                    })
+                    .map(|info| usize::try_from(info.size()).expect("u32 fits in usize"));
+                let size = match size {
+                    Some(size) => Some(size),
+                    None => find::tip_block(state.latest_best_chain(), &state.db)?
+                        .map(|block| block.zcash_serialized_size()),
+                };
+                Ok(ReadResponse::TipBlockSize(size))
             }
 
             // Used by the getchaintips RPC.
@@ -3747,7 +3765,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
         };
 
-        timed_span.spawn_blocking(request_handler)
+        timed_span.spawn_blocking(workers, request_handler)
     }
 }
 
@@ -3757,7 +3775,7 @@ fn check_prepared_mined_relay_eligibility_for_state(
     db: &ZakuraDb,
     commitment: BlockCommitmentData,
 ) -> Result<PreparedMinedRelayEligibility, BoxError> {
-    let parent_hash = commitment.block.header.previous_block_hash;
+    let parent_hash = commitment.block.header().previous_block_hash;
     let parent_chain =
         non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
     let history_tree = read::tree::history_tree(parent_chain, db, parent_hash.into());
@@ -3827,9 +3845,28 @@ fn check_prepared_mined_relay_eligibility_for_state(
     }
 }
 
+/// State services and update receivers created by initialization.
+///
+/// Select the fields a caller needs with a destructuring pattern and `..`. Keep `state`
+/// alive while using its writer; unused update receivers can be dropped. In particular,
+/// dropping `block_announcements` disables collection of announcements without affecting commits.
+/// This container has no additional shutdown behavior; each field owns its usual lifetime.
+#[derive(Debug)]
+pub struct InitializedState<S> {
+    /// Read-write service, boxed or buffered by the initializer as needed.
+    pub state: S,
+    /// Cloneable read-only access to committed state.
+    pub read_state: ReadStateService,
+    /// Current best chain tip, readable without a service request.
+    pub latest_chain_tip: LatestChainTip,
+    /// Receiver for changes to the best chain tip.
+    pub chain_tip_change: ChainTipChange,
+    /// Single-consumer feed of committed announcements, normally owned by gossip.
+    pub block_announcements: crate::BlockAnnouncements,
+}
+
 /// Initialize a state service from the provided [`Config`].
-/// Returns a boxed state service, a read-only state service,
-/// and receivers for state chain tip updates.
+/// Returns [`InitializedState`] with a boxed read-write service.
 ///
 /// Each `network` has its own separate on-disk database.
 ///
@@ -3852,30 +3889,28 @@ pub async fn init(
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
-) -> Result<
-    (
-        BoxService<Request, Response, BoxError>,
-        ReadStateService,
-        LatestChainTip,
-        ChainTipChange,
-    ),
-    StateInitError,
-> {
-    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(
-            config,
-            network,
-            max_checkpoint_height,
-            checkpoint_verify_concurrency_limit,
-        )
-        .await?;
-
-    Ok((
-        BoxService::new(state_service),
-        read_only_state_service,
+) -> Result<InitializedState<BoxService<Request, Response, BoxError>>, StateInitError> {
+    let InitializedState {
+        state,
+        read_state,
         latest_chain_tip,
         chain_tip_change,
-    ))
+        block_announcements,
+    } = StateService::new(
+        config,
+        network,
+        max_checkpoint_height,
+        checkpoint_verify_concurrency_limit,
+    )
+    .await?;
+
+    Ok(InitializedState {
+        state: BoxService::new(state),
+        read_state,
+        latest_chain_tip,
+        chain_tip_change,
+        block_announcements,
+    })
 }
 
 /// Initialize state and return the separate capability used to seal completion-gated body
@@ -3892,28 +3927,19 @@ pub async fn init_with_header_chain_body_evidence(
     checkpoint_verify_concurrency_limit: usize,
 ) -> Result<
     (
-        BoxService<Request, Response, BoxError>,
-        ReadStateService,
-        LatestChainTip,
-        ChainTipChange,
+        InitializedState<BoxService<Request, Response, BoxError>>,
         crate::HeaderChainBodyEvidenceAuthority,
     ),
     StateInitError,
 > {
-    let (state, read_state, latest_chain_tip, chain_tip_change) = init(
+    let initialized = init(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
     )
     .await?;
-    Ok((
-        state,
-        read_state,
-        latest_chain_tip,
-        chain_tip_change,
-        crate::HeaderChainBodyEvidenceAuthority::new(),
-    ))
+    Ok((initialized, crate::HeaderChainBodyEvidenceAuthority::new()))
 }
 
 /// Initialize a read state service from the provided [`Config`].
@@ -4010,40 +4036,41 @@ pub async fn init_test(
 ) -> Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, _, _, _) =
+    let InitializedState { state, .. } =
         StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
             .await
             .expect("ephemeral state initialization succeeds");
 
-    Buffer::new(BoxService::new(state_service), 1)
+    Buffer::new(BoxService::new(state), 1)
 }
 
 /// Initializes a state service with an ephemeral [`Config`] and a buffer with a single slot,
-/// then returns the read-write service, read-only service, and tip watch channels.
+/// then returns the services and update receivers in [`InitializedState`].
 ///
 /// This can be used to create a state service for testing. See also [`init`].
 #[cfg(any(test, feature = "proptest-impl"))]
 pub async fn init_test_services(
     network: &Network,
-) -> (
+) -> InitializedState<
     Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
-    ReadStateService,
-    LatestChainTip,
-    ChainTipChange,
-) {
+> {
     // TODO: pass max_checkpoint_height and checkpoint_verify_concurrency limit
     //       if we ever need to test final checkpoint sent UTXO queries
-    let (state_service, read_state_service, latest_chain_tip, chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
-
-    let state_service = Buffer::new(BoxService::new(state_service), 1);
-
-    (
-        state_service,
-        read_state_service,
+    let InitializedState {
+        state,
+        read_state,
         latest_chain_tip,
         chain_tip_change,
-    )
+        block_announcements,
+    } = StateService::new(Config::ephemeral(), network, block::Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
+
+    InitializedState {
+        state: Buffer::new(BoxService::new(state), 1),
+        read_state,
+        latest_chain_tip,
+        chain_tip_change,
+        block_announcements,
+    }
 }

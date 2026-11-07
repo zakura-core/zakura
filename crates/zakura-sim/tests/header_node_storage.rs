@@ -100,6 +100,7 @@ fn worked_example(policy: Policy) -> StorageScenario {
         ],
         policy,
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 
@@ -109,6 +110,7 @@ fn any() -> Policy {
         base: Base::Any,
         bound_ms: None,
         holds: Vec::new(),
+        reply_holds: Vec::new(),
     }
 }
 
@@ -153,7 +155,10 @@ fn facts(report: &RunReport) -> Vec<(u64, &StorageFact)> {
 fn operation_ids_are_unique_and_complete_once() {
     let scenario = worked_example(any());
     let (mut faulted, mut paired_error) = (false, false);
-    for input in sweep() {
+    // The transport's scheduling choices come before the storage outcome
+    // draws, so a plan needs room for both. Most 256-byte plans run out before
+    // the first outcome draw and complete every operation with the engine.
+    for input in inputs(64, 1_024) {
         let (report, _) = run(&scenario, input);
         let ids = report
             .properties
@@ -675,6 +680,7 @@ fn node_at_a3(
             ..Policy::converging()
         },
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 

@@ -1,7 +1,8 @@
 //! The shrinker: reduce a failing trace to fewer non-default picks on the
 //! build that recorded it (traces.md, Trace shrinking).
 //!
-//! [`shrink`] runs five passes:
+//! Machine histories delete aligned four-byte operations and preserve the exact
+//! failure phase and payload. Scheduler histories use five passes:
 //!
 //! 1. **Confirm.** Replay the trace Exact. A trace that doesn't replay, such
 //!    as a nondeterministic one, is refused and kept as it is.
@@ -38,6 +39,7 @@
 //! - `best-plan.json`: the best candidate's choices as a scripted [`Plan`],
 //!   rewritten after each accepted candidate, so an interrupted or killed
 //!   shrink keeps it;
+//! - `best-candidate.json`: the scenario and plan together, written atomically;
 //! - `reductions.jsonl`: one [`Reduction`] per accepted candidate;
 //! - `reduced/`: the re-recorded trace;
 //! - `report.json`: the [`ShrinkReport`].
@@ -63,13 +65,16 @@ pub use crate::plan::Candidate;
 use crate::{
     harness::{self, HarnessEntry, RecordInput},
     plan::{By, SkipScript},
-    record::{DrawRecord, EndRecord, Record, StepRecord},
+    record::{
+        machine::{MachineFailure, MachineScenario, MachineStep},
+        DrawRecord, EndRecord, Record, StepRecord,
+    },
     witness::{Expect, WitnessError},
     Category, MemorySink, Plan, PlanChoice, PlanInput,
 };
 
 /// The shrinker's version, as `meta.derived_from` records it.
-pub const SHRINK_VERSION: u32 = 1;
+pub const SHRINK_VERSION: u32 = 2;
 
 /// The copy of the original trace in the output directory.
 pub const ORIGINAL_DIR: &str = "original";
@@ -79,6 +84,12 @@ pub const REDUCED_DIR: &str = "reduced";
 
 /// The best candidate's choices, as a scripted [`Plan`].
 pub const BEST_PLAN_FILE: &str = "best-plan.json";
+
+/// The best scenario and plan, replaced together after an accepted candidate.
+pub const BEST_CANDIDATE_FILE: &str = "best-candidate.json";
+
+/// The bytes of one machine operation, the unit machine shrinking deletes.
+const MACHINE_OPERATION_BYTES: usize = 4;
 
 /// One [`Reduction`] per line.
 pub const REDUCTIONS_FILE: &str = "reductions.jsonl";
@@ -115,6 +126,9 @@ pub struct Counts {
     pub non_default: u64,
     /// Steps the run executed, drain included.
     pub events: u64,
+    /// Causal machine bytes, including inputs after the first failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_bytes: Option<usize>,
 }
 
 impl Counts {
@@ -123,6 +137,13 @@ impl Counts {
         let init = trace.init.as_ref().map_or(&[][..], |init| &init.draws);
         Counts {
             non_default: non_default(init, &trace.steps),
+            input_bytes: trace
+                .steps
+                .iter()
+                .any(|step| step.machine.is_some())
+                .then(|| machine_input(&trace.meta.scenario))
+                .flatten()
+                .map(|input| input.len()),
             // A usize always fits in a u64 on supported targets.
             events: trace
                 .end
@@ -132,7 +153,7 @@ impl Counts {
     }
 }
 
-/// Why the shrinker stopped before pass 4 reached a fixed point.
+/// Why the shrinker stopped before its final reduction pass reached a fixed point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Stop {
@@ -185,7 +206,7 @@ pub struct ShrinkReport {
     pub before: Counts,
     /// The re-recorded trace's counts. `None` if the re-record failed.
     pub after: Option<Counts>,
-    /// True if a full pass 4 accepted no candidate.
+    /// True if the final scheduling or machine-operation pass accepted no candidate.
     pub fixed_point: bool,
     /// Why the passes stopped early, if they did.
     pub stopped: Option<Stop>,
@@ -302,7 +323,8 @@ pub fn shrink_with(
     prepare_out(out, trace)?;
     let mut shrinker = Shrinker {
         harness,
-        scenario: &trace.meta.scenario,
+        scenario: trace.meta.scenario.clone(),
+        machine_failure: machine_failure(&trace.steps),
         property: property.clone(),
         budget,
         started,
@@ -331,13 +353,20 @@ pub fn shrink_with(
     };
     let (reduced, after, rerecord_failure) = match rerecord(
         harness,
-        &trace.meta.scenario,
+        &shrinker.scenario,
         &best.plan,
         &derivation,
         &property,
         &out.join(REDUCED_DIR),
     ) {
-        Ok(reduced) => (Some(reduced.id.clone()), Some(Counts::of(&reduced)), None),
+        Ok(reduced) if machine_failure(&reduced.steps) == shrinker.machine_failure => {
+            (Some(reduced.id.clone()), Some(Counts::of(&reduced)), None)
+        }
+        Ok(_) => (
+            None,
+            None,
+            Some("the re-recorded trace changed the machine failure".into()),
+        ),
         Err(reason) => (None, None, Some(reason)),
     };
     let report = ShrinkReport {
@@ -359,6 +388,21 @@ pub fn shrink_with(
         Some(error) => Err(ShrinkError::Io(error)),
         None => Ok(report),
     }
+}
+
+/// A machine scenario's causal bytes. Scheduler inputs stay separate.
+fn machine_input(scenario: &Value) -> Option<Vec<u8>> {
+    serde_json::from_value::<MachineScenario>(scenario.clone())
+        .ok()
+        .map(|scenario| scenario.input)
+}
+
+/// The first failure in `steps`' machine evidence.
+fn machine_failure<'a>(steps: impl IntoIterator<Item = &'a StepRecord>) -> Option<MachineFailure> {
+    steps
+        .into_iter()
+        .filter_map(|step| step.machine.as_deref())
+        .find_map(MachineStep::failure)
 }
 
 /// The property the shrink keeps violated: the one that ended the run, or
@@ -574,7 +618,8 @@ enum Choice {
 /// The state of one shrink.
 struct Shrinker<'a> {
     harness: &'static HarnessEntry,
-    scenario: &'a Value,
+    scenario: Value,
+    machine_failure: Option<MachineFailure>,
     property: String,
     budget: ShrinkBudget,
     started: Instant,
@@ -610,11 +655,81 @@ impl Shrinker<'_> {
     /// even when a limit stops them. `Ok` means pass 4 reached a fixed
     /// point.
     fn reduce(&mut self, base: &mut Run, violation_step: Option<u64>) -> Result<(), Stop> {
+        if self.harness.machine {
+            return self.reduce_machine(base);
+        }
         if let Some(step) = violation_step {
             self.cut_tail(base, step)?;
         }
         self.delete_external(base)?;
         self.default_scheduling(base)
+    }
+
+    /// Deletes machine operations, preserving alignment and the exact failure.
+    fn reduce_machine(&mut self, base: &mut Run) -> Result<(), Stop> {
+        let Some(mut input) = machine_input(&self.scenario) else {
+            return Ok(());
+        };
+        let mut size = input.len().div_ceil(MACHINE_OPERATION_BYTES);
+        while size > 0 {
+            let accepted_before = self.accepted;
+            let mut start = 0;
+            while start < input.len() {
+                self.check_budget()?;
+                let end = (start + size * MACHINE_OPERATION_BYTES).min(input.len());
+                let mut candidate = input.clone();
+                candidate.drain(start..end);
+                let previous = self.scenario.clone();
+                self.scenario["input"] = serde_json::json!(candidate);
+                self.candidates += 1;
+                match self.run(Vec::new(), Vec::new()) {
+                    Ok(run) => {
+                        let change = format!(
+                            "deleted machine bytes {start}..{end}; {} remain",
+                            candidate.len()
+                        );
+                        self.accept(3, &run, change);
+                        *base = run;
+                        input = candidate;
+                    }
+                    Err(_) => {
+                        self.scenario = previous;
+                        start = end;
+                    }
+                }
+            }
+            if size != 1 || self.accepted == accepted_before {
+                size /= 2;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_budget(&self) -> Result<(), Stop> {
+        if self.interrupt.load(Ordering::Relaxed) {
+            return Err(Stop::Interrupted);
+        }
+        if self.candidates >= self.budget.candidates {
+            return Err(Stop::CandidateLimit);
+        }
+        if self.started.elapsed() >= self.budget.wall {
+            return Err(Stop::WallClock);
+        }
+        Ok(())
+    }
+
+    fn accept(&mut self, pass: u8, run: &Run, change: String) {
+        self.accepted += 1;
+        let reduction = Reduction {
+            pass,
+            candidate: self.candidates,
+            change,
+            non_default: run.non_default,
+            events: run.events,
+        };
+        if let Err(error) = self.log(&reduction).and_then(|()| self.save_best(run)) {
+            self.write_error.get_or_insert(error);
+        }
     }
 
     /// Pass 2: drops the steps after `step`, if one of them made a
@@ -708,15 +823,7 @@ impl Shrinker<'_> {
         steps: Vec<Candidate>,
         change: String,
     ) -> Result<Option<Run>, Stop> {
-        if self.interrupt.load(Ordering::Relaxed) {
-            return Err(Stop::Interrupted);
-        }
-        if self.candidates >= self.budget.candidates {
-            return Err(Stop::CandidateLimit);
-        }
-        if self.started.elapsed() >= self.budget.wall {
-            return Err(Stop::WallClock);
-        }
+        self.check_budget()?;
         self.candidates += 1;
         let Ok(run) = self.run(init, steps) else {
             return Ok(None);
@@ -726,19 +833,7 @@ impl Shrinker<'_> {
             "a candidate drops at least one non-default choice of its base, and its \
              run makes no other"
         );
-        self.accepted += 1;
-        let reduction = Reduction {
-            pass,
-            candidate: self.candidates,
-            change,
-            non_default: run.non_default,
-            events: run.events,
-        };
-        // A failed write doesn't stop the passes, but fails the shrink at
-        // its end.
-        if let Err(error) = self.log(&reduction).and_then(|()| self.save_best(&run)) {
-            self.write_error.get_or_insert(error);
-        }
+        self.accept(pass, &run, change);
         Ok(Some(run))
     }
 
@@ -750,6 +845,7 @@ impl Shrinker<'_> {
             self.scenario.clone(),
             self.property.clone(),
         );
+        let expected_failure = self.machine_failure.clone();
         on_new_thread(move || {
             let mut sink = MemorySink::default();
             let judged = witness(
@@ -763,7 +859,17 @@ impl Shrinker<'_> {
                 .records
                 .iter()
                 .any(|record| matches!(record, Record::End(end) if end.cleanup.leaked == 0));
-            (judged.map(|()| Run::from_records(sink)), clean)
+            let judged = judged.and_then(|()| {
+                let steps = sink.records.iter().filter_map(|record| match record {
+                    Record::Step(step) => Some(step),
+                    _ => None,
+                });
+                if machine_failure(steps) != expected_failure {
+                    return Err(WitnessError::ChangedFailure);
+                }
+                Ok(Run::from_records(sink))
+            });
+            (judged, clean)
         })
     }
 
@@ -782,6 +888,13 @@ impl Shrinker<'_> {
         let path = self.out.join(BEST_PLAN_FILE);
         let partial = path.with_extension("json.partial");
         write_json(&partial, &run.plan)?;
+        fs::rename(partial, path)?;
+        let path = self.out.join(BEST_CANDIDATE_FILE);
+        let partial = path.with_extension("json.partial");
+        write_json(
+            &partial,
+            &serde_json::json!({"scenario": self.scenario, "plan": run.plan}),
+        )?;
         fs::rename(partial, path)
     }
 }

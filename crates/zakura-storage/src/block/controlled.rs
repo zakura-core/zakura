@@ -92,6 +92,7 @@ use zakura_network::{
     zakura::{BlockRangeReadResult, BlockSyncAction, BlockSyncHandle},
     BoxError,
 };
+use zakura_node_services::block_memory::BlockHandle;
 use zakura_rt::{sync::mpsc, task::JoinHandle, time::Instant};
 
 use super::{
@@ -545,7 +546,7 @@ impl Slot {
     }
 
     /// The submitted block this slot's request holds.
-    fn submitted_block(&self) -> Option<&Arc<block::Block>> {
+    fn submitted_block(&self) -> Option<&BlockHandle> {
         match &self.stage {
             SlotStage::Waiting {
                 request: BlockRequest::Action(BlockSyncAction::SubmitBlock { block, .. }),

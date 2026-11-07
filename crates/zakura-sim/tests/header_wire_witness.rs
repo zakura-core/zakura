@@ -20,7 +20,7 @@ use zakura_sim::{
     domain::session::{honest_never_punished, HonestPeers, HONEST_NEVER_PUNISHED},
     harness::{
         header_node::{Chain, Policy},
-        header_sync::{HeaderWire, WireScenario, FAMILY},
+        header_sync::{HeaderWire, WireScenario, FAMILY, HEADER_FAULT_PENALIZED},
         run_prepared,
         wire_plans::{act_scenario, SavedPlan},
         HarnessError, LinkSpec, NetScenario, Subsystem,
@@ -232,7 +232,8 @@ fn generated() -> Vec<String> {
 }
 
 /// The harness registers header sync's generated receiver and sender IDs,
-/// then `session/honest-never-punished`, after the storage properties.
+/// then `session/honest-never-punished`, after the storage properties and
+/// `header-sync/header-fault-penalized`.
 /// No downstream template is registered, since the adapter observes none
 /// of their effects.
 #[test]
@@ -251,7 +252,8 @@ fn the_harness_registers_the_generated_header_ids() {
         .map(|property| property.id.to_string())
         .collect();
     expected.push(HONEST_NEVER_PUNISHED.to_owned());
-    assert_eq!(registered[2..], expected[..]);
+    assert_eq!(registered[3], HEADER_FAULT_PENALIZED);
+    assert_eq!(registered[4..], expected[..]);
 }
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`,

@@ -136,7 +136,6 @@ pub(super) fn discovery_pipe(peer_id: ZakuraPeerId) -> Pipe<DsLocal, DsEnv> {
             DISCOVERY_ALLOWED_FRAME_TYPES,
             // The largest row payload, `PEERS_MAX_BYTES`, fits in `u32`.
             PEERS_MAX_BYTES as u32,
-            None,
         ),
         run_inbound,
         &PIPE_SHAPE,

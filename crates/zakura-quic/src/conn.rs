@@ -140,6 +140,13 @@ impl ConnLimits {
         self.max_bidi_streams = Some(streams);
         self
     }
+
+    /// Sets the connection-level receive window, before credit holds
+    /// (API-10).
+    pub fn with_receive_window(mut self, bytes: u64) -> Self {
+        self.receive_window = Some(bytes);
+        self
+    }
 }
 
 /// A connection's buffer and traffic state, published by its connection task

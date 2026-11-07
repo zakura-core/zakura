@@ -6,10 +6,10 @@ use zakura_rt::sync::CancellationToken;
 
 use super::{
     serving::{Server, Source},
-    wire::{Range, GET_BLOCKS},
+    wire::{Range, GET_BLOCKS, LARGEST_SERVED_RESPONSE},
 };
 use crate::zakura::{
-    block_sync::{ZakuraBlockSyncConfig, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_RESPONSE_BYTES},
+    block_sync::ZakuraBlockSyncConfig,
     regulation::{
         sizing, CompletionId, Completions, OutputOrder, Serve, ServeCapacity, ServeLimits,
     },
@@ -36,18 +36,38 @@ const PEER_EXECUTION: usize = NODE_EXECUTION / 2;
 // owed-ending gate well above one peer's jobs (see `MAX_PENDING_ENDINGS`).
 const _: () = assert!(2 * PEER_EXECUTION <= super::live_requester::MAX_PENDING_ENDINGS);
 
-/// The production GetBlocks serving limits. Execution is fixed by
-/// [`NODE_EXECUTION`]; output sizing covers the largest possible response, so
-/// the response configuration cannot inflate execution concurrency.
-pub(crate) fn serving_limits() -> ServeLimits {
-    let largest = Range::new(Height::MIN, MAX_BS_BLOCKS_PER_REQUEST)
-        .expect("the protocol's largest range starts at height zero")
-        .response_cap(MAX_BS_RESPONSE_BYTES)
-        .output_bytes();
+/// The production GetBlocks serving limits. `node_serve_output_bytes`
+/// replaces the node output budget when set. Unset, the budget is
+/// [`derived_serving_limits`]'s at the default connection count, until
+/// [`ZakuraBlockSyncConfig::for_node_connections`] sets it.
+pub(crate) fn serving_limits(config: &ZakuraBlockSyncConfig) -> ServeLimits {
+    sizing::with_node_output_bytes(
+        derived_serving_limits(config, crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS),
+        config.node_serve_output_bytes,
+    )
+}
+
+/// The GetBlocks serving limits on a node that admits `max_connections`.
+///
+/// Execution is fixed by [`NODE_EXECUTION`], so the response configuration
+/// cannot inflate execution concurrency. Output sizing covers the largest
+/// response a server sends, one advertised block ([`LARGEST_SERVED_RESPONSE`]),
+/// on every session that can serve at once. Those are the block-sync
+/// connections, which [`ZakuraBlockSyncConfig::block_sync_connections`] clamps
+/// to `max_connections`.
+pub(crate) fn derived_serving_limits(
+    config: &ZakuraBlockSyncConfig,
+    max_connections: usize,
+) -> ServeLimits {
+    let largest = LARGEST_SERVED_RESPONSE.output_bytes();
     ServeLimits {
         node_execution: NODE_EXECUTION,
         peer_execution: PEER_EXECUTION,
-        ..sizing::serve_limits(largest, sizing::TARGET_RTT)
+        ..sizing::serve_limits(
+            largest,
+            sizing::TARGET_RTT,
+            config.block_sync_connections(max_connections),
+        )
     }
 }
 
@@ -108,7 +128,7 @@ pub(crate) struct Serving {
 
 impl Serving {
     pub(crate) fn new(source: Arc<dyn Source>, config: &ZakuraBlockSyncConfig) -> Self {
-        let limits = serving_limits();
+        let limits = serving_limits(config);
         debug_assert!(
             serving_sessions_fit_budget(config),
             "the reactor validates the config before serving",

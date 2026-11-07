@@ -10,6 +10,11 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// Held by each test that raises a signal [`INTERRUPTED`] reads, and by each
+/// test that runs a child against the flag, so a raised signal never ends
+/// another test's child.
+pub(crate) static INTERRUPT_FLAG_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `zakura-sim`: `properties` lists `race/lost-update` and
 /// `sim/no-task-panic`, `confirm` writes a confirmation whose status the
 /// input's keywords pick, and `replay` fails for a trace named `bad`. A
@@ -515,6 +520,38 @@ fn an_unconfirmed_original_is_rejected() {
     }
 }
 
+/// Confirming alone runs the original's checks and no `tmin`: a
+/// reproducing original is `confirmed`, and one that confirms another
+/// property is `original-rejected`.
+#[test]
+fn confirming_checks_the_original_without_tmin() {
+    for (original, status) in [
+        (ORIGINAL, Status::Confirmed),
+        (&b"other original"[..], Status::OriginalRejected),
+    ] {
+        let fake = Fake::new(original, &[b"good"]);
+        let started = Instant::now();
+        let preserved = preserve_original(&fake.request).unwrap();
+        let report = confirm_with(
+            &fake.request,
+            &fake.tools(TminScript::default()),
+            preserved,
+            started,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.status, status, "{report:#?}");
+        assert_eq!(
+            report.original.check.as_ref().map(|check| check.accepted),
+            Some(status == Status::Confirmed)
+        );
+        assert_eq!(report.reduction.end, ReductionEnd::NotRun);
+        assert_eq!(report.candidates, []);
+        assert!(!fake.out(TMIN_DIR).exists());
+        assert_eq!(fake.written()["status"], status.to_string());
+    }
+}
+
 /// When the wrapper itself fails, here on a `zakura-sim confirm` that
 /// refuses its arguments, the run still ends with a report: `error`, with
 /// the error as its reason, and the original kept. The command still fails.
@@ -826,7 +863,10 @@ fn arguments_need_explicit_budgets_and_a_known_target() {
         (
             full.replace("race_fixtures", "header_pursuit"),
             "unknown simulation fuzz target `header_pursuit`; expected one of \
-             discovery_wait_complete, header_sync_storage, race_fixtures",
+             block_decoded_retention, block_reactor_policy, block_work_funding, \
+             block_work_ownership, discovery_record_book, discovery_session_installation, \
+             discovery_verification_capacity, discovery_wait_complete, header_publisher_policy, \
+             header_reactor_policy, header_sync_storage, race_fixtures",
         ),
         (format!("{full} --runs 1"), "--runs given twice"),
         (
@@ -1041,6 +1081,16 @@ fn reading_the_source_leaves_the_git_dir_alone() {
 /// the wrapper.
 #[test]
 fn signals_set_the_interrupt_flag() {
+    let _flag = INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A test run under `nohup` starts with SIGHUP ignored.
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: the default action replaces any handler.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
     install_interrupt_handler();
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         INTERRUPTED.store(false, Ordering::SeqCst);
@@ -1051,4 +1101,79 @@ fn signals_set_the_interrupt_flag() {
         }
         assert!(INTERRUPTED.load(Ordering::SeqCst), "signal {signal}");
     }
+    INTERRUPTED.store(false, Ordering::SeqCst);
+}
+
+/// A signal ignored at startup, as `nohup` ignores SIGHUP, stays ignored,
+/// and any other gets the handler. SIGUSR2 stands in for it, since no other
+/// test handles or raises it. No signal is sent.
+#[test]
+fn ignored_signals_stay_ignored() {
+    let start_with = |handler| {
+        // SAFETY: no other test relies on SIGUSR2's handler.
+        unsafe {
+            libc::signal(libc::SIGUSR2, handler);
+        }
+    };
+    start_with(libc::SIG_IGN);
+    catch_signals(&[libc::SIGUSR2]);
+    assert_eq!(signal_handler(libc::SIGUSR2), libc::SIG_IGN);
+    start_with(libc::SIG_DFL);
+    catch_signals(&[libc::SIGUSR2]);
+    let caught = signal_handler(libc::SIGUSR2);
+    assert!(
+        caught != libc::SIG_DFL && caught != libc::SIG_IGN,
+        "SIGUSR2's handler is {caught}"
+    );
+    start_with(libc::SIG_DFL);
+}
+
+/// A child that exits leaves no descendant behind: `run_child` kills the
+/// child's process group once the child itself has exited.
+#[test]
+fn an_exited_child_leaves_no_descendant() {
+    let dir = TempDir::new().unwrap();
+    let pid_file = dir.path().join("descendant.pid");
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 600 & echo $! > \"$1\"")
+        .arg("sh")
+        .arg(&pid_file);
+    let end = run_child(
+        &mut command,
+        &dir.path().join("child.log"),
+        Some(Duration::from_secs(30)),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(end, ChildEnd::Exited(0));
+    let pid: libc::pid_t = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The killed descendant is gone once its new parent reaps it. Until
+    // then it's a zombie, which no longer runs.
+    let gone = || {
+        // SAFETY: signal 0 only checks that the process exists.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        let zombie = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .map(|rest| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false);
+        !exists || zombie
+    };
+    let started = Instant::now();
+    while !gone() && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        gone(),
+        "descendant {pid} still runs after run_child returned"
+    );
 }

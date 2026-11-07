@@ -36,6 +36,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, TransactionHandle};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -132,7 +133,7 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
+        EarlyMinedBlock, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
         SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
         SubmitSolutionParameters, SubmitSolutionResponse,
     },
@@ -863,7 +864,8 @@ pub trait RpcServer {
 
     /// Returns the recommended standard fee per logical action, in zatoshis.
     ///
-    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
+    /// Returns at least 1,000 zatoshis per action, with `version` 0.
+    /// Uses Zakura's ZIP 317 marginal fee when it exceeds this floor.
     /// A dynamic estimate can replace this value without changing the parameters or
     /// result shape.
     ///
@@ -1126,7 +1128,7 @@ where
     let parent = block.header.previous_block_hash;
     let block = Arc::new(block);
     let request = zakura_consensus::Request::Prepare {
-        block: block.clone(),
+        block: block.clone().into(),
         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
     };
 
@@ -1388,7 +1390,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -1612,6 +1614,46 @@ where
             .await
     }
 
+    /// Builds the coinbase-only template a long poll returns once it sees a new tip.
+    ///
+    /// Miners want work on the new tip before the mempool has caught up with it, so this
+    /// template has no mempool transactions and an ID that names none. The client's next long
+    /// poll then returns the full template as soon as the mempool has any. Returns `Ok(None)`
+    /// when the template was superseded, like [`Self::finish_mining_template`].
+    async fn new_tip_template(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        rejection_state: &types::get_block_template::TemplateRejections,
+        client_long_poll_id: Option<&types::long_poll::LongPollId>,
+    ) -> Result<Option<GetBlockTemplateResponse>> {
+        let mut long_poll_id = LongPollInput::new(
+            chain_info.tip_height,
+            chain_info.tip_hash,
+            chain_info.max_time,
+            vec![],
+        )
+        .generate_id();
+        long_poll_id.revision = rejection_state.revision;
+        let submit_old = client_long_poll_id.map(|old| long_poll_id.submit_old(old));
+
+        // After ZIP 234 activation the coinbase proof must wait for the new parent's pools, so
+        // the build runs off the async worker to let other RPC requests continue.
+        let template = self
+            .build_mining_template(
+                precomputed_coinbase,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                vec![],
+                submit_old,
+            )
+            .await?;
+        self.finish_mining_template(template, chain_info, miner_params)
+            .await
+    }
+
     /// Validates an empty replacement template in the foreground and publishes it.
     ///
     /// A recovered template is the only work this parent may still hand out, so it is validated
@@ -1803,9 +1845,13 @@ where
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
         };
+        // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
+        // runs only after the reservation rejects duplicate and over-capacity submissions.
+        let size = block.zcash_serialized_size();
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
+            block: block.clone().into(),
+            size,
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -1835,9 +1881,11 @@ where
                         && optimistic_block_inventory
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = MinedBlockEvent::Early {
+                            let event = EarlyMinedBlock {
+                                admission: admission.clone(),
                                 hash: block_hash,
                                 height,
+                                size,
                                 submitted_at,
                                 submission,
                                 pending: registration.signal(),
@@ -1861,23 +1909,7 @@ where
                 );
             }
 
-            if verification_result.is_ok() {
-                if mined_block_sender
-                    .send(MinedBlockEvent::Committed {
-                        hash: block_hash,
-                        height,
-                    })
-                    .is_err()
-                {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
-                    tracing::warn!(
-                        ?block_hash,
-                        ?height,
-                        "could not send the final mined-block event"
-                    );
-                }
-            } else if early_sent {
+            if verification_result.is_err() && early_sent {
                 metrics::counter!("mining.optimistic_inventory.post_admission_failures")
                     .increment(1);
                 tracing::warn!(
@@ -2387,9 +2419,12 @@ where
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => {
-                    Ok(GetBlockResponse::Raw(block.into()))
-                }
+                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
+                    block
+                        .zcash_serialize_to_vec()
+                        .expect("serialization to memory cannot fail")
+                        .into(),
+                )),
                 zakura_state::ReadResponse::Block(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
@@ -2477,14 +2512,14 @@ where
                 ),
                 zakura_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
-                    let block_time = block.header.time;
+                    let block_time = block.header().time;
                     let transactions = block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .map(|tx| {
                             GetBlockTransaction::Object(Box::new(
                                 TransactionObject::from_transaction(
-                                    tx.clone(),
+                                    tx,
                                     Some(height),
                                     Some(confirmations),
                                     &network,
@@ -2625,18 +2660,28 @@ where
             .clone()
             .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
             .await
-            .map_err(|_| "block height not in best chain")
-            .map_error(
-                // ## Compatibility with `zcashd`.
-                //
-                // Since this function is reused by getblock(), we return the errors
-                // expected by it (they differ whether a hash or a height was passed).
-                if hash_or_height.hash().is_some() {
-                    server::error::LegacyCode::InvalidAddressOrKey
+            .map_err(|error| {
+                if is_read_capacity_refusal(&*error) {
+                    // A capacity refusal says nothing about the block, so the caller can retry.
+                    ErrorObject::new(
+                        server::error::LegacyCode::OutOfMemory,
+                        "state read capacity is temporarily exhausted, retry later",
+                    )
                 } else {
-                    server::error::LegacyCode::InvalidParameter
-                },
-            )?
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    ErrorObject::new(
+                        if hash_or_height.hash().is_some() {
+                            server::error::LegacyCode::InvalidAddressOrKey
+                        } else {
+                            server::error::LegacyCode::InvalidParameter
+                        },
+                        "block height not in best chain",
+                    )
+                }
+            })?
         else {
             panic!("unexpected response to BlockHeader request")
         };
@@ -2955,7 +3000,7 @@ where
                             Some(mined.block_time),
                         ),
                         _ => {
-                            let raw_tx: Arc<Transaction> = tx.into();
+                            let raw_tx: TransactionHandle = tx.into();
                             (raw_tx, None, None, None)
                         }
                     };
@@ -3019,7 +3064,7 @@ where
                     }
                 }
             } else {
-                let tx: Arc<Transaction> = tx.into();
+                let tx: TransactionHandle = tx.into();
                 let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),
@@ -3490,6 +3535,33 @@ where
                     continue;
                 };
 
+                // A long poll whose ID names an older tip has missed the tip change it waits for:
+                // the client sent it after the change, or this loop came back around after it.
+                // Answer the way the tip arm below does, instead of waiting for the mempool to
+                // process the new block and then building a full template.
+                if client_long_poll_id
+                    .as_ref()
+                    .is_some_and(|client_long_poll_id| {
+                        !LongPollInput::new(tip_height, tip_hash, max_time, vec![])
+                            .generate_id()
+                            .same_tip(client_long_poll_id)
+                    })
+                {
+                    if let Some(template) = self
+                        .new_tip_template(
+                            None,
+                            miner_params,
+                            &chain_info,
+                            &rejection_state,
+                            client_long_poll_id.as_ref(),
+                        )
+                        .await?
+                    {
+                        return Ok(template);
+                    }
+                    continue 'rebuild;
+                }
+
                 // Fetch the mempool data for the block template:
                 // - if the mempool transactions change, we might return from long polling.
                 //
@@ -3674,18 +3746,6 @@ where
                         else {
                             continue;
                         };
-                        let mut server_long_poll_id = LongPollInput::new(
-                            chain_info.tip_height,
-                            chain_info.tip_hash,
-                            chain_info.max_time,
-                            vec![]
-                        )
-                        .generate_id();
-                        server_long_poll_id.revision = rejection_state.revision;
-
-                        let submit_old = client_long_poll_id
-                            .as_ref()
-                            .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
 
                         // Discard the precomputed coinbase if our `+2` guess was wrong
                         // (multi-block advance, reorg, or spurious notification) — its
@@ -3695,19 +3755,16 @@ where
                             .then_some(precomputed_coinbase)
                             .flatten();
 
-                        // Build an empty block on the new tip. After ZIP 234 activation,
-                        // its proof must wait for the new parent's pools; build it off the
-                        // async worker so other RPC requests can continue.
-                        let template = self.build_mining_template(
-                            precomputed_coinbase,
-                            miner_params,
-                            &chain_info,
-                            server_long_poll_id,
-                            vec![],
-                            submit_old,
-                        )
-                        .await?;
-                        if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
+                        if let Some(template) = self
+                            .new_tip_template(
+                                precomputed_coinbase,
+                                miner_params,
+                                &chain_info,
+                                &rejection_state,
+                                client_long_poll_id.as_ref(),
+                            )
+                            .await?
+                        {
                             return Ok(template);
                         }
                         continue 'rebuild;
@@ -4044,7 +4101,7 @@ where
 
     async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
         Ok(GetStandardFeeResponse {
-            standard_fee: transaction::zip317::MARGINAL_FEE,
+            standard_fee: transaction::zip317::MARGINAL_FEE.max(1_000),
             version: 0,
         })
     }

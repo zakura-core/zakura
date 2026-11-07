@@ -10,3 +10,7 @@ source = "crates/zakura-sim/tests/block_resource_properties.rs"
 [[witness]]
 property = "block-sync/budget-ledgers-agree"
 expect = "holds"
+
+[[witness]]
+property = "block-sync/payload-inventory-agrees"
+expect = "holds"

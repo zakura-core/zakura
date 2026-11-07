@@ -74,7 +74,7 @@ fn one_action_of_each() -> Vec<BlockSyncAction> {
             owner,
             source,
             token: 1,
-            block,
+            block: block.into(),
         },
         BlockSyncAction::RecordBodyUnavailable {
             expected_version: version,

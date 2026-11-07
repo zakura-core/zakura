@@ -430,6 +430,7 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // The verifier failed, or the error does not name the rule that failed.
         Script(_)
         | InternalDowncastError(_)
+        | StateUnavailable(_)
         | Io(_)
         | TryFromSlice(_)
         | Amount(_)
@@ -1091,15 +1092,11 @@ impl Service<Request> for Mempool {
 
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
-            }
 
-            // Remove expired transactions from the mempool.
-            //
-            // Lock times never expire, because block times are strictly increasing.
-            // So we don't need to check them here.
-            if let Some(tip_height) = best_tip_height {
-                let expired_transactions = storage.remove_expired_transactions(tip_height);
-                // Remove transactions that are expired from the peers list
+                // Expiry changes only when the chain grows. New transactions
+                // are verified for the next height, and verification is retried
+                // if the tip height changes before insertion.
+                let expired_transactions = storage.remove_expired_transactions(block.height);
                 send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {
@@ -1250,15 +1247,17 @@ impl Service<Request> for Mempool {
                 Request::AwaitOutput(outpoint) => {
                     trace!(?req, "got mempool request");
 
-                    let response_fut = storage.pending_outputs.queue(outpoint);
-
-                    if let Some(output) = storage.created_output(&outpoint) {
-                        storage.pending_outputs.respond(&outpoint, output)
-                    }
+                    // A created output answers immediately, without a waiter slot.
+                    let response_fut = if let Some(output) = storage.created_output(&outpoint) {
+                        storage.pending_outputs.respond(&outpoint, output.clone());
+                        async move { Ok(Response::UnspentOutput(output)) }.boxed()
+                    } else {
+                        storage.pending_outputs.queue(outpoint).boxed()
+                    };
 
                     trace!("answered mempool request");
 
-                    response_fut.boxed()
+                    response_fut
                 }
 
                 Request::FullTransactions => {

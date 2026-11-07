@@ -123,13 +123,25 @@ timeout-secs = 1800
 file = "crates/zakura-sim/tests/discovery.rs"
 test = "regenerate_wait_complete_input"
 run = false
-reason = "a tool, not a test: it rewrites the committed input, and needs the lost-wakeup patch applied"
+reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_storage_seeds.rs"
+test = "regenerate_storage_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed seeds"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_reset_mid_flight_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
 
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
@@ -157,7 +169,9 @@ timeout-secs = 2700
 # qa/fuzz/sim/Cargo.toml's `[package.metadata.zakura-sim.targets]` table
 # maps it to, and starts from that harness's admitted seeds. Its smoke run
 # is short; the campaign sets each target's search budget after
-# calibration.
+# calibration. `cargo xtask sim-targets` runs each `sim` target on those
+# seeds alone, with the row's arguments and variables, and needs at least
+# one seed that applies a property of the harness's own.
 [[target]]
 package = "sim"
 name = "discovery_wait_complete"
@@ -165,12 +179,14 @@ smoke-secs = 60
 timeout-secs = 1800
 
 # The action grammar is built for 4,096-byte inputs, as qa/fuzz/sim's README
-# says.
+# says. Each run takes tens to hundreds of milliseconds, so libFuzzer's
+# default length control would keep mutations under the 344-byte scenario
+# prefix for hours. `-len_control=0` lets them reach the whole input at once.
 [[target]]
 package = "sim"
 name = "header_sync_storage"
 smoke-secs = 60
-args = ["-max_len=4096"]
+args = ["-max_len=4096", "-len_control=0"]
 timeout-secs = 1800
 
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
@@ -191,11 +207,34 @@ covers = [
 smoke-secs = 60
 timeout-secs = 1800
 
-# The header-chain targets, with header-fuzz.yml's limits.
+# Each package's scheduled campaign. `scripts/check-fuzz-campaign.py --matrix` joins
+# these defaults with each target's `campaign-*` overrides and its `args`, so a
+# target's limits have one home. A target without `-max_len` lets libFuzzer choose.
+[campaign.header-chain]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
+[campaign.p2p]
+seconds = 900
+weekly-seconds = 3600
+rss-mb = 2048
+
+# The simulator's scheduled run is a smoke: it shows each target still builds
+# and runs, and isn't meant to find bugs. Sunday's run is the same smoke. Long
+# campaigns run on a remote host, as qa/fuzz/sim's README says under Long runs.
+[campaign.sim]
+seconds = 120
+weekly-seconds = 120
+rss-mb = 4096
+
+# The header-chain targets. Their `args` also set their campaign's limits.
 [[target]]
 package = "header-chain"
 name = "fork_transitions"
 smoke-secs = 60
+campaign-seconds = 1800
+campaign-weekly-seconds = 7200
 args = ["-rss_limit_mb=4096", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
@@ -214,8 +253,8 @@ args = ["-rss_limit_mb=2048", "-max_len=512", "-detect_leaks=1"]
 timeout-secs = 2700
 
 # RocksDB keeps process-global allocations after each temporary database
-# closes, so the exit-time leak check is off too, as header-fuzz.yml and the
-# package's README say.
+# closes, so the exit-time leak check is off too, as the package's README
+# says.
 [[target]]
 package = "header-chain"
 name = "recovery_rows"
@@ -223,6 +262,22 @@ smoke-secs = 60
 args = ["-rss_limit_mb=4096", "-max_len=256", "-detect_leaks=0"]
 env = ["ASAN_OPTIONS=detect_leaks=0"]
 timeout-secs = 2700
+
+# The P2P machine targets, with qa/fuzz/p2p's input limit. Each replay reads
+# at most 512 bytes.
+[[target]]
+package = "p2p"
+name = "service_session"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "cadence"
+smoke-secs = 60
+args = ["-rss_limit_mb=2048", "-max_len=512"]
+timeout-secs = 1800
 
 [[excluded-target]]
 package = "rpc"
@@ -243,24 +298,18 @@ reason = "no target: the harness has a fixed scenario, and no plan maps it to a 
 [[missing-target]]
 harness = "block-sync/storage"
 owner = "E5a"
-reason = "the target waits for E5a's readiness contract"
+reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
 
 [[missing-target]]
 harness = "header-sync/wire"
 owner = "E5a"
-reason = "the target waits for E5a's readiness contract"
+reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
 
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and
 # then the check fails until its row here goes.
 [[pending]]
 id = "header-sync/stale-completion-inert"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/chunk-budget-bound"
 kind = "property"
 owner = "P4a"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
@@ -477,3 +526,158 @@ id = "feature/teardown"
 kind = "feature"
 owner = "G2b/E2b"
 plan = "https://valargroup.getoutline.com/doc/ddf09ddc-0577-4872-82af-fb522cbd4776"
+
+# Preserved machine drivers run without the simulator. The semantic work
+# target uses the shared artifact pipeline without starting Sim or QUIC.
+[[target]]
+package = "p2p"
+name = "block_peer_registry"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_retry_authority"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_session"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_query"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_redial"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_fill"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_query"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_reactor"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_request_lifecycle"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "discovery_candidate"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_work_ownership"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "discovery_record_book"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_work_funding"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "discovery_session_installation"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_decoded_retention"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_sequencer_evidence"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_sequencer_order"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "p2p"
+name = "block_sequencer_reset"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "header_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "block_reactor_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "discovery_verification_capacity"
+smoke-secs = 60
+timeout-secs = 1800
+
+[[target]]
+package = "sim"
+name = "header_publisher_policy"
+smoke-secs = 60
+args = ["-max_len=512"]
+timeout-secs = 1800

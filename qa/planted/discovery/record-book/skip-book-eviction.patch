@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/protocol.rs b/crates/zakura-network/src/zakura/discovery/protocol.rs
+index f80874e5f..f842d80d3 100644
+--- a/crates/zakura-network/src/zakura/discovery/protocol.rs
++++ b/crates/zakura-network/src/zakura/discovery/protocol.rs
+@@ -2777,7 +2777,7 @@ impl ZakuraDiscoveryBook {
+     }
+ 
+     fn evict_to_limits(&mut self, now: u64, changes: &mut Vec<BookChange>) {
+-        while self.discovered_len() > self.limits.max_records {
++        while false && self.discovered_len() > self.limits.max_records {
+             let Some(node_id) = self.next_eviction_candidate(now) else {
+                 break;
+             };

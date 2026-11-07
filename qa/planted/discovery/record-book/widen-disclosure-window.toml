@@ -1,0 +1,4 @@
+# Widens the snapshot to the book, so a requester learns more in one epoch.
+input = "crates/zakura-sim/tests/fixtures/discovery-record-book.bin"
+# The harness drives discovery state and the transport types under it.
+checks = ["crates/zakura-network/src/zakura"]

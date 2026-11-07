@@ -2,7 +2,7 @@
 # runs it, the generator version it was built for, and its SHA-256.
 harness = "discovery/wait-complete"
 generator = 1
-sha256 = "0de50dd7cd5955cb68246bd9a27056b91bba8dea6872f5bf65e254d1db890acf"
+sha256 = "4e7ed67d67b60bc3652be6311ce9e4c63354b09b997e63ba56a9987cf82f1236"
 scenario_sha256 = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
 source = "crates/zakura-sim/tests/witness.rs"
 

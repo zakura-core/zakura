@@ -6135,6 +6135,10 @@ mod tests {
             let (result, sent) = futures::join!(download, reply);
             sent?;
             let mut actual = result.expect("a complete singleton must not wait for FIN")?;
+            // Block fetches carry supplier feedback, which the expected response cannot hold.
+            if let Response::BlocksWithFeedback { blocks, .. } = actual {
+                actual = Response::Blocks(blocks);
+            }
             // This regression compares inventory, independently of attribution.
             match &mut actual {
                 Response::Blocks(items) => {

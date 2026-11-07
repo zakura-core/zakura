@@ -18,6 +18,7 @@ use crate::{
     },
     ObservationLog,
 };
+use zakura_scheduler::SimInstant;
 
 /// The header chunk budget never holds more than its capacity, reserved
 /// and owned together.
@@ -26,6 +27,11 @@ pub const CHUNK_BUDGET_BOUND: &str = "header-sync/chunk-budget-bound";
 /// The model's header chunk budget capacity, from properties.md's
 /// Header-sync chunk budget. A unit test pins it to production's.
 pub const CHUNK_BUDGET_CAPACITY: usize = 4_000;
+
+/// The model's cached-pass refill interval: a deferred pass runs at most
+/// this long after a release's wake opens. A unit test pins it to
+/// production's.
+pub const CACHED_PASS_REFILL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// What the header budget checks read: one reactor's probe reads and the
 /// claim breaks its tap found.
@@ -319,7 +325,8 @@ where
         id: PropertyId::new(CAPACITY_RELEASE_WAKES),
         claim: "in the wake fixture, a header budget return that leaves room for an offer \
                 waiting for it gets that offer's locator read to storage before quiescence, \
-                unless its session ends",
+                or within one cached-pass refill when the pass is deferred, unless its \
+                session ends",
         kind: Kind::Liveness {
             bound: LivenessBound::BeforeQuiescence,
         },
@@ -336,8 +343,10 @@ where
 /// Each wake the step's facts opened ([`WakeFact::Opened`]) obliges the
 /// waiting peer's locator read to reach storage before quiescence. The
 /// read's submission or the waiting session's end answers it, and a
-/// deferred cached pass moves its deadline to the pass's refill. It applies
-/// once a release opened a wake.
+/// deferred cached pass moves its deadline to the pass's refill, but never
+/// past [`CACHED_PASS_REFILL`] after the wake opened. Otherwise a budget that
+/// never refills would keep deferring it. It applies once a release opened
+/// a wake.
 fn check_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -345,7 +354,10 @@ where
 {
     let view = cx.view();
     for stamp in cx.new_stamps().to_vec() {
-        if let Some(WakeFact::Opened { peer, session_id }) = view.wake().fact(stamp) {
+        if let Some(WakeFact::Opened {
+            peer, session_id, ..
+        }) = view.wake().fact(stamp)
+        {
             let subject = Subject::Session(wake_subject(&peer, session_id));
             let obligation = cx.fact_obligation(Some(stamp), subject, wake_answer::<S::View>);
             cx.oblige(obligation);
@@ -382,9 +394,29 @@ fn wake_answer<V: WakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAn
         {
             FactAnswer::Discharges
         }
-        Some(WakeFact::Deferred { until }) => FactAnswer::DefersTo(until),
+        Some(WakeFact::Deferred { until }) => {
+            let cap = opened_at(view.wake(), subject, stamp)
+                .and_then(|opened| opened.checked_add(CACHED_PASS_REFILL));
+            FactAnswer::DefersTo(cap.map_or(until, |cap| until.min(cap)))
+        }
         _ => FactAnswer::Unrelated,
     }
+}
+
+/// When the last wake for `subject` before `stamp` opened.
+fn opened_at(wake: &WakeEvidence, subject: &str, stamp: u64) -> Option<SimInstant> {
+    wake.facts()
+        .into_iter()
+        .rev()
+        .filter(|(at, _)| *at < stamp)
+        .find_map(|(_, fact)| match fact {
+            WakeFact::Opened {
+                peer,
+                session_id,
+                at,
+            } if wake_subject(&peer, session_id) == subject => Some(at),
+            _ => None,
+        })
 }
 
 /// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a release opened a wake.
@@ -439,11 +471,13 @@ fn budget_claimed<V: BudgetView>(view: &V, _: &ObservationLog) -> bool {
 mod tests {
     use std::{collections::VecDeque, rc::Rc};
 
-    use zakura_network::zakura::observe::HEADER_CHUNK_BUDGET_CAPACITY;
+    use zakura_network::zakura::observe::{
+        HEADER_CACHED_PASS_REFILL, HEADER_CHUNK_BUDGET_CAPACITY,
+    };
 
     use super::{
         chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
-        EndViolation, TeardownView, CHUNK_BUDGET_CAPACITY,
+        EndViolation, TeardownView, CACHED_PASS_REFILL, CHUNK_BUDGET_CAPACITY,
     };
     use crate::{
         harness::header_node::{
@@ -456,10 +490,11 @@ mod tests {
         PlanInput, PropertyOutcome, RunEnd, RunReport, Sim,
     };
 
-    /// The model's capacity is production's.
+    /// The model's capacity and refill interval are production's.
     #[test]
     fn the_model_capacity_is_production_s() {
         assert_eq!(CHUNK_BUDGET_CAPACITY, HEADER_CHUNK_BUDGET_CAPACITY);
+        assert_eq!(CACHED_PASS_REFILL, HEADER_CACHED_PASS_REFILL);
     }
 
     /// A probe's and a ledger's evidence with no tap behind it.

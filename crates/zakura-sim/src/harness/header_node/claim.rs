@@ -67,9 +67,10 @@ pub struct Settlement {
     /// haven't returned, or a call that held their headers hasn't been
     /// handled.
     pub unsettled: usize,
-    /// How many calls that hold an unsettled round's headers haven't ended,
-    /// so storage may still answer them.
-    pub pending: usize,
+    /// How many of those unsettled rounds have no call that holds their
+    /// headers still unended, so storage has nothing left that could settle
+    /// them.
+    pub stuck: usize,
     /// Whether the harness began stopping the reactor.
     pub shutdown: bool,
     /// Whether the stopped reactor's teardown is done: the reactor is gone
@@ -160,14 +161,15 @@ impl SettlementEvidence {
 
     /// The last drain's settlement, if the run ended at rest with a
     /// released round unsettled and no call that holds its headers still
-    /// pending in storage. Nothing is left that could settle it then.
+    /// pending in storage. Nothing is left that could settle that round
+    /// then, whatever storage still holds for others.
     pub fn stuck(&self) -> Option<Settlement> {
         self.with(|store| {
             store
                 .rows
                 .last()
                 .map(|(row, _)| *row)
-                .filter(|last| store.at_rest && last.unsettled > 0 && last.pending == 0)
+                .filter(|last| store.at_rest && last.stuck > 0)
         })
     }
 }

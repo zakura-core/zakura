@@ -933,16 +933,20 @@ impl HeaderWorkLedger {
             })
     }
 
-    /// How many calls that hold an unsettled round's headers haven't ended,
-    /// so storage may still answer them and settle the round.
-    pub fn pending_unsettled_calls(&self) -> usize {
-        self.calls
-            .values()
-            .filter(|call| {
-                call.end.is_none()
-                    && call.held.as_ref().is_some_and(|held| {
-                        self.released.contains(&held.incarnation)
-                            && self.unsettled(held.incarnation)
+    /// How many released rounds haven't settled with no call that holds
+    /// their headers still unended, so storage has nothing left to answer
+    /// that could settle them.
+    pub fn stuck_rounds(&self) -> usize {
+        self.released
+            .iter()
+            .filter(|incarnation| {
+                self.unsettled(**incarnation)
+                    && !self.calls.values().any(|call| {
+                        call.end.is_none()
+                            && call
+                                .held
+                                .as_ref()
+                                .is_some_and(|held| held.incarnation == **incarnation)
                     })
             })
             .count()

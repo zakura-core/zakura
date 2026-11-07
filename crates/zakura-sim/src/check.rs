@@ -3,6 +3,8 @@
 //! The property registry, [`crate::property::RegistryChecker`], builds on
 //! these hooks. M1 ships [`NoChecks`] and [`FnChecker`] for tests.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::{SimInstant, Status};
 
@@ -88,6 +90,11 @@ pub struct PropertyReport {
     /// needs and the exclusion's reason. Set only with `NotApplicable`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excluded: Option<String>,
+    /// Each quantity's largest value over the run, as the property's check
+    /// measured it, such as the most bytes a resource bound's allowance
+    /// held. Empty for a property that measures none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peaks: BTreeMap<String, u64>,
     /// Every violation, in the order the run found them. `Violated`'s
     /// witness is the first one's. A `Known` or `Draft` property can fail
     /// again after its first violation, and one step can expire several
@@ -101,7 +108,7 @@ pub struct PropertyReport {
 }
 
 impl PropertyReport {
-    /// A report of `outcome` for `property`, with no `holds_since`,
+    /// A report of `outcome` for `property`, with no `holds_since`, peaks,
     /// exclusion, or retained violations.
     pub fn new(property: impl Into<String>, outcome: PropertyOutcome) -> Self {
         PropertyReport {
@@ -109,6 +116,7 @@ impl PropertyReport {
             outcome,
             holds_since: None,
             excluded: None,
+            peaks: BTreeMap::new(),
             violations: Vec::new(),
         }
     }

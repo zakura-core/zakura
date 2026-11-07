@@ -26,6 +26,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod node_envelope;
 mod peer_memory;
 mod regulation;
 #[cfg(any(test, feature = "zakura-testkit", zakura_sim))]
@@ -42,6 +43,8 @@ pub use header_sync::*;
 pub(crate) use ip::canonical_ip;
 pub use legacy_gossip::*;
 pub use peer_memory::*;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use regulation::{replay_cadence_bytes, CadenceReplaySummary};
 pub use trace::{
     commit_state_trace, peer_label as zakura_trace_peer_label,
     reject_reason_label as zakura_trace_reject_reason_label, ZakuraTrace, ZakuraTraceEvent,
@@ -245,6 +248,9 @@ pub(crate) enum ZakuraUpgradeDialStart {
     AlreadyRunning,
     /// The dial address contains an invalid peer identity.
     InvalidPeerId,
+    /// An earlier upgrade dial to this peer ended on an ALPN mismatch less
+    /// than [`ZAKURA_ALPN_MISMATCH_BACKOFF`] ago (zakura-quic DIAL-5).
+    AlpnBackoff,
 }
 
 /// An error from the Zakura handshake upgrade hook.
@@ -341,7 +347,9 @@ impl ZakuraHandshakeConnector {
         let cancel_guard = match dial_start {
             ZakuraUpgradeDialStart::Started => Some(UpgradeDialCancelGuard { endpoint, peer_id }),
             ZakuraUpgradeDialStart::AlreadyRunning => None,
-            ZakuraUpgradeDialStart::InvalidPeerId => return ZakuraNativeHandoff::Failed,
+            ZakuraUpgradeDialStart::InvalidPeerId | ZakuraUpgradeDialStart::AlpnBackoff => {
+                return ZakuraNativeHandoff::Failed;
+            }
         };
         let conn_id = registration_wait.wait(ZAKURA_LIVENESS_APPEAR_TIMEOUT).await;
         match (cancel_guard, conn_id) {
@@ -546,6 +554,14 @@ fn resume_task_panic<T>(
     })
 }
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use header_sync::{
+    trace_header_publisher_bytes, trace_header_reactor_bytes, HeaderMachineFailure,
+    HeaderMachinePhase, HeaderPublisherHistory, HeaderPublisherStep,
+    HeaderPublisherSubscriptionView, HeaderPublisherView, HeaderReactorHistory,
+    HeaderReactorReadView, HeaderReactorSessionView, HeaderReactorStallView, HeaderReactorStep,
+    HeaderReactorView,
+};
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -915,6 +915,10 @@ if rpc_url:
                 header = rpc_call("getblockheader", [best_hash, True])
                 if isinstance(header, dict):
                     out["previous_hash"] = header.get("previousblockhash") or ""
+                    # Bind the target to the accepted tip, rather than a header
+                    # observed at another height while the chain advances.
+                    if header.get("hash") == best_hash and header.get("height") == tip_height:
+                        out["difficulty_bits"] = header.get("bits")
             except Exception as error:
                 out["previous_hash_error"] = str(error)
 
@@ -1215,6 +1219,15 @@ def monitoring_snapshot(value, node_names):
                 safe[field] = row[field]
         for field in ("block_hash", "previous_hash"):
             if block_hash(row.get(field)):
+                safe[field] = row[field]
+        bits = row.get("difficulty_bits")
+        if isinstance(bits, str) and re.fullmatch(r"[0-9a-fA-F]{8}", bits):
+            safe["difficulty_bits"] = bits
+        safe["rpc_ok"] = row.get("rpc_ok") is True
+        if row.get("rpc_chain") in {"main", "test", "regtest"}:
+            safe["rpc_chain"] = row["rpc_chain"]
+        for field in ("last_seen_at", "last_advanced_at"):
+            if number(row.get(field)):
                 safe[field] = row[field]
         ancestors = row.get("ancestor_hashes")
         if isinstance(ancestors, dict):
@@ -1678,6 +1691,7 @@ class ClusterCollector:
             "commit": probe.get("commit") or "",
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
+            "difficulty_bits": probe.get("difficulty_bits"),
             "ancestor_hashes": ancestor_hashes,
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",

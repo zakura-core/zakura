@@ -40,6 +40,7 @@ impl Subsystem for Yielders {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 1;
     type Scenario = Tasks;
+    type Prepared = ();
 
     /// 2 workers and small stacks.
     fn config(_: &Tasks) -> RunConfig {
@@ -53,8 +54,11 @@ impl Subsystem for Yielders {
         }
     }
 
+    /// Nothing to set up.
+    fn prepare(_: &Tasks) {}
+
     /// Spawns the tasks, each yielding twice.
-    fn build(sim: &mut Sim, scenario: &Tasks) -> Self {
+    fn build(sim: &mut Sim, scenario: &Tasks, (): ()) -> Self {
         for _ in 0..scenario.tasks {
             sim.scheduler().spawn_root("yielder", async {
                 zakura_rt::task::yield_now().await;
@@ -85,10 +89,12 @@ fn record_writes_a_complete_trace() {
         assert_eq!(read, trace);
         assert!(read.is_complete());
         assert_eq!(read.meta.sim, entry.name);
-        assert_eq!(
-            read.meta.scenario,
-            (entry.draw)(&BYTES[..entry.scenario_bytes])
-        );
+        // Fixed-prefix harnesses read missing scenario bytes as 0.
+        let mut prefix = BYTES[..entry.scenario_bytes.min(BYTES.len())].to_vec();
+        if !entry.machine {
+            prefix.resize(entry.scenario_bytes, 0);
+        }
+        assert_eq!(read.meta.scenario, (entry.draw)(&prefix));
         let input = read.meta.input.as_ref().expect("a full input is saved");
         assert_eq!(input.len, u64::try_from(BYTES.len()).unwrap());
         assert_eq!(std::fs::read(dir.path().join(INPUT_FILE)).unwrap(), BYTES);

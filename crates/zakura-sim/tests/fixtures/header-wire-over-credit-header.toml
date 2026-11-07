@@ -1,0 +1,9 @@
+# The committed fuzz input `header-wire-over-credit-header.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `over-credit-header` scenario, and
+# `header-wire-over-credit-header.end.json` is its pinned end record.
+harness = "header-sync/wire"
+generator = 2
+sha256 = "4e4ab8a37b9e22d438fa28be9bafd72f452b88c98834b150d4c510802ecb46c1"
+scenario_sha256 = "fb5dba622e160b33e9d259fc30b7b1718f45f40cec26e76e8385b474104b717c"
+source = "crates/zakura-sim/tests/header_wire_lifecycle.rs"

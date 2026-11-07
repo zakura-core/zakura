@@ -59,6 +59,9 @@ pub struct HeaderSyncStartup {
     pub shutdown: CancellationToken,
     /// Private fatal notifications consumed by the node root.
     pub(crate) fatal_events: Option<mpsc::UnboundedSender<HeaderSyncFatalEvent>>,
+    /// Receives the reactor's events in test and simulator builds.
+    #[cfg(any(test, zakura_sim))]
+    pub observer: super::observe::ObserverSlot,
 }
 
 impl HeaderSyncStartup {
@@ -94,6 +97,8 @@ impl HeaderSyncStartup {
             trace: ZakuraTrace::noop(),
             shutdown: CancellationToken::new(),
             fatal_events: None,
+            #[cfg(any(test, zakura_sim))]
+            observer: super::observe::ObserverSlot::default(),
         }
     }
 

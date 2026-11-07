@@ -130,6 +130,8 @@ fn deserialize_version_with_time(time: i64) -> Result<Message, Error> {
     })
 }
 
+/// L.ignored: ignored Bloom commands pass their checksum and leave nothing behind. The
+/// decoder continues to the next message in the same turn, as the protocol rule requires.
 #[test]
 fn bloom_filter_messages_are_discarded_without_dropping_following_messages() {
     let mut codec = Codec::builder().finish();
@@ -664,7 +666,10 @@ fn block_conversion_panic_returns_parse_error() {
     let mut encoding_codec = Codec::builder().finish();
     encoding_codec.reconfigure_full_body_len();
     encoding_codec
-        .encode(Message::Block(block.into()), &mut block_frame)
+        .encode(
+            Message::Block(std::sync::Arc::new(block).into()),
+            &mut block_frame,
+        )
         .expect("test block should encode");
 
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async move {

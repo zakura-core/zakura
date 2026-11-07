@@ -259,7 +259,9 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
     /// Block-sync peer disconnected from the reactor.
     pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
-    /// Body range request sent to a peer.
+    /// Queue admission funded a block request's retained run.
+    pub const BLOCK_REQUEST_FUNDED: &str = "block_request_funded";
+    /// A published body range request entered the peer's transport queue.
     pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
     /// Reactor accepted a decoded inbound block-sync wire message.
     pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";
@@ -336,6 +338,10 @@ pub mod discovery_trace {
     pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
     /// The discovery reader rejected a peer's frame and closed the connection.
     pub const DISCOVERY_VIOLATION: &str = "discovery_violation";
+    /// Phase of one claimed query answer.
+    pub const DISCOVERY_ANSWER: &str = "discovery_answer";
+    /// Phase of one candidate dial attempt.
+    pub const DISCOVERY_DIAL_PHASE: &str = "discovery_dial_phase";
 }
 
 /// Shared commit/frontier adapter trace event names and field keys.

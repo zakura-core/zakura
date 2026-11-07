@@ -93,6 +93,15 @@ pub enum HarnessFailure {
         /// `BoundarySkipped`.
         detail: String,
     },
+    /// A tapped reactor caught one of its port calls panicking, which no
+    /// run expects. It outranks any evidence failure of the same step,
+    /// since the panic leaves the call's storage receipt unpaired.
+    ReactorPortPanicked {
+        /// The tap, such as `reactor:node#0`.
+        source: String,
+        /// The call's number.
+        call: u64,
+    },
 }
 
 impl fmt::Display for HarnessFailure {
@@ -157,6 +166,9 @@ impl fmt::Display for HarnessFailure {
             ),
             HarnessFailure::SourceEvidence { source, detail } => {
                 write!(f, "{source}'s evidence failed: {detail}")
+            }
+            HarnessFailure::ReactorPortPanicked { source, call } => {
+                write!(f, "{source}'s port call {call} panicked")
             }
         }
     }

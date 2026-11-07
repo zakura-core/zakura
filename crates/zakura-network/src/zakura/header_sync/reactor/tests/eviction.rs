@@ -1,5 +1,8 @@
 use super::*;
-use crate::zakura::transport::FramedRecv;
+use crate::zakura::{
+    header_sync::HeaderSyncService, transport::FramedRecv, Service, ServicePeerDirection,
+    SessionDemand, ZAKURA_CAP_HEADER_SYNC,
+};
 use tokio::time;
 
 /// One admitted header-sync session with the state needed to drive it unproductive.
@@ -12,7 +15,7 @@ struct EvictionFixture {
     /// Kept alive so the session's outbound queue never fails for want of a reader.
     _outbound: FramedRecv,
     _snapshots_tx: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
-    _handle: HeaderSyncHandle,
+    handle: HeaderSyncHandle,
 }
 
 fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> EvictionFixture {
@@ -31,7 +34,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
         PeerSession::from_parts_with_session_id(peer.clone(), session_id, send, cancel.clone()),
     ));
     assert!(
-        reactor.peer_state.contains_key(&peer),
+        reactor.sessions.contains_key(&peer),
         "the fixture peer starts admitted"
     );
     EvictionFixture {
@@ -42,7 +45,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
         cancel,
         _outbound: outbound,
         _snapshots_tx: snapshots_tx,
-        _handle: handle,
+        handle,
     }
 }
 
@@ -50,13 +53,14 @@ impl EvictionFixture {
     /// Strike count charged against the currently admitted session, if any.
     fn unproductive_requests(&self) -> Option<u32> {
         self.reactor
-            .peer_state
+            .state
+            .peers
             .get(&self.peer)
-            .map(|state| state.unproductive_requests)
+            .map(|schedule| schedule.unproductive_requests)
     }
 
     fn is_admitted(&self) -> bool {
-        self.reactor.peer_state.contains_key(&self.peer)
+        self.reactor.sessions.contains_key(&self.peer)
     }
 
     /// Publish one request owned by `session_id` and let its deadline expire unanswered.
@@ -69,6 +73,7 @@ impl EvictionFixture {
         );
         let deadline = Instant::now();
         self.reactor
+            .state
             .request_deadlines
             .insert(self.peer.clone(), deadline);
         self.reactor.retire_timed_out_requests(deadline);
@@ -113,7 +118,6 @@ impl EvictionFixture {
             tree_aux_schema: AuxSchema::None,
             entries: vec![entry],
         };
-        let _ = active;
         self.reactor
             .peer_work_queue
             .set_capacity_for_test(&self.peer, 0, 1);
@@ -205,6 +209,96 @@ fn a_productive_response_resets_the_unproductive_counter() {
         "strikes that straddle a productive response must not accumulate across it"
     );
     assert_eq!(fixture.unproductive_requests(), Some(2));
+}
+
+#[test]
+fn strikes_survive_session_replacement() {
+    let mut fixture = eviction_fixture(3, 7);
+    for _ in 0..2 {
+        fixture.time_out_one_request(7);
+    }
+    assert_eq!(fixture.unproductive_requests(), Some(2));
+
+    let replacement = CancellationToken::new();
+    let (send, _replacement_outbound) = framed_channel(8);
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(fixture.peer.clone(), 8, send, replacement.clone()),
+    ));
+    assert_eq!(
+        fixture.unproductive_requests(),
+        Some(2),
+        "replacing a session cannot reset its strikes"
+    );
+
+    fixture.time_out_one_request(8);
+    assert!(
+        !fixture.is_admitted() && replacement.is_cancelled(),
+        "the replacement's first strike reaches the limit"
+    );
+}
+
+impl EvictionFixture {
+    /// Disconnect session `old` and connect `new` for the same peer.
+    fn reconnect(&mut self, old: u64, new: u64) -> CancellationToken {
+        self.reactor
+            .handle_peer_disconnected(&self.peer.clone(), old, "test disconnect");
+        let cancel = CancellationToken::new();
+        let (send, outbound) = framed_channel(8);
+        self._outbound = outbound;
+        self.reactor.handle_event(Event::PeerConnected(
+            PeerSession::from_parts_with_session_id(self.peer.clone(), new, send, cancel.clone()),
+        ));
+        cancel
+    }
+}
+
+/// Covers a plain reconnect, and a replacement whose old session's disconnect
+/// reaches the reactor before the new session's connect.
+#[tokio::test(start_paused = true)]
+async fn strikes_survive_a_reconnect_within_the_cooldown() {
+    let mut fixture = eviction_fixture(3, 7);
+    for _ in 0..2 {
+        fixture.time_out_one_request(7);
+    }
+    time::advance(fixture.reactor.startup.config.unproductive_peer_cooldown / 2).await;
+    let reconnected = fixture.reconnect(7, 8);
+    assert_eq!(
+        fixture.unproductive_requests(),
+        Some(2),
+        "reconnecting cannot reset strikes"
+    );
+
+    fixture.time_out_one_request(8);
+    assert!(
+        !fixture.is_admitted() && reconnected.is_cancelled(),
+        "the reconnected session's first strike reaches the limit"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn strikes_expire_after_a_cooldown_away() {
+    let mut fixture = eviction_fixture(3, 7);
+    for _ in 0..2 {
+        fixture.time_out_one_request(7);
+    }
+    fixture
+        .reactor
+        .handle_peer_disconnected(&fixture.peer.clone(), 7, "test disconnect");
+    time::advance(fixture.reactor.startup.config.unproductive_peer_cooldown).await;
+    fixture.reactor.refresh_statuses();
+    assert!(fixture.reactor.state.departed_strikes.is_empty());
+
+    let (send, outbound) = framed_channel(8);
+    fixture._outbound = outbound;
+    fixture.reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(
+            fixture.peer.clone(),
+            8,
+            send,
+            CancellationToken::new(),
+        ),
+    ));
+    assert_eq!(fixture.unproductive_requests(), Some(0));
 }
 
 #[test]
@@ -320,5 +414,180 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
         fixture.unproductive_requests(),
         Some(0),
         "a readmitted peer starts from a clean count"
+    );
+}
+
+/// A peer that redials late in its cooldown is re-offered when the cooldown
+/// ends, not one fixed back-off after its redial. Maintenance wakes at the
+/// cooldown's end and republishes it, which wakes the header service's demand.
+#[tokio::test(start_paused = true)]
+async fn a_redial_late_in_the_cooldown_reopens_when_it_ends() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = std::time::Duration::from_secs(15);
+    let second = std::time::Duration::from_secs(1);
+    fixture.reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let ends = Instant::now() + cooldown;
+    fixture.time_out_one_request(7);
+    assert!(!fixture.is_admitted());
+
+    time::advance(cooldown - second).await;
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = || {
+        service.session_demand(
+            1,
+            &fixture.peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    let SessionDemand::WaitForChange(mut reopen) = demand() else {
+        panic!("the service waits for the reactor to end the cooldown");
+    };
+    assert!(futures::poll!(&mut reopen).is_pending());
+    assert_eq!(
+        fixture.reactor.next_maintenance_deadline(),
+        ends,
+        "maintenance wakes when the cooldown ends"
+    );
+
+    time::advance(second).await;
+    fixture.reactor.refresh_statuses();
+    assert!(
+        futures::poll!(&mut reopen).is_ready(),
+        "republishing the cooldown's end wakes the parked demand"
+    );
+    assert!(matches!(demand(), SessionDemand::OpenNow));
+    assert!(
+        fixture.reactor.next_maintenance_deadline() > Instant::now(),
+        "a pruned cooldown doesn't wake maintenance again"
+    );
+}
+
+/// A cooldown that a later fault extends holds until its new end. The
+/// cached end still wakes maintenance at the original deadline, which
+/// refuses the peer, keeps the parked demand waiting, and moves the next
+/// wake to the new end. An unrelated publication doesn't wake the demand.
+#[tokio::test(start_paused = true)]
+async fn an_extended_cooldown_holds_through_its_original_end() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = std::time::Duration::from_secs(15);
+    let extended_after = std::time::Duration::from_secs(5);
+    fixture.reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let first_end = Instant::now() + cooldown;
+    let extended_end = first_end + extended_after;
+    fixture.time_out_one_request(7);
+
+    time::advance(extended_after).await;
+    fixture
+        .reactor
+        .state
+        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = || {
+        service.session_demand(
+            1,
+            &fixture.peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    let SessionDemand::WaitForChange(mut reopen) = demand() else {
+        panic!("the service waits for the reactor to end the cooldown");
+    };
+    assert_eq!(fixture.reactor.next_maintenance_deadline(), first_end);
+
+    time::advance(first_end - Instant::now()).await;
+    fixture.reactor.refresh_statuses();
+    fixture.reactor.publish_peer_state();
+    assert!(fixture
+        .reactor
+        .state
+        .readmission_refused(&fixture.peer, Instant::now()));
+    assert!(
+        futures::poll!(&mut reopen).is_pending(),
+        "the original end and an unrelated publication keep the demand parked"
+    );
+    assert_eq!(
+        fixture.reactor.next_maintenance_deadline(),
+        extended_end,
+        "the original end's wake moves the next one to the extended end"
+    );
+
+    time::advance(extended_after).await;
+    fixture.reactor.refresh_statuses();
+    assert!(futures::poll!(&mut reopen).is_ready());
+    assert!(matches!(demand(), SessionDemand::OpenNow));
+}
+
+/// The published backed-off set is sorted, which the header service's binary
+/// search relies on. Every cooled peer is found and parked, and a peer that
+/// sorts between them is not.
+#[tokio::test(start_paused = true)]
+async fn the_backed_off_set_is_sorted_for_the_services_search() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let mut peers: Vec<_> = (0x60_u8..0x90)
+        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has 32 bytes"))
+        .filter(|peer| node_id_from_peer(peer).is_some())
+        .take(5)
+        .collect();
+    assert_eq!(peers.len(), 5, "enough test bytes decode as node IDs");
+    let open = peers.remove(2);
+    for peer in peers.iter().rev() {
+        fixture
+            .reactor
+            .state
+            .start_readmission_cooldown(peer, Instant::now(), cooldown);
+    }
+    fixture.reactor.publish_peer_state();
+
+    let published = fixture
+        .reactor
+        .candidates
+        .borrow()
+        .backed_off_node_ids
+        .clone();
+    assert_eq!(published.len(), peers.len());
+    assert!(published.windows(2).all(|pair| pair[0] < pair[1]));
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = |peer: &ZakuraPeerId| {
+        service.session_demand(
+            1,
+            peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    for peer in &peers {
+        assert!(matches!(demand(peer), SessionDemand::WaitForChange(_)));
+    }
+    assert!(matches!(demand(&open), SessionDemand::OpenNow));
+}
+
+/// Fresh identities that each leave with a strike end the earliest holds
+/// instead of growing the held set past its limit.
+#[tokio::test(start_paused = true)]
+async fn the_departed_limit_bounds_held_strikes() {
+    let mut fixture = eviction_fixture(3, 7);
+    let hold = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let max_departed = 2;
+    let peers: Vec<_> = (0_u8..4)
+        .map(|index| {
+            ZakuraPeerId::new(vec![0x80 + index; 32]).expect("the test peer ID has 32 bytes")
+        })
+        .collect();
+    for peer in &peers {
+        let state = &mut fixture.reactor.state;
+        state.admit_session(peer, Instant::now());
+        state.charge_unproductive_request(peer, 3);
+        state.remove_session(peer, Instant::now(), hold, max_departed);
+        time::advance(std::time::Duration::from_secs(1)).await;
+    }
+
+    let held = &fixture.reactor.state.departed_strikes;
+    assert_eq!(held.len(), max_departed);
+    assert!(
+        peers[2..].iter().all(|peer| held.contains_key(peer)),
+        "the latest holds stay"
     );
 }

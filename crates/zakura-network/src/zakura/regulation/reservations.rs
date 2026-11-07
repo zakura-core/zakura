@@ -111,7 +111,7 @@ impl ReservationPool {
     }
 
     /// Entries in use across the node.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "p2p-fuzz"))]
     pub(crate) fn held(&self) -> usize {
         self.entries.reserved()
     }
@@ -238,7 +238,7 @@ struct Reservation {
     frames: u32,
     bytes: u64,
     abandoned: bool,
-    _entry: PoolEntry,
+    entry: PoolEntry,
     /// The request's exchange, if the reactor fences its writers. Dropping a
     /// started exchange without its ending closes the connection.
     exchange: Option<Exchange>,
@@ -394,7 +394,7 @@ impl<K: Eq + Hash> Reservations<K> {
             frames: 0,
             bytes: 0,
             abandoned: false,
-            _entry: entry,
+            entry,
             exchange,
         };
         let row = self.rows.entry(request_type).or_default();
@@ -559,6 +559,20 @@ impl<K: Eq + Hash> Reservations<K> {
         message_type: u16,
         payload_len: usize,
     ) -> Result<Ended, ClaimRefused> {
+        self.claim_end_holding_entry(key, message_type, payload_len)
+            .map(|(ended, _entry)| ended)
+    }
+
+    /// Consume the reservation with its ending, as [`Self::claim_end`] does,
+    /// and hand its pool entry to the caller. The entry keeps counting
+    /// against the node pool while the caller decodes and processes the
+    /// ending.
+    pub(crate) fn claim_end_holding_entry(
+        &mut self,
+        key: &K,
+        message_type: u16,
+        payload_len: usize,
+    ) -> Result<(Ended, PoolEntry), ClaimRefused> {
         let (request, before, _, _) = self.charge(key, message_type, payload_len, true)?;
         self.row(request).untrack(before);
         let mut reservation = self
@@ -569,11 +583,17 @@ impl<K: Eq + Hash> Reservations<K> {
         if let Some(exchange) = &mut reservation.exchange {
             exchange.end();
         }
-        Ok(Ended {
+        let ended = Ended {
             frames: reservation.frames,
             bytes: reservation.bytes,
             abandoned: reservation.abandoned,
-        })
+        };
+        Ok((ended, reservation.entry))
+    }
+
+    /// Whether the transport reader queued a frame the handler has not taken.
+    pub(crate) fn has_queued(&self) -> bool {
+        self.rows.values().any(|row| row.queued.frames > 0)
     }
 
     /// Check and charge one frame. Returns the request type, the remaining
@@ -747,6 +767,9 @@ struct PrecheckSetup {
     choice: OnceLock<Option<Arc<dyn ResponsePrecheck>>>,
     gated: AtomicBool,
     ready: CancellationToken,
+    /// The stream's transport observer, shared by its reader and service.
+    #[cfg(any(test, zakura_sim))]
+    tap: OnceLock<Arc<crate::zakura::StreamTap>>,
 }
 
 impl PrecheckSlot {
@@ -778,6 +801,19 @@ impl PrecheckSlot {
     /// The attached precheck.
     pub(crate) fn get(&self) -> Option<&dyn ResponsePrecheck> {
         self.0.choice.get().and_then(|choice| choice.as_deref())
+    }
+
+    /// Report this stream's reads, writes and regulation through `tap`. Only
+    /// the first call attaches one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<crate::zakura::StreamTap>) {
+        let _ = self.0.tap.set(tap);
+    }
+
+    /// The stream's transport observer, if one is attached.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn tap(&self) -> Option<&Arc<crate::zakura::StreamTap>> {
+        self.0.tap.get()
     }
 }
 

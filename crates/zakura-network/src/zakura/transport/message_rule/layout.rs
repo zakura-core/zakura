@@ -538,8 +538,8 @@ impl Stream {
     ///   tables passes the remaining rules trivially;
     /// - every table has a row, and each message type and each row name
     ///   appears in exactly one row of the layout;
-    /// - each row name is nonempty lowercase ASCII letters, digits, and
-    ///   hyphens;
+    /// - each row name is hyphen-separated words of lowercase ASCII letters
+    ///   and digits, with no empty word, as a property ID's segment;
     /// - each row's largest frame fits its stream's frame cap;
     /// - a request/response stream carries no announcement;
     /// - each request allows an exchange in flight;
@@ -725,14 +725,14 @@ const fn check_cadence(message_type: u16, cadence: Cadence) -> Result<(), Layout
 ///
 /// `const fn` cannot take closures, so the queries below share this
 /// cursor instead of a visitor.
-struct Rows<'a> {
+pub(super) struct Rows<'a> {
     layout: &'a [Stream],
     stream: usize,
     row: usize,
 }
 
 impl<'a> Rows<'a> {
-    const fn new(layout: &'a [Stream]) -> Self {
+    pub(super) const fn new(layout: &'a [Stream]) -> Self {
         Self {
             layout,
             stream: 0,
@@ -740,7 +740,7 @@ impl<'a> Rows<'a> {
         }
     }
 
-    const fn next(&mut self) -> Option<MessageRule> {
+    pub(super) const fn next(&mut self) -> Option<MessageRule> {
         while self.stream < self.layout.len() {
             if let Some(rows) = self.layout[self.stream].messages {
                 if self.row < rows.len() {

@@ -47,6 +47,7 @@ pub const FAULT_CAUSES: &[&str] = &[
     "request_oversize",
     "ordered_read_rejected",
     "request_read_rejected",
+    "undersized_frame_cap",
 ];
 
 /// True if a close with first recorded cause `cause` assigns the peer a

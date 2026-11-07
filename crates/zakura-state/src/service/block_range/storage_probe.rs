@@ -12,10 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tower::ServiceExt;
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_test::process_stats::{cpu_seconds, memory_kib};
 
-use crate::{init_read_only, Config, PruningConfig, StorageMode};
+use crate::{init_read_only, Config, PruningConfig, ReadRequest, ReadResponse, StorageMode};
 
 /// Production advertises this many body bytes per response by default.
 const MAX_RESPONSE_BYTES: u32 = 32 * 1024 * 1024;
@@ -60,7 +61,13 @@ fn elapsed_us(began: Instant) -> u32 {
 /// page cache. Reads return serialized bytes, so finalized blocks are never
 /// decoded. With `ZAKURA_STORAGE_PROBE_ENCODE=1`, each read is followed by the
 /// serving encode on a blocking thread, which copies those bytes into frames,
-/// and `p50_us`/`p99_us` cover both.
+/// and `p50_us`/`p99_us` cover both. `ZAKURA_STORAGE_PROBE_CONTROL=1` also
+/// measures chain-tip reads every 10 ms while the data reads run.
+/// `ZAKURA_STORAGE_PROBE_DECODE=1` instead reads decoded block batches through
+/// the read service. That mode excludes encoding and caps concurrency at 48,
+/// so its largest batch workload retains at most 768 of the 1024 data slots.
+/// `ZAKURA_STORAGE_PROBE_TRANSACTIONS=1` instead reads transactions by hash and
+/// holds each batch until it ends, with the same concurrency cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "manual storage evidence; requires ZAKURA_STORAGE_PROBE_CACHE_DIR"]
 #[allow(clippy::print_stderr)]
@@ -78,6 +85,17 @@ async fn getblocks_storage_read_probe() {
         .unwrap_or(10);
     let drop_caches = std::env::var_os("ZAKURA_PROBE_DROP_CACHES").is_some();
     let encode = std::env::var_os("ZAKURA_STORAGE_PROBE_ENCODE").is_some();
+    let decode = std::env::var_os("ZAKURA_STORAGE_PROBE_DECODE").is_some();
+    assert!(
+        !(encode && decode),
+        "choose serialized encoding or decoded reads"
+    );
+    let transactions = std::env::var_os("ZAKURA_STORAGE_PROBE_TRANSACTIONS").is_some();
+    assert!(
+        !(transactions && (encode || decode)),
+        "transaction reads measure neither block encoding nor block decoding"
+    );
+    let control_reads = std::env::var_os("ZAKURA_STORAGE_PROBE_CONTROL").is_some();
     let storage_mode = if std::env::var_os("ZAKURA_STORAGE_PROBE_ARCHIVE").is_some() {
         StorageMode::Archive
     } else {
@@ -120,6 +138,28 @@ async fn getblocks_storage_read_probe() {
         memory_kib()
     );
 
+    let mut hashes = Vec::new();
+    if transactions {
+        for height in retained.0..=retained.1 {
+            let response = state
+                .clone()
+                .oneshot(ReadRequest::BlocksByHeightRange {
+                    start: Height(height),
+                    count: 1,
+                })
+                .await
+                .unwrap();
+            let ReadResponse::Blocks(blocks) = response else {
+                panic!("decoded range requests return block batches")
+            };
+            for (_, block, _) in blocks.iter() {
+                hashes.extend(block.transactions().map(|transaction| transaction.hash()));
+            }
+        }
+        assert!(!hashes.is_empty(), "the probe needs stored transactions");
+    }
+    let hashes = Arc::new(hashes);
+
     for (shape, count) in [
         ("sequential_near_tip", 1_u32),
         ("random_retained", 1),
@@ -127,6 +167,9 @@ async fn getblocks_storage_read_probe() {
         ("unavailable_above_tip", 1),
     ] {
         for concurrency in [1_usize, 4, 8, 16, 19, 24, 32, 38, 48, 64, 76] {
+            if (decode || transactions) && concurrency > 48 {
+                continue;
+            }
             if drop_caches {
                 std::process::Command::new("sync").status().unwrap();
                 std::fs::write("/proc/sys/vm/drop_caches", "3").unwrap();
@@ -135,11 +178,36 @@ async fn getblocks_storage_read_probe() {
                 tip.0.saturating_sub(200_000).max(retained.0),
             ));
             let cpu_start = cpu_seconds();
-            let deadline = Instant::now() + Duration::from_secs(seconds);
+            let began_case = Instant::now();
+            let deadline = began_case + Duration::from_secs(seconds);
+            let control = control_reads.then(|| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut latencies = Vec::new();
+                    while Instant::now() < deadline {
+                        let began = Instant::now();
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            state.clone().oneshot(ReadRequest::Tip),
+                        )
+                        .await
+                        .expect("chain-tip reads keep progressing during data-read saturation")
+                        .unwrap();
+                        let ReadResponse::Tip(Some((height, _))) = response else {
+                            panic!("the read-only database retains its chain tip")
+                        };
+                        assert_eq!(height, tip, "the secondary keeps the measured state fixed");
+                        latencies.push(elapsed_us(began));
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    latencies
+                })
+            });
             let workers: Vec<_> = (0..concurrency)
                 .map(|worker| {
                     let mut state = state.clone();
                     let next = next.clone();
+                    let hashes = hashes.clone();
                     // A small xorshift keeps random heights reproducible per worker.
                     let mut seed = 0x9E37_79B9_u32 ^ u32::try_from(worker).unwrap();
                     tokio::spawn(async move {
@@ -161,6 +229,69 @@ async fn getblocks_storage_read_probe() {
                                 _ => retained.0 + seed % span,
                             };
                             let began = Instant::now();
+                            if transactions {
+                                let mut results = Vec::with_capacity(count as usize);
+                                for offset in 0..count {
+                                    let hash = if shape == "unavailable_above_tip" {
+                                        zakura_chain::transaction::Hash([0xff; 32])
+                                    } else {
+                                        // Height selection maps onto the stored hash list.
+                                        let index = (start - retained.0 + offset) as usize;
+                                        hashes[index % hashes.len()]
+                                    };
+                                    let response = state
+                                        .clone()
+                                        .oneshot(ReadRequest::Transaction(hash))
+                                        .await
+                                        .unwrap();
+                                    let ReadResponse::Transaction(result) = response else {
+                                        panic!("transaction requests return one transaction")
+                                    };
+                                    assert_eq!(
+                                        result.is_some(),
+                                        shape != "unavailable_above_tip",
+                                        "stored hashes resolve and unknown hashes do not"
+                                    );
+                                    if let Some(result) = result {
+                                        assert_eq!(result.tx.hash(), hash);
+                                        tally.blocks += 1;
+                                        results.push(result);
+                                    }
+                                }
+                                drop(std::hint::black_box(results));
+                                tally.latencies_us.push(elapsed_us(began));
+                                tally.reads += 1;
+                                continue;
+                            }
+                            if decode {
+                                let response = state
+                                    .clone()
+                                    .oneshot(ReadRequest::BlocksByHeightRange {
+                                        start: Height(start),
+                                        count,
+                                    })
+                                    .await
+                                    .unwrap();
+                                let ReadResponse::Blocks(blocks) = response else {
+                                    panic!("decoded range requests return block batches")
+                                };
+                                let expected = if start > retained.1 {
+                                    0
+                                } else {
+                                    count.min(retained.1 - start + 1)
+                                };
+                                assert_eq!(blocks.len(), usize::try_from(expected).unwrap());
+                                for (offset, (height, block, size)) in blocks.iter().enumerate() {
+                                    assert_eq!(height.0, start + u32::try_from(offset).unwrap());
+                                    assert_eq!(block.coinbase_height(), Some(*height));
+                                    tally.bytes += u64::try_from(*size).unwrap();
+                                }
+                                tally.blocks += u64::try_from(blocks.len()).unwrap();
+                                drop(std::hint::black_box(blocks));
+                                tally.latencies_us.push(elapsed_us(began));
+                                tally.reads += 1;
+                                continue;
+                            }
                             let range = state
                                 .read_owned_block_range(
                                     Height(start),
@@ -204,6 +335,13 @@ async fn getblocks_storage_read_probe() {
                 total.latencies_us.extend(tally.latencies_us);
                 total.encode_us.extend(tally.encode_us);
             }
+            let mut control_latencies = match control {
+                Some(control) => control.await.unwrap(),
+                None => Vec::new(),
+            };
+            assert!(!control_reads || !control_latencies.is_empty());
+            control_latencies.sort_unstable();
+            let elapsed_seconds = began_case.elapsed().as_secs_f64();
             let cpu = cpu_seconds().zip(cpu_start).map(|(end, start)| end - start);
             total.latencies_us.sort_unstable();
             total.encode_us.sort_unstable();
@@ -215,11 +353,13 @@ async fn getblocks_storage_read_probe() {
             };
             let percentile = |p: usize| at(&total.latencies_us, p);
             // Float conversions are lossy only far beyond these counts.
-            let per_second = |value: u64| value as f64 / seconds as f64;
+            let per_second = |value: u64| value as f64 / elapsed_seconds;
             eprintln!(
                 "storage_probe shape={shape} count={count} concurrency={concurrency} \
-                 cold_cache={drop_caches} encode={encode} reads_per_s={:.0} blocks_per_s={:.0} \
+                 cold_cache={drop_caches} encode={encode} decode={decode} elapsed_s={elapsed_seconds:.6} \
+                 reads_per_s={:.0} blocks_per_s={:.0} \
                  mb_per_s={:.2} p50_us={} p99_us={} max_us={} encode_p50_us={} encode_p99_us={} \
+                 control_reads={} control_p99_us={} control_max_us={} \
                  cpu_s={cpu:?} rss_kib={:?}",
                 per_second(total.reads),
                 per_second(total.blocks),
@@ -229,6 +369,9 @@ async fn getblocks_storage_read_probe() {
                 total.latencies_us.last().copied().unwrap_or(0),
                 at(&total.encode_us, 50),
                 at(&total.encode_us, 99),
+                control_latencies.len(),
+                at(&control_latencies, 99),
+                control_latencies.last().copied().unwrap_or(0),
                 memory_kib(),
             );
         }

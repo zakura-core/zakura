@@ -12,7 +12,7 @@ use zakura_sim::{
     check::{self, StepCtx, Violation},
     harness::{
         self,
-        coverage::{Witness, COVERAGE},
+        coverage::{Bypass, Ci, Witness, COVERAGE},
         run_harness, HarnessEntry, HarnessError, Subsystem, HARNESSES, NO_TASK_PANIC,
     },
     property::{Assume, AssumeRecord, Assumptions, HasView, Status},
@@ -109,6 +109,7 @@ impl Subsystem for Probe {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(_: &Behavior) -> RunConfig {
         RunConfig {
@@ -118,7 +119,10 @@ impl Subsystem for Probe {
         }
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
         let behavior = *behavior;
         sim.scheduler().spawn_root("probe", async move {
             match behavior {
@@ -214,13 +218,17 @@ impl Subsystem for Unbounded {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(behavior: &Behavior) -> RunConfig {
         Probe::config(behavior)
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
-        Probe::build(sim, behavior);
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
+        Probe::build(sim, behavior, ());
         Unbounded
     }
 
@@ -275,13 +283,17 @@ impl Subsystem for Counted {
     const GENERATOR: u32 = 1;
     const SCENARIO_BYTES: usize = 0;
     type Scenario = Behavior;
+    type Prepared = ();
 
     fn config(behavior: &Behavior) -> RunConfig {
         Probe::config(behavior)
     }
 
-    fn build(sim: &mut Sim, behavior: &Behavior) -> Self {
-        Probe::build(sim, behavior);
+    /// Nothing to set up.
+    fn prepare(_: &Behavior) {}
+
+    fn build(sim: &mut Sim, behavior: &Behavior, (): ()) -> Self {
+        Probe::build(sim, behavior, ());
         Counted
     }
 
@@ -385,11 +397,18 @@ fn a_clean_run_holds_no_task_panic() {
 fn every_harness_names_its_statuses() {
     for entry in HARNESSES {
         let properties = (entry.properties)();
-        assert_eq!(properties[0].id, NO_TASK_PANIC, "{}", entry.name);
+        if entry.machine {
+            assert_eq!(properties.len(), 1);
+            assert_eq!(properties[0].id, entry.name);
+            assert_eq!(entry.status(NO_TASK_PANIC), None);
+            assert_eq!(entry.status(NO_LIVELOCK), None);
+        } else {
+            assert_eq!(properties[0].id, NO_TASK_PANIC, "{}", entry.name);
+            assert_eq!(entry.status(NO_LIVELOCK), Some(Status::Active));
+        }
         for property in properties {
             assert_eq!(entry.status(&property.id), Some(property.status));
         }
-        assert_eq!(entry.status(NO_LIVELOCK), Some(Status::Active));
         assert_eq!(entry.status("no/such-property"), None);
     }
 }
@@ -406,9 +425,10 @@ fn the_coverage_manifest_lists_every_reported_property() {
     assert_eq!(listed, reported);
 }
 
-/// Checks that `witness` is a test CI runs: `source` defines it once, the
-/// attributes directly above it include `#[test]` and no `#[cfg`, and an
-/// ignored one is named in `workflow`, the `tests-unit.yml` text.
+/// Checks that `witness` is a test that runs where it says: `source`
+/// defines it once, and the attributes directly above it include `#[test]`
+/// and no `#[cfg`. A CI job's ignored test is named in `workflow`, the
+/// `tests-unit.yml` text, and an on-demand test is ignored.
 fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), String> {
     let lines: Vec<&str> = source.lines().map(str::trim).collect();
     let signature = format!("fn {}()", witness.test);
@@ -438,23 +458,60 @@ fn witness_runs(source: &str, workflow: &str, witness: Witness) -> Result<(), St
     if attributes.iter().any(|a| a.starts_with("#[cfg")) {
         return Err(format!("{} is behind a cfg", witness.test));
     }
-    if !workflow.contains(&format!("name: {}", witness.ci)) {
-        return Err(format!("no `{}` job", witness.ci));
-    }
     let ignored = attributes.iter().any(|a| a.starts_with("#[ignore"));
-    if ignored && !workflow.contains(witness.test) {
-        return Err(format!("CI never runs the ignored {}", witness.test));
+    match witness.ci {
+        Ci::Job(job) => {
+            if !workflow.contains(&format!("name: {job}")) {
+                return Err(format!("no `{job}` job"));
+            }
+            if ignored && !workflow.contains(witness.test) {
+                return Err(format!("CI never runs the ignored {}", witness.test));
+            }
+        }
+        Ci::OnDemand => {
+            if !ignored {
+                return Err(format!("the on-demand {} isn't ignored", witness.test));
+            }
+        }
     }
     Ok(())
 }
 
 #[test]
-fn every_coverage_witness_exists_and_ci_runs_it() {
+fn every_coverage_witness_exists_and_runs_where_it_says() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow =
         std::fs::read_to_string(crate_dir.join("../../.github/workflows/tests-unit.yml")).unwrap();
     for row in COVERAGE {
-        for witness in [row.passing, row.bypass] {
+        let witnesses = match row.bypass {
+            Bypass::Test(bypass) => vec![row.passing.witness(), bypass],
+            Bypass::Planted(name) => {
+                let patch = crate_dir
+                    .join("../../qa/planted")
+                    .join(row.property)
+                    .join(format!("{name}.patch"));
+                assert!(patch.is_file(), "{}: no {}", row.property, patch.display());
+                assert!(
+                    workflow.contains("cargo xtask planted"),
+                    "{}: CI never runs `cargo xtask planted`",
+                    row.property
+                );
+                vec![row.passing.witness()]
+            }
+            Bypass::Pending(_) => {
+                let statuses: Vec<_> = HARNESSES
+                    .iter()
+                    .filter_map(|entry| entry.status(row.property))
+                    .collect();
+                assert!(
+                    !statuses.is_empty() && statuses.iter().all(|status| *status == Status::Draft),
+                    "{}: only a draft's bypass is pending, not {statuses:?}'s",
+                    row.property
+                );
+                vec![row.passing.witness()]
+            }
+        };
+        for witness in witnesses {
             let source = std::fs::read_to_string(crate_dir.join(witness.file))
                 .unwrap_or_else(|error| panic!("{}: {}: {error}", row.property, witness.file));
             if let Err(error) = witness_runs(&source, &workflow, witness) {
@@ -471,7 +528,7 @@ fn the_witness_check_refuses_lookalikes() {
     let witness = Witness {
         file: "tests/fake.rs",
         test: "witness",
-        ci: "zakura_sim build",
+        ci: Ci::Job("zakura_sim build"),
     };
     let check = |source: &str| witness_runs(source, workflow, witness);
     assert_eq!(check("#[test]\nfn witness() {}"), Ok(()));
@@ -496,4 +553,14 @@ fn the_witness_check_refuses_lookalikes() {
     ] {
         assert_eq!(check(source), Err(error.to_owned()), "{source}");
     }
+    let on_demand = Witness {
+        ci: Ci::OnDemand,
+        ..witness
+    };
+    let check = |source: &str| witness_runs(source, workflow, on_demand);
+    assert_eq!(check("#[ignore]\n#[test]\nfn witness() {}"), Ok(()));
+    assert_eq!(
+        check("#[test]\nfn witness() {}"),
+        Err("the on-demand witness isn't ignored".to_owned())
+    );
 }

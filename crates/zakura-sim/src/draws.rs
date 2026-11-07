@@ -112,8 +112,8 @@ impl Choices {
     }
 }
 
-/// The first harness failure a draw hit. The loop checks it after setup and
-/// after every step.
+/// The first harness failure a draw, or a source's observation, hit. The
+/// loop checks it after setup and after every step.
 pub(crate) type Failure = Rc<RefCell<Option<HarnessFailure>>>;
 
 /// Installs the callback that answers `sched`'s draws from `choices`.

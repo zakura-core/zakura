@@ -130,7 +130,7 @@ const THREAD_ITEMS: [&str; 7] = [
 /// interface watcher reads the host's interfaces through `getifaddrs`, but it
 /// starts only for a wildcard socket, and `bind_with` refuses one inside a
 /// simulated run.
-const ALLOWED: [(&str, &str, &str); 24] = [
+const ALLOWED: [(&str, &str, &str); 32] = [
     (
         "crates/zakura-network/src/zakura/handler.rs",
         "tokio::sync::oneshot::Sender",
@@ -232,6 +232,46 @@ const ALLOWED: [(&str, &str, &str); 24] = [
         SIM_HARNESS,
     ),
     (
+        "crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/probe.rs",
+        "std::sync::Weak",
+        RESOURCE_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/probe.rs",
+        "std::sync::Arc::downgrade",
+        RESOURCE_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/probe.rs",
+        "Arc::downgrade",
+        RESOURCE_PROBE,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/observe.rs",
+        "std::sync::Mutex",
+        TRANSPORT_TAP,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/observe.rs",
+        "std::sync::MutexGuard",
+        TRANSPORT_TAP,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/observe.rs",
+        "std::sync::PoisonError",
+        TRANSPORT_TAP,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/observe.rs",
+        "std::sync::Mutex::new",
+        TRANSPORT_TAP,
+    ),
+    (
+        "crates/zakura-network/src/zakura/transport/observe.rs",
+        "std::sync::PoisonError::into_inner",
+        TRANSPORT_TAP,
+    ),
+    (
         "crates/zakura-quic/src/congestion.rs",
         "std::time::Instant",
         QUINN_INSTANT,
@@ -271,6 +311,18 @@ const QUINN_INSTANT: &str = "quinn-proto's API takes std's Instant, and the driv
 /// test-only, and it's harness infrastructure, not code under test.
 const SIM_HARNESS: &str = "harness infrastructure for simulated runs: the fake \
      network and the process-wide seed pool, not code under test";
+
+/// Why `zakura-network`'s transport observer may use std's mutex. It
+/// compiles only under `cfg(any(test, zakura_sim))`, and a simulator mutex
+/// would add preemption points inside the regulation locks it reports from.
+const TRANSPORT_TAP: &str = "the transport observer's own state, which must add no \
+     scheduling point to a simulated run, not code under test";
+
+/// Why the header resource probe may use std's `Weak`. It compiles only
+/// under `cfg(zakura_sim)`, and reads only inside a boundary read, which
+/// `zakura_rt`'s `Weak::upgrade` would fail with its preemption point.
+const RESOURCE_PROBE: &str = "the header resource probe's handles, which a boundary \
+     read upgrades and so must take no scheduling point, not code under test";
 
 const MISSING_NAME: &str = "a zakura_rt name (add one if it's missing)";
 

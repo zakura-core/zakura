@@ -47,7 +47,7 @@ pub fn preempt(point: Point) {
             }
             s.stuck.insert(task);
         } else {
-            s.advance_point(task, point.op, Some(point.site));
+            s.advance_point(task, point.op, point.object, Some(point.site));
         }
         Some(s.tasks[task.index()].yielder)
     })

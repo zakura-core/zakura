@@ -119,7 +119,7 @@ where
 
 /// A released round returns its reservation and leases once its calls are
 /// handled, and a stopped node's teardown returns every chunk-budget charge
-/// and every locator permit.
+/// and every locator permit no pending storage read still holds.
 pub const TEARDOWN_RETURNS_BASELINE: &str = "header-sync/teardown-returns-baseline";
 
 /// The claim rules [`TEARDOWN_RETURNS_BASELINE`] reports: round settlement's,
@@ -155,7 +155,7 @@ where
         id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
         claim: "a released header round returns its reservation and leases once its calls are \
                 handled, and a stopped node's teardown returns every chunk-budget charge and \
-                every locator permit",
+                every locator permit no pending storage read still holds",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -201,8 +201,9 @@ where
     if row.is_some_and(|row| row.unsettled > 0 || (row.shutdown && !row.settled)) {
         cx.unsettled(Inconclusive::TeardownOpen);
     }
-    let expected = "a released round, and a stopped node, keeps no reservation, lease, held \
-                    headers or locator permit once settled";
+    let expected = "a released round, and a stopped node, keeps no reservation, lease or held \
+                    headers once settled, and no locator permit a pending storage read doesn't \
+                    hold";
     let mut breaks = view.claims().at(step, &TEARDOWN_CLAIMS).into_iter();
     if let Some(first) = breaks.next() {
         for other in breaks {

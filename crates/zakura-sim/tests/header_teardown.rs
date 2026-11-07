@@ -131,9 +131,10 @@ fn captured() -> String {
     format!("{:?}\n", rounds.rows())
 }
 
-/// The committed close-and-relink witness, recorded in this process and
-/// replayed exactly in a fresh process of the same test binary, gives the
-/// released rounds at each drain its recorded run gave.
+/// Each teardown witness, the committed close-and-relink input and
+/// [`held_lease_witness`], recorded in this process and replayed exactly in
+/// a fresh process of the same test binary, gives the settlement at each
+/// drain its recorded run gave.
 #[test]
 fn the_teardown_witness_replays_in_a_fresh_process() {
     let entry = HarnessEntry {
@@ -151,28 +152,40 @@ fn the_teardown_witness_replays_in_a_fresh_process() {
             .expect("the test harness captures stdout");
         return;
     }
-    let dir = TempDir::new().expect("a temporary directory");
-    record(&entry, RecordInput::Input(CLOSE_RELINK_INPUT), dir.path())
-        .expect("the witness records");
-    let recorded = captured();
-    let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
-        .args([
-            "--exact",
-            "the_teardown_witness_replays_in_a_fresh_process",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, dir.path())
-        .output()
-        .expect("the test binary runs");
-    let stdout = String::from_utf8_lossy(&child.stdout);
-    assert!(child.status.success(), "{child:?}");
-    let replayed = stdout
-        .split_once("ROUNDS-BEGIN\n")
-        .and_then(|(_, rest)| rest.split_once("ROUNDS-END"))
-        .map(|(rounds, _)| rounds)
-        .unwrap_or_else(|| panic!("the child prints its rounds: {stdout}"));
-    assert_eq!(replayed, recorded);
+    let held_lease = serde_json::to_value(held_lease_witness()).expect("a scenario serializes");
+    let PlanInput::Bytes(plan) = support::inputs(1, 256).remove(0) else {
+        unreachable!("fuzz inputs are bytes");
+    };
+    for witness in 0..2 {
+        let what = match witness {
+            0 => RecordInput::Input(CLOSE_RELINK_INPUT),
+            _ => RecordInput::Plan {
+                scenario: &held_lease,
+                plan: &plan,
+            },
+        };
+        let dir = TempDir::new().expect("a temporary directory");
+        record(&entry, what, dir.path()).expect("the witness records");
+        let recorded = captured();
+        let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
+            .args([
+                "--exact",
+                "the_teardown_witness_replays_in_a_fresh_process",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, dir.path())
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(child.status.success(), "{child:?}");
+        let replayed = stdout
+            .split_once("ROUNDS-BEGIN\n")
+            .and_then(|(_, rest)| rest.split_once("ROUNDS-END"))
+            .map(|(rounds, _)| rounds)
+            .unwrap_or_else(|| panic!("the child prints its rounds: {stdout}"));
+        assert_eq!(replayed, recorded, "witness {witness}");
+    }
 }
 
 /// The plan's teardown witness: the node's first prepare is held, and

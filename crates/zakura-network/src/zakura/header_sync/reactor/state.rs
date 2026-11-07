@@ -46,8 +46,9 @@ pub(super) struct ReactorState {
     /// the per-publish sort stay bounded however many identities fault in one
     /// cooldown. Past the limit the cooldown that ends first ends now. Evicting
     /// one takes more faulting identities in one cooldown than the limits admit
-    /// at once, and it gains the evicted identity nothing a fresh identity
-    /// doesn't already get, since a cooldown only refuses the exact identity.
+    /// at once, and it gains the evicted identity little: a cooldown only
+    /// refuses the exact identity, so a fresh one already gets back in for the
+    /// cost of one handshake.
     pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,
     /// No later than the earliest end in [`Self::unproductive_peer_cooldowns`],
     /// so maintenance wakes to republish it without scanning the map each turn.

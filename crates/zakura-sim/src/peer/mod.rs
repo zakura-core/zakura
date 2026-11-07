@@ -79,7 +79,7 @@ pub(crate) use self::evidence::{PeerRecord, PeerRecords, RecordBody, Remote};
 use self::{
     adversary::{Act, Adversary, AdversarySpec},
     content::ContentLabeller,
-    discovery::{DiscoveryPeer, DiscoveryScript, Request},
+    discovery::{DiscoveryAct, DiscoveryPeer, DiscoveryScript, Request},
     evidence::WireEvidence,
     handshake::{Echo, Local},
     honest::{Honest, HonestChain, HonestSpec},
@@ -217,6 +217,14 @@ impl PeerSpec {
         }
     }
 
+    /// True if the peer's script holds a discovery act, so it's an
+    /// adversary on its discovery stream.
+    pub fn discovers_adversarially(&self) -> bool {
+        self.script
+            .iter()
+            .any(|action| matches!(action, PeerAction::Discover { .. }))
+    }
+
     /// True if the peer is `HonestPeer`: it runs the honest script on a
     /// valid chain, takes no adversarial act, echoes the node's nonce rightly, and opens no
     /// stream outside the honest script.
@@ -270,6 +278,12 @@ pub enum PeerAction {
         /// The request.
         request: Request,
     },
+    /// A discovery act on the peer's discovery stream, offered once the
+    /// stream holds the state it needs.
+    Discover {
+        /// The act.
+        act: DiscoveryAct,
+    },
 }
 
 impl PeerAction {
@@ -284,6 +298,7 @@ impl PeerAction {
             PeerAction::Grant => "grant",
             PeerAction::Act { act } => act.name(),
             PeerAction::Ask { request } => request.name(),
+            PeerAction::Discover { act } => act.name(),
         }
     }
 }
@@ -1470,8 +1485,16 @@ impl PeerTask {
             let now = Instant::now();
             let next = self.spec.script.get(self.taken).copied();
             let wake = scripts.wake(next);
+            let discovery_ready = match next {
+                Some(PeerAction::Discover { act }) => scripts
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|script| discovery.is_some() && script.ready(act)),
+                _ => true,
+            };
             let ready = settled
                 && discovery_settled
+                && discovery_ready
                 && (scripts.honest.is_none() || wake.is_some_and(|wake| now >= wake));
             self.readiness.set(ready);
             // The honest script's next timer: its refresh, or when it may
@@ -1606,13 +1629,29 @@ impl PeerTask {
                             }
                         }
                         PeerAction::Ask { request } => {
-                            let Some(script) = scripts.discovery.as_mut().filter(|_| discovery.is_some()) else {
+                            let script =
+                                scripts.discovery.as_mut().filter(|_| discovery.is_some());
+                            let Some(script) = script else {
                                 return self.fail(format!(
                                     "can't {} without a discovery stream",
                                     request.name()
                                 ));
                             };
                             answers = vec![script.ask(request)];
+                        }
+                        PeerAction::Discover { act } => {
+                            let script =
+                                scripts.discovery.as_mut().filter(|_| discovery.is_some());
+                            let Some(script) = script else {
+                                return self.fail(format!(
+                                    "can't {} without a discovery stream",
+                                    act.name()
+                                ));
+                            };
+                            match script.act(act) {
+                                Ok(acted) => answers = acted,
+                                Err(why) => return self.fail(why),
+                            }
                         }
                     }
                 }

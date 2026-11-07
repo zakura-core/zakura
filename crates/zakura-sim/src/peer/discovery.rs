@@ -11,7 +11,13 @@
 //! Every frame the peer sends is labelled before the write by reg-5's
 //! [`FrameModel`], [`ExchangeModel`] and [`CadenceModel`] over discovery's
 //! rows, which come from `DiscoveryService::streams()`, so the labels follow
-//! the table the node enforces without a copy of it.
+//! the table the node enforces without a copy of it, and by the content
+//! labeller ([`content`]). A `Peers` also owes no more than its `GetPeers`
+//! limit's cap, which the node's claim checks: [`ExchangeModel`] owes every
+//! answer the row's largest ending, as the node's reservation does.
+//!
+//! A peer also takes [`DiscoveryAct`]s, the receiver-direction boundaries of
+//! disc-3 ([`adversary`]).
 //!
 //! [`PeerAction::Ask`]: super::PeerAction::Ask
 
@@ -29,6 +35,7 @@ use zakura_network::zakura::{
     MessageRole, Service, ServiceSummaryEnvelope, Services, Stream, ZakuraDiscoveryConfig,
     ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraNodeRecord,
     ZakuraNodeRecordBody, ZakuraServiceId, MAX_DISCOVERY_RECORDS_PER_RESPONSE,
+    MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::{
@@ -36,9 +43,17 @@ use zakura_rt::{
     time::{utc_now, Instant},
 };
 
+mod adversary;
+mod content;
+
+pub use self::adversary::{DiscoveryAct, DiscoveryRow, DiscoveryRule};
+use self::content::DiscoveryContent;
 use super::{evidence::RecordBody, frame_bytes, Outgoing};
 use crate::{
-    model::{CadenceModel, Charge, ExchangeModel, FrameHeader, FrameModel, Owed, ReaderEnd},
+    model::{
+        CadenceModel, Charge, ExchangeModel, FrameHeader, FrameModel, Label, Labels, Owed,
+        ReaderEnd,
+    },
     observe::StreamId,
     table::rule_row,
 };
@@ -56,7 +71,18 @@ pub(crate) fn record(
     now: u64,
     direct_addrs: Vec<SocketAddr>,
 ) -> ZakuraNodeRecord {
-    let body = ZakuraNodeRecordBody {
+    ZakuraNodeRecord::sign(body(secret, handshake, now, direct_addrs), secret)
+        .expect("a fixture record signs")
+}
+
+/// The body of [`record`].
+fn body(
+    secret: &NodeSecretKey,
+    handshake: &ZakuraHandshakeConfig,
+    now: u64,
+    direct_addrs: Vec<SocketAddr>,
+) -> ZakuraNodeRecordBody {
+    ZakuraNodeRecordBody {
         node_id: secret.public(),
         direct_addrs,
         services: vec![ZakuraServiceId::discovery()],
@@ -67,8 +93,7 @@ pub(crate) fn record(
         sequence: 1,
         expires_at_unix_secs: now.saturating_add(600),
         extensions: Vec::new(),
-    };
-    ZakuraNodeRecord::sign(body, secret).expect("a fixture record signs")
+    }
 }
 
 /// The key of the author of a script's `index`th relayed record.
@@ -163,7 +188,7 @@ pub struct Hold {
 }
 
 /// A frame the peer sends because the node's session expects it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Answer {
     /// Its own `Hello`, once its stream starts.
@@ -175,7 +200,7 @@ pub enum Answer {
 }
 
 /// A request the peer sends on its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Request {
     /// `GetPeers` for the most records a response may carry.
@@ -201,9 +226,60 @@ const SESSION: u64 = 0;
 /// An answer waiting for its hold.
 struct Held {
     due: Instant,
+    answer: Answer,
     message: DiscoveryMessage,
     /// The node's request it answers.
     exchange: Option<u64>,
+}
+
+/// A frame a peer writes on a discovery stream: the message its labels
+/// read, the header and payload it actually writes, and the records whose
+/// signature the fixture forged. An honest frame is its message encoded. A
+/// crafted one may declare another type, flags or length, or carry bytes
+/// the encoder refuses.
+#[derive(Clone, Debug)]
+pub(crate) struct DiscoveryFrame {
+    /// What the frame means to the role and content labels.
+    message: DiscoveryMessage,
+    /// The header written.
+    header: FrameHeader,
+    /// The bytes written after the header.
+    payload: Vec<u8>,
+    /// The message's records whose signature the fixture forged, by place.
+    forged: Vec<usize>,
+}
+
+impl DiscoveryFrame {
+    /// `message`, encoded as it is.
+    fn of(message: DiscoveryMessage) -> Self {
+        let frame = encode_frame(&message).expect("a fixture frame starts from a valid message");
+        DiscoveryFrame {
+            header: FrameHeader {
+                message_type: frame.message_type,
+                flags: frame.flags,
+                payload_len: frame.payload.len(),
+            },
+            payload: frame.payload,
+            message,
+            forged: Vec::new(),
+        }
+    }
+
+    /// Writes `len` payload bytes: the payload cut short, or padded with
+    /// zeros.
+    fn resize(&mut self, len: usize) {
+        self.payload.resize(len, 0);
+        self.header.payload_len = len;
+    }
+}
+
+/// The most a `Peers` answer to a `GetPeers` with `limit` may carry, as the
+/// node's claim checks it: the record count, then at most `limit` of the
+/// largest records. The `peers` row's minimum is an empty `Peers`, its
+/// count alone.
+fn peers_cap(peers: &zakura_network::zakura::MessageRule, limit: u16) -> u64 {
+    let bytes = peers.payload.min() + usize::from(limit) * MAX_NODE_RECORD_BYTES;
+    u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 /// One discovery stream's role models and the answers it holds.
@@ -216,11 +292,19 @@ struct Models {
     /// The peer's requests, which the node answers, by request type.
     peer_asks: BTreeMap<u16, ExchangeModel>,
     cadence: CadenceModel,
+    /// The node's `GetPeers` limits, by the exchange key its answer takes.
+    limits: BTreeMap<u64, u16>,
     /// The next exchange key, shared by both ends' requests.
     next_key: u64,
     /// Frames labelled so far, the next one's `seq`.
     sent: u64,
     held: Vec<Held>,
+    /// The answers sent at least once.
+    answered: Vec<Answer>,
+    /// The request row of a [`DiscoveryAct::RequestRun`] under way.
+    run: Option<Request>,
+    /// The requests that run sent.
+    run_sent: usize,
 }
 
 impl Models {
@@ -250,9 +334,13 @@ impl Models {
             node_asks: requests(),
             peer_asks,
             cadence: CadenceModel::new(),
+            limits: BTreeMap::new(),
             next_key: 0,
             sent: 0,
             held: Vec::new(),
+            answered: Vec::new(),
+            run: None,
+            run_sent: 0,
         }
     }
 
@@ -275,6 +363,7 @@ pub(crate) struct DiscoveryPeer {
     handshake: ZakuraHandshakeConfig,
     /// The authors of the records it relays.
     relays: Vec<NodeSecretKey>,
+    content: DiscoveryContent,
     models: Option<Models>,
 }
 
@@ -296,15 +385,18 @@ impl DiscoveryPeer {
             ));
         }
         let relays = (0..script.relays).map(relay_author).collect();
+        let handshake =
+            ZakuraHandshakeConfig::for_network(&Network::new_regtest(Default::default()));
+        // The node runs on the peer's network.
+        let content = DiscoveryContent::new(handshake, secret.public());
         Ok(DiscoveryPeer {
             stream,
             script,
             secret,
             addr,
-            handshake: ZakuraHandshakeConfig::for_network(
-                &Network::new_regtest(Default::default()),
-            ),
+            handshake,
             relays,
+            content,
             models: None,
         })
     }
@@ -318,11 +410,16 @@ impl DiscoveryPeer {
     /// unless it's held.
     pub(crate) fn start(&mut self) -> Vec<Outgoing> {
         self.models = Some(Models::new(&self.stream));
-        let hello = DiscoveryMessage::Hello {
-            record: record(&self.secret, &self.handshake, unix_now(), vec![self.addr]),
-        };
+        let hello = self.hello();
         self.queue(Answer::Hello, hello, None);
         self.tick()
+    }
+
+    /// The peer's own `Hello`, valid for ten minutes from now.
+    fn hello(&self) -> DiscoveryMessage {
+        DiscoveryMessage::Hello {
+            record: record(&self.secret, &self.handshake, unix_now(), vec![self.addr]),
+        }
     }
 
     /// Follows the node's `message` and queues the answer to a request.
@@ -331,9 +428,12 @@ impl DiscoveryPeer {
         let message_type = message.message_type();
         let models = self.models.as_mut().expect("a discovery stream started");
         let row = models.frames.row(message_type);
+        let mut limit = None;
+        let mut run = Vec::new();
         let answer = match message {
             DiscoveryMessage::Hello { .. } => None,
             DiscoveryMessage::GetPeers(query) => {
+                limit = Some(query.limit);
                 let records = self
                     .relays
                     .iter()
@@ -352,12 +452,19 @@ impl DiscoveryPeer {
                     if let Some(model) = models.peer_asks.get_mut(&request) {
                         model.answered(SESSION);
                     }
+                    // A run asks again once the node answered the last.
+                    if let Some(next) = models.run.filter(|ran| request == ran.message_type()) {
+                        run.push(next);
+                    }
                 }
                 None
             }
         };
         if let Some((answer, reply)) = answer {
             let key = models.key();
+            if let Some(limit) = limit {
+                models.limits.insert(key, limit);
+            }
             // A zero owes the answer its row's largest ending, the most
             // `ExchangeModel` lets any request owe.
             let owed = Owed {
@@ -369,28 +476,28 @@ impl DiscoveryPeer {
             }
             self.queue(answer, reply, Some(key));
         }
-        self.tick()
+        let mut out = self.tick();
+        for request in run {
+            out.extend(self.run_step(request));
+        }
+        out
     }
 
     /// The peer's own `request` on its current discovery stream, labelled.
     pub(crate) fn ask(&mut self, request: Request) -> Outgoing {
-        let message = match request {
-            Request::GetPeers => DiscoveryMessage::GetPeers(GetPeers {
-                limit: u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE)
-                    .expect("the wire limit fits u16"),
-                wanted_services: Vec::new(),
-                exclude_node_ids: Vec::new(),
-            }),
-            Request::GetServices => DiscoveryMessage::GetServices(GetServices {
-                wanted_services: Vec::new(),
-            }),
-        };
+        let message = request.message();
+        self.send_new(DiscoveryFrame::of(message))
+    }
+
+    /// Labels `frame`, a request, under a new exchange key, as
+    /// [`Self::send`] does.
+    fn send_new(&mut self, frame: DiscoveryFrame) -> Outgoing {
         let key = self
             .models
             .as_mut()
             .expect("a discovery stream started")
             .key();
-        self.send(&message, Some(key))
+        self.send(frame, Some(key))
     }
 
     /// When the next held answer is due, if one waits.
@@ -409,8 +516,27 @@ impl DiscoveryPeer {
             .partition::<Vec<_>, _>(|held| held.due <= now);
         models.held = waiting;
         due.into_iter()
-            .map(|held| self.send(&held.message, held.exchange))
+            .map(|held| self.send(DiscoveryFrame::of(held.message), held.exchange))
             .collect()
+    }
+
+    /// Takes the held `answer`, and returns its message and the exchange it
+    /// answers. `None` if none is held.
+    fn take_held(&mut self, answer: Answer) -> Option<(DiscoveryMessage, Option<u64>)> {
+        let held = &mut self.models.as_mut()?.held;
+        let at = held.iter().position(|held| held.answer == answer)?;
+        let held = held.remove(at);
+        Some((held.message, held.exchange))
+    }
+
+    /// The held `answer`'s message, if one is held.
+    fn held(&self, answer: Answer) -> Option<&DiscoveryMessage> {
+        self.models
+            .as_ref()?
+            .held
+            .iter()
+            .find(|held| held.answer == answer)
+            .map(|held| &held.message)
     }
 
     /// Queues `message`, the peer's `answer` to exchange `exchange`, until
@@ -433,40 +559,75 @@ impl DiscoveryPeer {
         let models = self.models.as_mut().expect("a discovery stream started");
         models.held.push(Held {
             due,
+            answer,
             message,
             exchange,
         });
     }
 
-    /// Labels `message` with the stream's models and returns its bytes and
-    /// record. A request opens exchange `exchange`, and a response answers
-    /// the node's request `exchange`. A conformant frame changes the models
-    /// as its sending does.
-    fn send(&mut self, message: &DiscoveryMessage, exchange: Option<u64>) -> Outgoing {
-        let frame = encode_frame(message).expect("the fixture's frames encode");
-        let header = FrameHeader {
-            message_type: frame.message_type,
-            flags: frame.flags,
-            payload_len: frame.payload.len(),
-        };
+    /// Labels `frame` with the stream's models and its content, and returns
+    /// its bytes and record. A request opens exchange `exchange`, and a
+    /// response answers the node's request `exchange`: with none, it's
+    /// unsolicited. A conformant frame changes the models as its sending
+    /// does, and a faulty one is labelled on a copy of them.
+    fn send(&mut self, frame: DiscoveryFrame, exchange: Option<u64>) -> Outgoing {
+        let header = frame.header;
         let stream = &self.stream;
+        let content = &self.content;
         let models = self.models.as_mut().expect("a discovery stream started");
         let row = models.frames.row(header.message_type);
-        let mut labels = models.frames.labels(&header);
-        if labels.is_conformant() {
-            labels = match row.map(|row| row.role) {
-                Some(MessageRole::Request { .. }) => models
+        let own_row = row.is_some() && frame.message.message_type() == header.message_type;
+        let limit = exchange.and_then(|key| models.limits.get(&key).copied());
+        let faults = models.frames.labels(&header).union(content.label(
+            &frame.message,
+            &frame.forged,
+            limit,
+        ));
+        let role = match row.map(|row| row.role).filter(|_| own_row) {
+            Some(MessageRole::Request { .. }) => {
+                let model = models
                     .peer_asks
                     .get_mut(&header.message_type)
-                    .map_or(labels, |model| model.request_frame(SESSION)),
-                Some(MessageRole::Response { request, .. }) => {
-                    match (exchange, models.node_asks.get_mut(&request)) {
-                        (Some(key), Some(model)) => model.response_frame(SESSION, key, &header),
-                        _ => labels,
-                    }
+                    .expect("every request row has a model");
+                if faults.is_conformant() {
+                    model.request_frame(SESSION)
+                } else {
+                    model.clone().request_frame(SESSION)
                 }
-                _ => labels,
-            };
+            }
+            Some(MessageRole::Response { request, .. }) => {
+                let model = models
+                    .node_asks
+                    .get_mut(&request)
+                    .expect("every request row has a model");
+                let peers = row.filter(|row| row.message_type == u16::from(MSG_DISCOVERY_PEERS));
+                match exchange {
+                    None => Labels::of(Label::Unsolicited),
+                    // The node's claim refuses a `Peers` above its own
+                    // `GetPeers` limit's cap, below the row's largest.
+                    Some(key)
+                        if model.owed(SESSION, key).is_some()
+                            && peers.zip(limit).is_some_and(|(peers, limit)| {
+                                header.payload_len as u64 > peers_cap(peers, limit)
+                            }) =>
+                    {
+                        Labels::of(Label::OverOwed)
+                    }
+                    Some(key) if faults.is_conformant() => {
+                        model.response_frame(SESSION, key, &header)
+                    }
+                    Some(key) => model.clone().response_frame(SESSION, key, &header),
+                }
+            }
+            _ => Labels::NONE,
+        };
+        let labels = faults.union(role);
+        if labels.is_conformant() {
+            if let Some(answer) = answer_of(&frame.message) {
+                if !models.answered.contains(&answer) {
+                    models.answered.push(answer);
+                }
+            }
         }
         let label = labels.first();
         let id = |stream: &Stream| StreamId {
@@ -504,10 +665,42 @@ impl DiscoveryPeer {
     }
 }
 
+/// The answer `message` is, if it's one.
+fn answer_of(message: &DiscoveryMessage) -> Option<Answer> {
+    match message {
+        DiscoveryMessage::Hello { .. } => Some(Answer::Hello),
+        DiscoveryMessage::Peers { .. } => Some(Answer::Peers),
+        DiscoveryMessage::Services(_) => Some(Answer::Services),
+        DiscoveryMessage::GetPeers(_) | DiscoveryMessage::GetServices(_) => None,
+    }
+}
+
+impl Request {
+    /// The request's message: `GetPeers` for the most records a response
+    /// may carry, or `GetServices` for every service.
+    fn message(self) -> DiscoveryMessage {
+        match self {
+            Request::GetPeers => DiscoveryMessage::GetPeers(GetPeers {
+                limit: u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE)
+                    .expect("the wire limit fits u16"),
+                wanted_services: Vec::new(),
+                exclude_node_ids: Vec::new(),
+            }),
+            Request::GetServices => DiscoveryMessage::GetServices(GetServices {
+                wanted_services: Vec::new(),
+            }),
+        }
+    }
+
+    /// The request's message type.
+    fn message_type(self) -> u16 {
+        self.message().message_type()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Label;
 
     /// A peer on discovery's stream, with that stream's models started.
     fn started() -> DiscoveryPeer {
@@ -546,6 +739,14 @@ mod tests {
         let peers = DiscoveryMessage::Peers {
             records: Vec::new(),
         };
-        assert_eq!(label(&peer.send(&peers, Some(9))), Label::Unsolicited);
+        assert_eq!(
+            label(&peer.send(DiscoveryFrame::of(peers.clone()), Some(9))),
+            Label::Unsolicited
+        );
+        assert_eq!(
+            label(&peer.send(DiscoveryFrame::of(peers), None)),
+            Label::Unsolicited,
+            "a response with no exchange answers nothing"
+        );
     }
 }

@@ -208,6 +208,40 @@ const OUTCOME: &str = "headers_outcome_faults_apply_in_their_witnesses";
 const NOT_OWED: &str = "header sync's responses answer a subscription, whose pages spend credit, \
                         so the models label an overrun over-credit, never over-owed";
 
+/// The file of `discovery/wire`'s witness tests (disc-3.1).
+const DISCOVERY_WITNESSES: &str = "tests/discovery_wire_witness.rs";
+
+/// Why a discovery ID whose guard is discovery's own has no bypass yet.
+const DISCOVERY_GUARD: Bypass = Bypass::Pending("disc-3.2 adds its planted case");
+
+/// Why a discovery ID whose guard is the shared reader's has no bypass
+/// yet.
+const READER_GUARD: Bypass = Bypass::Pending("disc-3.3 adds its planted case");
+
+/// A discovery generated property's row: its witness test in
+/// [`DISCOVERY_WITNESSES`], and the disc-3 PR that adds its planted case.
+/// Each is a `Draft` until then.
+const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass) -> Coverage {
+    Coverage {
+        property,
+        passing: passes(DISCOVERY_WITNESSES, passing),
+        bypass,
+    }
+}
+
+/// The honest exchange, and the check that the witnesses list every ID.
+const DISCOVERY_EVERY: &str = "every_discovery_property_applies_in_its_witness";
+/// The `undeclared-type` and `hello` act witnesses.
+const HELLO_ACTS: &str = "hello_acts_apply_in_their_witnesses";
+/// The `get-peers` act witnesses.
+const GET_PEERS_ACTS: &str = "get_peers_acts_apply_in_their_witnesses";
+/// The `peers` act witnesses.
+const PEERS_ACTS: &str = "peers_acts_apply_in_their_witnesses";
+/// The `get-services` act witnesses.
+const GET_SERVICES_ACTS: &str = "get_services_acts_apply_in_their_witnesses";
+/// The `services` act witnesses.
+const SERVICES_ACTS: &str = "services_acts_apply_in_their_witnesses";
+
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
@@ -545,6 +579,165 @@ pub static COVERAGE: &[Coverage] = &[
         NOT_OWED,
         OUTCOME,
     ),
+    discovery(
+        "discovery/s4v2/conformant-never-closes",
+        DISCOVERY_EVERY,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/undeclared-type-closes",
+        HELLO_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/reserved-flags-closes",
+        HELLO_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/short-payload-closes",
+        HELLO_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/long-payload-closes",
+        HELLO_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/bad-content-closes",
+        HELLO_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/hello/cadence-never-closes",
+        HELLO_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/reserved-flags-closes",
+        GET_PEERS_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/short-payload-closes",
+        GET_PEERS_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/long-payload-closes",
+        GET_PEERS_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/over-margin-closes",
+        GET_PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/bad-content-closes",
+        GET_PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-peers/cadence-never-closes",
+        GET_PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/reserved-flags-closes",
+        PEERS_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/short-payload-closes",
+        PEERS_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/long-payload-closes",
+        PEERS_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/unsolicited-closes",
+        PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/over-owed-closes",
+        PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/peers/bad-content-closes",
+        PEERS_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/reserved-flags-closes",
+        GET_SERVICES_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/short-payload-closes",
+        GET_SERVICES_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/long-payload-closes",
+        GET_SERVICES_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/over-margin-closes",
+        GET_SERVICES_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/bad-content-closes",
+        GET_SERVICES_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/get-services/cadence-never-closes",
+        GET_SERVICES_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/services/reserved-flags-closes",
+        SERVICES_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/services/short-payload-closes",
+        SERVICES_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/services/long-payload-closes",
+        SERVICES_ACTS,
+        READER_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/services/unsolicited-closes",
+        SERVICES_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    discovery(
+        "discovery/s4v2/services/bad-content-closes",
+        SERVICES_ACTS,
+        DISCOVERY_GUARD,
+    ),
+    Coverage {
+        property: "discovery/s4v2/services/over-owed-closes",
+        passing: Passing::Unreachable {
+            reason: "the node asks for every service, so its GetServices owes the row's largest \
+                     Services, and a larger one is long-payload",
+            witness: sim_test(DISCOVERY_WITNESSES, SERVICES_ACTS),
+        },
+        bypass: DISCOVERY_GUARD,
+    },
     // Any production change that punishes an honest header-sync peer also
     // violates `conformant-never-closes`, and a planted case's input must
     // violate its property alone. The scripted bypass punishes an honest

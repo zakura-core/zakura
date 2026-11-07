@@ -28,8 +28,18 @@ pub enum Claim {
     LeakedReservation,
     /// A released round kept a lease past its settlement.
     LeakedLease,
-    /// A call was handled with its round's headers still held.
+    /// A call was handled with its round's headers still held, or still
+    /// held them at teardown.
     OpenOwnership,
+    /// A reservation never ended by teardown.
+    OpenReservation,
+    /// The stopped reactor is gone with headers still reserved.
+    TeardownReserved,
+    /// The stopped reactor is gone with headers still owned.
+    TeardownOwned,
+    /// The stopped reactor is gone with a locator permit missing that no
+    /// pending storage read holds.
+    TeardownLocatorPermits,
 }
 
 impl Claim {
@@ -40,13 +50,15 @@ impl Claim {
             ClaimRule::LeakedReservation => Claim::LeakedReservation,
             ClaimRule::LeakedLease => Claim::LeakedLease,
             ClaimRule::OpenOwnership => Claim::OpenOwnership,
+            ClaimRule::OpenReservation => Claim::OpenReservation,
         }
     }
 }
 
-/// The node's released rounds at one drain.
+/// The node's settlement at one drain: its released rounds, and its own
+/// teardown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rounds {
+pub struct Settlement {
     /// The step whose drain read them.
     pub step: u64,
     /// How many rounds the queue has released so far.
@@ -59,32 +71,38 @@ pub struct Rounds {
     /// headers still unended, so storage has nothing left that could settle
     /// them.
     pub stuck: usize,
+    /// Whether the harness began stopping the reactor.
+    pub shutdown: bool,
+    /// Whether the stopped reactor's teardown is done: the reactor is gone
+    /// without unwinding, and every call it dropped has its drop receipt.
+    pub settled: bool,
 }
 
-/// What [`RoundEvidence`] keeps.
+/// What [`SettlementEvidence`] keeps.
 #[derive(Debug, Default)]
-struct RoundStore {
-    /// Each drain's rounds, in order.
-    rows: Vec<Rounds>,
+struct SettlementStore {
+    /// Each drain's settlement, in order, with whether a property read it.
+    rows: Vec<(Settlement, bool)>,
     /// Whether the run ended at rest: idle, or with its drain run dry.
     at_rest: bool,
 }
 
-/// One reactor's released rounds at each drain, and how the run ended,
-/// shared by its tap and whoever reads them. Cloning shares the store.
+/// One reactor's settlement at each drain, each with whether a property
+/// read it, and how the run ended, shared by its tap and whoever reads
+/// them. Cloning shares the store.
 #[derive(Clone, Debug, Default)]
-pub struct RoundEvidence(Arc<Mutex<RoundStore>>);
+pub struct SettlementEvidence(Arc<Mutex<SettlementStore>>);
 
-impl RoundEvidence {
+impl SettlementEvidence {
     /// Runs `read` on the store. Nothing else is called while the lock is
     /// held.
-    fn with<R>(&self, read: impl FnOnce(&mut RoundStore) -> R) -> R {
+    fn with<R>(&self, read: impl FnOnce(&mut SettlementStore) -> R) -> R {
         read(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Keeps `rounds`.
-    pub(crate) fn record(&self, rounds: Rounds) {
-        self.with(|store| store.rows.push(rounds));
+    /// Keeps `rounds`, unread.
+    pub(crate) fn record(&self, rounds: Settlement) {
+        self.with(|store| store.rows.push((rounds, false)));
     }
 
     /// Notes how the run ended: at rest when it went idle or its drain ran
@@ -98,38 +116,59 @@ impl RoundEvidence {
         self.with(|store| store.at_rest = at_rest);
     }
 
-    /// The rounds the drain of `step` read, if it did.
-    pub fn at(&self, step: u64) -> Option<Rounds> {
+    /// The settlement the drain of `step` read, if it did, which this marks
+    /// read. Only the property that reports it reads it this way.
+    pub fn at(&self, step: u64) -> Option<Settlement> {
+        self.with(|store| {
+            store
+                .rows
+                .iter_mut()
+                .rev()
+                .find(|(row, _)| row.step == step)
+                .map(|(row, read)| {
+                    *read = true;
+                    *row
+                })
+        })
+    }
+
+    /// Whether a property read the drain of `step`'s settlement.
+    pub(super) fn read_at(&self, step: u64) -> bool {
         self.with(|store| {
             store
                 .rows
                 .iter()
                 .rev()
-                .find(|rounds| rounds.step == step)
-                .copied()
+                .find(|(row, _)| row.step == step)
+                .is_some_and(|(_, read)| *read)
         })
     }
 
-    /// Every drain's rounds so far, in order.
-    pub fn rows(&self) -> Vec<Rounds> {
-        self.with(|store| store.rows.clone())
+    /// Every drain's settlement so far, in order.
+    pub fn rows(&self) -> Vec<Settlement> {
+        self.with(|store| store.rows.iter().map(|(row, _)| *row).collect())
+    }
+
+    /// Whether a drain found the stopped reactor's teardown done.
+    pub fn settled(&self) -> bool {
+        self.with(|store| store.rows.iter().any(|(row, _)| row.settled))
     }
 
     /// Whether any drain found a released round.
     pub fn any_released(&self) -> bool {
-        self.with(|store| store.rows.iter().any(|rounds| rounds.released > 0))
+        self.with(|store| store.rows.iter().any(|(row, _)| row.released > 0))
     }
 
-    /// The last drain's rounds, if the run ended at rest with a released
-    /// round unsettled and no call that holds its headers still pending in
-    /// storage. Nothing is left that could settle that round then, whatever
-    /// storage still holds for others.
-    pub fn stuck(&self) -> Option<Rounds> {
+    /// The last drain's settlement, if the run ended at rest with a
+    /// released round unsettled and no call that holds its headers still
+    /// pending in storage. Nothing is left that could settle that round
+    /// then, whatever storage still holds for others.
+    pub fn stuck(&self) -> Option<Settlement> {
         self.with(|store| {
             store
                 .rows
                 .last()
-                .copied()
+                .map(|(row, _)| *row)
                 .filter(|last| store.at_rest && last.stuck > 0)
         })
     }

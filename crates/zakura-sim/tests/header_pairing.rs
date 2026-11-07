@@ -414,8 +414,9 @@ fn a_call_left_unended_fails_at_teardown() {
     assert!(detail.starts_with("UnendedCall: call 1"), "{detail}");
 }
 
-/// A call that ended and kept its headers fails the run once the reactor's
-/// teardown is done.
+/// A call that ended and kept its headers fails the run once the stopped
+/// reactor's teardown is done: the ledger finds it as an `OpenOwnership`
+/// claim, and with no property to report it the run fails at its end.
 #[test]
 fn headers_left_held_fail_at_teardown() {
     let mut events = Vec::from(open_work(2));
@@ -423,7 +424,7 @@ fn headers_left_held_fail_at_teardown() {
         call: 1,
         end: CallEnd::NotSubmitted,
     });
-    let report = teardown_after(events, false, false);
+    let report = teardown_after(events, false, true);
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("OpenOwnership: call 1"), "{detail}");
 }
@@ -517,6 +518,105 @@ fn a_run_that_ends_mid_stop_fails() {
     let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
+/// A stop that wedges, with the reactor parked and the drain run dry, fails
+/// as `ShutdownIncomplete` even though a checker read every drain's
+/// settlement, as `header-sync/teardown-returns-baseline` does. Only a drain
+/// cut off at its bound leaves the stop to the property.
+#[test]
+fn a_wedged_stop_with_a_dry_drain_fails_though_its_settlement_was_read() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let rounds = tap.rounds();
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+    let read = rounds.clone();
+    let mut checker = zakura_sim::check::after_step(move |cx| {
+        let _ = read.at(cx.step);
+        None
+    });
+    let report = sim.run(&mut checker, &mut MemorySink::default());
+    // The run reached its budget, and its drain ended well short of the
+    // bound, since the parked reactor leaves nothing ready.
+    let config = storage_config();
+    assert!(
+        report.end.steps > config.budget && report.end.steps < config.budget + config.drain_bound,
+        "{:?}",
+        report.end
+    );
+    assert!(
+        rounds
+            .rows()
+            .last()
+            .is_some_and(|row| row.step == report.end.steps),
+        "the last drain recorded a settlement"
+    );
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
+/// A stop cut off at the drain bound is the teardown property's to report,
+/// but a tap with no property reading its settlement still fails it as
+/// `ShutdownIncomplete`, so the unfinished stop never ends silently.
+#[test]
+fn a_cut_off_stop_with_no_property_still_fails() {
+    let config = zakura_sim::RunConfig {
+        drain_bound: 2,
+        ..storage_config()
+    };
+    let mut sim = Sim::new(config, PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    tap.shutdown().begin();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        let _observer = observer;
+        loop {
+            zakura_rt::task::yield_now().await;
+        }
+    });
+    // The reactor yields forever, so the drain runs to its bound.
+    let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("ShutdownIncomplete"), "{detail}");
+}
+
+/// The scheduler reports how a task ended, a panic included, to the tap,
+/// whatever still holds that task's observer: the tap judges a reactor's
+/// exit by its task, so a surviving observer clone can't make a panic look
+/// like a clean stop.
+#[test]
+fn the_scheduler_reports_a_reactor_panic() {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let panicking = sim
+        .scheduler()
+        .spawn_root("reactor", async { panic!("the reactor panics") });
+    let task = panicking.task();
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let reported = Arc::clone(&seen);
+    sim.scheduler().spawn_root("watcher", async move {
+        while zakura_scheduler::hooks::task_exit(task).is_none() {
+            zakura_rt::task::yield_now().await;
+        }
+        *reported.lock().expect("one writer") = zakura_scheduler::hooks::task_exit(task);
+    });
+    let _ = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
+    assert_eq!(
+        *seen.lock().expect("one writer"),
+        Some(zakura_scheduler::TaskExit::Panicked)
+    );
 }
 
 /// A reactor that unwinds during an announced stop crashed rather than

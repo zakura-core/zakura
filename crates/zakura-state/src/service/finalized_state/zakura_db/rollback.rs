@@ -329,6 +329,15 @@ fn rollback_open_db(
 
     db.write_batch(prepared.batch)?;
 
+    // The batch lowered the recorded static file tip, so if this fails, the next
+    // open truncates the static files instead.
+    if let Err(error) = db.truncate_static_files_above(options.target_height) {
+        tracing::warn!(
+            ?error,
+            "failed to truncate rolled back static file transactions, the next open will retry"
+        );
+    }
+
     Ok(summary)
 }
 
@@ -538,6 +547,7 @@ fn prepare_rollback(
 
     write_address_balances(db, &mut batch, address_balances);
     reset_tip_trees(db, &mut batch, &target_treestate);
+    batch.prepare_static_file_rollback(db, options.target_height);
     reset_value_pool(db, &mut batch, &target_value_pool);
     prune_tree_indexes(
         db,

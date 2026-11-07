@@ -82,8 +82,6 @@ pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 pub(super) mod header_chain;
-// The state database starts using these in the next change of this stack.
-#[allow(dead_code)]
 pub(crate) mod static_file;
 pub mod treestate_artifact;
 pub mod treestate_export;
@@ -1381,6 +1379,20 @@ impl FinalizedState {
             if retention.clears_archive_backlog() {
                 self.checkpoint_raw_tx_archive_backlog
                     .store(false, Ordering::Relaxed);
+            }
+
+            // Moves run after the block commit, so a failure leaves the bodies
+            // in `tx_by_loc` and the next commit retries.
+            if let Err(error) = self
+                .db
+                .move_transactions_to_static_files()
+                .and_then(|()| self.db.delete_pruned_static_files())
+            {
+                tracing::error!(
+                    ?error,
+                    ?height,
+                    "failed to move finalized transactions to static files, will retry"
+                );
             }
 
             // TODO: move the stop height check to the syncer (#3442)

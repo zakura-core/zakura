@@ -126,6 +126,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/replay_exact.rs"
+test = "regenerate_discovery_book_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed input from the witness zakura-network encodes"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -341,12 +347,6 @@ plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f
 id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/honest-progress"
-kind = "property"
-owner = "P4c"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
 
 [[pending]]

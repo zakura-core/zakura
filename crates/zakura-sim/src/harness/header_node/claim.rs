@@ -55,9 +55,10 @@ pub struct Rounds {
     /// haven't returned, or a call that held their headers hasn't been
     /// handled.
     pub unsettled: usize,
-    /// How many calls that hold an unsettled round's headers haven't ended,
-    /// so storage may still answer them.
-    pub pending: usize,
+    /// How many of those unsettled rounds have no call that holds their
+    /// headers still unended, so storage has nothing left that could settle
+    /// them.
+    pub stuck: usize,
 }
 
 /// What [`RoundEvidence`] keeps.
@@ -121,14 +122,15 @@ impl RoundEvidence {
 
     /// The last drain's rounds, if the run ended at rest with a released
     /// round unsettled and no call that holds its headers still pending in
-    /// storage. Nothing is left that could settle it then.
+    /// storage. Nothing is left that could settle that round then, whatever
+    /// storage still holds for others.
     pub fn stuck(&self) -> Option<Rounds> {
         self.with(|store| {
             store
                 .rows
                 .last()
                 .copied()
-                .filter(|last| store.at_rest && last.unsettled > 0 && last.pending == 0)
+                .filter(|last| store.at_rest && last.stuck > 0)
         })
     }
 }

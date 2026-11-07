@@ -212,9 +212,9 @@ pub fn teardown_end_violations(rounds: &RoundEvidence) -> Vec<EndViolation> {
             property: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
             expected: "a released round settles before the run comes to rest".to_owned(),
             actual: format!(
-                "the run came to rest after step {} with {} released rounds unsettled and no \
-                 call that holds their headers pending",
-                last.step, last.unsettled
+                "the run came to rest after step {} with {} released rounds unsettled and \
+                 no call that holds their headers pending",
+                last.step, last.stuck
             ),
         })
         .into_iter()
@@ -319,7 +319,7 @@ mod tests {
         Rounds {
             released: u64,
             unsettled: usize,
-            pending: usize,
+            stuck: usize,
         },
         Broke(Claim),
     }
@@ -359,12 +359,12 @@ mod tests {
                 Some(Scripted::Rounds {
                     released,
                     unsettled,
-                    pending,
+                    stuck,
                 }) => self.probe.rounds.record(Rounds {
                     step,
                     released,
                     unsettled,
-                    pending,
+                    stuck,
                 }),
                 Some(Scripted::Broke(claim)) => {
                     self.probe.claims.record(ClaimRecord {
@@ -376,7 +376,7 @@ mod tests {
                         step,
                         released: 1,
                         unsettled: 0,
-                        pending: 0,
+                        stuck: 0,
                     });
                 }
                 None => {}
@@ -496,17 +496,17 @@ mod tests {
                 Scripted::Rounds {
                     released: 0,
                     unsettled: 0,
-                    pending: 0,
+                    stuck: 0,
                 },
                 Scripted::Rounds {
                     released: 1,
                     unsettled: 1,
-                    pending: 1,
+                    stuck: 0,
                 },
                 Scripted::Rounds {
                     released: 1,
                     unsettled: 0,
-                    pending: 0,
+                    stuck: 0,
                 },
             ],
         );
@@ -518,7 +518,8 @@ mod tests {
 
     /// A run that ends with a released round unsettled is inconclusive
     /// while storage still holds a call with its headers, and violated once
-    /// it came to rest with none, since nothing can settle the round then.
+    /// it came to rest with a round that has none, since nothing can settle
+    /// that round then, whatever another round still waits on.
     #[test]
     fn a_run_ending_with_an_unsettled_round_is_judged_by_its_pending_calls() {
         let report = run_property(
@@ -526,7 +527,7 @@ mod tests {
             &[Scripted::Rounds {
                 released: 1,
                 unsettled: 1,
-                pending: 1,
+                stuck: 0,
             }],
         );
         assert!(matches!(report.end.outcome, Outcome::Idle { .. }));
@@ -541,7 +542,7 @@ mod tests {
             &[Scripted::Rounds {
                 released: 1,
                 unsettled: 1,
-                pending: 0,
+                stuck: 1,
             }],
         );
         assert!(matches!(
@@ -552,6 +553,20 @@ mod tests {
             report.properties[0].violations[0].expected,
             "a released round settles before the run comes to rest"
         );
+        // One round's call still pending doesn't hide another round that
+        // nothing can settle.
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[Scripted::Rounds {
+                released: 2,
+                unsettled: 2,
+                stuck: 1,
+            }],
+        );
+        assert!(matches!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated { .. }
+        ));
     }
 
     /// Each round settlement claim violates at the step whose drain found
@@ -573,7 +588,7 @@ mod tests {
                     Scripted::Rounds {
                         released: 1,
                         unsettled: 0,
-                        pending: 0,
+                        stuck: 0,
                     },
                     Scripted::Broke(claim),
                 ],

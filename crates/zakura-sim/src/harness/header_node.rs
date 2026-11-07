@@ -681,6 +681,12 @@ async fn flood(far: FarEnd) {
 /// as its dialer, all of them once per scheduling step, until the node's
 /// shutdown. Each relink replaces the mirror's session, so the node's
 /// lifecycle queue takes a disconnect and a connect for it every time.
+///
+/// Opening a link has scheduling points, so a `Shutdown` can be picked and
+/// sweep the node's links while one is half open. The sweep then misses
+/// it, so a relink that returns after the pick closes its own link and
+/// stops. The pick sets [`Topology::stopping`] before the sweep runs, so a
+/// link the check passes is already in the sweep's copy.
 async fn churn(topology: Rc<Topology>, mut starts: mpsc::Receiver<usize>) {
     let mut churning = Vec::new();
     loop {
@@ -693,11 +699,15 @@ async fn churn(topology: Rc<Topology>, mut starts: mpsc::Receiver<usize>) {
         while let Ok(index) = starts.try_recv() {
             churning.push(index);
         }
-        if topology.stopping() {
-            return;
-        }
         for &index in &churning {
-            topology.link(index, 0);
+            if topology.stopping() {
+                return;
+            }
+            let link = topology.link(index, 0);
+            if topology.stopping() {
+                link.close();
+                return;
+            }
         }
         zakura_rt::task::yield_now().await;
     }
@@ -1217,12 +1227,14 @@ impl Control {
                     ControlAction::Flood => topology.flood(&step.peer),
                     ControlAction::Churn => {
                         let index = topology.index(&step.peer);
-                        to_churn
+                        // The churn task stops at a shutdown, which can be
+                        // picked while this step waits in the queue. Its
+                        // mirror then has nothing left to churn.
+                        let _ = to_churn
                             .as_ref()
                             .expect("a script with a churn step spawns the churn task")
                             .send(index)
-                            .await
-                            .expect("the churn task outlives the run");
+                            .await;
                     }
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }

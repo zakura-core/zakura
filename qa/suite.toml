@@ -126,6 +126,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/replay_exact.rs"
+test = "regenerate_discovery_book_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed input from the witness zakura-network encodes"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false

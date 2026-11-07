@@ -20,9 +20,9 @@ mod serving;
 mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{
-    trace_discovery_book_bytes, trace_discovery_state_bytes, AdmittedFact, BookEntryFact, BookFact,
-    BookStep, BookView, DiscoverySessionStep, DriverFailure, EvictionFact, HintFact, ImportFact,
-    InstallFact, SessionView,
+    discovery_book_witness_bytes, trace_discovery_book_bytes, trace_discovery_state_bytes,
+    AdmittedFact, BookEntryFact, BookFact, BookStep, BookView, DiscoverySessionStep, DriverFailure,
+    EvictionFact, HintFact, ImportFact, InstallFact, SessionView,
 };
 mod trace;
 mod verified;

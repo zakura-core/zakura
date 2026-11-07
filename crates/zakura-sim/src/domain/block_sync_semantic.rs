@@ -337,6 +337,11 @@ pub struct SemanticModel {
     /// Whether such a completion released a submission whose height the
     /// frontier had already passed.
     pub saw_room_freed_past_frontier: bool,
+    /// Whether such a past-frontier release freed room for a submission
+    /// whose owner's body work epoch is older than the reactor's authority.
+    /// Block sync credits that completion to no current owner, so only the
+    /// sequencer's room check, #1523's fix, wakes the waiting body.
+    pub saw_old_epoch_room_freed_past_frontier: bool,
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
@@ -378,9 +383,10 @@ struct StepChanges {
     detached: BTreeSet<u64>,
     /// Releases that freed room beside an eligible body, as
     /// [`SemanticModel::note_room`] judged each then: the released token,
-    /// the release's position, the body's height and
-    /// [`RoomFreed::past_frontier`].
-    rooms: Vec<(u64, usize, u32, bool)>,
+    /// the release's position, the body's height,
+    /// [`RoomFreed::past_frontier`], and whether the released submission's
+    /// owner was older than the reactor's authority.
+    rooms: Vec<(u64, usize, u32, bool, bool)>,
     /// Tokens whose last holder the step released. The model keeps their
     /// submissions and stale completions until [`STALE_COMPLETION_INERT`]
     /// judges the step's releases.
@@ -680,11 +686,8 @@ impl SemanticModel {
                                 self.queued_decoded_peak.max(self.queued_decoded());
                         } else {
                             self.queued.remove(allocation);
-                            self.saw_old_epoch_body_dequeued |= body
-                                .owner
-                                .body_work_epoch
-                                .zip(self.authority_epoch)
-                                .is_some_and(|(owned, current)| owned < current);
+                            self.saw_old_epoch_body_dequeued |=
+                                self.older_than_authority(body.owner.body_work_epoch);
                         }
                     }
                     BlockSyncHolder::Applying { allocation } => {
@@ -730,7 +733,8 @@ impl SemanticModel {
                             if *counts == (0, 0) {
                                 self.pending.emptied.insert(*token);
                             }
-                            self.note_room(*token, held_before, at, past_frontier);
+                            let old_epoch = self.older_than_authority(body.owner.body_work_epoch);
+                            self.note_room(*token, held_before, at, past_frontier, old_epoch);
                         } else if *counts == (0, 0) && !self.pending.emptied.contains(token) {
                             self.submissions.remove(token);
                         }
@@ -992,14 +996,31 @@ impl SemanticModel {
     /// admits the next body, so only the count limit held it back. The
     /// release is judged before the rest of its step, since a sequencer
     /// that wakes the body submits it in the same step.
-    fn note_room(&mut self, token: u64, held_before: u64, at: usize, past_frontier: bool) {
+    fn note_room(
+        &mut self,
+        token: u64,
+        held_before: u64,
+        at: usize,
+        past_frontier: bool,
+        old_epoch: bool,
+    ) {
         let limit = self.limit();
         if self.closed || held_before < limit || self.in_flight() >= limit || self.attached() > 0 {
             return;
         }
         if let Some(height) = self.eligible() {
-            self.pending.rooms.push((token, at, height, past_frontier));
+            self.pending
+                .rooms
+                .push((token, at, height, past_frontier, old_epoch));
         }
+    }
+
+    /// Whether an owner of body work epoch `epoch` is older than the
+    /// reactor's authority.
+    fn older_than_authority(&self, epoch: Option<u64>) -> bool {
+        epoch
+            .zip(self.authority_epoch)
+            .is_some_and(|(owned, current)| owned < current)
     }
 
     /// Records `step`'s [`CAPACITY_RELEASE_WAKES`] trigger: the first room
@@ -1011,9 +1032,10 @@ impl SemanticModel {
             .rooms
             .iter()
             .find(|(token, ..)| !changes.detached.contains(token));
-        if let Some(&(_, at, height, past_frontier)) = room {
+        if let Some(&(_, at, height, past_frontier, old_epoch)) = room {
             self.saw_room_freed = true;
             self.saw_room_freed_past_frontier |= past_frontier;
+            self.saw_old_epoch_room_freed_past_frontier |= past_frontier && old_epoch;
             self.rooms.push(RoomFreed {
                 step,
                 at,

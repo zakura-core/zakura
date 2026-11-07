@@ -185,6 +185,7 @@ fn bypasses_follow_their_committed_input() {
         patches,
         [
             "qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation.patch",
+            "qa/planted/header-sync/teardown-returns-baseline/forgotten-completion.patch",
             "qa/planted/header-sync/teardown-returns-baseline/forgotten-retained-headers.patch",
             "qa/planted/header-sync/teardown-returns-baseline/kept-queue-lease.patch",
             "qa/planted/header-sync/teardown-returns-baseline/leaked-lease-clone.patch",

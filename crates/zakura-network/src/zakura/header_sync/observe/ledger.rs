@@ -912,15 +912,34 @@ impl HeaderWorkLedger {
     pub fn unsettled_rounds(&self) -> usize {
         self.released
             .iter()
-            .filter(|incarnation| {
-                self.started.contains_key(incarnation)
-                    || self.calls.values().any(|call| {
-                        !call.handled
-                            && call.end != Some(CallEnd::Dropped)
-                            && call
-                                .held
-                                .as_ref()
-                                .is_some_and(|held| held.incarnation == **incarnation)
+            .filter(|incarnation| self.unsettled(**incarnation))
+            .count()
+    }
+
+    /// Whether released round `incarnation` hasn't settled, as
+    /// [`unsettled_rounds`](Self::unsettled_rounds) counts it.
+    fn unsettled(&self, incarnation: u64) -> bool {
+        self.started.contains_key(&incarnation)
+            || self.calls.values().any(|call| {
+                !call.handled
+                    && call.end != Some(CallEnd::Dropped)
+                    && call
+                        .held
+                        .as_ref()
+                        .is_some_and(|held| held.incarnation == incarnation)
+            })
+    }
+
+    /// How many calls that hold an unsettled round's headers haven't ended,
+    /// so storage may still answer them and settle the round.
+    pub fn pending_unsettled_calls(&self) -> usize {
+        self.calls
+            .values()
+            .filter(|call| {
+                call.end.is_none()
+                    && call.held.as_ref().is_some_and(|held| {
+                        self.released.contains(&held.incarnation)
+                            && self.unsettled(held.incarnation)
                     })
             })
             .count()

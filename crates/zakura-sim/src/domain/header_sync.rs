@@ -10,7 +10,7 @@ use crate::{
         claim::{Claim, ClaimEvidence, RoundEvidence},
     },
     property::{
-        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
+        CheckCtx, EndViolation, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
         TriggerHistory, Unit, Verdict,
     },
     ObservationLog,
@@ -167,7 +167,11 @@ where
 /// `OpenOwnership`, and any break the step's drain found violates.
 ///
 /// It applies once the queue released a round. A run that ends with a
-/// released round unsettled, its leases not all back, is inconclusive.
+/// released round unsettled is inconclusive while storage still holds a
+/// call with that round's headers or the drain was cut off at its bound,
+/// since that call could still settle it. A run that ends at rest, idle or
+/// with its drain run dry, with no such call pending can never settle it,
+/// so [`teardown_end_violations`] violates it then.
 fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -195,6 +199,28 @@ where
     }
 }
 
+/// [`TEARDOWN_RETURNS_BASELINE`]'s violation at the run's end: a released
+/// round left unsettled when the run came to rest with no call that holds
+/// its headers still pending in storage, as [`RoundEvidence::stuck`]
+/// finds. A harness whose view is a [`TeardownView`] reports these from
+/// [`HasView::end_violations`], after it handed the run's end to
+/// [`RoundEvidence::end`].
+pub fn teardown_end_violations(rounds: &RoundEvidence) -> Vec<EndViolation> {
+    rounds
+        .stuck()
+        .map(|last| EndViolation {
+            property: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
+            expected: "a released round settles before the run comes to rest".to_owned(),
+            actual: format!(
+                "the run came to rest after step {} with {} released rounds unsettled and no \
+                 call that holds their headers pending",
+                last.step, last.unsettled
+            ),
+        })
+        .into_iter()
+        .collect()
+}
+
 /// [`TEARDOWN_RETURNS_BASELINE`]'s trigger history: the queue released a
 /// round.
 fn round_released<V: TeardownView>(view: &V, _: &ObservationLog) -> bool {
@@ -217,8 +243,8 @@ mod tests {
     use zakura_network::zakura::observe::HEADER_CHUNK_BUDGET_CAPACITY;
 
     use super::{
-        chunk_budget_bound, teardown_returns_baseline, BudgetView, TeardownView,
-        CHUNK_BUDGET_CAPACITY,
+        chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
+        EndViolation, TeardownView, CHUNK_BUDGET_CAPACITY,
     };
     use crate::{
         harness::header_node::{
@@ -228,7 +254,7 @@ mod tests {
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunReport, Sim,
+        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim,
     };
 
     /// The model's capacity is production's.
@@ -272,6 +298,16 @@ mod tests {
         fn view(&self) -> Probe {
             self.clone()
         }
+
+        /// Keeps the run's end for the teardown rule.
+        fn ended(&self, end: &RunEnd) {
+            self.rounds.end(end);
+        }
+
+        /// [`teardown_end_violations`].
+        fn end_violations(&self, _: &ObservationLog) -> Vec<EndViolation> {
+            teardown_end_violations(&self.rounds)
+        }
     }
 
     /// One boundary's scripted evidence: a read of claimed headers, an
@@ -280,7 +316,11 @@ mod tests {
     enum Scripted {
         Read(usize),
         Unread(BoundaryRead),
-        Rounds { released: u64, unsettled: usize },
+        Rounds {
+            released: u64,
+            unsettled: usize,
+            pending: usize,
+        },
         Broke(Claim),
     }
 
@@ -319,10 +359,12 @@ mod tests {
                 Some(Scripted::Rounds {
                     released,
                     unsettled,
+                    pending,
                 }) => self.probe.rounds.record(Rounds {
                     step,
                     released,
                     unsettled,
+                    pending,
                 }),
                 Some(Scripted::Broke(claim)) => {
                     self.probe.claims.record(ClaimRecord {
@@ -334,6 +376,7 @@ mod tests {
                         step,
                         released: 1,
                         unsettled: 0,
+                        pending: 0,
                     });
                 }
                 None => {}
@@ -453,14 +496,17 @@ mod tests {
                 Scripted::Rounds {
                     released: 0,
                     unsettled: 0,
+                    pending: 0,
                 },
                 Scripted::Rounds {
                     released: 1,
                     unsettled: 1,
+                    pending: 1,
                 },
                 Scripted::Rounds {
                     released: 1,
                     unsettled: 0,
+                    pending: 0,
                 },
             ],
         );
@@ -470,21 +516,41 @@ mod tests {
         );
     }
 
-    /// A run that ends with a released round unsettled is inconclusive.
+    /// A run that ends with a released round unsettled is inconclusive
+    /// while storage still holds a call with its headers, and violated once
+    /// it came to rest with none, since nothing can settle the round then.
     #[test]
-    fn a_run_ending_with_an_unsettled_round_is_inconclusive() {
+    fn a_run_ending_with_an_unsettled_round_is_judged_by_its_pending_calls() {
         let report = run_property(
             teardown_returns_baseline(),
             &[Scripted::Rounds {
                 released: 1,
                 unsettled: 1,
+                pending: 1,
             }],
         );
+        assert!(matches!(report.end.outcome, Outcome::Idle { .. }));
         assert_eq!(
             report.properties[0].outcome,
             PropertyOutcome::Inconclusive {
                 reason: "teardown-open".to_owned()
             }
+        );
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[Scripted::Rounds {
+                released: 1,
+                unsettled: 1,
+                pending: 0,
+            }],
+        );
+        assert!(matches!(
+            report.properties[0].outcome,
+            PropertyOutcome::Violated { .. }
+        ));
+        assert_eq!(
+            report.properties[0].violations[0].expected,
+            "a released round settles before the run comes to rest"
         );
     }
 
@@ -507,6 +573,7 @@ mod tests {
                     Scripted::Rounds {
                         released: 1,
                         unsettled: 0,
+                        pending: 0,
                     },
                     Scripted::Broke(claim),
                 ],

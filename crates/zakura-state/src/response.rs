@@ -173,10 +173,11 @@ pub enum Response {
 /// The result of checking a candidate block's external inputs against its parent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParentInputs {
-    /// Every input is unspent at the parent, with the output each one spends.
+    /// Every input is unspent at the parent, with the outputs that fit the retention budget.
     ///
     /// The block verifier hands these outputs to its transaction checks, so they are read once
-    /// per block. The map holds each output once while the block verifies, in addition to the
+    /// per block when retained. An absent entry must be looked up again, not treated as missing.
+    /// The map holds each retained output once while the block verifies, in addition to the
     /// copies the transaction checks make of the outputs they spend. Its locking scripts are
     /// capped per check, see `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
     Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
@@ -185,8 +186,7 @@ pub enum ParentInputs {
     /// The parent is neither in a non-finalized chain nor the finalized tip,
     /// so no chain can accept the candidate now.
     ParentUnavailable,
-    /// The state could not decide, for example because the parent context changed during the read,
-    /// or every input was found but their outputs were too large to keep.
+    /// The state could not decide, for example because the parent context changed during the read.
     Inconclusive,
 }
 

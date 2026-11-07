@@ -64,7 +64,7 @@ use crate::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
     server::error::{LegacyCode, MapError, OkOrError},
-    MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
+    EarlyMinedBlock, EarlyMinedBlockChannel, PendingBlockRegistry,
 };
 
 use constants::{
@@ -819,7 +819,7 @@ where
 
     /// A channel to send successful block submissions to the block gossip task,
     /// so they can be advertised to peers.
-    mined_block_sender: mpsc::UnboundedSender<MinedBlockEvent>,
+    mined_block_sender: mpsc::UnboundedSender<EarlyMinedBlock>,
 
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
@@ -856,7 +856,7 @@ where
         conf: config::mining::Config,
         block_verifier_router: BlockVerifierRouter,
         sync_status: SyncStatus,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> Self {
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
@@ -865,7 +865,7 @@ where
             prepared_candidates: PreparedCandidateResolver::default(),
             sync_status,
             mined_block_sender: mined_block_sender
-                .unwrap_or(SubmitBlockChannel::default().sender()),
+                .unwrap_or(EarlyMinedBlockChannel::default().sender()),
             pending_blocks: PendingBlockRegistry::default(),
             mined_submissions: Default::default(),
             optimistic_block_inventory,
@@ -938,7 +938,7 @@ where
     }
 
     /// Returns a sender for the owned mined-block lifecycle task.
-    pub fn mined_block_sender(&self) -> mpsc::UnboundedSender<MinedBlockEvent> {
+    pub fn mined_block_sender(&self) -> mpsc::UnboundedSender<EarlyMinedBlock> {
         self.mined_block_sender.clone()
     }
 

@@ -11,7 +11,15 @@ independently.
 
 ## [Unreleased]
 
-## [1.8.4] - 2026-11-05
+## [1.8.4] - 2026-11-06
+
+### Added
+
+- Added an optional loopback-only raw trace endpoint. `GET /traces` lists the
+  JSONL trace tables, and `GET /traces/<table>` streams one table with standard
+  HTTP byte ranges and an `ETag`, so collectors can follow a growing table with
+  `If-Range`. It is disabled by default and requires `trace_dir`
+  ([#2072](https://github.com/zakura-core/zakura/pull/2072)).
 
 ### Changed
 
@@ -28,8 +36,18 @@ independently.
 - Classify the compatible performance improvements and fee recommendation
   increase as a patch node release; library crates retain their independent
   version requirements ([#2074](https://github.com/zakura-core/zakura/pull/2074)).
+- Raised the default `advert_window_min` and `advert_window_max` from 32 and 64
+  to 1000, so every block is advertised to up to 1000 peers at once. Relayed
+  blocks previously reached the last peers 9 to 12 s late in 3 s waves. Config
+  files that still hold the previous defaults, such as files made by
+  `zakurad generate`, now load as the new defaults. Other configured values are
+  kept ([#2078](https://github.com/zakura-core/zakura/pull/2078)).
+- Reduced how long the legacy block advertiser waits for a peer to request an
+  advertised block from 3 s to 2 s, so peers that already have the block hold
+  up new-block fan-out for less time
+  ([#2079](https://github.com/zakura-core/zakura/pull/2079)).
 
-<!-- release-readiness: allow-patch; reason: The v1.8.4 Changed entries are compatible performance improvements in #2022 and #2048 and a higher getstandardfee recommendation in #2060 that preserves the RPC shape and the mempool acceptance fee. Library crates retain their independently required SemVer bumps. -->
+<!-- release-readiness: allow-patch; reason: The v1.8.4 Changed entries are compatible performance improvements in #2022 and #2048 and a higher getstandardfee recommendation in #2060 that preserves the RPC shape and the mempool acceptance fee, plus the block advert window and wait tuning in #2078 and #2079, whose configuration fields are unchanged. The only Added entry, #2072, is an opt-in, disabled-by-default trace endpoint. Library crates retain their independently required SemVer bumps. -->
 
 ### Fixed
 
@@ -57,6 +75,16 @@ independently.
   reserves the service only once its streams are open. The connection's first
   session opens also end at once when the node closes the connection
   ([#2014](https://github.com/zakura-core/zakura/pull/2014)).
+- Reduced `getblocktemplate` transaction-selection work for large mempools by
+  avoiding repeated rebuilds of fee-sampling weights
+  ([#2054](https://github.com/zakura-core/zakura/pull/2054)).
+- Fixed maintained Zakura redials that credited connection setup time toward
+  a healthy connection, and an alternate connection that lifted the ten-minute
+  ALPN-mismatch backoff
+  ([#2062](https://github.com/zakura-core/zakura/pull/2062)).
+- Reduced redundant block and transaction decoding when fetching inventory over
+  Zakura compatibility streams
+  ([#2057](https://github.com/zakura-core/zakura/pull/2057)).
 
 ## [1.8.3] - 2026-11-05
 

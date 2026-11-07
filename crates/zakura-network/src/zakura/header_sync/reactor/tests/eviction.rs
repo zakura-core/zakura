@@ -1,5 +1,8 @@
 use super::*;
-use crate::zakura::transport::FramedRecv;
+use crate::zakura::{
+    header_sync::HeaderSyncService, transport::FramedRecv, Service, ServicePeerDirection,
+    SessionDemand, ZAKURA_CAP_HEADER_SYNC,
+};
 use tokio::time;
 
 /// One admitted header-sync session with the state needed to drive it unproductive.
@@ -12,7 +15,7 @@ struct EvictionFixture {
     /// Kept alive so the session's outbound queue never fails for want of a reader.
     _outbound: FramedRecv,
     _snapshots_tx: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
-    _handle: HeaderSyncHandle,
+    handle: HeaderSyncHandle,
 }
 
 fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> EvictionFixture {
@@ -42,7 +45,7 @@ fn eviction_fixture(max_unproductive_header_requests: u32, session_id: u64) -> E
         cancel,
         _outbound: outbound,
         _snapshots_tx: snapshots_tx,
-        _handle: handle,
+        handle,
     }
 }
 
@@ -412,6 +415,153 @@ async fn a_dropped_peer_is_refused_readmission_until_its_cooldown_expires() {
         Some(0),
         "a readmitted peer starts from a clean count"
     );
+}
+
+/// A peer that redials late in its cooldown is re-offered when the cooldown
+/// ends, not one fixed back-off after its redial. Maintenance wakes at the
+/// cooldown's end and republishes it, which wakes the header service's demand.
+#[tokio::test(start_paused = true)]
+async fn a_redial_late_in_the_cooldown_reopens_when_it_ends() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = std::time::Duration::from_secs(15);
+    let second = std::time::Duration::from_secs(1);
+    fixture.reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let ends = Instant::now() + cooldown;
+    fixture.time_out_one_request(7);
+    assert!(!fixture.is_admitted());
+
+    time::advance(cooldown - second).await;
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = || {
+        service.session_demand(
+            1,
+            &fixture.peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    let SessionDemand::WaitForChange(mut reopen) = demand() else {
+        panic!("the service waits for the reactor to end the cooldown");
+    };
+    assert!(futures::poll!(&mut reopen).is_pending());
+    assert_eq!(
+        fixture.reactor.next_maintenance_deadline(),
+        ends,
+        "maintenance wakes when the cooldown ends"
+    );
+
+    time::advance(second).await;
+    fixture.reactor.refresh_statuses();
+    assert!(
+        futures::poll!(&mut reopen).is_ready(),
+        "republishing the cooldown's end wakes the parked demand"
+    );
+    assert!(matches!(demand(), SessionDemand::OpenNow));
+    assert!(
+        fixture.reactor.next_maintenance_deadline() > Instant::now(),
+        "a pruned cooldown doesn't wake maintenance again"
+    );
+}
+
+/// A cooldown that a later fault extends holds until its new end. The
+/// cached end still wakes maintenance at the original deadline, which
+/// refuses the peer, keeps the parked demand waiting, and moves the next
+/// wake to the new end. An unrelated publication doesn't wake the demand.
+#[tokio::test(start_paused = true)]
+async fn an_extended_cooldown_holds_through_its_original_end() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = std::time::Duration::from_secs(15);
+    let extended_after = std::time::Duration::from_secs(5);
+    fixture.reactor.startup.config.unproductive_peer_cooldown = cooldown;
+    let first_end = Instant::now() + cooldown;
+    let extended_end = first_end + extended_after;
+    fixture.time_out_one_request(7);
+
+    time::advance(extended_after).await;
+    fixture
+        .reactor
+        .state
+        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = || {
+        service.session_demand(
+            1,
+            &fixture.peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    let SessionDemand::WaitForChange(mut reopen) = demand() else {
+        panic!("the service waits for the reactor to end the cooldown");
+    };
+    assert_eq!(fixture.reactor.next_maintenance_deadline(), first_end);
+
+    time::advance(first_end - Instant::now()).await;
+    fixture.reactor.refresh_statuses();
+    fixture.reactor.publish_peer_state();
+    assert!(fixture
+        .reactor
+        .state
+        .readmission_refused(&fixture.peer, Instant::now()));
+    assert!(
+        futures::poll!(&mut reopen).is_pending(),
+        "the original end and an unrelated publication keep the demand parked"
+    );
+    assert_eq!(
+        fixture.reactor.next_maintenance_deadline(),
+        extended_end,
+        "the original end's wake moves the next one to the extended end"
+    );
+
+    time::advance(extended_after).await;
+    fixture.reactor.refresh_statuses();
+    assert!(futures::poll!(&mut reopen).is_ready());
+    assert!(matches!(demand(), SessionDemand::OpenNow));
+}
+
+/// The published backed-off set is sorted, which the header service's binary
+/// search relies on. Every cooled peer is found and parked, and a peer that
+/// sorts between them is not.
+#[tokio::test(start_paused = true)]
+async fn the_backed_off_set_is_sorted_for_the_services_search() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let mut peers: Vec<_> = (0x60_u8..0x90)
+        .map(|byte| ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has 32 bytes"))
+        .filter(|peer| node_id_from_peer(peer).is_some())
+        .take(5)
+        .collect();
+    assert_eq!(peers.len(), 5, "enough test bytes decode as node IDs");
+    let open = peers.remove(2);
+    for peer in peers.iter().rev() {
+        fixture
+            .reactor
+            .state
+            .start_readmission_cooldown(peer, Instant::now(), cooldown);
+    }
+    fixture.reactor.publish_peer_state();
+
+    let published = fixture
+        .reactor
+        .candidates
+        .borrow()
+        .backed_off_node_ids
+        .clone();
+    assert_eq!(published.len(), peers.len());
+    assert!(published.windows(2).all(|pair| pair[0] < pair[1]));
+    let service = HeaderSyncService::new(fixture.handle.clone());
+    let demand = |peer: &ZakuraPeerId| {
+        service.session_demand(
+            1,
+            peer,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+        )
+    };
+    for peer in &peers {
+        assert!(matches!(demand(peer), SessionDemand::WaitForChange(_)));
+    }
+    assert!(matches!(demand(&open), SessionDemand::OpenNow));
 }
 
 /// Fresh identities that each leave with a strike end the earliest holds

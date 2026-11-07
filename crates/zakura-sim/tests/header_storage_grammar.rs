@@ -240,6 +240,7 @@ fn hand_built_scenarios_round_trip() {
                     then: vec![Allow::Unavailable, Allow::Rejected],
                     deadline_ms: None,
                 }],
+                reply_holds: Vec::new(),
             },
             controls: vec![step(
                 "mirror-1",

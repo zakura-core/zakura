@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "12.1.0"
+version = "13.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -65,7 +65,6 @@ ripemd = { workspace = true }
 # Matches version used by hdwallet
 secp256k1 = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true, features = ["compress"] }
-uint = { workspace = true }
 bech32 = { workspace = true }
 zcash_script.workspace = true
 

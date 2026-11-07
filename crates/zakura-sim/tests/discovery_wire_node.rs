@@ -23,6 +23,7 @@ use zakura_sim::{
         header_sync::wire_config,
         NetScenario,
     },
+    model::Label,
     observe::TransportFact,
     peer::{
         discovery::{Answer, DiscoveryScript, Hold, Request},
@@ -224,10 +225,22 @@ fn an_answering_peer_runs_discovery_verify() {
         count(|obs| matches!(obs, Observation::PeerReceived { .. })) >= 3,
         "the node's Hello, GetPeers and GetServices"
     );
+    // disc-3.1's sender adapter labels each node frame a peer read.
     assert_eq!(
         count(|obs| matches!(obs, Observation::NodeFrame { .. })),
-        0,
-        "disc-3.1 labels the node's discovery frames"
+        count(|obs| matches!(obs, Observation::PeerReceived { .. })),
+    );
+    assert_eq!(
+        count(|obs| matches!(
+            obs,
+            Observation::NodeFrame {
+                label: Label::Conformant,
+                exhausted: false,
+                ..
+            }
+        )),
+        count(|obs| matches!(obs, Observation::NodeFrame { .. })),
+        "the node's frames follow the sender's rules"
     );
     assert_eq!(closes(&report), ["discovery_exchange_complete"]);
     let again = run_peers(Vec::new(), &peers);

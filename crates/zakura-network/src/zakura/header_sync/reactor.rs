@@ -508,8 +508,10 @@ impl HeaderSyncReactor {
             }
             // Retire already-ready state operations before any event can enforce
             // their hard deadlines. Bound this pass to the current operation set.
+            // A spent coop budget mustn't hide one. See `a_spent_budget_hides_no_ready_completion`.
             for _ in 0..self.pending_port_operations.len() {
-                let Some(Some(completion)) = self.pending_port_operations.next().now_or_never()
+                let Some(Some(completion)) =
+                    coop::unconstrained(self.pending_port_operations.next()).now_or_never()
                 else {
                     break;
                 };

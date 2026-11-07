@@ -13,8 +13,8 @@ use zakura_node_services::sync_lifecycle::{
 use super::*;
 use crate::service::{
     write::{
-        BlockWriteNotice, BlockWriteSender, BlockWriteTaskExit, FinalizedWriteReset, HeaderChainObservers,
-        NonFinalizedWriteMessage, WriteBlockWorkerTask,
+        BlockWriteNotice, BlockWriteSender, BlockWriteTaskExit, FinalizedWriteReset,
+        HeaderChainObservers, NonFinalizedWriteMessage, WriteBlockWorkerTask,
     },
     ChainTipSender,
 };

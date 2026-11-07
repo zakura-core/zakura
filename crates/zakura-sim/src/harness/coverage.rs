@@ -345,6 +345,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("uncapped-secondary-reservation"),
     },
     Coverage {
+        property: super::super::domain::header_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/header_teardown.rs",
+            "the_close_relink_input_holds_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("kept-queue-lease"),
+    },
+    Coverage {
         property: super::header_sync::HEADER_FAULT_PENALIZED,
         passing: passes(
             "tests/header_wire_prepare_fault.rs",

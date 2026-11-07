@@ -22,6 +22,7 @@ use zakura_sim::{
         self,
         header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
+            claim::RoundEvidence,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             reservation::ReservationEvidence,
             session::SessionEvidence,
@@ -206,9 +207,9 @@ fn the_close_relink_input_holds_chunk_budget_bound() {
     assert_eq!(result, Ok(()));
 }
 
-/// The witness's probe readings and full log depend only on scenario and
-/// plan: plan A twice in a row, then B, then A again, gives A's every time,
-/// and B's log differs.
+/// The witness's probe readings, its released rounds at each drain and its
+/// full log depend only on scenario and plan: plan A twice in a row, then B,
+/// then A again, gives A's every time, and B's log differs.
 #[test]
 fn the_capacity_witness_repeats_a_a_and_a_b_a() {
     let plans = inputs(3, 256);
@@ -216,10 +217,24 @@ fn the_capacity_witness_repeats_a_a_and_a_b_a() {
     let runs: Vec<(String, String)> = [&plans[1], &plans[1], &plans[2], &plans[1]]
         .into_iter()
         .map(|input| {
-            let (report, readings) = run(&scenario, input.clone());
+            let ports = Storage::prepare(&scenario);
+            let (capacity, rounds) = (ports.capacity.clone(), ports.rounds.clone());
+            let report = run_prepared::<Storage>(
+                &scenario,
+                ports,
+                input.clone(),
+                &mut MemorySink::default(),
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            assert!(
+                rounds.any_released(),
+                "the close releases a round: {:?}",
+                rounds.rows()
+            );
             (
                 format!("{:?}", report.log.entries()),
-                format!("{readings:?}"),
+                format!("{:?}\n{:?}", capacity.readings(), rounds.rows()),
             )
         })
         .collect();
@@ -233,12 +248,14 @@ fn the_capacity_witness_repeats_a_a_and_a_b_a() {
 const CHILD: &str = "ZAKURA_SIM_CAPACITY_TRACE";
 
 thread_local! {
-    /// The probe readings of the run [`capture_run`] last prepared.
-    static CAPTURED: RefCell<Option<CapacityEvidence>> = const { RefCell::new(None) };
+    /// The probe readings and released rounds of the run [`capture_run`]
+    /// last prepared.
+    static CAPTURED: RefCell<Option<(CapacityEvidence, RoundEvidence)>> =
+        const { RefCell::new(None) };
 }
 
-/// `header-sync/storage`'s own run, keeping its probe readings in
-/// [`CAPTURED`] for the replay to read.
+/// `header-sync/storage`'s own run, keeping its probe readings and released
+/// rounds in [`CAPTURED`] for the replay to read.
 fn capture_run(
     scenario: &Value,
     input: PlanInput,
@@ -247,21 +264,24 @@ fn capture_run(
     let scenario: StorageScenario =
         serde_json::from_value(scenario.clone()).map_err(HarnessError::Scenario)?;
     let ports = Storage::prepare(&scenario);
-    CAPTURED.with(|captured| *captured.borrow_mut() = Some(ports.capacity.clone()));
+    CAPTURED.with(|captured| {
+        *captured.borrow_mut() = Some((ports.capacity.clone(), ports.rounds.clone()));
+    });
     run_prepared::<Storage>(&scenario, ports, input, sink, None)
 }
 
-/// The probe readings [`capture_run`] last kept, as text.
+/// The probe readings and released rounds [`capture_run`] last kept, as
+/// text.
 fn captured() -> String {
-    let evidence = CAPTURED
+    let (capacity, rounds) = CAPTURED
         .with(|captured| captured.borrow_mut().take())
         .expect("the run prepared its ports");
-    format!("{:?}\n", evidence.readings())
+    format!("{:?}\n{:?}\n", capacity.readings(), rounds.rows())
 }
 
 /// The witness recorded under one plan in this process, then replayed
 /// exactly in a fresh process of the same test binary, gives the probe
-/// readings its recorded run gave.
+/// readings and released rounds its recorded run gave.
 #[test]
 fn the_capacity_witness_replays_in_a_fresh_process() {
     let entry = HarnessEntry {
@@ -330,6 +350,7 @@ fn probe_failure(
         SessionEvidence::default(),
         ReservationEvidence::default(),
         CapacityEvidence::default(),
+        RoundEvidence::default(),
     );
     sim.add_source(Box::new(tap));
     let nodes = spawn(&mut sim, &fixture, &observer);

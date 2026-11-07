@@ -315,12 +315,6 @@ owner = "P4a"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
 
 [[pending]]
-id = "header-sync/teardown-returns-baseline"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
 id = "header-sync/capacity-release-wakes"
 kind = "property"
 owner = "P4b"

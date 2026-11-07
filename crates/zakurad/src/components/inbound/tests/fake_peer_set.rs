@@ -1052,6 +1052,100 @@ async fn inbound_bad_coinbase_scores_and_requeues(missing: bool) -> Result<(), c
     Ok(())
 }
 
+/// Test that bodies under headers without real work leave the retry table for real blocks.
+///
+/// The retry table holds at most [`MAX_INBOUND_CONCURRENCY`] hashes per tip. A header without
+/// valid proof of work costs nothing to make, so each such junk body is scored but not retried.
+/// After a table's worth of junk, a poisoned real tip child is still re-requested.
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_junk_headers_leave_retry_capacity() -> Result<(), crate::BoxError> {
+    let (
+        inbound_service,
+        _mempool,
+        _committed_blocks,
+        _added_transactions,
+        mut tx_verifier,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        _sync_gossip_task_handle,
+        _tx_gossip_task_handle,
+        mut misbehavior_rx,
+        _syncer,
+    ) = setup_with_misbehavior_receiver(false).await;
+
+    let canonical: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.zcash_deserialize_into()?;
+
+    for junk in 0..MAX_INBOUND_CONCURRENCY {
+        // A changed nonce leaves the Equihash solution invalid for the header.
+        let mut body = (*canonical).clone();
+        body.transactions.clear();
+        let header = Arc::make_mut(&mut body.header);
+        let mut nonce = [0xA5; 32];
+        nonce[..8].copy_from_slice(&u64::try_from(junk)?.to_le_bytes());
+        header.nonce = nonce.into();
+        let body = Arc::new(body);
+        let junk_hash = body.hash();
+        let addr: PeerSocketAddr =
+            format!("127.0.{}.{}:8233", junk / 250, junk % 250 + 1).parse()?;
+
+        inbound_service
+            .clone()
+            .oneshot(Request::AdvertiseBlock(
+                junk_hash.into(),
+                Some(zakura_network::PeerSource::LegacySocket(addr)),
+            ))
+            .await?;
+        peer_set
+            .expect_request(Request::BlocksByHashFrom {
+                hashes: iter::once(junk_hash).collect(),
+                source: zakura_network::PeerSource::LegacySocket(addr),
+            })
+            .await
+            .respond(Response::Blocks(vec![Available((body.into(), Some(addr)))]));
+        let report = timeout(Duration::from_secs(5), misbehavior_rx.recv())
+            .await
+            .expect("idle inbound must process the junk download");
+        assert_eq!(report, Some((addr, 100)), "junk supplier {junk} is scored");
+    }
+
+    let block_hash = canonical.hash();
+    let poisoned = poison_coinbase_height(&canonical, Height(1));
+    let advertiser_addr: PeerSocketAddr = "127.0.9.1:8233".parse()?;
+    inbound_service
+        .clone()
+        .oneshot(Request::AdvertiseBlock(
+            block_hash.into(),
+            Some(zakura_network::PeerSource::LegacySocket(advertiser_addr)),
+        ))
+        .await?;
+    peer_set
+        .expect_request(Request::BlocksByHashFrom {
+            hashes: iter::once(block_hash).collect(),
+            source: zakura_network::PeerSource::LegacySocket(advertiser_addr),
+        })
+        .await
+        .respond(Response::Blocks(vec![Available((
+            poisoned.into(),
+            Some(advertiser_addr),
+        ))]));
+    let report = timeout(Duration::from_secs(5), misbehavior_rx.recv())
+        .await
+        .expect("idle inbound must process the poisoned download");
+    assert_eq!(report, Some((advertiser_addr, 100)));
+
+    // The junk spent no retry slot, so the real block is re-requested.
+    peer_set
+        .expect_request(Request::BlocksByHash(iter::once(block_hash).collect()))
+        .await
+        .respond(Response::Blocks(vec![Available((canonical.into(), None))]));
+
+    tx_verifier.expect_no_requests().await;
+
+    Ok(())
+}
+
 /// Test that a poisoned parent recovery scores its supplying peer without re-requesting the parent.
 ///
 /// A re-request would be an ordinary download, outside the recovery bounds.

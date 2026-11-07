@@ -156,8 +156,9 @@ impl GossipedBlockDownloadDriver {
                     }
 
                     // A failed parent recovery is left to the syncer. A re-request would
-                    // leave the recovery bounds, because it is an ordinary download.
-                    if !mismatch.parent_recovery {
+                    // leave the recovery bounds, because it is an ordinary download. A header
+                    // without real work names no block worth a slot in the retry table.
+                    if !mismatch.parent_recovery && mismatch.header_has_work {
                         // The outcome, including a replacement refused by the queue bounds,
                         // is logged by `retry_poisoned` itself.
                         let _ = downloads.retry_poisoned(mismatch.hash);

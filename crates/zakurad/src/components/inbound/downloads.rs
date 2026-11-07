@@ -52,6 +52,34 @@ pub struct GossipedUnboundHeight {
     ///
     /// A failed recovery is left to the syncer, so it stays within [`MAX_PARENT_RECOVERIES`].
     pub parent_recovery: bool,
+
+    /// Whether the header carries the work of a real block, so its hash is worth re-requesting.
+    ///
+    /// A header without that work costs nothing to make. Its body must not spend a slot in the
+    /// bounded retry table, or junk could leave no slot for the next real block.
+    pub header_has_work: bool,
+}
+
+/// Returns whether `header` carries the work a real block needs: a target within the Mainnet
+/// admission floor, and valid proof of work on `network`.
+///
+/// `height` is the height the header's checks run at. The floor is height-independent once our
+/// tip passes it, and proof of work uses the height only for network upgrade rules.
+async fn header_has_work(
+    header: block::Header,
+    hash: block::Hash,
+    network: Network,
+    tip_height: Option<block::Height>,
+    height: block::Height,
+) -> bool {
+    if !has_sufficient_work(&network, tip_height, height, header.difficulty_threshold) {
+        return false;
+    }
+    tokio::task::spawn_blocking(move || {
+        zakura_consensus::proof_of_work_is_valid(&header, &network, &height, &hash)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Source key used for inbound block download ordering.
@@ -974,11 +1002,20 @@ where
                 if let Some(feedback) = &supplier_feedback {
                     feedback.reject();
                 }
+                let header_has_work = header_has_work(
+                    *block.header(),
+                    hash,
+                    chain_network.clone(),
+                    tip_height,
+                    tip_height.map_or(block::Height(0), |tip| tip.next().unwrap_or(tip)),
+                )
+                .await;
                 return Err((
                     BoxError::from(GossipedUnboundHeight {
                         height: None,
                         hash,
                         parent_recovery: kind == DownloadKind::ParentRecovery,
+                        header_has_work,
                     }),
                     advertiser_addr,
                 ));
@@ -1009,11 +1046,20 @@ where
                 if let Some(feedback) = &supplier_feedback {
                     feedback.reject();
                 }
+                let header_has_work = header_has_work(
+                    *block.header(),
+                    hash,
+                    chain_network.clone(),
+                    tip_height,
+                    block_height,
+                )
+                .await;
                 return Err((
                     BoxError::from(GossipedUnboundHeight {
                         height: Some(block_height),
                         hash,
                         parent_recovery: kind == DownloadKind::ParentRecovery,
+                        header_has_work,
                     }),
                     advertiser_addr,
                 ));

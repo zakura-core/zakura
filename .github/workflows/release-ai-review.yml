@@ -3,6 +3,7 @@ name: Release AI review
 on:
   workflow_run: # zizmor: ignore[dangerous-triggers] -- default-branch code only; revalidates same-repository release PR metadata; reviewed Git objects are never checked out or executed
     workflows: [Release AI review request]
+    branches: ['release/v*']
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -33,7 +34,11 @@ env:
 
 jobs:
   resolve:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        startsWith(github.event.workflow_run.head_branch, 'release/v')))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

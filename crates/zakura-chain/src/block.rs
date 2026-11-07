@@ -1,12 +1,19 @@
 //! Blocks and block-related structures (heights, headers, etc.)
 
-use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    ops::{Deref, Neg},
+    sync::Arc,
+};
+
+use ref_cast::RefCast;
 
 use halo2::pasta::pallas;
 
 use crate::{
     amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed},
-    block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
+    block::merkle::{auth_digest_or_placeholder, AuthDataRoot, AUTH_DIGEST_PLACEHOLDER},
     fmt::DisplayToDebug,
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
@@ -15,10 +22,13 @@ use crate::{
     sapling,
     serialization::TrustedPreallocate,
     sprout,
-    transaction::Transaction,
+    transaction::{self, AuthDigest, Transaction, UnminedTxId, WtxId},
     transparent,
     value_balance::{ValueBalance, ValueBalanceError},
 };
+
+/// The smallest transaction count that repays parallel hashing overhead in measured block mixes.
+const PARALLEL_TRANSACTION_HASHES_MIN: usize = 64;
 
 mod commitment;
 mod error;
@@ -65,6 +75,66 @@ pub struct Block {
     pub transactions: Vec<Arc<Transaction>>,
 }
 
+/// A block's ZIP-244 authorizing-data digests, in block order, from
+/// [`BlockRef::auth_data_digests`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthDataDigests {
+    /// Each transaction's authorizing-data digest, `None` before v5.
+    digests: Vec<Option<AuthDigest>>,
+    /// The ZIP-244 authorizing-data root over `digests`.
+    pub root: AuthDataRoot,
+}
+
+impl AuthDataDigests {
+    /// Each transaction's unmined ID, pairing `hashes` with these digests in block order.
+    ///
+    /// # Panics
+    ///
+    /// If `hashes` is not the same block's [`BlockRef::transaction_hashes`].
+    pub fn unmined_ids<'a>(
+        &'a self,
+        hashes: &'a [transaction::Hash],
+    ) -> impl ExactSizeIterator<Item = UnminedTxId> + 'a {
+        assert_eq!(
+            hashes.len(),
+            self.digests.len(),
+            "transaction hashes and authorizing-data digests come from the same block"
+        );
+        hashes
+            .iter()
+            .zip(&self.digests)
+            .map(|(&id, auth_digest)| match *auth_digest {
+                None => UnminedTxId::Legacy(id),
+                Some(auth_digest) => UnminedTxId::Witnessed(WtxId { id, auth_digest }),
+            })
+    }
+}
+
+/// Read-only block access that does not expose shared header or transaction handles.
+/// Runtime owners can lend this reference without letting a caller clone their raw Arcs.
+#[derive(Debug, RefCast)]
+#[repr(transparent)]
+pub struct BlockRef(Block);
+
+/// A block's read-only methods live on [`BlockRef`], so owners that hold a block can
+/// lend them through their own `Deref` impls.
+impl Deref for Block {
+    type Target = BlockRef;
+
+    fn deref(&self) -> &BlockRef {
+        BlockRef::ref_cast(self)
+    }
+}
+
+impl crate::serialization::ZcashSerialize for BlockRef {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
+        self.0.zcash_serialize(writer)
+    }
+}
+
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut fmter = f.debug_struct("Block");
@@ -79,7 +149,32 @@ impl fmt::Display for Block {
     }
 }
 
-impl Block {
+impl BlockRef {
+    /// Borrow the header without lending its shared handle.
+    pub fn header(&self) -> &Header {
+        &self.0.header
+    }
+
+    /// Borrow transactions in block order without lending their shared handles.
+    pub fn transactions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Transaction> + DoubleEndedIterator {
+        self.0.transactions.iter().map(Arc::as_ref)
+    }
+
+    /// Number of allocated slots in the transaction vector.
+    pub fn transaction_capacity(&self) -> usize {
+        self.0.transactions.capacity()
+    }
+
+    /// Borrow transactions for indexed parallel computation without cloning handles.
+    pub fn parallel_transactions(
+        &self,
+    ) -> impl rayon::iter::IndexedParallelIterator<Item = &Transaction> {
+        use rayon::prelude::*;
+        self.0.transactions.par_iter().map(Arc::as_ref)
+    }
+
     /// Returns a deterministic attributed size for this decoded block's
     /// Rust-visible object-graph payload.
     ///
@@ -93,16 +188,17 @@ impl Block {
     /// control blocks, temporary allocations, external library/runtime
     /// overhead, and allocations made by downstream verifiers.
     pub fn attributed_memory_size_bytes(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .map(|transaction| {
                 inline_size_bytes::<Transaction>()
                     .saturating_add(transaction.attributed_memory_size_bytes())
             })
             .fold(
-                inline_size_bytes::<Self>()
+                inline_size_bytes::<Block>()
                     .saturating_add(inline_size_bytes::<Header>())
-                    .saturating_add(vec_capacity_bytes(&self.transactions)),
+                    .saturating_add(vec_capacity_bytes(&self.0.transactions)),
                 u64::saturating_add,
             )
     }
@@ -113,7 +209,8 @@ impl Block {
     ///
     /// Verified blocks have a valid height.
     pub fn coinbase_height(&self) -> Option<Height> {
-        self.transactions
+        self.0
+            .transactions
             .first()
             .and_then(|tx| tx.inputs().first())
             .and_then(|input| match input {
@@ -124,7 +221,7 @@ impl Block {
 
     /// Compute the hash of this block.
     pub fn hash(&self) -> Hash {
-        Hash::from(self)
+        Hash::from(&self.0)
     }
 
     /// Get the parsed block [`Commitment`] for this block.
@@ -139,7 +236,9 @@ impl Block {
             None => Err(CommitmentError::MissingBlockHeight {
                 block_hash: self.hash(),
             }),
-            Some(height) => Commitment::from_bytes(*self.header.commitment_bytes, network, height),
+            Some(height) => {
+                Commitment::from_bytes(*self.0.header.commitment_bytes, network, height)
+            }
         }
     }
 
@@ -163,6 +262,7 @@ impl Block {
             NetworkUpgrade::current(network, self.coinbase_height().expect("a valid height"));
 
         if self
+            .0
             .transactions
             .iter()
             .filter_map(|trans| trans.as_ref().network_upgrade())
@@ -176,35 +276,40 @@ impl Block {
 
     /// Access the [`sprout::Nullifier`]s from all transactions in this block.
     pub fn sprout_nullifiers(&self) -> impl Iterator<Item = &sprout::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sprout_nullifiers())
     }
 
     /// Access the [`sapling::Nullifier`]s from all transactions in this block.
     pub fn sapling_nullifiers(&self) -> impl Iterator<Item = &sapling::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sapling_nullifiers())
     }
 
     /// Access the [`orchard::Nullifier`]s from all transactions in this block.
     pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.orchard_nullifiers())
     }
 
     /// Access the [`ironwood::Nullifier`]s from all transactions in this block.
     pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = &ironwood::Nullifier> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.ironwood_nullifiers())
     }
 
     /// Access the [`sprout::NoteCommitment`]s from all transactions in this block.
     pub fn sprout_note_commitments(&self) -> impl Iterator<Item = &sprout::NoteCommitment> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sprout_note_commitments())
     }
@@ -214,21 +319,24 @@ impl Block {
     pub fn sapling_note_commitments(
         &self,
     ) -> impl Iterator<Item = &sapling_crypto::note::ExtractedNoteCommitment> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.sapling_note_commitments())
     }
 
     /// Access the [orchard note commitments](pallas::Base) from all transactions in this block.
     pub fn orchard_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.orchard_note_commitments())
     }
 
     /// Access the Ironwood note commitments from all transactions in this block.
     pub fn ironwood_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .flat_map(|transaction| transaction.ironwood_note_commitments())
     }
@@ -237,7 +345,8 @@ impl Block {
     /// i.e. transactions "where either of vSpendsSapling or vOutputsSapling is non-empty"
     /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn sapling_transactions_count(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .filter(|tx| tx.has_sapling_shielded_data())
             .count()
@@ -249,7 +358,8 @@ impl Block {
     /// i.e. transactions "where vActionsOrchard is non-empty."
     /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn orchard_transactions_count(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .filter(|tx| tx.has_orchard_shielded_data())
             .count()
@@ -261,7 +371,8 @@ impl Block {
     /// i.e. transactions containing Ironwood shielded data.
     /// <https://zips.z.cash/zip-0221#tree-node-specification>.
     pub fn ironwood_transactions_count(&self) -> u64 {
-        self.transactions
+        self.0
+            .transactions
             .iter()
             .filter(|tx| tx.has_ironwood_shielded_data())
             .count()
@@ -339,6 +450,7 @@ impl Block {
         // would silently drop transactions whose value balance returns `Err`. Use `try_fold`
         // to propagate the first error instead.
         let tx_pool_sum = self
+            .0
             .transactions
             .iter()
             .try_fold(ValueBalance::<NegativeAllowed>::zero(), |acc, tx| {
@@ -424,12 +536,51 @@ impl Block {
 
         // Compute each transaction's auth digest in parallel, and collect into a
         // Vec with the same ordering.
-        self.transactions
+        self.0
+            .transactions
             .par_iter()
             .map(|tx| auth_digest_or_placeholder(tx))
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<AuthDataRoot>()
+    }
+
+    /// Apply `f` to every transaction in block order.
+    ///
+    /// Blocks with fewer than 64 transactions, and single-worker Rayon pools, run on the
+    /// calling thread, where splitting costs more than it saves.
+    fn map_transactions<T, F>(&self, f: F) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(&Transaction) -> T + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        if self.0.transactions.len() < PARALLEL_TRANSACTION_HASHES_MIN
+            || rayon::current_num_threads() == 1
+        {
+            self.transactions().map(f).collect()
+        } else {
+            self.parallel_transactions().map(f).collect()
+        }
+    }
+
+    /// Every transaction's mined ID, in block order.
+    pub fn transaction_hashes(&self) -> Arc<[transaction::Hash]> {
+        self.map_transactions(Transaction::hash).into()
+    }
+
+    /// Every transaction's ZIP-244 authorizing-data digest and their root.
+    ///
+    /// This hashes each v5/v6 transaction's scriptSigs, proofs and signatures, so callers
+    /// run it only for a body whose transaction IDs already match the header.
+    pub fn auth_data_digests(&self) -> AuthDataDigests {
+        let digests = self.map_transactions(Transaction::auth_digest);
+        let root = digests
+            .iter()
+            .map(|auth_digest| auth_digest.unwrap_or(AUTH_DIGEST_PLACEHOLDER))
+            .collect();
+        AuthDataDigests { digests, root }
     }
 }
 

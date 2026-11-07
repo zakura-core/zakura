@@ -31,10 +31,9 @@ use tokio::{
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::task::AbortOnDropHandle;
 use tower::{
-    buffer::Buffer,
     discover::Change,
     layer::Layer,
-    util::{BoxCloneService, BoxService},
+    util::{BoxCloneService, BoxCloneSyncService, BoxService},
     Service, ServiceExt,
 };
 use tracing::Instrument;
@@ -160,7 +159,7 @@ pub async fn init<S, C>(
     user_agent: String,
     advertised_services: PeerServices,
 ) -> (
-    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
+    BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
 )
@@ -194,7 +193,7 @@ pub async fn init_with_zakura_header_sync<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
 ) -> (
-    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
+    BoxCloneSyncService<Request, Response, BoxError>,
     Arc<std::sync::Mutex<AddressBook>>,
     mpsc::Sender<(PeerSocketAddr, u32)>,
     Option<ZakuraEndpoint>,
@@ -236,7 +235,7 @@ pub async fn init_with_zakura<S, C>(
     custom_services: Vec<CustomService>,
 ) -> Result<
     (
-        Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
+        BoxCloneSyncService<Request, Response, BoxError>,
         Arc<std::sync::Mutex<AddressBook>>,
         mpsc::Sender<(PeerSocketAddr, u32)>,
         Option<ZakuraEndpoint>,
@@ -259,6 +258,8 @@ where
     // Clone the inbound service for the Zakura legacy-gossip sink before the
     // handshake builder consumes the original below. The factory only runs when
     // `v2_p2p` is enabled; otherwise the endpoint is `None` and the clone drops.
+    // TCP and compatibility ingress reach the backend through clones of this one
+    // service, so its load-shedding buffer is their shared admission.
     let inbound_for_zakura_sink = inbound_service.clone();
     let peer_registry = PeerRegistry::default();
     let zakura_endpoint = crate::zakura::spawn_zakura_endpoint_with_peer_registry(
@@ -395,17 +396,7 @@ where
         .as_ref()
         .map(ZakuraEndpoint::background_shutdown_token)
         .unwrap_or_default();
-    // Block advertisements must reach busy peers, so they bypass the buffer's readiness wait.
-    let block_advertiser = peer_set.block_advertiser();
-    // Using Buffer::pair returns the background service, letting us inject our cancellation
-    let (peer_set, worker) =
-        Buffer::pair(BoxService::new(peer_set), constants::PEERSET_BUFFER_SIZE);
-    tokio::spawn(erased(async move {
-        tokio::select! {
-            _ = shutdown.cancelled() => {}
-            _ = worker => {}
-        }
-    }));
+    let (peer_set, block_advertiser) = super::driver::spawn(peer_set, shutdown);
 
     // Start the peer disk cache updater
     let peer_cache_updater_fut = peer_cache_updater(config.clone(), address_book.clone());
@@ -558,7 +549,10 @@ where
                 config.zakura.stream_open_rate_per_second,
             );
             (
-                spawn_buffer(BoxService::new(dual_stack), constants::PEERSET_BUFFER_SIZE),
+                BoxCloneSyncService::new(spawn_buffer(
+                    BoxService::new(dual_stack),
+                    constants::PEERSET_BUFFER_SIZE,
+                )),
                 BoxCloneService::new(advert_dual_stack),
             )
         }
@@ -1070,6 +1064,7 @@ where
     let connected_addr = peer::ConnectedAddr::new_inbound_direct(addr);
 
     debug!("got incoming connection");
+    peer::disable_nagle(&tcp_stream);
 
     // # Correctness
     //

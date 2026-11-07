@@ -420,7 +420,11 @@ impl<A: StreamConformance> LayoutService<A> {
             .iter()
             .map(|request| {
                 let largest = request.cap().output_bytes();
-                let limits = sizing::serve_limits(largest, Duration::from_millis(1));
+                let limits = sizing::serve_limits(
+                    largest,
+                    Duration::from_millis(1),
+                    crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+                );
                 ServeCapacity::new("stream_conformance", request.row, limits)
                     .expect("derived limits are valid")
             })
@@ -431,7 +435,11 @@ impl<A: StreamConformance> LayoutService<A> {
             .map(|subscription| {
                 // Widening usize to u64 is lossless on supported targets.
                 let largest = (subscription.page.payload.max() + FRAME_HEADER_BYTES) as u64;
-                let limits = sizing::serve_limits(largest, Duration::from_millis(1));
+                let limits = sizing::serve_limits(
+                    largest,
+                    Duration::from_millis(1),
+                    crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
+                );
                 ServeCapacity::new("stream_conformance", subscription.row, limits)
                     .expect("derived limits are valid")
             })

@@ -225,6 +225,7 @@ impl Fact {
                 id,
                 request: StorageRequest::ContinuationLocator,
                 digest: String::new(),
+                call: None,
             },
             Fact::Completed(id) => StorageFact::Completed {
                 id,
@@ -293,6 +294,12 @@ impl HasView for Planted {
             port: self.port.clone(),
             direct_dispatch_broken: self.dispatch.get(),
             honest_peers: Default::default(),
+            adoption: Default::default(),
+            sessions: Default::default(),
+            faults: Default::default(),
+            capacity: Default::default(),
+            claims: Default::default(),
+            rounds: Default::default(),
         }
     }
 }

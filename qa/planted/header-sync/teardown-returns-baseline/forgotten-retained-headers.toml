@@ -1,0 +1,8 @@
+# The apply handler never drops its retained headers, so the call is
+# handled with its ownership still open. The input's node applies the
+# headers it prepares.
+input = "crates/zakura-sim/tests/fixtures/header-storage-close-relink.bin"
+# Besides reactor.rs, which the patch changes, the rest of header sync
+# decides when the node applies. A change there can move the input off
+# its first apply.
+checks = ["crates/zakura-network/src/zakura/header_sync"]

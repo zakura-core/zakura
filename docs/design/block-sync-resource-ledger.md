@@ -21,15 +21,16 @@ it is sized to the throughput target, not below it.
 
 Every term counts one physical allocation once. Defaults are shown. "Peer" means one
 connection; the node admits at most `zakura.max_connections` = 92 of them. The transport holds
-at most 124 live QUIC connections, admitted or not (zakura-quic ADM-12): the most that
-`zakura.peer_memory_budget_bytes` = 8 GiB funds after one 256 MiB datagram queue for the one
-bound socket, with 32 of them headroom for handshakes (CTRL-26). Closed connections release their
+at most 124 live QUIC connections, admitted or not (zakura-quic ADM-12): 92 admitted and 32 of
+headroom for handshakes. `zakura.peer_memory_budget_bytes` = 15 GiB funds them after one 256 MiB
+datagram queue for the one bound socket, charging a handshake its 64 MiB of windows and an
+admitted connection its raised window plus send window, 141,937,353 B (CTRL-26). Closed connections release their
 stream buffers and drain in a separate allowance of 248 (ADM-13). The QUIC rows count all 124
 live connections; the application rows count the 92 admitted peers.
 
 | Term | Per peer | Node | Bound comes from |
 | --- | --- | --- | --- |
-| QUIC receive buffers | 32 MiB connection window (16 MiB per stream) | 3.9 GiB | `DEFAULT_ZAKURA_RECEIVE_WINDOW`, `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` in `handler.rs`, enforced by QUIC flow control |
+| QUIC receive buffers | 108,382,921 B connection window once admitted: 32 MiB handshake window plus every reactor's receive share, 43,287,718 B per stream | 10.3 GiB (92 admitted plus 32 handshakes at 32 MiB) | `DEFAULT_ZAKURA_RECEIVE_WINDOW` in `handler.rs` and the reactor budgets in `ZakuraConfig::reactor_shares`, enforced by QUIC flow control |
 | QUIC send buffers | 32 MiB | 3.9 GiB | `DEFAULT_ZAKURA_SEND_WINDOW`; serving output below sits inside it |
 | Serving bookkeeping | 1 MiB (144 KiB + 2 × 2,816 × 160 B) | 512 MiB | `BOOKKEEPING_BUDGET_BYTES` in `regulated/session.rs`; config validation refuses a config that cannot fund one request per slot |
 | Serving storage results | 12 jobs | 24 jobs × one read (≤ `blocks_per_response` decoded blocks) | `NODE_EXECUTION` / `PEER_EXECUTION`; a lease lives until the blocking read and encode return |
@@ -44,10 +45,10 @@ At defaults, block-sync application memory sums to about 11 GB in the worst case
 serving bookkeeping, 1.25 GB serving output, 1.3 GB of worst-case serving reads (about 170 MB
 for real blocks), 0.13 GiB requester hashes, 1.8 GB of raw frames awaiting their routines and
 5.6 GB of requested bodies (both derived below). The QUIC windows
-add 3.9 + 3.9 GiB, and the datagram queues 256 MiB more per bound socket, however many
-connections it serves. They are shared with every other service on the connection and stay
-unchanged: the 8 GiB peer memory budget covers all three for every live QUIC connection the
-transport holds, and is a transport budget, not a block-sync choice.
+add 10.3 + 3.9 GiB, and the datagram queues 256 MiB more per bound socket, however many
+connections it serves. They are shared with every other service on the connection: the 15 GiB
+peer memory budget covers all three for every live QUIC connection the transport holds, and is a
+transport budget, not a block-sync choice.
 
 ## Serving
 

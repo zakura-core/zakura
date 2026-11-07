@@ -47,6 +47,22 @@ pub struct ZakuraHeaderSyncConfig {
     /// When unset, header sync starts from genesis. When set, [`anchor_height`](Self::anchor_height)
     /// must also be set and must match genesis or a configured checkpoint.
     pub anchor_hash: Option<block::Hash>,
+    /// The most unsent header-sync page bytes this node holds across every
+    /// serving session.
+    ///
+    /// Unset uses the derived budget: the inbound plus outbound `peer_limits`
+    /// sessions, clamped to the admitted connections, times one session's output
+    /// budget. One session's budget is twice the default QUIC send window or the
+    /// largest page, whichever is larger: 64 MiB at defaults, so the node budget is
+    /// 92 × 64 MiB = 5.75 GiB. Every session can then hold its whole budget at once,
+    /// so a fast reader never pauses another peer's serving. These
+    /// bytes are reserved before each page is produced and held until its last frame
+    /// is written; idle sessions hold nothing.
+    ///
+    /// A smaller value bounds this memory more tightly, but lets peers that read
+    /// at full speed pause each other's serving. A value below one session's budget
+    /// rises to that budget.
+    pub node_serve_output_bytes: Option<u64>,
 }
 
 impl Default for ZakuraHeaderSyncConfig {
@@ -59,11 +75,39 @@ impl Default for ZakuraHeaderSyncConfig {
             unproductive_peer_cooldown: DEFAULT_HS_UNPRODUCTIVE_PEER_COOLDOWN,
             anchor_height: None,
             anchor_hash: None,
+            node_serve_output_bytes: None,
         }
     }
 }
 
 impl ZakuraHeaderSyncConfig {
+    /// The header-sync sessions that can serve at once on a node that admits
+    /// `max_connections`: the inbound plus outbound session slots, clamped to
+    /// `max_connections`.
+    pub(crate) fn serving_sessions(&self, max_connections: usize) -> usize {
+        self.peer_limits
+            .max_inbound_peers
+            .saturating_add(self.peer_limits.max_outbound_peers)
+            .min(max_connections)
+    }
+
+    /// This config for a node that admits `max_connections`: an unset serving
+    /// output budget becomes one session's budget on each of
+    /// [`Self::serving_sessions`]. A configured value stays.
+    pub fn for_node_connections(mut self, max_connections: usize) -> Self {
+        if self.node_serve_output_bytes.is_none() {
+            self.node_serve_output_bytes = Some(
+                super::v9::serving_limits(
+                    super::v9::SERVE_PEER_OUTPUT_BYTES,
+                    self.serving_sessions(max_connections),
+                    None,
+                )
+                .node_output_bytes,
+            );
+        }
+        self
+    }
+
     /// Return the clamped served-range advertisement for wire status messages.
     pub fn advertised_max_headers_per_response(&self) -> u32 {
         self.max_headers_per_response.clamp(1, MAX_HS_RANGE)

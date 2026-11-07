@@ -1,11 +1,32 @@
+use super::super::repair::vct_repair_task;
 use super::*;
 use crate::zakura::testkit::{TraceCapture, TraceValue};
 
+/// Records each reservation the reactor reports.
+#[derive(Debug, Default)]
+struct Reservations(std::sync::Mutex<Vec<ReactorEvent>>);
+
+impl observe::HeaderSyncObserver for Reservations {
+    /// Keeps `event` if it's a reservation.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(event, ReactorEvent::ReservationOpened { .. }) {
+            self.0
+                .lock()
+                .expect("no test panics while holding it")
+                .push(event);
+        }
+    }
+}
+
+/// The repair request also reports its reservation, once, for its supplier,
+/// as a repair of the bounded count that names no round yet.
 #[tokio::test]
 async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     startup.config.max_headers_per_response = 2;
+    let reservations = Arc::new(Reservations::default());
+    startup.observer = observe::ObserverSlot(Some(reservations.clone()));
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let selected = [
         zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
@@ -107,6 +128,19 @@ async fn vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity() {
     assert_eq!(request.added_credit.objects, 2);
     assert_eq!(request.locator_hashes, vec![anchor.hash]);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
+    assert_eq!(
+        *reservations
+            .0
+            .lock()
+            .expect("no test panics while holding it"),
+        [ReactorEvent::ReservationOpened {
+            reservation: 1,
+            peer: large_peer.clone(),
+            purpose: observe::ReservationPurpose::Repair,
+            headers: 2,
+            request: None,
+        }]
+    );
 
     shutdown.cancel();
     reactor.await.expect("the reactor task joins");

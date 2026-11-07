@@ -637,7 +637,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -681,6 +685,10 @@ impl FinalizedState {
                 Ok(())
             },
         )
+        .map(|(block, trees, response)| {
+            let _ = response.send(Ok(block.hash));
+            (block, trees)
+        })
     }
 
     fn commit_finalized_inner_with<C>(
@@ -691,7 +699,11 @@ impl FinalizedState {
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         commit: C,
     ) -> Result<
-        (CheckpointVerifiedBlock, NoteCommitmentTrees),
+        (
+            CheckpointVerifiedBlock,
+            NoteCommitmentTrees,
+            tokio::sync::oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+        ),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
     >
     where
@@ -729,9 +741,8 @@ impl FinalizedState {
         };
 
         match result {
-            Ok((hash, note_commitment_trees)) => {
-                let _ = rsp_tx.send(Ok(hash));
-                Ok((checkpoint_verified, note_commitment_trees))
+            Ok((_, note_commitment_trees)) => {
+                Ok((checkpoint_verified, note_commitment_trees, rsp_tx))
             }
             Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
@@ -1218,7 +1229,7 @@ impl FinalizedState {
                         // tree. They are independent; the history push below joins them.
                         #[cfg(feature = "commit-metrics")]
                         metrics::histogram!("zakura.state.write.block_tx_count")
-                            .record(block.transactions.len() as f64);
+                            .record(block.transactions().len() as f64);
                         #[cfg(feature = "commit-metrics")]
                         let _ckpt_compute = std::time::Instant::now();
                         let mut commitment_result = None;
@@ -1260,7 +1271,7 @@ impl FinalizedState {
                         history_tree_mut
                             .push(
                                 &network,
-                                block.clone(),
+                                &block,
                                 &sapling_root,
                                 &orchard_root,
                                 &ironwood_root,
@@ -1317,7 +1328,8 @@ impl FinalizedState {
         // Assert that callers (including unit tests) get the chain order correct
         if self.db.is_empty() {
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "the first block added to an empty state must be a genesis block, source: {source}",
             );
             assert_eq!(
@@ -1333,7 +1345,8 @@ impl FinalizedState {
             );
 
             assert_eq!(
-                committed_tip_hash, finalized.block.header.previous_block_hash,
+                committed_tip_hash,
+                finalized.block.header().previous_block_hash,
                 "committed block must be a child of the finalized tip, source: {source}",
             );
         }

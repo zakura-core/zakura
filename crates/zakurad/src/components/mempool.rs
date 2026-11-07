@@ -31,7 +31,12 @@ use std::{
 
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
-use tower::{buffer::Buffer, timeout::Timeout, util::BoxCloneService, Service, ServiceExt};
+use tower::{
+    buffer::Buffer,
+    timeout::Timeout,
+    util::{BoxCloneService, BoxCloneSyncService},
+    Service, ServiceExt,
+};
 
 use zakura_chain::{
     block::{self, Height},
@@ -120,8 +125,7 @@ fn transaction_error_peer_log_label(
     }
 }
 
-type Outbound =
-    Buffer<zn::Request, futures::future::BoxFuture<'static, Result<zn::Response, zn::BoxError>>>;
+type Outbound = BoxCloneSyncService<zn::Request, zn::Response, zn::BoxError>;
 type State =
     Buffer<zs::Request, futures::future::BoxFuture<'static, Result<zs::Response, zs::BoxError>>>;
 type ReadState = BoxCloneService<zs::ReadRequest, zs::ReadResponse, zs::BoxError>;
@@ -135,7 +139,6 @@ type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, Re
 /// mempool and its crawler activate, and at which the mempool starts peer
 /// transaction cooldowns.
 ///
-/// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
 /// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
 /// the gap between the two thresholds keeps the mempool from flapping.
 const MAX_ESTIMATED_DISTANCE_TO_ENABLE: block::HeightDiff = 100;
@@ -427,6 +430,7 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // The verifier failed, or the error does not name the rule that failed.
         Script(_)
         | InternalDowncastError(_)
+        | StateUnavailable(_)
         | Io(_)
         | TryFromSlice(_)
         | Amount(_)
@@ -623,6 +627,8 @@ pub struct Mempool {
     /// cools down, or disconnects these peers.
     zcashd_compat_peer_ips: HashSet<IpAddr>,
 
+    /// Configured peers exempt from mempool bans, cooldowns, and disconnects.
+    unconditional_peers: zn::UnconditionalPeers,
     /// Signalled after each transaction download and verify task finishes.
     /// Shared with every downloader, and kept across mempool resets.
     verification_finished: Arc<Notify>,
@@ -642,6 +648,7 @@ impl Mempool {
         chain_tip_change: ChainTipChange,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
         zcashd_compat_peer_ips: Vec<IpAddr>,
+        unconditional_peers: zn::UnconditionalPeers,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -662,6 +669,7 @@ impl Mempool {
             transaction_sender,
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             misbehavior_sender,
+            unconditional_peers,
             zcashd_compat_peer_ips: zcashd_compat_peer_ips
                 .into_iter()
                 .map(|ip| ip.to_canonical())
@@ -990,8 +998,10 @@ impl Service<Request> for Mempool {
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
                         let zcashd_compat_peer_ips = &self.zcashd_compat_peer_ips;
-                        let ban_peer = transaction_ban_peer(&error)
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                        let ban_peer = transaction_ban_peer(&error).filter(|peer| {
+                            !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer)
+                                && !self.unconditional_peers.contains(peer.ip())
+                        });
                         if let Some(peer) = ban_peer {
                             let _ = self
                                 .misbehavior_sender
@@ -1010,7 +1020,10 @@ impl Service<Request> for Mempool {
                                 )
                             })
                             .flatten()
-                            .filter(|peer| !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer));
+                            .filter(|peer| {
+                                !is_zcashd_compat_peer(zcashd_compat_peer_ips, *peer)
+                                    && !self.unconditional_peers.contains(peer.ip())
+                            });
                         if let Some(peer) = cooldown_peer {
                             start_peer_cooldown(
                                 &self.peer_cooldowns,
@@ -1088,15 +1101,11 @@ impl Service<Request> for Mempool {
 
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
-            }
 
-            // Remove expired transactions from the mempool.
-            //
-            // Lock times never expire, because block times are strictly increasing.
-            // So we don't need to check them here.
-            if let Some(tip_height) = best_tip_height {
-                let expired_transactions = storage.remove_expired_transactions(tip_height);
-                // Remove transactions that are expired from the peers list
+                // Expiry changes only when the chain grows. New transactions
+                // are verified for the next height, and verification is retried
+                // if the tip height changes before insertion.
+                let expired_transactions = storage.remove_expired_transactions(block.height);
                 send_to_peers_ids.retain(|id| !expired_transactions.contains(id));
 
                 if !expired_transactions.is_empty() {
@@ -1247,15 +1256,17 @@ impl Service<Request> for Mempool {
                 Request::AwaitOutput(outpoint) => {
                     trace!(?req, "got mempool request");
 
-                    let response_fut = storage.pending_outputs.queue(outpoint);
-
-                    if let Some(output) = storage.created_output(&outpoint) {
-                        storage.pending_outputs.respond(&outpoint, output)
-                    }
+                    // A created output answers immediately, without a waiter slot.
+                    let response_fut = if let Some(output) = storage.created_output(&outpoint) {
+                        storage.pending_outputs.respond(&outpoint, output.clone());
+                        async move { Ok(Response::UnspentOutput(output)) }.boxed()
+                    } else {
+                        storage.pending_outputs.queue(outpoint).boxed()
+                    };
 
                     trace!("answered mempool request");
 
-                    response_fut.boxed()
+                    response_fut
                 }
 
                 Request::FullTransactions => {

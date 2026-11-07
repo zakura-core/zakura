@@ -140,7 +140,7 @@ impl RequestIdentity {
                 token: *token,
                 height: block.coinbase_height(),
                 hash: block.hash(),
-                parent: block.header.previous_block_hash,
+                parent: block.header().previous_block_hash,
                 class,
                 decoded_bytes: block.attributed_memory_size_bytes(),
             },

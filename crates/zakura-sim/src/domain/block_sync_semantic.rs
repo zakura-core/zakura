@@ -16,6 +16,10 @@
 //! decoded-byte target, [`BS_MAX_DECODED_SUBMISSION_WINDOW_BYTES`], is a
 //! constant.
 
+mod reactor_queries;
+
+pub use reactor_queries::ReactorQueries;
+
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -31,7 +35,7 @@ use crate::{
     },
     property::{
         CheckCtx, HasView, Kind, LivenessBound, ObligationKey, Property, PropertyId, Source,
-        Status, Subject, Unit, Verdict,
+        Status, Subject, TriggerHistory, Unit, Verdict,
     },
     storage::BLOCK_SERVICE,
     Observation, ObservationLog,
@@ -54,8 +58,16 @@ pub const DETACHED_SUBMISSION_BOUNDED: &str = "block-sync/detached-submission-bo
 /// and `applying`'s decoded bytes leave room for it under the decoded cap.
 pub const INPUT_DECODED_BOUND: &str = "block-sync/input-decoded-bound";
 
-/// What every property here reads.
+/// The reactor's accepted and refused needed-block queries keep their exact
+/// identities, and refusal and close leave only the retries they owe.
+pub const REACTOR_QUERY_LIFECYCLE: &str = "block-sync/reactor-query-lifecycle";
+
+/// What every property here but [`REACTOR_QUERY_LIFECYCLE`] reads.
 const NEEDS: &[Source] = &[Source::Storage, Source::Frames, Source::View];
+
+/// What [`REACTOR_QUERY_LIFECYCLE`] reads: storage's queries, and the
+/// reactor's transitions through the view's tap. See [`reactor_queries`].
+const REACTOR_NEEDS: &[Source] = &[Source::Storage, Source::View];
 
 /// A view that carries a [`SemanticModel`].
 pub trait SemanticView {
@@ -66,7 +78,8 @@ pub trait SemanticView {
 /// The block-sync semantic properties, for a harness whose view carries the
 /// model: [`SUBMIT_ONLY_REQUESTED`], [`STALE_COMPLETION_INERT`],
 /// [`DETACHED_SUBMISSION_BOUNDED`], [`CAPACITY_RELEASE_WAKES`] and
-/// [`INPUT_DECODED_BOUND`], all active.
+/// [`INPUT_DECODED_BOUND`], all active, and [`REACTOR_QUERY_LIFECYCLE`], a
+/// draft until a simulated run exercises it.
 pub fn semantic_properties<S>() -> Vec<Property<S>>
 where
     S: HasView,
@@ -84,7 +97,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_submit_only_requested::<S>,
-            witness: Some(any_submission),
+            witness: Some(TriggerHistory::Log(any_submission)),
         },
         Property {
             id: PropertyId::new(STALE_COMPLETION_INERT),
@@ -95,7 +108,9 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_stale_completion_inert::<S>,
-            witness: Some(stale_completion_beside_a_current_submission),
+            witness: Some(TriggerHistory::Log(
+                stale_completion_beside_a_current_submission,
+            )),
         },
         Property {
             id: PropertyId::new(CAPACITY_RELEASE_WAKES),
@@ -109,7 +124,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_capacity_release_wakes::<S>,
-            witness: Some(room_freed_past_the_frontier),
+            witness: Some(TriggerHistory::Log(room_freed_past_the_frontier)),
         },
         Property {
             id: PropertyId::new(DETACHED_SUBMISSION_BOUNDED),
@@ -123,7 +138,7 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_detached_submission_bounded::<S>,
-            witness: Some(reset_or_verdict_while_held),
+            witness: Some(TriggerHistory::Log(reset_or_verdict_while_held)),
         },
         Property {
             id: PropertyId::new(INPUT_DECODED_BOUND),
@@ -138,7 +153,22 @@ where
             needs: NEEDS,
             status: Status::Active,
             check: check_input_decoded_bound::<S>,
-            witness: Some(any_decoded_queued),
+            witness: Some(TriggerHistory::Log(any_decoded_queued)),
+        },
+        Property {
+            id: PropertyId::new(REACTOR_QUERY_LIFECYCLE),
+            claim: "storage takes only accepted needed-block queries, once, under their \
+                    exact identities; an accepted query becomes the reported pending query and \
+                    advances the next ID; a refusal keeps both, and arms a retry unless the \
+                    channel closed, which ends dispatch and arms nothing; a stale reply or \
+                    failure keeps the pending query; a reset, authority change, or tip reset \
+                    retires it",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: REACTOR_NEEDS,
+            status: Status::Draft,
+            check: check_reactor_query_lifecycle::<S>,
+            witness: Some(TriggerHistory::Log(query_reached_storage)),
         },
     ]
 }
@@ -285,6 +315,8 @@ pub struct SemanticModel {
     detached_findings: Vec<Finding>,
     /// Findings for [`INPUT_DECODED_BOUND`], not yet reported.
     input_findings: Vec<Finding>,
+    /// [`REACTOR_QUERY_LIFECYCLE`]'s model, with its findings.
+    pub reactor_queries: ReactorQueries,
     /// Triggers of [`CAPACITY_RELEASE_WAKES`], not yet obliged.
     rooms: Vec<RoomFreed>,
 
@@ -307,6 +339,9 @@ pub struct SemanticModel {
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
+    /// Whether the sequencer refused a body as stale because the body work
+    /// epoch it applied was newer than the body owner's.
+    pub saw_old_epoch_body_refused: bool,
     /// Whether a verdict reached block sync while a submission holder still
     /// held its token.
     pub saw_verdict_while_held: bool,
@@ -505,6 +540,8 @@ impl SemanticModel {
                 StorageRequest::QueryNeededBlocks { scope, .. } => {
                     self.queries.insert(*id, scope.body_work_epoch);
                     self.note_epoch(scope.body_work_epoch);
+                    self.reactor_queries
+                        .storage_query(self.step.unwrap_or_default(), request);
                 }
                 StorageRequest::SubmitBlock {
                     owner,
@@ -709,6 +746,17 @@ impl SemanticModel {
                     .filter(|submission| submission.detached)
                     .map(|submission| submission.decoded_attributed_memory_bytes);
                 self.applying_decoded = applying.chain(detached).fold(0, u64::saturating_add);
+            }
+            BlockSyncFact::StaleScope { body, scope_epoch } => {
+                self.saw_old_epoch_body_refused |= body
+                    .owner
+                    .body_work_epoch
+                    .zip(*scope_epoch)
+                    .is_some_and(|(owned, applied)| owned < applied);
+            }
+            BlockSyncFact::Reactor { transition, state } => {
+                self.reactor_queries
+                    .transition(self.step.unwrap_or_default(), transition, state);
             }
             BlockSyncFact::SequencerClosed => self.closed = true,
             _ => {}
@@ -1228,6 +1276,31 @@ where
     })
 }
 
+/// Checks [`REACTOR_QUERY_LIFECYCLE`] after each reactor transition and
+/// storage query. Once no task can run, a query storage took that the channel
+/// never accepted is a finding too.
+fn check_reactor_query_lifecycle<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: SemanticView,
+{
+    let model = caught_up(cx);
+    let (findings, applicable) = {
+        let mut model = model.borrow_mut();
+        let queries = &mut model.reactor_queries;
+        let mut findings = std::mem::take(&mut queries.findings);
+        if cx.status != zakura_scheduler::Status::Running {
+            findings.extend(queries.take_unaccepted(cx.step));
+        }
+        (findings, queries.saw_proposal)
+    };
+    report(cx, findings).unwrap_or(if applicable {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    })
+}
+
 /// [`SUBMIT_ONLY_REQUESTED`]'s trigger history: storage took a submission.
 fn any_submission(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_submission
@@ -1266,12 +1339,22 @@ fn any_decoded_queued(log: &ObservationLog) -> bool {
     SemanticModel::of(log).saw_decoded_queued
 }
 
+/// [`REACTOR_QUERY_LIFECYCLE`]'s trigger history: storage took a query the
+/// action channel accepted, under its exact identity. A refusal needs a full
+/// or closed action channel, which this history doesn't require.
+fn query_reached_storage(log: &ObservationLog) -> bool {
+    SemanticModel::of(log).reactor_queries.saw_query_at_storage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::{
-        BlockSyncBody, BlockSyncRetained, BodyScope, StorageBranch, StoragePoint, StreamId,
-        WorkScope,
+    use crate::{
+        observe::{
+            BlockSyncBody, BlockSyncReactorState, BlockSyncRetained, BodyScope, StorageBranch,
+            StoragePoint, StreamId, WorkScope,
+        },
+        record::machine::{BodyAuthority, ReactorAction},
     };
 
     /// A log built one step at a time.
@@ -1734,8 +1817,14 @@ mod tests {
             history.session(session, session);
         }
         history.sync(BlockSyncFact::Sequencer {
+            payloads: vec![crate::observe::BlockSyncPayload {
+                id: 1,
+                decoded_attributed_memory_bytes: applying,
+            }],
             reorder: Vec::new(),
             applying: vec![BlockSyncRetained {
+                payload_id: 1,
+                policy_decoded_bytes: applying,
                 body: BlockSyncBody {
                     height: HEIGHT - 1,
                     owner: owner(1, 1, 1),
@@ -1781,5 +1870,86 @@ mod tests {
         assert_eq!(decoded_handoffs(1, cap, 1), []);
         assert_eq!(decoded_handoffs(4, cap, 1), []);
         assert_eq!(decoded_handoffs(4, cap, 2).len(), 1);
+    }
+
+    /// The reactor reports epoch 2's authority, and the sequencer takes
+    /// an epoch-1 body from its input before it applies epoch 2. It buffers
+    /// the body as current, so the model sees no refusal.
+    fn dequeued_in_the_gap() -> History {
+        let mut history = History::default();
+        history
+            .step()
+            .sync(BlockSyncFact::Reactor {
+                transition: ReactorAction::AuthorityChanged {
+                    authority: BodyAuthority {
+                        header: owner(0, 0, 2).scope,
+                        verified_generation: 1,
+                        body_work_epoch: 2,
+                    },
+                    epoch_changed: true,
+                },
+                state: BlockSyncReactorState {
+                    pending: None,
+                    next_query_id: Some(1),
+                    retry_armed: false,
+                    retry_forced: false,
+                    dispatch_closed: false,
+                    scope: None,
+                    verified_tip: 0,
+                    request_floor: 0,
+                    header_tip: 8,
+                    reset_epoch: 1,
+                    reaction_epoch: 1,
+                },
+            })
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Queued {
+                    allocation: 1,
+                    decoded_attributed_memory_bytes: 0,
+                },
+                "released",
+            )
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Reorder { allocation: 1 },
+                "retained",
+            );
+        history
+    }
+
+    /// The sequencer refuses `owner`'s body under epoch `applied`.
+    fn refused(owner: WorkOwner, applied: Option<u64>) -> BlockSyncFact {
+        BlockSyncFact::StaleScope {
+            body: BlockSyncBody {
+                height: HEIGHT,
+                owner,
+                bytes: 100,
+            },
+            scope_epoch: applied,
+        }
+    }
+
+    /// An old-epoch body the sequencer takes before it applies the newer
+    /// epoch is no refusal, though the reactor's authority already moved.
+    #[test]
+    fn an_old_epoch_body_dequeued_before_the_sequencer_applies_the_reset_is_not_refused() {
+        let history = dequeued_in_the_gap();
+        assert!(!SemanticModel::of(&history.log).saw_old_epoch_body_refused);
+    }
+
+    /// Only the sequencer's refusal of an older epoch's body under a newer
+    /// applied epoch counts: not one of a newer body under an older scope,
+    /// nor one before the sequencer had a scope.
+    #[test]
+    fn only_a_refusal_under_a_newer_applied_epoch_counts() {
+        let saw = |fact| {
+            let mut history = dequeued_in_the_gap();
+            history.step().sync(fact);
+            SemanticModel::of(&history.log).saw_old_epoch_body_refused
+        };
+        assert!(saw(refused(owner(1, 2, 1), Some(2))));
+        assert!(!saw(refused(owner(1, 2, 2), Some(1))));
+        assert!(!saw(refused(owner(1, 2, 1), None)));
     }
 }

@@ -11,7 +11,517 @@ independently.
 
 ## [Unreleased]
 
-## [1.8.0-rc0] - 2026-11-01
+## [1.8.5] - 2026-11-07
+
+### Changed
+
+- Relayed blocks are gossiped as soon as they are committed. Previously every tip change
+  waited about 1 ms for a possible locally submitted block, which added to each relay hop
+  ([#2087](https://github.com/zakura-core/zakura/pull/2087)).
+- Require the shared mined-submission registry when constructing node RPC services. Update
+  the state, consensus, and RPC crate major versions for the Rust interface changes, and the
+  utilities crate dependency version. JSON-RPC methods and stored data formats are unchanged.
+- Announce successfully submitted local blocks directly from committed state, including
+  side-chain blocks, without waiting for the submitting RPC task to resume
+  ([#2093](https://github.com/zakura-core/zakura/pull/2093)).
+- Return state services and update receivers in a named `InitializedState` result
+  so Rust library callers can select the fields they need.
+- Change the Rust `ParentInputs::Unspent` response to retain a bounded subset of
+  outputs. Library callers must look up omitted outputs rather than assume the
+  map is complete; the state and consensus crates receive major version bumps
+  ([#2116](https://github.com/zakura-core/zakura/pull/2116)).
+- Skip the duplicate transparent-spend scan for blocks without non-coinbase
+  transparent inputs, reusing the existing coinbase-validation pass
+  ([#2117](https://github.com/zakura-core/zakura/pull/2117)).
+- Updated Common to 5.3.0 to pick up Orchard and Halo 2 verification optimizations
+  ([#2133](https://github.com/zakura-core/zakura/pull/2133)).
+- Classify the compatible relay, verification, and dependency improvements as a
+  patch node release; library crates retain their independent version
+  requirements ([#2148](https://github.com/zakura-core/zakura/pull/2148)).
+
+<!-- release-readiness: allow-patch; reason: The v1.8.5 Changed entries are compatible block-relay latency improvements in #2087, #2090, and #2093, a skipped redundant duplicate-spend scan in #2117, and the Common 5.3.0 verification speedups in #2133. Existing node configurations, JSON-RPC methods, stored data formats, and consensus rules are unchanged. The Rust interface changes in #2090, #2093, and #2116 are covered by their crate major bumps; library crates retain their independently required SemVer bumps. -->
+
+### Fixed
+
+- A peer that abandons a request by stopping its response stream now ends the
+  request's service call and returns the request's output reservation at once,
+  instead of at the first response write
+  ([#2064](https://github.com/zakura-core/zakura/pull/2064)).
+- Fixed the discovery candidate dialer so that candidates it can't dial, such
+  as those on an IP at the per-IP cap or with more addresses than the free
+  connection slots, no longer take a round's dial slots from other candidates,
+  and so that finished dials no longer start rounds faster than the one-second
+  dial interval
+  ([#2065](https://github.com/zakura-core/zakura/pull/2065)).
+- Discovery now confirms only the record addresses this node authenticated. A
+  peer's own `Hello` confirms the record addresses on its connection's remote
+  IP, and a dial confirms only the exact address it reached. A record that
+  replaces an expired one without a higher sequence starts with no confirmed
+  address. A record becomes eligible for peer samples once one of its
+  addresses is confirmed. On each IP, the discovery dialer tries the address
+  a successful dial reached first, then the record's other confirmed
+  addresses ([#2066](https://github.com/zakura-core/zakura/pull/2066)).
+- Replaced rolling block-advertisement windows with one size-dependent delay.
+  Peers outside the initial group no longer wait for other peers to request or
+  finish uploading a block. Restored the initial-group defaults to 32/64 peers
+  and preserved explicitly configured bounds. New `advert_delay_min` and
+  `advert_delay_max` settings default to zero, so all peers receive announcements
+  immediately by default, including for blocks larger than 100 KiB
+  ([#2082](https://github.com/zakura-core/zakura/pull/2082)).
+- Notify block-upload tracking when a connection fails, before closing its writer.
+  Retry failed announcement snapshots when replacement peers arrive, without
+  restarting the announcement delay. Retain bounded recent-success history so
+  timeout fallbacks can skip peers whose earlier announcement succeeded.
+- Complete singleton block and transaction fetches over Zakura compatibility
+  streams as soon as the item or missing-item record arrives, without waiting
+  for the peer to finish the response stream
+  ([#2086](https://github.com/zakura-core/zakura/pull/2086)).
+- Coordinate mining broadcasts with state admission, so a peer's committed copy is relayed
+  promptly even while the same local submission is still verifying. Admitted local submissions
+  suppress ordinary committed-tip gossip for at most 90 seconds from their first deferral,
+  including across tip changes, while retaining verification capacity. This bound covers
+  submission coordination, not network delivery
+  ([#2090](https://github.com/zakura-core/zakura/pull/2090)).
+- Suppress delayed optimistic block announcements after state commits the submission,
+  while preserving committed-broadcast retries.
+- A peer that header sync faulted becomes eligible for a header session again
+  as soon as its readmission cooldown ends. Previously the node could keep
+  refusing its sessions for up to about another cooldown. On an inbound
+  connection the peer still has to re-offer the session, which a Zakura peer
+  does within a few seconds
+  ([#2104](https://github.com/zakura-core/zakura/pull/2104)).
+- Reduced block-processing overhead for indexed transparent addresses with long
+  retained payment histories by sharing unchanged groups of output heights
+  ([#2112](https://github.com/zakura-core/zakura/pull/2112)).
+- Avoid repeating every parent-output lookup when transparent scripts cross the
+  retention budget, keeping the existing limit on retained script bytes
+  ([#2116](https://github.com/zakura-core/zakura/pull/2116)).
+- Reject blocks whose transactions spend the same transparent output before
+  performing parent-output reads and expensive transaction verification
+  ([#2117](https://github.com/zakura-core/zakura/pull/2117)).
+
+## [1.8.4] - 2026-11-06
+
+### Added
+
+- Added an optional loopback-only raw trace endpoint. `GET /traces` lists the
+  JSONL trace tables, and `GET /traces/<table>` streams one table with standard
+  HTTP byte ranges and an `ETag`, so collectors can follow a growing table with
+  `If-Range`. It is disabled by default and requires `trace_dir`
+  ([#2072](https://github.com/zakura-core/zakura/pull/2072)).
+
+### Changed
+
+- Verifying a block computes each v5 and v6 transaction's ID and authorizing-data
+  digest once, and reuses them for transaction verification and the block's
+  authorizing-data commitment check, instead of recomputing the digests
+  ([#2022](https://github.com/zakura-core/zakura/pull/2022)).
+- Reduced block and transaction-expiry cleanup work by removing known mempool
+  transaction IDs without rescanning the pool
+  ([#2048](https://github.com/zakura-core/zakura/pull/2048)).
+- Raised the minimum fee recommendation from `getstandardfee` to 1,000
+  zatoshis per logical action
+  ([#2060](https://github.com/zakura-core/zakura/pull/2060)).
+- Classify the compatible performance improvements and fee recommendation
+  increase as a patch node release; library crates retain their independent
+  version requirements ([#2074](https://github.com/zakura-core/zakura/pull/2074)).
+- Raised the default `advert_window_min` and `advert_window_max` from 32 and 64
+  to 1000, so every block is advertised to up to 1000 peers at once. Relayed
+  blocks previously reached the last peers 9 to 12 s late in 3 s waves. Config
+  files that still hold the previous defaults, such as files made by
+  `zakurad generate`, now load as the new defaults. Other configured values are
+  kept ([#2078](https://github.com/zakura-core/zakura/pull/2078)).
+- Reduced how long the legacy block advertiser waits for a peer to request an
+  advertised block from 3 s to 2 s, so peers that already have the block hold
+  up new-block fan-out for less time
+  ([#2079](https://github.com/zakura-core/zakura/pull/2079)).
+
+<!-- release-readiness: allow-patch; reason: The v1.8.4 Changed entries are compatible performance improvements in #2022 and #2048 and a higher getstandardfee recommendation in #2060 that preserves the RPC shape and the mempool acceptance fee, plus the block advert window and wait tuning in #2078 and #2079, whose configuration fields are unchanged. The only Added entry, #2072, is an opt-in, disabled-by-default trace endpoint. Library crates retain their independently required SemVer bumps. -->
+
+### Fixed
+
+- Fixed header sync re-requesting a VCT repair target from a peer that refused
+  it before that peer advertised a new status, and capped such refusals at
+  three per peer per repair episode. A peer's repair failures now survive its
+  session being replaced, and hold for one readmission cooldown after it
+  disconnects ([#2000](https://github.com/zakura-core/zakura/pull/2000)).
+- Fixed block sync giving a peer a fresh Status allowance each time it reopened
+  the block-sync stream. The connection now keeps its Status pacing across
+  stream replacements
+  ([#2012](https://github.com/zakura-core/zakura/pull/2012)).
+- Fixed block sync advertising free download slots for a peer whose outbound
+  queue was full
+  ([#2012](https://github.com/zakura-core/zakura/pull/2012)).
+- Fixed native discovery authoring an older self-record after a backward clock
+  step across a restart, which left peers dialing the node's previous addresses
+  until the old record expired. The node now stores its last authored sequence
+  beside its identity key, in
+  `<identity_dir>/<network>.<node_id>.zakura-discovery-sequence`
+  ([#2013](https://github.com/zakura-core/zakura/pull/2013)).
+- Fixed a native P2P peer being able to stall its connection for up to 10
+  seconds by withholding stream credit while the node reopened one of its
+  service sessions. The reopen now runs beside the connection's other work and
+  reserves the service only once its streams are open. The connection's first
+  session opens also end at once when the node closes the connection
+  ([#2014](https://github.com/zakura-core/zakura/pull/2014)).
+- Reduced `getblocktemplate` transaction-selection work for large mempools by
+  avoiding repeated rebuilds of fee-sampling weights
+  ([#2054](https://github.com/zakura-core/zakura/pull/2054)).
+- Fixed maintained Zakura redials that credited connection setup time toward
+  a healthy connection, and an alternate connection that lifted the ten-minute
+  ALPN-mismatch backoff
+  ([#2062](https://github.com/zakura-core/zakura/pull/2062)).
+- Reduced redundant block and transaction decoding when fetching inventory over
+  Zakura compatibility streams
+  ([#2057](https://github.com/zakura-core/zakura/pull/2057)).
+
+## [1.8.3] - 2026-11-05
+
+### Added
+
+- The `peer.block_gossip.advert_priority_writes` counter: block announcements
+  written ahead of a peer's messages because those had kept the announcement
+  waiting ([#2010](https://github.com/zakura-core/zakura/pull/2010)).
+
+### Changed
+
+- Bounded native P2P raw frames and queued frames without another owner per
+  connection and stream kind. Each kind has a receive share and an output share
+  on every connection. A kind whose local consumers lag behind its share now
+  pauses that kind's readers or senders on that connection instead of retaining
+  more memory. No budget spans connections, so one peer's traffic cannot pause
+  another. Connection teardown now waits, for a bounded time, for its aborted
+  stream workers before returning its connection slot. A subscription's
+  terminal outcome now queues behind prior data without waiting for queue space
+  ([#1620](https://github.com/zakura-core/zakura/pull/1620)).
+- Counted native P2P frames that the node has read but still keeps against the
+  peer's QUIC receive window, so a peer can't send more while the node holds
+  its earlier frames. A connection starts at `quic.receive_window_bytes`, and
+  after negotiation its window grows once by the receive share of each stream
+  kind it negotiated. `quic.receive_window_bytes` may now be smaller than
+  `quic.stream_receive_window_bytes`
+  ([#1620](https://github.com/zakura-core/zakura/pull/1620)).
+- Charged each native stream kind's receive share against
+  `[network.zakura] peer_memory_budget_bytes`, so a connection costs 144 MiB at
+  the default windows instead of 64 MiB. The default budget rises from 8 GiB
+  to 18,112 MiB and still admits 92 connections. A generated config that stores
+  `peer_memory_budget_bytes = 8589934592` now admits 23 connections; raise the
+  value or delete the line to use the default
+  ([#1620](https://github.com/zakura-core/zakura/pull/1620)).
+- Refused a `[network.zakura.quic] stream_receive_window_bytes` below one
+  block-sync frame (3 MiB plus its header) at config load, when the node runs
+  native P2P. Each stream kind receives at most one stream window
+  ([#1620](https://github.com/zakura-core/zakura/pull/1620)).
+- Bounded connection teardown's wait for its stream workers to one deadline,
+  however many workers end during it. A request stream's response write now
+  also ends when its connection closes. A peer that reads responses slowly
+  can no longer hold its connection slot after the connection ends
+  ([#1620](https://github.com/zakura-core/zakura/pull/1620)).
+- Returned an error from native endpoint startup, instead of panicking, when a
+  stream kind's receive or output share can't hold that kind's largest frame.
+  The check covers custom services' streams and configs built in code, and it
+  runs before the endpoint binds its QUIC socket
+  ([#1620](https://github.com/zakura-core/zakura/pull/1620)).
+- Keep a configured `zakura.block_sync.max_inflight_block_bytes` above one worst-case block (about 2 MB). The node used to raise any value up to 32 MiB to just above 32 MiB ([#1626](https://github.com/zakura-core/zakura/pull/1626)).
+- Cap each peer's block-sync byte congestion window at `zakura.block_sync.bbr_max_cwnd_bytes`, 32 MiB by default, so the window never grants more than the block work queue admits. A peer at 1 Gbps and 250 ms still gets its full rate ([#1630](https://github.com/zakura-core/zakura/pull/1630)).
+- Cap the block-request bytes one peer session may have outstanding at 32 MiB plus the floor bypass. The new `zakura.block_sync.bbr_max_cwnd_bytes` setting sets the cap ([#1864](https://github.com/zakura-core/zakura/pull/1864)).
+- Limit admitted blocking state reads across service clones.
+  Keep admission until cancelled jobs finish and reserve capacity for chain-tip reads
+  ([#1868](https://github.com/zakura-core/zakura/pull/1868)).
+- Add one Tokio blocking thread per admitted state read to Tokio's default 512, so
+  saturated reads no longer delay other blocking work.
+- Reserve the decoded bound of a disk read's recorded size before reading it, then
+  settle to the measured result and keep the charge through the last result handle.
+  Blocks, standalone transactions, headers and serialized blocks share one retained
+  byte budget. Report capacity refusal separately from missing data. Reserve
+  separate result capacity for chain-tip publication.
+- Startup migrations, rollback, format checks and offline tools read without
+  network read admission.
+- Add `read_result_byte_limit`. When unset, `zakurad` derives it from the inbound
+  peer limit times the blocks one `getdata` request can hold, clamped to
+  `network.zakura.peer_memory_budget_bytes` (8 GiB by default).
+- Legacy `getdata` answers each block read refused for capacity with `notfound`.
+  `getblockheader` and `getblock` report a refusal as a retryable out-of-memory
+  error. The mempool no longer caches a transaction as rejected when the state
+  refuses its input lookup.
+- Refuse to start when read or verification limits cannot fund their workers, or
+  when the effective verification limits exceed the node allowance. Log both
+  checked bounds at startup.
+- Bound callers waiting for mempool outputs, and remove abandoned output and UTXO
+  waiters while the chain tip stalls.
+- Bounded legacy TCP and compatibility ingress. Each outbound compatibility
+  exchange now funds its serialized frames from a gate its connection owns through
+  decode, and TCP decoders reserve at most 64 KiB before a message body arrives.
+  Decoded inbound gossip and requests share a byte budget until their handoff to the
+  inbound service, and a saturated budget refuses new work. Header responses now keep
+  their read admission through the send, and a separate charge covers their copied
+  bytes. Decoded TCP `block` and `tx` messages share a node-wide byte budget until the
+  connection hands them on. A response to this node's request never refuses, and a
+  saturated budget drops an unsolicited transaction.
+  The TCP decoder now continues past ignored Bloom and unknown commands to the next
+  message, so that message no longer waits for more bytes from the peer. An inbound
+  request stream now reserves its response's output from its stream kind's gate
+  before the service runs, so a peer that stops reading holds further requests of
+  that kind before they execute. The reservation counts each frame's overhead and
+  ignores a small frame cap, so a request whose response cannot fit its kind's
+  output share is refused before its service runs
+  ([#1882](https://github.com/zakura-core/zakura/pull/1882)).
+- The derived state read result limit keeps its own 8 GiB ceiling, so the
+  larger peer memory budget does not raise it
+  ([#1882](https://github.com/zakura-core/zakura/pull/1882)).
+- Native P2P now checks its combined resource limits at startup and refuses an
+  overflowing bound or an invalid decoded allowance. A new counter reports owner
+  counts above their bound
+  ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- The node-wide serving output budget now holds the budget of every session
+  that can serve at once, so conformant peers can no longer pause each other's
+  block and header serving. Those sessions are the inbound plus outbound peer
+  limits, clamped to the admitted connections. At the 92 default connections,
+  block sync and header sync can each reserve 5.75 GiB of unsent responses.
+  The new `[network.zakura.block_sync] node_serve_output_bytes` and
+  `[network.zakura.header_sync] node_serve_output_bytes` settings lower that
+  budget ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- Each native P2P connection's QUIC receive window now grants the handshake
+  window plus the receive share of each stream kind it negotiates, sized from
+  that reactor's own limits. The default peer memory budget changes from
+  18,112 MiB ([#1620](https://github.com/zakura-core/zakura/pull/1620)) to
+  15 GiB, so it funds the 92 default connections at those windows. The
+  default connection count stays 92
+  ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- Nodes that register custom P2P services through
+  `zakurad::node::run_with_services` now charge each custom stream kind's
+  receive share to `[network.zakura] peer_memory_budget_bytes`, as the
+  connection's QUIC window grants it. At the same budget, such nodes admit
+  fewer native connections
+  ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- **Operators with a generated config:** `zakurad generate` wrote
+  `peer_memory_budget_bytes = 8589934592` (8 GiB) into the config file. That
+  value now admits 43 native connections instead of 92, and a budget of 4 GiB
+  or less admits too few for a node that runs native P2P to start. Raise
+  `[network.zakura] peer_memory_budget_bytes` to at least 15 GiB, or delete the
+  line to use the default
+  ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- Config load now refuses a `[network.zakura.block_sync] bbr_max_cwnd_bytes`
+  above about 246 MiB, because the block-sync receive share it derives must
+  fit QUIC's 256 MiB stream receive window. Such a config used to fail at bind
+  ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- `[network.zakura.block_sync] max_inflight_block_bytes` is now optional.
+  Unset, the node derives it from its block-sync connections and the cwnd cap:
+  2,944 MiB at the defaults, down from 6 GiB. Configs that set it keep their
+  value ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- New gauges `zakura.p2p.gate.held_bytes` and `zakura.p2p.gate.bound_bytes`,
+  labeled by stream kind and gate, and `zakura.p2p.compat_exchange.held_bytes`
+  report the bytes each reactor holds, every 10 seconds
+  ([#1884](https://github.com/zakura-core/zakura/pull/1884)).
+- Adding a block to the best chain now hashes the note commitment trees at the same time as
+  the other chain updates instead of one after the other, which makes accepting blocks
+  with shielded notes faster ([#1952](https://github.com/zakura-core/zakura/pull/1952)).
+- Sized the state database's RocksDB background flush and compaction pool from
+  the available CPU cores (2 to 16 jobs) instead of RocksDB's default of two,
+  which removes write stalls during archive-mode initial sync
+  ([#1967](https://github.com/zakura-core/zakura/pull/1967)).
+- `zakurad` log lines are now plain text. The `tracing.use_color` and
+  `tracing.force_use_color` settings now only control the startup
+  screen-clear and logo
+  ([#1995](https://github.com/zakura-core/zakura/pull/1995)).
+- The managed `zcashd` download now trusts the system CA bundle, or the PEM
+  bundle named by `SSL_CERT_FILE`, instead of a root list compiled into
+  `zakurad`. Hosts that use managed `zcashd` need CA certificates installed,
+  for example the `ca-certificates` package
+  ([#1995](https://github.com/zakura-core/zakura/pull/1995)).
+- The standalone `zakura-prune-state` and `zakura-rollback-state` binaries
+  are no longer shipped, including in the Docker image. Use
+  `zakurad prune-state` and `zakurad rollback-state`, which take the same
+  arguments but start from the loaded `zakura.toml` instead of the default
+  state configuration; pass `--cache-dir` to choose the state directory
+  explicitly ([#1997](https://github.com/zakura-core/zakura/pull/1997)).
+
+<!-- release-readiness: allow-patch; reason: Release owner chose a patch release. The standalone state tools moved into zakurad subcommands that take the same arguments, and the other additions and behavior changes keep existing configurations working. -->
+- Legacy peer connections send each message as soon as it is written, instead
+  of waiting for the peer to acknowledge earlier data. Blocks announced over a
+  new connection, and small blocks in general, reach peers tens of
+  milliseconds sooner ([#2011](https://github.com/zakura-core/zakura/pull/2011)).
+- JSON-RPC 2.0 calls with one large string argument, such as `submitblock`, now check that
+  argument for quotes and escapes with a vectorized search, which saves about 1.5 ms on a
+  1.9 MB block ([#2021](https://github.com/zakura-core/zakura/pull/2021)).
+- Compute transaction IDs in parallel when verifying blocks with at least 64
+  transactions and multiple hashing workers, reducing hashing time for larger
+  blocks while keeping small blocks on the serial path
+  ([#2024](https://github.com/zakura-core/zakura/pull/2024)).
+- Block verification hands transactions to the transaction verifier without waiting on it
+  for each one, which shortens verification of blocks with thousands of transactions
+  ([#2025](https://github.com/zakura-core/zakura/pull/2025)).
+- Orchard proofs are now verified in batches of up to 128 actions instead of 64, which checks
+  a cold 1.9 MB Orchard block about 11% faster
+  ([#2035](https://github.com/zakura-core/zakura/pull/2035)).
+- Reduced mempool polling work between blocks by checking transaction expiry
+  only when the best chain grows
+  ([#2044](https://github.com/zakura-core/zakura/pull/2044)).
+- Updated Common dependencies to 5.2.0, bringing faster Orchard batch
+  verification, RedPallas signing and verification, and multiscalar
+  multiplication
+  ([#2046](https://github.com/zakura-core/zakura/pull/2046)).
+- Reduced mempool TXID lookup work by selecting requested transactions
+  directly from the existing index
+  ([#2047](https://github.com/zakura-core/zakura/pull/2047)).
+
+### Fixed
+
+- Fixed discovery admission so that a peer's replacement session in the other
+  direction no longer exceeds that direction's peer limit. The bug predates this
+  PR ([#1621](https://github.com/zakura-core/zakura/pull/1621)).
+- Query a reopened block gap first after a block-sync reset or a failed block apply, instead of finishing a stale body-size hint refresh ([#1626](https://github.com/zakura-core/zakura/pull/1626)).
+- Restart a persistent body-unavailable alarm for a new supplier on the next block-sync re-query, even when the supplier's status notice was dropped ([#1626](https://github.com/zakura-core/zakura/pull/1626)).
+- Stop a rejected block body that races a header-authority refresh from leaving other suppliers suppressed for that body ([#1626](https://github.com/zakura-core/zakura/pull/1626)).
+- Grant the block-sync liveness congestion grace once per no-progress episode, so a peer can no longer renew it by briefly draining its outbound queue ([#1630](https://github.com/zakura-core/zakura/pull/1630)).
+- Show no free block-sync slots for a peer at its no-progress request cap, so other peers no longer defer the download floor to a peer that refuses work ([#1630](https://github.com/zakura-core/zakura/pull/1630)).
+- Preserve block-download capacity through cancellation and request transfer. Close admission and drain accepted block work for at most 30 seconds when accounting fails ([#1864](https://github.com/zakura-core/zakura/pull/1864)).
+- Keep a reissued block request funded when a late body for that height's pre-reset hash arrives. The late body previously ended the replacement's reservation, which could stall block sync at that height ([#1864](https://github.com/zakura-core/zakura/pull/1864)).
+- Keep native block-sync decoded payloads charged while downstream holders retain them.
+  Retry pending block decoding when holders release capacity.
+  Limit decoded bytes in the block-sync pipeline by a bound derived from its request budgets,
+  without refusing requested bodies or commit-window submissions
+  ([#1865](https://github.com/zakura-core/zakura/pull/1865)).
+- Keep block-sync peer reports from verification out of the action-channel slot reserved for needed-body queries and body-availability requests.
+  A tampering report waits for room beyond that slot instead of taking it
+  ([#1865](https://github.com/zakura-core/zakura/pull/1865)).
+- Keep a block that failed to apply within the decoded pipeline bound until verifier work that outlives the apply, such as queued script checks, releases it
+  ([#1865](https://github.com/zakura-core/zakura/pull/1865)).
+- Keep discovery connections open when another service takes ownership while
+  discovery waits for pending answers. Prevent discovery from missing exchange
+  completion notifications
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Release discovery dial reservations and transport capacity when a candidate worker is cancelled
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Keep a discovery query's reservation slot through verification and import of its answer, so a
+  slow verification cannot stack further answers. A closing discovery-only connection now waits, up
+  to its deadline, for answers the peer already delivered
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Stop importing a `Peers` answer whose discovery session was replaced during its verification
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Credit a discovery dial only for a registration that its own handshake authenticated. A
+  registration from another connection no longer scores the attempt or confirms the dialed record,
+  so this node no longer shares that record's addresses with other peers. A dial that this node's
+  admission limits refuse at registration now pauses discovery dialing instead of backing off the
+  peer
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Hold a closing discovery-only connection, up to its deadline, for a `Hello` in verification, so the
+  connection closes with the exchange counted as complete
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Count in-flight discovery dials against the connection soft cap, so discovered peers no longer
+  take the slots reserved for bootstrap peers. The bug predates this PR
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Keep a connection open when another service takes it while discovery closes a discovery-only
+  exchange. Discovery now checks the connection's owners last, with no wait before the close
+  ([#1867](https://github.com/zakura-core/zakura/pull/1867)).
+- Fixed Zakura-only nodes shutting down at startup with "genesis apply handoff
+  failed: illegal sync lifecycle transition" when the header runtime was ready
+  before block sync started
+  ([#1965](https://github.com/zakura-core/zakura/pull/1965)).
+- Fixed header sync letting a peer escape its penalties. Replacing a session no
+  longer resets the peer's unproductive-request strikes, and a reconnect within
+  one readmission cooldown resumes them. Invalid headers that arrive after their
+  request retired still hold back the peer's readmission
+  ([#2001](https://github.com/zakura-core/zakura/pull/2001)).
+- Fixed block sync crediting a peer's reliability for every late block body.
+  A late body now offsets only a timeout that the same session charged for its
+  height, and only once
+  ([#2002](https://github.com/zakura-core/zakura/pull/2002)).
+- A peer that always has a message ready can no longer keep this node's block
+  announcement queued on its connection: once its messages have held the
+  announcement back for a second, the announcement is written first, so such a peer
+  cannot spend a block's announcement
+  ([#2010](https://github.com/zakura-core/zakura/pull/2010)).
+- Enable runtime-detected SHA-2 acceleration on little-endian ARM64 Linux and
+  macOS builds, retaining the software fallback when CPU support is unavailable
+  ([#2015](https://github.com/zakura-core/zakura/pull/2015)).
+- A `getblocktemplate` long poll sent with an older tip's ID now gets
+  coinbase-only work on the new tip right away, instead of waiting for the
+  mempool to catch up and building a full template first
+  ([#2038](https://github.com/zakura-core/zakura/pull/2038)).
+
+### Security
+
+- The managed `zcashd` download never trusts eMudhra (emSign) root
+  certificates, even when the system bundle includes them
+  ([#1995](https://github.com/zakura-core/zakura/pull/1995)).
+
+## [1.8.2] - 2026-11-04
+
+### Changed
+
+- Block verification starts shielded transaction checks before transparent ones, shortening verification of mixed blocks
+  ([#1922](https://github.com/zakura-core/zakura/pull/1922)).
+- JSON-RPC 2.0 calls with one unescaped string argument, such as `submitblock`,
+  no longer copy and re-encode parameters before the server reads them
+  ([#1957](https://github.com/zakura-core/zakura/pull/1957)).
+- Committing a mined block now reuses the chain state the node already built when it validated
+  that block's template as a proposal, instead of building it a second time. Cached proposal
+  chains are released when their parent leaves the live state, even if proposals stop arriving
+  ([#1963](https://github.com/zakura-core/zakura/pull/1963)).
+- Updated Common dependencies to 5.1.0, bringing Orchard and Sapling signature
+  verification improvements
+  ([#1964](https://github.com/zakura-core/zakura/pull/1964)).
+- Block verification flushes partial Sapling and Orchard proof batches as soon as the block's shielded transactions have
+  queued them, instead of after every transaction has started, so mixed blocks verify their proofs alongside the
+  transparent checks ([#1968](https://github.com/zakura-core/zakura/pull/1968)).
+- Classify the accumulated compatible performance and dependency improvements as
+  a patch release for the node; published libraries retain their independent
+  API version requirements ([#1971](https://github.com/zakura-core/zakura/pull/1971)).
+
+<!-- release-readiness: allow-patch; reason: The Changed entries since v1.8.1 are backwards-compatible performance and dependency improvements. Existing node configurations, RPC behavior, and consensus rules remain compatible. Published library API changes are versioned independently. -->
+
+### Security
+
+- Reject mempool transactions with unknown shielded anchors or already-spent
+  nullifiers before submitting proof verification to the shared block verifiers
+  ([#1962](https://github.com/zakura-core/zakura/pull/1962)).
+
+## [1.8.1] - 2026-11-03
+
+### Changed
+
+- Experimental: legacy block broadcasts adjust their advert window from the
+  block's size. Blocks up to 100 KiB use 64 peers. Blocks at or above 1.5 MiB
+  use 32 peers. The window decreases linearly between these sizes. New
+  `[network]` settings `advert_window_min` (default 32), `advert_window_max`
+  (default 64), `advert_window_small_size_bytes` (default 100 KiB), and
+  `advert_window_full_size_bytes` (default 1.5 MiB) control these bounds
+  ([#1886](https://github.com/zakura-core/zakura/pull/1886)).
+- Verifying transparent-only transactions skips a signature hash that only shielded
+  data uses ([#1910](https://github.com/zakura-core/zakura/pull/1910)).
+- Verifying a block the node has not seen before starts its parallel script checks
+  sooner, because each transaction's setup no longer re-hashes the transaction or copies
+  the read-state service ([#1916](https://github.com/zakura-core/zakura/pull/1916)).
+- Block verification no longer computes ZIP-244 digests when preparing signature hashes for pre-v5 transactions
+  ([#1919](https://github.com/zakura-core/zakura/pull/1919)).
+- Block verification reads each transparent input from the parent's UTXO set once,
+  instead of looking it up again for each transaction. Blocks with hundreds of
+  transparent inputs verify about 10 to 20 percent faster
+  ([#1937](https://github.com/zakura-core/zakura/pull/1937)).
+- Halo2 verifying keys are built in the background at startup, so the first
+  Orchard or Ironwood block after a restart no longer waits about 75 ms for them
+  ([#1937](https://github.com/zakura-core/zakura/pull/1937)).
+- `zakura_state::ParentInputs` has a new `Unspent` variant and is no longer `Copy`,
+  and `zakura_consensus::transaction::Request::Block` has a new `parent_utxos` field
+  ([#1937](https://github.com/zakura-core/zakura/pull/1937)).
+- Committing a block no longer copies the earlier transparent outputs of each address
+  it pays, which makes accepting blocks faster for mining and busy addresses
+  ([#1946](https://github.com/zakura-core/zakura/pull/1946)).
+- Pruned nodes that skip the transparent address indexes no longer maintain them for
+  recent, non-finalized blocks either, which makes accepting blocks cheaper on those nodes
+  ([#1947](https://github.com/zakura-core/zakura/pull/1947)).
+
+<!-- release-readiness: allow-patch; reason: The new [network] advert-window settings are optional with defaults, so existing configs keep working. All other Changed entries are backwards-compatible performance improvements with no RPC or consensus rule change. -->
+
+### Fixed
+
+- Block downloads triggered by a block advertisement now prefer an advertising
+  peer whose legacy connection can send the request immediately, rather than a
+  peer whose connection is still awaiting an unrelated transaction response
+  ([#1876](https://github.com/zakura-core/zakura/pull/1876)).
+
+## [1.8.0] - 2026-11-02
 
 ### Added
 
@@ -82,6 +592,47 @@ independently.
 - Release binaries and Docker images no longer force the `portable` feature.
   They still use portable Pasta arithmetic and run on any x86-64 CPU
   ([#1869](https://github.com/zakura-core/zakura/pull/1869)).
+- Enable BMI2/ADX Pasta assembly in default node and release builds, without
+  global CPU compiler flags or per-operation runtime CPU detection. Default
+  x86-64 binaries now require both CPU extensions and check compatibility at
+  startup, including in the standalone rollback utility. Build with
+  `--features portable` for older x86-64 CPUs
+  ([#1893](https://github.com/zakura-core/zakura/pull/1893)).
+- Committing a block no longer opens INFO tracing spans for each transaction, which made
+  large blocks slower to accept. At INFO, logs from inside block commits lose the
+  per-transaction span names, hashes and indexes; TRACE keeps them
+  ([#1894](https://github.com/zakura-core/zakura/pull/1894)).
+- Sapling value commitments are now held as bytes through librustzcash
+  conversion, following Common's sapling-crypto change; the set of accepted
+  `cv` encodings is unchanged, and an invalid one is still rejected by the
+  semantic verifier before any proof work
+  ([#1907](https://github.com/zakura-core/zakura/pull/1907)).
+- Reduced parent-input check latency for blocks with large batches of transparent inputs by overlapping reads ([#1908](https://github.com/zakura-core/zakura/pull/1908)).
+- Verifying a block the node has not seen before is faster for blocks with many
+  transactions: about a third faster for a 1.9 MB transparent block
+  ([#1909](https://github.com/zakura-core/zakura/pull/1909)).
+- `getblocktemplate` now reports `-10` (not synced) only when the local chain
+  tip's block time is more than 6 hours old. The threshold is now a fixed
+  duration rather than a block count, so it no longer shrinks when block
+  spacing changes ([#1911](https://github.com/zakura-core/zakura/pull/1911)).
+- Require a minimum claimed proof-of-work difficulty for recent Mainnet block
+  downloads as a defense-in-depth admission policy
+  ([#1915](https://github.com/zakura-core/zakura/pull/1915)).
+- Block verification no longer recomputes each transaction's ID when preparing its signature hashes
+  ([#1920](https://github.com/zakura-core/zakura/pull/1920)).
+- Network upgrade and consensus branch ID lookups no longer rebuild their maps on each call
+  ([#1921](https://github.com/zakura-core/zakura/pull/1921)).
+- Orchard proof batches are prepared on blocking threads instead of the async worker that admits them
+  ([#1924](https://github.com/zakura-core/zakura/pull/1924)).
+- Improved Sapling verification throughput and async responsiveness by preparing
+  batches on CPU workers
+  ([#1934](https://github.com/zakura-core/zakura/pull/1934)).
+- Updated Common cryptography libraries to `5.0.0-rc.4` for faster Groth16
+  proof and RedDSA signature batch verification
+  ([#1939](https://github.com/zakura-core/zakura/pull/1939)).
+- Updated Common cryptographic libraries to the final 5.0.0 release, including
+  faster Sapling bundle proof parsing and proof verification
+  ([#1941](https://github.com/zakura-core/zakura/pull/1941)).
 
 ### Fixed
 
@@ -135,6 +686,35 @@ independently.
   the same connection is now downloaded right away, instead of after the
   syncer's whole discovery round, which could take up to 6 seconds
   ([#1881](https://github.com/zakura-core/zakura/pull/1881)).
+- A gossiped block that arrives before its parent now immediately requests the
+  missing parent, or waits on the parent's existing download, instead of waiting
+  for another peer or the next sync round. The request goes to a peer that
+  advertised the parent, or otherwise to the peer that sent the block. The block
+  must have valid proof of work to start a request
+  ([#1873](https://github.com/zakura-core/zakura/pull/1873)).
+- A newly mined or received block is announced to peers right away, instead of
+  waiting up to several seconds for an earlier block's announcements to
+  finish ([#1874](https://github.com/zakura-core/zakura/pull/1874)).
+- Smoothed short-term variation in sync progress reporting
+  ([#1913](https://github.com/zakura-core/zakura/pull/1913)).
+- Keep legacy block announcement peers current while the node is idle, and retry
+  announcements against fresh peers when selected connections lose authorization
+  ([#1883](https://github.com/zakura-core/zakura/pull/1883)).
+- Block verification now reports a block commitment failure, rather than an
+  unrelated consensus rule, when an NU5 or later block's body doesn't match its
+  header ([#1914](https://github.com/zakura-core/zakura/pull/1914)).
+- Exempt historical Mainnet downloads from the work floor only while the committed
+  tip is below the fixed height 3,535,411 and the downloaded block claims a height
+  at or below it, independently of checkpoint-sync settings. Preserve historical
+  full-verification sync, prevent old height claims from bypassing the active floor,
+  and reject policy failures before changing sync throttling
+  ([#1928](https://github.com/zakura-core/zakura/pull/1928)).
+- Corrected Mainnet end of support for the November 3, 2026 release to target
+  December 5, 2026. The last supported height is 3,643,309; the next block
+  projects to December 5 at 00:00:20 UTC from current Mainnet progress, with
+  upgrade warnings starting three days earlier. Enforcement follows block
+  height, so the actual halt time is approximate
+  ([#1938](https://github.com/zakura-core/zakura/pull/1938)).
 
 ### Security
 

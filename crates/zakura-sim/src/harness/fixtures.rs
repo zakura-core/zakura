@@ -36,7 +36,7 @@ use super::Subsystem;
 use crate::{
     property::{
         CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status as PropertyStatus,
-        Verdict,
+        TriggerHistory, Verdict,
     },
     Observation, ObservationLog, RunConfig, Sim,
 };
@@ -166,7 +166,7 @@ impl<F: Fixture> Subsystem for Race<F> {
             needs: &[Source::View, Source::Schedule],
             status: PropertyStatus::Active,
             check: no_race::<F>,
-            witness: Some(F::trigger_history),
+            witness: Some(TriggerHistory::Log(F::trigger_history)),
         }]
     }
 
@@ -959,7 +959,7 @@ fn picked_property<F: Fixture, const FIXED_ONLY: bool>() -> Property<Pick<FIXED_
         needs: &[Source::View, Source::Schedule],
         status: PropertyStatus::Active,
         check: no_race_in::<F, FIXED_ONLY>,
-        witness: Some(F::trigger_history),
+        witness: Some(TriggerHistory::Log(F::trigger_history)),
     }
 }
 

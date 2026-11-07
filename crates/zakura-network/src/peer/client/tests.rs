@@ -35,6 +35,8 @@ use crate::{
 };
 
 #[cfg(test)]
+pub(crate) mod connected;
+#[cfg(test)]
 mod vectors;
 
 /// The maximum time a mocked peer connection should be alive during a test.
@@ -118,6 +120,14 @@ impl ClientTestHarness {
         self.client_request_receiver
             .take()
             .expect("request receiver endpoint has already been dropped");
+    }
+
+    /// Waits for the next queued block advert.
+    pub(crate) async fn receive_block_advert(&mut self) -> BlockAdvert {
+        self.block_advert_receiver
+            .recv()
+            .await
+            .expect("the connection remains open")
     }
 
     /// Returns the next block advert the [`Client`] queued, if any.
@@ -322,6 +332,7 @@ where
 
         let client = Client {
             block_uploads: Default::default(),
+            request_slot: Default::default(),
             peer_registry_updater: None,
             connection_info,
             shutdown_tx: Some(shutdown_sender),

@@ -211,6 +211,62 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// Every property a harness reports, by ID.
 pub static COVERAGE: &[Coverage] = &[
     Coverage {
+        property: super::super::domain::block_sync::PAYLOAD_INVENTORY_AGREES,
+        passing: passes(
+            "tests/block_resource_properties.rs",
+            "the_handoff_input_holds_payload_inventory_agrees",
+        ),
+        bypass: Bypass::Planted("lost-payload-release"),
+    },
+    Coverage {
+        property: "block/decoded-retention",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "decoded_retention_replays_final_holders_in_a_fresh_process",
+        ),
+        bypass: Bypass::Planted("raw-transaction-escape"),
+    },
+    Coverage {
+        property: "block/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_query_identities",
+        ),
+        bypass: Bypass::Planted("refusal-consumes-query-id"),
+    },
+    Coverage {
+        property: "block/work-funding",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_funding_records_and_replays_retained_runtime_owners",
+        ),
+        bypass: Bypass::Planted("lost-reservation-release"),
+    },
+    Coverage {
+        property: "block/work-ownership",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "work_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("missing-published-charge"),
+    },
+    Coverage {
+        property: "header/reactor-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "reactor_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("locator-call-settles-without-removal"),
+    },
+    Coverage {
+        property: "header/publisher-policy",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "publisher_machine_records_and_replays_without_transport",
+        ),
+        bypass: Bypass::Planted("lost-credit"),
+    },
+    Coverage {
         property: super::NO_TASK_PANIC,
         passing: passes("tests/harness.rs", "a_clean_run_holds_no_task_panic"),
         bypass: Bypass::Test(sim_test(
@@ -229,6 +285,30 @@ pub static COVERAGE: &[Coverage] = &[
     race("race/timer-cancel", "timer_cancel_witness"),
     race("race/ab-ba", "ab_ba_witness"),
     race("race/abort-without-join", "abort_without_join_witness"),
+    Coverage {
+        property: "discovery/record-book",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_book_records_and_replays_signed_samples",
+        ),
+        bypass: Bypass::Planted("skip-book-eviction"),
+    },
+    Coverage {
+        property: "discovery/session-installation",
+        passing: passes(
+            "tests/replay_exact.rs",
+            "discovery_state_records_and_replays_installations",
+        ),
+        bypass: Bypass::Planted("install-superseded-result"),
+    },
+    Coverage {
+        property: crate::domain::discovery::VERIFICATION_CAPACITY,
+        passing: passes(
+            "tests/discovery.rs",
+            "verification_results_keep_their_slots",
+        ),
+        bypass: Bypass::Planted("release-before-install"),
+    },
     Coverage {
         property: crate::domain::discovery::WAIT_COMPLETE_WAKES,
         passing: passes("tests/witness.rs", "discovery_wait_complete_lost_wakeup"),
@@ -254,6 +334,33 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Test(sim_test(
             "tests/header_node.rs",
             "direct_dispatch_guard_reports_a_violation",
+        )),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::CHUNK_BUDGET_BOUND,
+        passing: passes(
+            "tests/header_node_capacity.rs",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
+        bypass: Bypass::Planted("uncapped-secondary-reservation"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/header_teardown.rs",
+            "the_close_relink_input_holds_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("kept-queue-lease"),
+    },
+    Coverage {
+        property: super::header_sync::HEADER_FAULT_PENALIZED,
+        passing: passes(
+            "tests/header_wire_prepare_fault.rs",
+            "a_disconnect_mid_prepare_is_still_penalized",
+        ),
+        bypass: Bypass::Test(sim_test(
+            "tests/header_wire_prepare_fault.rs",
+            "hidden_cooldowns_violate_the_penalty_rule",
         )),
     },
     Coverage {
@@ -557,5 +664,16 @@ pub static COVERAGE: &[Coverage] = &[
             "the_decoded_input_stall_input_holds_input_decoded_bound",
         )),
         bypass: Bypass::Planted("no-room-check"),
+    },
+    Coverage {
+        property: crate::domain::block_sync_semantic::REACTOR_QUERY_LIFECYCLE,
+        passing: passes(
+            "tests/block_semantic_properties.rs",
+            "the_reset_mid_flight_input_holds_reactor_query_lifecycle",
+        ),
+        bypass: Bypass::Pending(
+            "no committed input is known to fill or close the action channel, so no planted \
+             refusal bug can reach this check yet; checker tests cover crafted refusals",
+        ),
     },
 ];

@@ -161,6 +161,20 @@ impl<T> Sender<T> {
         })
     }
 
+    /// Waits for `n` slots and holds them together. Each one sends a message.
+    #[track_caller]
+    pub fn reserve_many(
+        &self,
+        n: usize,
+    ) -> impl Future<Output = Result<PermitIterator<'_, T>, SendError<()>>> + '_ {
+        let site = Location::caller();
+        async move {
+            point(Op::Send, site);
+            let inner = self.tx().reserve_many(n).await?;
+            Ok(PermitIterator { inner, site })
+        }
+    }
+
     /// Holds `n` slots if they're free now. Each one sends a message.
     #[track_caller]
     pub fn try_reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, TrySendError<()>> {
@@ -321,7 +335,8 @@ impl<T> fmt::Debug for Permit<'_, T> {
     }
 }
 
-/// Held slots from [`Sender::try_reserve_many`], one [`Permit`] each.
+/// Held slots from [`Sender::reserve_many`] or [`Sender::try_reserve_many`],
+/// one [`Permit`] each.
 pub struct PermitIterator<'a, T> {
     inner: tokio_mpsc::PermitIterator<'a, T>,
     site: &'static Location<'static>,

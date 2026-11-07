@@ -267,6 +267,10 @@ impl BlockSyncView {
             }
             BlockEvent::WorkQueue(items) => self.work_queue.clone_from(items),
             BlockEvent::Sequencer(ownership) => {
+                if !ownership.payloads_match_policy() {
+                    self.anomalies
+                        .push("runtime payload inventory differs from sequencing policy".into());
+                }
                 self.compare_holders(ownership);
                 self.sequencer.clone_from(ownership);
             }
@@ -358,7 +362,15 @@ mod tests {
     fn snapshot(allocation: usize, submitted: bool) -> BlockEvent {
         let held = body();
         BlockEvent::Sequencer(SequencerOwnership {
+            payloads: vec![
+                zakura_network::zakura::block_sync_observe::PayloadOwnership {
+                    id: 1,
+                    decoded_attributed_memory_bytes: 0,
+                },
+            ],
             reorder: vec![RetainedBody {
+                payload_id: 1,
+                policy_decoded_bytes: 0,
                 height: held.height,
                 owner: held.owner,
                 bytes: held.bytes,

@@ -72,6 +72,7 @@ mod manifest;
 mod run;
 mod snapshot;
 mod store;
+mod targets;
 mod verify;
 
 pub use build::{build_fuzzer, BuildIdentity, FuzzBuild, FUZZ_PACKAGE, NIGHTLY};
@@ -86,4 +87,9 @@ pub use run::{
 };
 pub use snapshot::{Snapshot, SnapshotEntry, SnapshotIndex, Source};
 pub use store::{CampaignError, Digest, RunState, Store, STORE_VERSION};
+pub use targets::{
+    bypasses, check_targets, declared_targets, judge_run, max_len, own_applicability, resolve,
+    run_seed, smoke_command, BypassCase, DeclaredTarget, Readiness, SeedRun, TargetReadiness,
+    TargetStatus, TargetsOptions, READINESS_FILE, READINESS_VERSION, SHARED_PROPERTIES,
+};
 pub use verify::{verify, Verified};

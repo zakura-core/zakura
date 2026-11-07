@@ -368,7 +368,7 @@ fn output(command: &mut Command) -> Result<String, CampaignError> {
 /// The harness that fuzz target `target` runs, from the
 /// `[package.metadata.zakura-sim.targets]` table of the fuzz package's
 /// manifest `manifest`, if the table maps one.
-fn target_harness(manifest: &str, target: &str) -> Option<String> {
+pub(super) fn target_harness(manifest: &str, target: &str) -> Option<String> {
     let manifest: toml::Value = toml::from_str(manifest).ok()?;
     manifest
         .get("package")?

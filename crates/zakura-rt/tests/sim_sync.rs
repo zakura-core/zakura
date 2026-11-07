@@ -14,7 +14,7 @@ use std::{
 
 use support::run;
 use zakura_rt::{
-    sim::Op,
+    sim::{self, Op, Peek},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         counter, mpsc, oneshot, watch, CancellationToken, Mutex, Notify, PoisonError, Semaphore,
@@ -108,6 +108,100 @@ fn each_send_through_a_reserved_permit_is_a_point() {
     });
     assert_eq!(received, (Some(1), Some(2)));
     assert_eq!(report.count(Op::Send), 3, "try_reserve_many, two sends");
+}
+
+#[test]
+fn reserve_many_waits_for_the_whole_batch_in_fifo_order() {
+    run(async {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(1).await.unwrap();
+        let mut batch = pin!(tx.reserve_many(2));
+        let mut later = pin!(tx.reserve());
+        poll_fn(|cx| {
+            assert!(batch.as_mut().poll(cx).is_pending());
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(rx.recv().await, Some(1));
+        assert!(tx.try_reserve().is_err(), "the queued batch owns the slots");
+        let mut permits = batch.await.unwrap();
+        assert_eq!(permits.len(), 2);
+        permits.next().unwrap().send(2);
+        poll_fn(|cx| {
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(permits);
+        later.await.unwrap().send(3);
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(tx.capacity(), 2);
+    });
+}
+
+#[test]
+fn cancelling_reserve_many_returns_partial_capacity_to_the_next_waiter() {
+    run(async {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(1).await.unwrap();
+        let mut batch = Box::pin(tx.reserve_many(2));
+        let mut later = pin!(tx.reserve());
+        poll_fn(|cx| {
+            assert!(batch.as_mut().poll(cx).is_pending());
+            assert!(later.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(batch);
+        later.await.unwrap().send(2);
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(tx.capacity(), 2);
+    });
+}
+
+#[test]
+fn reserve_many_handles_zero_oversized_and_closed_requests() {
+    run(async {
+        let (tx, mut rx) = mpsc::channel::<u8>(2);
+        assert_eq!(tx.reserve_many(0).await.unwrap().len(), 0);
+        assert!(tx.reserve_many(3).await.is_err());
+        assert_eq!(tx.capacity(), 2);
+        tx.send(1).await.unwrap();
+        let mut batch = pin!(tx.reserve_many(2));
+        poll_fn(|cx| {
+            assert!(batch.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        rx.close();
+        assert!(batch.await.is_err());
+        assert!(tx.reserve_many(1).await.is_err());
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, None);
+    });
+}
+
+#[test]
+fn reserve_many_instruments_sends_and_unused_permit_releases() {
+    let (_channels, report) = run(async {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut permits = tx.reserve_many(4).await.unwrap();
+        permits.next().unwrap().send(1);
+        drop(permits.next().unwrap());
+        drop(permits);
+        assert_eq!(rx.recv().await, Some(1));
+        // Returning the channel lets the report exclude closing-handle releases.
+        (tx, rx)
+    });
+    assert_eq!(report.count(Op::Send), 2, "one reservation and one send");
+    assert_eq!(
+        report.count(Op::Release),
+        2,
+        "one permit and the remaining batch"
+    );
 }
 
 #[test]
@@ -560,4 +654,175 @@ fn on_cancel_adds_no_point() {
     let (hooked, plain) = (cancel_with(true), cancel_with(false));
     assert_eq!(hooked.points, plain.points);
     assert_eq!(hooked.draws, plain.draws);
+}
+
+/// A task holds a `Mutex` guard and peeks it in the same poll, which reads
+/// `Held` with the task as its holder, then drops the guard and peeks again,
+/// which reads `Current`. The atomics and the semaphore peek their values.
+/// The task reaches the same points as without the peeks: its own lock and
+/// release, and nothing else.
+///
+/// This fails if a peek reaches a point.
+#[test]
+fn peeks_add_no_point() {
+    let peeked = |peek: bool| {
+        run(async move {
+            let lock = Mutex::new(1_u64);
+            let (atomic, flag, semaphore) =
+                (AtomicU64::new(2), AtomicBool::new(true), Semaphore::new(3));
+            let mut seen = Vec::new();
+            let guard = lock.lock().unwrap();
+            if peek {
+                seen.push(lock.peek(|value| *value));
+                assert_eq!(atomic.peek(), 2);
+                assert!(flag.peek());
+                assert_eq!(semaphore.peek_available(), 3);
+            }
+            drop(guard);
+            if peek {
+                seen.push(lock.peek(|value| *value));
+            }
+            seen
+        })
+    };
+    let ((seen, with), (_, without)) = (peeked(true), peeked(false));
+    assert_eq!(
+        seen,
+        [
+            Peek::Held {
+                holder: Some(sim::TaskId::new(0))
+            },
+            Peek::Current(1)
+        ]
+    );
+    assert_eq!(
+        (with.count(Op::Lock), with.count(Op::Release)),
+        (1, 1),
+        "the task's own lock and release"
+    );
+    assert_eq!(with.points, without.points);
+}
+
+/// Outside a run, a peek is std's `try_lock` with no holder to name, and a
+/// panicked holder's value reads `Poisoned`.
+#[test]
+fn peeks_outside_a_run_behave_like_std() {
+    let lock = Arc::new(Mutex::new(5));
+    assert_eq!(lock.peek(|value| *value), Peek::Current(5));
+    let guard = lock.lock().unwrap();
+    assert_eq!(lock.peek(|value| *value), Peek::Held { holder: None });
+    drop(guard);
+    let poisoner = lock.clone();
+    std::thread::spawn(move || {
+        let _guard = poisoner.lock().unwrap();
+        panic!("poisons the lock");
+    })
+    .join()
+    .expect_err("the holder panicked");
+    assert_eq!(lock.peek(|value| *value), Peek::Poisoned(5));
+    assert_eq!(AtomicU64::new(7).peek(), 7);
+    assert_eq!(Semaphore::new(2).peek_available(), 2);
+}
+
+/// Inside a boundary read, a point, a `Mutex` lock, any use of the
+/// executor and a guard's release panic, and the mark clears when the read unwinds, so the task's own
+/// points work again. A peek inside one is fine.
+///
+/// This fails if the runtime doesn't check the mark.
+#[test]
+fn a_read_that_reaches_the_runtime_panics() {
+    let ((), report) = run(async {
+        let atomic = AtomicU64::new(0);
+        let lock = Mutex::new(0);
+        let refused = |read: &dyn Fn()| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim::boundary_read(read)))
+                .is_err()
+        };
+        assert!(refused(&|| {
+            atomic.load(Ordering::SeqCst);
+        }));
+        assert!(refused(&|| drop(lock.lock())));
+        assert!(refused(&|| {
+            let _ = sim::executor();
+        }));
+        let guard = std::cell::Cell::new(Some(lock.lock().unwrap()));
+        assert!(refused(&|| drop(guard.take())));
+        assert!(!sim::in_boundary_read(), "an unwound read clears its mark");
+        assert_eq!(sim::boundary_read(|| atomic.peek()), 0);
+        atomic.load(Ordering::SeqCst);
+    });
+    assert_eq!(
+        report.count(Op::AtomicLoad),
+        1,
+        "only the load outside any read reached its point"
+    );
+}
+
+#[test]
+fn caught_runtime_panics_still_invalidate_boundary_reads() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    run(async {
+        let atomic = AtomicU64::new(3);
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| atomic.store(4, Ordering::SeqCst))).is_err()
+                );
+                atomic.peek()
+            })
+        }));
+        assert!(failed.is_err());
+        assert_eq!(atomic.peek(), 3);
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(catch_unwind(AssertUnwindSafe(|| sim::boundary_read(|| {
+                    atomic.store(5, Ordering::SeqCst);
+                })))
+                .is_err());
+            })
+        }));
+        assert!(failed.is_err());
+        assert_eq!(sim::boundary_read(|| atomic.peek()), 3);
+    });
+}
+
+#[test]
+fn boundary_reads_reject_capacity_addition_before_it_changes_capacity() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    run(async {
+        let sem = Semaphore::new(2);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| sem.add_permits(4))
+        }));
+        assert!(result.is_err());
+        assert_eq!(sem.peek_available(), 2);
+    });
+}
+
+#[test]
+fn boundary_reads_cannot_hide_release_before_point() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    run(async {
+        let sem = Semaphore::new(1);
+        let permit = sem.try_acquire().unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(catch_unwind(AssertUnwindSafe(|| drop(permit))).is_err());
+                // The inner Tokio permit releases before the wrapper's point.
+                assert_eq!(sem.peek_available(), 1);
+            })
+        }));
+        assert!(
+            result.is_err(),
+            "a changed capacity cannot become a successful read"
+        );
+        let (sender, receiver) = watch::channel(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sim::boundary_read(|| {
+                assert!(catch_unwind(AssertUnwindSafe(|| drop(sender))).is_err());
+            })
+        }));
+        assert!(result.is_err());
+        assert!(receiver.has_changed().is_err());
+    });
 }

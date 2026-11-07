@@ -101,12 +101,10 @@ COPY --link --chown=${UID}:${GID} ./ ${HOME}
 # Build Zebra test binaries using nextest, but don't run them.
 # This also copies the necessary binaries to /usr/local/bin.
 RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
     cargo nextest run --locked --release --no-run --features "${FEATURES}" && \
     # Copy binaries to standard location
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin && \
     # Only copy zakura-checkpoints if the feature is enabled
     if echo "${FEATURES}" | grep -q "zakura-checkpoints"; then \
         cp ${CARGO_TARGET_DIR}/release/zakura-checkpoints /usr/local/bin; \
@@ -168,10 +166,8 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad --bin zakura-rollback-state --bin zakura-prune-state && \
-    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-rollback-state /usr/local/bin && \
-    cp ${CARGO_TARGET_DIR}/release/zakura-prune-state /usr/local/bin
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
+    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin
 
 # This stage starts from scratch using Debian and copies the built Zebra binaries
 # from the `release` stage along with other binaries and files.
@@ -225,8 +221,6 @@ RUN chown -R ${UID}:${GID} ${HOME}
 # setpriv is part of util-linux, already included in debian:trixie-slim.
 
 COPY --link --from=release /usr/local/bin/zakurad /usr/local/bin/
-COPY --link --from=release /usr/local/bin/zakura-rollback-state /usr/local/bin/
-COPY --link --from=release /usr/local/bin/zakura-prune-state /usr/local/bin/
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT [ "entrypoint.sh" ]

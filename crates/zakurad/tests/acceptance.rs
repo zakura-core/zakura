@@ -116,6 +116,7 @@ use std::{
 };
 #[cfg(not(target_os = "windows"))]
 use std::{net::SocketAddr, path::Path};
+use zakura_node_services::block_memory::BlockHandle;
 
 use eyre::{eyre, WrapErr};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -147,7 +148,7 @@ use zakura_rpc::{
     methods::{RpcImpl, RpcServer},
     proposal_block_from_template,
     server::OPENED_RPC_ENDPOINT_MSG,
-    MinedBlockEvent, MinerParams, SubmitBlockChannel,
+    EarlyMinedBlockChannel, MinerParams,
 };
 use zakura_state::state_database_format_version_in_code;
 use zakura_test::{
@@ -2400,7 +2401,9 @@ async fn validate_regtest_genesis_block() {
         .await;
 
     let genesis_hash = block_verifier_router
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            regtest_genesis_block().into(),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -2919,7 +2922,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3045,7 +3048,7 @@ async fn trusted_chain_sync_handles_forks_correctly() -> Result<()> {
         };
 
         assert_eq!(
-            zebra_block,
+            BlockHandle::from(zebra_block),
             read_state_block.expect("read state should have the block"),
             "read state should have the same block"
         );
@@ -3151,8 +3154,13 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let mining_conf = default_test_config.mining;
     let miner_params = MinerParams::new(&network, mining_conf.clone())?;
 
-    let (state, read_state, latest_chain_tip, _chain_tip_change) =
-        zakura_state::init_test_services(&network).await;
+    let zakura_state::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip,
+        mut block_announcements,
+        ..
+    } = zakura_state::init_test_services(&network).await;
 
     let (
         block_verifier_router,
@@ -3170,7 +3178,9 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
 
     let genesis_hash = block_verifier_router
         .clone()
-        .oneshot(zakura_consensus::Request::Commit(regtest_genesis_block()))
+        .oneshot(zakura_consensus::Request::Commit(
+            regtest_genesis_block().into(),
+        ))
         .await
         .expect("should validate Regtest genesis block");
 
@@ -3180,7 +3190,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     let mut mock_sync_status = MockSyncStatus::default();
     mock_sync_status.set_is_close_to_tip(true);
 
-    let submitblock_channel = SubmitBlockChannel::new();
+    let submitblock_channel = EarlyMinedBlockChannel::new();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
@@ -3259,13 +3269,16 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         "valid block should be accepted"
     );
 
-    // Check that the submitblock channel received the submitted block
-    let mut submit_block_receiver = submitblock_channel.receiver();
-    let submit_block_channel_data = submit_block_receiver.recv().await.expect("channel is open");
-    let (submitted_hash, submitted_height) = match submit_block_channel_data {
-        MinedBlockEvent::Early { hash, height, .. }
-        | MinedBlockEvent::Committed { hash, height, .. } => (hash, height),
-    };
+    // State announces the local commit independently of the RPC early channel.
+    let announcement = block_announcements
+        .recv(false)
+        .await
+        .expect("state is open");
+    let (submitted_hash, submitted_height) = (announcement.hash, announcement.height);
+    assert!(matches!(
+        announcement.origin,
+        zakura_state::BlockOrigin::LocalSubmission { .. }
+    ));
     assert_eq!(submitted_hash, proposal_block.hash());
     assert_eq!(submitted_height, proposal_block.coinbase_height().unwrap());
 
@@ -3528,7 +3541,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
 
         let block = block.expect("should have block with latest_chain_tip hash");
 
-        let spends_with_spending_tx_hashes = block.transactions.iter().cloned().flat_map(|tx| {
+        let spends_with_spending_tx_hashes = block.view().transactions().flat_map(|tx| {
             let tx_hash = tx.hash();
             tx.inputs()
                 .iter()
@@ -3578,7 +3591,7 @@ async fn has_spending_transaction_ids() -> Result<()> {
             );
         }
 
-        tip_hash = block.header.previous_block_hash;
+        tip_hash = block.view().header().previous_block_hash;
     }
 
     assert!(

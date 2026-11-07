@@ -641,13 +641,22 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid {
-                error: e.into(),
-                advertiser_addr,
-                tip_height,
-                transaction_version,
-                transaction_network_upgrade,
-                retried_after_tip_reset,
+            result.map_err(|e| match zakura_consensus::error::TransactionError::from(e) {
+                // The state could not answer a lookup. The rejected cache must not
+                // remember this transaction, so a later relay retries it.
+                zakura_consensus::error::TransactionError::StateUnavailable(error) => {
+                    TransactionDownloadVerifyError::StateError(CloneError::from(BoxError::from(
+                        error,
+                    )))
+                }
+                error => TransactionDownloadVerifyError::Invalid {
+                    error,
+                    advertiser_addr,
+                    tip_height,
+                    transaction_version,
+                    transaction_network_upgrade,
+                    retried_after_tip_reset,
+                },
             })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
@@ -1550,6 +1559,58 @@ mod tests {
             ),
             "expected the pushed transaction failure to carry the peer address, version, and upgrade, got {error:?}"
         );
+    }
+
+    /// A state lookup failure is not a verdict on the transaction, so the mempool
+    /// must not cache the transaction as rejected.
+    #[tokio::test]
+    async fn state_lookup_failure_is_not_cached_as_a_rejection() {
+        use zakura_consensus::error::TransactionError;
+
+        let transaction = empty_v5_transaction(1);
+        let tx_id = transaction.id();
+
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(|_request| async move {
+                Err(Box::new(TransactionError::StateUnavailable(
+                    "read capacity exhausted".to_string(),
+                )) as BoxError)
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            PeerCooldowns::default(),
+            Arc::new(Notify::new()),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Tx(transaction), None, None)
+            .expect("download is queued");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("verification should complete")
+            .expect("download stream should yield an item")
+            .expect("verification should not time out")
+            .expect_err("an unavailable state fails verification")
+            .1;
+        assert!(
+            matches!(error, TransactionDownloadVerifyError::StateError(_)),
+            "{error:?}"
+        );
+
+        let mut storage = super::super::storage::Storage::new(&super::super::Config::default());
+        storage.reject_if_needed(tx_id, error);
+        assert!(!storage.contains_rejected(&tx_id));
     }
 
     /// A transaction served by a peer in a cooldown must not be verified, even

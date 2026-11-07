@@ -28,6 +28,7 @@
 //! | The sender paces rows and keeps one unwritten frame per row | `the_sender_waits_for_its_interval_and_keeps_only_the_latest_value`, `a_blocked_writer_holds_at_most_one_frame_per_row` |
 //! | A row reports pacing, an unwritten frame, and a full queue apart | `a_row_reports_why_it_did_not_send` |
 //! | A local minimum interval only slows a row | `a_minimum_interval_only_slows_a_row` |
+//! | Charges at explicit instants match an interval-stepping bucket | `the_ledger_matches_an_interval_stepping_bucket` |
 
 use std::time::Duration;
 
@@ -38,8 +39,12 @@ use crate::zakura::{
     Cadence, Clock, FrameGuard, FramedSend, MessageRole, MessageRule, RealClock,
 };
 
+#[cfg(any(test, feature = "p2p-fuzz"))]
+mod fuzz;
 #[cfg(test)]
 mod tests;
+#[cfg(any(test, feature = "p2p-fuzz"))]
+pub use fuzz::{replay_cadence_bytes, CadenceReplaySummary};
 
 /// The result of charging one frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -114,6 +119,54 @@ impl Bucket {
     }
 }
 
+/// What [`CadenceLedger::charge`] did with one frame.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Charged {
+    /// The bucket had a token. `low` reports that fewer than a quarter of the
+    /// row's capacity remain.
+    Admit { low: bool },
+    /// The bucket is empty.
+    Exhausted,
+}
+
+/// One connection's cadence buckets, charged at explicit instants.
+///
+/// It reads no clock and emits no metric. [`CadenceBuckets`] supplies the
+/// time and reports the facts it returns.
+#[derive(Debug, Default)]
+struct CadenceLedger {
+    buckets: HashMap<CadenceKey, Bucket>,
+}
+
+impl CadenceLedger {
+    /// Charge one frame of a row with `cadence` at `now`.
+    fn charge(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> Charged {
+        let bucket = self.bucket(key, cadence, now);
+        if bucket.tokens == 0 {
+            return Charged::Exhausted;
+        }
+        bucket.tokens -= 1;
+        Charged::Admit {
+            low: bucket.tokens < cadence.capacity / 4,
+        }
+    }
+
+    /// Credit a local read pause of `paused` to a row with `cadence` at `now`.
+    fn credit_pause(&mut self, key: CadenceKey, cadence: Cadence, paused: Duration, now: Instant) {
+        self.bucket(key, cadence, now).credit_pause(paused);
+    }
+
+    /// The bucket of `key`, created full on first use and refilled to `now`.
+    fn bucket(&mut self, key: CadenceKey, cadence: Cadence, now: Instant) -> &mut Bucket {
+        let bucket = self
+            .buckets
+            .entry(key)
+            .or_insert_with(|| Bucket::new(cadence, now));
+        bucket.refill(now);
+        bucket
+    }
+}
+
 /// One connection's cadence buckets.
 ///
 /// Created with the connection. Retiring a session or reopening a stream in
@@ -121,7 +174,7 @@ impl Bucket {
 /// connection admission bounds reconnects.
 #[derive(Debug)]
 pub(crate) struct CadenceBuckets<C: Clock = RealClock> {
-    buckets: HashMap<CadenceKey, Bucket>,
+    ledger: CadenceLedger,
     clock: C,
 }
 
@@ -134,7 +187,7 @@ impl Default for CadenceBuckets<RealClock> {
 impl<C: Clock> CadenceBuckets<C> {
     pub(crate) fn new(clock: C) -> Self {
         Self {
-            buckets: HashMap::new(),
+            ledger: CadenceLedger::default(),
             clock,
         }
     }
@@ -145,36 +198,33 @@ impl<C: Clock> CadenceBuckets<C> {
         let Some(cadence) = cadence(rule) else {
             return CadenceCharge::Exempt;
         };
-        let now = self.clock.now();
         let key = CadenceKey {
             layout,
             message_type: rule.message_type,
         };
-        let bucket = self
-            .buckets
-            .entry(key)
-            .or_insert_with(|| Bucket::new(cadence, now));
-        bucket.refill(now);
-        if bucket.tokens == 0 {
-            metrics::counter!(
-                "zakura.p2p.cadence.exhausted",
-                "layout" => layout.to_string(),
-                "message_type" => rule.message_type.to_string(),
-            )
-            .increment(1);
-            return CadenceCharge::Exhausted;
+        match self.ledger.charge(key, cadence, self.clock.now()) {
+            Charged::Exhausted => {
+                metrics::counter!(
+                    "zakura.p2p.cadence.exhausted",
+                    "layout" => layout.to_string(),
+                    "message_type" => rule.message_type.to_string(),
+                )
+                .increment(1);
+                CadenceCharge::Exhausted
+            }
+            Charged::Admit { low } => {
+                if low {
+                    // Count low buckets as evidence for tuning.
+                    metrics::counter!(
+                        "zakura.p2p.cadence.low",
+                        "layout" => layout.to_string(),
+                        "message_type" => rule.message_type.to_string(),
+                    )
+                    .increment(1);
+                }
+                CadenceCharge::Admit
+            }
         }
-        bucket.tokens -= 1;
-        if bucket.tokens < cadence.capacity / 4 {
-            // Count low buckets as evidence for tuning.
-            metrics::counter!(
-                "zakura.p2p.cadence.low",
-                "layout" => layout.to_string(),
-                "message_type" => rule.message_type.to_string(),
-            )
-            .increment(1);
-        }
-        CadenceCharge::Admit
     }
 
     /// Credit a local read pause on a stream of `layout` that carries `rules`.
@@ -193,19 +243,15 @@ impl<C: Clock> CadenceBuckets<C> {
                 layout,
                 message_type: rule.message_type,
             };
-            let bucket = self
-                .buckets
-                .entry(key)
-                .or_insert_with(|| Bucket::new(cadence, now));
-            bucket.refill(now);
-            bucket.credit_pause(paused);
+            self.ledger.credit_pause(key, cadence, paused, now);
         }
     }
 
     /// Tokens left in a bucket, if it exists.
     #[cfg(test)]
     pub(crate) fn tokens(&self, layout: u16, message_type: u16) -> Option<u32> {
-        self.buckets
+        self.ledger
+            .buckets
             .get(&CadenceKey {
                 layout,
                 message_type,
@@ -386,23 +432,33 @@ pub(crate) enum RowSend {
     QueueFull,
 }
 
+impl<M> Slot<M> {
+    /// Why this row cannot queue its value at `now`, if it cannot.
+    ///
+    /// `unwritten` reports whether the row's previous frame still waits for
+    /// its transport write.
+    fn hold(&self, now: Instant, unwritten: bool) -> Option<RowSend> {
+        if self.latest.is_none() {
+            return Some(RowSend::Idle);
+        }
+        if let Some(due) = self
+            .last_sent
+            .map(|last| last + self.send_interval)
+            .filter(|due| *due > now)
+        {
+            return Some(RowSend::DeferredUntil(due));
+        }
+        unwritten.then_some(RowSend::Unwritten)
+    }
+}
+
 fn send_slot<M: WireMessage>(
     slot: &mut Slot<M>,
     now: Instant,
     send: &FramedSend,
 ) -> Result<RowSend, CadenceSendError> {
-    if slot.latest.is_none() {
-        return Ok(RowSend::Idle);
-    }
-    if let Some(due) = slot
-        .last_sent
-        .map(|last| last + slot.send_interval)
-        .filter(|due| *due > now)
-    {
-        return Ok(RowSend::DeferredUntil(due));
-    }
-    if slot.unwritten.strong_count() > 0 {
-        return Ok(RowSend::Unwritten);
+    if let Some(hold) = slot.hold(now, slot.unwritten.strong_count() > 0) {
+        return Ok(hold);
     }
     let reserved = match send.try_reserve_guarded() {
         Ok(reserved) => reserved,

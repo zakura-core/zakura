@@ -862,21 +862,36 @@ impl ZakuraDiscoveryEntry {
         !self.confirmed_addrs.is_empty()
     }
 
-    /// Keeps the confirmed and dialed addresses that the stored record lists,
-    /// adds the listed `authenticated` and `dialed` ones, and returns true
-    /// when that confirms a previously unconfirmed entry.
+    /// Adds the `authenticated` and `dialed` addresses that the stored record
+    /// lists, and returns true when that confirms a previously unconfirmed
+    /// entry.
     ///
-    /// A `dialed` address is also confirmed.
+    /// A `dialed` address is also confirmed. The confirmed and dialed
+    /// addresses stay canonical, sorted and free of duplicates, and the
+    /// stored record lists each of them. An import or dial that adds nothing
+    /// changes nothing and allocates nothing.
     fn confirm(&mut self, authenticated: &[SocketAddr], dialed: &[SocketAddr]) -> bool {
+        if authenticated.is_empty() && dialed.is_empty() {
+            return false;
+        }
         let was_confirmed = self.is_confirmed();
-        let mut confirmed = std::mem::take(&mut self.confirmed_addrs);
-        confirmed.extend_from_slice(authenticated);
-        confirmed.extend_from_slice(dialed);
-        self.confirmed_addrs = listed_addrs(&self.record, &confirmed);
-        let mut reached = std::mem::take(&mut self.dialed_addrs);
-        reached.extend_from_slice(dialed);
-        self.dialed_addrs = listed_addrs(&self.record, &reached);
+        for addr in authenticated.iter().chain(dialed) {
+            insert_listed(&mut self.confirmed_addrs, &self.record, *addr);
+        }
+        for addr in dialed {
+            insert_listed(&mut self.dialed_addrs, &self.record, *addr);
+        }
         !was_confirmed && self.is_confirmed()
+    }
+
+    /// Stores `record` in place of the entry's record, and keeps only the
+    /// confirmed and dialed addresses that `record` lists.
+    fn replace_record(&mut self, record: VerifiedRecord) {
+        self.record = record;
+        let record = &self.record;
+        self.confirmed_addrs
+            .retain(|addr| lists_addr(record, *addr));
+        self.dialed_addrs.retain(|addr| lists_addr(record, *addr));
     }
 
     /// Returns the consecutive dial failure count.
@@ -3283,24 +3298,25 @@ fn canonical_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
-/// The canonical form of each `record` address that `confirmed` holds in any
-/// form, sorted.
-fn listed_addrs(record: &ZakuraNodeRecord, confirmed: &[SocketAddr]) -> Vec<SocketAddr> {
-    let mut listed: Vec<_> = record
+/// Whether `record` lists the canonical `addr`, in any form.
+fn lists_addr(record: &ZakuraNodeRecord, addr: SocketAddr) -> bool {
+    record
         .body
         .direct_addrs
         .iter()
-        .copied()
-        .map(canonical_addr)
-        .filter(|addr| {
-            confirmed
-                .iter()
-                .any(|other| canonical_addr(*other) == *addr)
-        })
-        .collect();
-    listed.sort_unstable();
-    listed.dedup();
-    listed
+        .any(|listed| canonical_addr(*listed) == addr)
+}
+
+/// Inserts the canonical form of `addr` into the sorted `addrs` if `record`
+/// lists it and `addrs` doesn't hold it yet.
+fn insert_listed(addrs: &mut Vec<SocketAddr>, record: &ZakuraNodeRecord, addr: SocketAddr) {
+    let addr = canonical_addr(addr);
+    if !lists_addr(record, addr) {
+        return;
+    }
+    if let Err(index) = addrs.binary_search(&addr) {
+        addrs.insert(index, addr);
+    }
 }
 
 /// Applies an import to an existing entry, and returns its outcome and whether
@@ -3345,7 +3361,7 @@ fn update_existing_entry(
     let outcome = if same_sequence {
         ImportOutcome::MetadataUpdated
     } else {
-        entry.record = record;
+        entry.replace_record(record);
         ImportOutcome::Updated
     };
     let newly_confirmed = entry.confirm(&metadata.confirmed_addrs, &metadata.dialed_addrs);
@@ -8187,6 +8203,42 @@ mod tests {
                 .confirmed_addrs(),
             &[reached]
         );
+    }
+
+    /// A repeated `Hello`, a relayed copy of the record and a repeated dial
+    /// add no address, so they keep the confirmed and dialed addresses in
+    /// place instead of rebuilding them.
+    #[test]
+    fn repeated_confirmation_keeps_the_address_lists_in_place() {
+        let mut book = ZakuraDiscoveryBook::default();
+        let secret = secret_key();
+        let node_id = secret.public();
+        let (authenticated, other) = (test_addr(1), test_addr(2));
+        let same_ip = SocketAddr::new(authenticated.ip(), 18233);
+        let record = record_listing(&secret, 1, vec![authenticated, same_ip, other]);
+        import_hello(&mut book, record.clone(), NOW).expect("the hello imports");
+        book.mark_dial_success(&node_id, Some(authenticated), NOW);
+        let entry = book.get(&node_id).expect("entry is stored");
+        let confirmed = entry.confirmed_addrs().as_ptr();
+        let dialed = entry.dialed_addrs().as_ptr();
+
+        assert_eq!(
+            import_hello(&mut book, record.clone(), NOW + 1).expect("the hello imports"),
+            ImportOutcome::MetadataUpdated
+        );
+        let relay = signed_record_with(9, service(9), test_addr(9)).body.node_id;
+        assert_eq!(
+            book.import_record(record, Some(relay), NOW + 2, &context())
+                .expect("the relayed copy imports"),
+            ImportOutcome::MetadataUpdated
+        );
+        book.mark_dial_success(&node_id, Some(authenticated), NOW + 3);
+
+        let entry = book.get(&node_id).expect("entry is stored");
+        assert_eq!(entry.confirmed_addrs(), &[authenticated, same_ip]);
+        assert_eq!(entry.dialed_addrs(), &[authenticated]);
+        assert_eq!(entry.confirmed_addrs().as_ptr(), confirmed);
+        assert_eq!(entry.dialed_addrs().as_ptr(), dialed);
     }
 
     /// V12 F-571: a lower-sequence record that replaces an expired one, here

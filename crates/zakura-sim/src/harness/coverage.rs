@@ -337,6 +337,30 @@ pub static COVERAGE: &[Coverage] = &[
         )),
     },
     Coverage {
+        property: super::super::domain::header_sync::CHUNK_BUDGET_BOUND,
+        passing: passes(
+            "tests/header_node_capacity.rs",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
+        bypass: Bypass::Planted("uncapped-secondary-reservation"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::TEARDOWN_RETURNS_BASELINE,
+        passing: passes(
+            "tests/header_teardown.rs",
+            "the_close_relink_input_holds_teardown_returns_baseline",
+        ),
+        bypass: Bypass::Planted("kept-queue-lease"),
+    },
+    Coverage {
+        property: super::super::domain::header_sync::STALE_COMPLETION_INERT,
+        passing: passes(
+            "tests/header_stale.rs",
+            "the_stale_prepare_input_holds_stale_completion_inert",
+        ),
+        bypass: Bypass::Planted("stale-release"),
+    },
+    Coverage {
         property: super::header_sync::HEADER_FAULT_PENALIZED,
         passing: passes(
             "tests/header_wire_prepare_fault.rs",
@@ -556,6 +580,14 @@ pub static COVERAGE: &[Coverage] = &[
             HEADER_WITNESSES,
             "scripted_punishments_of_an_honest_peer_violate_honest_never_punished",
         )),
+    },
+    Coverage {
+        property: crate::domain::header_sync_progress::HONEST_PROGRESS,
+        passing: passes(
+            "tests/header_wire_progress.rs",
+            "the_progress_fixture_holds_honest_progress",
+        ),
+        bypass: Bypass::Planted("skipped-apply"),
     },
     // The stuck floor's witness test is ignored, since one debug run takes
     // minutes. `cargo xtask planted` runs its committed input unpatched as a

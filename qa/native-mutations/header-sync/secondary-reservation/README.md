@@ -3,9 +3,11 @@
 `secondary-reservation.patch` takes a second reservation from the budget for a
 peer that just reserved, and forgets it outside `request_reservations`, so the
 queue's accounting never ends it. The budget reports every reservation it
-makes, so the patch adds no report of its own. `uncapped-secondary-reservation`
+makes, so the patch adds no report of its own. The planted case
+`qa/planted/header-sync/chunk-budget-bound/uncapped-secondary-reservation`
 reruns it unreported, with the budget's own capacity checks bypassed, where
-the resource probe's read fails `BudgetOverCapacity`.
+the resource probe's read breaks `BudgetOverCapacity` and violates
+`header-sync/chunk-budget-bound`.
 
 The witness is `a_round_retires_with_headers_still_reserved` in
 `crates/zakura-sim/tests/header_node_reservations.rs`. The node's first

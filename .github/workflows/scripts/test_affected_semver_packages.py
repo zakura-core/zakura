@@ -153,16 +153,16 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
     def test_new_mmr_crate_still_selects_its_dependents(self):
         packages = [
-            self.package("zakura_mmr_tree"),
+            self.package("zakura-mmr-tree"),
             self.package(
                 "zakura-chain",
-                dependencies=[self.dependency("zakura_mmr_tree")],
+                dependencies=[self.dependency("zakura-mmr-tree")],
             ),
         ]
 
         affected = affected_semver_packages.affected_publishable_packages(
             self.metadata(packages),
-            changed_files=["zakura_mmr_tree/src/tree.rs"],
+            changed_files=["zakura-mmr-tree/src/tree.rs"],
         )
 
         self.assertEqual(affected, ["zakura-chain"])

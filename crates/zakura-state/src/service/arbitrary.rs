@@ -168,13 +168,15 @@ impl Strategy for PreparedChain {
                 .new_tree(runner)?
                 .current();
             // Generate a history tree from the first block
-            let history_tree = HistoryTree::from_block(
+            let history_tree = HistoryTree::from_parts(
                 &network,
-                blocks[0].block.clone(),
-                // Dummy roots since this is only used for tests
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
+                zakura_chain::history_tree::HistoryTreeBlockParts::from_block(
+                    &blocks[0].block,
+                    // Dummy roots since this is only used for tests
+                    &Default::default(),
+                    &Default::default(),
+                    &Default::default(),
+                ),
             )
             .expect("history tree should be created");
             *chain = Some((
@@ -207,7 +209,7 @@ pub async fn populated_state(
     blocks: impl IntoIterator<Item = Arc<Block>>,
     network: &Network,
 ) -> (
-    Buffer<BoxService<Request, Response, BoxError>, Request>,
+    Buffer<Request, futures::future::BoxFuture<'static, Result<Response, BoxError>>>,
     ReadStateService,
     LatestChainTip,
     ChainTipChange,
@@ -218,10 +220,15 @@ pub async fn populated_state(
 
     // TODO: write a test that checks the finalized to non-finalized transition with UTXOs,
     //       and set max_checkpoint_height and checkpoint_verify_concurrency_limit correctly.
-    let (state, read_state, latest_chain_tip, mut chain_tip_change) =
-        StateService::new(Config::ephemeral(), network, Height::MAX, 0)
-            .await
-            .expect("ephemeral state initialization succeeds");
+    let crate::InitializedState {
+        state,
+        read_state,
+        latest_chain_tip,
+        mut chain_tip_change,
+        ..
+    } = StateService::new(Config::ephemeral(), network, Height::MAX, 0)
+        .await
+        .expect("ephemeral state initialization succeeds");
     let mut state = Buffer::new(BoxService::new(state), 1);
 
     let mut responses = FuturesUnordered::new();

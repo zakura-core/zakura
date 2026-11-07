@@ -122,6 +122,9 @@ Host files:
 - trace symlink: `/var/log/zakura/traces`
 - legacy sync trace: `/var/log/zakura/traces/legacy_sync.jsonl`
 - monitor log: `/var/log/zakura/monitor.log`
+- network sysctls: `/etc/sysctl.d/60-zakura-network.conf`, copied from
+  `deploy/sysctl/` and loaded on every deploy. The next run's `zakurad` gets
+  its full 7 MiB UDP socket buffers.
 
 ## Deployment
 
@@ -201,6 +204,12 @@ The state file is atomically replaced and flushed to disk, and a file lock preve
 concurrent senders on that host. Missing or corrupt state fails visibly instead
 of restarting a 24-hour wait or replaying old completions. The configured Slack
 destination must match the saved delivery history.
+
+Routine summaries go to `#zakura-monitoring`. The summary service loads
+`SLACK_MONITORING_WEBHOOK_URL` from the root-only `/etc/zakura-monitoring.env`.
+Provision that channel's webhook through the operator secret store. There is no
+fallback to the alert webhook. Failure notifications keep their existing
+`#zakura-alerts` configuration in `/etc/zakura-alerts.env` and GitHub Actions.
 
 Each post includes runs completed since that node was last successfully reported.
 Runs still in progress wait for the next day. An unavailable node is identified in
@@ -282,10 +291,10 @@ After the GitHub audit revision that disables routine summaries is active, and
 any older audit has finished, initialize and preview on the sender:
 
 ```bash
-systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-alerts.env \
+systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-monitoring.env \
   /usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py \
   initialize --from-file /root/sync-summary-seed.json
-systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-alerts.env \
+systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-monitoring.env \
   /usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py run --dry-run
 ```
 
@@ -313,6 +322,36 @@ deliveries retain all runs; the sender never claims exactly-once delivery.
 For rollback, stop the timer first. `audit --legacy-digest` retains the old reporting
 path, but its cache is not updated by the new sender; reconstruct its completion
 baseline from the last confirmed post before using it. Never enable both senders.
+
+### Move an existing sender to monitoring
+
+Provision `/etc/zakura-monitoring.env` with mode `0600` and the monitoring
+webhook before installing the reviewed revision with `deploy-summary --no-start`.
+That command disables the timer and refuses installation while a send is still
+running. Wait for any active send to finish, then retry installation.
+
+Back up `/var/lib/zakura-sync-summary/state.json` while the timer is disabled.
+Read its `destination` field, which is a SHA-256 digest, not a webhook URL, and
+use it as `<saved-destination-sha256>` below. Preserve the existing delivery
+history instead of initializing from current node counters. Otherwise pending
+runs could be lost or previously reported runs could be repeated.
+
+```bash
+systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-monitoring.env \
+  /usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py \
+  migrate-destination --expected-destination '<saved-destination-sha256>'
+systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-monitoring.env \
+  /usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py run --dry-run
+```
+
+Migration holds the same lock as delivery, validates the saved state and expected
+destination, and changes only the destination digest. It sends no Slack message.
+The last delivered slot, run cursors, and unavailable-node history stay intact.
+The preview respects the deadline, so before the next deadline it may report
+that today's summary was already delivered. Enable `zakura-sync-summary.timer`
+after verification, then confirm the next scheduled report in
+`#zakura-monitoring` and check the sender status. An overdue report retries with
+its pending runs. Leave the alert credentials unchanged.
 
 ### VCT canary notifications
 
@@ -515,7 +554,7 @@ For a fresh Ubuntu x86_64 host:
    apt-get update
    apt-get install -y \
      build-essential clang cmake git libclang-dev pkg-config \
-     protobuf-compiler python3 logrotate
+     python3 logrotate
    ```
 
 5. Install the Rust toolchain specified by `rust-toolchain.toml`.

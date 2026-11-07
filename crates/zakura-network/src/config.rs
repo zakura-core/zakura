@@ -12,10 +12,12 @@ use std::{
 };
 
 use indexmap::IndexSet;
-use iroh::SecretKey;
-use rand::{rngs::OsRng, RngCore};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, value::MapAccessDeserializer, IntoDeserializer, MapAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use tokio::fs;
+use zakura_quic::NodeSecretKey;
 
 use tracing::Span;
 use zakura_chain::{
@@ -33,6 +35,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
+        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_MAX,
+        DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
@@ -43,17 +47,20 @@ use crate::{
 };
 
 mod cache_dir;
+mod unconditional_peers;
 
 #[cfg(test)]
 mod tests;
 
 pub use cache_dir::CacheDir;
+pub use unconditional_peers::UnconditionalPeers;
 
 pub(crate) use cache_dir::{
-    default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
+    default_network_identity_dir, zakura_discovery_sequence_file_path,
+    zakura_node_secret_key_file_path as zakura_secret_key_file_path,
 };
 
-/// A sensitive iroh secret-key override for Zakura P2P node identity.
+/// A sensitive secret-key override for Zakura P2P node identity.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 #[serde(transparent)]
 pub struct ZakuraNodeSecretKey(String);
@@ -61,7 +68,7 @@ pub struct ZakuraNodeSecretKey(String);
 impl ZakuraNodeSecretKey {
     /// Returns the secret-key override.
     ///
-    /// Callers should only expose this value to iroh identity construction or
+    /// Callers should only expose this value to node identity construction or
     /// controlled persistence paths.
     pub fn expose_secret(&self) -> &str {
         &self.0
@@ -86,8 +93,8 @@ impl serde::Serialize for ZakuraNodeSecretKey {
 /// An error that can occur while resolving the Zakura node secret key.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ZakuraSecretKeyError {
-    /// The configured `zakura_node_secret_key` is not a valid iroh secret key.
-    #[error("configured zakura_node_secret_key is not a valid iroh secret key")]
+    /// The configured `zakura_node_secret_key` is not a valid node secret key.
+    #[error("configured zakura_node_secret_key is not a valid node secret key")]
     InvalidConfigured,
 }
 
@@ -265,10 +272,10 @@ pub struct Config {
     /// The default is `~/.zakura`.
     pub identity_dir: PathBuf,
 
-    /// An optional persistent iroh secret key for Zakura P2P identity.
+    /// An optional persistent secret key for Zakura P2P identity.
     ///
     /// This is reserved for Zakura endpoint construction. If unset, a future Zakura endpoint
-    /// implementation will generate an ed25519 iroh [`SecretKey`] on first use
+    /// implementation will generate an ed25519 [`NodeSecretKey`] on first use
     /// and persist it under [`identity_dir`](Self::identity_dir), outside Zakura's
     /// cache and state directories by default.
     ///
@@ -352,6 +359,78 @@ pub struct Config {
     /// Enabling this setting reveals peer topology in logs and trace files. Restrict access
     /// to logs, trace directories, and downstream monitoring systems.
     pub expose_peer_addresses: bool,
+
+    /// Peer IP addresses and CIDR ranges that Zakura never scores or bans.
+    ///
+    /// Each entry is an IP address, such as `"192.0.2.1"`, or a CIDR range, such as
+    /// `"2001:db8::/32"`. CIDR ranges with host bits set are rejected.
+    /// Zakura ignores misbehavior reports for these peers, so their
+    /// misbehavior score stays at zero and Zakura never bans their IP address. Use this
+    /// setting for peers you operate, such as your own nodes, miners, or sidecars, so
+    /// that tip lag, upgrade boundaries, or bugs cannot get them banned.
+    ///
+    /// This setting exempts peers from misbehavior scores, bans, and mempool
+    /// cooldowns and their disconnects. Zakura still applies connection limits to these
+    /// peers, and still disconnects them on protocol
+    /// errors or inbound overload.
+    ///
+    /// Entries match legacy peer IP addresses. An IPv4 entry also matches the
+    /// IPv4-mapped IPv6 form of the same address. The default is empty.
+    ///
+    /// # Security
+    ///
+    /// Zakura never bans a listed peer, even if it sends invalid blocks or transactions.
+    /// Only list peers you trust.
+    pub unconditional_peers: UnconditionalPeers,
+    /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
+    ///
+    /// The count grows linearly to `advert_window_max` as block size falls to
+    /// `advert_window_small_size_bytes`. Sidecars receive inventory immediately outside
+    /// this group. All remaining peers receive inventory after the configured delay.
+    ///
+    /// Experimental.
+    pub advert_window_min: usize,
+
+    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
+    /// Must be at least `advert_window_min`.
+    ///
+    /// Experimental.
+    pub advert_window_max: usize,
+
+    /// The size at or below which broadcasts use the largest initial group and shortest delay.
+    /// Must be below `advert_window_full_size_bytes`.
+    ///
+    /// Experimental.
+    pub advert_window_small_size_bytes: u64,
+
+    /// The size at or above which broadcasts use the smallest initial group and longest delay.
+    /// Must exceed `advert_window_small_size_bytes`.
+    ///
+    /// Experimental.
+    pub advert_window_full_size_bytes: u64,
+
+    /// The delay before announcing small blocks to peers outside the initial group.
+    ///
+    /// The delay grows linearly to `advert_delay_max` between the configured size thresholds.
+    /// Each broadcast measures this delay once from its start, independently of peer requests
+    /// and uploads. Zero announces to every peer immediately. Defaults to zero.
+    ///
+    /// Experimental.
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    pub advert_delay_min: Duration,
+
+    /// The delay before announcing full-sized or unknown-sized blocks to remaining peers.
+    ///
+    /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
+    /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
+    /// concurrent body writes.
+    /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
+    /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
+    /// announcements to the remaining peers.
+    ///
+    /// Experimental.
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    pub advert_delay_max: Duration,
 }
 
 impl Config {
@@ -398,6 +477,19 @@ impl Config {
     /// at the same time.
     pub fn peerset_total_connection_limit(&self) -> usize {
         self.peerset_outbound_connection_limit() + self.peerset_inbound_connection_limit()
+    }
+
+    /// The most bytes that TCP decoders can hold for incomplete messages across every
+    /// allowed connection.
+    ///
+    /// This partition follows from the connection limit, because each connection's
+    /// decoder holds at most one incomplete message. The decoder cannot wait for
+    /// shared capacity, so the connection limit is the enforced bound. Handshaking
+    /// connections have a smaller body limit, so this also covers them.
+    pub fn tcp_ingress_bound_bytes(&self) -> u64 {
+        // Widening usize to u64 is lossless on supported targets.
+        (self.peerset_total_connection_limit() as u64)
+            .saturating_mul(crate::zakura::TCP_INGRESS_BUDGET.receive)
     }
 
     /// Returns the initial seed peer hostnames for the configured network.
@@ -671,6 +763,18 @@ impl Config {
             return Ok(());
         }
 
+        self.write_peer_cache(peer_list).await
+    }
+
+    /// Replaces the peer cache, including when all previous peers have been banned.
+    pub(crate) async fn write_peer_cache(
+        &self,
+        peer_list: HashSet<PeerSocketAddr>,
+    ) -> io::Result<()> {
+        let Some(peer_cache_file) = self.cache_dir.peer_cache_file_path(&self.network) else {
+            return Ok(());
+        };
+
         let selected_peers: Vec<PeerSocketAddr> = peer_list
             .iter()
             .take(MAX_PEER_DISK_CACHE_SIZE)
@@ -686,7 +790,7 @@ impl Config {
         //
         // Sort to destroy any peer order, which could leak peer connection times.
         // (Currently the HashSet argument does this as well.)
-        peer_list.sort();
+        peer_list.sort_unstable();
         // Make a newline-separated list
         let peer_data = peer_list.join("\n");
 
@@ -718,13 +822,13 @@ impl Config {
 
                 Ok(())
             }
-            Err(error) => Err(error.error),
+            Err(error) => Err(error),
         }
     }
 
-    /// Resolves the Zakura native iroh [`SecretKey`] for this node, persisting a
+    /// Resolves the Zakura native [`NodeSecretKey`] for this node, persisting a
     /// freshly generated key on first use so the node keeps a stable
-    /// [`EndpointId`](iroh::EndpointId) across restarts.
+    /// [`NodeId`](zakura_quic::NodeId) across restarts.
     ///
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
@@ -742,15 +846,21 @@ impl Config {
     /// The persisted key file is the node's long-term private identity. It is
     /// written outside the cache and state directories and restricted to owner
     /// read/write on Unix.
-    pub fn zakura_secret_key(&self) -> Result<SecretKey, ZakuraSecretKeyError> {
+    pub fn zakura_secret_key(&self) -> Result<NodeSecretKey, ZakuraSecretKeyError> {
         if let Some(secret) = &self.zakura_node_secret_key {
-            return SecretKey::from_str(secret.expose_secret())
+            return NodeSecretKey::from_str(secret.expose_secret())
                 .map_err(|_| ZakuraSecretKeyError::InvalidConfigured);
         }
 
         let key_file = zakura_secret_key_file_path(&self.identity_dir, &self.network);
 
         Ok(load_or_generate_zakura_secret_key(&key_file))
+    }
+
+    /// The file that holds the last discovery self-record sequence that
+    /// `node_id` authored, under [`identity_dir`](Self::identity_dir).
+    pub(crate) fn zakura_discovery_sequence_file(&self, node_id: &zakura_quic::NodeId) -> PathBuf {
+        zakura_discovery_sequence_file_path(&self.identity_dir, &self.network, node_id)
     }
 
     /// Returns `true` if Zakura should run the legacy TCP Zcash P2P listener, initial peer
@@ -769,6 +879,9 @@ impl Config {
     /// Builds a network config for tests with [`p2p_stack`](Self::p2p_stack) pinned to
     /// `p2p_stack`, so the stack is never re-derived from the network's binary defaults.
     ///
+    /// [`identity_dir`](Self::identity_dir) is a fresh [`test_identity_dir`], so a test
+    /// endpoint never reads or overwrites a real node's identity files.
+    ///
     /// Override other fields with struct-update syntax, e.g.
     /// `Config { network, ..Config::for_test(P2pStack::Dual) }`.
     ///
@@ -786,6 +899,7 @@ impl Config {
 
         Config {
             p2p_stack,
+            identity_dir: test_identity_dir(),
             zakura: ZakuraConfig {
                 listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
                 ..ZakuraConfig::default()
@@ -795,14 +909,27 @@ impl Config {
     }
 }
 
+/// Returns a new directory path under [`std::env::temp_dir`] for a test node's
+/// identity files. The default `~/.zakura` holds a real node's identity key and
+/// discovery sequence, which a test endpoint would otherwise read and overwrite.
+///
+/// The path is not created: the first write creates it, and it outlives the test.
+#[cfg(any(test, feature = "proptest-impl"))]
+pub(crate) fn test_identity_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "zakura-test-identity-{:016x}",
+        rand_10::random::<u64>()
+    ))
+}
+
 /// Loads a persisted Zakura secret key from `key_file`, or generates, persists, and
 /// returns a fresh key when the file is absent or cannot be parsed.
 ///
 /// I/O failures are logged and downgraded to an ephemeral key for this run, so a
 /// read-only or full cache directory never prevents the node from starting.
-fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
+fn load_or_generate_zakura_secret_key(key_file: &Path) -> NodeSecretKey {
     match std::fs::read_to_string(key_file) {
-        Ok(contents) => match SecretKey::from_str(contents.trim()) {
+        Ok(contents) => match NodeSecretKey::from_str(contents.trim()) {
             Ok(secret_key) => return secret_key,
             Err(_) => warn!(
                 ?key_file,
@@ -817,17 +944,15 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
         ),
     }
 
-    let mut key_bytes = [0; 32];
-    OsRng.fill_bytes(&mut key_bytes);
-    let secret_key = SecretKey::from_bytes(&key_bytes);
+    let secret_key = NodeSecretKey::generate();
     persist_zakura_secret_key(key_file, &secret_key);
     secret_key
 }
 
 /// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts
 /// the file to owner-only access. Persistence failures are logged but not fatal.
-fn persist_zakura_secret_key(key_file: &Path, secret_key: &SecretKey) {
-    let encoded = hex::encode(secret_key.to_bytes());
+fn persist_zakura_secret_key(key_file: &Path, secret_key: &NodeSecretKey) {
+    let encoded = secret_key.to_hex();
 
     match atomic_write(key_file.to_path_buf(), encoded.as_bytes()) {
         Ok(Ok(path)) => {
@@ -913,6 +1038,13 @@ impl Default for Config {
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
+            unconditional_peers: UnconditionalPeers::default(),
+            advert_window_min: DEFAULT_ADVERT_WINDOW_MIN,
+            advert_window_max: DEFAULT_ADVERT_WINDOW_MAX,
+            advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
+            advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
+            advert_delay_min: Duration::ZERO,
+            advert_delay_max: Duration::ZERO,
         }
     }
 }
@@ -991,10 +1123,32 @@ struct DTestnetParameters {
     /// scheduled issuance and monetary pools. The cumulative schedule through the block
     /// before NU7 must then fit in `MAX_MONEY`. An explicit value overrides that derivation.
     initial_nsm_value_balance: Option<u64>,
+    /// The Regtest form's `params` table. Read here so `network` needs no buffering, and
+    /// rejected anywhere other than directly inside `network`.
+    #[serde(default, skip_serializing)]
+    params: Option<Box<DTestnetParameters>>,
+    /// The Regtest form's `regtest` flag, accepted alongside `params`.
+    #[serde(default, skip_serializing)]
+    regtest: Option<bool>,
+}
+
+impl DTestnetParameters {
+    /// Rejects the Regtest form's `params` and `regtest` keys where they don't belong.
+    fn reject_regtest_form_keys<E: de::Error>(&self) -> Result<(), E> {
+        match (&self.params, &self.regtest) {
+            (Some(_), _) => Err(E::custom(
+                "unknown field `params`: it is only valid directly inside `network`",
+            )),
+            (None, Some(_)) => Err(E::custom(
+                "unknown field `regtest`: it is only valid next to `network.params`",
+            )),
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// Network configuration used during deserialization.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(untagged)]
 enum DNetwork {
     DefaultForKind(NetworkKind),
@@ -1005,6 +1159,47 @@ enum DNetwork {
         regtest: Option<bool>,
     },
     ConfiguredTestnet(Box<DTestnetParameters>),
+}
+
+impl<'de> Deserialize<'de> for DNetwork {
+    /// Dispatches on the value's shape instead of buffering it like `#[serde(untagged)]`, so the
+    /// network parameter types are only instantiated for the config's own deserializer.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DNetworkVisitor;
+
+        impl<'de> Visitor<'de> for DNetworkVisitor {
+            type Value = DNetwork;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a network kind or a table of network parameters")
+            }
+
+            fn visit_str<E: de::Error>(self, kind: &str) -> Result<DNetwork, E> {
+                NetworkKind::deserialize(kind.into_deserializer()).map(DNetwork::DefaultForKind)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DNetwork, A::Error> {
+                let mut table = DTestnetParameters::deserialize(MapAccessDeserializer::new(map))?;
+                match table.params.take() {
+                    // Like the former untagged variant, other parameters next to `params` are
+                    // ignored.
+                    Some(params) => {
+                        params.reject_regtest_form_keys()?;
+                        Ok(DNetwork::ConfiguredRegtest {
+                            params,
+                            regtest: table.regtest,
+                        })
+                    }
+                    None => {
+                        table.reject_regtest_form_keys()?;
+                        Ok(DNetwork::ConfiguredTestnet(Box::new(table)))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_any(DNetworkVisitor)
+    }
 }
 
 impl Default for DNetwork {
@@ -1048,6 +1243,18 @@ struct DConfig {
     crawl_new_peer_interval: Duration,
     max_connections_per_ip: Option<usize>,
     expose_peer_addresses: bool,
+    unconditional_peers: UnconditionalPeers,
+    /// `None` if the config does not set it, so [`resolve_advert_windows`] can derive it from
+    /// the other bound.
+    advert_window_min: Option<usize>,
+    /// `None` if the config does not set it. See `advert_window_min`.
+    advert_window_max: Option<usize>,
+    advert_window_small_size_bytes: u64,
+    advert_window_full_size_bytes: u64,
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    advert_delay_min: Duration,
+    #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
+    advert_delay_max: Duration,
 }
 
 impl Default for DConfig {
@@ -1071,6 +1278,13 @@ impl Default for DConfig {
             crawl_new_peer_interval: config.crawl_new_peer_interval,
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
+            unconditional_peers: config.unconditional_peers,
+            advert_window_min: None,
+            advert_window_max: None,
+            advert_window_small_size_bytes: config.advert_window_small_size_bytes,
+            advert_window_full_size_bytes: config.advert_window_full_size_bytes,
+            advert_delay_min: config.advert_delay_min,
+            advert_delay_max: config.advert_delay_max,
         }
     }
 }
@@ -1117,6 +1331,8 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
                     u64::try_from(i64::from(balance)).expect("configured seeds are nonnegative")
                 },
             ),
+            params: None,
+            regtest: None,
         }
     }
 }
@@ -1138,6 +1354,13 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         }: Config,
     ) -> Self {
         let dnetwork = match network.kind() {
@@ -1179,6 +1402,13 @@ impl From<Config> for DConfig {
             crawl_new_peer_interval,
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
+            unconditional_peers,
+            advert_window_min: Some(advert_window_min),
+            advert_window_max: Some(advert_window_max),
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         }
     }
 }
@@ -1206,9 +1436,27 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
+        let (advert_window_min, advert_window_max) =
+            resolve_advert_windows(advert_window_min, advert_window_max);
+        validate_advert_fanout(
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
+        )
+        .map_err(de::Error::custom)?;
 
         let network = match (dnetwork, testnet_parameters) {
             (DNetwork::ConfiguredTestnet(params), None) => {
@@ -1222,6 +1470,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
+                params.reject_regtest_form_keys::<D::Error>()?;
                 build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
@@ -1315,6 +1564,24 @@ impl<'de> Deserialize<'de> for Config {
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;
+        if zakura.nat_traversal {
+            return Err(de::Error::custom(
+                crate::zakura::ZAKURA_NAT_TRAVERSAL_REMOVED,
+            ));
+        }
+        zakura.quic.validate().map_err(de::Error::custom)?;
+        if p2p_stack.resolve(&network).runs_zakura() {
+            zakura
+                .validate_stream_receive_window()
+                .map_err(de::Error::custom)?;
+        }
+        if p2p_stack.resolve(&network).runs_zakura() {
+            // Legacy-only nodes create no QUIC endpoint. For v2, the endpoint
+            // lowers a larger cap after tracing starts so its warning is logged.
+            zakura
+                .budgeted_max_connections(&network)
+                .map_err(de::Error::custom)?;
+        }
 
         Ok(Config {
             listen_addr: canonical_socket_addr(listen_addr),
@@ -1331,8 +1598,59 @@ impl<'de> Deserialize<'de> for Config {
             crawl_new_peer_interval,
             max_connections_per_ip,
             expose_peer_addresses,
+            unconditional_peers,
+            advert_window_min,
+            advert_window_max,
+            advert_window_small_size_bytes,
+            advert_window_full_size_bytes,
+            advert_delay_min,
+            advert_delay_max,
         })
     }
+}
+
+/// Resolves omitted initial-group bounds without changing explicitly configured values.
+fn resolve_advert_windows(min: Option<usize>, max: Option<usize>) -> (usize, usize) {
+    match (min, max) {
+        (Some(min), Some(max)) => (min, max),
+        (Some(min), None) => (min, DEFAULT_ADVERT_WINDOW_MAX.max(min)),
+        (None, Some(max)) => (DEFAULT_ADVERT_WINDOW_MIN.min(max), max),
+        (None, None) => (DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_MAX),
+    }
+}
+
+/// Checks the block advert fan-out settings.
+fn validate_advert_fanout(
+    advert_window_min: usize,
+    advert_window_max: usize,
+    advert_window_small_size_bytes: u64,
+    advert_window_full_size_bytes: u64,
+    advert_delay_min: Duration,
+    advert_delay_max: Duration,
+) -> Result<(), String> {
+    if advert_window_min == 0 || advert_window_min > advert_window_max {
+        return Err(format!(
+            "advert_window_min and advert_window_max must satisfy \
+             1 <= advert_window_min <= advert_window_max, \
+             got {advert_window_min} and {advert_window_max}"
+        ));
+    }
+    if advert_window_small_size_bytes >= advert_window_full_size_bytes {
+        return Err(format!(
+            "advert_window_small_size_bytes must be below advert_window_full_size_bytes, \
+             got {advert_window_small_size_bytes} and {advert_window_full_size_bytes}"
+        ));
+    }
+    if advert_delay_min > advert_delay_max {
+        return Err("advert_delay_min must not exceed advert_delay_max".to_owned());
+    }
+    if std::time::Instant::now()
+        .checked_add(advert_delay_max)
+        .is_none()
+    {
+        return Err("advert_delay_max exceeds the monotonic clock range".to_owned());
+    }
+    Ok(())
 }
 
 fn zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(zakura: &ZakuraConfig) -> bool {
@@ -1392,6 +1710,9 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
         initial_nsm_value_balance,
+        // Deserialization only builds a configured Testnet from a table without these.
+        params: _,
+        regtest: _,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();

@@ -64,6 +64,18 @@ pub enum AwaitBlockInfoError {
     },
 }
 
+/// The block that a block header read identifies is not in the best chain.
+///
+/// The read handler returns this error when the hash or the height does not identify a block in
+/// the best chain. RPC methods use this type to tell a missing block from a failure of the state
+/// service.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("block hash or height not found")]
+pub struct BlockHeaderNotFound {
+    /// The block that the request identifies.
+    pub hash_or_height: HashOrHeight,
+}
+
 /// The finalized database has blocks but no persisted Sprout tip frontier.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("missing Sprout note commitment tree at finalized tip {tip:?}")]
@@ -152,6 +164,14 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// Disk block decoding or retention exhausted its admission pool.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
+    /// The configured read limits cannot fund their workers and one legal result.
+    #[error("invalid read capacity configuration: {0}")]
+    ReadCapacity(#[from] crate::config::ReadCapacityError),
+
     /// The configured historical frontier artifact could not be read or decoded.
     ///
     /// Only nodes that derive historical trees reach this. A node that does not derive ignores an
@@ -269,7 +289,38 @@ pub enum StateInitError {
          Hint: discard the database and resync, or restore a snapshot taken with a current release"
     )]
     VctSproutHistoryUnrepairable,
+
+    /// A database that stopped building transparent address indexes was opened in archive storage mode.
+    ///
+    /// Archive nodes serve address balances, UTXOs, and histories, which this database cannot
+    /// answer completely.
+    #[error(
+        "cannot open state in archive storage mode: the database at {path:?} was created by a \
+         pruned checkpoint-syncing node and stopped maintaining transparent address indexes. \
+         Hint: configure `storage_mode.pruned`, or sync an archive node into a fresh cache directory"
+    )]
+    TransparentIndexesMissingInArchiveMode {
+        /// The database directory without transparent indexes.
+        path: PathBuf,
+    },
 }
+
+/// A transparent address or transparent spender query was sent to a state database that does not
+/// build those indexes.
+///
+/// A pruned checkpoint-syncing node stops updating finalized transparent address balances,
+/// address UTXO and transaction indexes, and transparent spender indexes in its existing database.
+/// Answering from partial data would return balances, UTXO lists, histories, or spenders that look
+/// authoritative but are incomplete, so these queries fail instead.
+#[derive(Copy, Clone, Debug, Error, PartialEq, Eq)]
+#[error(
+    "transparent address and spender indexes are unavailable: this node's state database \
+     stopped maintaining them in pruned storage mode with checkpoint sync. \
+     getaddressbalance, getaddressutxos, getaddresstxids, and transparent spending transaction \
+     lookups need an archive node, or a pruned node that synced into a fresh cache directory with \
+     consensus.checkpoint_sync = false"
+)]
+pub struct TransparentIndexesUnavailable;
 
 /// An error describing why a block could not be queued to be committed to the state.
 #[derive(Debug, Error, Clone, PartialEq, Eq, new)]
@@ -515,6 +566,10 @@ impl From<ValidateContextError> for CommitCheckpointVerifiedError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum InvalidateError {
+    /// The fallback finalized tip could not acquire disk-result capacity.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The state is currently checkpointing blocks and cannot accept invalidation requests.
     #[error("cannot invalidate blocks while still committing checkpointed blocks")]
     ProcessingCheckpointedBlocks,
@@ -548,6 +603,10 @@ pub enum InvalidateError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ReconsiderError {
+    /// The fallback finalized tip could not acquire disk-result capacity.
+    #[error("disk block admission failed: {0}")]
+    BlockAdmission(#[from] zakura_node_services::block_memory::AdmissionFailure),
+
     /// The block is not found in the list of invalidated blocks.
     #[error("Block with hash {0} was not previously invalidated")]
     MissingInvalidatedBlock(block::Hash),
@@ -940,6 +999,14 @@ pub enum ValidateContextError {
 }
 
 impl ValidateContextError {
+    /// Reports an output spent by multiple transactions in the same block.
+    pub fn duplicate_transparent_spend_in_block(outpoint: transparent::OutPoint) -> Self {
+        Self::DuplicateTransparentSpend {
+            outpoint,
+            location: "the same block",
+        }
+    }
+
     /// Classify contextual validation without conflating peer data and local availability.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         use zakura_chain::block::CommitmentError;
@@ -984,7 +1051,7 @@ impl ValidateContextError {
                         BodyCommitmentKind::Other("chain_history_root")
                     }
                     CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. } => {
-                        BodyCommitmentKind::Other("chain_history_block_tx_auth_commitment")
+                        BodyCommitmentKind::CHAIN_HISTORY_BLOCK_TX_AUTH_COMMITMENT
                     }
                     CommitmentError::InvalidPreNu5OrchardRoot { .. } => {
                         BodyCommitmentKind::Other("pre_nu5_orchard_root")
@@ -1168,8 +1235,7 @@ impl ValidateContextError {
     /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
-    /// parks and retries the same block for both. A header insertion wakes a missing-root stall.
-    /// A short bounded delay wakes an await-successor stall.
+    /// parks and retries the same block for both. A committed header insertion wakes either stall.
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height }
@@ -1242,6 +1308,10 @@ mod tests {
         };
         for error in [auth_commitment.clone(), prevalidated_root] {
             assert!(error.is_auth_commitment_mismatch());
+            assert!(matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::PayloadMismatch(kind) if kind.proves_tampered_body()
+            ));
             let commit = CommitCheckpointVerifiedError::from(
                 CommitBlockError::ValidateContextError(Box::new(error)),
             );
@@ -1268,6 +1338,10 @@ mod tests {
             ValidateContextError::AncestorBodyRejected(block::Hash([9; 32])),
         ] {
             assert!(!error.is_auth_commitment_mismatch());
+            assert!(!matches!(
+                error.body_verification_class(),
+                BodyVerificationClass::PayloadMismatch(kind) if kind.proves_tampered_body()
+            ));
         }
     }
 
@@ -1310,13 +1384,10 @@ mod tests {
             BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
         );
         assert_eq!(
-            ValidateContextError::DuplicateTransparentSpend {
-                outpoint: transparent::OutPoint {
-                    hash: [3; 32].into(),
-                    index: 0,
-                },
-                location: "test chain",
-            }
+            ValidateContextError::duplicate_transparent_spend_in_block(transparent::OutPoint {
+                hash: [3; 32].into(),
+                index: 0,
+            })
             .body_verification_class(),
             BodyVerificationClass::ConsensusInvalid(zakura_header_chain::BodyRuleId::new(
                 "context.duplicate_transparent_spend"

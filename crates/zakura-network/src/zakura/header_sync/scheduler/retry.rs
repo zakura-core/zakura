@@ -1,11 +1,12 @@
 //! Branch-owned body-availability retry episodes.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
 use zakura_header_chain::{
     BodyUnavailableSummary, BranchId, Clock, Frontier, HeaderGeneration, SourceId,
 };
+use zakura_rt::collections::HashMap;
 
 const ALARM_ATTEMPTS: u32 = 10;
 const ALARM_AFTER: Duration = Duration::minutes(10);
@@ -94,7 +95,7 @@ pub struct BodyRetryEpisode {
 
 impl BodyRetryEpisode {
     /// Start a fresh episode using an injected authoritative clock.
-    pub fn new<C: Clock>(
+    pub fn new<C: Clock + ?Sized>(
         branch: BranchId,
         generation: HeaderGeneration,
         header: Frontier,
@@ -157,7 +158,7 @@ impl BodyRetryEpisode {
     }
 
     /// Start a new episode after an explicit operator retry command.
-    pub fn restart<C: Clock>(&mut self, clock: &C) {
+    pub fn restart<C: Clock + ?Sized>(&mut self, clock: &C) {
         *self = Self::new(
             self.branch,
             self.generation,
@@ -167,13 +168,8 @@ impl BodyRetryEpisode {
         );
     }
 
-    /// Whether a repeated supplier attempt or persistent-alarm probe is due.
-    pub fn is_due<C: Clock>(&self, clock: &C) -> bool {
-        clock.now() >= self.next_probe_at
-    }
-
     /// Record one failed supplier attempt and return its bounded scheduling consequence.
-    pub fn record_failure<C: Clock, J: RetryJitter>(
+    pub fn record_failure<C: Clock + ?Sized, J: RetryJitter>(
         &mut self,
         supplier: SourceId,
         clock: &C,
@@ -494,7 +490,7 @@ mod tests {
         assert_eq!(episode.attempts, attempts.saturating_add(1));
         episode.restart(&clock);
         assert_eq!(episode.attempts, 0);
-        assert!(episode.is_due(&clock));
+        assert!(clock.now() >= episode.next_probe_at);
     }
 
     #[test]
@@ -564,7 +560,7 @@ mod tests {
         );
 
         assert_eq!(episode.summary(), summary);
-        assert!(!episode.is_due(&clock));
+        assert!(clock.now() < episode.next_probe_at);
         assert_eq!(
             episode.record_failure(first, &clock, &FixedJitter(0)),
             RetryUpdate::TooEarly

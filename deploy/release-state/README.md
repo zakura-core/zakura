@@ -2,8 +2,8 @@
 
 Publishes Mainnet release-state bundles — the coupled checkpoint list, VCT
 frontier, completed-subtree roots, and historical frontier grid — from an
-archive host to R2, where the `update-release-state.yml` workflow imports them
-into reviewable draft PRs.
+archive host to R2. The daily `update-release-state.yml` workflow publishes
+complete sets; `adopt-release-state.yml` imports them into reviewable draft PRs.
 Design: `docs/design/verified-commitment-trees.md`, section 16.
 Production host wiring, operations, and rollback:
 [`SNAPSHOT_HOST.md`](SNAPSHOT_HOST.md).
@@ -31,18 +31,94 @@ host with none.
   `mainnet-treestate-subtrees.bin`, and `mainnet-frontier-grid.bin`),
   then atomically replaces `release-state/latest.json`. Bundles are retained
   newest-4 by default (`RELEASE_STATE_KEEP`).
-- **GitHub (repository):** the workflow resolves `latest.json` over a pinned
-  HTTPS host, verifies every digest, publishes the bundle's frontier grid to
-  crates.io, and opens a draft PR that imports the other three artifacts and
-  repins the grid. Humans review and merge; releases build only committed
-  source and the exact versions the lockfile pins.
+- **GitHub (repository):** daily publication verifies one candidate and its
+  matching grid crate before advertising a complete ready set. A separate
+  weekly/manual workflow imports ready sets into draft PRs. Humans review
+  and merge; releases build committed source and exact locked dependencies.
 
   The grid is published rather than committed because it is regenerated on
   every refresh at ~2.1 MB, which the repository would carry in its history
   forever. Cargo can only resolve a version that already exists, so the
-  publish necessarily precedes the PR that pins it; a candidate the reviewer
-  rejects is a yanked, unreferenced version. See
+  publish necessarily precedes the PR that pins it. Unadopted versions remain
+  available so published sets keep resolving. See
   `docs/design/historical-treestate-serving.md` §5.
+
+## Daily publication and reviewed adoption
+
+`update-release-state.yml` keeps the existing crates.io publishing identity and
+runs daily at 07:00 UTC or by manual dispatch. It verifies one candidate,
+publishes or verifies the matching grid crate, confirms Cargo resolution,
+and promotes the complete set into `release-state/published/v1/<height>/`.
+Only then does it conditionally advance `release-state/published/latest.json`.
+Existing immutable objects must match byte for byte. Concurrent or delayed
+runs cannot replace a newer pointer with an older one. Identical retries also
+verify that the public ready pointer is readable and identifies the selected set.
+
+The published prefix is retained without automatic expiry. The archive
+exporter's four-candidate cleanup only visits `release-state/v1/`; it cannot
+remove a ready set. Publication failures before the pointer commit leave the
+previous ready set intact. A lost acknowledgement after the final commit can
+leave the new complete set selected; retrying verifies and reuses it.
+
+The ready pointer uses schema version 2: the original bundle identity plus an
+`asset` record containing `name`, `version`, `checksum` (the crate archive), and
+`grid_sha256`. Candidate pointers remain schema version 1. Consumers use
+`MAINNET_RELEASE_STATE_READY_URL`, never fall back to the candidate pointer,
+and verify the bundle and crate together. Checkpoint metadata must match the
+final checkpoint height and hash before publication or consumption; checkpoint
+format checks run before publication. Registry archives are bounded before and
+after decompression, including their metadata headers. A set older than 48 hours is
+rejected, including waived imports. Republishing does not reset generation
+time. This age check does not independently measure the archive node's lag
+behind the live chain.
+
+`adopt-release-state.yml` runs Monday at 06:00 UTC or manually. It imports a
+ready set, updates the exact dependency and lockfile, validates the result,
+and opens a draft PR. Review and merge remain human decisions. Release
+preparation consumes the same ready sets and no longer dispatches publication.
+Branch dry runs are read-only with respect to publishing, storage, and PRs.
+
+### Production qualification and activation
+
+The schedules are controlled by repository activation variables. Complete
+storage setup and qualification before enabling them. They may be configured
+before merge after an authorized branch qualification; the new schedules only
+run once these workflows reach `main`.
+
+1. Use a dedicated object read/write credential from the generator's existing
+   Infisical project/environment; do not copy its host credential. Restrict it
+   to the existing `zakura-release-state` bucket where possible. Reusing an
+   existing credential with broader bucket access needs explicit operator
+   authorization.
+2. Configure the `release-state-storage` GitHub environment with no per-run
+   reviewer gate, deployment restricted to `main`, and only
+   `RELEASE_STATE_R2_ACCESS_KEY_ID` and `RELEASE_STATE_R2_SECRET_ACCESS_KEY`.
+   Keep crates.io authentication isolated in `crates-io-assets`.
+3. Audit bucket lifecycle rules to exclude `release-state/published/` from
+   expiry. Configure the custom domain to bypass caching for the published
+   pointer and to avoid caching missing objects under the published prefix.
+4. Qualify publication, registry availability, Cargo resolution, every public
+   bundle file, and pointer advancement. Rerun to verify reuse. Authorized
+   branch qualification keeps its temporary publishing exceptions separate
+   from the PR and removes them afterward. After merge, inspect the first
+   publication from `main` to confirm the merged configuration.
+5. Set `MAINNET_RELEASE_STATE_READY_URL` to
+   `https://zakura-release.valargroup.dev/release-state/published/latest.json`.
+   Keep `MAINNET_RELEASE_STATE_LATEST_URL` pointing at the candidate pointer.
+6. Run adoption and release-preparation dry runs against the ready set. Set
+   `MAINNET_RELEASE_STATE_PUBLICATION_ENABLED=true` and
+   `MAINNET_RELEASE_STATE_ADOPTION_ENABLED=true` only after qualification.
+
+Local validation uses Python 3.12, the pinned client requirements in
+`.github/scripts/requirements-release-state.txt`, and
+`python -m unittest discover -s .github/scripts -p 'test_*release_state*.py'`.
+The integration tests run actual Cargo publication, resolution, and lockfile
+updates against a loopback registry. Promotion runs against an in-memory store
+with S3 conditional-write semantics, and stubbed SDK calls check how storage
+responses map onto those semantics. The tests require no production
+credentials or uploads.
+Real R2/CDN behavior, crates.io authentication, and the node's cryptographic
+subtree verifier still require their separate live/CI qualification.
 
 ## Why an archive node, and why it need not be stopped
 
@@ -58,24 +134,13 @@ everywhere, so the grid is built from reads with no replay at all, and its
 coverage follows its tip. A fast-synced archive node also works, but pays one
 whole-band replay — hours on Mainnet.
 
-## Cutover order
+## Exporter compatibility
 
-The importer requires every bundle to carry all four files and fails closed on one that does not,
-so the publisher has to be updated around the same time as the repository. It cannot be updated
-_first_: `deploy-snapshot-host.sh` refuses to install an exporter whose revision is not already an
-ancestor of `origin/main`, which is a supply-chain control worth keeping.
-
-So the order is:
-
-1. Merge the repository change.
-2. Run `deploy-snapshot-host.sh`, now buildable from `main`.
-3. Set `RELEASE_STATE_ARCHIVE_CACHE` and enable the timer.
-4. Dispatch `update-release-state.yml` once the first new bundle exists.
-
-Between 1 and 3 a scheduled import will fail with `meta.files is missing keys:
-mainnet-frontier-grid.bin`. Nothing is committed and nothing in production changes — it is a red
-scheduled job that clears as soon as the new publisher publishes — but prefer merging and
-deploying the same day over leaving it red for a week.
+The importer requires all four data files, including the historical frontier
+grid. Older candidates without the grid are rejected before publication.
+The existing archive exporter already produces this format; this change does
+not require redeploying it. Follow the production qualification and activation
+steps above for the new ready-set path.
 
 ## One-time host setup
 

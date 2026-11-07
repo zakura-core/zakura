@@ -100,7 +100,7 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 29;
+const DATABASE_FORMAT_VERSION: u64 = 30;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -109,7 +109,7 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
@@ -151,6 +151,14 @@ pub const MAX_FIND_BLOCK_HASHES_RESULTS: u32 = 500;
 
 /// The maximum number of block headers allowed in `getheaders` responses in the Zcash network protocol.
 pub const MAX_FIND_BLOCK_HEADERS_RESULTS: u32 = 160;
+
+/// Read-service slots reserved for bounded chain-tip and depth queries.
+/// Bulk reads cannot occupy this admission pool.
+pub(crate) const CONTROL_READ_CONCURRENCY: usize = 4;
+
+/// Full disk blocks retained by chain-tip publication, separate from ordinary results.
+/// Old tip subscribers keep their charge; exhaustion refuses operator changes before commit.
+pub(crate) const CHAIN_TIP_BLOCK_RETENTION: u64 = 4;
 
 /// The maximum number of headers returned by native Zakura header-sync range reads.
 ///

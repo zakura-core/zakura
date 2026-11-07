@@ -185,7 +185,10 @@ impl std::str::FromStr for Hash {
 }
 
 impl ZcashSerialize for Hash {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_32_bytes(&self.into())
     }
 }
@@ -351,7 +354,10 @@ impl std::str::FromStr for WtxId {
 }
 
 impl ZcashSerialize for WtxId {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_64_bytes(&self.into())
     }
 }

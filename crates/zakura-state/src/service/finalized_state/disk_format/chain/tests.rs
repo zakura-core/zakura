@@ -61,8 +61,7 @@ fn legacy_parts_from(tree: &NonEmptyHistoryTree) -> LegacyHistoryTreeParts {
             .peaks()
             .iter()
             .map(|(index, entry)| {
-                let serialized = bincode::DefaultOptions::new()
-                    .serialize(entry)
+                let serialized = bincode_format::serialize(entry)
                     .expect("history tree entry serialization succeeds");
                 let mut inner = [0; LEGACY_MAX_ENTRY_SIZE];
                 inner.copy_from_slice(&serialized[..LEGACY_MAX_ENTRY_SIZE]);
@@ -120,9 +119,7 @@ fn history_tree_parts_reads_legacy_entry_width() {
         current_height: Height(1_000),
     };
 
-    let legacy_bytes = bincode::DefaultOptions::new()
-        .serialize(&legacy)
-        .expect("legacy serialization succeeds");
+    let legacy_bytes = bincode_format::serialize(&legacy).expect("legacy serialization succeeds");
 
     let parts =
         HistoryTreeParts::try_from_bytes(&legacy_bytes).expect("legacy snapshot must decode");
@@ -163,22 +160,15 @@ fn history_tree_parts_reads_legacy_entry_width_after_non_eof_current_error() {
         current_height: Height(1_000),
     };
 
-    let legacy_bytes = bincode::DefaultOptions::new()
-        .serialize(&legacy)
-        .expect("legacy serialization succeeds");
+    let legacy_bytes = bincode_format::serialize(&legacy).expect("legacy serialization succeeds");
 
-    let current_error =
-        match bincode::DefaultOptions::new().deserialize::<HistoryTreeParts>(&legacy_bytes) {
-            Ok(_) => panic!("legacy bytes must not parse as current-width history tree parts"),
-            Err(error) => error,
-        };
+    let current_error = match bincode_format::deserialize::<HistoryTreeParts>(&legacy_bytes) {
+        Ok(_) => panic!("legacy bytes must not parse as current-width history tree parts"),
+        Err(error) => error,
+    };
 
     assert!(
-        !matches!(
-            current_error.as_ref(),
-            bincode::ErrorKind::Io(io_error)
-                if io_error.kind() == std::io::ErrorKind::UnexpectedEof
-        ),
+        current_error != BincodeError::UnexpectedEnd,
         "test fixture must exercise a legacy row with a non-EOF current-width error"
     );
 
@@ -307,9 +297,7 @@ fn try_history_tree_reads_legacy_snapshot() {
     let db = ephemeral_db(&network);
     let tree = valid_history_tree();
     let legacy = legacy_parts_from(&tree);
-    let legacy_bytes = bincode::DefaultOptions::new()
-        .serialize(&legacy)
-        .expect("legacy serialization succeeds");
+    let legacy_bytes = bincode_format::serialize(&legacy).expect("legacy serialization succeeds");
     write_raw_history_tree(
         &db,
         RawBytes::new_raw_bytes(Height(1).as_bytes().to_vec()),
@@ -348,13 +336,11 @@ fn legacy_history_entry_keeps_its_unprefixed_bytes() {
         u8::try_from(index).expect("the legacy entry width is less than 256 bytes")
     });
     let entry = LegacyEntry { inner };
-    let encoded = bincode::DefaultOptions::new().serialize(&entry).unwrap();
+    let encoded = bincode_format::serialize(&entry).unwrap();
     assert_eq!(encoded, inner);
-    let decoded: LegacyEntry = bincode::DefaultOptions::new()
-        .deserialize(&encoded)
-        .unwrap();
+    let decoded: LegacyEntry = bincode_format::deserialize(&encoded).unwrap();
     assert_eq!(decoded.inner, inner);
-    assert!(bincode::DefaultOptions::new()
-        .deserialize::<LegacyEntry>(&encoded[..LEGACY_MAX_ENTRY_SIZE - 1])
-        .is_err());
+    assert!(
+        bincode_format::deserialize::<LegacyEntry>(&encoded[..LEGACY_MAX_ENTRY_SIZE - 1]).is_err()
+    );
 }

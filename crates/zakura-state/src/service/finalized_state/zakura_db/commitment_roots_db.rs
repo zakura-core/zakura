@@ -85,10 +85,6 @@ impl ZakuraDb {
             .expect("column family was created when database was created")
     }
 
-    pub(super) fn has_commitment_roots_index(&self) -> bool {
-        CommitmentRootsCf::new(&self.db, COMMITMENT_ROOTS_BY_HEIGHT).is_some()
-    }
-
     /// Returns the commitment roots stored at `height`.
     pub fn commitment_roots(&self, height: Height) -> Option<BlockCommitmentRoots> {
         self.commitment_roots_cf()
@@ -220,19 +216,6 @@ impl ZakuraDb {
         Some(CommitmentRootIndexIssue::Missing(expected))
     }
 
-    /// Returns at most `limit` root heights for startup repair.
-    pub(crate) fn commitment_root_heights_for_repair(
-        &self,
-        start: Height,
-        limit: usize,
-    ) -> Vec<Height> {
-        self.commitment_roots_cf()
-            .zs_forward_range_iter(start..)
-            .map(|(height, _row)| height)
-            .take(limit)
-            .collect()
-    }
-
     /// Visits root rows in `range` for rollback and migration bookkeeping.
     pub(super) fn visit_commitment_roots_for_migration(
         &self,
@@ -287,39 +270,6 @@ impl DiskWriteBatch {
             .zs_insert(&roots.height, &disk_row(roots));
     }
 
-    /// Deletes the header-supplied row superseded by a committed body.
-    ///
-    /// Only body commit calls this, and the same batch writes the authoritative
-    /// body-derived replacement row, so the index never loses contiguity.
-    pub(super) fn delete_superseded_header_commitment_root(
-        &mut self,
-        db: &ZakuraDb,
-        height: Height,
-    ) {
-        let _ = db
-            .commitment_roots_cf()
-            .with_batch_for_writing(self)
-            .zs_delete(&height);
-    }
-
-    /// Deletes the inclusive header-supplied suffix displaced by a header reorganization.
-    pub(super) fn delete_header_reorg_commitment_roots(
-        &mut self,
-        db: &ZakuraDb,
-        start: Height,
-        end: Height,
-    ) {
-        if start > end {
-            return;
-        }
-
-        let mut writer = db.commitment_roots_cf().with_batch_for_writing(self);
-        for height in (start.0..=end.0).map(Height) {
-            writer = writer.zs_delete(&height);
-        }
-        let _ = writer;
-    }
-
     /// Truncates authoritative rows strictly above a finalized rollback target.
     pub(crate) fn truncate_commitment_roots_after(&mut self, db: &ZakuraDb, target: Height) {
         let Ok(start) = target.next() else {
@@ -331,14 +281,6 @@ impl DiskWriteBatch {
             .zs_delete_range(&start, &Height::MAX)
             .zs_delete(&Height::MAX);
         let _ = writer;
-    }
-
-    /// Deletes one row selected by startup repair or a database migration.
-    pub(super) fn delete_commitment_root_for_repair(&mut self, db: &ZakuraDb, height: Height) {
-        let _ = db
-            .commitment_roots_cf()
-            .with_batch_for_writing(self)
-            .zs_delete(&height);
     }
 
     #[cfg(test)]

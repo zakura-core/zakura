@@ -128,6 +128,41 @@ fn legacy_progress_bar_is_accepted_without_redirecting_logs() {
 }
 
 #[test]
+fn legacy_use_journald_is_accepted_and_not_serialized() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("legacy_journald.toml");
+    fs::write(&config_path, "[tracing]\nuse_journald = true\n").expect("write legacy config");
+
+    let config =
+        ZakuradConfig::load(Some(config_path)).expect("legacy journald setting remains valid");
+
+    let serialized = toml::to_string(&config).expect("serialize config");
+    assert!(!serialized.contains("use_journald"));
+}
+
+#[test]
+fn legacy_opentelemetry_settings_are_accepted_and_not_serialized() {
+    let _env = EnvGuard::new();
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let config_path = temp_dir.path().join("legacy_opentelemetry.toml");
+    fs::write(
+        &config_path,
+        "[tracing]\n\
+         opentelemetry_endpoint = \"http://localhost:4318\"\n\
+         opentelemetry_service_name = \"zakura\"\n\
+         opentelemetry_sample_percent = 10\n",
+    )
+    .expect("write legacy config");
+
+    let config =
+        ZakuradConfig::load(Some(config_path)).expect("legacy OpenTelemetry settings remain valid");
+
+    let serialized = toml::to_string(&config).expect("serialize config");
+    assert!(!serialized.contains("opentelemetry"));
+}
+
+#[test]
 fn legacy_progress_bar_preserves_explicit_log_file() {
     let log_file = PathBuf::from("custom-zakura.log");
     let tracing_config = TracingConfig::from(TracingInnerConfig {
@@ -602,6 +637,19 @@ fn config_generated_file_roundtrip() {
         ZakuradConfig::load(Some(path)).expect("reload config"),
         expected
     );
+}
+
+#[test]
+fn config_rejects_sections_written_as_arrays() {
+    let _env = EnvGuard::new();
+    let dir = TempDir::new().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "rpc = []\n").expect("write config");
+    let error = ZakuradConfig::load(Some(path))
+        .expect_err("reject a section written as an array")
+        .to_string();
+    assert!(error.contains("rpc"), "{error}");
+    assert!(error.contains("sequence"), "{error}");
 }
 
 #[test]

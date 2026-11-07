@@ -11,10 +11,10 @@
 //! A root of a note commitment tree is associated with each treestate.
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use byteorder::{BigEndian, ByteOrder};
 use incrementalmerkletree::frontier::Frontier;
-use lazy_static::lazy_static;
 use thiserror::Error;
 
 use super::commitment::NoteCommitment;
@@ -62,25 +62,23 @@ fn merkle_crh_sprout(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     derived_bytes
 }
 
-lazy_static! {
-    /// List of "empty" Sprout note commitment roots (nodes), one for each layer.
-    ///
-    /// The list is indexed by the layer number (0: root; `MERKLE_DEPTH`: leaf).
-    pub(super) static ref EMPTY_ROOTS: Vec<[u8; 32]> = {
-        // The empty leaf node at layer `MERKLE_DEPTH`.
-        let mut v = vec![NoteCommitmentTree::uncommitted()];
+/// List of "empty" Sprout note commitment roots (nodes), one for each layer.
+///
+/// The list is indexed by the layer number (0: root; `MERKLE_DEPTH`: leaf).
+pub(super) static EMPTY_ROOTS: LazyLock<Vec<[u8; 32]>> = LazyLock::new(|| {
+    // The empty leaf node at layer `MERKLE_DEPTH`.
+    let mut v = vec![NoteCommitmentTree::uncommitted()];
 
-        // Starting with layer `MERKLE_DEPTH` - 1 (the first internal layer, after the leaves),
-        // generate the empty roots up to layer 0, the root.
-        for _ in 0..MERKLE_DEPTH {
-            // The vector is generated from the end, pushing new nodes to its beginning.
-            // For this reason, the layer below is v[0].
-            v.insert(0, merkle_crh_sprout(v[0], v[0]));
-        }
+    // Starting with layer `MERKLE_DEPTH` - 1 (the first internal layer, after the leaves),
+    // generate the empty roots up to layer 0, the root.
+    for _ in 0..MERKLE_DEPTH {
+        // The vector is generated from the end, pushing new nodes to its beginning.
+        // For this reason, the layer below is v[0].
+        v.insert(0, merkle_crh_sprout(v[0], v[0]));
+    }
 
-        v
-    };
-}
+    v
+});
 
 /// Sprout note commitment tree root node hash.
 ///

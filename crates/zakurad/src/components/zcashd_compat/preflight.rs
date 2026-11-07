@@ -10,7 +10,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use color_eyre::eyre::{eyre, Report};
+use eyre::{eyre, Report};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 #[cfg(target_os = "linux")]
@@ -61,10 +61,7 @@ const TESTNET_RECOMMENDED_COMBINED_TOTAL_BYTES: u64 = 100 * GIB;
 ///
 /// On Linux, checks CPU, effective memory and mount-aware disk provisioning.
 /// On non-Linux, startup fails unless `unsafe_low_specs` is explicitly set.
-pub fn run_preflight(
-    config: &ZakuradConfig,
-    unsafe_low_specs: bool,
-) -> Result<(), color_eyre::eyre::Report> {
+pub fn run_preflight(config: &ZakuradConfig, unsafe_low_specs: bool) -> Result<(), eyre::Report> {
     #[cfg(target_os = "linux")]
     {
         run_linux_preflight(config, unsafe_low_specs)
@@ -81,7 +78,7 @@ pub fn run_preflight(
             );
             Ok(())
         } else {
-            Err(color_eyre::eyre::eyre!(message))
+            Err(eyre::eyre!(message))
         }
     }
 }

@@ -32,7 +32,7 @@ from typing import Any, Callable
 # shipped with this script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from zakura_monitoring import monitor, slack  # noqa: E402,F401 - tests patch slack limits
+from zakura_monitoring import difficulty, monitor, nu7, slack  # noqa: E402,F401 - tests patch slack limits
 from zakura_monitoring.delivery import deliver_pending, queue_transitions  # noqa: E402
 from zakura_monitoring.slack import (  # noqa: E402
     bounded_text,
@@ -55,6 +55,7 @@ from zakura_monitoring.suppression import suppression_until  # noqa: E402
 DOWN_HEALTH = {"down", "rpc_error"}
 MAC_NODE_NAME = "mac-os-cranelift"
 PROPAGATION_GRACE_SECONDS = 120
+RELEASE_STATE_FETCH_GRACE_SECONDS = 3600
 MAX_DECISION_HISTORY = 16
 MAX_DECISION_ROWS = 64
 MAX_SHARED_DIAGNOSTIC_ROWS = 8
@@ -79,6 +80,9 @@ STALL_PIPELINE_METRICS = (
     ("oldest missing", "sync_header_work_oldest_missing_height"),
     ("header in flight", "sync_header_work_in_flight_count"),
     ("block applying", "sync_block_applying"),
+    ("apply operations", "sync_zakura_apply_operations"),
+    ("apply in flight", "sync_zakura_apply_in_flight"),
+    ("oldest apply seconds", "sync_zakura_apply_oldest_seconds"),
     ("block header tip", "sync_block_best_header_tip_height"),
     ("block verified tip", "sync_block_verified_tip_height"),
     ("block fill stop", "sync_block_fill_stop"),
@@ -112,6 +116,7 @@ class Fleet:
     name: str
     url: str
     dashboard_url: str
+    difficulty_monitor: bool = False
 
 
 @dataclass(frozen=True)
@@ -247,7 +252,11 @@ def load_fleets(config_path: Path) -> list[Fleet]:
 
         url = str(raw["url"])
         dashboard_url = str(raw.get("dashboard_url") or url.removesuffix("/data"))
-        fleets.append(Fleet(name=name, url=url, dashboard_url=dashboard_url))
+        difficulty_monitor = raw.get("difficulty_monitor", False)
+        if type(difficulty_monitor) is not bool or (difficulty_monitor and name != "mainnet"):
+            raise SystemExit("difficulty_monitor must be a boolean enabled only for mainnet")
+        fleets.append(Fleet(name=name, url=url, dashboard_url=dashboard_url,
+                            difficulty_monitor=difficulty_monitor))
 
     if not fleets:
         raise SystemExit(f"no [[fleets]] defined in {config_path}")
@@ -273,7 +282,9 @@ def fetch_json(url: str, timeout: float) -> dict[str, Any]:
         },
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read()
+        body = response.read(4 * 1024 * 1024 + 1)
+    if len(body) > 4 * 1024 * 1024:
+        raise ValueError("monitoring JSON response exceeds 4 MiB")
 
     decoded = json.loads(body.decode("utf-8"))
     if not isinstance(decoded, dict):
@@ -384,6 +395,10 @@ def node_diagnostic_lines(row: dict[str, Any]) -> list[str]:
     )
     metrics, available = alert_metrics(row)
     pipeline = named_metrics(metrics, STALL_PIPELINE_METRICS)
+    phase = coerce_float(metrics.get("sync_zakura_apply_phase"))
+    phase_name = {0: "bootstrap", 1: "native", 2: "draining", 3: "fallback", 4: "failed"}.get(phase)
+    if phase_name:
+        pipeline = " | ".join(value for value in (pipeline, f"apply phase {phase_name}") if value)
     repair = named_metrics(metrics, STALL_REPAIR_METRICS)
 
     lines = []
@@ -1124,12 +1139,14 @@ class Watchdog:
         release_state: list[ReleaseState] | None = None,
         checkpoint: Callable[[dict[str, Any]], None] | None = None,
         compatibility: list[monitor.ProbeWorker] | None = None,
+        nu7_dashboard: list[nu7.Target] | None = None,
     ):
         self.notify = lambda text, args: post_slack(text, args)
         self.checkpoint = checkpoint or (lambda state: None)
         self.fleets = fleets
         self.release_state = release_state or []
         self.compatibility = compatibility or []
+        self.nu7_dashboard = nu7_dashboard or []
         self.args = args
         self.started_at = time.time()
         self.fetch_recovered_at: dict[str, float] = {}
@@ -1161,6 +1178,9 @@ class Watchdog:
             else:
                 self.commit_fleet_state(state, fleet, candidate)
 
+        for target in self.nu7_dashboard:
+            self.handle_nu7_dashboard(state, target, time.time(), suppressed)
+
         for target in self.release_state:
             self.handle_release_state(state, target, now, suppressed)
 
@@ -1173,6 +1193,53 @@ class Watchdog:
             self.handle_compatibility(state, worker)
 
         self.reconcile_pagerduty(state, now, suppressed)
+
+    def handle_nu7_dashboard(
+        self, state: dict[str, Any], target: nu7.Target, now: float, suppressed: bool
+    ) -> None:
+        """Plan endpoint transitions using the shared durable Slack queue."""
+        queue = "nu7_dashboard_pending_delivery"
+        pending = state.setdefault(queue, {})
+        bucket = state.setdefault("nu7_dashboard", {})
+        candidate = copy.deepcopy(
+            pending[target.name]["state"] if target.name in pending else bucket.get(target.name, {})
+        )
+        try:
+            snapshot = fetch_json(target.url, self.args.request_timeout)
+            result = nu7.failure(snapshot, now, self.args.dashboard_down_after)
+        except Exception as error:
+            # Remote error text can contain response bodies or credentials.
+            result = (f"dashboard request failed ({type(error).__name__})", now)
+        reason, bad_since = result if result is not None else ("", now)
+        previous_since = coerce_float(candidate.get("bad_since"))
+        if result is not None and candidate.get("condition") == "failing" and previous_since is not None:
+            bad_since = min(bad_since, previous_since)
+        name = slack_identity(target.name, MAX_ALERT_NAME_CHARS, "unknown")
+        endpoint = slack_dashboard_url(target.url)
+        messages: list[str] = []
+        planned = {target.name: candidate}
+        update_alert_state(
+            planned, target.name, "failing" if result is not None else "ok",
+            bad_since, self.args.dashboard_down_after,
+            f":rotating_light: *Zakura {name}* dashboard unavailable for {format_duration(now - bad_since)}\n"
+            f"reason: {reason}\nendpoint: {endpoint}\n"
+            f"dashboard: {slack_dashboard_url(target.dashboard_url)}",
+            f":white_check_mark: *Zakura {name}* dashboard recovered; data is fresh\nendpoint: {endpoint}",
+            now, suppressed, self.args,
+            notify=lambda text, _args: (messages.append(text), True)[1],
+        )
+        candidate = planned[target.name]
+        if messages or target.name in pending:
+            queue_transitions(state, queue, target.name, messages, candidate, now, title=None)
+            if not suppressed:
+                deliver_pending(
+                    state, queue, target.name,
+                    post=lambda text: post_slack(text, self.args),
+                    commit=lambda entry: bucket.__setitem__(target.name, entry),
+                    checkpoint=self.checkpoint,
+                )
+        else:
+            bucket[target.name] = candidate
 
     def handle_compatibility(
         self, state: dict[str, Any], worker: monitor.ProbeWorker, now: float | None = None
@@ -1397,7 +1464,7 @@ class Watchdog:
     def fleet_state(state: dict[str, Any], fleet: Fleet) -> dict[str, Any]:
         """Copy only this fleet's state so delivery cannot overwrite another fleet."""
         result = {}
-        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks"):
+        for bucket in ("nodes", "fleets", "shared_stalls", "propagation", "decisions", "mac_forks", "difficulty"):
             entries = state.get(bucket, {})
             result[bucket] = copy.deepcopy({
                 key: value for key, value in entries.items()
@@ -1435,8 +1502,11 @@ class Watchdog:
             node_rows = validated_fleet_rows(snapshot)
             last_poll = snapshot_last_poll(snapshot)
         except Exception as error:
+            self.observe_difficulty(state, fleet, None, now)
             self.handle_fleet_error(state, fleet, error, now, suppressed)
             return
+
+        self.observe_difficulty(state, fleet, snapshot, now)
 
         if (
             last_poll is not None
@@ -1501,6 +1571,14 @@ class Watchdog:
                 observation.condition == "stalled"
                 and observation.name in (shared_nodes | propagation_nodes),
             )
+
+    def observe_difficulty(self, state, fleet, snapshot, now):
+        """Share this fleet's persisted incident and durable Slack delivery."""
+        if not fleet.difficulty_monitor:
+            return
+        entry = state.setdefault("difficulty", {}).setdefault(fleet.name, {})
+        for message in difficulty.update(entry, snapshot, now):
+            self.notify(message + f"\ndashboard: {slack_dashboard_url(fleet.dashboard_url)}", self.args)
 
     def handle_mac_fork(self, state, fleet, rows, now, suppressed):
         """Alert on proven >10-block divergence against 70% of all other nodes.
@@ -1687,6 +1765,7 @@ class Watchdog:
         key = target.name
         entry = bucket.get(key, {})
         height: Any = entry.get("height")
+        threshold = 0.0
 
         try:
             pointer = fetch_json(target.url, self.args.request_timeout)
@@ -1698,6 +1777,15 @@ class Watchdog:
             condition, detail = release_state_condition(target, pointer, meta, now)
         except Exception as error:
             condition, detail = "unreachable", str(error)
+            # Every fetch failure waits out the same grace. The edge returns a new kind
+            # of one-poll blip every few weeks (5xx, 429, resets, timeouts), and the
+            # bundle only goes stale after 48 hours, so an hour's delay loses nothing.
+            # A failed fetch also cannot clear the last notified incident. Keep it
+            # until a readable bundle can establish its next condition.
+            if entry.get("alerting"):
+                entry["last_seen"] = now
+                return
+            threshold = RELEASE_STATE_FETCH_GRACE_SECONDS
 
         previous_bad_since = coerce_float(entry.get("bad_since"))
         bad_since = (
@@ -1708,15 +1796,14 @@ class Watchdog:
             else now
         )
 
-        # Threshold zero: a bundle that is already past its staleness window, or is
-        # missing a file, is not a transient blip to wait out. The window itself is
-        # the grace period.
+        # Only fetch failures get a grace period. A readable bundle that is invalid,
+        # incomplete, or stale still requires immediate attention.
         update_alert_state(
             bucket,
             key,
             condition,
             bad_since,
-            0.0,
+            threshold,
             release_state_alert_text(target, condition, detail, height),
             release_state_recovery_text(target, entry),
             now,
@@ -2293,6 +2380,7 @@ def main() -> int:
         fleets, args, load_release_state(args.config),
         checkpoint=lambda state: save_state(args.state_file, state),
         compatibility=compatibility,
+        nu7_dashboard=nu7.load_targets(args.config),
     )
 
     while True:

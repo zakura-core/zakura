@@ -129,14 +129,14 @@ impl OutputInTransactionV4 {
 }
 
 impl ZcashSerialize for OutputInTransactionV4 {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         let output = self.0.clone();
         writer.write_all(&output.cv.0)?;
         writer.write_all(&output.cm_u.to_bytes())?;
-        output.ephemeral_key.zcash_serialize(&mut writer)?;
-        output.enc_ciphertext.zcash_serialize(&mut writer)?;
-        output.out_ciphertext.zcash_serialize(&mut writer)?;
-        output.zkproof.zcash_serialize(&mut writer)?;
+        output.ephemeral_key.zcash_serialize(writer)?;
+        output.enc_ciphertext.zcash_serialize(writer)?;
+        output.out_ciphertext.zcash_serialize(writer)?;
+        output.zkproof.zcash_serialize(writer)?;
         Ok(())
     }
 }
@@ -199,12 +199,12 @@ impl ZcashDeserialize for OutputInTransactionV4 {
 // Output prefix fields, which are stored in the same array.
 
 impl ZcashSerialize for OutputPrefixInTransactionV5 {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.cv.0)?;
         writer.write_all(&self.cm_u.to_bytes())?;
-        self.ephemeral_key.zcash_serialize(&mut writer)?;
-        self.enc_ciphertext.zcash_serialize(&mut writer)?;
-        self.out_ciphertext.zcash_serialize(&mut writer)?;
+        self.ephemeral_key.zcash_serialize(writer)?;
+        self.enc_ciphertext.zcash_serialize(writer)?;
+        self.out_ciphertext.zcash_serialize(writer)?;
         Ok(())
     }
 }

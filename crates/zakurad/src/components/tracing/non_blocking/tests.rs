@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use super::*;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -17,7 +15,7 @@ struct RecordingWriter {
     recorded: Arc<Mutex<Recorded>>,
     fail_first_write: bool,
     fail_flush: bool,
-    flushed: Option<Sender<()>>,
+    flushed: Option<SyncSender<()>>,
 }
 
 // Test coordination failures must panic: the logger discards output errors.
@@ -60,7 +58,7 @@ impl Drop for RecordingWriter {
 
 struct BlockedWriter {
     inner: RecordingWriter,
-    entered: Sender<()>,
+    entered: SyncSender<()>,
     release: Receiver<()>,
 }
 
@@ -84,13 +82,13 @@ impl Write for BlockedWriter {
 fn blocked_writer() -> (
     BlockedWriter,
     Receiver<()>,
-    Sender<()>,
+    SyncSender<()>,
     Arc<Mutex<Recorded>>,
 ) {
     let inner = RecordingWriter::default();
     let recorded = inner.recorded.clone();
-    let (entered, entered_receiver) = bounded(2);
-    let (release_sender, release) = bounded(2);
+    let (entered, entered_receiver) = sync_channel(2);
+    let (release_sender, release) = sync_channel(2);
     (
         BlockedWriter {
             inner,
@@ -122,7 +120,7 @@ fn queued_logs_are_written_in_order_and_flushed_on_shutdown() {
 
 #[test]
 fn an_idle_worker_flushes_before_shutdown() {
-    let (flushed, completion) = bounded(1);
+    let (flushed, completion) = sync_channel(1);
     let output = RecordingWriter {
         recorded: Default::default(),
         fail_first_write: false,
@@ -146,7 +144,7 @@ fn a_full_queue_drops_new_logs_without_blocking_callers() {
     entered.recv_timeout(TEST_TIMEOUT).unwrap();
     writer.write_all(b"second").unwrap();
 
-    let (returned, completion) = bounded(1);
+    let (returned, completion) = sync_channel(1);
     let caller = thread::spawn(move || {
         let result = writer.write_all(b"dropped");
         returned.send(result).unwrap();
@@ -196,7 +194,7 @@ fn concurrent_tracing_events_reach_the_background_writer() {
     let output = RecordingWriter::default();
     let recorded = output.recorded.clone();
     let (writer, guard) = non_blocking(output, 100).unwrap();
-    let (finished, completion) = bounded(8);
+    let (finished, completion) = sync_channel(8);
     let callers: Vec<_> = (0..8)
         .map(|id| {
             let writer = writer.clone();
@@ -245,7 +243,7 @@ fn blocked_output_does_not_hold_up_shutdown_indefinitely() {
         // Keep a completion receiver after the guard is dropped so the test
         // can wait for the detached worker after unblocking its output.
         let finished = guard.finished.clone();
-        let (returned, completion) = bounded(1);
+        let (returned, completion) = sync_channel(1);
         let shutdown = thread::spawn(move || {
             drop(guard);
             returned.send(()).unwrap();
@@ -259,7 +257,7 @@ fn blocked_output_does_not_hold_up_shutdown_indefinitely() {
         if full_queue {
             release.send(()).unwrap();
         }
-        finished.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert!(finished.wait_timeout(TEST_TIMEOUT));
         let recorded = recorded.lock().unwrap();
         assert!(recorded.dropped);
         assert_eq!(

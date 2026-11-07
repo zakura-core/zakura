@@ -1,0 +1,79 @@
+name: RPC fuzzing
+
+on:
+  # Run a bounded campaign daily, and a longer one on Sunday.
+  schedule:
+    - cron: "43 5 * * 1-6"
+    - cron: "43 5 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  # One group per run, so a manual run never cancels a scheduled one on `main`.
+  group: ${{ github.workflow }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.13.2
+  RPC_FUZZ_NIGHTLY: nightly-2026-07-15
+  RUST_BACKTRACE: 1
+  CXXFLAGS: -include cstdint
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: json_rpc_request
+            seconds: 900
+            weekly_seconds: 3600
+            rss_mb: 2048
+            max_len: 65536
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: ${{ env.RPC_FUZZ_NIGHTLY }}
+          cache: true
+          cache-on-failure: true
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
+      - name: Run bounded campaign
+        working-directory: qa/fuzz/rpc
+        env:
+          NORMAL_SECONDS: ${{ matrix.seconds }}
+          WEEKLY_SECONDS: ${{ matrix.weekly_seconds }}
+          SCHEDULE: ${{ github.event.schedule }}
+          TARGET: ${{ matrix.target }}
+          RSS_MB: ${{ matrix.rss_mb }}
+          MAX_LEN: ${{ matrix.max_len }}
+        run: |
+          seconds="${NORMAL_SECONDS}"
+          if [ "${SCHEDULE}" = "43 5 * * 0" ]; then
+            seconds="${WEEKLY_SECONDS}"
+          fi
+          # cargo-fuzz otherwise looks for `fuzz/` under the workspace root.
+          cargo fuzz run --fuzz-dir . "${TARGET}" -- \
+            -max_total_time="${seconds}" \
+            -rss_limit_mb="${RSS_MB}" \
+            -max_len="${MAX_LEN}"
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: rpc-fuzz-${{ matrix.target }}-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: qa/fuzz/rpc/artifacts/${{ matrix.target }}

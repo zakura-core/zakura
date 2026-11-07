@@ -33,7 +33,7 @@ pub struct RetainedPathLease {
     pub session_id: u64,
     /// Exact retained target named by the request.
     pub target: Frontier,
-    /// First requester-order locator intersection.
+    /// Nearest locator ancestor on the target’s chain.
     pub common_ancestor: Frontier,
     /// Exact generation and branch that state observed during snapshot acquisition.
     pub scope: HeaderWorkAuthority,

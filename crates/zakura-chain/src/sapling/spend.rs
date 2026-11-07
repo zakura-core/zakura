@@ -165,12 +165,12 @@ impl Spend<SharedAnchor> {
 }
 
 impl ZcashSerialize for Spend<PerSpendAnchor> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.cv.0)?;
-        self.per_spend_anchor.zcash_serialize(&mut writer)?;
+        self.per_spend_anchor.zcash_serialize(writer)?;
         writer.write_32_bytes(&self.nullifier.into())?;
         writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
-        self.zkproof.zcash_serialize(&mut writer)?;
+        self.zkproof.zcash_serialize(writer)?;
         writer.write_all(&<[u8; 64]>::from(self.spend_auth_sig)[..])?;
         Ok(())
     }
@@ -248,7 +248,7 @@ impl ZcashDeserialize for Spend<PerSpendAnchor> {
 // Spend<SharedAnchor> prefix fields, which are stored in the same array.
 
 impl ZcashSerialize for SpendPrefixInTransactionV5 {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.cv.0)?;
         writer.write_32_bytes(&self.nullifier.into())?;
         writer.write_all(&<[u8; 32]>::from(self.rk.clone())[..])?;
@@ -290,7 +290,7 @@ impl ZcashDeserialize for SpendPrefixInTransactionV5 {
 /// In Transaction V5, SpendAuth signatures are serialized and deserialized in a
 /// separate array.
 impl ZcashSerialize for redjubjub::Signature<SpendAuth> {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&<[u8; 64]>::from(*self)[..])?;
         Ok(())
     }

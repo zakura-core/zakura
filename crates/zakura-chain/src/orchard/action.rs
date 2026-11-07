@@ -44,14 +44,14 @@ pub struct Action {
 }
 
 impl ZcashSerialize for Action {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
-        self.cv.zcash_serialize(&mut writer)?;
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+        self.cv.zcash_serialize(writer)?;
         writer.write_all(&<[u8; 32]>::from(self.nullifier)[..])?;
         writer.write_all(&<[u8; 32]>::from(self.rk)[..])?;
         writer.write_all(&<[u8; 32]>::from(self.cm_x)[..])?;
-        self.ephemeral_key.zcash_serialize(&mut writer)?;
-        self.enc_ciphertext.zcash_serialize(&mut writer)?;
-        self.out_ciphertext.zcash_serialize(&mut writer)?;
+        self.ephemeral_key.zcash_serialize(writer)?;
+        self.enc_ciphertext.zcash_serialize(writer)?;
+        self.out_ciphertext.zcash_serialize(writer)?;
         Ok(())
     }
 }

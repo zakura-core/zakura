@@ -2,15 +2,12 @@
 
 use derive_new::new;
 use getset::Getters;
-use schemars::JsonSchema;
 
 use crate::methods::{hex_data::HexData, types::long_poll::LongPollId};
 
 /// Defines whether the RPC method should generate a block template or attempt to validate a block
 /// proposal.
-#[derive(
-    Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq, JsonSchema,
-)]
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GetBlockTemplateRequestMode {
     /// Indicates a request for a block template.
@@ -22,7 +19,7 @@ pub enum GetBlockTemplateRequestMode {
 }
 
 /// Valid `capabilities` values that indicate client-side support.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq, JsonSchema)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GetBlockTemplateCapability {
     /// Long Polling support.
@@ -62,16 +59,7 @@ pub enum GetBlockTemplateCapability {
 /// The `data` field must be provided in `proposal` mode, and must be omitted in `template` mode.
 /// All other fields are optional.
 #[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    serde::Deserialize,
-    serde::Serialize,
-    Default,
-    Getters,
-    new,
-    JsonSchema,
+    Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default, Getters, new,
 )]
 pub struct GetBlockTemplateParameters {
     /// Defines whether the RPC method should generate a block template or attempt to

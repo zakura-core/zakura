@@ -2,10 +2,9 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use color_eyre::eyre::Report;
-use once_cell::sync::Lazy;
+use eyre::Report;
 use tracing::Instrument;
 
 use zakura_chain::{
@@ -17,9 +16,9 @@ use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use zakura_state::*;
 
-static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
+static COMMIT_FINALIZED_BLOCK_MAINNET: LazyLock<
     Vec<(Request, Result<Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
@@ -33,14 +32,14 @@ static COMMIT_FINALIZED_BLOCK_MAINNET: Lazy<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block2))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });
 
-static COMMIT_FINALIZED_BLOCK_TESTNET: Lazy<
+static COMMIT_FINALIZED_BLOCK_TESTNET: LazyLock<
     Vec<(Request, Result<Response, ExpectedTranscriptError>)>,
-> = Lazy::new(|| {
+> = LazyLock::new(|| {
     let block: Arc<_> =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES[..])
             .unwrap()
@@ -54,7 +53,7 @@ static COMMIT_FINALIZED_BLOCK_TESTNET: Lazy<
         ),
         (
             Request::Block(hash.into()),
-            Ok(Response::Block(Some(block2))),
+            Ok(Response::Block(Some(block2.into()))),
         ),
     ]
 });
@@ -83,7 +82,7 @@ async fn check_transcripts(network: Network) -> Result<(), Report> {
 
     for transcript_data in net_data {
         // We're not verifying UTXOs here.
-        let (service, _, _, _) =
+        let zakura_state::InitializedState { state: service, .. } =
             zakura_state::init(Config::ephemeral(), &network, Height::MAX, 0).await?;
         let transcript = Transcript::from(transcript_data.iter().cloned());
         async { transcript.check(service).await }

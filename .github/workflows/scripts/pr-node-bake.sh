@@ -31,15 +31,8 @@ cloud-init status --wait >/dev/null 2>&1 || true
 for _ in $(seq 1 120); do pgrep -x apt-get >/dev/null || break; sleep 5; done
 apt-get -o DPkg::Lock::Timeout=600 update -qq
 apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
-  build-essential clang cmake pkg-config libssl-dev protobuf-compiler \
+  build-essential clang cmake pkg-config libssl-dev \
   git curl zstd jq python3
-# CPU-profiling tools for zakura-perf-bench.yml (best-effort: perf still gets
-# installed at run time if the kernel-matched package is missing here);
-# libc6-dbg restores glibc's internal symbols for stack sampling
-apt-get -o DPkg::Lock::Timeout=600 install -y -qq \
-  "linux-tools-$(uname -r)" 2>/dev/null \
-  || apt-get -o DPkg::Lock::Timeout=600 install -y -qq linux-tools-generic 2>/dev/null || true
-apt-get -o DPkg::Lock::Timeout=600 install -y -qq libc6-dbg 2>/dev/null || true
 
 # --------------------------------------------------------------------------- #
 # Rust toolchain + repo clone + warm release build
@@ -60,13 +53,6 @@ chmod 0755 "${rustup_init}"
 # deploy.py runs bare `cargo` from a non-login SSH shell where ~/.cargo/env has
 # not been sourced, so the toolchain must be reachable from the default PATH.
 ln -sf /root/.cargo/bin/cargo /root/.cargo/bin/rustc /root/.cargo/bin/rustup /usr/local/bin/
-# flamegraph renderer + Rust v0 symbol demangler for zakura-perf-bench.yml
-# (best-effort; the run script falls back gracefully without either)
-cargo install inferno --locked >/dev/null 2>&1 || true
-cargo install rustfilt --locked >/dev/null 2>&1 || true
-ln -sf /root/.cargo/bin/inferno-flamegraph /root/.cargo/bin/rustfilt \
-  /usr/local/bin/ 2>/dev/null || true
-
 git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /root/zakura
 # Strip the token from the baked image; run droplets fetch with a fresh
 # per-run token via an http.extraheader instead.
@@ -205,6 +191,39 @@ fetch_tip_state() {
   IFS=$'\t' read -r url sha <<< "$fields"
   echo "$network tip: $(printf '%s\n' "$metadata" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
   fetch_state "$url" "$sha" "$dest" "$network"
+  upgrade_tip_state "$dest" "$network"
+}
+
+upgrade_tip_state() {
+  # tip-height opens read-only and cannot reuse a previous major-version path.
+  # Normal startup performs supported format upgrades before checking the stop
+  # height. Stop at the existing tip before any network sync or block commits.
+  local cache_dir="$1" network="$2" config output
+  case "$network" in
+    mainnet) network=Mainnet ;;
+    testnet) network=Testnet ;;
+  esac
+  config=$(mktemp)
+  cat > "$config" <<TOML
+[network]
+network = "$network"
+p2p_stack = "zakura"
+
+[state]
+cache_dir = "$cache_dir"
+storage_mode = "pruned"
+debug_stop_at_height = 0
+
+[consensus]
+checkpoint_sync = true
+vct_fast_sync = true
+TOML
+  if ! output=$(timeout 20m "${CARGO_TARGET_DIR}/release/zakurad" -c "$config" start 2>&1); then
+    rm -f "$config"
+    printf 'could not upgrade restored %s database:\n%s\n' "$network" "$output" >&2
+    return 1
+  fi
+  rm -f "$config"
 }
 
 read_state_height() {

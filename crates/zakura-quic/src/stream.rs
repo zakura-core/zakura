@@ -1,0 +1,461 @@
+//! Stream handles (API-5).
+//!
+//! Each handle sends its requests to the connection task in order. A send
+//! handle pipelines writes up to [`WRITE_AHEAD_BYTES`] ahead of quinn-proto, so
+//! a burst of small writes leaves in one packet. A receive handle has at most
+//! one read in flight. A cancelled operation's reply stays in the handle, and
+//! the next call waits for it first, so cancelling a call never reorders or
+//! loses stream data.
+//!
+//! A reader can hold receive credit for bytes it keeps after reading them
+//! (API-10). The hold rides in the stream's next command, and the connection
+//! takes it out of its receive window before that command's read, so the
+//! peer gets the credit back only when the [`CreditHold`] drops.
+
+use std::{collections::VecDeque, future::Future, mem, sync::Arc};
+
+use bytes::{Buf as _, Bytes};
+use quinn_proto::{ConnectionError, StreamId, VarInt};
+use zakura_rt::sync::oneshot::{self, error::TryRecvError};
+
+use crate::{
+    driver::{ConnCmd, ConnRef, ConnShared, ReadReply},
+    error::{ClosedStream, ReadError, ReadExactError, ReadToEndError, WriteError},
+};
+
+/// Bytes one stream may queue at the connection task before a write waits for
+/// quinn-proto to accept them. Without write-ahead, every write would cost a
+/// round trip to the connection task and its own packet.
+pub(crate) const WRITE_AHEAD_BYTES: usize = 64 * 1024;
+
+/// The least `read` and `read_exact` ask the connection task for (DRV-4).
+/// A small frame then costs one request, and a stream pins at most this much
+/// data its application hasn't asked for.
+pub(crate) const READ_AHEAD_BYTES: usize = 4 * 1024;
+
+type WriteReply = oneshot::Receiver<Result<(), WriteError>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SendState {
+    Open,
+    Finished,
+    Reset,
+}
+
+/// The sending half of a bidirectional stream.
+///
+/// Dropping it without [`finish`](Self::finish) or [`reset`](Self::reset)
+/// finishes the stream once every write is delivered to quinn-proto.
+#[derive(Debug)]
+pub struct SendStream {
+    conn: ConnRef,
+    id: StreamId,
+    state: SendState,
+    /// Writes the connection task hasn't fully handed to quinn-proto, oldest
+    /// first, with their sizes.
+    pending: VecDeque<(usize, WriteReply)>,
+    pending_bytes: usize,
+}
+
+impl SendStream {
+    pub(crate) fn new(conn: ConnRef, id: StreamId) -> Self {
+        Self {
+            conn,
+            id,
+            state: SendState::Open,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+        }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
+    }
+
+    /// Writes all of `buf`. Returns once at most [`WRITE_AHEAD_BYTES`] of this
+    /// stream's data wait for quinn-proto, which waits on the peer's flow
+    /// control and the send window.
+    pub async fn write_all(&mut self, buf: &[u8]) -> Result<(), WriteError> {
+        self.write_chunk(Bytes::copy_from_slice(buf)).await
+    }
+
+    /// Writes `data` without copying it.
+    ///
+    /// A failure of an earlier write surfaces here, because writes pipeline.
+    pub async fn write_chunk(&mut self, data: Bytes) -> Result<(), WriteError> {
+        if self.state != SendState::Open {
+            return Err(WriteError::ClosedStream);
+        }
+        self.reap()?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let len = data.len();
+        let (reply, result) = oneshot::channel();
+        self.conn
+            .send(ConnCmd::Write {
+                id: self.id,
+                data,
+                reply,
+            })
+            .map_err(WriteError::ConnectionLost)?;
+        self.pending.push_back((len, result));
+        self.pending_bytes += len;
+        while self.pending_bytes > WRITE_AHEAD_BYTES {
+            self.settle_oldest().await?;
+        }
+        Ok(())
+    }
+
+    /// Collects the replies that already arrived, without waiting.
+    fn reap(&mut self) -> Result<(), WriteError> {
+        while let Some((len, reply)) = self.pending.front_mut() {
+            let result = match reply.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Closed) => Err(lost(&self.conn)),
+            };
+            self.pending_bytes -= *len;
+            self.pending.pop_front();
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Waits for the oldest write. Cancelling the wait keeps its reply.
+    async fn settle_oldest(&mut self) -> Result<(), WriteError> {
+        let Some((len, reply)) = self.pending.front_mut() else {
+            return Ok(());
+        };
+        let len = *len;
+        let result = reply.await.unwrap_or_else(|_| Err(lost(&self.conn)));
+        self.pending_bytes -= len;
+        self.pending.pop_front();
+        result
+    }
+
+    /// Resolves with the peer's STOP_SENDING code once the peer stops the
+    /// stream, or with the close reason once the connection closes.
+    ///
+    /// The future doesn't borrow the handle, so a caller can make it once and
+    /// keep it across writes. It costs no task, and a stop wakes only this
+    /// stream's waiters. A stop that arrives after [`finish`](Self::finish),
+    /// [`reset`](Self::reset) or a drop never resolves it.
+    pub fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<VarInt, ConnectionError>> + Send + 'static {
+        let shared = self.conn.shared.clone();
+        // Subscribe now, so the slot exists only while the handle can write.
+        // The connection task drops it when the handle finishes, resets or
+        // drops.
+        let mut stop = (self.state == SendState::Open).then(|| shared.watch_stop(self.id));
+        async move {
+            let mut closed = shared.closed.subscribe();
+            loop {
+                if let Some(code) = stop.as_mut().and_then(|stop| *stop.borrow_and_update()) {
+                    return Ok(code);
+                }
+                if let Some(error) = closed.borrow_and_update().clone() {
+                    return Err(error);
+                }
+                // `shared` keeps the close sender alive, so its wait can't
+                // fail. A failed stop wait means the slot dropped, and only
+                // the close can resolve this future from then on.
+                zakura_rt::select! {
+                    biased;
+                    changed = async {
+                        match stop.as_mut() {
+                            Some(stop) => stop.changed().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if changed.is_err() {
+                            stop = None;
+                        }
+                    }
+                    _ = closed.changed() => {}
+                }
+            }
+        }
+    }
+
+    /// Finishes the stream after the data already written.
+    pub fn finish(&mut self) -> Result<(), ClosedStream> {
+        if self.state != SendState::Open {
+            return Err(ClosedStream::new());
+        }
+        self.state = SendState::Finished;
+        let _ = self.conn.send(ConnCmd::Finish { id: self.id });
+        Ok(())
+    }
+
+    /// Sets the stream's send priority. quinn-proto sends higher priorities
+    /// first; streams of equal priority share the connection round-robin.
+    ///
+    /// Ordered with this stream's writes: data written after the call gets
+    /// the new priority.
+    pub fn set_priority(&mut self, priority: i32) -> Result<(), ClosedStream> {
+        if self.state != SendState::Open {
+            return Err(ClosedStream::new());
+        }
+        self.conn
+            .send(ConnCmd::SetPriority {
+                id: self.id,
+                priority,
+            })
+            .map_err(|_| ClosedStream::new())
+    }
+
+    /// Abandons the stream with an application error code.
+    pub fn reset(&mut self, code: VarInt) -> Result<(), ClosedStream> {
+        if self.state == SendState::Reset {
+            return Err(ClosedStream::new());
+        }
+        self.state = SendState::Reset;
+        self.pending.clear();
+        self.pending_bytes = 0;
+        let _ = self.conn.send(ConnCmd::Reset { id: self.id, code });
+        Ok(())
+    }
+}
+
+fn lost(conn: &ConnRef) -> WriteError {
+    WriteError::ConnectionLost(conn.shared.close_reason())
+}
+
+impl Drop for SendStream {
+    fn drop(&mut self) {
+        if self.state == SendState::Open {
+            let _ = self.conn.send(ConnCmd::DropSend { id: self.id });
+        }
+    }
+}
+
+/// The receiving half of a bidirectional stream.
+///
+/// Dropping it before the stream ends stops the stream with code 0.
+#[derive(Debug)]
+pub struct RecvStream {
+    conn: ConnRef,
+    id: StreamId,
+    buffered: VecDeque<Bytes>,
+    finished: bool,
+    stopped: bool,
+    pending: Option<oneshot::Receiver<ReadReply>>,
+    /// Credit held since the last command, which the next one carries.
+    unsent_hold: u64,
+}
+
+impl RecvStream {
+    pub(crate) fn new(conn: ConnRef, id: StreamId) -> Self {
+        Self {
+            conn,
+            id,
+            buffered: VecDeque::new(),
+            finished: false,
+            stopped: false,
+            pending: None,
+            unsent_hold: 0,
+        }
+    }
+
+    /// Keeps `bytes` of the connection's receive window from the peer until
+    /// the returned hold drops (API-10).
+    ///
+    /// The connection takes the bytes out of its window before this stream's
+    /// next read, so the bytes that read takes return no credit while the
+    /// caller holds them. Bytes this handle already buffered returned their
+    /// credit when it read them, so the hold covers as many later bytes
+    /// instead. Dropping the hold, from any task, grants the credit back.
+    pub fn hold_credit(&mut self, bytes: u64) -> CreditHold {
+        self.unsent_hold = self.unsent_hold.saturating_add(bytes);
+        CreditHold {
+            shared: self.conn.shared.clone(),
+            bytes,
+        }
+    }
+
+    /// The QUIC stream ID, which both endpoints of the stream share.
+    pub fn id(&self) -> u64 {
+        u64::from(self.id)
+    }
+
+    /// Waits until data is buffered; returns `false` at the end of the stream.
+    ///
+    /// A new request asks the connection task for at most `max` bytes, so
+    /// the rest stays in quinn-proto and keeps counting against the peer's
+    /// flow-control credit (DRV-4).
+    async fn fill(&mut self, max: usize) -> Result<bool, ReadError> {
+        if !self.buffered.is_empty() {
+            return Ok(true);
+        }
+        if self.finished {
+            return Ok(false);
+        }
+        if self.stopped {
+            return Err(ReadError::ClosedStream);
+        }
+        let pending = match self.pending.as_mut() {
+            Some(pending) => pending,
+            None => {
+                let (reply, result) = oneshot::channel();
+                self.conn
+                    .send(ConnCmd::Read {
+                        id: self.id,
+                        max,
+                        hold: mem::take(&mut self.unsent_hold),
+                        reply,
+                    })
+                    .map_err(ReadError::ConnectionLost)?;
+                self.pending.insert(result)
+            }
+        };
+        let result = pending.await;
+        self.pending = None;
+        match result {
+            Ok(Ok(Some(chunks))) => {
+                self.buffered
+                    .extend(chunks.into_iter().filter(|chunk| !chunk.is_empty()));
+                Ok(!self.buffered.is_empty() || !self.finished)
+            }
+            Ok(Ok(None)) => {
+                self.finished = true;
+                Ok(false)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(ReadError::ConnectionLost(self.conn.shared.close_reason())),
+        }
+    }
+
+    /// Reads into `buf`. Returns the byte count, or `None` at the end of the
+    /// stream.
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ReadError> {
+        if buf.is_empty() {
+            return Ok(Some(0));
+        }
+        loop {
+            // A little read-ahead keeps a small frame to one request, while
+            // a header read still leaves a large body in quinn-proto.
+            if !self.fill(buf.len().max(READ_AHEAD_BYTES)).await? {
+                return Ok(None);
+            }
+            if let Some(read) = self.copy_out(buf) {
+                return Ok(Some(read));
+            }
+        }
+    }
+
+    /// Reads the next chunk of at most `max` bytes, or `None` at the end of
+    /// the stream. A new request takes at most `max` bytes out of quinn-proto,
+    /// so unread data keeps counting against the peer's flow control.
+    pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, ReadError> {
+        loop {
+            if !self.fill(max).await? {
+                return Ok(None);
+            }
+            if let Some(front) = self.buffered.front_mut() {
+                let chunk = front.split_to(front.len().min(max.max(1)));
+                if front.is_empty() {
+                    self.buffered.pop_front();
+                }
+                return Ok(Some(chunk));
+            }
+        }
+    }
+
+    fn copy_out(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let mut read = 0;
+        while read < buf.len() {
+            let Some(front) = self.buffered.front_mut() else {
+                break;
+            };
+            let take = front.len().min(buf.len() - read);
+            buf[read..read + take].copy_from_slice(&front[..take]);
+            front.advance(take);
+            read += take;
+            if front.is_empty() {
+                self.buffered.pop_front();
+            }
+        }
+        (read > 0).then_some(read)
+    }
+
+    /// Fills `buf` exactly.
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadExactError> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read(&mut buf[filled..]).await? {
+                Some(read) => filled += read,
+                None => return Err(ReadExactError::FinishedEarly(filled)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads to the end of the stream, refusing more than `size_limit` bytes.
+    pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
+        let mut out = Vec::new();
+        while self.fill(usize::MAX).await? {
+            while let Some(chunk) = self.buffered.pop_front() {
+                if out.len().saturating_add(chunk.len()) > size_limit {
+                    return Err(ReadToEndError::TooLong);
+                }
+                out.extend_from_slice(&chunk);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Tells the peer to stop sending, with an application error code.
+    pub fn stop(&mut self, code: VarInt) -> Result<(), ClosedStream> {
+        if self.stopped || self.finished {
+            return Err(ClosedStream::new());
+        }
+        self.stopped = true;
+        self.buffered.clear();
+        self.pending = None;
+        let _ = self.conn.send(ConnCmd::Stop {
+            id: self.id,
+            code,
+            hold: mem::take(&mut self.unsent_hold),
+        });
+        Ok(())
+    }
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        // An unsent hold still goes out, so its release can't grow the window.
+        if (!self.stopped && !self.finished) || self.unsent_hold > 0 {
+            let _ = self.conn.send(ConnCmd::DropRecv {
+                id: self.id,
+                hold: self.unsent_hold,
+            });
+        }
+    }
+}
+
+/// Receive credit a reader keeps from its peer (API-10).
+///
+/// [`RecvStream::hold_credit`] creates it. Dropping it grants the credit back
+/// to the peer. It doesn't keep the connection open.
+#[derive(Debug)]
+#[must_use = "dropping a credit hold grants its bytes back to the peer"]
+pub struct CreditHold {
+    shared: Arc<ConnShared>,
+    bytes: u64,
+}
+
+impl CreditHold {
+    /// The bytes this hold keeps.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for CreditHold {
+    fn drop(&mut self) {
+        self.shared.release_credit(self.bytes);
+    }
+}

@@ -11,7 +11,7 @@ use crate::{
     constants::MIN_TRANSPARENT_COINBASE_MATURITY,
     service::{
         finalized_state::ZakuraDb,
-        non_finalized_state::{CreatedUtxos, SpendingTransactionId},
+        non_finalized_state::{CreatedUtxos, SharedMap, SpendingTransactionId},
     },
     SemanticallyVerifiedBlock,
     ValidateContextError::{
@@ -45,13 +45,16 @@ use crate::{
 pub fn transparent_spend(
     semantically_verified: &SemanticallyVerifiedBlock,
     non_finalized_chain_created_utxos: &CreatedUtxos,
-    non_finalized_chain_spent_utxos: &HashMap<transparent::OutPoint, SpendingTransactionId>,
+    non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZakuraDb,
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
     let mut block_spends = HashMap::new();
 
-    for (spend_tx_index_in_block, transaction) in
-        semantically_verified.block.transactions.iter().enumerate()
+    for (spend_tx_index_in_block, transaction) in semantically_verified
+        .block
+        .view()
+        .transactions()
+        .enumerate()
     {
         // Coinbase inputs represent new coins,
         // so there are no UTXOs to mark as spent.
@@ -135,7 +138,7 @@ fn transparent_spend_chain_order(
     spend_tx_index_in_block: usize,
     block_new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     non_finalized_chain_created_utxos: &CreatedUtxos,
-    non_finalized_chain_spent_utxos: &HashMap<transparent::OutPoint, SpendingTransactionId>,
+    non_finalized_chain_spent_utxos: &SharedMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZakuraDb,
 ) -> Result<transparent::OrderedUtxo, ValidateContextError> {
     if let Some(output) = block_new_outputs.get(&spend) {
@@ -242,8 +245,11 @@ pub fn remaining_transaction_value(
     semantically_verified: &SemanticallyVerifiedBlock,
     utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) -> Result<(), ValidateContextError> {
-    for (tx_index_in_block, transaction) in
-        semantically_verified.block.transactions.iter().enumerate()
+    for (tx_index_in_block, transaction) in semantically_verified
+        .block
+        .view()
+        .transactions()
+        .enumerate()
     {
         if transaction.is_coinbase() {
             continue;

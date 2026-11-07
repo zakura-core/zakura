@@ -117,6 +117,10 @@ ALERT_DIAGNOSTIC_METRICS = (
     "sync_header_work_oldest_missing_height",
     "sync_header_work_in_flight_count",
     "sync_block_applying",
+    "sync_zakura_apply_operations",
+    "sync_zakura_apply_in_flight",
+    "sync_zakura_apply_oldest_seconds",
+    "sync_zakura_apply_phase",
     "sync_block_best_header_tip_height",
     "sync_block_verified_tip_height",
     "sync_block_fill_stop",
@@ -417,6 +421,9 @@ WANTED_METRICS = frozenset((
     "sync_header_chain_frontier_finalized_height",
     "sync_header_chain_frontier_divergence",
     "sync_header_chain_reorg_depth",
+    "sync_zakura_apply_operations",
+    "sync_zakura_apply_in_flight",
+    "sync_zakura_apply_oldest_seconds",
     "sync_zakura_apply_phase",
     "sync_zakura_apply_epoch",
     "sync_zakura_legacy_fallback_active",
@@ -915,6 +922,10 @@ if rpc_url:
                 header = rpc_call("getblockheader", [best_hash, True])
                 if isinstance(header, dict):
                     out["previous_hash"] = header.get("previousblockhash") or ""
+                    # Bind the target to the accepted tip, rather than a header
+                    # observed at another height while the chain advances.
+                    if header.get("hash") == best_hash and header.get("height") == tip_height:
+                        out["difficulty_bits"] = header.get("bits")
             except Exception as error:
                 out["previous_hash_error"] = str(error)
 
@@ -1215,6 +1226,15 @@ def monitoring_snapshot(value, node_names):
                 safe[field] = row[field]
         for field in ("block_hash", "previous_hash"):
             if block_hash(row.get(field)):
+                safe[field] = row[field]
+        bits = row.get("difficulty_bits")
+        if isinstance(bits, str) and re.fullmatch(r"[0-9a-fA-F]{8}", bits):
+            safe["difficulty_bits"] = bits
+        safe["rpc_ok"] = row.get("rpc_ok") is True
+        if row.get("rpc_chain") in {"main", "test", "regtest"}:
+            safe["rpc_chain"] = row["rpc_chain"]
+        for field in ("last_seen_at", "last_advanced_at"):
+            if number(row.get(field)):
                 safe[field] = row[field]
         ancestors = row.get("ancestor_hashes")
         if isinstance(ancestors, dict):
@@ -1678,6 +1698,7 @@ class ClusterCollector:
             "commit": probe.get("commit") or "",
             "block_hash": block_hash,
             "previous_hash": previous_block_hash,
+            "difficulty_bits": probe.get("difficulty_bits"),
             "ancestor_hashes": ancestor_hashes,
             "node_id": node.node_id or probe.get("node_id") or "",
             "version": probe.get("version") or "",
@@ -4296,6 +4317,8 @@ setInterval(renderFreshness, 1000);
 
 
 COLLECTOR: ClusterCollector | None = None
+ACTIVATION_FEED = None
+TRUSTED_PROXY_IPS = set()
 RATE_LIMITER = RateLimiter()
 # The page and its data both change every poll, and the HTML carries no
 # fingerprint. Without this a browser heuristically caches the page and keeps
@@ -4408,7 +4431,7 @@ class Handler(BaseHTTPRequestHandler):
             return peer
 
         forwarded_for = self.headers.get("X-Forwarded-For")
-        if peer_address.is_loopback and forwarded_for:
+        if (peer_address.is_loopback or peer_address in TRUSTED_PROXY_IPS) and forwarded_for:
             candidate = forwarded_for.rsplit(",", 1)[-1].strip()
             try:
                 return str(ipaddress.ip_address(candidate))
@@ -4466,6 +4489,14 @@ class Handler(BaseHTTPRequestHandler):
                 )
             status, payload = COLLECTOR.ironwood_status()
             return self.send_json(status, payload, headers)
+        if parsed.path == "/v1/dashboard" and ACTIVATION_FEED is not None:
+            headers = self.public_headers()
+            if not RATE_LIMITER.allow(self.rate_limit_client()):
+                headers["Retry-After"] = str(int(PUBLIC_RATE_WINDOW))
+                return self.send_json(429, {"schemaVersion": 1, "error": "Request rate limit exceeded"}, headers)
+            code, payload = ACTIVATION_FEED.response()
+            headers["Cache-Control"] = "public, max-age=10" if code == 200 else "no-store"
+            return self.send_json(code, payload, headers)
         if parsed.path == "/v1/status" and COLLECTOR.nu7 is not None:
             headers = self.public_headers()
             if not RATE_LIMITER.allow(self.rate_limit_client()):
@@ -4506,6 +4537,8 @@ class Handler(BaseHTTPRequestHandler):
         public_paths = {"/ironwood-status.json"}
         if COLLECTOR is not None and COLLECTOR.nu7 is not None:
             public_paths.add("/v1/status")
+        if ACTIVATION_FEED is not None:
+            public_paths.add("/v1/dashboard")
         if parsed.path not in public_paths:
             return self.send_body(
                 404,
@@ -4522,7 +4555,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    global COLLECTOR
+    global COLLECTOR, ACTIVATION_FEED, TRUSTED_PROXY_IPS
 
     parser = argparse.ArgumentParser(description="Serve a Zakura fleet status dashboard.")
     parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
@@ -4574,7 +4607,12 @@ def main() -> None:
         default=None,
         help="seconds between metric scrapes; omit to adapt to the last scrape's cost",
     )
+    parser.add_argument("--nu7-activation-config", default="",
+                        help="approved profile/selector JSON; serves coherent /v1/dashboard")
+    parser.add_argument("--trusted-proxy", action="append", default=[], type=ipaddress.ip_address,
+                        help="explicit reverse-proxy IP allowed to supply X-Forwarded-For; repeat per IP")
     args = parser.parse_args()
+    TRUSTED_PROXY_IPS = set(args.trusted_proxy)
 
     nodes = load_nodes(Path(args.config))
     state_file = Path(args.state_file) if args.state_file else None
@@ -4593,6 +4631,10 @@ def main() -> None:
         nu7=nu7,
     )
     threading.Thread(target=COLLECTOR.loop, daemon=True).start()
+    if args.nu7_activation_config:
+        from nu7_activation import ActivationFeed
+        ACTIVATION_FEED = ActivationFeed(args.nu7_activation_config, nu7)
+        threading.Thread(target=ACTIVATION_FEED.loop, daemon=True).start()
 
     print(
         f"cluster status dashboard bound on {args.host}:{args.port}; "

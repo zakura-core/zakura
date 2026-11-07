@@ -106,5 +106,8 @@ pub mod activation_heights {
         pub const NU6_2: Height = Height(3_364_600);
         /// The block height at which `NU6.3` activates on Mainnet.
         pub const NU6_3: Height = Height(3_428_143);
+        /// The block height at which [`NU7`](crate::parameters::NetworkUpgrade::Nu7)
+        /// activates on Mainnet, assigned by [ZIP 259](https://zips.z.cash/zip-0259).
+        pub(in crate::parameters) const NU7: Height = Height(3_543_405);
     }
 }

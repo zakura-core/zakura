@@ -1,0 +1,41 @@
+{
+  "armed": false,
+  "protocolReferenceFile": "/opt/zakura-nu7-status/nu7-mainnet-protocol-reference.json",
+  "identityCheckpoint": {
+    "height": 3540000,
+    "hash": "00000000000a0c35af066366975fce325ee3d1c030aabde80a40279642a0ac33"
+  },
+  "manifest": {
+    "schemaVersion": 1,
+    "nodeRevision": "d7b2e2cc4379e80ba66005f6e8aac33c75d06514",
+    "network": {
+      "name": "Mainnet",
+      "magic": "24e92764",
+      "branchId": "77190ad9",
+      "activationHeight": 3543405
+    },
+    "config": "[network]\nnetwork = \"Mainnet\"\nlisten_addr = \"0.0.0.0:8233\"\n\n[rpc]\nlisten_addr = \"127.0.0.1:8232\"\n\n[state]\ncache_dir = \"./nu7-mainnet-state\"\nstorage_mode = \"pruned\"\n",
+    "configSha256": "dd29ea6ef5b4c664e9d4d94916abb89efa5b54884204ad1087d46bfb32677475"
+  },
+  "nodes": [
+    {
+      "name": "us-0",
+      "expectedRevision": "d7b2e2cc4379e80ba66005f6e8aac33c75d06514",
+      "rpcUrl": "http://104.131.184.123:8232/"
+    },
+    {
+      "name": "us-west-0",
+      "expectedRevision": "d7b2e2cc4379e80ba66005f6e8aac33c75d06514",
+      "rpcUrl": "http://143.244.184.176:8232/"
+    },
+    {
+      "name": "canada-0",
+      "expectedRevision": "7709add81642c63c0665f7817c12bb64e0288a46",
+      "rpcUrl": "http://159.203.38.10:8232/"
+    }
+  ],
+  "capabilities": {
+    "faucet": null,
+    "snapshot": null
+  }
+}

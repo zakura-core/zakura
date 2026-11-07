@@ -1,17 +1,17 @@
 //! Loading and checking correctness of Groth16 Sprout parameters.
 
+use std::sync::LazyLock;
+
 use bellman::groth16::{prepare_verifying_key, PreparedVerifyingKey, VerifyingKey};
 use bls12_381::Bls12;
 use getset::Getters;
 
-lazy_static::lazy_static! {
-    /// Spend parameters for the Sprout circuit.
-    ///
-    /// Used to verify Sprout shielded data in transactions.
-    ///
-    /// Note that adding value to the Sprout pool was disabled by the Canopy network upgrade.
-    pub static ref SPROUT: SproutParams = Default::default();
-}
+/// Spend parameters for the Sprout circuit.
+///
+/// Used to verify Sprout shielded data in transactions.
+///
+/// Note that adding value to the Sprout pool was disabled by the Canopy network upgrade.
+pub static SPROUT: LazyLock<SproutParams> = LazyLock::new(Default::default);
 
 /// Spend parameters for the Sprout circuit.
 ///

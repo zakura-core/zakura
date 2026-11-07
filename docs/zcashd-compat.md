@@ -71,9 +71,9 @@ The installer:
 3. downloads SHA256-pinned release binaries (or pulls pinned Docker images);
 4. bootstraps a minimal `zcash.conf` if none exists;
 5. for Docker modes, bind-mounts both the Zakura state cache and the
-   persistent iroh identity directory (`~/.zakura` by default, override with
+   persistent Zakura identity directory (`~/.zakura` by default, override with
    `--zakura-identity-dir`) so NodeId secrets survive `--rm` containers,
-   and runs Zakura with `--network host` so the native QUIC/iroh endpoint
+   and runs Zakura with `--network host` so the native QUIC endpoint
    (`8234/udp`) and legacy Zcash TCP P2P listener bind on the host's real
    addresses (bridge NAT would advertise an unreachable `172.17.0.x`);
 6. prints ready-to-copy start commands for the mode you chose.
@@ -91,12 +91,15 @@ See `install-zakura.sh --help` for the full list, including `--dry-run`.
 
 Use the sidecar `zcashd` build from
 [valargroup/zcashd](https://github.com/valargroup/zcashd). Zakura's embedded
-download pins the [v1.2.0 release](https://github.com/valargroup/zcashd/releases/tag/v1.2.0)'s
+download pins the [v1.3.1 release](https://github.com/valargroup/zcashd/releases/tag/v1.3.1)'s
 standalone `zcashd` executable by SHA256. The
 split-container mode uses the
-[zakuracore/zcashd v1.2.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
-Sidecars before v1.2.0 do not support NU7, so they stop following the chain
-when NU7 activates. The build differs from stock `zcash/zcash` in three ways:
+[zakuracore/zcashd v1.3.1 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+This release schedules Mainnet NU7 at height 3,543,405, matching
+Zakura. The v1.2.0 sidecar supports NU7 on Testnet but leaves Mainnet NU7
+unscheduled; sidecars before v1.2.0 do not support NU7 on either network.
+Upgrade before activation to keep following Mainnet. The build differs from
+stock `zcash/zcash` in three ways:
 
 1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
    exactly one `-connect=<zakura-address>` peer is configured. It never opens a

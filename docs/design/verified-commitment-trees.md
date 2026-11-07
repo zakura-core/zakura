@@ -411,14 +411,32 @@ a successful delivery as `Authenticated`. The sweep rejects an attributable deli
 disputes both deliveries when the boundary cannot identify which delivery is invalid. Either
 failure starts metadata repair immediately.
 
+Before a blocked commit waits for peer input, the writer exhausts local recovery at that
+commit's boundary. New failure evidence triggers an immediate retry because rejection can expose
+another selected delivery. When that retry makes no progress, the writer searches retained pairs
+at `H` and `H+1` against the committed history tree. The delivery cap bounds the complete search.
+Recovery does not use the idle sweep's elapsed-time budget or copy its selected projection.
+Authentication retries the commit only when the selected delivery or its authentication changes.
+The committer still verifies the delivery before committing the body.
+
+When local recovery is exhausted, both missing-root and missing-successor stalls wait on
+header-chain control messages. The writer processes resource-stall recovery and shutdown while
+waiting. The diagnostic deadline reports a stall without polling the blocked commit.
+
 Three properties keep the committer authoritative:
 
 - **The committer still verifies every committed delivery.** The sweep adds an early check.
   It does not move the trust boundary.
 - **Failure attribution matches the committer.** The header-chain writer disputes both deliveries
   when the boundary cannot identify the invalid delivery. A replacement can later authenticate the
-  honest delivery and reject the invalid delivery. A failure on a delivery's pre-activation fields
-  rejects only that delivery.
+  honest delivery and reject the invalid delivery. Repair of that dispute requests both headers in
+  one range. Honest suppliers return the same payload for the honest header, so a repair of either
+  header alone could wait forever. State admits the range when it carries at least one new payload,
+  and it drops the repeated payload. Selection pairs the best row of each header, and a disputed
+  row cannot take a second dispute. After an ambiguous failure, the sweep therefore verifies every
+  other delivery pair at that boundary that has not failed together, and it authenticates the
+  first pair that passes. A failure on a delivery's pre-activation fields rejects only that
+  delivery.
 - **Authentication pins selection.** `select_vct_auxiliary_delivery` prefers an authenticated
   delivery. Authentication state cannot return to `Unauthenticated`. A later delivery cannot
   displace roots that the running MMR already folded.

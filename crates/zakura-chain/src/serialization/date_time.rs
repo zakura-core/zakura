@@ -364,7 +364,10 @@ impl FromStr for Duration32 {
 }
 
 impl ZcashSerialize for DateTime32 {
-    fn zcash_serialize<W: std::io::Write>(&self, mut writer: W) -> Result<(), std::io::Error> {
+    fn zcash_serialize<W: std::io::Write + ?Sized>(
+        &self,
+        writer: &mut W,
+    ) -> Result<(), std::io::Error> {
         writer.write_u32::<LittleEndian>(self.timestamp)
     }
 }

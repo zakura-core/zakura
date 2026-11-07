@@ -81,7 +81,7 @@ impl LongPollInput {
 
         // The mempool returns unordered transactions, we need to sort them here so
         // that the longpollid doesn't change unexpectedly.
-        tx_mined_ids.sort();
+        tx_mined_ids.sort_unstable();
 
         LongPollInput {
             tip_height,
@@ -123,18 +123,7 @@ impl LongPollInput {
 ///
 /// `zcashd` IDs are currently 69 hex/decimal digits long.
 /// IDs use 46 hex/decimal digits, or 62 after the first template withdrawal.
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    CopyGetters,
-    new,
-    schemars::JsonSchema,
-)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CopyGetters, new)]
 #[serde(try_from = "String", into = "String")]
 pub struct LongPollId {
     /// Template withdrawal generation. Zero preserves the legacy wire format.
@@ -230,9 +219,13 @@ impl LongPollId {
     /// Returns whether the IDs share the parent and time limit, ignoring withdrawals.
     /// Internal miners use exact work IDs to decide which withdrawn work to cancel.
     pub fn same_work_context(&self, old_long_poll_id: &LongPollId) -> bool {
+        self.same_tip(old_long_poll_id) && self.max_timestamp == old_long_poll_id.max_timestamp
+    }
+
+    /// Returns whether the IDs were generated on the same chain tip.
+    pub fn same_tip(&self, old_long_poll_id: &LongPollId) -> bool {
         self.tip_height == old_long_poll_id.tip_height
             && self.tip_hash_checksum == old_long_poll_id.tip_hash_checksum
-            && self.max_timestamp == old_long_poll_id.max_timestamp
     }
 }
 

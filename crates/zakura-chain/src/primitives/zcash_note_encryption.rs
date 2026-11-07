@@ -9,6 +9,10 @@ use crate::{
 
 /// Returns true if all Sapling, Orchard, or Ironwood outputs, if any, decrypt
 /// successfully with an all-zeroes outgoing viewing key.
+///
+/// This does not validate Sapling value commitments: the conversion through
+/// librustzcash keeps `cv` as bytes. The semantic verifier's
+/// `Transaction::sapling_point_encodings_are_valid` check rejects an invalid one.
 pub fn decrypts_successfully(tx: &Transaction, network: &Network, height: Height) -> bool {
     let nu = NetworkUpgrade::current(network, height);
 
@@ -93,7 +97,6 @@ mod tests {
         value::{NoteValue, ValueCommitment},
         Action, Address, Note,
     };
-    use rand_core::OsRng;
     use zcash_note_encryption::Domain;
 
     use crate::{
@@ -194,7 +197,7 @@ mod tests {
             .expect("test vector has a valid value commitment");
         let ovk = orchard::keys::OutgoingViewingKey::from([0; 32]);
         let encryptor = IronwoodNoteEncryption::new(Some(ovk), note, v.memo);
-        let mut rng = OsRng;
+        let mut rng = rand_10::rng();
 
         Action::from_parts(
             Nullifier::from_bytes(&v.rho).expect("test vector has a valid nullifier"),
@@ -266,7 +269,7 @@ mod tests {
             }],
             outputs: vec![],
             sapling_shielded_data: None,
-            orchard_shielded_data,
+            orchard_shielded_data: orchard_shielded_data.map(Box::new),
             ironwood_shielded_data,
         }
     }

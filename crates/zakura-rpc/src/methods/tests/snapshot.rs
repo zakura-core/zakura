@@ -5,6 +5,7 @@
 //! cargo insta test --review --release -p zakura-rpc --lib -- test_rpc_response_data
 //! ```
 
+use crate::tests::test_rpc::TestRpcImpl;
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -12,11 +13,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::server::jsonrpc::RpcResult as Result;
 use futures::FutureExt;
 use hex::FromHex;
 use insta::Settings;
-use jsonrpsee::core::RpcResult as Result;
-use tower::{buffer::Buffer, util::BoxService, Service};
+use tower::{buffer::Buffer, Service};
 
 use zakura_chain::{
     block::{Block, Hash},
@@ -142,7 +143,7 @@ async fn test_z_get_treestate() {
     let (state, read_state, tip, _) =
         zakura_state::populated_state(blocks.clone(), &custom_testnet).await;
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         custom_testnet,
         Default::default(),
         false,
@@ -253,7 +254,7 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         Default::default(),
         false,
@@ -642,7 +643,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
     let mut read_state = MockService::build().for_unit_tests();
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         Default::default(),
         false,
@@ -1014,7 +1015,10 @@ pub async fn test_mining_rpcs<State, ReadState>(
     >,
     state: State,
     read_state: ReadState,
-    block_verifier_router: Buffer<BoxService<Request, Hash, RouterError>, Request>,
+    block_verifier_router: Buffer<
+        Request,
+        futures::future::BoxFuture<'static, std::result::Result<Hash, RouterError>>,
+    >,
     settings: Settings,
 ) where
     State: Service<
@@ -1074,6 +1078,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     mock_tip_sender.send_best_tip_height(fake_tip_height);
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let mock_address_book = MockAddressBookPeers::new(vec![MetaAddr::new_connected(
         SocketAddr::new(
@@ -1088,7 +1093,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
 
-    let (rpc, _) = RpcImpl::new(
+    let (rpc, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         mining_conf.clone(),
         false,
@@ -1247,7 +1252,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     // send tip hash and time needed for getblocktemplate rpc
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
 
-    let (rpc_mock_state, _) = RpcImpl::new(
+    let (rpc_mock_state, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         mining_conf.clone(),
         false,
@@ -1308,9 +1313,9 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .parse()
         .expect("unexpected invalid LongPollId");
 
-    // Fake the ChainInfo and FullTransaction responses
+    // Fake the ChainInfo response. This ID names another tip, so the node answers with
+    // coinbase-only work on the current tip without asking the mempool.
     let mock_read_state_request_handler = make_mock_read_state_request_handler();
-    let mock_mempool_request_handler = make_mock_mempool_request_handler();
 
     let get_block_template_fut = rpc_mock_state.get_block_template(
         GetBlockTemplateParameters {
@@ -1320,11 +1325,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .into(),
     );
 
-    let (get_block_template, ..) = tokio::join!(
-        get_block_template_fut,
-        mock_mempool_request_handler,
-        mock_read_state_request_handler,
-    );
+    let (get_block_template, ..) =
+        tokio::join!(get_block_template_fut, mock_read_state_request_handler,);
 
     let GetBlockTemplateResponse::TemplateMode(get_block_template) =
         get_block_template.expect("unexpected error in getblocktemplate RPC call")
@@ -1365,7 +1367,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     // the following snapshots use a mock read_state and block_verifier_router
 
     let mut mock_block_verifier_router = MockService::build().for_unit_tests();
-    let (rpc_mock_state_verifier, _) = RpcImpl::new(
+    let (rpc_mock_state_verifier, _) = TestRpcImpl::new_for_tests(
         network.clone(),
         mining_conf,
         false,

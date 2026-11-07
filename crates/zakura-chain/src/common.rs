@@ -7,12 +7,12 @@ use std::{
     path::PathBuf,
 };
 
-use tempfile::PersistError;
-
 mod directories;
+mod temp;
 
 use directories::cache_dir;
 pub use directories::{home_dir, preference_dir};
+pub use temp::{TempDir, TempFile};
 
 /// Returns Zakura's default cache directory path.
 pub fn default_cache_dir() -> PathBuf {
@@ -27,7 +27,8 @@ pub fn default_cache_dir() -> PathBuf {
 /// panics, crashes, or exits while the file is being written, or if multiple Zebra instances
 /// try to read and write the same file.
 ///
-/// Returns the provided file path if successful.
+/// Returns the provided file path if successful. The outer error means the data
+/// could not be written; the inner error means it could not be moved to `file_path`.
 ///
 /// # Concurrency
 ///
@@ -37,10 +38,7 @@ pub fn default_cache_dir() -> PathBuf {
 /// # Panics
 ///
 /// If the provided `file_path` is a directory path.
-pub fn atomic_write(
-    file_path: PathBuf,
-    data: &[u8],
-) -> io::Result<Result<PathBuf, PersistError<fs::File>>> {
+pub fn atomic_write(file_path: PathBuf, data: &[u8]) -> io::Result<io::Result<PathBuf>> {
     // Get the file's parent directory, or use Zebra's default cache directory
     let file_dir = file_path
         .parent()
@@ -58,14 +56,13 @@ pub fn atomic_write(
             .file_name()
             .expect("file path must have a file name"),
     );
+    tmp_file_prefix.push(".");
 
     // Create the temporary file in the same directory as the permanent file,
     // so atomic filesystem operations are possible.
-    let mut tmp_file = tempfile::Builder::new()
-        .prefix(&tmp_file_prefix)
-        .tempfile_in(&file_dir)?;
+    let mut tmp_file = TempFile::new_in(&file_dir, &tmp_file_prefix)?;
 
-    tmp_file.write_all(data)?;
+    tmp_file.as_file_mut().write_all(data)?;
     tmp_file.as_file().sync_all()?;
 
     // Atomically write the temp file to `file_path`.

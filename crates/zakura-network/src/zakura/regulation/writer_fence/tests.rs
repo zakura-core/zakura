@@ -6,7 +6,7 @@ use std::time::Duration;
 use proptest::prelude::*;
 
 use super::*;
-use crate::zakura::framed_channel;
+use crate::zakura::{framed_channel, transport::worker_framed_channel};
 
 fn fence() -> (WriterFence, CancellationToken, CloseCause) {
     let connection = CancellationToken::new();
@@ -171,6 +171,106 @@ async fn a_fenced_send_writes_only_before_retirement() {
             exchange.end();
             assert!(fence.retire());
             assert!(!connection.is_cancelled());
+        }
+    }
+}
+
+/// A fenced request that fails to encode starts no exchange, so retiring its
+/// session leaves the connection up.
+#[tokio::test]
+async fn a_fenced_request_that_fails_to_encode_starts_nothing() {
+    for encodes in [false, true] {
+        let (fence, connection, cause) = fence();
+        let (send, mut output) = worker_framed_channel(1);
+        let exchange = fence.open().unwrap();
+        let frame = Frame {
+            message_type: 1,
+            flags: 0,
+            payload: vec![7],
+        };
+        send.send_fenced(frame, &exchange.writer()).await.unwrap();
+        let queued = output.recv().await.unwrap();
+        let result = queued
+            .encode_and_write_with(
+                |frame| {
+                    if encodes {
+                        Ok(frame)
+                    } else {
+                        Err("does not fit")
+                    }
+                },
+                |_| async { Ok(()) },
+            )
+            .await;
+        assert_eq!(result.is_ok(), encodes);
+        assert_eq!(fence.retire(), !encodes);
+        assert_eq!(connection.is_cancelled(), encodes);
+        if encodes {
+            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
+        }
+    }
+}
+
+/// A frame queued to follow a request goes out only after the request's
+/// first byte and before retirement, so retirement skips it whether the
+/// request was skipped or already ended. An ending that arrives before the
+/// request's first byte skips both.
+#[tokio::test]
+async fn a_following_frame_needs_its_request_started() {
+    let frame = || Frame {
+        message_type: 1,
+        flags: 0,
+        payload: vec![7],
+    };
+    // Retire before the request, retire after the request ended, never
+    // retire, or end the exchange before the request's first byte.
+    for case in 0..4 {
+        let (fence, connection, _) = fence();
+        let (send, mut output) = framed_channel(2);
+        let mut exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        send.send_fenced(frame(), &writer).await.unwrap();
+        send.send_following(frame(), &writer).await.unwrap();
+        if case == 0 {
+            assert!(fence.retire());
+        } else if case == 3 {
+            exchange.end();
+            assert_eq!(output.try_recv().ok(), None, "the request is skipped");
+        } else {
+            assert_eq!(output.recv().await, Some(frame()));
+            exchange.end();
+            if case == 1 {
+                assert!(fence.retire(), "an ended exchange leaves it reusable");
+            }
+        }
+        drop(send);
+        let follow_up = output.recv().await;
+        assert_eq!(follow_up.is_some(), case == 2, "case {case}");
+        assert!(!connection.is_cancelled());
+    }
+}
+
+/// A following frame's claim holds the fence until its write finishes, so
+/// retirement in between closes the connection, even after the request's
+/// exchange ended. A finished write leaves the connection reusable.
+#[test]
+fn retirement_during_a_following_write_closes_the_connection() {
+    for written in [false, true] {
+        let (fence, connection, cause) = fence();
+        let mut exchange = fence.open().unwrap();
+        let writer = exchange.writer();
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        exchange.end();
+        let follow = FollowingWrite(writer);
+        assert!(follow.try_start());
+        if written {
+            follow.written();
+        }
+        assert_eq!(fence.retire(), written);
+        assert_eq!(connection.is_cancelled(), !written);
+        if !written {
+            assert_eq!(cause.get_or("unset"), UNFINISHED_EXCHANGE);
         }
     }
 }

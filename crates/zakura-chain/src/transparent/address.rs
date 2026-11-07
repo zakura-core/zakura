@@ -192,7 +192,7 @@ impl std::str::FromStr for Address {
 }
 
 impl ZcashSerialize for Address {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         match self {
             Address::PayToScriptHash {
                 network_kind,
@@ -407,7 +407,6 @@ mod tests {
         /// The resulting hash in both of these cases is always exactly 20
         /// bytes.
         /// <https://en.bitcoin.it/Base58Check_encoding#Encoding_a_Bitcoin_address>
-        #[allow(dead_code)]
         fn hash_payload(bytes: &[u8]) -> [u8; 20] {
             let sha_hash = Sha256::digest(bytes);
             let ripe_hash = Ripemd160::digest(sha_hash);

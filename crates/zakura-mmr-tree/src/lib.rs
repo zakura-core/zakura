@@ -71,12 +71,6 @@ pub enum EntryKind {
 }
 
 impl Error {
-    /// Entry expected to be a node (specifying for which link this is not
-    /// true).
-    pub fn link_node_expected(link: EntryLink) -> Self {
-        Self::ExpectedNode(Some(link))
-    }
-
     /// Some entry is expected to be node
     pub fn node_expected() -> Self {
         Self::ExpectedNode(None)

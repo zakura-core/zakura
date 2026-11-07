@@ -21,6 +21,7 @@ use zakura_chain::block::Height;
 
 use crate::{
     constants,
+    peer::block_gossip::BlockAdvert,
     peer::{
         error::SharedPeerError, CancelHeartbeatTask, Client, ClientRequest, ConnectedAddr,
         ConnectionInfo, ErrorSlot,
@@ -34,6 +35,8 @@ use crate::{
 };
 
 #[cfg(test)]
+pub(crate) mod connected;
+#[cfg(test)]
 mod vectors;
 
 /// The maximum time a mocked peer connection should be alive during a test.
@@ -42,6 +45,7 @@ const MAX_PEER_CONNECTION_TIME: Duration = Duration::from_secs(10);
 /// A harness with mocked channels for testing a [`Client`] instance.
 pub struct ClientTestHarness {
     client_request_receiver: Option<mpsc::Receiver<ClientRequest>>,
+    block_advert_receiver: tokio::sync::mpsc::Receiver<BlockAdvert>,
     shutdown_receiver: Option<oneshot::Receiver<CancelHeartbeatTask>>,
     #[allow(dead_code)]
     inv_receiver: Option<broadcast::Receiver<InventoryChange>>,
@@ -116,6 +120,19 @@ impl ClientTestHarness {
         self.client_request_receiver
             .take()
             .expect("request receiver endpoint has already been dropped");
+    }
+
+    /// Waits for the next queued block advert.
+    pub(crate) async fn receive_block_advert(&mut self) -> BlockAdvert {
+        self.block_advert_receiver
+            .recv()
+            .await
+            .expect("the connection remains open")
+    }
+
+    /// Returns the next block advert the [`Client`] queued, if any.
+    pub(crate) fn try_to_receive_block_advert(&mut self) -> Option<BlockAdvert> {
+        self.block_advert_receiver.try_recv().ok()
     }
 
     /// Tries to receive a [`ClientRequest`] sent by the [`Client`] instance.
@@ -272,6 +289,8 @@ where
     pub fn finish(self) -> (Client, ClientTestHarness) {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (client_request_sender, client_request_receiver) = mpsc::channel(1);
+        let (block_advert_sender, block_advert_receiver) =
+            tokio::sync::mpsc::channel(crate::peer::block_gossip::BLOCK_ADVERT_QUEUE);
         let (inv_sender, inv_receiver) = broadcast::channel(5);
 
         let error_slot = ErrorSlot::default();
@@ -313,10 +332,12 @@ where
 
         let client = Client {
             block_uploads: Default::default(),
+            request_slot: Default::default(),
             peer_registry_updater: None,
             connection_info,
             shutdown_tx: Some(shutdown_sender),
             server_tx: client_request_sender,
+            block_advert_tx: block_advert_sender,
             inv_collector: inv_sender,
             error_slot: error_slot.clone(),
             connection_task,
@@ -325,6 +346,7 @@ where
 
         let harness = ClientTestHarness {
             client_request_receiver: Some(client_request_receiver),
+            block_advert_receiver,
             shutdown_receiver: Some(shutdown_receiver),
             inv_receiver: Some(inv_receiver),
             error_slot,

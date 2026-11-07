@@ -9,10 +9,14 @@
 //!
 //! The adapter, [`StreamConformance`], only encodes a valid message for a row
 //! and names the exchange a message belongs to. For a subscription row, it
-//! also encodes and reads updates and encodes pages. The layout's tables
-//! supply the rest: which rows are requests, which responses end an exchange,
-//! `max_in_flight`, credit windows, frame caps, queue depths, and write
-//! policies.
+//! also encodes and reads updates and encodes and reads pages. The layout's
+//! tables supply the rest: which rows are requests or subscriptions, which
+//! responses end an exchange, `max_in_flight`, `max_live`, credit windows,
+//! frame caps, queue depths, and write policies.
+//!
+//! A layout needs a request row or a subscription row. Each property checks
+//! every kind of row the layout has, so a layout whose only exchange is a
+//! subscription runs the whole suite.
 //!
 //! The harness runs real handlers over loopback QUIC with production limits:
 //!
@@ -22,7 +26,7 @@
 //!   serving answers each request with one part, if the request row has a
 //!   part row, then one ending. It publishes each subscription row through
 //!   `Publications`: one page per cursor while credit lasts, and the ending
-//!   row after `Close`.
+//!   row after `Close`. It subscribes through fenced `Subscriptions`.
 //! - Two [`SiblingService`]s share each connection. They echo probes, and
 //!   they can stop reading to hold their stream windows.
 //! - [`RawLayoutPeer`] opens or accepts a layout by hand and can send any
@@ -35,12 +39,12 @@
 //!
 //! | Id | Property |
 //! | --- | --- |
-//! | P1 | An unsolicited response disconnects its sender before decode, and a control peer keeps working. |
-//! | P2 | `limit` requests re-sent at each ending never fault; `2 × limit` at once are served and never fault; one more disconnects. |
-//! | P3 | Sustained conformant exchanges never fault. |
-//! | P4 | Two peers that saturate each other's serving both finish their downloads. |
-//! | P5 | Ending one member retires the session, siblings stay usable, and the layout reopens; a started exchange closes the connection instead. |
-//! | P6 | Paused siblings up to the supported count do not stop the layout; after connection credit runs out and returns, the original exchange completes. |
+//! | P1 | An unsolicited response, or a page beyond its subscription's credit, disconnects its sender before decode, and a control peer keeps working. |
+//! | P2 | `limit` requests re-sent at each ending never fault; `2 × limit` at once are served and never fault; one more disconnects. Subscriptions keep the same margin over `max_live`. |
+//! | P3 | Sustained conformant exchanges and subscriptions never fault. |
+//! | P4 | Two peers that saturate each other's serving and pushing both finish their downloads. |
+//! | P5 | Ending one member retires the session, siblings stay usable, and the layout reopens; a started exchange or subscription closes the connection instead. |
+//! | P6 | Paused siblings up to the supported count do not stop the layout; after connection credit runs out and returns, the original exchanges complete. |
 //! | P7 | A stream at a version the peers did not negotiate is refused, and the connection stays usable. |
 //! | P8 | A reset mid-frame retires only the session; a FIN mid-payload closes the connection; a stalled frame ends at the read deadline. |
 //! | P9 | `Close` ends a subscription, and other control messages progress, while its pages sit unread and every execution slot and output byte is held. |
@@ -109,6 +113,9 @@ pub(crate) trait StreamConformance: Debug + Send + Sync + 'static {
     /// Page `cursor` of subscription `key`, on the page row `row`. A page
     /// carries one object, and its cursor follows the previous page's.
     fn page(row: &MessageRule, key: u32, cursor: u32) -> Self::Message;
+
+    /// The subscription key and cursor `message` carries, if it is a page.
+    fn read_page(message: &Self::Message) -> Option<(u32, u32)>;
 }
 
 /// Add the stream conformance suite for `$layout` in a module named `$name`.

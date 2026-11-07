@@ -231,6 +231,109 @@ During restart deploys, the workflows write a Unix timestamp 20 minutes in the
 future to `/run/zakura-fleet-watchdog/deploy-suppressed-until`. While that marker
 is active, new failure alerts are logged locally but not posted to Slack.
 
+## Release-State Availability
+
+Release-state pointer and metadata requests wait one hour from the first failed
+fetch before alerting. Any failure counts, including timeouts, HTTP errors such as
+429 or 5xx, dropped connections, and unparsable responses. Consecutive failures
+share the same timer, which survives watchdog restarts. A successful, valid check
+resets the timer. Recovery is posted only if a failure alert was sent. An active
+alert stays latched through failed fetches, so the next valid check can send its
+recovery without losing or duplicating the original alert. Once both files load,
+unreadable metadata and incomplete or stale bundles still alert immediately. The
+freshness limit remains 48 hours.
+
+## Mainnet Difficulty Headroom
+
+The Mainnet fleet watchdog sends difficulty warnings and recoveries to the
+existing `#zakura-alerts` webhook when `difficulty_monitor = true` on the
+Mainnet fleet. It reads only our fleet's accepted tips; no explorer, external
+RPC, new secret or additional node RPC request is required. The collector
+includes the exact `difficulty_bits` from its existing accepted-tip header
+request, bound to that tip's hash and height.
+
+Headroom is the maximum admitted target from PR #1915 divided by the observed
+target. This equals observed difficulty divided by the fixed admission floor.
+Decisions use integer arithmetic; rounded ratios are for Slack display only.
+The reference target, multiplier and starting height have a CI coupling check
+against the node's Rust policy, so a policy update must update monitoring too.
+
+| Condition | Notification |
+| --- | --- |
+| Headroom below 2× for 15 minutes | Warning |
+| Headroom below 1.25× | Immediate critical escalation |
+| Headroom below 1× | Immediate floor-breach escalation |
+| Headroom above 2.25× for 15 minutes | Recovery |
+| Observation unavailable for 10 minutes | Separate monitoring-unavailable alert |
+
+The monitor selects the highest fresh Mainnet accepted tip and requires a
+second fleet node to corroborate its hash, or its sampled ancestry when the
+second node is behind. Conflicting tips or targets cannot establish health;
+tip-only reporters can corroborate a hash when another node supplies the
+target for that same highest hash, including the macOS verifier's tip report.
+Missing data at the highest tip cannot fall back to a lower, easier-to-monitor
+tip. Observations require fresh collection and node timestamps. A tip that
+does not advance in 10 minutes becomes unavailable even if a restarted
+collector refreshes its timestamps. Gaps over three minutes interrupt the
+warning and recovery holds. Unavailability preserves an existing difficulty
+incident, and restoring observations is distinct from difficulty recovery.
+Severity remains latched until the recovery condition, with one notification
+per escalation and no repeated posts for unchanged conditions.
+
+All fleet nodes may share the admission floor. If they all stop accepting
+blocks below it, this monitor cannot establish those unseen blocks' difficulty.
+It reports stale observations and retains the existing fleet stall alerts;
+an old accepted target never proves fresh health. A floor-breach alert is
+possible only when a fleet node actually accepts and reports such a block.
+Peer-supplied rejected headers are not an alert source. Operators should
+inspect fleet progress and prepare a reviewed policy update; the monitor
+never changes the floor or adds PagerDuty escalation.
+
+Incident timers and transitions share the existing durable fleet Slack queue.
+Slack failures and deployment suppression defer delivery without discarding
+alerts or recoveries. Existing webhook acknowledgement crash limitations apply.
+
+Roll out the collector update on the Mainnet dashboard before activating the
+watchdog configuration, and verify `difficulty_bits` on at least two advancing
+Mainnet nodes. The monitoring-only `fleet-deploy` operation updates the
+watchdog, not the dashboard; updating only that package leaves the source
+unavailable. Use the existing dashboard installation procedure and then deploy
+the monitoring package from an exact tested commit. Preserve incident state.
+Check the installed policy and fresh observations before testing labeled
+failure and recovery notifications in `#zakura-alerts` with temporary state.
+Activation and real-channel acceptance are separate from merging the code.
+
+## NU7 Dashboard Availability
+
+The existing fleet watchdog also checks
+`https://api.nu7.valargroup.dev/v1/dashboard` through its public HTTPS route.
+The `[[nu7_dashboard]]` target shares the service's 60-second polling,
+request timeout, 10-minute dashboard threshold, deployment suppression,
+persisted state and durable Slack delivery to `#zakura-alerts`.
+
+A response must use dashboard and observation schema version 1, contain finite,
+positive `generatedAt` and `status.observedAt` timestamps, and report `live`,
+`degraded` or `unavailable`. Both timestamps must be less than 10 minutes old
+and no more than 60 seconds ahead of the monitor's clock. Already stale data
+alerts on the first poll, using the oldest timestamp to measure its age.
+Connection errors, HTTP errors, malformed responses and explicit `unavailable`
+observations alert after 10 minutes of continuous failure. Changing failure
+reasons does not restart that timer or create another incident.
+
+Fresh `degraded` data counts as available: this lane monitors publication,
+not validator agreement or block progress. It sends one failure and one
+recovery notification per incident. Pending messages survive restarts and
+Slack delivery failures through the existing queue; webhook delivery retains
+its existing possibility of a duplicate after a crash during acknowledgement.
+Fleet deployment suppression delays delivery while polling continues.
+
+The existing monitoring package includes the lane and its synthetic tests.
+Activate it separately through the monitoring-only `fleet-deploy` path after
+review; no node restart or new service is required. Before declaring it live,
+verify the installed version and confirm labeled failure and recovery messages
+in `#zakura-alerts` through the configured webhook. This change adds no
+PagerDuty escalation or automatic remediation.
+
 ## Compatibility Monitoring
 
 The fleet watchdog also monitors the zcashd-compat pair on `zakura-compat`

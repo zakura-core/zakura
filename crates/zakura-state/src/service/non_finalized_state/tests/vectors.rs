@@ -1,6 +1,7 @@
 //! Fixed test vectors for the non-finalized state.
 
 use std::{sync::Arc, time::Duration};
+use zakura_node_services::block_memory::BlockHandle;
 
 use zakura_chain::{
     amount::NonNegative,
@@ -192,10 +193,10 @@ fn finalize_pops_from_best_chain_for_network(network: Network) -> Result<()> {
 
     let finalized = state.finalize().inner_block();
 
-    assert_eq!(block1, finalized);
+    assert_eq!(BlockHandle::from(block1), finalized);
 
     let finalized = state.finalize().inner_block();
-    assert_eq!(block2, finalized);
+    assert_eq!(BlockHandle::from(block2), finalized);
 
     assert!(state.best_chain().is_none());
 
@@ -240,7 +241,7 @@ fn finalize_drops_empty_side_chain_for_network(network: Network) -> Result<()> {
 
     let finalized = state.finalize().inner_block();
 
-    assert_eq!(root, finalized);
+    assert_eq!(BlockHandle::from(root), finalized);
     assert_eq!(state.chain_count(), 1);
     assert_eq!(state.best_chain_len(), Some(1));
     assert_eq!(
@@ -1557,4 +1558,120 @@ fn precious_block_keeps_one_chain_per_tip() {
         .map(|chain| chain.non_finalized_tip_hash())
         .collect();
     assert_eq!(tips, vec![low.hash(), high.hash()]);
+}
+
+/// Receipt order is independent of commit scheduling, hash order, and replay.
+#[test]
+fn equal_work_prefers_first_receipt_through_forks_and_reconsideration() {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        let root = Arc::new(network.test_block(653599, 583999).unwrap());
+        let a = root
+            .make_fake_child()
+            .set_work(10)
+            .set_block_commitment([1; 32]);
+        let b = root
+            .make_fake_child()
+            .set_work(10)
+            .set_block_commitment([2; 32]);
+        for (early, late) in [(&a, &b), (&b, &a)] {
+            for reverse_completion in [false, true] {
+                let (mut state, finalized) = new_invalidate_test_state(&network);
+                state
+                    .commit_new_chain(root.clone().prepare(), &finalized.db)
+                    .unwrap();
+                let mut early_block = early.clone().prepare();
+                early_block.receipt_order = Some(1);
+                let mut late_block = late.clone().prepare();
+                late_block.receipt_order = Some(2);
+                let commits = if reverse_completion {
+                    [late_block, early_block]
+                } else {
+                    [early_block, late_block]
+                };
+                for block in commits {
+                    state.commit_block(block, &finalized.db).unwrap();
+                }
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+                assert_eq!(state.chain_set.len(), 2);
+                let mut duplicate = early.clone().prepare();
+                duplicate.receipt_order = Some(99);
+                state.commit_block(duplicate, &finalized.db).unwrap();
+                assert_eq!(state.chain_set.len(), 2);
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+                state.invalidate_block(early.hash()).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, late.hash());
+                state.reconsider_block(early.hash(), &finalized.db).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+                let child = late.make_fake_child().set_work(1);
+                let mut prepared = child.clone().prepare();
+                prepared.receipt_order = Some(3);
+                state.commit_block(prepared, &finalized.db).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, child.hash());
+                state.invalidate_block(child.hash()).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+                state.precious_block(late.hash(), &finalized.db).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, late.hash());
+                state.invalidate_block(late.hash()).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+                state.reconsider_block(late.hash(), &finalized.db).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, late.hash());
+                state.precious_block(early.hash(), &finalized.db).unwrap();
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+                state.finalize();
+                assert_eq!(state.best_tip().unwrap().1, early.hash());
+            }
+        }
+    }
+}
+
+#[test]
+fn receipt_fallback_and_backup_restore_ignore_replay_order() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let root = Arc::new(network.test_block(653599, 583999).unwrap());
+    let a = root
+        .make_fake_child()
+        .set_work(10)
+        .set_block_commitment([1; 32]);
+    let b = root
+        .make_fake_child()
+        .set_work(10)
+        .set_block_commitment([2; 32]);
+    let (low, high) = if a.hash().0 < b.hash().0 {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    for (low_order, high_order, expected) in [
+        (None, None, high.hash()),
+        (Some(1), Some(1), high.hash()),
+        (None, Some(1), low.hash()),
+        (Some(1), None, high.hash()),
+        (Some(1), Some(2), low.hash()),
+    ] {
+        let (mut state, finalized) = new_invalidate_test_state(&network);
+        state
+            .commit_new_chain(root.clone().prepare(), &finalized.db)
+            .unwrap();
+        for (block, order) in [(&high, high_order), (&low, low_order)] {
+            let mut prepared = block.clone().prepare();
+            prepared.receipt_order = order;
+            state.commit_block(prepared, &finalized.db).unwrap();
+        }
+        assert_eq!(state.best_tip().unwrap().1, expected);
+        let backup = tempfile::tempdir().unwrap();
+        state.write_to_backup(backup.path());
+        let restored = super::super::backup::restore_backup(
+            NonFinalizedState::new(&network),
+            backup.path(),
+            &finalized.db,
+        );
+        assert_eq!(restored.best_tip().unwrap().1, high.hash());
+        assert!(restored.chain_iter().all(|chain| chain
+            .tip_block()
+            .unwrap()
+            .receipt_order
+            .is_none()));
+    }
 }

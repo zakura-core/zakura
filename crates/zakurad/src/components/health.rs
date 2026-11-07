@@ -56,6 +56,7 @@ use tracing::{debug, info, warn};
 
 use zakura_chain::{chain_sync_status::ChainSyncStatus, parameters::Network};
 use zakura_network::AddressBookPeers;
+use zakura_node_services::task::spawn_erased;
 
 // Refresh peers on a short cadence so the cached snapshot tracks live network
 // conditions closely without hitting the address book mutex on every request.
@@ -126,7 +127,7 @@ where
     SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     let Some(listen_addr) = config.listen_addr else {
-        return (tokio::spawn(std::future::pending()), None);
+        return (spawn_erased(std::future::pending()), None);
     };
 
     info!("opening health endpoint at {listen_addr}...",);
@@ -158,7 +159,7 @@ where
         num_live_peer_receiver,
     });
 
-    let task = tokio::spawn(async move {
+    let task = spawn_erased(async move {
         tokio::select! {
             _ = peer_metrics_refresh_task(address_book, num_live_peer_sender) => {},
             _ = run_health_server(listener, shared) => {},
@@ -323,7 +324,7 @@ async fn run_health_server<SyncStatus>(
                 let service =
                     hyper::service::service_fn(move |req| handle_request(req, svc_ctx.clone()));
 
-                tokio::spawn(async move {
+                spawn_erased(async move {
                     if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                         debug!(?err, "health server connection closed with error");
                     }

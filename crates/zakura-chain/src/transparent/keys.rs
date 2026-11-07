@@ -12,7 +12,7 @@ use secp256k1::PublicKey;
 use crate::serialization::{SerializationError, ZcashDeserialize, ZcashSerialize};
 
 impl ZcashSerialize for PublicKey {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.serialize())?;
         Ok(())
     }

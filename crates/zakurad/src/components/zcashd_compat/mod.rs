@@ -2,10 +2,12 @@
 
 mod config;
 mod datadir;
+mod download;
 mod managed;
 mod manifest;
 mod preflight;
 mod supervisor;
+mod trust_roots;
 #[cfg(unix)]
 mod unix;
 

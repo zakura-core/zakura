@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 
-use bincode::Options;
 use thiserror::Error;
 
 use zakura_chain::{
@@ -17,6 +16,7 @@ use zakura_chain::{
     history_tree::{HistoryTreeError, NonEmptyHistoryTree},
     parameters::{Network, NetworkKind},
     primitives::zcash_history,
+    serialization::bincode_format::{self, BincodeError},
     value_balance::ValueBalance,
 };
 
@@ -32,9 +32,9 @@ pub enum HistoryTreeDecodeError {
     )]
     InvalidEncoding {
         /// The current-width decoding error.
-        current: bincode::Error,
+        current: BincodeError,
         /// The legacy-width decoding error.
-        legacy: bincode::Error,
+        legacy: BincodeError,
     },
 
     /// The snapshot was created for a different network kind.
@@ -68,11 +68,11 @@ impl FromDisk for ValueBalance<NonNegative> {
 }
 
 // The following implementations for history trees use `serde` and
-// `bincode`. `serde` serializations depend on the inner structure of the type.
+// the `bincode` 1.3 format. `serde` serializations depend on the inner structure of the type.
 // They should not be used in new code. (This is an issue for any derived serialization format.)
 //
-// We explicitly use `bincode::DefaultOptions`  to disallow trailing bytes; see
-// https://docs.rs/bincode/1.3.3/bincode/config/index.html#options-struct-vs-bincode-functions
+// The format rejects trailing bytes, like `bincode::DefaultOptions`; see
+// [`bincode_format`].
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct HistoryTreeParts {
@@ -86,8 +86,6 @@ impl HistoryTreeParts {
     /// Decodes current-width or legacy-width history-tree snapshot bytes.
     pub(crate) fn try_from_bytes(bytes: impl AsRef<[u8]>) -> Result<Self, HistoryTreeDecodeError> {
         let bytes = bytes.as_ref();
-        let options = bincode::DefaultOptions::new();
-
         // Try the current entry width first. Databases written before NU6.3 widened
         // `zcash_history::Entry` store narrower entries that fail to parse at the current width,
         // so fall back to the legacy width and zero-pad each entry up to the current width.
@@ -95,10 +93,9 @@ impl HistoryTreeParts {
         // Legacy-width rows can fail the current-width decoder with errors other than
         // `UnexpectedEof`, because the wider entry can read into the next legacy entry and
         // interpret arbitrary entry bytes as bincode control bytes.
-        match options.deserialize::<HistoryTreeParts>(bytes) {
+        match bincode_format::deserialize::<HistoryTreeParts>(bytes) {
             Ok(parts) => Ok(parts),
-            Err(current) => options
-                .deserialize::<LegacyHistoryTreeParts>(bytes)
+            Err(current) => bincode_format::deserialize::<LegacyHistoryTreeParts>(bytes)
                 .map(HistoryTreeParts::from)
                 .map_err(|legacy| HistoryTreeDecodeError::InvalidEncoding { current, legacy }),
         }
@@ -141,9 +138,7 @@ impl IntoDisk for HistoryTreeParts {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
-        bincode::DefaultOptions::new()
-            .serialize(self)
-            .expect("serialization to vec doesn't fail")
+        bincode_format::serialize(self).expect("history tree parts have known lengths")
     }
 }
 

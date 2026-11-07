@@ -67,16 +67,13 @@
 //!
 //! Sending traces to different subscribers:
 //! * configuring a `tracing.log_file`: appends traces to a file on disk.
-//! * `journald`: send tracing spans and events to `systemd-journald`.
 //!
 //! Changing the traces that are collected:
 //! * `error-debug`: enable extra debugging in release builds.
-//! * `tokio-console`: enable tokio's `console-subscriber` (needs [specific compiler flags])
 //! * A set of features that [skip verbose tracing].
 //!   The default features ignore `debug` and `trace` logs in release builds.
 //!
 //! [skip verbose tracing]: https://docs.rs/tracing/0.1.35/tracing/level_filters/index.html#compile-time-filters
-//! [specific compiler flags]: https://docs.rs/console-subscriber/latest/console_subscriber/#enabling-tokio-instrumentation
 //!
 //! ### Testing
 //!
@@ -93,8 +90,6 @@
 //! [The Zakura monorepo](https://github.com/zakura-core/zakura) is a collection of the following
 //! crates:
 //!
-//! - [zakura-tower-batch-control](https://docs.rs/zakura-tower-batch-control/latest/tower_batch_control/)
-//! - [zakura-tower-fallback](https://docs.rs/zakura-tower-fallback/latest/tower_fallback/)
 //! - [zakura-chain](https://docs.rs/zakura-chain/latest/zakura_chain/)
 //! - [zakura-consensus](https://docs.rs/zakura-consensus/latest/zakura_consensus/)
 //! - [zakura-network](https://docs.rs/zakura-network/latest/zakura_network/)
@@ -133,4 +128,3 @@ pub mod commands;
 pub mod components;
 pub mod config;
 pub mod node;
-pub mod prelude;

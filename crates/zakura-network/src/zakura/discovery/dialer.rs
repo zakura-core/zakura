@@ -1,11 +1,18 @@
 //! Bootstrap and candidate dial entry points for native discovery.
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, str::FromStr};
 
-use iroh::{EndpointAddr, EndpointId};
+use zakura_node_services::task::spawn_erased_named;
+use zakura_quic::{NodeAddr, NodeId};
+use zakura_rt::{
+    collections::HashMap,
+    sync::{oneshot, CancellationToken},
+    task::JoinHandle,
+};
 
 use super::{native_dial_supervised, RedialPolicy};
 use crate::zakura::{
+    handler::{DialRegistration, DialReport},
     ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF,
     DEFAULT_ZAKURA_REDIAL_MAX_BACKOFF,
 };
@@ -19,7 +26,7 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     endpoint: ZakuraEndpoint,
     bootstrap_peers: Vec<String>,
     limits: ZakuraLocalLimits,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<JoinHandle<()>> {
     if bootstrap_peers.is_empty() {
         return Vec::new();
     }
@@ -39,8 +46,15 @@ pub(crate) fn spawn_native_bootstrap_dialer(
     for node_addr in node_addrs {
         let endpoint = endpoint.clone();
         let limits = limits.clone();
-        tasks.push(tokio::spawn(async move {
-            native_dial_supervised(endpoint, node_addr, limits, policy).await
+        tasks.push(spawn_erased_named("bootstrap_dial", async move {
+            native_dial_supervised(
+                endpoint,
+                node_addr,
+                limits,
+                policy,
+                CancellationToken::new(),
+            )
+            .await;
         }));
     }
     tasks
@@ -48,9 +62,9 @@ pub(crate) fn spawn_native_bootstrap_dialer(
 
 fn grouped_remote_bootstrap_peers(
     bootstrap_peers: Vec<String>,
-    local_node_id: EndpointId,
-) -> Vec<EndpointAddr> {
-    let mut direct_addrs_by_node = HashMap::<EndpointId, Vec<SocketAddr>>::new();
+    local_node_id: NodeId,
+) -> Vec<NodeAddr> {
+    let mut direct_addrs_by_node = HashMap::<NodeId, Vec<SocketAddr>>::new();
     for entry in bootstrap_peers {
         let node_addr = match parse_bootstrap_peer(&entry) {
             Ok(node_addr) => node_addr,
@@ -66,7 +80,7 @@ fn grouped_remote_bootstrap_peers(
         direct_addrs_by_node
             .entry(node_addr.id)
             .or_default()
-            .extend(node_addr.ip_addrs().copied());
+            .extend(node_addr.direct);
     }
 
     direct_addrs_by_node
@@ -74,38 +88,116 @@ fn grouped_remote_bootstrap_peers(
         .map(|(node_id, mut direct_addrs)| {
             direct_addrs.sort_unstable();
             direct_addrs.dedup();
-            EndpointAddr::new(node_id)
-                .with_addrs((direct_addrs).into_iter().map(iroh::TransportAddr::Ip))
+            NodeAddr::with_addrs(node_id, direct_addrs)
         })
         .collect()
 }
 
+/// Dials and serves a maintained connection, and reports on `registration`
+/// how its registration ended.
 pub(crate) async fn native_bootstrap_dial(
     endpoint: &ZakuraEndpoint,
-    node_addr: EndpointAddr,
+    node_addr: NodeAddr,
     limits: &ZakuraLocalLimits,
+    registration: oneshot::Sender<DialRegistration>,
 ) -> Result<(), ZakuraHandlerError> {
-    crate::zakura::handler::serve_native_dial_connection(endpoint, node_addr, limits).await
+    // Only discovery uses the admitted address, to settle per-IP reservations
+    // and confirm the record address the dial reached.
+    let (admitted_addr, _) = oneshot::channel();
+    let report = DialReport {
+        admitted_addr,
+        registration,
+    };
+    crate::zakura::handler::serve_reported_native_dial_connection(
+        endpoint,
+        node_addr,
+        limits,
+        Some(report),
+        crate::zakura::handler::NativeDialKind::Maintained,
+    )
+    .await
 }
 
-pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<EndpointAddr, ZakuraHandlerError> {
+/// Dials a discovery candidate and reports on `report` the address whose
+/// handshake TLS authenticated and how registration ended.
+pub(crate) async fn native_discovery_dial(
+    endpoint: &ZakuraEndpoint,
+    node_addr: NodeAddr,
+    limits: &ZakuraLocalLimits,
+    report: DialReport,
+) -> Result<(), ZakuraHandlerError> {
+    crate::zakura::handler::serve_reported_native_dial_connection(
+        endpoint,
+        node_addr,
+        limits,
+        Some(report),
+        crate::zakura::handler::NativeDialKind::Discovery,
+    )
+    .await
+}
+
+pub(crate) fn parse_bootstrap_peer(entry: &str) -> Result<NodeAddr, ZakuraHandlerError> {
     let Some((node_id, direct_addr)) = entry.split_once('@') else {
         return Err(ZakuraHandlerError::InvalidBootstrapPeer);
     };
     let node_id =
-        EndpointId::from_str(node_id).map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
+        NodeId::from_str(node_id).map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
     let direct_addr = direct_addr
         .parse::<SocketAddr>()
         .map_err(|_| ZakuraHandlerError::InvalidBootstrapPeer)?;
-    Ok(EndpointAddr::new(node_id)
-        .with_addrs(([direct_addr]).into_iter().map(iroh::TransportAddr::Ip)))
+    Ok(NodeAddr::with_addrs(node_id, [direct_addr]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use crate::{BoxError, Config};
 
     use crate::zakura::{DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_BOOTSTRAP_PEERS};
+
+    /// The discovery caller uses the lower transport ceiling and reports a
+    /// local limit when a small configuration has room only for inbound peers.
+    #[tokio::test]
+    async fn discovery_dial_uses_the_inbound_preserving_limit() -> Result<(), BoxError> {
+        use crate::zakura::testkit::ZakuraTestNode;
+        use crate::zakura::ZakuraLocalLimits;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let limits = ZakuraLocalLimits {
+                max_connections: 1,
+                max_pending_handshakes: 1,
+                ..ZakuraLocalLimits::from_config(&Config::default())
+            };
+            let node = ZakuraTestNode::builder(151_508)
+                .limits(limits.clone())
+                .spawn()
+                .await?;
+            let silent = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let target = NodeAddr::with_addrs(
+                zakura_quic::NodeSecretKey::generate().public(),
+                [silent.local_addr()?],
+            );
+            let endpoint = node.endpoint();
+            assert_eq!(endpoint.discovery_admission_capacity(), 0);
+            let (admitted_addr, _admitted_rx) = tokio::sync::oneshot::channel();
+            let (registration, _registration_rx) = tokio::sync::oneshot::channel();
+            let report = DialReport {
+                admitted_addr,
+                registration,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_millis(200),
+                native_discovery_dial(&endpoint, target, &limits, report),
+            )
+            .await?;
+            assert!(matches!(result, Err(ref error) if error.is_pre_dial_limit()));
+            node.shutdown().await;
+            Ok::<_, BoxError>(())
+        })
+        .await?
+    }
 
     #[test]
     fn bootstrap_peer_requires_node_id_and_direct_address() {
@@ -125,8 +217,8 @@ mod tests {
 
     #[test]
     fn bootstrap_peers_skip_self_and_merge_duplicate_remote_identities() {
-        let local_id = iroh::SecretKey::from_bytes(&[1; 32]).public();
-        let remote_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let local_id = zakura_quic::NodeSecretKey::from_bytes(&[1; 32]).public();
+        let remote_id = zakura_quic::NodeSecretKey::from_bytes(&[2; 32]).public();
         let first_addr: SocketAddr = "127.0.0.1:8234".parse().expect("test address parses");
         let second_addr: SocketAddr = "127.0.0.1:8235".parse().expect("test address parses");
         let grouped = grouped_remote_bootstrap_peers(
@@ -141,9 +233,6 @@ mod tests {
 
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].id, remote_id);
-        assert_eq!(
-            grouped[0].ip_addrs().copied().collect::<Vec<_>>(),
-            vec![first_addr, second_addr]
-        );
+        assert_eq!(grouped[0].direct, vec![first_addr, second_addr]);
     }
 }

@@ -129,7 +129,7 @@ impl ToHex for Root {
 }
 
 impl ZcashSerialize for Root {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&<[u8; 32]>::from(*self)[..])?;
 
         Ok(())

@@ -61,6 +61,7 @@ use tracing::Instrument;
 use zakura_chain::{block::Height, chain_sync_status::ChainSyncStatus, transaction::UnminedTxId};
 use zakura_network as zn;
 use zakura_node_services::mempool::Gossip;
+use zakura_node_services::task::spawn_erased;
 use zakura_state::ChainTipChange;
 
 use crate::components::{
@@ -140,7 +141,7 @@ where
             debug_enable_at_height: config.debug_enable_at_height.map(Height),
         };
 
-        tokio::spawn(crawler.run().in_current_span())
+        spawn_erased(crawler.run().in_current_span())
     }
 
     /// Returns true when the crawler has been force-enabled by debug config.

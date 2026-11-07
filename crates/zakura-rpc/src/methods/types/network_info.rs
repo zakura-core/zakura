@@ -4,7 +4,7 @@ use derive_new::new;
 
 /// Response to a `getnetworkinfo` RPC request
 ///
-/// See the notes for [`Rpc::get_network_info` method]
+/// See the notes for [`RpcServer::get_network_info` method]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GetNetworkInfoResponse {
     /// The server version

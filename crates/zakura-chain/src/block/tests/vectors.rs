@@ -18,8 +18,12 @@ use crate::{
     serialization::{
         sha256d, SerializationError, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
     },
-    transaction::{arbitrary::v5_transactions, LockTime, Transaction},
+    transaction::{
+        arbitrary::{fake_v6_with_orchard_and_ironwood_actions, v5_transactions},
+        LockTime, Transaction,
+    },
     transparent,
+    work::equihash::Solution,
 };
 
 use super::generate; // TODO: this should be rewritten as strategies
@@ -224,7 +228,7 @@ fn ironwood_block_accessors_preserve_pool_and_wire_order() {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 sapling_shielded_data: None,
-                orchard_shielded_data: Some(orchard_shielded_data),
+                orchard_shielded_data: Some(Box::new(orchard_shielded_data)),
                 ironwood_shielded_data: Some(ironwood_shielded_data),
             })
         };
@@ -316,7 +320,7 @@ fn ironwood_transaction_count_is_pool_specific_and_counts_bundles() {
                 inputs: Vec::new(),
                 outputs: Vec::new(),
                 sapling_shielded_data: None,
-                orchard_shielded_data,
+                orchard_shielded_data: orchard_shielded_data.map(Box::new),
                 ironwood_shielded_data,
             })
         };
@@ -552,6 +556,50 @@ fn coinbase_parsing_rejects_above_0x80() {
 }
 
 /// Checks that the block commitment field parses without errors.
+/// Header sizes are computed from the Equihash solution without encoding the
+/// header, so they must match the encoded length on every network.
+#[test]
+fn header_serialized_size_matches_encoding() {
+    let _init_guard = zakura_test::init();
+
+    let mut headers: Vec<Header> = Network::iter()
+        .flat_map(|net| {
+            net.block_iter()
+                .map(|(_, bytes)| {
+                    *bytes
+                        .zcash_deserialize_into::<Block>()
+                        .expect("block test vectors are structurally valid")
+                        .header
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let regtest_header = *crate::block::genesis::regtest_genesis_block().header;
+    assert!(matches!(regtest_header.solution, Solution::Regtest(_)));
+    assert!(headers
+        .iter()
+        .all(|header| matches!(header.solution, Solution::Common(_))));
+    headers.push(regtest_header);
+
+    for header in headers {
+        let encoded = header
+            .zcash_serialize_to_vec()
+            .expect("vec serialization is infallible");
+        assert_eq!(header.zcash_serialized_size(), encoded.len());
+        assert!(encoded.len() <= crate::block::header::MAX_SERIALIZED_HEADER_BYTES);
+        if matches!(header.solution, Solution::Common(_)) {
+            assert_eq!(
+                encoded.len(),
+                crate::block::header::MAX_SERIALIZED_HEADER_BYTES
+            );
+        }
+        assert_eq!(
+            header.solution.zcash_serialized_size(),
+            encoded.len() - crate::block::header::HEADER_BYTES_BEFORE_SOLUTION,
+        );
+    }
+}
+
 /// For sapling and blossom blocks, also check the final sapling root value.
 ///
 /// TODO: add chain history test vectors?
@@ -775,4 +823,111 @@ fn time_check_fixed() {
         // Invert the check, leading to a valid time
         node_time_check(now, block_header_time).expect("the inverse comparison should be valid");
     }
+}
+
+#[test]
+fn transaction_hashes_and_auth_data_digests_match_separate_computation_across_parallel_cutoff() {
+    let _init_guard = zakura_test::init();
+
+    // Pre-v5 (genesis, Sapling era) and NU5 blocks, so both auth digest branches are covered.
+    let blocks: Vec<Block> = [
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .map(|bytes| {
+        bytes
+            .zcash_deserialize_into()
+            .expect("block fixture deserializes")
+    })
+    .collect();
+    let mut transactions: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter().cloned())
+        .collect();
+    assert!(
+        transactions.iter().any(|tx| tx.version() >= 5),
+        "fixtures include v5 transactions"
+    );
+
+    let orchard_bundle = transactions
+        .iter()
+        .find_map(|tx| tx.orchard_shielded_data().cloned())
+        .expect("the NU5 fixture contains an Orchard bundle");
+    let v6_transactions: Vec<_> = [(1, 0), (0, 1), (1, 1)]
+        .into_iter()
+        .map(|(orchard_actions, ironwood_actions)| {
+            let mut transaction =
+                fake_v6_with_orchard_and_ironwood_actions(Nu6_3, orchard_actions, ironwood_actions);
+            let Transaction::V6 {
+                orchard_shielded_data,
+                ironwood_shielded_data,
+                ..
+            } = Arc::make_mut(&mut transaction)
+            else {
+                unreachable!("the V6 fixture helper returns a V6 transaction");
+            };
+            // Use fixed vector bytes in each populated slot so the fixture is deterministic.
+            if orchard_shielded_data.is_some() {
+                *orchard_shielded_data = Some(Box::new(orchard_bundle.clone()));
+            }
+            if ironwood_shielded_data.is_some() {
+                *ironwood_shielded_data = Some(orchard_bundle.clone());
+            }
+            transaction
+        })
+        .collect();
+    transactions.extend(v6_transactions.iter().cloned());
+    let mixes = [
+        ("Orchard-only V6", &v6_transactions[0..1]),
+        ("Ironwood-only V6", &v6_transactions[1..2]),
+        ("both pools V6", &v6_transactions[2..3]),
+        ("mixed V6", v6_transactions.as_slice()),
+        ("mixed versions", transactions.as_slice()),
+    ];
+
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("the test thread pool starts");
+
+        for (mix, transactions) in mixes {
+            for count in [1, 63, 64, 65, 129] {
+                let mut block = blocks[0].clone();
+                block.transactions = transactions.iter().cycle().take(count).cloned().collect();
+
+                let hashes = pool.install(|| block.transaction_hashes());
+                let auth = pool.install(|| block.auth_data_digests());
+
+                let expected_hashes: Vec<_> = block.transactions().map(|tx| tx.hash()).collect();
+                let expected_auth: Vec<_> =
+                    block.transactions().map(|tx| tx.auth_digest()).collect();
+                let expected_ids: Vec<_> = block.transactions().map(|tx| tx.unmined_id()).collect();
+                let context = format!("{mix}: {count} transactions with {threads} workers");
+
+                assert_eq!(hashes.as_ref(), expected_hashes, "{context}");
+                assert_eq!(auth.digests, expected_auth, "{context}");
+                assert_eq!(
+                    auth.unmined_ids(&hashes).collect::<Vec<_>>(),
+                    expected_ids,
+                    "{context}"
+                );
+                assert_eq!(auth.root, block.auth_data_root(), "{context}");
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "come from the same block")]
+fn unmined_ids_reject_hashes_from_a_different_block() {
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("block fixture deserializes");
+    let auth = block.auth_data_digests();
+    let fewer_hashes = &block.transaction_hashes()[1..];
+
+    let _ = auth.unmined_ids(fewer_hashes).count();
 }

@@ -36,17 +36,15 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::{is_read_capacity_refusal, TransactionHandle};
 
+use async_trait::async_trait;
 use chrono::Utc;
 use derive_new::new;
 use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
 use getset::{CopyGetters, Getters};
 use hex::{FromHex, ToHex};
 use indexmap::IndexMap;
-use jsonrpsee::core::{async_trait, RpcResult as Result};
-use jsonrpsee_proc_macros::rpc;
-use jsonrpsee_types::{ErrorCode, ErrorObject};
-use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -84,6 +82,7 @@ use zakura_consensus::{
 };
 use zakura_network::{address_book_peers::AddressBookPeers, types::PeerServices, PeerSocketAddr};
 use zakura_node_services::mempool::{self, CreatedOrSpent, MempoolService};
+use zakura_node_services::task::spawn_erased;
 use zakura_state::{
     AnyTx, HashOrHeight, OutputLocation, ReadRequest, ReadResponse, ReadState as ReadStateService,
     State as StateService, TransactionLocation,
@@ -102,6 +101,7 @@ use crate::{
     server::{
         self,
         error::{MapError, OkOrError},
+        jsonrpc::{ErrorCode, ErrorObject, RpcResult as Result},
     },
 };
 
@@ -133,7 +133,7 @@ use types::{
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
     submit_block::{
-        MinedBlockEvent, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
+        EarlyMinedBlock, MinedBlockSubmission, PendingBlockRegistry, SubmitBlockErrorResponse,
         SubmitBlockParameters, SubmitBlockResponse, SubmitSolutionErrorResponse,
         SubmitSolutionParameters, SubmitSolutionResponse,
     },
@@ -298,9 +298,9 @@ mod unix;
 #[cfg(test)]
 mod tests;
 
-#[rpc(server)]
+server::jsonrpc::rpc_trait! {
 /// RPC method signatures.
-pub trait Rpc {
+pub trait RpcServer {
     /// Returns software information from the RPC server, as a
     /// [`GetInfoResponse`] JSON struct.
     ///
@@ -803,9 +803,7 @@ pub trait Rpc {
         &self,
         num_blocks: Option<i32>,
         height: Option<i32>,
-    ) -> Result<u64> {
-        self.get_network_sol_ps(num_blocks, height).await
-    }
+    ) -> Result<u64>;
 
     /// Returns an object containing various state info regarding P2P networking.
     ///
@@ -866,7 +864,8 @@ pub trait Rpc {
 
     /// Returns the recommended standard fee per logical action, in zatoshis.
     ///
-    /// Currently returns Zakura's ZIP 317 marginal fee (`zip317::MARGINAL_FEE`), with `version` 0.
+    /// Returns at least 1,000 zatoshis per action, with `version` 0.
+    /// Uses Zakura's ZIP 317 marginal fee when it exceeds this floor.
     /// A dynamic estimate can replace this value without changing the parameters or
     /// result shape.
     ///
@@ -1017,6 +1016,7 @@ pub trait Rpc {
         include_mempool: Option<bool>,
     ) -> Result<GetTxOutResponse>;
 }
+}
 
 /// RPC method implementations.
 #[derive(Clone)]
@@ -1128,7 +1128,7 @@ where
     let parent = block.header.previous_block_hash;
     let block = Arc::new(block);
     let request = zakura_consensus::Request::Prepare {
-        block: block.clone(),
+        block: block.clone().into(),
         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
     };
 
@@ -1390,7 +1390,7 @@ where
         latest_chain_tip: Tip,
         address_book: AddressBook,
         last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
+        mined_block_sender: Option<mpsc::UnboundedSender<EarlyMinedBlock>>,
     ) -> (Self, JoinHandle<()>)
     where
         VersionString: ToString + Clone + Send + 'static,
@@ -1432,7 +1432,7 @@ where
         };
 
         // run the process queue
-        let rpc_tx_queue_task_handle = tokio::spawn(
+        let rpc_tx_queue_task_handle = spawn_erased(
             runner
                 .run(mempool, read_state, latest_chain_tip, network)
                 .in_current_span(),
@@ -1604,14 +1604,53 @@ where
         }
 
         if state.saturated {
-            return Err(ErrorObject::owned(
+            return Err(ErrorObject::new(
                 0,
                 "template rejection limit reached; wait for a new tip",
-                None::<()>,
             ));
         }
 
         self.recover_template(template, chain_info, miner_params, &state)
+            .await
+    }
+
+    /// Builds the coinbase-only template a long poll returns once it sees a new tip.
+    ///
+    /// Miners want work on the new tip before the mempool has caught up with it, so this
+    /// template has no mempool transactions and an ID that names none. The client's next long
+    /// poll then returns the full template as soon as the mempool has any. Returns `Ok(None)`
+    /// when the template was superseded, like [`Self::finish_mining_template`].
+    async fn new_tip_template(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        rejection_state: &types::get_block_template::TemplateRejections,
+        client_long_poll_id: Option<&types::long_poll::LongPollId>,
+    ) -> Result<Option<GetBlockTemplateResponse>> {
+        let mut long_poll_id = LongPollInput::new(
+            chain_info.tip_height,
+            chain_info.tip_hash,
+            chain_info.max_time,
+            vec![],
+        )
+        .generate_id();
+        long_poll_id.revision = rejection_state.revision;
+        let submit_old = client_long_poll_id.map(|old| long_poll_id.submit_old(old));
+
+        // After ZIP 234 activation the coinbase proof must wait for the new parent's pools, so
+        // the build runs off the async worker to let other RPC requests continue.
+        let template = self
+            .build_mining_template(
+                precomputed_coinbase,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                vec![],
+                submit_old,
+            )
+            .await?;
+        self.finish_mining_template(template, chain_info, miner_params)
             .await
     }
 
@@ -1709,7 +1748,7 @@ where
                 Ok(None)
             }
             Ok(Ok(zakura_state::ReadResponse::Tip(_))) | Ok(Err(_)) | Err(_) => {
-                Err(ErrorObject::owned(0, error, None::<()>))
+                Err(ErrorObject::new(0, error))
             }
             Ok(Ok(_)) => unreachable!("unmatched response to a tip request"),
         }
@@ -1806,9 +1845,13 @@ where
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
         };
+        // Block gossip sizes its advert fan-out from this. Sizing walks every transaction, so it
+        // runs only after the reservation rejects duplicate and over-capacity submissions.
+        let size = block.zcash_serialized_size();
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
-            block: block.clone(),
+            block: block.clone().into(),
+            size,
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -1838,9 +1881,11 @@ where
                         && optimistic_block_inventory
                     {
                         if let Some(registration) = pending_blocks.insert(block.clone()) {
-                            let event = MinedBlockEvent::Early {
+                            let event = EarlyMinedBlock {
+                                admission: admission.clone(),
                                 hash: block_hash,
                                 height,
+                                size,
                                 submitted_at,
                                 submission,
                                 pending: registration.signal(),
@@ -1864,23 +1909,7 @@ where
                 );
             }
 
-            if verification_result.is_ok() {
-                if mined_block_sender
-                    .send(MinedBlockEvent::Committed {
-                        hash: block_hash,
-                        height,
-                    })
-                    .is_err()
-                {
-                    metrics::counter!("mining.optimistic_inventory.final_send_failures")
-                        .increment(1);
-                    tracing::warn!(
-                        ?block_hash,
-                        ?height,
-                        "could not send the final mined-block event"
-                    );
-                }
-            } else if early_sent {
+            if verification_result.is_err() && early_sent {
                 metrics::counter!("mining.optimistic_inventory.post_admission_failures")
                     .increment(1);
                 tracing::warn!(
@@ -1893,10 +1922,9 @@ where
         });
 
         let block_verifier_router_response = lifecycle.await.map_err(|error| {
-            ErrorObject::owned(
-                ErrorCode::InternalError.code(),
+            ErrorObject::new(
+                ErrorCode::InternalError,
                 format!("mined block lifecycle task failed: {error}"),
-                None::<()>,
             )
         })?;
 
@@ -2391,9 +2419,12 @@ where
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => {
-                    Ok(GetBlockResponse::Raw(block.into()))
-                }
+                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
+                    block
+                        .zcash_serialize_to_vec()
+                        .expect("serialization to memory cannot fail")
+                        .into(),
+                )),
                 zakura_state::ReadResponse::Block(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
@@ -2481,14 +2512,14 @@ where
                 ),
                 zakura_state::ReadResponse::BlockAndSize(block_and_size) => {
                     let (block, size) = block_and_size.ok_or_misc_error("Block not found")?;
-                    let block_time = block.header.time;
+                    let block_time = block.header().time;
                     let transactions = block
-                        .transactions
-                        .iter()
+                        .view()
+                        .transactions()
                         .map(|tx| {
                             GetBlockTransaction::Object(Box::new(
                                 TransactionObject::from_transaction(
-                                    tx.clone(),
+                                    tx,
                                     Some(height),
                                     Some(confirmations),
                                     &network,
@@ -2629,18 +2660,28 @@ where
             .clone()
             .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
             .await
-            .map_err(|_| "block height not in best chain")
-            .map_error(
-                // ## Compatibility with `zcashd`.
-                //
-                // Since this function is reused by getblock(), we return the errors
-                // expected by it (they differ whether a hash or a height was passed).
-                if hash_or_height.hash().is_some() {
-                    server::error::LegacyCode::InvalidAddressOrKey
+            .map_err(|error| {
+                if is_read_capacity_refusal(&*error) {
+                    // A capacity refusal says nothing about the block, so the caller can retry.
+                    ErrorObject::new(
+                        server::error::LegacyCode::OutOfMemory,
+                        "state read capacity is temporarily exhausted, retry later",
+                    )
                 } else {
-                    server::error::LegacyCode::InvalidParameter
-                },
-            )?
+                    // ## Compatibility with `zcashd`.
+                    //
+                    // Since this function is reused by getblock(), we return the errors
+                    // expected by it (they differ whether a hash or a height was passed).
+                    ErrorObject::new(
+                        if hash_or_height.hash().is_some() {
+                            server::error::LegacyCode::InvalidAddressOrKey
+                        } else {
+                            server::error::LegacyCode::InvalidParameter
+                        },
+                        "block height not in best chain",
+                    )
+                }
+            })?
         else {
             panic!("unexpected response to BlockHeader request")
         };
@@ -2854,7 +2895,7 @@ where
                     .collect();
 
                 // Sort returned transaction IDs in numeric/string order.
-                tx_ids.sort();
+                tx_ids.sort_unstable();
 
                 Ok(GetRawMempoolResponse::TxIds(tx_ids))
             }
@@ -2959,7 +3000,7 @@ where
                             Some(mined.block_time),
                         ),
                         _ => {
-                            let raw_tx: Arc<Transaction> = tx.into();
+                            let raw_tx: TransactionHandle = tx.into();
                             (raw_tx, None, None, None)
                         }
                     };
@@ -3023,7 +3064,7 @@ where
                     }
                 }
             } else {
-                let tx: Arc<Transaction> = tx.into();
+                let tx: TransactionHandle = tx.into();
                 let hex = tx.into();
                 GetRawTransactionResponse::Raw(hex)
             }),
@@ -3047,39 +3088,37 @@ where
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
 
-        // Fetch the block referenced by [`hash_or_height`] from the state.
+        // Get the header of the block that [`hash_or_height`] identifies from the state.
         //
         // # Concurrency
         //
         // For consistency, this lookup must be performed first, then all the other lookups must
         // be based on the hash.
-        //
-        // TODO: If this RPC is called a lot, just get the block header, rather than the whole block.
-        let block = match call_service(
-            &mut read_state,
-            zakura_state::ReadRequest::Block(hash_or_height),
-        )
-        .await?
+        let response = match read_state
+            .clone()
+            .oneshot(zakura_state::ReadRequest::BlockHeader(hash_or_height))
+            .await
         {
-            zakura_state::ReadResponse::Block(Some(block)) => block,
-            zakura_state::ReadResponse::Block(None) => {
+            Ok(response) => response,
+            Err(error) if error.is::<zakura_state::BlockHeaderNotFound>() => {
                 // Reference for the legacy error code:
                 // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/blockchain.cpp#L629>
                 return Err("the requested block is not in the main chain")
                     .map_error(server::error::LegacyCode::InvalidParameter);
             }
-            _ => unreachable!("unmatched response to a block request"),
+            Err(error) => return Err(error).map_misc_error(),
+        };
+        let zakura_state::ReadResponse::BlockHeader {
+            header,
+            hash,
+            height,
+            ..
+        } = response
+        else {
+            unreachable!("unmatched response to a block header request")
         };
 
-        let hash = hash_or_height
-            .hash_or_else(|_| Some(block.hash()))
-            .expect("block hash");
-
-        let height = hash_or_height
-            .height_or_else(|_| block.coinbase_height())
-            .expect("verified blocks have a coinbase height");
-
-        let time = u32::try_from(block.header.time.timestamp())
+        let time = u32::try_from(header.time.timestamp())
             .expect("Timestamps of valid blocks always fit into u32.");
 
         let sapling = if network.is_nu_active(consensus::NetworkUpgrade::Sapling, height.into()) {
@@ -3228,10 +3267,9 @@ where
                 subtrees,
             })
         } else {
-            Err(ErrorObject::owned(
-                server::error::LegacyCode::Misc.into(),
+            Err(ErrorObject::new(
+                server::error::LegacyCode::Misc,
                 format!("invalid pool name, must be one of: {POOL_LIST:?}").as_str(),
-                None::<()>,
             ))
         }
     }
@@ -3352,24 +3390,21 @@ where
         if self.network.is_regtest() {
             match unix::raise_interrupt() {
                 Ok(_) => Ok("Zakura server stopping".to_string()),
-                Err(error) => Err(ErrorObject::owned(
-                    ErrorCode::InternalError.code(),
+                Err(error) => Err(ErrorObject::new(
+                    ErrorCode::InternalError,
                     format!("Failed to shut down: {error}").as_str(),
-                    None::<()>,
                 )),
             }
         } else {
-            Err(ErrorObject::borrowed(
-                ErrorCode::MethodNotFound.code(),
+            Err(ErrorObject::new(
+                ErrorCode::MethodNotFound,
                 "stop is only available on regtest networks",
-                None,
             ))
         }
         #[cfg(target_os = "windows")]
-        Err(ErrorObject::borrowed(
-            ErrorCode::MethodNotFound.code(),
+        Err(ErrorObject::new(
+            ErrorCode::MethodNotFound,
             "stop is not available in windows targets",
-            None,
         ))
     }
 
@@ -3391,10 +3426,9 @@ where
 
         match response {
             zakura_state::ReadResponse::BlockHash(Some(hash)) => Ok(GetBlockHashResponse(hash)),
-            zakura_state::ReadResponse::BlockHash(None) => Err(ErrorObject::borrowed(
-                server::error::LegacyCode::InvalidParameter.into(),
+            zakura_state::ReadResponse::BlockHash(None) => Err(ErrorObject::new(
+                server::error::LegacyCode::InvalidParameter,
                 "Block not found",
-                None,
             )),
             _ => unreachable!("unmatched response to a block request"),
         }
@@ -3412,7 +3446,6 @@ where
         // Clone Services
         let mempool = self.mempool.clone();
         let mut latest_chain_tip = self.latest_chain_tip.clone();
-        let sync_status = self.gbt.sync_status();
         let read_state = self.read_state.clone();
 
         if let Some(HexData(block_proposal_bytes)) = parameters
@@ -3424,11 +3457,10 @@ where
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
-                sync_status,
+                self.gbt.prepared_candidates(),
                 parameters
                     .as_ref()
-                    .and_then(|params| params.work_id.as_deref())
-                    .map(|work_id| (self.gbt.prepared_candidates(), work_id)),
+                    .and_then(|params| params.work_id.as_deref()),
             )
             .await;
         }
@@ -3470,7 +3502,7 @@ where
                 //
                 // Optional TODO:
                 // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                check_synced_to_tip(&self.network, latest_chain_tip.clone())?;
                 // TODO: return an error if we have no peers, like `zcashd` does,
                 //       and add a developer config that mines regardless of how many peers we have.
                 // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
@@ -3502,6 +3534,33 @@ where
                 else {
                     continue;
                 };
+
+                // A long poll whose ID names an older tip has missed the tip change it waits for:
+                // the client sent it after the change, or this loop came back around after it.
+                // Answer the way the tip arm below does, instead of waiting for the mempool to
+                // process the new block and then building a full template.
+                if client_long_poll_id
+                    .as_ref()
+                    .is_some_and(|client_long_poll_id| {
+                        !LongPollInput::new(tip_height, tip_hash, max_time, vec![])
+                            .generate_id()
+                            .same_tip(client_long_poll_id)
+                    })
+                {
+                    if let Some(template) = self
+                        .new_tip_template(
+                            None,
+                            miner_params,
+                            &chain_info,
+                            &rejection_state,
+                            client_long_poll_id.as_ref(),
+                        )
+                        .await?
+                    {
+                        return Ok(template);
+                    }
+                    continue 'rebuild;
+                }
 
                 // Fetch the mempool data for the block template:
                 // - if the mempool transactions change, we might return from long polling.
@@ -3618,7 +3677,7 @@ where
 
                     let _ = wait_for_new_tip.await;
 
-                    Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
+                    Ok::<_, ErrorObject>(precomputed_coinbase)
                 };
 
                 // Wait for the template's time range to expire. On testnet, minimum difficulty
@@ -3687,18 +3746,6 @@ where
                         else {
                             continue;
                         };
-                        let mut server_long_poll_id = LongPollInput::new(
-                            chain_info.tip_height,
-                            chain_info.tip_hash,
-                            chain_info.max_time,
-                            vec![]
-                        )
-                        .generate_id();
-                        server_long_poll_id.revision = rejection_state.revision;
-
-                        let submit_old = client_long_poll_id
-                            .as_ref()
-                            .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
 
                         // Discard the precomputed coinbase if our `+2` guess was wrong
                         // (multi-block advance, reorg, or spurious notification) — its
@@ -3708,19 +3755,16 @@ where
                             .then_some(precomputed_coinbase)
                             .flatten();
 
-                        // Build an empty block on the new tip. After ZIP 234 activation,
-                        // its proof must wait for the new parent's pools; build it off the
-                        // async worker so other RPC requests can continue.
-                        let template = self.build_mining_template(
-                            precomputed_coinbase,
-                            miner_params,
-                            &chain_info,
-                            server_long_poll_id,
-                            vec![],
-                            submit_old,
-                        )
-                        .await?;
-                        if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
+                        if let Some(template) = self
+                            .new_tip_template(
+                                precomputed_coinbase,
+                                miner_params,
+                                &chain_info,
+                                &rejection_state,
+                                client_long_poll_id.as_ref(),
+                            )
+                            .await?
+                        {
                             return Ok(template);
                         }
                         continue 'rebuild;
@@ -3805,11 +3849,7 @@ where
             }
         }
 
-        Err(ErrorObject::owned(
-            0,
-            "template parent changed; retry",
-            None::<()>,
-        ))
+        Err(ErrorObject::new(0, "template parent changed; retry"))
     }
 
     async fn submit_block(
@@ -3820,23 +3860,26 @@ where
         _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let submitted_at = std::time::Instant::now();
-        let block: Block = match block_bytes.zcash_deserialize_into() {
-            Ok(block) => block,
-            Err(error) => {
-                tracing::info!(
-                    ?error,
-                    "submit block failed: block bytes could not be deserialized into a structurally valid block"
-                );
+        let block = match self
+            .gbt
+            .prepared_candidates()
+            .decode_submitted(&block_bytes)
+        {
+            Some(block) => block,
+            None => match block_bytes.zcash_deserialize_into::<Block>() {
+                Ok(block) => Arc::new(block),
+                Err(error) => {
+                    tracing::info!(
+                        ?error,
+                        "submit block failed: block bytes could not be deserialized into a structurally valid block"
+                    );
 
-                return Ok(SubmitBlockErrorResponse::Rejected.into());
-            }
+                    return Ok(SubmitBlockErrorResponse::Rejected.into());
+                }
+            },
         };
-        self.run_mined_block_lifecycle(
-            Arc::new(block),
-            submitted_at,
-            MinedBlockSubmission::FullBlock,
-        )
-        .await
+        self.run_mined_block_lifecycle(block, submitted_at, MinedBlockSubmission::FullBlock)
+            .await
     }
 
     async fn submit_solution(
@@ -3966,6 +4009,14 @@ where
         Ok(solution_rate.min(U256::from(u64::MAX)).as_u64())
     }
 
+    async fn get_network_hash_ps(
+        &self,
+        num_blocks: Option<i32>,
+        height: Option<i32>,
+    ) -> Result<u64> {
+        self.get_network_sol_ps(num_blocks, height).await
+    }
+
     async fn get_network_info(&self) -> Result<GetNetworkInfoResponse> {
         let version = GetInfoResponse::version_from_string(&self.build_version)
             .expect("invalid version string");
@@ -4050,7 +4101,7 @@ where
 
     async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse> {
         Ok(GetStandardFeeResponse {
-            standard_fee: transaction::zip317::MARGINAL_FEE,
+            standard_fee: transaction::zip317::MARGINAL_FEE.max(1_000),
             version: 0,
         })
     }
@@ -4077,10 +4128,9 @@ where
             )
             .await
             .map_err(|_| {
-                ErrorObject::owned(
-                    server::error::LegacyCode::Misc.into(),
+                ErrorObject::new(
+                    server::error::LegacyCode::Misc,
                     "timed out waiting for parent block information",
-                    None::<()>,
                 )
             })??
             else {
@@ -4119,7 +4169,7 @@ where
             });
 
         // Use the same funding stream order as zcashd
-        funding_streams.sort_by_key(|(receiver, _funding_stream)| {
+        funding_streams.sort_unstable_by_key(|(receiver, _funding_stream)| {
             ZCASHD_FUNDING_STREAM_ORDER
                 .iter()
                 .position(|zcashd_receiver| zcashd_receiver == receiver)
@@ -4251,10 +4301,9 @@ where
             Ok(zakura_state::Response::Precious) => Ok(()),
             Ok(_) => unreachable!("unmatched response to a precious block request"),
             Err(error) => match error.downcast_ref::<zakura_state::PreciousError>() {
-                Some(zakura_state::PreciousError::BlockNotFound(_)) => Err(ErrorObject::owned(
-                    server::error::LegacyCode::InvalidAddressOrKey.into(),
+                Some(zakura_state::PreciousError::BlockNotFound(_)) => Err(ErrorObject::new(
+                    server::error::LegacyCode::InvalidAddressOrKey,
                     "Block not found",
-                    None::<()>,
                 )),
                 _ => Err(error).map_misc_error(),
             },
@@ -4266,10 +4315,9 @@ where
         let network = self.network.clone();
 
         if !network.disable_pow() {
-            return Err(ErrorObject::borrowed(
+            return Err(ErrorObject::new(
                 0,
                 "generate is only supported on networks where PoW is disabled",
-                None,
             ));
         }
 
@@ -4283,11 +4331,7 @@ where
             let block_template = rpc.get_block_template(None).await.map_misc_error()?;
 
             let GetBlockTemplateResponse::TemplateMode(block_template) = block_template else {
-                return Err(ErrorObject::borrowed(
-                    0,
-                    "error generating block template",
-                    None,
-                ));
+                return Err(ErrorObject::new(0, "error generating block template"));
             };
 
             let proposal_block = proposal_block_from_template(
@@ -4307,10 +4351,9 @@ where
             match r {
                 SubmitBlockResponse::Accepted => { /* pass */ }
                 SubmitBlockResponse::ErrorResponse(response) => {
-                    return Err(ErrorObject::owned(
-                        server::error::LegacyCode::Misc.into(),
+                    return Err(ErrorObject::new(
+                        server::error::LegacyCode::Misc,
                         format!("block was rejected: {response:?}"),
-                        None::<()>,
                     ));
                 }
             }
@@ -4333,19 +4376,17 @@ where
                     if self.address_book.clone().add_peer(addr) {
                         Ok(())
                     } else {
-                        return Err(ErrorObject::owned(
-                            server::error::LegacyCode::ClientNodeAlreadyAdded.into(),
+                        return Err(ErrorObject::new(
+                            server::error::LegacyCode::ClientNodeAlreadyAdded,
                             format!("peer address was already present in the address book: {addr}"),
-                            None::<()>,
                         ));
                     }
                 }
             }
         } else {
-            return Err(ErrorObject::owned(
-                ErrorCode::InvalidParams.code(),
+            return Err(ErrorObject::new(
+                ErrorCode::InvalidParams,
                 "addnode command is only supported on regtest",
-                None::<()>,
             ));
         }
     }
@@ -4481,7 +4522,7 @@ where
 
 /// Response to a `getinfo` RPC request.
 ///
-/// See the notes for the [`Rpc::get_info` method].
+/// See the notes for the [`RpcServer::get_info` method].
 #[allow(clippy::too_many_arguments)]
 #[derive(
     Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
@@ -4748,7 +4789,7 @@ where
 
 /// Response to a `getblockchaininfo` RPC request.
 ///
-/// See the notes for the [`Rpc::get_blockchain_info` method].
+/// See the notes for the [`RpcServer::get_blockchain_info` method].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters)]
 pub struct GetBlockchainInfoResponse {
     /// Current network name as defined in BIP70 (main, test, regtest)
@@ -5097,7 +5138,7 @@ impl GetBlockchainInfoResponse {
 }
 
 /// A request for [`RpcServer::get_address_balance`].
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(from = "DGetAddressBalanceRequest")]
 pub struct GetAddressBalanceRequest {
     /// A list of transparent address strings.
@@ -5118,7 +5159,7 @@ impl From<DGetAddressBalanceRequest> for GetAddressBalanceRequest {
 }
 
 /// An intermediate type used to deserialize [`GetAddressBalanceRequest`].
-#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Deserialize)]
 #[serde(untagged)]
 enum DGetAddressBalanceRequest {
     /// A list of address strings.
@@ -5190,16 +5231,7 @@ pub struct GetAddressBalanceResponse {
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Deserialize,
-    serde::Serialize,
-    Getters,
-    CopyGetters,
-    new,
-    JsonSchema,
+    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, CopyGetters, new,
 )]
 #[serde(from = "DGetAddressUtxosRequest")]
 pub struct GetAddressUtxosRequest {
@@ -5232,7 +5264,7 @@ impl From<DGetAddressUtxosRequest> for GetAddressUtxosRequest {
 }
 
 /// An intermediate type used to deserialize [`GetAddressUtxosRequest`].
-#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum DGetAddressUtxosRequest {
     /// A single address string.
@@ -5358,7 +5390,7 @@ impl TipConsensusBranch {
 ///
 /// Contains the hex-encoded hash of the sent transaction.
 ///
-/// See the notes for the [`Rpc::send_raw_transaction` method].
+/// See the notes for the [`RpcServer::send_raw_transaction` method].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SendRawTransactionResponse(#[serde(with = "hex")] transaction::Hash);
 
@@ -5747,7 +5779,7 @@ impl Default for GetBlockHashResponse {
 
 /// Response to a `getrawtransaction` RPC request.
 ///
-/// See the notes for the [`Rpc::get_raw_transaction` method].
+/// See the notes for the [`RpcServer::get_raw_transaction` method].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum GetRawTransactionResponse {
@@ -5792,7 +5824,7 @@ pub struct GetAddressUtxosResponseObject {
 
 /// A UTXO returned by the `getaddressutxos` RPC request.
 ///
-/// See the notes for the [`Rpc::get_address_utxos` method].
+/// See the notes for the [`RpcServer::get_address_utxos` method].
 #[derive(
     Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, CopyGetters, new,
 )]
@@ -5869,9 +5901,7 @@ impl Utxo {
 /// Parameters of [`RpcServer::get_address_tx_ids`] RPC method.
 ///
 /// See [`RpcServer::get_address_tx_ids`] for more details.
-#[derive(
-    Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new, JsonSchema,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]
 #[serde(from = "DGetAddressTxIdsRequest")]
 pub struct GetAddressTxIdsRequest {
     /// A list of addresses. The RPC method will get transactions IDs that sent or received
@@ -5919,7 +5949,7 @@ impl From<DGetAddressTxIdsRequest> for GetAddressTxIdsRequest {
 }
 
 /// An intermediate type used to deserialize [`GetAddressTxIdsRequest`].
-#[derive(Debug, serde::Deserialize, JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(untagged)]
 enum DGetAddressTxIdsRequest {
     /// A single address string.
@@ -6049,10 +6079,9 @@ fn build_height_range(
     };
 
     if start > end {
-        return Err(ErrorObject::owned(
-            ErrorCode::InvalidParams.code(),
+        return Err(ErrorObject::new(
+            ErrorCode::InvalidParams,
             format!("start {start:?} must be less than or equal to end {end:?}"),
-            None::<()>,
         ));
     }
 
@@ -6068,18 +6097,13 @@ fn build_height_range(
 // TODO: also use this function in `get_block` and `z_get_treestate`
 pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> {
     if index >= 0 {
-        let height = index.try_into().map_err(|_| {
-            ErrorObject::borrowed(
-                ErrorCode::InvalidParams.code(),
-                "Index conversion failed",
-                None,
-            )
-        })?;
+        let height = index
+            .try_into()
+            .map_err(|_| ErrorObject::new(ErrorCode::InvalidParams, "Index conversion failed"))?;
         if height > tip_height.0 {
-            return Err(ErrorObject::borrowed(
-                ErrorCode::InvalidParams.code(),
+            return Err(ErrorObject::new(
+                ErrorCode::InvalidParams,
                 "Provided index is greater than the current tip",
-                None,
             ));
         }
         Ok(Height(height))
@@ -6087,42 +6111,31 @@ pub fn height_from_signed_int(index: i32, tip_height: Height) -> Result<Height> 
         // `index + 1` can't overflow, because `index` is always negative here.
         let height = i32::try_from(tip_height.0)
             .map_err(|_| {
-                ErrorObject::borrowed(
-                    ErrorCode::InvalidParams.code(),
-                    "Tip height conversion failed",
-                    None,
-                )
+                ErrorObject::new(ErrorCode::InvalidParams, "Tip height conversion failed")
             })?
             .checked_add(index + 1);
 
         let sanitized_height = match height {
             None => {
-                return Err(ErrorObject::borrowed(
-                    ErrorCode::InvalidParams.code(),
+                return Err(ErrorObject::new(
+                    ErrorCode::InvalidParams,
                     "Provided index is not valid",
-                    None,
                 ));
             }
             Some(h) => {
                 if h < 0 {
-                    return Err(ErrorObject::borrowed(
-                        ErrorCode::InvalidParams.code(),
+                    return Err(ErrorObject::new(
+                        ErrorCode::InvalidParams,
                         "Provided negative index ends up with a negative height",
-                        None,
                     ));
                 }
                 let h: u32 = h.try_into().map_err(|_| {
-                    ErrorObject::borrowed(
-                        ErrorCode::InvalidParams.code(),
-                        "Height conversion failed",
-                        None,
-                    )
+                    ErrorObject::new(ErrorCode::InvalidParams, "Height conversion failed")
                 })?;
                 if h > tip_height.0 {
-                    return Err(ErrorObject::borrowed(
-                        ErrorCode::InvalidParams.code(),
+                    return Err(ErrorObject::new(
+                        ErrorCode::InvalidParams,
                         "Provided index is greater than the current tip",
-                        None,
                     ));
                 }
 
@@ -6288,7 +6301,7 @@ where
 }
 
 /// Commands for the `addnode` RPC method.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AddNodeCommand {
     /// Add a node to the address book.
     #[serde(rename = "add")]
@@ -6297,7 +6310,7 @@ pub enum AddNodeCommand {
 
 /// Response to a `gettxout` RPC request.
 ///
-/// See the notes for the [`Rpc::get_tx_out` method].
+/// See the notes for the [`RpcServer::get_tx_out` method].
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct GetTxOutResponse(Option<types::transaction::OutputObject>);

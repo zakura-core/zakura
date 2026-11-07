@@ -32,10 +32,6 @@ use UnminedTxId::*;
 #[cfg(any(test, feature = "proptest-impl"))]
 use proptest_derive::Arbitrary;
 
-// Documentation-only
-#[allow(unused_imports)]
-use crate::block::MAX_BLOCK_BYTES;
-
 pub mod zip317;
 
 /// The minimum cost value for a transaction in the mempool.
@@ -376,7 +372,7 @@ pub struct VerifiedUnminedTx {
 
     /// The number of conventional actions for `transaction`, as defined by [ZIP-317].
     ///
-    /// The number of actions is limited by [`MAX_BLOCK_BYTES`], so it fits in a u32.
+    /// The number of actions is limited by [`MAX_BLOCK_BYTES`](crate::block::MAX_BLOCK_BYTES), so it fits in a u32.
     ///
     /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
     pub conventional_actions: u32,
@@ -384,7 +380,7 @@ pub struct VerifiedUnminedTx {
     /// The number of unpaid actions for `transaction`,
     /// as defined by [ZIP-317] for block production.
     ///
-    /// The number of actions is limited by [`MAX_BLOCK_BYTES`], so it fits in a u32.
+    /// The number of actions is limited by [`MAX_BLOCK_BYTES`](crate::block::MAX_BLOCK_BYTES), so it fits in a u32.
     ///
     /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
     pub unpaid_actions: u32,

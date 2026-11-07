@@ -111,54 +111,6 @@ pub struct GetTreestateResponse {
     ironwood: Treestate,
 }
 
-impl GetTreestateResponse {
-    /// Constructs [`Treestate`] from its constituent parts.
-    #[deprecated(note = "Use `new` instead.")]
-    pub fn from_parts(
-        hash: Hash,
-        height: Height,
-        time: u32,
-        sapling: Option<Vec<u8>>,
-        orchard: Option<Vec<u8>>,
-    ) -> Self {
-        let sapling = Treestate {
-            commitments: Commitments {
-                final_state: sapling,
-                final_root: None,
-            },
-        };
-        let orchard = Treestate {
-            commitments: Commitments {
-                final_state: orchard,
-                final_root: None,
-            },
-        };
-        Self {
-            hash,
-            height,
-            time,
-            sprout: None,
-            sapling,
-            orchard,
-            // This deprecated compatibility helper only accepts Sapling and
-            // Orchard tree bytes, so it cannot synthesize an Ironwood tree.
-            ironwood: Default::default(),
-        }
-    }
-
-    /// Returns the contents of ['GetTreeState'].
-    #[deprecated(note = "Use getters instead.")]
-    pub fn into_parts(self) -> (Hash, Height, u32, Option<Vec<u8>>, Option<Vec<u8>>) {
-        (
-            self.hash,
-            self.height,
-            self.time,
-            self.sapling.commitments.final_state,
-            self.orchard.commitments.final_state,
-        )
-    }
-}
-
 impl Default for GetTreestateResponse {
     fn default() -> Self {
         Self {
@@ -182,14 +134,6 @@ pub struct Treestate {
     /// hex-encoded.
     #[getset(get = "pub")]
     commitments: Commitments,
-}
-
-impl Treestate {
-    /// Returns a reference to the commitments.
-    #[deprecated(note = "Use `commitments()` instead.")]
-    pub fn inner(&self) -> &Commitments {
-        self.commitments()
-    }
 }
 
 impl Default for Treestate {
@@ -230,12 +174,4 @@ pub struct Commitments {
     #[serde(rename = "finalState")]
     #[getset(get = "pub")]
     final_state: Option<Vec<u8>>,
-}
-
-impl Commitments {
-    /// Returns a reference to the optional `final_state`.
-    #[deprecated(note = "Use `final_state()` instead.")]
-    pub fn inner(&self) -> &Option<Vec<u8>> {
-        &self.final_state
-    }
 }

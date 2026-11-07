@@ -259,6 +259,49 @@ class NodeBuilder:
         return deploy.Node(**data)
 
 
+class NetworkSysctlTests(NodeBuilder, unittest.TestCase):
+    def test_sysctl_file_raises_udp_socket_buffers(self):
+        settings = {}
+        for line in deploy.NETWORK_SYSCTL_CONF.read_text().splitlines():
+            if line.strip() and not line.startswith("#"):
+                key, value = (part.strip() for part in line.split("=", 1))
+                settings[key] = int(value)
+        # netwatch requests 7 MiB buffers for the QUIC socket; the caps must admit them.
+        for key in ("rmem_max", "wmem_max"):
+            self.assertGreaterEqual(settings[f"net.core.{key}"], 7 << 20)
+        self.assertNotIn("net.core.rmem_default", settings)
+        self.assertNotIn("net.core.wmem_default", settings)
+        self.assertEqual(settings["net.ipv4.tcp_slow_start_after_idle"], 0)
+
+    def test_deploy_installs_sysctls_before_the_node(self):
+        node = self.node(manage_config=False)
+        events = []
+
+        def fake_ssh(_node, script):
+            events.append("sysctl" if "sysctl --load" in script else "install")
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(deploy, "load_nodes", return_value=[node]), \
+                mock.patch.object(deploy, "build_nodes", return_value={"": Path("/bin/true")}), \
+                mock.patch.object(deploy, "build_publishers", return_value={}), \
+                mock.patch.object(deploy, "run", return_value=mock.Mock(stdout="/tmp/zakurad-deploy.test")), \
+                mock.patch.object(deploy, "ssh_with_stdin", side_effect=fake_ssh):
+            args = mock.Mock(config="nodes.toml", node=None, force=False, no_restart=False)
+            self.assertEqual(deploy.cmd_deploy(args), 0)
+        self.assertEqual(events, ["sysctl", "install"])
+
+    def test_sysctl_failure_fails_the_node(self):
+        node = self.node(manage_config=False)
+        with mock.patch.object(deploy, "load_nodes", return_value=[node]), \
+                mock.patch.object(deploy, "build_nodes", return_value={"": Path("/bin/true")}), \
+                mock.patch.object(deploy, "build_publishers", return_value={}), \
+                mock.patch.object(deploy, "run", return_value=mock.Mock(stdout="/tmp/zakurad-deploy.test")), \
+                mock.patch.object(deploy, "ssh_with_stdin", return_value=mock.Mock(returncode=1)) as ssh:
+            args = mock.Mock(config="nodes.toml", node=None, force=False, no_restart=False)
+            self.assertEqual(deploy.cmd_deploy(args), 1)
+        ssh.assert_called_once()
+
+
 class MountRenderingTests(NodeBuilder, unittest.TestCase):
     def test_render_service_requires_data_mount_for_data_paths(self):
         service = deploy.render_service(self.node(
@@ -627,6 +670,12 @@ class SharedHostStagingTests(unittest.TestCase):
             raise AssertionError(f"unexpected command: {cmd}")
 
         def fake_install(node, script):
+            if "sysctl --load" in script:
+                stage = re.search(r"^STAGE=(\S+)$", script, re.MULTILINE)[1]
+                with lock:
+                    self.assertEqual(host_files[f"{stage}/zakura-network-sysctl.conf"],
+                                     deploy.NETWORK_SYSCTL_CONF.read_bytes())
+                return mock.Mock(returncode=0)
             uploaded.wait()
             stage = re.search(r"^STAGE=(\S+)$", script, re.MULTILINE)[1]
             config_path = re.search(r"^CONFIG_PATH=(\S+)$", script, re.MULTILINE)[1]
@@ -680,7 +729,7 @@ class SharedHostStagingTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
     def test_install_scripts_read_only_their_staging_directory(self):
-        for script in (deploy.INSTALL_SCRIPT, deploy.PROCESS_INSTALL_SCRIPT,
+        for script in (deploy.NETWORK_SYSCTL_SCRIPT, deploy.INSTALL_SCRIPT, deploy.PROCESS_INSTALL_SCRIPT,
                        deploy.BINARY_ONLY_INSTALL_SCRIPT,
                        deploy.DOCKER_BINARY_ONLY_INSTALL_SCRIPT):
             self.assertIn("STAGE={stage}", script)

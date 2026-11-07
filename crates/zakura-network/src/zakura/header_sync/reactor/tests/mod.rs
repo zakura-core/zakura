@@ -1,10 +1,12 @@
 mod admission;
-mod capacity;
+mod aux_fallback;
+mod closing;
 mod completion;
 mod eviction;
+mod observer;
 mod peer_faults;
 mod port_panics;
-mod serving;
+mod status_offers;
 mod terminal_trace;
 mod timeouts;
 mod vct_repair;
@@ -14,8 +16,36 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{block::genesis::regtest_genesis_block, parameters::Network};
 
-use super::*;
-use crate::zakura::{framed_channel, LOCAL_MAX_MESSAGE_BYTES};
+use super::{machine_tests::committed_snapshot, state::*, *};
+use crate::zakura::{
+    framed_channel,
+    wire_codec::{decode_frame, encode_frame},
+    Frame, LOCAL_MAX_MESSAGE_BYTES,
+};
+
+/// Results that enter the handlers without a storage call, as an external
+/// driver's do.
+impl HeaderSyncReactor {
+    fn handle_header_target_prepared(
+        &mut self,
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        result: HeaderTargetPreparationResult,
+    ) {
+        self.handle_target_prepared(peer, source, owner, result, None);
+    }
+
+    fn handle_header_target_admission_ready(
+        &mut self,
+        peer: ZakuraPeerId,
+        source: zakura_header_chain::SourceId,
+        owner: zakura_header_chain::HeaderSyncWorkOwner,
+        result: HeaderTargetAdmissionResult,
+    ) {
+        self.handle_target_admission(peer, source, owner, result, None);
+    }
+}
 
 fn peer() -> ZakuraPeerId {
     ZakuraPeerId::new(vec![0x71; 32]).expect("the test peer ID has the required length")
@@ -68,13 +98,98 @@ fn invalid_header_failure(
     ))
 }
 
-fn request(request_id: u64, target: block::Hash, locator: block::Hash) -> GetHeaders {
-    GetHeaders {
-        request_id,
-        target_tip_hash: target,
-        locator_hashes: vec![locator],
-        max_header_count: 1,
-        tree_aux_schema: AuxSchema::V1,
+/// What `peer`'s subscriber admits for `page`: through the session's
+/// subscriber when it holds the page's subscription, as the session reader
+/// does, or as admitted when a test seeded the work without one.
+fn admit_page(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId, page: &Headers) -> v9::Admitted {
+    if let Some(handles) = reactor.sessions.get(peer) {
+        let mut subscriber = handles.session.subscriber();
+        if subscriber.live() == Some(page.subscription_id) {
+            let frame = encode_frame(&v9::RegtestMessage::Headers(page.clone()))
+                .expect("the test page encodes");
+            return subscriber
+                .receive_page(page, frame.payload.len())
+                .expect("the test page is conformant");
+        }
+    }
+    v9::Admitted::seeded(page)
+}
+
+impl HeaderSyncReactor {
+    /// Deliver `page` from `peer`'s session `session_id` once its subscriber
+    /// admitted it. See [`admit_page`].
+    fn deliver_page(&mut self, peer: ZakuraPeerId, session_id: u64, page: Headers) {
+        let admitted = admit_page(self, &peer, &page);
+        self.handle_page(peer, session_id, page, admitted);
+    }
+
+    /// Deliver `outcome` from `peer`'s session `session_id` as its subscriber
+    /// admits it, or as admitted when a test seeded the work without one.
+    fn deliver_outcome(&mut self, peer: ZakuraPeerId, session_id: u64, outcome: HeadersOutcome) {
+        let live = self.sessions.get(&peer).and_then(|handles| {
+            let mut subscriber = handles.session.subscriber();
+            (subscriber.live() == Some(outcome.subscription_id)).then(|| {
+                subscriber
+                    .receive_outcome(&outcome)
+                    .expect("the test outcome is conformant")
+            })
+        });
+        let start = v9::Cursor {
+            height: block::Height(0),
+            hash: block::Hash([0; 32]),
+            headers: 0,
+            bytes: 0,
+        };
+        let ended = live
+            .unwrap_or_else(|| v9::Ended::seeded(outcome.subscription_id, outcome.outcome, start));
+        self.handle_outcome(peer, session_id, ended);
+    }
+}
+
+/// The subscription update in `frame`.
+fn update(frame: Frame) -> v9::SubscribeHeaders {
+    match decode_frame::<v9::RegtestMessage>(&frame).expect("the update decodes") {
+        v9::Message::SubscribeHeaders(update) => update,
+        other => panic!("expected a subscription update, got {other:?}"),
+    }
+}
+
+/// The `Status` in `frame`.
+fn decode_status(frame: Frame) -> Status {
+    match decode_frame::<v9::RegtestMessage>(&frame).expect("the status decodes") {
+        v9::Message::Status(status) => status,
+        other => panic!("expected a status, got {other:?}"),
+    }
+}
+
+/// The `Page` event for `page`, admitted by `session`'s subscriber as its
+/// session reader does.
+fn page_event(session: &PeerSession, page: Headers) -> Event {
+    let frame =
+        encode_frame(&v9::RegtestMessage::Headers(page.clone())).expect("the test page encodes");
+    let admitted = session
+        .subscriber()
+        .receive_page(&page, frame.payload.len())
+        .expect("the test page is conformant");
+    Event::Page {
+        peer: session.peer_id().clone(),
+        session_id: session.session_id(),
+        page,
+        admitted,
+    }
+}
+
+/// The `Outcome` event for `outcome`, admitted by `session`'s subscriber as
+/// its session reader does.
+fn outcome_event(session: &PeerSession, outcome: HeadersOutcome) -> Event {
+    let ended = session
+        .subscriber()
+        .receive_outcome(&outcome)
+        .expect("the test outcome is conformant");
+    Event::Outcome {
+        peer: session.peer_id().clone(),
+        session_id: session.session_id(),
+        ended,
     }
 }
 
@@ -97,38 +212,14 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
     startup
 }
 
-fn committed_snapshot(
-    anchor: zakura_header_chain::Frontier,
-) -> zakura_header_chain::EngineSnapshot {
-    zakura_header_chain::EngineSnapshot {
-        mode: zakura_header_chain::EngineMode::Integrated,
-        state_version: zakura_header_chain::StateVersion::new(3),
-        header_generation: zakura_header_chain::HeaderGeneration::new(4),
-        verified_generation: zakura_header_chain::VerifiedGeneration::new(5),
-        frontiers: zakura_header_chain::FrontierSet {
-            finalized: anchor,
-            header_best: anchor,
-            verified_best: anchor,
-        },
-        header_best_score: zakura_header_chain::ChainScore::new(
-            zakura_header_chain::SuffixWork::zero(),
-            anchor.hash,
-        ),
-        oldest_retained_height: anchor.height,
-        alarms: Default::default(),
-    }
-}
-
-fn seed_applying_request(
-    reactor: &mut HeaderSyncReactor,
+/// An applying ordinary round for `peer`'s session `session_id`, toward the
+/// header after `snapshot`'s finalized tip, with that one header staged, and
+/// the target it pursues. Nothing is reserved or started.
+fn applying_request(
     snapshot: &zakura_header_chain::EngineSnapshot,
     peer: ZakuraPeerId,
     session_id: u64,
-) -> (
-    zakura_header_chain::SourceId,
-    zakura_header_chain::HeaderSyncWorkOwner,
-    zakura_header_chain::BranchId,
-) {
+) -> (AdvertisedHeaderTarget, ActiveHeaderRequest) {
     let source = source_id_from_peer(&peer);
     let anchor = snapshot.frontiers.finalized;
     let mut header = *regtest_genesis_block().header;
@@ -160,36 +251,52 @@ fn seed_applying_request(
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(1_u8),
             oldest_retained_height: anchor.height,
             max_headers_per_response: 1,
-            max_inflight_requests: 1,
+            max_subscriptions: 1,
             max_message_bytes: 1_000,
             tree_aux_schema_mask: 0,
         },
     };
+    let mut request = ActiveHeaderRequest::new(
+        HeaderTargetPurpose::Normal,
+        peer,
+        source,
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        owner,
+        advertised.clone(),
+        request_id,
+        1,
+        AuxSchema::None,
+    );
+    request.common_ancestor = Some(anchor);
+    request.entries = vec![HeaderEntry {
+        header,
+        body_size: 0,
+        tree_aux: None,
+    }];
+    request.phase = HeaderTargetPhase::Applying;
+    (advertised, request)
+}
+
+fn seed_applying_request(
+    reactor: &mut HeaderSyncReactor,
+    snapshot: &zakura_header_chain::EngineSnapshot,
+    peer: ZakuraPeerId,
+    session_id: u64,
+) -> (
+    zakura_header_chain::SourceId,
+    zakura_header_chain::HeaderSyncWorkOwner,
+    zakura_header_chain::BranchId,
+) {
+    let (advertised, request) = applying_request(snapshot, peer.clone(), session_id);
+    let (source, owner) = (request.source, request.owner);
     assert_eq!(
         reactor
             .peer_work_queue
-            .stage(peer.clone(), advertised.clone(), PeerWorkPriority::Normal,),
+            .stage(peer.clone(), advertised, PeerWorkPriority::Normal,),
         QueueWorkResult::NeedsLocator
     );
     assert!(reactor.peer_work_queue.reserve_request(&peer, 1));
-    assert!(reactor.peer_work_queue.start(ActiveHeaderRequest {
-        purpose: HeaderTargetPurpose::Normal,
-        peer: peer.clone(),
-        source,
-        target: advertised,
-        sent_locator: zakura_header_chain::HeaderLocator::for_continuation(anchor),
-        request_id,
-        owner,
-        common_ancestor: Some(anchor),
-        entries: vec![HeaderEntry {
-            header,
-            body_size: 0,
-            tree_aux: None,
-        }],
-        phase: HeaderTargetPhase::Applying,
-        max_header_count: 1,
-        tree_aux_schema: AuxSchema::None,
-    }));
+    assert!(reactor.peer_work_queue.start(request));
     reactor.peer_work_queue.set_capacity_for_test(&peer, 1, 1);
     (source, owner, owner.header_authority().branch)
 }

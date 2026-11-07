@@ -24,6 +24,8 @@ use crate::zakura::{
 #[derive(Default, Serialize)]
 pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounting_closed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
@@ -31,6 +33,10 @@ pub(super) struct BlockTraceFields {
     pub height: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_priority: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range_start: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -480,14 +486,6 @@ enum BlockEventDetail {
         hash: String,
     },
     NeededBlocks {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        query_id: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        request_authority: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        read_authority: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        body_anchor_height: Option<u64>,
         range_count: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         range_start: Option<u64>,
@@ -502,18 +500,6 @@ enum BlockEventDetail {
         result: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         verified_block_tip: Option<u64>,
-    },
-    BlockRangeResponseFinished {
-        peer: String,
-        range_start: u64,
-        range_count: u64,
-        expected_count: u64,
-    },
-    BlockRangeResponseReady {
-        peer: String,
-        range_start: u64,
-        range_count: u64,
-        expected_count: u64,
     },
 }
 
@@ -555,26 +541,12 @@ impl BlockEventReceived {
                 verified_block_tip: height(frontiers.verified_block_tip),
                 hash: hash(frontiers.verified_block_hash),
             },
-            BlockSyncEvent::ScopedNeededBlocks {
-                query_id,
-                scope,
-                read_authority,
-                body_anchor,
-                blocks,
-            } => BlockEventDetail::NeededBlocks {
-                query_id: Some(query_id.get()),
-                request_authority: Some(format!("{scope:?}")),
-                read_authority: read_authority.map(|authority| format!("{authority:?}")),
-                body_anchor_height: Some(height(body_anchor.height)),
+            BlockSyncEvent::ScopedNeededBlocks { blocks, .. } => BlockEventDetail::NeededBlocks {
                 range_count: saturating_usize(blocks.len()),
                 range_start: blocks.first().map(|block| height(block.height)),
             },
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => BlockEventDetail::NeededBlocks {
-                query_id: None,
-                request_authority: None,
-                read_authority: None,
-                body_anchor_height: None,
                 range_count: saturating_usize(blocks.len()),
                 range_start: blocks.first().map(|block| height(block.height)),
             },
@@ -590,28 +562,6 @@ impl BlockEventReceived {
                 hash: hash(*event_hash),
                 result: block_apply_result_label(outcome.result()),
                 verified_block_tip: None,
-            },
-            BlockSyncEvent::BlockRangeResponseFinished {
-                peer,
-                start_height,
-                requested_count,
-                returned_count,
-            } => BlockEventDetail::BlockRangeResponseFinished {
-                peer: peer_label(peer),
-                range_start: height(*start_height),
-                range_count: u64::from(*returned_count),
-                expected_count: u64::from(*requested_count),
-            },
-            BlockSyncEvent::BlockRangeResponseReady {
-                peer,
-                start_height,
-                requested_count,
-                blocks,
-            } => BlockEventDetail::BlockRangeResponseReady {
-                peer: peer_label(peer),
-                range_start: height(*start_height),
-                range_count: saturating_usize(blocks.len()),
-                expected_count: u64::from(*requested_count),
             },
         };
         Self {
@@ -636,16 +586,9 @@ pub(super) struct BlockActionDispatched {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BlockActionDetail {
     QueryNeededBlocks {
-        query_id: u64,
-        request_authority: String,
         range_start: u64,
         range_count: u64,
         best_header_tip: u64,
-    },
-    QueryBlocksByHeightRange {
-        peer: String,
-        range_start: u64,
-        range_count: u64,
     },
     SubmitBlock {
         apply_token: u64,
@@ -667,26 +610,15 @@ impl BlockActionDispatched {
     pub(super) fn new(action: &BlockSyncAction) -> Self {
         let detail = match action {
             BlockSyncAction::QueryNeededBlocks {
-                query_id,
-                scope,
                 from,
                 limit,
                 best_header_tip,
                 ..
             } => BlockActionDetail::QueryNeededBlocks {
-                query_id: query_id.get(),
-                request_authority: format!("{scope:?}"),
                 range_start: height(*from),
                 range_count: u64::from(*limit),
                 best_header_tip: height(*best_header_tip),
             },
-            BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                BlockActionDetail::QueryBlocksByHeightRange {
-                    peer: peer_label(peer),
-                    range_start: height(*start),
-                    range_count: u64::from(*count),
-                }
-            }
             BlockSyncAction::SubmitBlock { token, block, .. } => BlockActionDetail::SubmitBlock {
                 apply_token: *token,
                 hash: hash(block.hash()),
@@ -741,15 +673,9 @@ pub(super) fn block_apply_result_label(result: BlockApplyResult) -> &'static str
 fn block_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
-        BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
-        BlockSyncMisbehavior::GetBlocksTooLong => "get_blocks_too_long",
-        BlockSyncMisbehavior::GetBlocksSpam => "get_blocks_spam",
         BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
         BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
-        BlockSyncMisbehavior::SizeMismatch => "size_mismatch",
-        BlockSyncMisbehavior::InvalidStatus => "invalid_status",
-        BlockSyncMisbehavior::UnsolicitedDone => "unsolicited_done",
         BlockSyncMisbehavior::RangeUnavailable => "range_unavailable",
         BlockSyncMisbehavior::StatusSpam => "status_spam",
     }
@@ -757,6 +683,20 @@ fn block_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
 
 pub(super) fn peer(peer: &ZakuraPeerId) -> String {
     peer_label(peer)
+}
+
+/// One request's exact work identity: its header and verified generations, its
+/// branch, its session, and its request ID.
+pub(super) fn request_owner(owner: &zakura_header_chain::BodyWorkOwner) -> String {
+    format!(
+        "{}/{}/{}/{}/{}/{}",
+        owner.header_generation.get(),
+        owner.verified_generation.get(),
+        owner.branch.anchor_hash,
+        owner.branch.target_tip_hash,
+        owner.session_id,
+        owner.request_id,
+    )
 }
 
 pub(super) fn height(height: block::Height) -> u64 {
@@ -930,10 +870,6 @@ mod tests {
             ),
             (
                 BlockEventDetail::NeededBlocks {
-                    query_id: None,
-                    request_authority: None,
-                    read_authority: None,
-                    body_anchor_height: None,
                     range_count: 2,
                     range_start: None,
                 },
@@ -948,24 +884,6 @@ mod tests {
                     verified_block_tip: Some(1),
                 },
                 json!({"kind": "block_apply_finished", "apply_token": 3, "height": 1, "hash": "h", "result": "committed", "verified_block_tip": 1}),
-            ),
-            (
-                BlockEventDetail::BlockRangeResponseFinished {
-                    peer: "p".into(),
-                    range_start: 1,
-                    range_count: 2,
-                    expected_count: 3,
-                },
-                json!({"kind": "block_range_response_finished", "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
-            ),
-            (
-                BlockEventDetail::BlockRangeResponseReady {
-                    peer: "p".into(),
-                    range_start: 1,
-                    range_count: 2,
-                    expected_count: 3,
-                },
-                json!({"kind": "block_range_response_ready", "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
             ),
         ];
 
@@ -984,21 +902,11 @@ mod tests {
         let cases = [
             (
                 BlockActionDetail::QueryNeededBlocks {
-                    query_id: 7,
-                    request_authority: "a".into(),
                     range_start: 1,
                     range_count: 2,
                     best_header_tip: 3,
                 },
-                json!({"kind": "query_needed_blocks", "query_id": 7, "request_authority": "a", "range_start": 1, "range_count": 2, "best_header_tip": 3}),
-            ),
-            (
-                BlockActionDetail::QueryBlocksByHeightRange {
-                    peer: "p".into(),
-                    range_start: 1,
-                    range_count: 2,
-                },
-                json!({"kind": "query_blocks_by_height_range", "peer": "p", "range_start": 1, "range_count": 2}),
+                json!({"kind": "query_needed_blocks", "range_start": 1, "range_count": 2, "best_header_tip": 3}),
             ),
             (
                 BlockActionDetail::SubmitBlock {

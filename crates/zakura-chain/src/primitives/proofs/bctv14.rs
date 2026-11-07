@@ -41,7 +41,7 @@ impl PartialEq for Bctv14Proof {
 impl Eq for Bctv14Proof {}
 
 impl ZcashSerialize for Bctv14Proof {
-    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         writer.write_all(&self.0[..])?;
         Ok(())
     }

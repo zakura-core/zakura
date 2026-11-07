@@ -40,7 +40,7 @@ retention_runs = 10
 cooldown_seconds = 60
 wipe_entries = ["state", "non_finalized_state"]
 preserve_entries = ["network"]
-tracing_filter = "info,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
+tracing_filter = "info"
 
 # Public mainnet Zakura peers used by today's temporary nodes.
 bootstrap_peers = [

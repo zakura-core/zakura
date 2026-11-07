@@ -1,6 +1,6 @@
 //! Startup and auth test bodies for the zcashd-compat integration test suite.
 
-use color_eyre::eyre::Result;
+use eyre::Result;
 
 use super::{
     config::{expected_zakurad_chain_name, expected_zcashd_chain_name},
@@ -24,7 +24,7 @@ pub async fn both_processes_start() -> Result<()> {
         .zakura_client
         .json_result_from_call("getblockchaininfo", "[]")
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("zakurad getblockchaininfo: {e}"))?;
+        .map_err(|e| eyre::eyre!("zakurad getblockchaininfo: {e}"))?;
 
     assert_eq!(
         zebra_info["chain"].as_str(),
@@ -37,7 +37,7 @@ pub async fn both_processes_start() -> Result<()> {
         .zcashd_client
         .json_result_from_call("getblockchaininfo", "[]")
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("zcashd getblockchaininfo: {e}"))?;
+        .map_err(|e| eyre::eyre!("zcashd getblockchaininfo: {e}"))?;
 
     assert_eq!(
         zcashd_info["chain"].as_str(),
@@ -69,12 +69,12 @@ pub async fn sidecar_follows_tip() -> Result<()> {
             .zakura_client
             .json_result_from_call("getbestblockhash", "[]")
             .await
-            .map_err(|e| color_eyre::eyre::eyre!("zakurad getbestblockhash: {e}"))?;
+            .map_err(|e| eyre::eyre!("zakurad getbestblockhash: {e}"))?;
         let zcashd_best: String = setup
             .zcashd_client
             .json_result_from_call("getbestblockhash", "[]")
             .await
-            .map_err(|e| color_eyre::eyre::eyre!("zcashd getbestblockhash: {e}"))?;
+            .map_err(|e| eyre::eyre!("zcashd getbestblockhash: {e}"))?;
 
         assert_eq!(
             zcashd_best, zebra_best,
@@ -86,7 +86,7 @@ pub async fn sidecar_follows_tip() -> Result<()> {
         .zcashd_client
         .json_result_from_call("getpeerinfo", "[]")
         .await
-        .map_err(|e| color_eyre::eyre::eyre!("zcashd getpeerinfo: {e}"))?;
+        .map_err(|e| eyre::eyre!("zcashd getpeerinfo: {e}"))?;
 
     assert_eq!(
         peers.len(),
@@ -135,7 +135,7 @@ pub async fn miner_rpcs_disabled() -> Result<()> {
             .zakura_client
             .json_result_from_call("getblocktemplate", "[]")
             .await
-            .map_err(|e| color_eyre::eyre::eyre!("zakurad getblocktemplate: {e}"))?;
+            .map_err(|e| eyre::eyre!("zakurad getblocktemplate: {e}"))?;
 
         assert!(
             template["height"].is_number(),

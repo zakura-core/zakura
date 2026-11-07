@@ -31,7 +31,7 @@ impl fmt::Debug for Halo2Proof {
 }
 
 impl ZcashSerialize for Halo2Proof {
-    fn zcash_serialize<W: io::Write>(&self, writer: W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
         zcash_serialize_bytes(&self.0, writer)
     }
 }

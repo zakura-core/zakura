@@ -3,9 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use crossbeam_channel::TryRecvError;
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator as _};
+use std::sync::mpsc::TryRecvError;
 use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NonNegative},
     block::{Block, Height},
@@ -59,13 +59,16 @@ impl DiskFormatUpgrade for Upgrade {
         &self,
         initial_finalized_tip_height: Option<zakura_chain::block::Height>,
         db: &crate::ZakuraDb,
-        cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
+        cancel_receiver: &super::CancelReceiver,
     ) -> Result<(), super::FormatChangeError> {
         let Some(initial_finalized_tip_height) = initial_finalized_tip_height else {
             return Ok(());
         };
         let network = db.network();
         let balance_by_transparent_addr = db.address_balance_cf();
+        // A database without transparent indexes has no address balances to add received
+        // amounts to. Block info is still added.
+        let skip_transparent_indexes = db.skips_transparent_indexes();
         let chunk_size = rayon::current_num_threads();
         tracing::info!(chunk_size = ?chunk_size, "adding block info data");
 
@@ -95,7 +98,8 @@ impl DiskFormatUpgrade for Upgrade {
                     // Load the block. This is slow since transaction
                     // parsing is slow.
                     let (block, size) = db
-                        .block_and_size(HashOrHeight::Height(height))
+                        .stored_block_and_size(HashOrHeight::Height(height))
+                        .map(|(block, size)| (Arc::new(block), size))
                         .expect("block info should be in the database");
 
                     // Load the utxos for all the transactions inputs in the block.
@@ -107,7 +111,7 @@ impl DiskFormatUpgrade for Upgrade {
                         for input in tx.inputs() {
                             if let Some(outpoint) = input.outpoint() {
                                 let (tx, h, _) = db
-                                    .transaction(outpoint.hash)
+                                    .stored_transaction(outpoint.hash)
                                     .expect("transaction should be in the database");
                                 let output = tx
                                     .outputs()
@@ -123,7 +127,7 @@ impl DiskFormatUpgrade for Upgrade {
                             }
                         }
 
-                        for output in tx.outputs() {
+                        for output in tx.outputs().iter().filter(|_| !skip_transparent_indexes) {
                             if let Some(address) = output.address(&network) {
                                 // Note: using `empty()` will set the location
                                 // to a dummy value. This only works because the
@@ -255,7 +259,7 @@ impl DiskFormatUpgrade for Upgrade {
     fn validate(
         &self,
         db: &crate::ZakuraDb,
-        cancel_receiver: &crossbeam_channel::Receiver<super::CancelFormatChange>,
+        cancel_receiver: &super::CancelReceiver,
     ) -> Result<Result<(), String>, super::FormatChangeError> {
         let network = db.network();
 
@@ -292,12 +296,18 @@ impl DiskFormatUpgrade for Upgrade {
             return Err(super::FormatChangeError::Cancelled);
         }
 
+        // A database without transparent indexes never stores address balances, so there are no
+        // received balances to check. The block info check above still applies.
+        if db.skips_transparent_indexes() {
+            return Ok(Ok(()));
+        }
+
         // Check that all recipient addresses of transparent transfers in the range have a non-zero received balance.
 
         // Collect the set of addresses that received transparent funds in the last query range (last 1000 blocks).
         let tx_loc_range = TransactionLocation::min_for_height(start_height)..;
         let addresses: HashSet<_> = db
-            .transactions_by_location_range(tx_loc_range)
+            .stored_transactions_by_location_range(tx_loc_range)
             .flat_map(|(_, tx)| tx.outputs().to_vec())
             .filter_map(|output| {
                 if output.value != 0 {

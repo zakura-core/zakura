@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
 };
 
-use color_eyre::eyre::{eyre, Result};
+use eyre::{eyre, Result};
 use tokio::time::sleep;
 #[cfg(target_os = "linux")]
 use zakura_test::command::CommandExt;

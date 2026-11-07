@@ -1,5 +1,6 @@
 //! Manual state-progress probe for blocks packed to the serialized size limit.
 
+use std::sync::Arc;
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -161,7 +162,7 @@ async fn measure(blocking_threads: usize, reserved: usize, inputs_per_transactio
         ("admitted-64", 64, true),
     ] {
         // The probe creates a fresh database for each mode, including its first SST read.
-        let (state, _, _, _) =
+        let crate::InitializedState { state, .. } =
             StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
                 .await
                 .unwrap();
@@ -218,13 +219,15 @@ async fn measure(blocking_threads: usize, reserved: usize, inputs_per_transactio
                     ));
                     reads.push(start.elapsed());
                     let start = Instant::now();
-                    let response = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        probe_state.clone().oneshot(Request::Tip),
-                    )
-                    .await
-                    .expect("buffered state request must complete within one second")
-                    .unwrap();
+                    // Boxing proves the buffered future is `Send` to the spawned probe.
+                    let tip: futures::future::BoxFuture<
+                        'static,
+                        Result<Response, crate::BoxError>,
+                    > = Box::pin(probe_state.clone().oneshot(Request::Tip));
+                    let response = tokio::time::timeout(Duration::from_secs(1), tip)
+                        .await
+                        .expect("buffered state request must complete within one second")
+                        .unwrap();
                     assert!(matches!(response, Response::Tip(_)));
                     tips.push(start.elapsed());
                     let start = Instant::now();

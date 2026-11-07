@@ -1,0 +1,14 @@
+--- a/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
++++ b/crates/zakura-state/src/service/finalized_state/zakura_db/block.rs
+@@ -578,7 +578,10 @@ impl ZakuraDb {
+         let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
+             return Ok(None);
+         };
+-        let transaction = self.decode_transaction(&raw)?;
++        let transaction: TransactionHandle = zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
++            .try_reserve(0)?
++            .retain(Transaction::from_bytes(raw.raw_bytes()))?
++            .into();
+         Ok(Some((transaction, location.height, header.time)))
+     }
+ 

@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
     fmt::HexDebug,
     parameters::Network,
-    serialization::{CompactSize64, TrustedPreallocate, ZcashSerialize, MAX_HEADERS_PER_MESSAGE},
+    serialization::{CompactSize64, TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
     work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 
@@ -151,6 +151,17 @@ pub struct CountedHeader {
     pub header: Arc<Header>,
 }
 
+/// The number of bytes in a serialized header before the Equihash solution:
+/// the Equihash input fields, then the 32-byte nonce.
+pub(crate) const HEADER_BYTES_BEFORE_SOLUTION: usize = Solution::INPUT_LENGTH + 32;
+
+/// The serialized size of a Mainnet or Testnet header, the largest on any
+/// network. Regtest headers are smaller, so a buffer of this size fits any header.
+pub(crate) const MAX_SERIALIZED_HEADER_BYTES: usize = HEADER_BYTES_BEFORE_SOLUTION
+    // Cast safe: SOLUTION_SIZE is the constant 1344, which fits in u64.
+    + CompactSize64::encoded_len(crate::work::equihash::SOLUTION_SIZE as u64)
+    + crate::work::equihash::SOLUTION_SIZE;
+
 /// The Zcash accepted block version.
 ///
 /// The consensus rules do not force the block version to be this value but just equal or greater than it.
@@ -159,21 +170,17 @@ pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
     fn min_serialized_size() -> u64 {
-        // The Equihash input contains the version, hashes, timestamp, and difficulty.
-        const HEADER_FIELDS_BEFORE_NONCE_BYTES: usize = Solution::INPUT_LENGTH;
-        const NONCE_BYTES: usize = 32;
         const ZERO_TRANSACTION_COUNT_BYTES: usize = 1;
 
         // Regtest's 36-byte solution needs a one-byte length prefix. Mainnet
         // and Testnet require 1,344 solution bytes and a three-byte prefix.
         // Use the smallest supported encoding so no valid network is excluded.
         let solution_bytes = crate::work::equihash::REGTEST_SOLUTION_SIZE;
-        let solution_length = CompactSize64::from(
+        let solution_length_prefix = CompactSize64::encoded_len(
             u64::try_from(solution_bytes).expect("fixed Equihash solution sizes fit in u64"),
         );
-        let minimum_bytes = HEADER_FIELDS_BEFORE_NONCE_BYTES
-            + NONCE_BYTES
-            + solution_length.zcash_serialized_size()
+        let minimum_bytes = HEADER_BYTES_BEFORE_SOLUTION
+            + solution_length_prefix
             + solution_bytes
             + ZERO_TRANSACTION_COUNT_BYTES;
         u64::try_from(minimum_bytes).expect("the fixed counted header size fits in u64")

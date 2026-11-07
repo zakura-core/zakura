@@ -9,7 +9,10 @@
 //! A stream whose length is unknown cannot provide this check. A maximum read
 //! limit alone does not tell us how many bytes are actually present.
 
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    ops::{Deref, DerefMut},
+};
 
 use super::{SerializationError, TrustedPreallocate, ZcashDeserialize};
 
@@ -21,6 +24,8 @@ use super::{SerializationError, TrustedPreallocate, ZcashDeserialize};
 pub struct ZcashReader<R> {
     inner: R,
     remaining: Option<usize>,
+    /// Bytes the innermost [`Self::with_limit`] still allows, or `None` without a limit.
+    limit: Option<u64>,
 }
 
 impl<'a, 'b> ZcashReader<&'a mut &'b [u8]> {
@@ -31,6 +36,7 @@ impl<'a, 'b> ZcashReader<&'a mut &'b [u8]> {
         Self {
             inner: bytes,
             remaining,
+            limit: None,
         }
     }
 }
@@ -40,22 +46,25 @@ impl<R: Read> ZcashReader<R> {
         Self {
             inner,
             remaining: None,
+            limit: None,
         }
     }
 
     /// Number of bytes still available, or `None` if the input length is unknown.
     /// A maximum read limit does not make an unknown stream length known.
     pub fn remaining_bytes(&self) -> Option<usize> {
-        self.remaining
+        self.remaining.map(|remaining| match self.limit {
+            Some(limit) => remaining.min(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => remaining,
+        })
     }
 
     /// Decode one value, letting its decoder see how many bytes remain.
+    ///
+    /// The value decodes on this same reader, so nested decoders are not
+    /// instantiated again for a reader type wrapping this one.
     pub fn read_value<T: ZcashDeserialize>(&mut self) -> Result<T, SerializationError> {
-        if self.remaining.is_some() {
-            T::zcash_deserialize_from(self)
-        } else {
-            T::zcash_deserialize(&mut self.inner)
-        }
+        T::zcash_deserialize_from(self)
     }
 
     /// Give a nested decoder permission to read at most `limit` bytes.
@@ -63,13 +72,17 @@ impl<R: Read> ZcashReader<R> {
     ///
     /// If 40 bytes remain and the limit is 100, only 40 bytes are available.
     /// If the stream length is unknown, the limit does not prove any bytes exist.
-    pub fn with_limit(&mut self, limit: u64) -> ZcashReader<io::Take<&mut Self>> {
-        let remaining = self
-            .remaining
-            .map(|remaining| remaining.min(usize::try_from(limit).unwrap_or(usize::MAX)));
-        ZcashReader {
-            inner: Read::take(self, limit),
-            remaining,
+    ///
+    /// The limit lasts until the returned guard is dropped. The guard dereferences
+    /// to this same reader, so nested decoders are not instantiated for a new type.
+    pub fn with_limit(&mut self, limit: u64) -> LimitedReader<'_, R> {
+        let outer_limit = self.limit;
+        let entry_limit = outer_limit.map_or(limit, |outer| outer.min(limit));
+        self.limit = Some(entry_limit);
+        LimitedReader {
+            reader: self,
+            outer_limit,
+            entry_limit,
         }
     }
 
@@ -92,13 +105,58 @@ impl<R: Read> ZcashReader<R> {
 
 impl<R: Read> Read for ZcashReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let length = self
+        // Like `io::Take`, an exhausted limit reports end of input without
+        // touching the inner reader.
+        if self.limit == Some(0) {
+            return Ok(0);
+        }
+        let mut length = self
             .remaining
             .map_or(buf.len(), |remaining| remaining.min(buf.len()));
+        if let Some(limit) = self.limit {
+            length = length.min(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
         let read = self.inner.read(&mut buf[..length])?;
         if let Some(remaining) = &mut self.remaining {
             *remaining = remaining.saturating_sub(read);
         }
+        if let Some(limit) = &mut self.limit {
+            *limit = limit.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+        }
         Ok(read)
+    }
+}
+
+/// A [`ZcashReader`] under a temporary read limit, from [`ZcashReader::with_limit`].
+///
+/// Dropping it restores the enclosing limit, reduced by the bytes read under this one.
+#[derive(Debug)]
+pub struct LimitedReader<'a, R> {
+    reader: &'a mut ZcashReader<R>,
+    outer_limit: Option<u64>,
+    entry_limit: u64,
+}
+
+impl<R> Deref for LimitedReader<'_, R> {
+    type Target = ZcashReader<R>;
+
+    fn deref(&self) -> &Self::Target {
+        self.reader
+    }
+}
+
+impl<R> DerefMut for LimitedReader<'_, R> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.reader
+    }
+}
+
+impl<R> Drop for LimitedReader<'_, R> {
+    fn drop(&mut self) {
+        // Reads only lower the limit, so the current limit never exceeds `entry_limit`.
+        let consumed = self
+            .entry_limit
+            .saturating_sub(self.reader.limit.unwrap_or(self.entry_limit));
+        self.reader.limit = self.outer_limit.map(|outer| outer.saturating_sub(consumed));
     }
 }

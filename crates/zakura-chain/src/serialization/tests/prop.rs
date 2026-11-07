@@ -42,7 +42,7 @@ proptest! {
             // so that if the encoding is different, we'll catch it on the part
             // that's written.
             let mut expect_bytes = bytes;
-            size.zcash_serialize(Cursor::new(&mut expect_bytes[..])).unwrap();
+            size.zcash_serialize(&mut Cursor::new(&mut expect_bytes[..])).unwrap();
 
             prop_assert_eq!(bytes, expect_bytes);
 
@@ -91,7 +91,7 @@ proptest! {
             // so that if the encoding is different, we'll catch it on the part
             // that's written.
             let mut expect_bytes = bytes;
-            s.zcash_serialize(Cursor::new(&mut expect_bytes[..])).unwrap();
+            s.zcash_serialize(&mut Cursor::new(&mut expect_bytes[..])).unwrap();
 
             prop_assert_eq!(bytes, expect_bytes);
         }

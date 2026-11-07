@@ -1,27 +1,39 @@
 //! Renders the generated method table as an OpenRPC document.
 
-use std::borrow::Cow;
-
-use schemars::{generate::SchemaSettings, JsonSchema, Schema, SchemaGenerator};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 use super::{RpcSurface, METHODS};
+
+mod schemas;
 
 const OPENRPC_VERSION: &str = "1.3.2";
 const RESULT_DESCRIPTION: &str = "An OpenRPC document.";
 const RESULT_SCHEMA: &str =
     "https://raw.githubusercontent.com/open-rpc/meta-schema/master/schema.json";
+const COMPONENTS_PATH: &str = "#/components/schemas/";
 
+/// A type that describes its JSON-RPC wire format as a draft-07 JSON Schema.
+///
+/// The schema describes what serde accepts or produces for the type, so an
+/// implementation must change together with the type's serde attributes.
+pub(super) trait RpcSchema {
+    /// The `#/components/schemas/` entry shared by every use of this type, or
+    /// `None` to write the schema inline at each use.
+    const COMPONENT: Option<&'static str> = None;
+
+    /// Returns this type's schema, registering any component schemas it uses.
+    fn schema(generator: &mut Generator) -> Value;
+}
+
+/// The placeholder result type, described by the OpenRPC meta-schema.
 struct ResultSchema;
 
-impl JsonSchema for ResultSchema {
-    fn schema_name() -> Cow<'static, str> {
-        "OpenRPC Schema".into()
-    }
+impl RpcSchema for ResultSchema {
+    const COMPONENT: Option<&'static str> = Some("OpenRPC Schema");
 
-    fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        Schema::new_ref(RESULT_SCHEMA.into())
+    fn schema(_: &mut Generator) -> Value {
+        json!({ "$ref": RESULT_SCHEMA })
     }
 }
 
@@ -34,10 +46,28 @@ pub(crate) struct RpcMethod {
 }
 
 /// Parameter schemas shared across one listener's OpenRPC document.
-pub(super) struct Generator(SchemaGenerator);
+#[derive(Default)]
+pub(super) struct Generator {
+    components: Map<String, Value>,
+}
 
 impl Generator {
-    pub(super) fn param<T: JsonSchema>(
+    /// Returns a reference to `T`'s component schema, or `T`'s inline schema
+    /// if it is not a component.
+    pub(super) fn subschema_for<T: RpcSchema>(&mut self) -> Value {
+        let Some(name) = T::COMPONENT else {
+            return T::schema(self);
+        };
+        if !self.components.contains_key(name) {
+            // Reserve the name first, so a self-referential schema terminates.
+            self.components.insert(name.to_owned(), Value::Null);
+            let schema = T::schema(self);
+            self.components.insert(name.to_owned(), schema);
+        }
+        json!({ "$ref": format!("{COMPONENTS_PATH}{}", name.replace(' ', "%20")) })
+    }
+
+    pub(super) fn param<T: RpcSchema>(
         &mut self,
         name: &'static str,
         description: &'static str,
@@ -48,26 +78,26 @@ impl Generator {
             summary: summary(description),
             description,
             required,
-            schema: self.0.subschema_for::<T>(),
+            schema: self.subschema_for::<T>(),
             deprecated: false,
         }
     }
 
     pub(super) fn result(&mut self, name: &'static str) -> ContentDescriptor {
-        // The existing generated table describes every result with the OpenRPC
-        // meta-schema. Keep that behavior separate from this dependency change.
+        // The generated table describes untyped results with the OpenRPC
+        // meta-schema.
         ContentDescriptor {
             name,
             summary: RESULT_DESCRIPTION,
             description: RESULT_DESCRIPTION,
             required: false,
-            schema: self.0.subschema_for::<ResultSchema>(),
+            schema: self.subschema_for::<ResultSchema>(),
             deprecated: false,
         }
     }
 
     /// Describes a result with the schema of its declared Rust result type.
-    pub(super) fn typed_result<T: JsonSchema>(
+    pub(super) fn typed_result<T: RpcSchema>(
         &mut self,
         name: &'static str,
         description: &'static str,
@@ -77,7 +107,7 @@ impl Generator {
             summary: summary(description),
             description,
             required: false,
-            schema: self.0.subschema_for::<T>(),
+            schema: self.subschema_for::<T>(),
             deprecated: false,
         }
     }
@@ -91,7 +121,7 @@ pub(super) struct ContentDescriptor {
     description: &'static str,
     #[serde(skip_serializing_if = "is_false")]
     required: bool,
-    schema: Schema,
+    schema: Value,
     #[serde(skip_serializing_if = "is_false")]
     deprecated: bool,
 }
@@ -108,11 +138,7 @@ struct Method {
 }
 
 pub(super) fn render(surface: RpcSurface) -> Value {
-    let mut generator = Generator(
-        SchemaSettings::draft07()
-            .with(|settings| settings.definitions_path = "#/components/schemas/".into())
-            .into_generator(),
-    );
+    let mut generator = Generator::default();
     let methods: Vec<_> = METHODS
         .iter()
         .filter(|(name, _)| surface.exposes(name))
@@ -137,7 +163,7 @@ pub(super) fn render(surface: RpcSurface) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
         },
         "methods": methods,
-        "components": { "schemas": generator.0.take_definitions(false) },
+        "components": { "schemas": generator.components },
     })
 }
 

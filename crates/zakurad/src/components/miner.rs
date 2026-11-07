@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::Report;
+use eyre::Report;
 use futures::{stream::FuturesUnordered, StreamExt};
 use tokio::{select, sync::watch, task::JoinHandle, time::sleep};
 use tracing::{Instrument, Span};
@@ -30,6 +30,7 @@ use zakura_chain::{
 use zakura_consensus::router::service_trait::BlockVerifierService;
 use zakura_network::AddressBookPeers;
 use zakura_node_services::mempool::MempoolService;
+use zakura_node_services::task::spawn_erased;
 use zakura_rpc::{
     client::{
         BlockTemplateResponse, BlockTemplateTimeSource,
@@ -145,7 +146,7 @@ where
     AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
 {
     // TODO: spawn an entirely new executor here, so mining is isolated from higher priority tasks.
-    tokio::spawn(init(config.clone(), rpc).in_current_span())
+    spawn_erased(init(config.clone(), rpc).in_current_span())
 }
 
 /// Initialize the miner based on its config.
@@ -189,9 +190,8 @@ where
     // This is particularly important when there are a large number of solver threads.
     let mut abort_handles = Vec::new();
 
-    let template_generator = tokio::task::spawn(
-        generate_block_templates(rpc.clone(), template_sender).in_current_span(),
-    );
+    let template_generator =
+        spawn_erased(generate_block_templates(rpc.clone(), template_sender).in_current_span());
     abort_handles.push(template_generator.abort_handle());
     let template_generator = template_generator.wait_for_panics();
 
@@ -202,7 +202,7 @@ where
             .try_into()
             .expect("just limited to u8::MAX");
 
-        let solver = tokio::task::spawn(
+        let solver = spawn_erased(
             run_mining_solver(solver_id, template_receiver.clone(), rpc.clone()).in_current_span(),
         );
         abort_handles.push(solver.abort_handle());
@@ -775,9 +775,9 @@ mod tests {
         chain_tip_sender.send_best_tip_height(block::Height(1));
         chain_tip_sender.send_best_tip_hash(block.hash());
         chain_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        chain_tip_sender.send_best_tip_block_time(chrono::Utc::now() - chrono::Duration::hours(7));
 
-        let mut sync_status = MockSyncStatus::default();
-        sync_status.set_is_close_to_tip(false);
+        let sync_status = MockSyncStatus::default();
 
         let mempool = Buffer::new(
             MockService::build().for_unit_tests::<
@@ -866,6 +866,7 @@ mod tests {
         tip_sender.send_best_tip_height(height);
         tip_sender.send_best_tip_hash(parent);
         tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        tip_sender.send_best_tip_block_time(chrono::Utc::now());
         let mut sync = MockSyncStatus::default();
         sync.set_is_close_to_tip(true);
         let (mempool_calls, mut calls) = watch::channel(0);

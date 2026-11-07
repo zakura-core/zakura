@@ -6,12 +6,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use zakura_node_services::block_memory::BlockHandle;
 
 use hex::ToHex;
 use zakura_chain::{
     amount::{Amount, DeferredPoolBalanceChange},
     block::{self, Block, Height},
-    serialization::{ZcashDeserializeInto, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashSerialize},
 };
 
 use crate::{
@@ -46,7 +47,7 @@ pub(super) fn restore_backup(
         for block in blocks {
             #[cfg(test)]
             let commit_result = if non_finalized_state
-                .any_chain_contains(&block.block.header.previous_block_hash)
+                .any_chain_contains(&block.block.header().previous_block_hash)
             {
                 non_finalized_state.commit_block(block, finalized_state)
             } else {
@@ -147,7 +148,7 @@ pub(super) async fn run_backup_task(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NonFinalizedBlockBackup {
-    block: Arc<Block>,
+    block: BlockHandle,
     deferred_pool_balance_change: Amount,
 }
 
@@ -186,10 +187,10 @@ impl NonFinalizedBlockBackup {
 
         Ok(Self {
             block: Arc::new(
-                block_bytes
-                    .zcash_deserialize_into()
+                Block::zcash_deserialize_from_slice(&mut &block_bytes[..])
                     .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?,
-            ),
+            )
+            .into(),
             deferred_pool_balance_change: Amount::from_bytes(
                 deferred_pool_balance_change_bytes
                     .try_into()

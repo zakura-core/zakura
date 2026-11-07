@@ -373,9 +373,8 @@ static PARENT_INPUT_READ_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::n
 ///
 /// The check keeps this map while the block's transaction checks run, on top of the copies those
 /// checks already make, so it is kept small. A full 2 MB block of standard 25-byte scripts keeps
-/// at most about 1.2 MB. A block whose inputs all exist but pass this limit, valid or not, gets
-/// [`ParentInputs::Inconclusive`], so its transactions look their inputs up one by one, as they
-/// did before the check returned outputs. A missing input still gets [`ParentInputs::Missing`].
+/// at most about 1.2 MB. Outputs that do not fit are omitted from the returned map, so transaction
+/// checks look up only those outputs again. A missing input still gets [`ParentInputs::Missing`].
 const MAX_KEPT_PARENT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// The result of reading one input in [`read_parent_inputs`].
@@ -393,9 +392,9 @@ enum ParentInputRead {
 /// Reads `outpoints` with `lookup`, which returns an output if it is unspent at the parent.
 ///
 /// Returns [`ParentInputs::Missing`] with the first missing input in `outpoints` order, or
-/// [`ParentInputs::Unspent`] if every input was found and their locking scripts fit in
-/// `max_kept_bytes`, or [`ParentInputs::Inconclusive`] otherwise. Repeated outpoints are read
-/// once, and inputs after one already known to be missing are not read, so an invalid block can't
+/// [`ParentInputs::Unspent`] if every input was found, retaining only outputs whose locking
+/// scripts fit in `max_kept_bytes`. Repeated outpoints are read once, and inputs after one
+/// already known to be missing are not read, so an invalid block can't
 /// make this keep more than `max_kept_bytes` of scripts.
 fn read_parent_inputs(
     outpoints: &[transparent::OutPoint],
@@ -449,7 +448,6 @@ fn read_parent_inputs(
     };
 
     let mut utxos = HashMap::with_capacity(outpoints.len());
-    let mut complete = true;
     for (outpoint, read) in outpoints.iter().zip(reads) {
         match read {
             ParentInputRead::Kept(utxo) => {
@@ -457,20 +455,17 @@ fn read_parent_inputs(
             }
             ParentInputRead::Missing => return ParentInputs::Missing(*outpoint),
             // Skipped inputs only follow a missing one, which returns above.
-            ParentInputRead::Dropped | ParentInputRead::Skipped => complete = false,
+            ParentInputRead::Dropped | ParentInputRead::Skipped => {}
         }
     }
-    if complete {
-        ParentInputs::Unspent(Arc::new(utxos))
-    } else {
-        ParentInputs::Inconclusive
-    }
+    ParentInputs::Unspent(Arc::new(utxos))
 }
 
 /// Checks `outpoints` against the UTXO set at `parent`.
 ///
-/// Returns [`ParentInputs::Unspent`] with every spent output, or [`ParentInputs::Missing`] with
-/// the first missing input in `outpoints` order, as [`read_parent_inputs`] describes. Returns
+/// Returns [`ParentInputs::Unspent`] with a bounded subset of spent outputs, or
+/// [`ParentInputs::Missing`] with the first missing input in `outpoints` order, as
+/// [`read_parent_inputs`] describes. Returns
 /// either one only if `parent` is the finalized tip, or if `parent` is in a non-finalized chain
 /// that continues the finalized tip. Finalization can remove an output that a block after
 /// `parent` spends, so callers must discard the result if the finalized tip changes during this
@@ -692,7 +687,7 @@ mod tests {
         }
     }
 
-    /// Outputs past the byte limit make the check inconclusive, unless an input is missing.
+    /// Crossing the byte limit preserves earlier reads without hiding a missing input.
     #[test]
     fn kept_output_bytes_are_limited() {
         let inputs = outpoints(MIN_WIDE_PARENT_INPUT_READS);
@@ -702,10 +697,23 @@ mod tests {
             read_parent_inputs(&inputs, total, |_| Some(utxo(10))),
             ParentInputs::Unspent(_)
         ));
-        assert_eq!(
-            read_parent_inputs(&inputs, total - 1, |_| Some(utxo(10))),
-            ParentInputs::Inconclusive
+        let ParentInputs::Unspent(kept) =
+            read_parent_inputs(&inputs, total - 1, |_| Some(utxo(10)))
+        else {
+            panic!("all inputs exist even when their scripts exceed the retention budget");
+        };
+        assert_eq!(kept.len(), inputs.len() - 1);
+        assert!(
+            kept.values()
+                .map(|utxo| utxo.output.lock_script.as_raw_bytes().len())
+                .sum::<usize>()
+                < total
         );
+
+        let ParentInputs::Unspent(kept) = read_parent_inputs(&inputs, 0, |_| Some(utxo(10))) else {
+            panic!("a zero retention budget still checks every input");
+        };
+        assert!(kept.is_empty());
 
         let missing = inputs[inputs.len() - 1];
         assert_eq!(
@@ -713,6 +721,28 @@ mod tests {
                 .then(|| utxo(10))),
             ParentInputs::Missing(missing)
         );
+    }
+
+    /// A single input beyond the production cap does not discard thousands of cached outputs.
+    #[test]
+    fn one_parent_over_the_retention_cap_keeps_the_others() {
+        let script_len = 1022;
+        let fitting = MAX_KEPT_PARENT_INPUT_BYTES / script_len;
+        for count in [fitting, fitting + 1] {
+            let inputs = outpoints(count);
+            let lookups = AtomicUsize::new(0);
+            let ParentInputs::Unspent(kept) =
+                read_parent_inputs(&inputs, MAX_KEPT_PARENT_INPUT_BYTES, |_| {
+                    lookups.fetch_add(1, Ordering::Relaxed);
+                    Some(utxo(script_len))
+                })
+            else {
+                panic!("every parent exists");
+            };
+            assert_eq!(lookups.load(Ordering::Relaxed), count);
+            assert_eq!(kept.len(), fitting);
+            assert!(kept.len() * script_len <= MAX_KEPT_PARENT_INPUT_BYTES);
+        }
     }
 
     /// Repeated outpoints are read once, and inputs after a missing one are not read.

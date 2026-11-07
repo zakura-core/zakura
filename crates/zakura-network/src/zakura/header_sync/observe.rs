@@ -357,7 +357,10 @@ pub enum ReactorEvent {
     },
     /// `peer`'s offer waits for header room: the reactor held it back with
     /// no headroom left for its target, not for a pause, or its locator
-    /// found no room to reserve. Reported at each such refusal.
+    /// found no room to reserve. Reported at each such refusal. The cached
+    /// pass skipping an offer with no headroom doesn't report it, so an
+    /// offer first held back for another reason can wait for room with no
+    /// `HeadroomWait`.
     HeadroomWait {
         /// The offering peer.
         peer: ZakuraPeerId,

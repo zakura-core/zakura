@@ -10,7 +10,7 @@
 pub mod grammar;
 mod release_wake;
 
-pub use release_wake::ReleaseWake;
+pub use release_wake::{ReleaseWake, WakeScenario};
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 

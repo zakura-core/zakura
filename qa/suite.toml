@@ -139,9 +139,9 @@ reason = "a tool, not a test: it rewrites the committed seeds"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_release_wake.rs"
-test = "regenerate_release_wake_seed"
+test = "regenerate_release_wake_seeds"
 run = false
-reason = "a tool, not a test: it rewrites the committed input"
+reason = "a tool, not a test: it rewrites the committed inputs"
 
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
@@ -295,7 +295,7 @@ reason = "no target: the harness has a fixed scenario, and no plan maps it to a 
 [[missing-target]]
 harness = "header-sync/release-wake"
 owner = "E5a"
-reason = "no target: the harness has a fixed scenario, the wake fixture, and no plan maps it to a target"
+reason = "no target: the harness has two fixed scenarios, the wake fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "block-sync/storage"

@@ -942,6 +942,8 @@ pub struct ZakuraHeaderSyncCandidateState {
     /// Peers already admitted by header sync; advisory "full" summaries do not remove them.
     pub admitted_node_ids: Vec<NodeId>,
     /// Peers in local, non-punitive advisory backoff after failing to confirm usefulness.
+    ///
+    /// Sorted and deduplicated, so readers can binary-search it.
     pub backed_off_node_ids: Vec<NodeId>,
 }
 

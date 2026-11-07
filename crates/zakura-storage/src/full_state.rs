@@ -45,8 +45,9 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     AuxDelivery, AuxDelta, BodySizeHint, BodySizeHintBatch, BodyWorkEpoch, ChangeSet,
-    CommittedHeaderChainView, CommittedTransitionError, EngineSnapshot, EvidenceId,
-    FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry, StateVersion, StoreError,
+    CommittedHeaderChainView, CommittedTransitionError, EligibilityReason, EngineSnapshot,
+    EvidenceId, FullStateEvidenceAuthority, HeaderChainEngine, OperatorBodyRetry,
+    OperatorInvalidate, OperatorInvalidationId, OperatorReconsider, StateVersion, StoreError,
     TransitionEffect, TransitionEvent, TransitionFailure, TransitionFingerprint, TransitionRequest,
     ValidationLease, VerifiedBlockAccepted, VerifiedChainChanged, VerifiedChangeCause,
     VerifiedHeaderRef,
@@ -464,6 +465,91 @@ fn classify_verified_change<'a>(
     } else {
         (VerifiedChangeCause::Reset, new_path)
     }
+}
+
+/// The operator invalidation of `target`, or with `invalidate` false its
+/// reconsideration, against `engine`'s snapshot and `chain`'s best path, as
+/// zakura-state's `commit_operator_change` builds it. A reconsideration
+/// names the evidence of the invalidation in force on `target`, or `None`.
+pub(crate) fn operator_request(
+    engine: &HeaderChainEngine,
+    chain: &VerifiedChain,
+    target: block::Hash,
+    invalidate: bool,
+) -> TransitionRequest {
+    let snapshot = engine.snapshot();
+    let path = chain.best_path();
+    let evidence = full_state_evidence(
+        if invalidate {
+            b"operator-invalidate"
+        } else {
+            b"operator-reconsider"
+        },
+        snapshot.state_version,
+        target,
+        &path,
+    );
+    let (id, operator_reason_digest) = operator_identity(target);
+    let event = if invalidate {
+        TransitionEvent::OperatorInvalidate(OperatorInvalidate {
+            target,
+            id,
+            operator_reason_digest,
+            evidence,
+        })
+    } else {
+        TransitionEvent::OperatorReconsider(OperatorReconsider {
+            target,
+            id,
+            invalidation_evidence: invalidation_evidence(engine, target),
+            evidence,
+        })
+    };
+    TransitionRequest {
+        expected_version: snapshot.state_version,
+        event,
+    }
+}
+
+/// The evidence of the operator invalidation in force on `target`, or
+/// `None` if there's none, as zakura-state's
+/// `operator_invalidation_evidence` reads it. Retention that evicts the
+/// header ends its reasons with it.
+pub(crate) fn invalidation_evidence(
+    engine: &HeaderChainEngine,
+    target: block::Hash,
+) -> Option<EvidenceId> {
+    let (id, _) = operator_identity(target);
+    engine.graph().header_node(target).and_then(|node| {
+        node.eligibility
+            .direct_reasons
+            .iter()
+            .find_map(|reason| match reason {
+                EligibilityReason::OperatorInvalid {
+                    id: existing,
+                    evidence,
+                    ..
+                } if *existing == id => Some(*evidence),
+                _ => None,
+            })
+    })
+}
+
+/// zakura-state's `operator_identity`: the invalidation ID and reason
+/// digest for `target`.
+fn operator_identity(target: block::Hash) -> (OperatorInvalidationId, [u8; 32]) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-operator-invalidation-id-v1");
+    hasher.update(target.0);
+    let id_digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0; 16];
+    id.copy_from_slice(&id_digest[..16]);
+    let id = OperatorInvalidationId::new(id);
+    let mut hasher = Sha256::new();
+    hasher.update(b"zakura-operator-invalidation-v1");
+    hasher.update(target.0);
+    hasher.update(id.bytes());
+    (id, hasher.finalize().into())
 }
 
 /// zakura-state's `full_state_evidence`.

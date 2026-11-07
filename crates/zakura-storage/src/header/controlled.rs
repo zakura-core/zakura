@@ -9,6 +9,15 @@
 //! fault. The completion is the operation's linearization point, as the
 //! contract in [`super`] says.
 //!
+//! An apply can instead finish in two stages, for a history where its commit
+//! is visible before its reply. [`ControlledPort::commit`] runs it against
+//! the engine and keeps the reply, and [`ControlledPort::deliver`] hands the
+//! reply over in a later step.
+//!
+//! [`ControlledPort::reset`] makes an operator invalidation or
+//! reconsideration on the engine, which moves header selection without an
+//! apply.
+//!
 //! Dropping a call's future cancels only the caller. The operation stays
 //! pending with its inputs, so a locator's permit stays held, and its reply is
 //! dropped when it completes. A reply nobody takes, at completion or because
@@ -17,15 +26,16 @@
 //!
 //! Every change is published as a transaction: a submission, a caller
 //! dropping its call, a caller taking or dropping its reply, a completion,
-//! or shutdown. A transaction's [`Fact`]s carry one transaction number and
-//! consecutive sequence numbers, in the order the changes happened, and end
-//! with one head fact that names the transaction.
+//! a commit or delivery, a reset, or shutdown. A transaction's [`Fact`]s carry one
+//! transaction number and consecutive sequence numbers, in the order the
+//! changes happened, and end with one head fact that names the transaction.
 //! [`ControlledPort::take_facts`] drains them.
 //!
 //! A change a task makes, such as dropping its call, is published in the
-//! critical section that makes it. A change the run makes, a completion or
-//! shutdown, is published at its end: the run makes it outside any task, so
-//! no task can run in between and see the change before its facts.
+//! critical section that makes it. A change the run makes, a completion,
+//! commit, delivery, reset or shutdown, is published at its end: the run makes it
+//! outside any task, so no task can run in between and see the change
+//! before its facts.
 
 use std::{
     collections::BTreeMap,
@@ -82,7 +92,83 @@ pub struct PendingOp {
     pub caller_waiting: bool,
 }
 
-/// What [`ControlledPort::complete`] did.
+/// A committed apply whose reply waits for [`ControlledPort::deliver`], as
+/// [`ControlledPort::committed`] lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedOp {
+    /// Its ID.
+    pub id: OpId,
+    /// How long ago it was committed.
+    pub since_commit: Duration,
+    /// Whether its caller still waits for the reply.
+    pub caller_waiting: bool,
+}
+
+/// What [`ControlledPort::commit`] did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Commit {
+    /// The apply installed a new snapshot, and its reply waits for
+    /// [`ControlledPort::deliver`].
+    Held {
+        /// The commit's transaction number.
+        txn: u64,
+        /// The engine's header generation once the commit finished.
+        generation: HeaderGeneration,
+        /// [`EnginePort::state_digest`] once the commit finished.
+        state_digest: [u8; 32],
+    },
+    /// The apply changed nothing, so it completed in the same step, as
+    /// [`ControlledPort::complete`] would have.
+    Completed(Box<Completion>),
+}
+
+/// A reset [`ControlledPort::reset`] makes.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResetRequest {
+    /// Invalidate the selected header `depth` below the selected tip, or
+    /// the lowest header above the finalized anchor if the chain is
+    /// shorter. Nothing to do while the tip is the anchor.
+    Invalidate {
+        /// How far below the tip.
+        depth: u32,
+    },
+    /// Reconsider the newest invalidation this port made that's still in
+    /// force. Nothing to do if there's none.
+    Reconsider,
+}
+
+/// Which operator event a reset ran.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ResetKind {
+    /// An invalidation.
+    Invalidate,
+    /// A reconsideration.
+    Reconsider,
+}
+
+/// Why [`ControlledPort::reset`] failed. A failure changes nothing the
+/// port's facts would miss.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResetError {
+    /// The port is bound to another run.
+    OutsideRun,
+    /// The engine refused the operator event or committed nothing, which a
+    /// header on the selected chain or an invalidation in force rules out.
+    NotCommitted(String),
+}
+
+impl fmt::Display for ResetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResetError::OutsideRun => f.write_str("the port is bound to another run"),
+            ResetError::NotCommitted(why) => write!(f, "the operator event didn't commit: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for ResetError {}
+
+/// What [`ControlledPort::complete`] or [`ControlledPort::deliver`] did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Completion {
     /// The completion's transaction number.
@@ -173,11 +259,33 @@ pub enum FactKind {
         /// The operation.
         id: OpId,
     },
-    /// Head: the run completed an operation.
+    /// Head: the run committed an apply and kept its reply, which a later
+    /// `Completed` delivers.
+    Committed {
+        /// The operation.
+        id: OpId,
+        /// The engine's header generation once the commit finished.
+        generation: HeaderGeneration,
+        /// [`EnginePort::state_digest`] once the commit finished.
+        state_digest: [u8; 32],
+    },
+    /// Head: the run reset the engine's header selection with an operator
+    /// event.
+    Reset {
+        /// Which event.
+        kind: ResetKind,
+        /// The header it named.
+        target: block::Hash,
+        /// The engine's header generation once it committed.
+        generation: HeaderGeneration,
+    },
+    /// Head: the run completed an operation, or delivered a committed
+    /// apply's reply.
     Completed(Box<Completion>),
     /// Head: the port shut down.
     ShutDown {
-        /// The operations it dropped, pending or with an untaken reply.
+        /// The operations it dropped: pending, committed, or with an untaken
+        /// reply.
         dropped: Vec<OpId>,
         /// Those of `dropped` whose call still existed. Only their callers can
         /// find their operation gone and publish no drop receipt.
@@ -219,13 +327,17 @@ impl fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
-/// Why [`ControlledPort::complete`] refused a completion. A refusal changes
-/// nothing.
+/// Why [`ControlledPort::complete`], [`ControlledPort::commit`] or
+/// [`ControlledPort::deliver`] refused. A refusal changes nothing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompleteError {
     /// No operation with this ID is pending. It never existed, or it already
-    /// completed.
+    /// completed or committed.
     NotPending(OpId),
+    /// Only an apply commits.
+    NotAnApply(OpId),
+    /// No committed apply with this ID waits for its reply.
+    NotCommitted(OpId),
     /// The contract doesn't allow this outcome for the operation now.
     Illegal(IllegalOutcome),
     /// The port is bound to another run. See
@@ -237,6 +349,12 @@ impl fmt::Display for CompleteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompleteError::NotPending(id) => write!(f, "no header operation {} is pending", id.0),
+            CompleteError::NotAnApply(id) => {
+                write!(f, "header operation {} isn't an apply", id.0)
+            }
+            CompleteError::NotCommitted(id) => {
+                write!(f, "no committed header apply {} waits for its reply", id.0)
+            }
             CompleteError::Illegal(illegal) => illegal.fmt(f),
             CompleteError::OutsideRun => f.write_str("the port is bound to another run"),
         }
@@ -279,6 +397,9 @@ struct Ops {
     facts: Vec<Fact>,
     /// Set by shutdown, after which nothing is submitted.
     shut_down: bool,
+    /// The targets of this port's invalidations, oldest first. Some may
+    /// have ended with an eviction, which `reset` checks.
+    invalidations: Vec<block::Hash>,
     /// Set once the port is bound to a run.
     bound: bool,
     /// The run it's bound to.
@@ -325,8 +446,15 @@ enum Stage {
         request: HeaderRequest,
         submitted: Instant,
     },
-    /// Taken by `complete`, which is running it.
+    /// Taken by `complete` or `commit`, which is running it.
     Running,
+    /// Committed by `commit`, with the reply `deliver` hands over and its
+    /// identity. The caller isn't woken until then.
+    Committed {
+        reply: HeaderReply,
+        result: ResultIdentity,
+        committed: Instant,
+    },
     /// Completed, with the reply its caller hasn't polled yet and that
     /// reply's identity, captured when it was made. A later read of the
     /// registry can't rebuild it: a refusal's signal or a locator's
@@ -450,6 +578,9 @@ impl ControlledPort {
                                 caller_waiting: slot.caller.is_some(),
                             },
                             Stage::Running => OperationStage::Running,
+                            Stage::Committed { .. } => OperationStage::Committed {
+                                caller_waiting: slot.caller.is_some(),
+                            },
                             Stage::Replied { result, .. } => OperationStage::Replied {
                                 result: result.clone(),
                             },
@@ -548,7 +679,25 @@ impl ControlledPort {
                         caller_waiting: slot.caller.is_some(),
                     })
                 }
-                Stage::Running | Stage::Replied { .. } => None,
+                Stage::Running | Stage::Committed { .. } | Stage::Replied { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Every committed apply whose reply waits for [`Self::deliver`], in ID
+    /// order.
+    pub fn committed(&self) -> Vec<CommittedOp> {
+        let now = Instant::now();
+        self.ops()
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| match &slot.stage {
+                Stage::Committed { committed, .. } => Some(CommittedOp {
+                    id: *id,
+                    since_commit: now.saturating_duration_since(*committed),
+                    caller_waiting: slot.caller.is_some(),
+                }),
+                Stage::Pending { .. } | Stage::Running | Stage::Replied { .. } => None,
             })
             .collect()
     }
@@ -565,7 +714,10 @@ impl ControlledPort {
                 Stage::Pending { request, submitted } if !slot.rejected => {
                     Some((request, *submitted))
                 }
-                Stage::Pending { .. } | Stage::Running | Stage::Replied { .. } => None,
+                Stage::Pending { .. }
+                | Stage::Running
+                | Stage::Committed { .. }
+                | Stage::Replied { .. } => None,
             })
             .filter(|(request, _)| {
                 request
@@ -595,6 +747,136 @@ impl ControlledPort {
     /// locks, the permit drop and the waiter signals are scheduling points
     /// between the change and its publish, which a task could interleave.
     pub fn complete(&self, id: OpId, outcome: Outcome) -> Result<Completion, CompleteError> {
+        match self.finish(id, outcome, false)? {
+            Commit::Completed(completion) => Ok(*completion),
+            Commit::Held { .. } => unreachable!("only `commit` holds a reply"),
+        }
+    }
+
+    /// Commits pending apply `id`: runs it against the engine, as
+    /// [`Self::complete`] with [`Outcome::Engine`] does. If that installed
+    /// and published a new snapshot, the reply stays with the port, the
+    /// caller isn't woken, and the port publishes [`FactKind::Committed`].
+    /// [`Self::deliver`] hands the reply over later. Otherwise the apply
+    /// completes in this step, exactly as `complete` would, since nothing
+    /// became visible before its reply.
+    ///
+    /// Refuses, changing nothing, if `id` isn't pending, isn't an apply, or
+    /// the contract doesn't allow an engine outcome for it now. Only the run
+    /// commits, as only the run completes.
+    pub fn commit(&self, id: OpId) -> Result<Commit, CompleteError> {
+        let apply = {
+            let mut ops = self.ops();
+            if ops.refuse_outside_run() {
+                return Err(CompleteError::OutsideRun);
+            }
+            ops.slots.get(&id).and_then(|slot| match &slot.stage {
+                Stage::Pending { request, .. } => Some(request.op() == HeaderOp::ApplyHeaderTarget),
+                Stage::Running | Stage::Committed { .. } | Stage::Replied { .. } => None,
+            })
+        };
+        match apply {
+            None => Err(CompleteError::NotPending(id)),
+            Some(false) => Err(CompleteError::NotAnApply(id)),
+            Some(true) => self.finish(id, Outcome::Engine, true),
+        }
+    }
+
+    /// Delivers committed apply `id`'s reply: it goes to the caller and
+    /// wakes it, or is dropped if the caller is gone. Publishes
+    /// [`FactKind::Completed`] with [`Outcome::Engine`], as a completion
+    /// does, with the engine's generation and state digest read now, so a
+    /// change since the commit shows. The commit's own transaction carried
+    /// the apply's effects.
+    ///
+    /// Refuses, changing nothing, if no committed apply `id` waits. Only the
+    /// run delivers, as only the run completes.
+    pub fn deliver(&self, id: OpId) -> Result<Completion, CompleteError> {
+        #[cfg(zakura_sim)]
+        debug_assert!(
+            zakura_rt::sim::executor()
+                .and_then(|executor| executor.current_task())
+                .is_none(),
+            "only the run delivers a controlled port's replies"
+        );
+        let now = Instant::now();
+        let (caller, abandoned, completion, txn) = {
+            let mut ops = self.ops();
+            if ops.refuse_outside_run() {
+                return Err(CompleteError::OutsideRun);
+            }
+            let txn = ops
+                .last_txn
+                .checked_add(1)
+                .expect("a run publishes fewer than 2^64 transactions");
+            let slot = ops
+                .slots
+                .get_mut(&id)
+                .ok_or(CompleteError::NotCommitted(id))?;
+            if !matches!(slot.stage, Stage::Committed { .. }) {
+                return Err(CompleteError::NotCommitted(id));
+            }
+            let Stage::Committed { reply, result, .. } =
+                std::mem::replace(&mut slot.stage, Stage::Running)
+            else {
+                unreachable!("the stage was checked above under the same lock");
+            };
+            let completion = (slot.identity.clone(), slot.request_digest, result.clone());
+            match slot.caller.take() {
+                Some(waker) => {
+                    slot.stage = Stage::Replied { reply, result };
+                    (Some(waker), None, completion, txn)
+                }
+                None => {
+                    let removed = ops.slots.remove(&id);
+                    (None, Some((removed, reply)), completion, txn)
+                }
+            }
+        };
+        let (request, request_digest, result) = completion;
+        let mut kinds: Vec<FactKind> = Vec::new();
+        if let Some((_, reply)) = &abandoned {
+            let ((), effects) = self.abandon(reply, |_| ());
+            kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
+        }
+        drop(abandoned);
+        let lease_ends = kinds
+            .iter()
+            .filter_map(|kind| match kind {
+                FactKind::Lease(fact) => LeaseEnd::of(fact),
+                _ => None,
+            })
+            .collect();
+        let completion = Completion {
+            txn,
+            id,
+            op: request.op(),
+            request,
+            result,
+            request_digest,
+            outcome: Outcome::Engine,
+            delivered: caller.is_some(),
+            lease_ends,
+            generation: self.engine.snapshot().header_generation,
+            state_digest: self.engine.state_digest(),
+        };
+        kinds.push(FactKind::Completed(Box::new(completion.clone())));
+        let published = self.ops().publish(now, kinds);
+        assert_eq!(
+            published[0].txn, txn,
+            "only the run publishes between reserving the number and here"
+        );
+        // Woken outside the lock, since a waker can run scheduler code.
+        if let Some(waker) = caller {
+            waker.wake();
+        }
+        Ok(completion)
+    }
+
+    /// [`Self::complete`]'s and [`Self::commit`]'s shared body. With `hold`,
+    /// an engine run that installed a new snapshot keeps its reply as
+    /// [`Stage::Committed`] instead of completing.
+    fn finish(&self, id: OpId, outcome: Outcome, hold: bool) -> Result<Commit, CompleteError> {
         #[cfg(zakura_sim)]
         debug_assert!(
             zakura_rt::sim::executor()
@@ -651,6 +933,9 @@ impl ControlledPort {
             (request, early, ops.permits.remove(&id), txn)
         };
         let op = request.op();
+        // Only a commit reads the snapshot around its run, to tell whether
+        // the apply installed one.
+        let before = hold.then(|| self.engine.snapshot());
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
         let (reply, effects, result) = match early {
@@ -679,6 +964,9 @@ impl ControlledPort {
             kinds.push(FactKind::PermitDropped { id });
         }
         kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
+        if before.is_some_and(|before| before != self.engine.snapshot()) {
+            return Ok(self.hold_reply(id, now, txn, reply, result, kinds));
+        }
         let (caller, abandoned, identity, request_digest) = {
             let mut ops = self.ops();
             let slot = ops
@@ -742,7 +1030,138 @@ impl ControlledPort {
         if let Some(waker) = caller {
             waker.wake();
         }
-        Ok(completion)
+        Ok(Commit::Completed(Box::new(completion)))
+    }
+
+    /// Keeps running operation `id`'s `reply` as [`Stage::Committed`] and
+    /// publishes `kinds`, its run's effects, with a [`FactKind::Committed`]
+    /// head in transaction `txn`. The caller isn't woken.
+    fn hold_reply(
+        &self,
+        id: OpId,
+        now: Instant,
+        txn: u64,
+        reply: HeaderReply,
+        result: ResultIdentity,
+        mut kinds: Vec<FactKind>,
+    ) -> Commit {
+        let generation = self.engine.snapshot().header_generation;
+        let state_digest = self.engine.state_digest();
+        let mut ops = self.ops();
+        ops.slots
+            .get_mut(&id)
+            .expect("a running operation keeps its slot until it replies")
+            .stage = Stage::Committed {
+            reply,
+            result,
+            committed: now,
+        };
+        kinds.push(FactKind::Committed {
+            id,
+            generation,
+            state_digest,
+        });
+        let published = ops.publish(now, kinds);
+        assert_eq!(
+            published[0].txn, txn,
+            "only the run publishes between reserving the number and here"
+        );
+        Commit::Held {
+            txn,
+            generation,
+            state_digest,
+        }
+    }
+
+    /// Makes `request` on the engine: an operator invalidation or
+    /// reconsideration in its own transaction, as zakura-state's operator
+    /// commands do, which publishes its snapshot and a [`FactKind::Reset`].
+    /// Returns what it did, or `None` if there was nothing to do: an
+    /// invalidation while the selected tip is the finalized anchor, a
+    /// reconsideration with no invalidation in force, or a port that shut
+    /// down. Those publish nothing.
+    ///
+    /// The reset is engine-level. Its event is the one zakura-state's
+    /// `commit_operator_change` builds, but production's operator commands
+    /// first change non-finalized full state. An invalidation removes the
+    /// block there, and fails with `BlockNotFound` for a header whose block
+    /// that state lacks. A reconsideration restores blocks that state
+    /// invalidated, and fails with `MissingInvalidatedBlock` otherwise.
+    /// Header runs commit no bodies, so this reset reaches header histories
+    /// the production commands can't. It stands in for any reset that advances
+    /// the header generation, which finality moves would otherwise give.
+    ///
+    /// Only the run resets, outside any task, as only the run completes.
+    ///
+    /// # Errors
+    ///
+    /// If the port is bound to another run, or the engine doesn't commit
+    /// the event.
+    pub fn reset(&self, request: ResetRequest) -> Result<Option<FactKind>, ResetError> {
+        #[cfg(zakura_sim)]
+        debug_assert!(
+            zakura_rt::sim::executor()
+                .and_then(|executor| executor.current_task())
+                .is_none(),
+            "only the run resets a controlled port's engine"
+        );
+        let now = Instant::now();
+        let (kind, target) = {
+            let mut ops = self.ops();
+            if ops.refuse_outside_run() {
+                return Err(ResetError::OutsideRun);
+            }
+            if ops.shut_down {
+                return Ok(None);
+            }
+            match request {
+                ResetRequest::Invalidate { depth } => {
+                    drop(ops);
+                    let Some(target) = self.engine.selected_below_tip(depth) else {
+                        return Ok(None);
+                    };
+                    (ResetKind::Invalidate, target.hash)
+                }
+                ResetRequest::Reconsider => {
+                    let remembered = ops.invalidations.clone();
+                    drop(ops);
+                    // Retention may have evicted an invalidated header, which
+                    // ends its invalidation, so only those still in force
+                    // count.
+                    let newest = remembered
+                        .iter()
+                        .rposition(|target| self.engine.invalidation_in_force(*target));
+                    self.ops()
+                        .invalidations
+                        .truncate(newest.map_or(0, |index| index + 1));
+                    match newest {
+                        Some(index) => (ResetKind::Reconsider, remembered[index]),
+                        None => return Ok(None),
+                    }
+                }
+            }
+        };
+        let applied = self
+            .engine
+            .operator(target, kind == ResetKind::Invalidate)
+            .map_err(|error| ResetError::NotCommitted(format!("{error:?}")))?;
+        if !matches!(applied.result, zakura_header_chain::ApplyResult::Committed) {
+            return Err(ResetError::NotCommitted(format!("{:?}", applied.result)));
+        }
+        let fact = FactKind::Reset {
+            kind,
+            target,
+            generation: self.engine.snapshot().header_generation,
+        };
+        let mut ops = self.ops();
+        match kind {
+            ResetKind::Invalidate => ops.invalidations.push(target),
+            ResetKind::Reconsider => {
+                ops.invalidations.pop();
+            }
+        }
+        ops.publish(now, vec![fact.clone()]);
+        Ok(Some(fact))
     }
 
     /// Ends the lease an `Acquired` reply carries, since nobody will take
@@ -775,9 +1194,10 @@ impl ControlledPort {
     }
 
     /// Shuts the service down, as the end of a run does. Drops every pending
-    /// operation unrun, with its inputs, and every untaken reply, then ends
-    /// every lease and closes the selected-chain watch. No caller is woken,
-    /// and a call polled afterwards never completes. A repeat does nothing.
+    /// operation unrun, with its inputs, every committed apply's held reply
+    /// and every untaken reply, then ends every lease and closes the
+    /// selected-chain watch. No caller is woken, and a call polled afterwards
+    /// never completes. A repeat does nothing.
     ///
     /// Only the run shuts a port down, outside any task: its transaction is
     /// published at its end, which a task could otherwise interleave.
@@ -994,7 +1414,7 @@ impl<T> Drop for Call<'_, T> {
                 ..
             } => Some((**path).clone()),
             Stage::Replied { .. } => None,
-            Stage::Pending { .. } | Stage::Running => {
+            Stage::Pending { .. } | Stage::Running | Stage::Committed { .. } => {
                 // Accepted work outlives its caller.
                 let caller = slot.caller.take();
                 ops.publish(Instant::now(), vec![FactKind::CallerDropped { id }]);

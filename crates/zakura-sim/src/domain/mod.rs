@@ -5,3 +5,4 @@ pub mod block_sync;
 pub mod block_sync_semantic;
 pub mod discovery;
 pub mod session;
+pub mod shared;

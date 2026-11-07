@@ -1,0 +1,1640 @@
+//! The pilot runner's classification and report tests, on synthetic
+//! observations. None builds or runs a simulator; one runs a shell script
+//! in its place.
+
+use super::*;
+use crate::planted::{end_of, Run};
+
+const ID: &str = "block/reactor-policy";
+const OTHER: &str = "sim/no-task-panic";
+const HELD: &str = r#"{"held":{"applicable":4}}"#;
+const VIOLATED: &str = r#"{"violated":{"witness":[3]}}"#;
+
+/// The planted runner's reading of an `end` line with `violation`, and
+/// `reports` as (property, outcome JSON) pairs.
+fn run(violation: Option<&str>, reports: &[(&str, &str)]) -> Run {
+    let properties: Vec<String> = reports
+        .iter()
+        .map(|(property, outcome)| format!(r#"{{"property":"{property}","outcome":{outcome}}}"#))
+        .collect();
+    let violation = violation.map_or_else(String::new, |property| {
+        format!(r#""violation":{{"property":"{property}"}},"#)
+    });
+    let line = format!(
+        r#"{{"end":{{"outcome":"idle",{violation}"steps":4,"cleanup":{{}},"properties":[{}]}}}}"#,
+        properties.join(",")
+    );
+    end_of(ID, &line).expect("the line is an end record")
+}
+
+/// `run` whose witness test failed with `why`.
+fn witness_failed(run: Run, why: &str) -> Run {
+    match run {
+        Run::Ended {
+            violation,
+            other_violated,
+            outcome,
+            harness,
+            ..
+        } => Run::Ended {
+            violation,
+            other_violated,
+            outcome,
+            harness,
+            witness: Some(why.to_owned()),
+        },
+        failed => failed,
+    }
+}
+
+/// A clean quiescent trace with `applicable` evaluations of the intended
+/// property.
+fn trace(applicable: Option<u64>) -> TraceFacts {
+    TraceFacts {
+        build: Value::Null,
+        harness: ID.to_owned(),
+        input_sha256: "ab".repeat(32),
+        steps: 4,
+        status: Some("quiescent".to_owned()),
+        cleanup: BTreeMap::from([("cancelled".to_owned(), 0), ("leaked".to_owned(), 0)]),
+        applicable,
+    }
+}
+
+fn recorded(run: Run, trace: Option<TraceFacts>) -> Recorded {
+    Recorded {
+        run,
+        trace,
+        unpaired: None,
+    }
+}
+
+/// A sensitivity case whose baseline holds with 4 applicable evaluations,
+/// whose patch applies and compiles, and whose mutant run is `mutant`.
+fn sensitivity_run(mutant: Run, confirmation: Option<Result<(), String>>) -> SensitivityRun {
+    SensitivityRun {
+        equivalent: None,
+        broken_build: None,
+        baseline: Some(Ok(recorded(run(None, &[(ID, HELD)]), Some(trace(Some(4)))))),
+        patch: Some(Ok(())),
+        mutant: Some(Ok(recorded(mutant, Some(trace(None))))),
+        confirmation,
+    }
+}
+
+fn class(run: &SensitivityRun) -> Class {
+    classify::sensitivity(ID, run).class
+}
+
+/// A confirmed violation of the intended ID, on a passing baseline, is the
+/// only intended violation.
+#[test]
+fn sensitivity_counts_only_a_confirmed_intended_violation() {
+    let caught = run(Some(ID), &[(ID, VIOLATED)]);
+    assert_eq!(
+        class(&sensitivity_run(caught.clone(), Some(Ok(())))),
+        Class::IntendedViolation
+    );
+    assert_eq!(
+        class(&sensitivity_run(caught.clone(), None)),
+        Class::HarnessFailure
+    );
+    let replay = classify::sensitivity(
+        ID,
+        &sensitivity_run(
+            caught,
+            Some(Err("the confirmed trace doesn't replay Exact".to_owned())),
+        ),
+    );
+    assert_eq!(replay.class, Class::HarnessFailure);
+    assert!(replay.reason.contains("Exact"), "{}", replay.reason);
+}
+
+/// A violation of another ID, or of the intended ID beside another, never
+/// counts as the intended violation.
+#[test]
+fn sensitivity_rejects_wrong_id_failures() {
+    for mutant in [
+        run(Some(OTHER), &[(ID, HELD), (OTHER, VIOLATED)]),
+        run(None, &[(ID, VIOLATED), (OTHER, VIOLATED)]),
+    ] {
+        let result = classify::sensitivity(ID, &sensitivity_run(mutant, Some(Ok(()))));
+        assert_eq!(result.class, Class::OtherViolation);
+        assert!(result.reason.contains(OTHER), "{}", result.reason);
+    }
+}
+
+/// A violation without its trigger history, or whose fresh confirmation
+/// loses it, is a harness failure that names the missing witness.
+#[test]
+fn sensitivity_rejects_missing_witnesses() {
+    let lost = witness_failed(run(Some(ID), &[(ID, VIOLATED)]), "lost its trigger history");
+    let result = classify::sensitivity(ID, &sensitivity_run(lost, Some(Ok(()))));
+    assert_eq!(result.class, Class::HarnessFailure);
+    assert!(
+        result.reason.starts_with("missing witness"),
+        "{}",
+        result.reason
+    );
+
+    let why = confirmed_trace(
+        ChildEnd::Exited(1),
+        Some(&serde_json::json!({"status": "witness-lost", "detail": null})),
+    )
+    .expect_err("a lost witness doesn't confirm");
+    assert!(why.starts_with("missing witness"), "{why}");
+    let caught = run(Some(ID), &[(ID, VIOLATED)]);
+    assert_eq!(
+        class(&sensitivity_run(caught, Some(Err(why)))),
+        Class::HarnessFailure
+    );
+}
+
+/// A baseline that violates, never applies, applies zero times, fails its
+/// witness, doesn't settle, or doesn't pair with the catalogue's build
+/// blocks the case, even if the mutant violates the intended ID.
+#[test]
+fn sensitivity_rejects_failed_baselines() {
+    let caught = run(Some(ID), &[(ID, VIOLATED)]);
+    let unsettled = TraceFacts {
+        status: Some("deadlock".to_owned()),
+        ..trace(Some(4))
+    };
+    let mut unpaired = recorded(run(None, &[(ID, HELD)]), Some(trace(Some(4))));
+    unpaired.unpaired = Some("the original build doesn't pair: rustc differ".to_owned());
+    for baseline in [
+        Err("the original build fails".to_owned()),
+        Ok(recorded(
+            run(Some(ID), &[(ID, VIOLATED)]),
+            Some(trace(None)),
+        )),
+        Ok(recorded(
+            run(None, &[(ID, HELD), (OTHER, VIOLATED)]),
+            Some(trace(Some(4))),
+        )),
+        Ok(recorded(
+            run(None, &[(ID, r#""not-applicable""#)]),
+            Some(trace(None)),
+        )),
+        Ok(recorded(run(None, &[(ID, HELD)]), Some(trace(Some(0))))),
+        Ok(recorded(
+            witness_failed(run(None, &[(ID, HELD)]), "lost its trigger history"),
+            Some(trace(Some(4))),
+        )),
+        Ok(recorded(run(None, &[(ID, HELD)]), Some(unsettled))),
+        Ok(recorded(run(None, &[(ID, HELD)]), None)),
+        Ok(unpaired),
+    ] {
+        let mut case = sensitivity_run(caught.clone(), Some(Ok(())));
+        case.baseline = Some(baseline);
+        assert_eq!(class(&case), Class::BaselineFailure, "{:?}", case.baseline);
+    }
+}
+
+/// A patch that doesn't apply, changes undeclared files or doesn't compile
+/// makes an invalid mutant, never a survivor or a detection.
+#[test]
+fn sensitivity_rejects_broken_patches() {
+    let mut case = sensitivity_run(run(None, &[(ID, HELD)]), None);
+    case.patch = Some(Err("the patch doesn't apply: a.rs".to_owned()));
+    case.mutant = None;
+    assert_eq!(class(&case), Class::InvalidMutant);
+}
+
+/// A run that reports nothing for the intended ID, ends inconclusive,
+/// leaks state, crashes, or doesn't pair with the original's build has
+/// incomplete observations: a harness failure.
+#[test]
+fn sensitivity_rejects_incomplete_observations() {
+    let leaky = TraceFacts {
+        cleanup: BTreeMap::from([("leaked".to_owned(), 2)]),
+        ..trace(None)
+    };
+    let mut leaked = sensitivity_run(run(Some(ID), &[(ID, VIOLATED)]), Some(Ok(())));
+    leaked.mutant = Some(Ok(recorded(run(Some(ID), &[(ID, VIOLATED)]), Some(leaky))));
+    let mut unpaired = sensitivity_run(run(Some(ID), &[(ID, VIOLATED)]), Some(Ok(())));
+    if let Some(Ok(mutant)) = &mut unpaired.mutant {
+        mutant.unpaired = Some("the mutant build doesn't pair: source differ".to_owned());
+    }
+    let mut missing = sensitivity_run(run(None, &[]), None);
+    missing.mutant = None;
+    for case in [
+        sensitivity_run(run(None, &[]), None),
+        sensitivity_run(
+            run(
+                None,
+                &[(ID, r#"{"inconclusive":{"reason":"harness-failed"}}"#)],
+            ),
+            None,
+        ),
+        sensitivity_run(Run::Failed("ran past its deadline".to_owned()), None),
+        leaked,
+        unpaired,
+        missing,
+    ] {
+        assert_eq!(class(&case), Class::HarnessFailure, "{case:?}");
+    }
+}
+
+/// A held mutant run survives, a never-applying one is not applicable, and
+/// only review metadata makes a case equivalent.
+#[test]
+fn sensitivity_names_survivors_and_equivalents() {
+    assert_eq!(
+        class(&sensitivity_run(run(None, &[(ID, HELD)]), None)),
+        Class::SurvivedBudget
+    );
+    assert_eq!(
+        class(&sensitivity_run(
+            run(None, &[(ID, r#""not-applicable""#)]),
+            None
+        )),
+        Class::NotApplicable
+    );
+    let review = SensitivityRun {
+        equivalent: Some("the branch is unreachable within the harness".to_owned()),
+        ..SensitivityRun::default()
+    };
+    assert_eq!(class(&review), Class::Equivalent);
+    // Nothing that ran makes a case equivalent.
+    assert_ne!(class(&SensitivityRun::default()), Class::Equivalent);
+}
+
+/// A complete, clean campaign from the empty corpus.
+fn campaign() -> CampaignFacts {
+    CampaignFacts {
+        status: "complete".to_owned(),
+        applied: true,
+        runs: 1000,
+        applicable_runs: 600,
+        millis: 600_000,
+        ..CampaignFacts::default()
+    }
+}
+
+/// A mutant campaign that the intended finding stopped.
+fn found(property: &str) -> CampaignFacts {
+    CampaignFacts {
+        status: "worker-stopped".to_owned(),
+        violated: vec![property.to_owned()],
+        incomplete: vec![r#"{"reason":"restart-limit","worker":0}"#.to_owned()],
+        intended_input: (property == ID)
+            .then(|| "runs/x/workers/0/sim/inputs/active/a.bin".to_owned()),
+        ..campaign()
+    }
+}
+
+fn discovery_run(mutant: CampaignFacts, confirmation: Option<Result<(), String>>) -> DiscoveryRun {
+    DiscoveryRun {
+        equivalent: None,
+        broken_build: None,
+        baseline: Some(Ok(campaign())),
+        patch: Some(Ok(())),
+        mutant: Some(Ok(mutant)),
+        confirmation,
+    }
+}
+
+fn discovered(run: &DiscoveryRun) -> Class {
+    classify::discovery(ID, run).class
+}
+
+/// A confirmed finding of the intended ID is an intended violation, though
+/// the finding stopped the campaign early. Another ID's finding isn't.
+#[test]
+fn discovery_counts_only_a_confirmed_intended_finding() {
+    assert_eq!(
+        discovered(&discovery_run(found(ID), Some(Ok(())))),
+        Class::IntendedViolation
+    );
+    assert_eq!(
+        discovered(&discovery_run(found(ID), None)),
+        Class::HarnessFailure
+    );
+    assert_eq!(
+        discovered(&discovery_run(
+            found(ID),
+            Some(Err(
+                "missing witness: the fresh confirmation is witness-lost".to_owned()
+            ))
+        )),
+        Class::HarnessFailure
+    );
+    assert_eq!(
+        discovered(&discovery_run(found(OTHER), Some(Ok(())))),
+        Class::OtherViolation
+    );
+    let mut both = found(ID);
+    both.violated.push(OTHER.to_owned());
+    assert_eq!(
+        discovered(&discovery_run(both, Some(Ok(())))),
+        Class::OtherViolation
+    );
+}
+
+/// A baseline campaign that violates anything, leaves a failure, stops
+/// early, starts from a nonempty corpus or doesn't pair blocks every
+/// mutant finding.
+#[test]
+fn discovery_rejects_failed_baselines() {
+    let mut cases = vec![
+        Err(NoCampaign::Failed(
+            "the original simulator fails to build".to_owned(),
+        )),
+        Ok(found(OTHER)),
+        Ok(CampaignFacts {
+            failures: vec!["runs/x/workers/0/sim/inputs/nondeterministic/a.bin".to_owned()],
+            ..campaign()
+        }),
+        Ok(CampaignFacts {
+            status: "interrupted".to_owned(),
+            ..campaign()
+        }),
+        Ok(CampaignFacts {
+            initial_inputs: 3,
+            ..campaign()
+        }),
+    ];
+    cases.push(Ok(CampaignFacts {
+        unpaired: Some("the original build doesn't pair: rustc differ".to_owned()),
+        ..campaign()
+    }));
+    for baseline in cases {
+        let mut run = discovery_run(found(ID), Some(Ok(())));
+        run.baseline = Some(baseline);
+        assert_eq!(
+            discovered(&run),
+            Class::BaselineFailure,
+            "{:?}",
+            run.baseline
+        );
+    }
+    // A baseline that never applies the property still passes.
+    let mut run = discovery_run(found(ID), Some(Ok(())));
+    run.baseline = Some(Ok(CampaignFacts {
+        applied: false,
+        ..campaign()
+    }));
+    assert_eq!(discovered(&run), Class::IntendedViolation);
+}
+
+/// A baseline campaign whose `start` ran past its deadline or died from a
+/// signal, or whose worker timed out or crashed without a violation, is a
+/// harness failure, even beside a violation: it never counts as a baseline
+/// failure, and it blocks the mutant's finding.
+#[test]
+fn a_baseline_campaign_that_times_out_or_is_killed_is_a_harness_failure() {
+    let timeout = "runs/x/workers/0/artifacts/timeout-1".to_owned();
+    let crash = "runs/x/workers/0/artifacts/crash-2".to_owned();
+    for baseline in [
+        Err(NoCampaign::Killed(
+            "`zakura-sim campaign start` ran past 900 s".to_owned(),
+        )),
+        Err(NoCampaign::Killed(
+            "`zakura-sim campaign start` died from signal 9".to_owned(),
+        )),
+        Ok(CampaignFacts {
+            killed: vec![timeout.clone()],
+            ..campaign()
+        }),
+        Ok(CampaignFacts {
+            killed: vec![crash],
+            ..campaign()
+        }),
+        Ok(CampaignFacts {
+            killed: vec![timeout],
+            ..found(OTHER)
+        }),
+    ] {
+        let mut run = discovery_run(found(ID), Some(Ok(())));
+        run.baseline = Some(baseline);
+        let result = classify::discovery(ID, &run);
+        assert_eq!(result.class, Class::HarnessFailure, "{:?}", run.baseline);
+        assert_eq!(
+            classify::discovery_baseline(&run.baseline).map(|failed| failed.class),
+            Some(Class::HarnessFailure),
+            "{:?}",
+            run.baseline
+        );
+    }
+}
+
+/// A campaign that stops without a finding, leaves another failure, or
+/// starts from a nonempty corpus is a harness failure. A complete campaign
+/// that never applies the property is not applicable, and only one that
+/// applied it survives.
+#[test]
+fn discovery_rejects_incomplete_observations() {
+    for mutant in [
+        CampaignFacts {
+            status: "worker-stopped".to_owned(),
+            incomplete: vec![r#"{"reason":"restart-limit","worker":0}"#.to_owned()],
+            ..campaign()
+        },
+        CampaignFacts {
+            failures: vec!["runs/x/workers/0/sim/inputs/nondeterministic/a.bin".to_owned()],
+            ..campaign()
+        },
+        CampaignFacts {
+            incomplete: vec![r#"{"reason":"partial-stats","worker":0,"pid":7}"#.to_owned()],
+            ..campaign()
+        },
+        CampaignFacts {
+            initial_inputs: 1,
+            ..found(ID)
+        },
+    ] {
+        assert_eq!(
+            discovered(&discovery_run(mutant.clone(), Some(Ok(())))),
+            Class::HarnessFailure,
+            "{mutant:?}"
+        );
+    }
+    let mut failed = discovery_run(campaign(), None);
+    failed.mutant = Some(Err(NoCampaign::Failed(
+        "the store holds no single run manifest".to_owned(),
+    )));
+    assert_eq!(discovered(&failed), Class::HarnessFailure);
+    failed.mutant = Some(Err(NoCampaign::Killed(
+        "`zakura-sim campaign start` ran past 900 s".to_owned(),
+    )));
+    assert_eq!(discovered(&failed), Class::HarnessFailure);
+    assert_eq!(
+        discovered(&discovery_run(
+            CampaignFacts {
+                applied: false,
+                applicable_runs: 0,
+                ..campaign()
+            },
+            None
+        )),
+        Class::NotApplicable
+    );
+    assert_eq!(
+        discovered(&discovery_run(campaign(), None)),
+        Class::SurvivedBudget
+    );
+}
+
+/// A broken patch or a mutant fuzz target that doesn't compile makes an
+/// invalid mutant, and review metadata alone an equivalent one.
+#[test]
+fn discovery_rejects_broken_patches() {
+    let mut run = discovery_run(campaign(), None);
+    run.patch = Some(Err("the mutant fuzz target doesn't compile".to_owned()));
+    run.mutant = None;
+    assert_eq!(discovered(&run), Class::InvalidMutant);
+    run.equivalent = Some("reviewed".to_owned());
+    assert_eq!(discovered(&run), Class::Equivalent);
+}
+
+/// The store's failure files sort into violations by property, crashes a
+/// violation explains, worker deaths and other failures; traces go with
+/// their inputs.
+#[test]
+fn campaign_facts_read_saved_failures() {
+    let worker = "runs/m/workers/0";
+    let end = |paths: &[&str]| {
+        serde_json::json!({
+            "failures": paths.iter().map(|path| serde_json::json!({"path": path, "sha256": "00"})).collect::<Vec<_>>(),
+            "workers": [{"index": 0, "millis": 1500}],
+        })
+    };
+    let evidence = serde_json::json!({
+        "status": "worker-stopped",
+        "totals": {"runs": 42},
+        "complete_totals": {"properties": {ID: {"held": 5, "violated": 0}}},
+        "unapplied": [],
+        "incomplete": [{"reason": "restart-limit", "worker": 0}],
+    });
+    let intended = format!("{worker}/sim/inputs/active/block/reactor-policy/aa.bin");
+    let crash = format!("{worker}/artifacts/crash-bb");
+    let trace = format!("{worker}/sim/traces/block/reactor-policy/cc/trace.jsonl");
+    let facts = campaign_facts(ID, Some(&end(&[&intended, &crash, &trace])), &evidence, 0);
+    assert_eq!(facts.violated, [ID]);
+    assert!(facts.failures.is_empty(), "{:?}", facts.failures);
+    assert_eq!(facts.intended_input.as_deref(), Some(intended.as_str()));
+    assert_eq!(
+        (facts.runs, facts.applicable_runs, facts.millis),
+        (42, 5, 1500)
+    );
+    assert_eq!(facts.status, "worker-stopped");
+    assert_eq!(facts.incomplete.len(), 1);
+    assert!(facts.applied);
+
+    let timeout = format!("{worker}/artifacts/timeout-dd");
+    let nondeterministic =
+        format!("{worker}/sim/inputs/nondeterministic/block/reactor-policy/ee.bin");
+    let facts = campaign_facts(
+        ID,
+        Some(&end(&[&crash, &timeout, &nondeterministic])),
+        &evidence,
+        0,
+    );
+    assert!(facts.violated.is_empty());
+    assert_eq!(facts.failures, [nondeterministic]);
+    assert_eq!(facts.killed, [timeout, crash]);
+
+    let unapplied = serde_json::json!({"status": "complete", "unapplied": [ID], "incomplete": []});
+    assert!(!campaign_facts(ID, None, &unapplied, 0).applied);
+    assert_eq!(
+        campaign_facts(ID, None, &serde_json::json!({}), 0).status,
+        "none"
+    );
+}
+
+/// Paired campaigns get the catalogue's bounds and seed: their arguments
+/// differ only in the store, the name and the build.
+#[test]
+fn paired_campaigns_share_their_budget() {
+    let catalogue = committed_catalogue();
+    let bounds = &catalogue.discovery;
+    let corpus = Path::new("qa/mutation-pilot/discovery-empty");
+    let baseline = start_args(
+        bounds,
+        "t-11",
+        "h",
+        "aa",
+        11,
+        corpus,
+        Path::new("s/baseline"),
+    );
+    let mutant = start_args(bounds, "c-11", "h", "bb", 11, corpus, Path::new("s/mutant"));
+    let differ: Vec<usize> = (0..baseline.len())
+        .filter(|i| baseline[*i] != mutant[*i])
+        .collect();
+    assert_eq!(baseline.len(), mutant.len());
+    let flags: Vec<&OsString> = differ.iter().map(|i| &baseline[i - 1]).collect();
+    assert_eq!(flags, ["--store", "--campaign", "--build"]);
+    let text: Vec<String> = baseline
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let flag = |name: &str| {
+        text[text
+            .iter()
+            .position(|a| a == name)
+            .expect("the flag is passed")
+            + 1]
+        .clone()
+    };
+    assert_eq!(flag("--seconds"), "600");
+    assert_eq!(flag("--max-restarts"), "0");
+    assert_eq!(flag("--fixtures"), "qa/mutation-pilot/discovery-empty");
+    assert!(!text.iter().any(|a| a == "--parent" || a == "--corpus"));
+}
+
+/// An original must match the catalogue's build and be clean; a mutant
+/// must share every other field, be dirty, and change the source.
+#[test]
+fn paired_builds_share_their_identity() {
+    let expected = serde_json::json!({"git": "g", "rustc": "r", "source": "s", "dirty": false});
+    let original = expected.clone();
+    assert_eq!(
+        paired_identity(&expected, &original, &["git", "rustc"], false),
+        None
+    );
+    let other_rustc = serde_json::json!({"git": "g", "rustc": "q", "source": "s", "dirty": false});
+    assert!(
+        paired_identity(&expected, &other_rustc, &["git", "rustc"], false)
+            .expect("rustc differs")
+            .contains("rustc")
+    );
+    let mutant = serde_json::json!({"git": "g", "rustc": "r", "source": "t", "dirty": true});
+    assert_eq!(
+        paired_identity(&expected, &mutant, &["git", "rustc"], true),
+        None
+    );
+    let unchanged = serde_json::json!({"git": "g", "rustc": "r", "source": "s", "dirty": true});
+    assert!(
+        paired_identity(&expected, &unchanged, &["git", "rustc"], true)
+            .expect("the patch changed no source")
+            .contains("source")
+    );
+    assert!(paired_identity(&expected, &mutant, &["git", "rustc"], false).is_some());
+}
+
+/// A trace's meta and end records give its build, input, settling and the
+/// intended property's applicability.
+#[test]
+fn traces_give_their_facts() {
+    let text = [
+        r#"{"meta":{"sim":"block/reactor-policy","input":{"sha256":"ab","len":3},"build":{"git":"g"}}}"#,
+        r#"{"step":1}"#,
+        r#"{"end":{"outcome":"idle","status":"quiescent","steps":4,"cleanup":{"cancelled":0,"leaked":0},"properties":[{"property":"block/reactor-policy","outcome":{"held":{"applicable":4}}}]}}"#,
+    ]
+    .join("\n");
+    let facts = parse_trace(&text, ID).expect("the trace parses");
+    assert_eq!(facts.harness, ID);
+    assert_eq!(facts.input_sha256, "ab");
+    assert_eq!(facts.applicable, Some(4));
+    assert_eq!(facts.status.as_deref(), Some("quiescent"));
+    assert_eq!(facts.build, serde_json::json!({"git": "g"}));
+    assert_eq!(
+        parse_trace(&text, OTHER)
+            .expect("the trace parses")
+            .applicable,
+        None
+    );
+    assert!(parse_trace("", ID).is_err());
+    assert!(parse_trace(r#"{"step":1}"#, ID).is_err());
+}
+
+/// A confirmation must say `confirmed`, exit 0 and name its trace.
+#[test]
+fn confirmations_must_confirm() {
+    let confirmed = serde_json::json!({"status": "confirmed", "trace": "traces/a/b"});
+    assert_eq!(
+        confirmed_trace(ChildEnd::Exited(0), Some(&confirmed)),
+        Ok(PathBuf::from("traces/a/b"))
+    );
+    assert!(confirmed_trace(ChildEnd::TimedOut, Some(&confirmed)).is_err());
+    assert!(confirmed_trace(ChildEnd::Exited(1), None).is_err());
+    let other = serde_json::json!({"status": "other-property", "detail": OTHER});
+    assert!(confirmed_trace(ChildEnd::Exited(1), Some(&other))
+        .expect_err("another property doesn't confirm")
+        .contains(OTHER));
+    let untraced = serde_json::json!({"status": "confirmed"});
+    assert!(confirmed_trace(ChildEnd::Exited(0), Some(&untraced)).is_err());
+}
+
+/// A patch must change exactly its declared production files.
+#[test]
+fn patches_change_only_declared_files() {
+    let declared = BTreeMap::from([("crates/a.rs".to_owned(), "00".to_owned())]);
+    let changed = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(undeclared(&changed(&["crates/a.rs"]), &declared), None);
+    let extra = undeclared(&changed(&["crates/a.rs", "crates/b.rs"]), &declared)
+        .expect("b.rs isn't declared");
+    assert!(extra.contains("crates/b.rs"), "{extra}");
+    assert!(undeclared(&changed(&[]), &declared)
+        .expect("a.rs is unchanged")
+        .contains("crates/a.rs"));
+}
+
+/// `prepare_patch` rejects a patch that doesn't apply and one that changes
+/// an undeclared file, in a real checkout.
+#[test]
+fn broken_patches_are_invalid_mutants() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path();
+    let git_ok = |args: &[&str]| {
+        let status = git(root)
+            .args(["-c", "user.name=pilot", "-c", "user.email=pilot@test"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    fs::write(root.join("a.rs"), "fn a() {}\n").expect("a.rs is written");
+    fs::write(root.join("b.rs"), "fn b() {}\n").expect("b.rs is written");
+    git_ok(&["init", "-q"]);
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-q", "-m", "base"]);
+    let mut case = committed_catalogue().cases[0].clone();
+    case.patch = PathBuf::from("p.patch");
+    case.production_files = BTreeMap::from([("a.rs".to_owned(), String::new())]);
+    let patch = |text: &str| fs::write(root.join("p.patch"), text).expect("the patch is written");
+    let reset = || {
+        git_ok(&["checkout", "-q", "--", "."]);
+    };
+
+    patch("--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn z() {}\n+fn c() {}\n");
+    let why = prepare_patch(root, &case)
+        .expect("git runs")
+        .expect_err("the context isn't in a.rs");
+    assert!(why.starts_with("the patch doesn't apply"), "{why}");
+
+    patch("--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-fn b() {}\n+fn c() {}\n");
+    let why = prepare_patch(root, &case)
+        .expect("git runs")
+        .expect_err("b.rs isn't declared");
+    assert!(why.contains("undeclared files [b.rs"), "{why}");
+    reset();
+
+    patch("--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn c() {}\n");
+    // The patch file itself is untracked, so declare it for this check.
+    case.production_files
+        .insert("p.patch".to_owned(), String::new());
+    assert_eq!(prepare_patch(root, &case).expect("git runs"), Ok(()));
+}
+
+/// The pilot reads each case's patch at the pinned revision. A later
+/// change to the patch in the tree the pilot runs from leaves the run
+/// alone, and a patch that exists in that tree but not at the pin fails
+/// the pin check, naming the case.
+#[test]
+fn patches_come_from_the_pinned_revision() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let root = dir.path().join("repo");
+    fs::create_dir(&root).expect("the repository directory is made");
+    let git_ok = |args: &[&str]| {
+        let status = git(&root)
+            .args(["-c", "user.name=pilot", "-c", "user.email=pilot@test"])
+            .args(args)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    };
+    let pinned = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn pinned() {}\n";
+    fs::write(root.join("a.rs"), "fn a() {}\n").expect("a.rs is written");
+    fs::write(root.join("w.bin"), "witness").expect("the witness is written");
+    fs::write(root.join("p.patch"), pinned).expect("the patch is written");
+    git_ok(&["init", "-q"]);
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-q", "-m", "pin"]);
+    let pin = head(&root).expect("the pin has a commit");
+    let mut case = committed_catalogue().cases[0].clone();
+    case.patch = PathBuf::from("p.patch");
+    case.patch_sha256 = file_sha256(&root.join("p.patch")).expect("the patch hashes");
+    case.witness = PathBuf::from("w.bin");
+    case.witness_sha256 = file_sha256(&root.join("w.bin")).expect("the witness hashes");
+    case.production_files = BTreeMap::from([(
+        "a.rs".to_owned(),
+        file_sha256(&root.join("a.rs")).expect("a.rs hashes"),
+    )]);
+    // After the pin, the tree's patch changes another line, and a new
+    // case's patch appears only in the tree.
+    fs::write(
+        root.join("p.patch"),
+        "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn a() {}\n+fn later() {}\n",
+    )
+    .expect("the patch is rewritten");
+    fs::write(root.join("q.patch"), pinned).expect("the new patch is written");
+    git_ok(&["add", "."]);
+    git_ok(&["commit", "-q", "-m", "later"]);
+
+    let tree = dir.path().join("pinned");
+    add_worktree(&root, &tree, &pin).expect("the pin checks out");
+    check_pins(&tree, &pin, &[&case]).expect("the pin-era patch matches its hash");
+    assert_eq!(prepare_patch(&tree, &case).expect("git runs"), Ok(()));
+    assert_eq!(
+        fs::read_to_string(tree.join("a.rs")).expect("a.rs is read"),
+        "fn pinned() {}\n"
+    );
+
+    let mut unpinned = case.clone();
+    unpinned.id = "later/case".to_owned();
+    unpinned.patch = PathBuf::from("q.patch");
+    let why = check_pins(&tree, &pin, &[&case, &unpinned])
+        .expect_err("q.patch isn't at the pin")
+        .to_string();
+    assert!(why.contains(&pin), "{why}");
+    assert!(why.contains("later/case: q.patch"), "{why}");
+    assert!(!why.contains(&case.id), "{why}");
+    remove_worktree(&root, &tree).expect("the worktree is removed");
+}
+
+/// The committed catalogue.
+fn committed_catalogue() -> Catalogue {
+    let root = crate::repo_root().expect("xtask lives in the workspace");
+    serde_json::from_slice(&fs::read(root.join(CATALOGUE)).expect("the catalogue is committed"))
+        .expect("the catalogue parses")
+}
+
+/// Zero selected cases or seeds, and an unknown case or seed, fail instead
+/// of producing an empty report.
+#[test]
+fn zero_selected_tests_fail() {
+    let catalogue = committed_catalogue();
+    assert_eq!(select(&catalogue.cases, &[]).expect("every case").len(), 10);
+    let one = select(&catalogue.cases, &[catalogue.cases[3].id.clone()]).expect("one case");
+    assert_eq!(one.len(), 1);
+    assert!(select(&catalogue.cases, &["no/such/case".to_owned()])
+        .expect_err("the ID isn't in the catalogue")
+        .contains("no/such/case"));
+    assert!(select(&[], &[])
+        .expect_err("no case")
+        .contains("zero cases"));
+    assert_eq!(select_seeds(&[11, 23], &[]), Ok(vec![11, 23]));
+    assert_eq!(select_seeds(&[11, 23], &[23]), Ok(vec![23]));
+    assert!(select_seeds(&[11, 23], &[5]).is_err());
+    assert!(select_seeds(&[], &[]).is_err());
+    assert!(classify::summarize(std::iter::empty()).is_err());
+    assert!(sensitivity_report(meta(), Vec::new()).is_err());
+    let unseeded = DiscoveryCase {
+        id: "a".to_owned(),
+        fault_class: "f".to_owned(),
+        property: ID.to_owned(),
+        target: "t".to_owned(),
+        seeds: Vec::new(),
+        cleanup: None,
+    };
+    assert!(discovery_report(meta(), vec![unseeded], Vec::new()).is_err());
+}
+
+fn meta() -> Meta {
+    Meta {
+        experiment: "sensitivity".to_owned(),
+        catalogue_sha256: "00".to_owned(),
+        built_revision: "r".to_owned(),
+        runner_revision: "h".to_owned(),
+        reviewed_cases: 10,
+    }
+}
+
+fn classified(class: Class) -> Classified {
+    Classified {
+        class,
+        reason: String::new(),
+    }
+}
+
+/// The rate counts every result but baseline failures, invalid mutants and
+/// equivalent mutants, keeps not-applicable results in, and splits by
+/// fault class.
+#[test]
+fn reports_count_classes_and_rates() {
+    let row = |fault_class: &str, class: Class| SensitivityCase {
+        id: format!("{fault_class}/{class:?}"),
+        fault_class: fault_class.to_owned(),
+        property: ID.to_owned(),
+        harness: ID.to_owned(),
+        result: classified(class),
+        baseline: None,
+        mutant: None,
+        artifacts: PathBuf::new(),
+        cleanup: None,
+    };
+    let report = sensitivity_report(
+        meta(),
+        vec![
+            row("stale", Class::IntendedViolation),
+            row("stale", Class::NotApplicable),
+            row("stale", Class::BaselineFailure),
+            row("queue", Class::IntendedViolation),
+            row("queue", Class::SurvivedBudget),
+            row("queue", Class::InvalidMutant),
+            row("queue", Class::Equivalent),
+            row("queue", Class::HarnessFailure),
+            row("queue", Class::OtherViolation),
+        ],
+    )
+    .expect("the report has results");
+    let summary = &report.summary;
+    assert_eq!(
+        (summary.results, summary.denominator, summary.intended),
+        (9, 6, 2)
+    );
+    assert_eq!(summary.classes.len(), 8);
+    assert_eq!(summary.classes[&Class::NotApplicable], 1);
+    let stale = &summary.by_fault_class["stale"];
+    assert_eq!(
+        (stale.results, stale.denominator, stale.intended),
+        (3, 2, 1)
+    );
+    let queue = &summary.by_fault_class["queue"];
+    assert_eq!(
+        (queue.results, queue.denominator, queue.intended),
+        (6, 4, 1)
+    );
+    let json = serde_json::to_value(&report).expect("the report serializes");
+    assert_eq!(json["experiment"], "sensitivity");
+    assert_eq!(json["cases"][0]["result"]["class"], "intended-violation");
+    assert_eq!(json["summary"]["classes"]["not-applicable"], 1);
+
+    // Discovery counts each seed of each case.
+    let seed = |seed: u32, class: Class| SeedResult {
+        seed,
+        result: classified(class),
+        baseline: None,
+        mutant: None,
+        store: None,
+    };
+    let case = DiscoveryCase {
+        id: "a".to_owned(),
+        fault_class: "stale".to_owned(),
+        property: ID.to_owned(),
+        target: "t".to_owned(),
+        seeds: vec![
+            seed(11, Class::IntendedViolation),
+            seed(23, Class::NotApplicable),
+            seed(47, Class::BaselineFailure),
+        ],
+        cleanup: None,
+    };
+    let excluded = Excluded {
+        id: "b".to_owned(),
+        fault_class: "stale".to_owned(),
+        reason: "never applied".to_owned(),
+    };
+    let report = discovery_report(meta(), vec![case], vec![excluded.clone()])
+        .expect("the report has results");
+    assert_eq!(
+        (
+            report.summary.results,
+            report.summary.denominator,
+            report.summary.intended
+        ),
+        (3, 2, 1)
+    );
+    assert_eq!(report.summary.by_fault_class["stale"].results, 3);
+    assert_eq!(report.excluded, vec![excluded]);
+}
+
+/// Discovery leaves out exactly the cases the catalogue excludes, the two
+/// record-book cases whose target never applied its property in
+/// calibration. Sensitivity still selects them, a discovery selection of
+/// only excluded cases fails, and an exclusion needs a reason.
+#[test]
+fn discovery_leaves_out_excluded_cases() {
+    let catalogue = committed_catalogue();
+    // Sensitivity runs every selected case, the record-book cases included.
+    let cases = select(&catalogue.cases, &[]).expect("every case");
+    assert_eq!(cases.len(), 10);
+    let (scored, excluded) = discovery_cases(&cases).expect("some case is scored");
+    assert_eq!(scored.len(), 8);
+    let ids: Vec<&str> = excluded.iter().map(|case| case.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "discovery/record-book/keep-old-relay-attribution",
+            "discovery/record-book/wrong-eviction-victim"
+        ]
+    );
+    assert!(excluded.iter().all(|case| !case.reason.is_empty()));
+    assert!(scored
+        .iter()
+        .all(|case| case.target != "discovery_record_book"));
+    let only = select(&catalogue.cases, &[ids[0].to_owned()]).expect("one case");
+    assert!(discovery_cases(&only)
+        .expect_err("only an excluded case")
+        .contains("excluded"));
+    assert_eq!(check_exclusions(&catalogue.cases), Ok(()));
+    for blank in ["", " "] {
+        let mut cases = catalogue.cases.clone();
+        cases[0].discovery_excluded = Some(blank.to_owned());
+        assert!(check_exclusions(&cases)
+            .expect_err("an exclusion needs a reason")
+            .contains(&cases[0].id));
+    }
+}
+
+/// The failure kinds a store's paths name.
+#[test]
+fn failure_paths_name_their_kind() {
+    let worker = "runs/m/workers/0";
+    assert_eq!(
+        failure_kind(&format!("{worker}/sim/inputs/known/a/b/cc.bin")),
+        Failure::Violation("a/b".to_owned())
+    );
+    assert_eq!(
+        failure_kind("runs/m/compact-sim/inputs/active/a/cc.bin"),
+        Failure::Violation("a".to_owned())
+    );
+    assert_eq!(
+        failure_kind(&format!("{worker}/sim/inputs/harness/cc.bin")),
+        Failure::Other
+    );
+    assert_eq!(
+        failure_kind(&format!("{worker}/sim/inputs/active/cc.bin")),
+        Failure::Other
+    );
+    assert_eq!(
+        failure_kind(&format!("{worker}/artifacts/oom-1")),
+        Failure::Other
+    );
+    assert_eq!(
+        failure_kind("runs/m/compact-artifacts/crash-1"),
+        Failure::Crash
+    );
+    assert_eq!(
+        failure_kind(&format!("{worker}/sim/traces/a/t/trace.jsonl")),
+        Failure::Companion
+    );
+}
+
+/// Every committed case pins production files, and its toolchain parses
+/// from the catalogue. The patch hashes pin the patches at the pinned
+/// revision, which a shallow checkout lacks, so `check_pins` checks them
+/// when a run starts.
+#[test]
+fn the_committed_catalogue_pins_its_cases() {
+    let catalogue = committed_catalogue();
+    assert_eq!(toolchain(&catalogue.baseline_build), Ok("1.99.0"));
+    for case in &catalogue.cases {
+        assert!(!case.production_files.is_empty(), "{}", case.id);
+        assert!(
+            case.equivalent.is_none(),
+            "{}: no review marked it equivalent",
+            case.id
+        );
+    }
+}
+
+/// An interrupted child stops the pilot with an error, so no result reads
+/// it as an invalid mutant or a harness failure. Every other end passes
+/// through. A set interrupt flag stops the pilot before its report.
+#[test]
+fn an_interrupt_stops_the_pilot() {
+    let error = stop_on_interrupt(ChildEnd::Interrupted).expect_err("an interrupt stops the pilot");
+    assert_eq!(error.to_string(), INTERRUPTED_ERROR);
+    for end in [
+        ChildEnd::Exited(0),
+        ChildEnd::Exited(1),
+        ChildEnd::TimedOut,
+        ChildEnd::Signaled(9),
+    ] {
+        assert_eq!(stop_on_interrupt(end).expect("not an interrupt"), end);
+    }
+    let error = check_interrupt(&AtomicBool::new(true)).expect_err("no report after an interrupt");
+    assert_eq!(error.to_string(), INTERRUPTED_ERROR);
+    check_interrupt(&AtomicBool::new(false)).expect("no interrupt");
+}
+
+/// A witness run that dies mid-trace, from a crash or at its deadline,
+/// leaves a trace with no end record, and a run can write its witness
+/// result without a trace. Each is a harness failure for a mutant, naming
+/// how the run ended, and the experiment goes on. For the original, a run
+/// past its deadline is a harness failure, and the others are baseline
+/// failures.
+#[cfg(unix)]
+#[test]
+fn a_witness_run_that_dies_mid_trace_is_classified() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const PARTIAL: &str = "printf '%s\\n' '{\"meta\":{}}' '{\"step\":1}' > \"$out/trace.jsonl\"";
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let partial_then = |death: &str| format!("{PARTIAL}\n{death}");
+    for (name, writes, ended, why, original) in [
+        (
+            "crash",
+            partial_then("exit 1"),
+            "exited with code 1",
+            "no end record",
+            Class::BaselineFailure,
+        ),
+        (
+            "hang",
+            partial_then("exec sleep 30"),
+            "ran past its deadline",
+            "no end record",
+            Class::HarnessFailure,
+        ),
+        (
+            "untraced",
+            "echo '{\"passed\":true,\"error\":null}' > \"$out/witness.json\"".to_owned(),
+            "exited with code 0",
+            "trace is unreadable",
+            Class::BaselineFailure,
+        ),
+    ] {
+        // A stand-in for `zakura-sim record` that writes `writes` into its
+        // `--out` directory.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = record ] || exit 0\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\n\
+                 mkdir -p \"$out\"\n\
+                 {writes}\n"
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = witness_run(
+            &sim,
+            dir.path(),
+            case,
+            &catalogue,
+            false,
+            &dir.path().join(format!("{name}-out")),
+            Duration::from_millis(500),
+            &AtomicBool::new(false),
+        )
+        .expect("the run's output doesn't stop the experiment");
+        let (Run::Failed(failed) | Run::Killed(failed)) = &recorded.run else {
+            panic!("{name}: the run didn't fail: {:?}", recorded.run);
+        };
+        assert!(failed.contains(ended), "{name}: {failed}");
+        assert!(failed.contains(why), "{name}: {failed}");
+        assert_eq!(recorded.trace, None, "{name}");
+
+        let baseline = classify::sensitivity_baseline(ID, &Some(Ok(recorded.clone())))
+            .expect("the baseline fails");
+        assert_eq!(baseline.class, original, "{name}");
+        assert!(
+            baseline.reason.contains(ended),
+            "{name}: {}",
+            baseline.reason
+        );
+
+        let mutant = SensitivityRun {
+            mutant: Some(Ok(recorded)),
+            ..sensitivity_run(run(None, &[(ID, HELD)]), None)
+        };
+        let result = classify::sensitivity(ID, &mutant);
+        assert_eq!(result.class, Class::HarnessFailure, "{name}");
+        assert!(result.reason.contains(ended), "{name}: {}", result.reason);
+    }
+}
+
+/// `--work` and `--out` come back absolute, against the current
+/// directory: the builds run cargo from their worktree, which would read a
+/// relative `CARGO_TARGET_DIR` under the worktree.
+#[test]
+fn relative_flags_become_absolute() {
+    let args = ["--work", "pilot-work", "--out", "pilot-out", "--seed", "11"];
+    let flags = parse_flags(args.into_iter().map(str::to_owned)).expect("the flags parse");
+    let cwd = std::env::current_dir().expect("a current directory");
+    assert_eq!(flags.work, Some(cwd.join("pilot-work")));
+    assert_eq!(flags.out, cwd.join("pilot-out"));
+    assert_eq!(flags.seeds, [11]);
+    let absolute =
+        parse_flags(["--out", "/a/b"].into_iter().map(str::to_owned)).expect("the flags parse");
+    assert_eq!(absolute.out, Path::new("/a/b"));
+    assert_eq!(absolute.work, None);
+    assert!(parse_flags(["--work", "w"].into_iter().map(str::to_owned)).is_err());
+}
+
+/// A campaign that left a libFuzzer timeout beside a confirmed finding of
+/// the intended ID is a harness failure: a timeout never counts as
+/// detection.
+#[test]
+fn a_timeout_beside_a_finding_is_a_harness_failure() {
+    let worker = "runs/m/workers/0";
+    let intended = format!("{worker}/sim/inputs/active/block/reactor-policy/aa.bin");
+    let crash = format!("{worker}/artifacts/crash-bb");
+    let timeout = format!("{worker}/artifacts/timeout-dd");
+    let failures: Vec<Value> = [&intended, &crash, &timeout]
+        .iter()
+        .map(|path| serde_json::json!({"path": path, "sha256": "00"}))
+        .collect();
+    let end = serde_json::json!({
+        "failures": failures,
+        "workers": [{"index": 0, "millis": 1500}],
+    });
+    let evidence = serde_json::json!({
+        "status": "worker-stopped",
+        "totals": {"runs": 42},
+        "unapplied": [],
+        "incomplete": [{"reason": "restart-limit", "worker": 0}],
+    });
+    let facts = campaign_facts(ID, Some(&end), &evidence, 0);
+    assert_eq!(facts.violated, [ID]);
+    assert!(facts.failures.is_empty(), "{:?}", facts.failures);
+    assert_eq!(facts.killed, std::slice::from_ref(&timeout));
+    let result = classify::discovery(ID, &discovery_run(facts, Some(Ok(()))));
+    assert_eq!(result.class, Class::HarnessFailure, "{}", result.reason);
+    assert!(result.reason.contains(&timeout), "{}", result.reason);
+    // Another ID's finding beside a timeout doesn't count either.
+    let mut other = found(OTHER);
+    other.killed = vec![timeout];
+    assert_eq!(
+        discovered(&discovery_run(other, Some(Ok(())))),
+        Class::HarnessFailure
+    );
+}
+
+/// A witness run that passes its deadline, or that a signal kills, fails
+/// though it already wrote a whole trace and its witness result. Its trace
+/// isn't scored: the original's run and a mutant's are each a harness
+/// failure, never a baseline failure, and a mutant's is one even beside a
+/// confirmed violation.
+#[cfg(unix)]
+#[test]
+fn a_witness_run_that_times_out_or_is_killed_is_not_scored() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let property = &case.property;
+    // A whole trace of the intended violation on a paired mutant build.
+    let mut build = catalogue.baseline_build.clone();
+    build["dirty"] = Value::Bool(true);
+    build["source"] = Value::String("mutated".to_owned());
+    let meta = serde_json::json!({"meta": {
+        "sim": case.harness,
+        "input": {"sha256": case.witness_sha256},
+        "build": build,
+    }});
+    let end = serde_json::json!({"end": {
+        "outcome": "idle",
+        "violation": {"property": property},
+        "status": "quiescent",
+        "steps": 4,
+        "cleanup": {},
+        "properties": [{"property": property, "outcome": {"violated": {"witness": [3]}}}],
+    }});
+    let trace = dir.path().join("trace.jsonl");
+    fs::write(&trace, format!("{meta}\n{{\"step\":1}}\n{end}\n")).expect("the trace is written");
+    for (name, death, ended) in [
+        ("hang", "exec sleep 30", "ran past its deadline"),
+        ("killed", "kill -KILL $$", "died from signal 9"),
+    ] {
+        // A stand-in for `zakura-sim record` that writes the whole trace and
+        // a passing witness result, then dies by `death`.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = record ] || exit 0\n\
+                 while [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\n\
+                 mkdir -p \"$out\"\n\
+                 cp '{}' \"$out/trace.jsonl\"\n\
+                 echo '{{\"passed\":true,\"error\":null}}' > \"$out/witness.json\"\n\
+                 {death}\n",
+                trace.display()
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let recorded = witness_run(
+            &sim,
+            dir.path(),
+            case,
+            &catalogue,
+            true,
+            &dir.path().join(format!("{name}-out")),
+            Duration::from_millis(500),
+            &AtomicBool::new(false),
+        )
+        .expect("the run's end doesn't stop the experiment");
+        let Run::Killed(failed) = &recorded.run else {
+            panic!("{name}: a run that {ended} was scored: {:?}", recorded.run);
+        };
+        assert!(failed.contains(ended), "{name}: {failed}");
+
+        let baseline = classify::sensitivity_baseline(property, &Some(Ok(recorded.clone())))
+            .expect("the baseline fails");
+        assert_eq!(baseline.class, Class::HarnessFailure, "{name}");
+        assert!(
+            baseline.reason.contains(ended),
+            "{name}: {}",
+            baseline.reason
+        );
+        // The baseline's harness failure is the case's result, and no
+        // mutant runs beside it.
+        let original = SensitivityRun {
+            baseline: Some(Ok(recorded.clone())),
+            ..sensitivity_run(run(Some(ID), &[(ID, VIOLATED)]), Some(Ok(())))
+        };
+        assert_eq!(class(&original), Class::HarnessFailure, "{name}");
+
+        let mutant = SensitivityRun {
+            mutant: Some(Ok(recorded)),
+            ..sensitivity_run(run(None, &[(ID, HELD)]), Some(Ok(())))
+        };
+        let result = classify::sensitivity(property, &mutant);
+        assert_eq!(result.class, Class::HarnessFailure, "{name}");
+        assert!(result.reason.contains(ended), "{name}: {}", result.reason);
+    }
+}
+
+/// A cargo JSON message from package `package` at `level`, with a source
+/// span if `located`.
+fn cargo_message(package: &str, level: &str, text: &str, located: bool) -> String {
+    let spans = if located {
+        serde_json::json!([{"file_name": "crates/zakura-network/src/a.rs", "line_start": 12}])
+    } else {
+        serde_json::json!([])
+    };
+    serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": package,
+        "message": {"level": level, "message": text, "spans": spans, "rendered": text},
+    })
+    .to_string()
+}
+
+/// Only a build that exits with a code after rustc reports an error at a
+/// source location is rejected. A killed compiler, a full disk, a failed
+/// link or an internal compiler error is a broken build.
+#[test]
+fn only_a_located_compile_error_rejects_a_build() {
+    const WORKSPACE: &str = "path+file:///w/crates/zakura-network#13.0.0";
+    const REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0";
+    let rejected = |failure: BuildFailure| matches!(failure, BuildFailure::Rejected(_));
+    let sim = |end: ChildEnd, log: &[String]| {
+        rejected(sim_build_failure(end, &log.join("\n"), "why".to_owned()))
+    };
+    let mismatched = cargo_message(WORKSPACE, "error", "mismatched types", true);
+    let progress = "   Compiling zakura-network v13.0.0 (/w/crates/zakura-network)".to_owned();
+    assert!(sim(
+        ChildEnd::Exited(101),
+        &[progress.clone(), mismatched.clone()]
+    ));
+    let BuildFailure::Rejected(why) =
+        sim_build_failure(ChildEnd::Exited(101), &mismatched, "see log".to_owned())
+    else {
+        panic!("a located error rejects the build");
+    };
+    assert!(
+        why.contains("mismatched types at crates/zakura-network/src/a.rs:12"),
+        "{why}"
+    );
+    for (end, log) in [
+        // The compiler was killed for memory after an error.
+        (ChildEnd::Signaled(9), vec![mismatched.clone()]),
+        (ChildEnd::TimedOut, vec![mismatched.clone()]),
+        // A full disk and a failed link have no source location.
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(
+                WORKSPACE,
+                "error",
+                "failed to write: No space left on device (os error 28)",
+                false,
+            )],
+        ),
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(
+                WORKSPACE,
+                "error",
+                "linking with `cc` failed",
+                false,
+            )],
+        ),
+        // Cargo reports a compiler that a signal killed only in its text.
+        (
+            ChildEnd::Exited(101),
+            vec![
+                progress.clone(),
+                "error: could not compile `zakura-network` (lib)".to_owned(),
+                "process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)".to_owned(),
+            ],
+        ),
+        // A warning, an internal compiler error and a dependency's error.
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(WORKSPACE, "warning", "unused", true)],
+        ),
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(
+                WORKSPACE,
+                "error: internal compiler error",
+                "unexpected panic",
+                true,
+            )],
+        ),
+        (
+            ChildEnd::Exited(101),
+            vec![cargo_message(REGISTRY, "error", "mismatched types", true)],
+        ),
+    ] {
+        assert!(!sim(end, &log), "{end}: {log:?}");
+    }
+
+    let fuzz = |end: ChildEnd, log: &str| rejected(fuzz_build_failure(end, log, "why".to_owned()));
+    let located = "   Compiling zakura-network v13.0.0\n\
+                   error[E0425]: cannot find value `x` in this scope\n  \
+                   --> /w/crates/zakura-network/src/a.rs:12:5\n   |\n\
+                   error: could not compile `zakura-network` (lib) due to 1 previous error\n\
+                   Error: cargo fuzz build of block_reactor_policy failed with exit status: 1\n";
+    assert!(fuzz(ChildEnd::Exited(1), located));
+    assert!(fuzz(
+        ChildEnd::Exited(1),
+        "error: unused variable: `y`\n --> crates/a.rs:3:9\n"
+    ));
+    for (end, log) in [
+        (ChildEnd::Signaled(9), located),
+        (
+            ChildEnd::Exited(1),
+            "error: could not compile `zakura-network` (lib)\n\nCaused by:\n  \
+             process didn't exit successfully: `rustc` (signal: 9, SIGKILL: kill)\n",
+        ),
+        (
+            ChildEnd::Exited(1),
+            "error: failed to write /w/target/a.rlib: No space left on device (os error 28)\n\n\
+             error: could not compile `zakura-network` (lib) due to 1 previous error\n",
+        ),
+        (
+            ChildEnd::Exited(1),
+            "error: linking with `cc` failed: exit status: 1\n  |\n  = note: ld: out of memory\n",
+        ),
+        (
+            ChildEnd::Exited(101),
+            "error: internal compiler error: unexpected panic\n --> crates/a.rs:3:9\n",
+        ),
+        (
+            ChildEnd::Exited(1),
+            "warning: unused import\n --> crates/a.rs:1:5\n",
+        ),
+    ] {
+        assert!(!fuzz(end, log), "{end}: {log}");
+    }
+}
+
+/// A broken build is a harness failure, not an invalid mutant or a
+/// baseline failure, whichever build broke. A mutant fuzz target that
+/// doesn't compile makes every later seed invalid, and one whose build
+/// broke fails only its own seed.
+#[test]
+fn a_broken_build_is_a_harness_failure() {
+    let broke = "the mutant build broke: `cargo build` died from signal 9".to_owned();
+    let mut sensitivity = SensitivityRun {
+        broken_build: Some(broke.clone()),
+        ..SensitivityRun::default()
+    };
+    let result = classify::sensitivity(ID, &sensitivity);
+    assert_eq!(result.class, Class::HarnessFailure);
+    assert_eq!(result.reason, broke);
+    // A mutant build that broke after a passing baseline.
+    sensitivity = SensitivityRun {
+        broken_build: Some(broke.clone()),
+        patch: None,
+        mutant: None,
+        confirmation: None,
+        ..sensitivity_run(run(None, &[(ID, HELD)]), None)
+    };
+    assert_eq!(class(&sensitivity), Class::HarnessFailure);
+
+    let mut discovery = discovery_run(campaign(), None);
+    discovery.patch = None;
+    discovery.mutant = None;
+    discovery.broken_build = Some(broke.clone());
+    assert_eq!(discovered(&discovery), Class::HarnessFailure);
+    // An original whose build broke.
+    discovery = DiscoveryRun {
+        broken_build: Some(broke),
+        ..DiscoveryRun::default()
+    };
+    assert_eq!(discovered(&discovery), Class::HarnessFailure);
+
+    let sim = PathBuf::from("zakura-sim");
+    let mut mutant = Ok(sim.clone());
+    let mut first = discovery_run(campaign(), None);
+    first.mutant = None;
+    fuzz_build_failed(
+        &mut first,
+        &mut mutant,
+        BuildFailure::Broken("the mutant fuzz target's build broke".to_owned()),
+    );
+    assert_eq!(discovered(&first), Class::HarnessFailure);
+    assert_eq!(mutant, Ok(sim), "a broken build fails only its seed");
+    fuzz_build_failed(
+        &mut first,
+        &mut mutant,
+        BuildFailure::Rejected("the mutant fuzz target doesn't compile".to_owned()),
+    );
+    assert!(
+        matches!(mutant, Err(BuildFailure::Rejected(_))),
+        "a compile error holds for every later seed"
+    );
+}
+
+/// `campaign_lane` reads a failed `zakura-sim campaign build`: a located
+/// rustc error rejects the build, and a build that a signal killed, or
+/// that reports no location, broke.
+#[cfg(unix)]
+#[test]
+fn a_campaign_build_is_rejected_only_for_a_compile_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    let located = "printf '%s\\n' 'error[E0425]: cannot find value `x`' \
+                   '  --> crates/a.rs:12:5' >&2";
+    let full = "echo 'error: failed to write: No space left on device (os error 28)' >&2";
+    for (name, body, compile_error) in [
+        ("located", format!("{located}\nexit 1"), true),
+        ("killed", format!("{located}\nkill -KILL $$"), false),
+        ("full", format!("{full}\nexit 1"), false),
+    ] {
+        // A stand-in for `zakura-sim` whose `campaign build` runs `body`.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!("#!/bin/sh\n[ \"$1 $2\" = 'campaign build' ] || exit 0\n{body}\n"),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lane = campaign_lane(
+            &sim,
+            &dir.path().join(format!("{name}-lane")),
+            &dir.path().join("fuzz-target"),
+            case,
+            11,
+            &catalogue,
+            dir.path(),
+            true,
+        )
+        .expect("the lane's build failure doesn't stop the experiment");
+        match lane {
+            Err(LaneError::Build(BuildFailure::Rejected(why))) => {
+                assert!(compile_error, "{name}: rejected: {why}");
+                assert!(why.contains("crates/a.rs:12:5"), "{name}: {why}");
+            }
+            Err(LaneError::Build(BuildFailure::Broken(why))) => {
+                assert!(!compile_error, "{name}: broken: {why}");
+            }
+            lane => panic!("{name}: {lane:?}"),
+        }
+    }
+}
+
+/// `campaign_lane` reads a `zakura-sim campaign start` or `campaign
+/// evidence` that a signal killed as a killed campaign, though `start` left
+/// a manifest and snapshot: the original's lane is then a harness failure,
+/// never a baseline failure.
+#[cfg(unix)]
+#[test]
+fn a_campaign_that_a_signal_killed_is_not_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    const RECORDS: &str = "mkdir -p \"$store/manifests\" \"$store/snapshots/s\"\n\
+                           echo '{\"initial_snapshot\":\"s\"}' > \"$store/manifests/r.json\"\n\
+                           echo '{\"inputs\":[]}' > \"$store/snapshots/s/snapshot.json\"";
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    for (name, start, evidence, killed) in [
+        (
+            "start",
+            format!("{RECORDS}\nkill -KILL $$"),
+            "exit 0",
+            "`zakura-sim campaign start` died from signal 9",
+        ),
+        (
+            "evidence",
+            format!("{RECORDS}\nexit 1"),
+            "kill -KILL $$",
+            "`zakura-sim campaign evidence` died from signal 9",
+        ),
+    ] {
+        // A stand-in for `zakura-sim` whose `campaign build` makes one
+        // build, and whose `campaign start` and `campaign evidence` run
+        // `start` and `evidence`.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 store=$4\n\
+                 case \"$1 $2\" in\n\
+                 'campaign build') mkdir -p \"$store/builds/b\" ;;\n\
+                 'campaign start') {start} ;;\n\
+                 'campaign evidence') {evidence} ;;\n\
+                 esac\n"
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lane = campaign_lane(
+            &sim,
+            &dir.path().join(format!("{name}-lane")),
+            &dir.path().join("fuzz-target"),
+            case,
+            11,
+            &catalogue,
+            dir.path(),
+            false,
+        )
+        .expect("the lane's death doesn't stop the experiment");
+        let Err(LaneError::Killed(why)) = lane else {
+            panic!("{name}: a killed campaign was read: {lane:?}");
+        };
+        assert!(why.contains(killed), "{name}: {why}");
+        let baseline = classify::discovery_baseline(&Some(Err(NoCampaign::Killed(why))))
+            .expect("the baseline fails");
+        assert_eq!(baseline.class, Class::HarnessFailure, "{name}");
+    }
+}

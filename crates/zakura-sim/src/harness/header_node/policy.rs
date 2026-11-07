@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use zakura_scheduler::SimInstant;
-use zakura_storage::header::{controlled::PendingOp, Fault, Outcome};
+use zakura_storage::header::{
+    controlled::{CommittedOp, OpId, PendingOp},
+    Fault, Outcome,
+};
 
 use super::Base;
 pub use crate::harness::policy::LinkEffect;
@@ -122,6 +125,11 @@ impl Family for Header {
     fn allows(allow: Allow, outcome: Outcome) -> bool {
         allow.outcome() == outcome
     }
+
+    /// Only an apply commits state, so only its reply can be held.
+    fn commits(kind: OpKind) -> bool {
+        kind == OpKind::Apply
+    }
 }
 
 /// Which header operations a hold or trigger names.
@@ -132,6 +140,9 @@ pub type Trigger = policy::Trigger<OpKind>;
 
 /// A hold on header operations.
 pub type Hold = policy::Hold<OpKind, Allow>;
+
+/// A hold on header applies' replies.
+pub type ReplyHold = policy::ReplyHold<OpKind>;
 
 /// The header node's holds and everything they count.
 pub type Predicates = policy::Predicates<Header>;
@@ -169,6 +180,7 @@ impl Predicates {
                 self.submit(*id, kind, session);
             }
             StorageFact::CallerDropped { id } => self.event(Event::CallerDropped, *id),
+            StorageFact::Committed { id, .. } => self.event(Event::Committed, *id),
             StorageFact::Completed { id, .. } => self.event(Event::Completed, *id),
             StorageFact::ReplyTaken { id } => self.event(Event::ReplyTaken, *id),
             _ => {}
@@ -201,6 +213,17 @@ impl Predicates {
             .unwrap_or_else(|| base.offers(&op.enabled, outcome))
     }
 
+    /// Whether a reply hold picked operation `id`, so an engine completion
+    /// commits it and holds its reply.
+    pub fn holds_reply(&self, id: OpId) -> bool {
+        self.reply_held(id.0)
+    }
+
+    /// Whether committed apply `op`'s reply is offered for delivery.
+    pub fn delivers(&self, op: &CommittedOp) -> bool {
+        self.delivery_offered(op.id.0, op.since_commit)
+    }
+
     /// Where time must stop for `op` at `now`: a held operation's unreached
     /// virtual times and its deadline, or else the base `bound`.
     pub fn boundaries(
@@ -211,5 +234,11 @@ impl Predicates {
         out: &mut Vec<Boundary>,
     ) {
         self.op_boundaries(bound, op.id.0, op.since_submit, now, out);
+    }
+
+    /// Where time must stop for committed apply `op` at `now`: its reply
+    /// hold's unreached virtual times.
+    pub fn reply_boundaries(&self, op: &CommittedOp, now: SimInstant, out: &mut Vec<Boundary>) {
+        self.delivery_boundaries(op.id.0, op.since_commit, now, out);
     }
 }

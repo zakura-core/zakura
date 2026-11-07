@@ -58,6 +58,7 @@ impl Recorder {
                         | ReactorEvent::CauseSet { .. }
                         | ReactorEvent::HeadroomWait { .. }
                         | ReactorEvent::CachedPassDeferred { .. }
+                        | ReactorEvent::EventTaken { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }

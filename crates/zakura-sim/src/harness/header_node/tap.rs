@@ -533,8 +533,8 @@ impl TapState {
                     .observe(&event, now);
             }
         }
-        // Budget changes, credit, causes, headroom waits and deferred passes
-        // stay out of the log, whose format pinned Plans fix, and a
+        // Budget changes, credit, causes, headroom waits, deferred passes and
+        // taken events stay out of the log, whose format pinned Plans fix, and a
         // teardown's returns after the run are expected.
         if matches!(
             event,
@@ -543,12 +543,22 @@ impl TapState {
                 | ReactorEvent::CauseSet { .. }
                 | ReactorEvent::HeadroomWait { .. }
                 | ReactorEvent::CachedPassDeferred { .. }
+                | ReactorEvent::EventTaken { .. }
         ) {
             if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
                 state
                     .buffer()
                     .effects
                     .push((LinkEffect::HeadroomWait, peer.clone()));
+            }
+            // The events it takes and its turns, kept in order with what it
+            // adopts. The run's own shutdown takes events and sets causes
+            // too, so only the run's are kept.
+            if let (Some(now), Some(fact)) = (
+                zakura_scheduler::hooks::now().filter(|_| in_run),
+                AdoptionFact::of_turn(&event),
+            ) {
+                state.adoption.record(now.since_start(), fact);
             }
             return;
         }

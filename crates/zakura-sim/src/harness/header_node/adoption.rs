@@ -21,7 +21,10 @@ use std::{
 
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion};
-use zakura_network::zakura::{observe::ReactorEvent, Status, ZakuraPeerId};
+use zakura_network::zakura::{
+    observe::{EventQueue, ReactorCause, ReactorEvent, TakePoint},
+    Status, ZakuraPeerId,
+};
 
 use crate::{IdleStatus, Outcome, RunEnd};
 
@@ -117,6 +120,28 @@ pub enum AdoptionFact {
         /// The generation the read was made under.
         generation: HeaderGeneration,
     },
+    /// A `Commit` step put this state in the node's engine, outside header
+    /// sync. The harness records it, not the reactor, before any task runs
+    /// again, so it comes before every reactor fact that could read it.
+    Published {
+        /// The engine's state version after the commit.
+        state_version: StateVersion,
+        /// Its header generation.
+        header_generation: HeaderGeneration,
+    },
+    /// `EventTaken`: the reactor took an event from `queue` at `point`,
+    /// leaving `queued` more there.
+    EventTaken {
+        /// The queue.
+        queue: EventQueue,
+        /// Where in the turn.
+        point: TakePoint,
+        /// The events left in the queue.
+        queued: usize,
+    },
+    /// The reactor reached its turn's cached pass: a `CauseSet` to `Pass`,
+    /// once per turn of its run loop.
+    Pass,
 }
 
 impl AdoptionFact {
@@ -173,6 +198,26 @@ impl AdoptionFact {
             },
             _ => return None,
         })
+    }
+
+    /// The turn fact `event` gives this store, if any: an `EventTaken`, or
+    /// a `CauseSet` to `Pass`. Both stay out of the log.
+    pub(super) fn of_turn(event: &ReactorEvent) -> Option<Self> {
+        match event {
+            ReactorEvent::EventTaken {
+                queue,
+                point,
+                queued,
+            } => Some(AdoptionFact::EventTaken {
+                queue: *queue,
+                point: *point,
+                queued: *queued,
+            }),
+            ReactorEvent::CauseSet {
+                cause: ReactorCause::Pass,
+            } => Some(AdoptionFact::Pass),
+            _ => None,
+        }
     }
 
     /// Whether only this store keeps the fact. `Started` and `Dispatched`
@@ -255,6 +300,21 @@ impl AdoptionEvidence {
         if !store.frozen {
             store.facts.push(Stamped { at, fact });
         }
+    }
+
+    /// Records that a `Commit` step left the node's engine at
+    /// `state_version` and `header_generation`, at the run's current time.
+    pub(super) fn publish(&self, state_version: StateVersion, header_generation: HeaderGeneration) {
+        let at = zakura_scheduler::hooks::now()
+            .map(|now| now.since_start())
+            .unwrap_or_default();
+        self.record(
+            at,
+            AdoptionFact::Published {
+                state_version,
+                header_generation,
+            },
+        );
     }
 
     /// Stops recording facts. The tap calls it when the run's log freezes,

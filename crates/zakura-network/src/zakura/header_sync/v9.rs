@@ -13,6 +13,8 @@ mod wire;
 #[cfg(test)]
 pub(crate) use publisher::FakePort;
 pub(crate) use publisher::{LeaseOwner, PageLimits, Publisher};
+#[cfg(any(test, zakura_sim))]
+pub(crate) use subscriber::CreditTap;
 pub(crate) use subscriber::{Admitted, Ended, SubscribeError, Subscriber};
 
 use super::config::COMMON_HEADER_BYTES;

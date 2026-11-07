@@ -162,6 +162,8 @@ pub enum Inconclusive {
     HarnessFailed,
     /// Every peer left, but the run ended before teardown settled.
     TeardownOpen,
+    /// The run ended at a boundary whose state the check couldn't read.
+    UnreadBoundary,
 }
 
 impl fmt::Display for Inconclusive {
@@ -173,6 +175,7 @@ impl fmt::Display for Inconclusive {
             Inconclusive::ObligationOpen => "obligation-open",
             Inconclusive::HarnessFailed => "harness-failed",
             Inconclusive::TeardownOpen => "teardown-open",
+            Inconclusive::UnreadBoundary => "unread-boundary",
         })
     }
 }

@@ -322,7 +322,7 @@ where
         id: PropertyId::new(CAPACITY_RELEASE_WAKES),
         claim: "in the wake fixture, a header budget return that leaves room for an offer \
                 waiting for it gets that offer's locator read to storage before quiescence, \
-                unless its session ends",
+                unless the environment ends its session",
         kind: Kind::Liveness {
             bound: LivenessBound::BeforeQuiescence,
         },
@@ -338,7 +338,8 @@ where
 ///
 /// Each wake the step's facts opened ([`WakeFact::Opened`]) obliges the
 /// waiting peer's locator read to reach storage before quiescence. The
-/// read's submission or the waiting session's end answers it, and a
+/// read's submission answers it, and so does the waiting session's end when
+/// the environment ended it ([`EndedBy`](crate::property::EndedBy)). A
 /// deferred cached pass moves its deadline to the pass's refill. It applies
 /// once a release opened a wake.
 fn check_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
@@ -380,11 +381,11 @@ fn wake_answer<V: WakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAn
         {
             FactAnswer::Discharges
         }
-        Some(WakeFact::Ended { peer, session_id })
-            if *subject == wake_subject(&peer, session_id) =>
-        {
-            FactAnswer::Discharges
-        }
+        Some(WakeFact::Ended {
+            peer,
+            session_id,
+            by,
+        }) if *subject == wake_subject(&peer, session_id) => by.answer(),
         Some(WakeFact::Deferred { until }) => FactAnswer::DefersTo(until),
         _ => FactAnswer::Unrelated,
     }

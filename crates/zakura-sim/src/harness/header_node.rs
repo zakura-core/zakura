@@ -587,6 +587,9 @@ impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.harness_closed(self.conn_id);
+        }
         self.record_closed();
         for token in &self.tokens {
             token.cancel();

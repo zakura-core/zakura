@@ -3995,6 +3995,7 @@ async fn cached_template_work_is_prepared_once() {
     tip_sender.send_best_tip_height(height);
     tip_sender.send_best_tip_hash(parent);
     tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync = MockSyncStatus::default();
     sync.set_is_close_to_tip(true);
     let read_state = tower::service_fn(move |request| async move {
@@ -5250,6 +5251,7 @@ async fn rpc_getdifficulty() {
     mock_tip_sender.send_best_tip_height(fake_tip_height);
     mock_tip_sender.send_best_tip_hash(fake_tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -5948,6 +5950,7 @@ async fn getblocktemplate_precomputed() {
     mock_tip_sender.send_best_tip_height(tip_height);
     mock_tip_sender.send_best_tip_hash(tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
@@ -6088,6 +6091,7 @@ async fn getblocktemplate_long_poll_waits_for_a_new_template() {
     mock_tip_sender.send_best_tip_height(tip_height);
     mock_tip_sender.send_best_tip_hash(tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
@@ -6328,6 +6332,7 @@ async fn getblocktemplate_ignores_precomputed_template_when_tip_channel_lags_sta
     mock_tip_sender.send_best_tip_height(tip_height);
     mock_tip_sender.send_best_tip_hash(tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
@@ -6437,6 +6442,7 @@ async fn getblocktemplate_rechecks_the_tip_after_waiting_for_a_template() {
     mock_tip_sender.send_best_tip_height(tip_height);
     mock_tip_sender.send_best_tip_hash(tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
 
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (rpc, _) = RpcImpl::new(
@@ -6518,6 +6524,7 @@ async fn getblocktemplate_long_poll_accounts_for_template_age() {
     mock_tip_sender.send_best_tip_height(tip_height);
     mock_tip_sender.send_best_tip_hash(tip_hash);
     mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
     let mut sync_status = MockSyncStatus::default();
     sync_status.set_is_close_to_tip(true);
     let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -6591,6 +6598,7 @@ macro_rules! cached_long_poll_rpc {
         mock_tip_sender.send_best_tip_height($tip_height);
         mock_tip_sender.send_best_tip_hash($tip_hash);
         mock_tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        mock_tip_sender.send_best_tip_block_time(chrono::Utc::now());
         let mut sync_status = MockSyncStatus::default();
         sync_status.set_is_close_to_tip(true);
         let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -6632,17 +6640,17 @@ fn long_poll_parameters(long_poll_id: LongPollId) -> GetBlockTemplateParameters 
     )
 }
 
-/// A cached long poll must re-check the sync status while it waits, like the synchronous path,
+/// A cached long poll must re-check the tip age while it waits, like the synchronous path,
 /// instead of serving the updater's retained template after Zebra falls behind.
 #[tokio::test(start_paused = true)]
-async fn cached_long_poll_rechecks_sync_status() {
+async fn cached_long_poll_rechecks_tip_age() {
     let _init_guard = zakura_test::init();
     let net = Network::Mainnet;
     let tip_height = NetworkUpgrade::Nu5.activation_height(&net).unwrap();
     let tip_hash = Hash([0xab; 32]);
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let (rpc, _mock_tip_sender, mut sync_status) =
+    let (rpc, mock_tip_sender, _sync_status) =
         cached_long_poll_rpc!(net, tip_height, tip_hash, read_state, mempool);
 
     let template = template_extending(&net, tip_height, tip_hash);
@@ -6660,13 +6668,17 @@ async fn cached_long_poll_rechecks_sync_status() {
     }
     assert!(futures::poll!(&mut long_poll).is_pending());
 
-    sync_status.set_is_close_to_tip(false);
+    mock_tip_sender.send_best_tip_block_time(
+        chrono::Utc::now()
+            - types::get_block_template::constants::MAX_TIME_SINCE_CHAIN_TIP
+            - chrono::Duration::minutes(1),
+    );
     let response = tokio::time::timeout(
         Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL + 1),
         &mut long_poll,
     )
     .await
-    .expect("a long poll must notice lost sync within the mempool polling interval");
+    .expect("a long poll must notice an old tip within the mempool polling interval");
     let error = response.expect_err("an unsynced node must not serve cached work");
     assert_eq!(
         error.code(),

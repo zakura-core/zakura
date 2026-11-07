@@ -25,7 +25,6 @@ use tower::ServiceExt;
 use zakura_chain::{
     amount::{Amount, NegativeOrZero},
     block::{self, Height},
-    chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
     parameters::{
         subsidy::{is_zip234_active, parent_nsm_value_balance},
@@ -194,7 +193,7 @@ impl TemplateCache {
 ///
 /// Runs until the task is aborted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
+pub(crate) async fn run<Mempool, ReadStateService, Tip>(
     network: Network,
     miner_params: MinerParams,
     coinbase_cache: CoinbaseCache,
@@ -203,12 +202,10 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
     mempool: Mempool,
     read_state: ReadStateService,
     mut latest_chain_tip: Tip,
-    sync_status: SyncStatus,
 ) where
     Mempool: MempoolService,
     ReadStateService: ReadState,
     Tip: ChainTip + Clone + Send + Sync + 'static,
-    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
 {
     // The coinbase transaction for a coinbase-only block at this height, built while we're idle. A
     // shielded coinbase takes seconds to prove, which is too slow to do after the tip changes.
@@ -220,9 +217,7 @@ pub(crate) async fn run<Mempool, ReadStateService, Tip, SyncStatus>(
     loop {
         // `getblocktemplate` returns an error until Zebra is synced to the tip, so there's nothing
         // to precompute before then.
-        if let Err(error) =
-            check_synced_to_tip(&network, latest_chain_tip.clone(), sync_status.clone())
-        {
+        if let Err(error) = check_synced_to_tip(&network, latest_chain_tip.clone()) {
             tracing::trace!(
                 ?error,
                 "waiting to sync to the tip before building templates"

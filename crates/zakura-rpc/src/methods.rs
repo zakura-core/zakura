@@ -1465,7 +1465,6 @@ where
                 self.mempool.clone(),
                 self.read_state.clone(),
                 self.latest_chain_tip.clone(),
-                self.gbt.sync_status(),
             )
             .in_current_span(),
         ))
@@ -1530,7 +1529,6 @@ where
             types::get_block_template::check_synced_to_tip(
                 &self.network,
                 self.latest_chain_tip.clone(),
-                self.gbt.sync_status(),
             )
             .ok()?;
 
@@ -3727,7 +3725,7 @@ where
             .miner_params()
             .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
-        check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+        check_synced_to_tip(&self.network, latest_chain_tip.clone())?;
         if let Some(template) = self.precomputed_block_template(client_long_poll_id).await {
             return Ok(template.into());
         }

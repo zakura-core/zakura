@@ -339,12 +339,6 @@ owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
 
 [[pending]]
-id = "header-sync/honest-progress"
-kind = "property"
-owner = "P4c"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
 id = "header-sync/commit-only-authorized"
 kind = "property"
 owner = "H1"

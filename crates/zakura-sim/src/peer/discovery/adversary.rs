@@ -27,7 +27,7 @@ use super::{
 use crate::{model::Label, peer::Outgoing};
 
 /// A row of discovery's table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiscoveryRow {
     /// `hello`.
@@ -91,7 +91,7 @@ impl DiscoveryRow {
 }
 
 /// A content rule the content labeller checks ([`super::content`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiscoveryRule {
     /// A `Hello` whose record carries another body's signature.

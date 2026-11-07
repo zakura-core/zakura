@@ -190,7 +190,7 @@ pub struct Hold {
 }
 
 /// A frame the peer sends because the node's session expects it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Answer {
     /// Its own `Hello`, once its stream starts.
@@ -202,7 +202,7 @@ pub enum Answer {
 }
 
 /// A request the peer sends on its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Request {
     /// `GetPeers` for the most records a response may carry.

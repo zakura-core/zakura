@@ -179,6 +179,42 @@ pub struct MirrorSpec {
     pub dialer: Dialer,
 }
 
+/// How much more work each header of fork branches 1 and 2 carries. A
+/// branch at weight `w`, 0 to [`MAX_WEIGHT`], has the genesis target shifted
+/// right by `w` bits, so each header has about `2^w` times the work. See
+/// [`HeaderFixture::with_weight`].
+///
+/// [`MAX_WEIGHT`]: zakura_storage::header::fixture::MAX_WEIGHT
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Weights {
+    /// Branch 1's weight.
+    #[serde(default)]
+    pub branch_1: u8,
+    /// Branch 2's weight.
+    #[serde(default)]
+    pub branch_2: u8,
+}
+
+impl Weights {
+    /// Whether every branch keeps the genesis target.
+    pub fn is_unweighted(&self) -> bool {
+        *self == Weights::default()
+    }
+
+    /// The Regtest fixture with these weights.
+    ///
+    /// # Panics
+    ///
+    /// If a weight is above
+    /// [`MAX_WEIGHT`](zakura_storage::header::fixture::MAX_WEIGHT).
+    pub fn fixture(self) -> HeaderFixture {
+        HeaderFixture::regtest()
+            .with_weight(1, self.branch_1)
+            .with_weight(2, self.branch_2)
+    }
+}
+
 /// The `header-sync/storage` scenario. A fuzz input's prefix encodes it as
 /// [`grammar`] describes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +224,10 @@ pub struct StorageScenario {
     pub node: Chain,
     /// The mirror peers, each linked once to the node at setup.
     pub mirrors: Vec<MirrorSpec>,
+    /// The weights of fork branches 1 and 2, which every chain in the run
+    /// shares.
+    #[serde(default, skip_serializing_if = "Weights::is_unweighted")]
+    pub weights: Weights,
     /// How the run completes the node's storage operations.
     pub policy: Policy,
     /// Link actions the `Plan` may take, in order.
@@ -206,6 +246,7 @@ impl Default for StorageScenario {
             }],
             policy: Policy::converging(),
             controls: Vec::new(),
+            weights: Weights::default(),
         }
     }
 }
@@ -368,6 +409,7 @@ impl StorageScenario {
                         deadline_ms: None,
                     },
                 ],
+                reply_holds: Vec::new(),
             },
             ..StorageScenario::default()
         }
@@ -452,6 +494,7 @@ impl StorageScenario {
                     })),
                 ),
             ],
+            weights: Weights::default(),
         }
     }
 }
@@ -581,16 +624,54 @@ impl Subsystem for Storage {
     /// If a hold or control step waits for a trigger the node never records
     /// ([`policy::undriven`]).
     fn prepare(scenario: &StorageScenario) -> Ports {
-        let triggers = scenario.policy.holds.iter().map(|hold| &hold.until).chain(
-            scenario
-                .controls
-                .iter()
-                .filter_map(|step| step.when.as_ref()),
-        );
+        let triggers = scenario
+            .policy
+            .holds
+            .iter()
+            .map(|hold| &hold.until)
+            .chain(scenario.policy.reply_holds.iter().map(|hold| &hold.until))
+            .chain(
+                scenario
+                    .controls
+                    .iter()
+                    .filter_map(|step| step.when.as_ref()),
+            );
         if let Some(why) = triggers.filter_map(policy::undriven).next() {
             panic!("{why}");
         }
-        let fixture = HeaderFixture::regtest();
+        if let Some(hold) = scenario
+            .policy
+            .reply_holds
+            .iter()
+            .find(|hold| hold.select.kind.is_some_and(|kind| kind != OpKind::Apply))
+        {
+            panic!("a reply hold picks only applies, but {hold:?} names another kind");
+        }
+        let released = |trigger: &Trigger| trigger.find(&|t| *t == Trigger::Released).is_some();
+        if scenario
+            .policy
+            .reply_holds
+            .iter()
+            .map(|hold| &hold.until)
+            .chain(
+                scenario
+                    .controls
+                    .iter()
+                    .filter_map(|step| step.when.as_ref()),
+            )
+            .any(released)
+        {
+            panic!("`released` holds only in a hold's own trigger");
+        }
+        let holds = scenario.policy.holds.len();
+        if let Some(step) = scenario
+            .controls
+            .iter()
+            .find(|step| matches!(step.action, ControlAction::Release { hold } if hold >= holds))
+        {
+            panic!("{step:?} releases a hold the policy's {holds} holds don't have");
+        }
+        let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
         preload(node.engine(), &fixture, &scenario.node);
         let mirrors = scenario
@@ -691,7 +772,8 @@ impl Subsystem for Storage {
             ports.fixture.clone(),
             scenario.controls.clone(),
             predicates,
-        );
+        )
+        .with_port(ports.node.clone());
         sim.add_source(Box::new(control));
         Storage {
             port: ports.node,

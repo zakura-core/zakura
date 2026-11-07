@@ -158,6 +158,11 @@ impl Family for Block {
                 )
         )
     }
+
+    /// Block storage answers each stage in one completion.
+    fn commits(_: BlockKind) -> bool {
+        false
+    }
 }
 
 /// Which block operations a hold or trigger names.
@@ -180,6 +185,8 @@ pub type Predicates = policy::Predicates<Block>;
 pub fn undriven(trigger: &Trigger) -> Option<String> {
     let found = trigger.find(&|trigger| match trigger {
         policy::Trigger::Handled(_)
+        | policy::Trigger::Committed(_)
+        | policy::Trigger::Released
         | policy::Trigger::ReservationOpened(_)
         | policy::Trigger::SessionAdmitted(_) => true,
         policy::Trigger::ReplyTaken(select) => {
@@ -191,6 +198,14 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         policy::Trigger::Handled(_) => format!(
             "a block scenario can't wait for {found:?}: nothing the block node records \
              witnesses block sync handling a reply"
+        ),
+        policy::Trigger::Released => format!(
+            "a block scenario can't wait for {found:?}: only a header scenario's control \
+             steps release a hold"
+        ),
+        policy::Trigger::Committed(_) => format!(
+            "a block scenario can't wait for {found:?}: block storage commits and replies in \
+             one completion"
         ),
         policy::Trigger::ReservationOpened(_) | policy::Trigger::SessionAdmitted(_) => format!(
             "a block scenario can't wait for {found:?}: only a header reactor's tap reports \

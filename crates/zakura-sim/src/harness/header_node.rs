@@ -50,17 +50,20 @@ use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    adapter::EnginePort, controlled::ControlledPort, fixture::HeaderFixture, Outcome,
+    adapter::EnginePort,
+    controlled::{ControlledPort, ResetRequest},
+    fixture::HeaderFixture,
+    Outcome,
 };
 
 use self::{
     adoption::SessionLife,
-    policy::{Hold, LinkEffect, Predicates, Trigger},
+    policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
-    storage::{FaultAttributions, HeaderStorage, HEADER_SERVICE},
+    storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -193,6 +196,11 @@ pub struct Policy {
     /// picks it.
     #[serde(default)]
     pub holds: Vec<Hold>,
+    /// Applies whose replies are held after they commit, each by the first
+    /// reply hold that picks it. Left out of a scenario that has none, so
+    /// older scenarios keep their encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_holds: Vec<ReplyHold>,
 }
 
 impl Policy {
@@ -202,13 +210,16 @@ impl Policy {
             base: Base::SuccessOnly,
             bound_ms: Some(5_000),
             holds: Vec::new(),
+            reply_holds: Vec::new(),
         }
     }
 }
 
-/// What tasks did to a [`Topology`], shared with the [`PolicySource`] that
-/// counts it for [`Trigger::Linked`], [`Trigger::Closed`] and
-/// [`Trigger::Grown`], and the names it counts tapped reactor facts under.
+/// What tasks and the [`Control`] source did to a [`Topology`], shared with
+/// the [`PolicySource`] that counts it for [`Trigger::Linked`],
+/// [`Trigger::Closed`], [`Trigger::Grown`], [`Trigger::Reset`] and
+/// [`Trigger::Released`], and the names it counts tapped reactor facts
+/// under.
 #[derive(Clone, Default)]
 pub struct Effects {
     /// Each node's peer identity and name, which [`Topology::new`] fills,
@@ -220,6 +231,11 @@ pub struct Effects {
     pub links: Rc<RefCell<Vec<Link>>>,
     /// Each peer whose chain grew, once per committed growth, in order.
     pub grown: Rc<RefCell<Vec<String>>>,
+    /// The node under test's name, once per `Reset` step that acted, in
+    /// order.
+    pub reset: Rc<RefCell<Vec<String>>>,
+    /// Each hold a `Release` step opened, by its index, in order.
+    pub released: Rc<RefCell<Vec<usize>>>,
     /// Why a `Control` step couldn't take effect, which ends the run as a
     /// harness failure: the scenario asked for something that can't happen.
     pub failure: Rc<RefCell<Option<String>>>,
@@ -232,8 +248,10 @@ pub struct Effects {
 
 /// A [`HeaderStorage`] whose offers follow a [`Policy`]. It changes its
 /// [`Predicates`] only in `observe`, so `enabled` and `boundaries` stay
-/// pure. With a [`ReactorTap`], it logs the node's reactor events after its
-/// storage facts, paired with them, and its predicates count both.
+/// pure. An engine completion of a reply-held apply commits it, and its
+/// delivery is offered once its reply hold opens. With a [`ReactorTap`], it
+/// logs the node's reactor events after its storage facts, paired with them,
+/// and its predicates count both.
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
@@ -248,6 +266,10 @@ pub struct PolicySource {
     closed: BTreeSet<u64>,
     /// How many growths are recorded.
     grown: usize,
+    /// How many resets are recorded.
+    reset: usize,
+    /// How many releases are recorded.
+    released: usize,
 }
 
 impl PolicySource {
@@ -260,11 +282,15 @@ impl PolicySource {
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
-            predicates: Rc::new(RefCell::new(Predicates::new(policy.holds))),
+            predicates: Rc::new(RefCell::new(
+                Predicates::new(policy.holds).with_reply_holds(policy.reply_holds),
+            )),
             effects,
             linked: 0,
             closed: BTreeSet::new(),
             grown: 0,
+            reset: 0,
+            released: 0,
         }
     }
 
@@ -292,15 +318,21 @@ impl PolicySource {
 impl ActionSource for PolicySource {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
         let pending = self.port.pending();
+        let committed = self.port.committed();
         let predicates = self.predicates.borrow();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
-            let (id, outcome) = crate::storage::decode(*local);
-            pending
-                .iter()
-                .find(|op| op.id == id)
-                .is_some_and(|op| predicates.offers(self.base, op, outcome))
+            match crate::storage::decode(*local) {
+                StorageAction::Complete(id, outcome) => pending
+                    .iter()
+                    .find(|op| op.id == id)
+                    .is_some_and(|op| predicates.offers(self.base, op, outcome)),
+                StorageAction::Deliver(id) => committed
+                    .iter()
+                    .find(|op| op.id == id)
+                    .is_some_and(|op| predicates.delivers(op)),
+            }
         }));
     }
 
@@ -310,10 +342,22 @@ impl ActionSource for PolicySource {
         for op in self.port.pending() {
             predicates.boundaries(self.bound, &op, now, out);
         }
+        for op in self.port.committed() {
+            predicates.reply_boundaries(&op, now, out);
+        }
     }
 
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
-        self.storage.execute(local, log);
+        match crate::storage::decode(local) {
+            StorageAction::Complete(id, Outcome::Engine)
+                if self.predicates.borrow().holds_reply(id) =>
+            {
+                self.port
+                    .commit(id)
+                    .expect("`enabled` offered this completion at this step");
+            }
+            _ => self.storage.execute(local, log),
+        }
     }
 
     fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
@@ -376,6 +420,16 @@ impl ActionSource for PolicySource {
             predicates.record_link(LinkEffect::Grown, peer);
         }
         self.grown = grown.len();
+        let reset = self.effects.reset.borrow();
+        for node in &reset[self.reset..] {
+            predicates.record_link(LinkEffect::Reset, node);
+        }
+        self.reset = reset.len();
+        let released = self.effects.released.borrow();
+        for hold in &released[self.released..] {
+            predicates.release(*hold);
+        }
+        self.released = released.len();
         match self.effects.failure.borrow().as_ref() {
             Some(failure) => Err(format!("ControlFailed: {failure}")),
             None => Ok(()),
@@ -615,6 +669,13 @@ impl Topology {
         }
     }
 
+    /// Whether a `Shutdown` step's stop of the node under test is done: its
+    /// tap saw the reactor drop its observer without unwinding. Never true
+    /// without a tap.
+    fn reactor_stopped(&self) -> bool {
+        self.tap.as_ref().is_some_and(TapShutdown::stopped)
+    }
+
     /// Stops the node under test, as zakurad's shutdown ends header sync:
     /// closes every link to it, so its sessions end, and cancels its
     /// reactor, which retires its work and drops its pending calls. Its tap
@@ -851,6 +912,40 @@ pub enum ControlAction {
     /// shutdown, or a run that ends idle or at its budget before the reactor
     /// is gone fails the run.
     Shutdown,
+    /// Make an operator invalidation or reconsideration on the node under
+    /// test's engine, which the step must name. See [`Reset`]. It's
+    /// engine-level, so it can name a header production's operator command
+    /// would refuse, as `ControlledPort::reset` says.
+    Reset(Reset),
+    /// Open the policy's hold number `hold`, from 0, whatever its trigger
+    /// says. The step must name the node under test. Releasing an open hold
+    /// does nothing.
+    Release {
+        /// The hold's index in the policy.
+        hold: usize,
+    },
+    /// Shut the node under test's storage down, which the step must name,
+    /// so its `shut-down` fact is logged in the run. Offered only once a
+    /// `Shutdown` step's stop is done.
+    StopStorage,
+}
+
+/// What a [`ControlAction::Reset`] does, judged at its pick, since only
+/// then is the node's chain known. A reset with nothing to do is still
+/// taken, but publishes nothing and counts for no trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Reset {
+    /// Invalidate the node's selected header `depth` below its selected tip,
+    /// or the lowest header above the finalized anchor if the chain is
+    /// shorter. Nothing to do while the node is at the anchor.
+    Invalidate {
+        /// How far below the tip.
+        depth: u32,
+    },
+    /// Reconsider the newest invalidation the scenario made that's still in
+    /// force. Nothing to do if there's none.
+    Reconsider,
 }
 
 impl ControlAction {
@@ -861,7 +956,20 @@ impl ControlAction {
             ControlAction::Relink => "relink",
             ControlAction::Grow { .. } => "grow",
             ControlAction::Shutdown => "shutdown",
+            ControlAction::Reset(_) => "reset",
+            ControlAction::Release { .. } => "release",
+            ControlAction::StopStorage => "stop-storage",
         }
+    }
+
+    /// Whether the step loop carries it out at its pick, outside any task,
+    /// rather than the control task. Each changes only storage or the
+    /// harness's own state.
+    fn run_only(self) -> bool {
+        matches!(
+            self,
+            ControlAction::Reset(_) | ControlAction::Release { .. } | ControlAction::StopStorage
+        )
     }
 }
 
@@ -886,6 +994,11 @@ pub struct ControlStep {
 /// only a task can wait. So a pick only queues the action, and triggers
 /// count the effect. Every check on a step runs at its pick, so a run cut
 /// off before the task takes the step still fails an invalid one.
+///
+/// A reset, release or storage stop changes only storage or the harness's
+/// own state, so the step loop carries it out at its pick, outside any
+/// task, as storage completions are. It's offered only once the task has
+/// carried out every earlier step, so the script keeps its order.
 pub struct Control {
     script: Vec<ControlStep>,
     topology: Rc<Topology>,
@@ -895,6 +1008,10 @@ pub struct Control {
     /// Set once a `Shutdown` step was picked.
     shut_down: bool,
     to_task: mpsc::Sender<ControlStep>,
+    /// How many queued steps the task hasn't carried out yet.
+    queued: Rc<Cell<usize>>,
+    /// The node under test's port, for the steps the step loop carries out.
+    port: Option<Arc<ControlledPort>>,
 }
 
 impl Control {
@@ -909,6 +1026,8 @@ impl Control {
     ) -> Self {
         let (to_task, mut steps) = mpsc::channel::<ControlStep>(script.len().max(1));
         let task_topology = topology.clone();
+        let queued = Rc::new(Cell::new(0));
+        let task_queued = queued.clone();
         sim.scheduler().spawn_root("control", async move {
             let topology = task_topology;
             while let Some(step) = steps.recv().await {
@@ -925,7 +1044,13 @@ impl Control {
                     }
                     ControlAction::Grow { len } => topology.grow(&step.peer, &fixture, len).await,
                     ControlAction::Shutdown => topology.shutdown(),
+                    ControlAction::Reset(_)
+                    | ControlAction::Release { .. }
+                    | ControlAction::StopStorage => {
+                        unreachable!("the step loop carries out run-only steps")
+                    }
                 }
+                task_queued.set(task_queued.get() - 1);
             }
         });
         Control {
@@ -935,7 +1060,65 @@ impl Control {
             next: 0,
             shut_down: false,
             to_task,
+            queued,
+            port: None,
         }
+    }
+
+    /// This source, resetting and stopping `port`, the node under test's.
+    /// Without it, a reset or storage stop fails the run.
+    pub fn with_port(self, port: Arc<ControlledPort>) -> Self {
+        Control {
+            port: Some(port),
+            ..self
+        }
+    }
+
+    /// Whether `step` may be offered now, apart from its trigger: a
+    /// run-only step once the task carried out every earlier step, and a
+    /// storage stop once the node's stop is done too.
+    fn ready(&self, step: &ControlStep) -> bool {
+        match step.action {
+            ControlAction::StopStorage => {
+                self.queued.get() == 0 && self.shut_down && self.topology.reactor_stopped()
+            }
+            action if action.run_only() => self.queued.get() == 0,
+            _ => true,
+        }
+    }
+
+    /// Carries out run-only `step` at its pick, or returns why it can't.
+    fn run(&mut self, step: &ControlStep) -> Result<(), String> {
+        let port = || {
+            self.port
+                .clone()
+                .ok_or_else(|| format!("{:?} needs the node's port", step.action))
+        };
+        match step.action {
+            ControlAction::Reset(reset) => {
+                let request = match reset {
+                    Reset::Invalidate { depth } => ResetRequest::Invalidate { depth },
+                    Reset::Reconsider => ResetRequest::Reconsider,
+                };
+                if port()?
+                    .reset(request)
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    self.topology
+                        .effects
+                        .reset
+                        .borrow_mut()
+                        .push(step.peer.clone());
+                }
+            }
+            ControlAction::Release { hold } => {
+                self.topology.effects.released.borrow_mut().push(hold);
+            }
+            ControlAction::StopStorage => port()?.shut_down(),
+            _ => unreachable!("only run-only steps run at their pick"),
+        }
+        Ok(())
     }
 }
 
@@ -944,10 +1127,11 @@ impl ActionSource for Control {
         let Some(step) = self.script.get(self.next) else {
             return;
         };
-        let open = step
-            .when
-            .as_ref()
-            .is_none_or(|when| self.predicates.borrow().control_holds(when, now));
+        let open = self.ready(step)
+            && step
+                .when
+                .as_ref()
+                .is_none_or(|when| self.predicates.borrow().control_holds(when, now));
         if open {
             // A script is far shorter than u64.
             out.push((
@@ -967,23 +1151,40 @@ impl ActionSource for Control {
         }
     }
 
-    /// Checks the next step and queues it for the control task. A shutdown
-    /// that doesn't name the node under test, a second shutdown, and a
-    /// relink after one fail the run here instead. A shutdown counts as
-    /// begun from its pick, before the task takes it.
+    /// Checks the next step and queues it for the control task, or carries
+    /// out a run-only one. A shutdown, reset, release or storage stop that
+    /// doesn't name the node under test, a second shutdown, and a relink,
+    /// reset or release after one fail the run here instead. A shutdown
+    /// counts as begun from its pick, before the task takes it.
     fn execute(&mut self, _: u64, _: &mut ObservationLog) {
         let step = self.script[self.next].clone();
         self.next += 1;
+        let node = &self.topology.nodes[0].name;
         let invalid = match step.action {
-            ControlAction::Shutdown if step.peer != self.topology.nodes[0].name => Some(format!(
-                "a shutdown names the node under test, not {}",
-                step.peer
-            )),
+            ControlAction::Shutdown
+            | ControlAction::Reset(_)
+            | ControlAction::Release { .. }
+            | ControlAction::StopStorage
+                if step.peer != *node =>
+            {
+                Some(format!(
+                    "a {} names the node under test, not {}",
+                    step.action.name(),
+                    step.peer
+                ))
+            }
             ControlAction::Shutdown if self.shut_down => {
                 Some("the node is already shut down".to_owned())
             }
             ControlAction::Relink if self.shut_down => {
                 Some(format!("relinking {} after the shutdown", step.peer))
+            }
+            ControlAction::Reset(_) | ControlAction::Release { .. } if self.shut_down => {
+                Some(format!(
+                    "a {} of {} after the shutdown",
+                    step.action.name(),
+                    step.peer
+                ))
             }
             _ => None,
         };
@@ -991,10 +1192,17 @@ impl ActionSource for Control {
             self.topology.fail(why);
             return;
         }
+        if step.action.run_only() {
+            if let Err(why) = self.run(&step) {
+                self.topology.fail(why);
+            }
+            return;
+        }
         if step.action == ControlAction::Shutdown {
             self.shut_down = true;
             self.topology.expect_shutdown();
         }
+        self.queued.set(self.queued.get() + 1);
         self.to_task
             .try_send(step)
             .expect("the channel holds the whole script, and the task outlives the run");

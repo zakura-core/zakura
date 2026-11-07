@@ -905,6 +905,12 @@ impl SequencerIO {
     fn handle_accept_body(&mut self, body: SequencedBody) {
         let queued_elapsed = body.received_at.elapsed();
         let height = body.height;
+        #[cfg(any(test, zakura_sim))]
+        let held = super::block_sync_observe::HeldBody {
+            height,
+            owner: body.owner,
+            bytes: body.bytes,
+        };
         let facts = self.payloads.insert(body.body);
         let state::BodyAccepted {
             acceptance,
@@ -921,6 +927,19 @@ impl SequencerIO {
             peer: body.peer,
         });
         self.payloads.apply(payload_changes);
+        #[cfg(any(test, zakura_sim))]
+        if acceptance == BodyAcceptance::StaleScope {
+            observe!(
+                self.observer,
+                super::block_sync_observe::BlockEvent::StaleScope {
+                    body: held,
+                    scope_epoch: self
+                        .state
+                        .current_scope()
+                        .map(|scope| scope.body_work_epoch),
+                }
+            );
+        }
         if let BodyAcceptance::RetentionDeferred {
             owner,
             height,
@@ -1988,6 +2007,85 @@ mod tests {
         task.handle_accept_body(old_body);
         assert_eq!(task.state.sequencer().reorder_len(), 0);
         assert_eq!(task.state.sequencer().applying_len(), 0);
+    }
+
+    /// The sequencer reports a stale-scope refusal against the epoch it
+    /// applied, not the reactor's. Before it applies the reset, it buffers an
+    /// old-epoch body as current and reports nothing, however far the
+    /// reactor's authority moved. After it applies the reset, it refuses the
+    /// same body and names the epoch it applied.
+    #[tokio::test]
+    async fn stale_scope_refusal_names_the_epoch_the_sequencer_applied() {
+        use super::super::block_sync_observe::{BlockEvent, BlockSyncObserver, ObserverSlot};
+
+        #[derive(Debug, Default)]
+        struct Refusals(std::sync::Mutex<Vec<BlockEvent>>);
+        impl BlockSyncObserver for Refusals {
+            fn observe(&self, event: BlockEvent) {
+                if matches!(event, BlockEvent::StaleScope { .. }) {
+                    self.0.lock().unwrap().push(event);
+                }
+            }
+        }
+
+        let frontiers = genesis_frontiers();
+        let old_scope = super::test_work_scope();
+        let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let (actions, _actions_rx) = mpsc::channel(4);
+        let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+        let refusals = Arc::new(Refusals::default());
+        let mut task = SequencerIO::new(
+            Sequencer::new(block::Height(0), 1),
+            Arc::new(WorkQueue::new(block::Height(0), ByteBudget::new(123))),
+            Arc::new(PeerRegistry::new()),
+            actions,
+            ThroughputMeter::new(Instant::now()),
+            frontiers,
+            Some(old_scope),
+            crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+            std::sync::Arc::new(crate::zakura::block_sync::BlockSyncClock),
+            body_rx,
+            control_rx,
+            input_bytes.clone(),
+            input_decoded_bytes.clone(),
+            view_tx,
+            Duration::from_secs(1),
+            ZakuraTrace::noop(),
+            super::test_decoded_pool(),
+        )
+        .with_observer(ObserverSlot(Some(refusals.clone())));
+
+        // The reactor's authority can already name epoch 1 here: it reports
+        // `AuthorityChanged` before it sends `BodyWorkEpochChanged`.
+        let mut early = queued_test_body(input_bytes.clone(), input_decoded_bytes.clone());
+        early.leave_queue();
+        task.handle_accept_body(early);
+        assert_eq!(task.state.sequencer().applying_len(), 1);
+        assert_eq!(*refusals.0.lock().unwrap(), []);
+
+        let mut new_scope = old_scope;
+        new_scope.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+        assert!(
+            task.handle_control_input(SequencerControlInput::BodyWorkEpochChanged {
+                authority: new_scope,
+                frontiers,
+            })
+            .await
+        );
+        let mut late = queued_test_body(input_bytes, input_decoded_bytes);
+        late.leave_queue();
+        let owner = late.owner;
+        task.handle_accept_body(late);
+        assert_eq!(task.state.sequencer().applying_len(), 0);
+        let refusals = refusals.0.lock().unwrap();
+        let [BlockEvent::StaleScope { body, scope_epoch }] = refusals.as_slice() else {
+            panic!("one refusal: {refusals:?}");
+        };
+        assert_eq!(body.owner, owner);
+        assert_eq!(*scope_epoch, Some(new_scope.body_work_epoch));
     }
 
     #[tokio::test]

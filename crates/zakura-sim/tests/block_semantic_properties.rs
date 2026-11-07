@@ -369,8 +369,8 @@ fn the_frontier_first_input_holds_capacity_release_wakes() {
 /// reaches #1523's order: the verified tip passed a released submission's
 /// height before its reply freed room beside a waiting body.
 /// `stale-completion-no-wake.patch` also needs that submission to be older
-/// than the reactor's authority. The scenario guarantees it: storage
-/// releases height 1, which it admitted before the reset.
+/// than the reactor's authority. In this scenario storage releases height
+/// 1, which it admitted before the reset.
 fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
     witnessed(committed(input), CAPACITY_RELEASE_WAKES, Expect::Holds).map(drop)
 }
@@ -384,8 +384,8 @@ fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
 #[test]
 #[ignore = "rewrites the committed input"]
 fn regenerate_capacity_frontier_first_input() {
-    // A capacity-release run takes about 6 minutes and peaks near 1.4 GB,
-    // so four candidates at once stay near 6 GB.
+    // Under `--profile planted`, a capacity-release run takes about 2 minutes
+    // and peaks near 1.5 GB, so four candidates at once stay near 6 GB.
     regenerate(
         "block-sync-capacity-frontier-first",
         CAPACITY_RELEASE_TAG,

@@ -278,6 +278,26 @@ fn a_quiet_run_has_turns_without_events() {
     assert!(turns.contains(&0), "{turns:?}");
 }
 
+/// A shutdown picked while churn steps are still queued stops the churn
+/// cleanly: the run ends with the node stopped, every property holding and
+/// no harness failure, under 32 plans. Before the fix, the control task
+/// panicked sending the second churn step to the stopped churn task.
+#[test]
+fn a_shutdown_during_churn_stops_it_cleanly() {
+    let mut scenario = scenario(vec![
+        step("mirror-0", ControlAction::Churn),
+        step("mirror-1", ControlAction::Churn),
+        step("node", ControlAction::Shutdown),
+    ]);
+    scenario.mirrors.push(MirrorSpec {
+        chain: Chain::main(4),
+        dialer: Dialer::Mirror,
+    });
+    for input in support::inputs(32, 256) {
+        run(&scenario, input);
+    }
+}
+
 /// Each capability's run depends only on the plan: the same plan twice
 /// gives the same adoption facts and the same log.
 #[test]

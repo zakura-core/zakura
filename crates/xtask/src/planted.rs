@@ -64,6 +64,10 @@
 //! runner, the simulator that records and judges each run, its scheduler
 //! and runtime, or the build configuration. A renamed file counts as a
 //! change to its old and its new path.
+//!
+//! `cargo xtask planted pilot (sensitivity|discovery)` runs the mutation
+//! pilot's paired experiments on the reviewed catalogue's cases; see
+//! [`pilot`].
 
 use std::{
     collections::BTreeMap,
@@ -87,9 +91,13 @@ use crate::{
     BoxError,
 };
 
+mod pilot;
+
 #[allow(dead_code)]
 #[path = "../../zakura-sim/build/provenance.rs"]
 mod provenance;
+
+pub(super) use pilot::run as pilot;
 
 /// Where the planted cases live, relative to the repository root.
 const PLANTED_DIR: &str = "qa/planted";
@@ -206,6 +214,10 @@ enum Run {
     },
     /// The build or the `zakura-sim` command failed before writing a trace.
     Failed(String),
+    /// The pilot's run passed its deadline or died from a signal, whatever
+    /// files it wrote. The pilot counts it as a harness failure, never as a
+    /// result of the code under test.
+    Killed(String),
 }
 
 /// What a case's short campaign found.
@@ -627,6 +639,7 @@ fn check_case(
         &case.property,
         "holds",
         &scratch.join("baseline"),
+        None,
     )?;
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
@@ -643,6 +656,7 @@ fn check_case(
         &case.property,
         "violated",
         &scratch.join("patched"),
+        None,
     )?;
     let verdict = match classify(&case.property, &patched) {
         Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
@@ -781,6 +795,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
             &case.property,
             "violated",
             &dir.join(format!("run-{index}")),
+            None,
         )?;
         match classify(&case.property, &run) {
             Verdict::Caught(_) => caught += 1,
@@ -895,6 +910,11 @@ fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
 /// Records `input` on `harness` with `zakura_sim`, a `zakura-sim` command,
 /// as a witness test of `property` that expects `expect`, writing the trace
 /// to `out`, and reads its `end` record and the test's result.
+///
+/// With a `deadline` and its interrupt flag, the command's output goes to
+/// `<out>.log`. A run past the deadline, or one that a signal killed, is
+/// [`Run::Killed`], whatever files it already wrote. A set flag kills the
+/// run and stops the pilot.
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -902,25 +922,47 @@ fn record(
     property: &str,
     expect: &str,
     out: &Path,
+    deadline: Option<(Duration, &AtomicBool)>,
 ) -> Result<Run, BoxError> {
     if out.exists() {
         fs::remove_dir_all(out)?;
     }
-    let status = zakura_sim
+    zakura_sim
         .args(["record", "--sim", harness, "--input"])
         .arg(input)
         .arg("--out")
         .arg(out)
-        .args(["--witness", property, "--expect", expect])
-        .status()?;
+        .args(["--witness", property, "--expect", expect]);
+    let ended = match deadline {
+        None => format!("exited with {}", zakura_sim.status()?),
+        Some((deadline, interrupt)) => {
+            let log = out.with_extension("log");
+            let end = sim_minimize::run_child(&mut zakura_sim, &log, Some(deadline), interrupt)?;
+            let ended = format!("{end}; see {}", log.display());
+            match end {
+                sim_minimize::ChildEnd::Interrupted => return Err(pilot::INTERRUPTED_ERROR.into()),
+                // Its trace and witness result may look whole, but the
+                // run didn't finish.
+                sim_minimize::ChildEnd::TimedOut | sim_minimize::ChildEnd::Signaled(_) => {
+                    return Ok(Run::Killed(format!("`zakura-sim record` {ended}")))
+                }
+                sim_minimize::ChildEnd::Exited(_) => ended,
+            }
+        }
+    };
     // A failed witness test exits 1 too, but only after writing its result.
     let Ok(witness) = fs::read_to_string(out.join("witness.json")) else {
-        return Ok(Run::Failed(format!(
-            "`zakura-sim record` exited with {status}"
-        )));
+        return Ok(Run::Failed(format!("`zakura-sim record` {ended}")));
     };
     let witness: WitnessFile = serde_json::from_str(&witness)?;
-    let trace = fs::read_to_string(out.join("trace.jsonl"))?;
+    let trace = match fs::read_to_string(out.join("trace.jsonl")) {
+        Ok(trace) => trace,
+        Err(error) => {
+            return Ok(Run::Failed(format!(
+                "`zakura-sim record` {ended} and wrote its witness result, but its trace is unreadable: {error}"
+            )))
+        }
+    };
     let end = trace.lines().next_back().ok_or("the trace is empty")?;
     let mut run = end_of(property, end)?;
     if let Run::Ended {
@@ -976,7 +1018,7 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
 /// Why `baseline` doesn't hold `property` cleanly, or `None` if it does.
 fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
     match baseline {
-        Run::Failed(why) => Some(why.clone()),
+        Run::Failed(why) | Run::Killed(why) => Some(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..
@@ -1003,7 +1045,7 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
 /// What the patched run shows about `property`.
 fn classify(property: &str, patched: &Run) -> Verdict {
     match patched {
-        Run::Failed(why) => Verdict::Failed(why.clone()),
+        Run::Failed(why) | Run::Killed(why) => Verdict::Failed(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..

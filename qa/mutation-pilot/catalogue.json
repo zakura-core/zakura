@@ -407,7 +407,7 @@
       "id": "discovery/record-book/wrong-eviction-victim",
       "fault_class": "eviction-policy",
       "patch": "qa/planted/discovery/record-book/wrong-eviction-victim.patch",
-      "patch_sha256": "95adfe32b70de60d2f39af6a2d3bc06a2627cf0c492f8fb51cc511747f4008a7",
+      "patch_sha256": "a089d0bea28c5681512cfb583aad8a710324e34a63e7db1009a876c42941a843",
       "production_files": {
         "crates/zakura-network/src/zakura/discovery/protocol.rs": "2439135715ccf6a9c2e54ae7a276331d75543eb6960d2f52615154ce623ddecf"
       },

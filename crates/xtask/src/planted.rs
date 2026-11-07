@@ -212,9 +212,12 @@ enum Run {
         /// Why the witness test failed, or `None` if it passed.
         witness: Option<String>,
     },
-    /// The build or the `zakura-sim` command failed before writing a trace,
-    /// or the pilot's run passed its deadline or died from a signal.
+    /// The build or the `zakura-sim` command failed before writing a trace.
     Failed(String),
+    /// The pilot's run passed its deadline or died from a signal, whatever
+    /// files it wrote. The pilot counts it as a harness failure, never as a
+    /// result of the code under test.
+    Killed(String),
 }
 
 /// What a case's short campaign found.
@@ -909,9 +912,9 @@ fn cargo_sim(worktree: &Path, target: &Path, verb: &str) -> Command {
 /// to `out`, and reads its `end` record and the test's result.
 ///
 /// With a `deadline` and its interrupt flag, the command's output goes to
-/// `<out>.log`. A run past the deadline is killed and fails, as does a run
-/// that a signal killed, whatever files it already wrote. A set flag kills
-/// the run and stops the pilot.
+/// `<out>.log`. A run past the deadline, or one that a signal killed, is
+/// [`Run::Killed`], whatever files it already wrote. A set flag kills the
+/// run and stops the pilot.
 fn record(
     mut zakura_sim: Command,
     harness: &str,
@@ -941,7 +944,7 @@ fn record(
                 // Its trace and witness result may look whole, but the
                 // run didn't finish.
                 sim_minimize::ChildEnd::TimedOut | sim_minimize::ChildEnd::Signaled(_) => {
-                    return Ok(Run::Failed(format!("`zakura-sim record` {ended}")))
+                    return Ok(Run::Killed(format!("`zakura-sim record` {ended}")))
                 }
                 sim_minimize::ChildEnd::Exited(_) => ended,
             }
@@ -1015,7 +1018,7 @@ fn end_of(property: &str, line: &str) -> Result<Run, BoxError> {
 /// Why `baseline` doesn't hold `property` cleanly, or `None` if it does.
 fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
     match baseline {
-        Run::Failed(why) => Some(why.clone()),
+        Run::Failed(why) | Run::Killed(why) => Some(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..
@@ -1042,7 +1045,7 @@ fn baseline_failure(property: &str, baseline: &Run) -> Option<String> {
 /// What the patched run shows about `property`.
 fn classify(property: &str, patched: &Run) -> Verdict {
     match patched {
-        Run::Failed(why) => Verdict::Failed(why.clone()),
+        Run::Failed(why) | Run::Killed(why) => Verdict::Failed(why.clone()),
         Run::Ended {
             harness: Some(failure),
             ..

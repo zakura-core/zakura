@@ -139,14 +139,18 @@ across hosts.
 
 Each result is exactly one class of the plan's table: intended violation,
 other violation, survived budget, not applicable, baseline failure, invalid
-mutant, harness failure or equivalent. Only review metadata marks a case
-equivalent, through an `equivalent` argument on its catalogue entry. An
-intended violation also needs a fresh `zakura-sim confirm` and an Exact
-replay of the confirmed trace. Each report counts results by class and fault
-class. The rate's denominator leaves out baseline failures, invalid mutants
-and equivalent mutants, and keeps not-applicable results. `discovery` skips
-each case whose catalogue entry sets `discovery_excluded`, and lists it with
-its reason outside the counts. `sensitivity` still runs it.
+mutant, harness failure or equivalent. A process that runs past its deadline
+or dies from a signal is a harness failure, for the original as for the
+mutant: a witness run, a `campaign start` or `campaign evidence` process, or
+a campaign worker's libFuzzer timeout or unexplained crash. Only review
+metadata marks a case equivalent, through an `equivalent` argument on its
+catalogue entry. An intended violation also needs a fresh `zakura-sim
+confirm` and an Exact replay of the confirmed trace. Each report counts
+results by class and fault class. The rate's denominator leaves out baseline
+failures, invalid mutants and equivalent mutants, and keeps not-applicable
+results. `discovery` skips each case whose catalogue entry sets
+`discovery_excluded`, and lists it with its reason outside the counts.
+`sensitivity` still runs it.
 
 The catalogue first pinned production at `870678be1` and the fuzz inputs
 at `b2e0456474`, which existed only on the stack branches that merged as

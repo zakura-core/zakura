@@ -338,10 +338,12 @@ fn discovery_counts_only_a_confirmed_intended_finding() {
 #[test]
 fn discovery_rejects_failed_baselines() {
     let mut cases = vec![
-        Err("the original simulator fails to build".to_owned()),
+        Err(NoCampaign::Failed(
+            "the original simulator fails to build".to_owned(),
+        )),
         Ok(found(OTHER)),
         Ok(CampaignFacts {
-            failures: vec!["runs/x/workers/0/artifacts/timeout-1".to_owned()],
+            failures: vec!["runs/x/workers/0/sim/inputs/nondeterministic/a.bin".to_owned()],
             ..campaign()
         }),
         Ok(CampaignFacts {
@@ -376,6 +378,47 @@ fn discovery_rejects_failed_baselines() {
     assert_eq!(discovered(&run), Class::IntendedViolation);
 }
 
+/// A baseline campaign whose `start` ran past its deadline or died from a
+/// signal, or whose worker timed out or crashed without a violation, is a
+/// harness failure, even beside a violation: it never counts as a baseline
+/// failure, and it blocks the mutant's finding.
+#[test]
+fn a_baseline_campaign_that_times_out_or_is_killed_is_a_harness_failure() {
+    let timeout = "runs/x/workers/0/artifacts/timeout-1".to_owned();
+    let crash = "runs/x/workers/0/artifacts/crash-2".to_owned();
+    for baseline in [
+        Err(NoCampaign::Killed(
+            "`zakura-sim campaign start` ran past 900 s".to_owned(),
+        )),
+        Err(NoCampaign::Killed(
+            "`zakura-sim campaign start` died from signal 9".to_owned(),
+        )),
+        Ok(CampaignFacts {
+            killed: vec![timeout.clone()],
+            ..campaign()
+        }),
+        Ok(CampaignFacts {
+            killed: vec![crash],
+            ..campaign()
+        }),
+        Ok(CampaignFacts {
+            killed: vec![timeout],
+            ..found(OTHER)
+        }),
+    ] {
+        let mut run = discovery_run(found(ID), Some(Ok(())));
+        run.baseline = Some(baseline);
+        let result = classify::discovery(ID, &run);
+        assert_eq!(result.class, Class::HarnessFailure, "{:?}", run.baseline);
+        assert_eq!(
+            classify::discovery_baseline(&run.baseline).map(|failed| failed.class),
+            Some(Class::HarnessFailure),
+            "{:?}",
+            run.baseline
+        );
+    }
+}
+
 /// A campaign that stops without a finding, leaves another failure, or
 /// starts from a nonempty corpus is a harness failure. A complete campaign
 /// that never applies the property is not applicable, and only one that
@@ -408,7 +451,13 @@ fn discovery_rejects_incomplete_observations() {
         );
     }
     let mut failed = discovery_run(campaign(), None);
-    failed.mutant = Some(Err("`zakura-sim campaign start` ran past 900 s".to_owned()));
+    failed.mutant = Some(Err(NoCampaign::Failed(
+        "the store holds no single run manifest".to_owned(),
+    )));
+    assert_eq!(discovered(&failed), Class::HarnessFailure);
+    failed.mutant = Some(Err(NoCampaign::Killed(
+        "`zakura-sim campaign start` ran past 900 s".to_owned(),
+    )));
     assert_eq!(discovered(&failed), Class::HarnessFailure);
     assert_eq!(
         discovered(&discovery_run(
@@ -440,7 +489,8 @@ fn discovery_rejects_broken_patches() {
 }
 
 /// The store's failure files sort into violations by property, crashes a
-/// violation explains, and other failures; traces go with their inputs.
+/// violation explains, worker deaths and other failures; traces go with
+/// their inputs.
 #[test]
 fn campaign_facts_read_saved_failures() {
     let worker = "runs/m/workers/0";
@@ -482,7 +532,8 @@ fn campaign_facts_read_saved_failures() {
         0,
     );
     assert!(facts.violated.is_empty());
-    assert_eq!(facts.failures, [timeout, nondeterministic, crash]);
+    assert_eq!(facts.failures, [nondeterministic]);
+    assert_eq!(facts.killed, [timeout, crash]);
 
     let unapplied = serde_json::json!({"status": "complete", "unapplied": [ID], "incomplete": []});
     assert!(!campaign_facts(ID, None, &unapplied, 0).applied);
@@ -937,9 +988,10 @@ fn an_interrupt_stops_the_pilot() {
 
 /// A witness run that dies mid-trace, from a crash or at its deadline,
 /// leaves a trace with no end record, and a run can write its witness
-/// result without a trace. Each is a baseline failure for the original and
-/// a harness failure for a mutant, naming how the run ended, and the
-/// experiment goes on.
+/// result without a trace. Each is a harness failure for a mutant, naming
+/// how the run ended, and the experiment goes on. For the original, a run
+/// past its deadline is a harness failure, and the others are baseline
+/// failures.
 #[cfg(unix)]
 #[test]
 fn a_witness_run_that_dies_mid_trace_is_classified() {
@@ -950,24 +1002,27 @@ fn a_witness_run_that_dies_mid_trace_is_classified() {
     let catalogue = committed_catalogue();
     let case = &catalogue.cases[0];
     let partial_then = |death: &str| format!("{PARTIAL}\n{death}");
-    for (name, writes, ended, why) in [
+    for (name, writes, ended, why, original) in [
         (
             "crash",
             partial_then("exit 1"),
             "exited with code 1",
             "no end record",
+            Class::BaselineFailure,
         ),
         (
             "hang",
             partial_then("exec sleep 30"),
             "ran past its deadline",
             "no end record",
+            Class::HarnessFailure,
         ),
         (
             "untraced",
             "echo '{\"passed\":true,\"error\":null}' > \"$out/witness.json\"".to_owned(),
             "exited with code 0",
             "trace is unreadable",
+            Class::BaselineFailure,
         ),
     ] {
         // A stand-in for `zakura-sim record` that writes `writes` into its
@@ -1002,7 +1057,7 @@ fn a_witness_run_that_dies_mid_trace_is_classified() {
             &AtomicBool::new(false),
         )
         .expect("the run's output doesn't stop the experiment");
-        let Run::Failed(failed) = &recorded.run else {
+        let (Run::Failed(failed) | Run::Killed(failed)) = &recorded.run else {
             panic!("{name}: the run didn't fail: {:?}", recorded.run);
         };
         assert!(failed.contains(ended), "{name}: {failed}");
@@ -1011,7 +1066,7 @@ fn a_witness_run_that_dies_mid_trace_is_classified() {
 
         let baseline = classify::sensitivity_baseline(ID, &Some(Ok(recorded.clone())))
             .expect("the baseline fails");
-        assert_eq!(baseline.class, Class::BaselineFailure, "{name}");
+        assert_eq!(baseline.class, original, "{name}");
         assert!(
             baseline.reason.contains(ended),
             "{name}: {}",
@@ -1071,13 +1126,14 @@ fn a_timeout_beside_a_finding_is_a_harness_failure() {
     });
     let facts = campaign_facts(ID, Some(&end), &evidence, 0);
     assert_eq!(facts.violated, [ID]);
-    assert_eq!(facts.failures, std::slice::from_ref(&timeout));
+    assert!(facts.failures.is_empty(), "{:?}", facts.failures);
+    assert_eq!(facts.killed, std::slice::from_ref(&timeout));
     let result = classify::discovery(ID, &discovery_run(facts, Some(Ok(()))));
     assert_eq!(result.class, Class::HarnessFailure, "{}", result.reason);
     assert!(result.reason.contains(&timeout), "{}", result.reason);
     // Another ID's finding beside a timeout doesn't count either.
     let mut other = found(OTHER);
-    other.failures = vec![timeout];
+    other.killed = vec![timeout];
     assert_eq!(
         discovered(&discovery_run(other, Some(Ok(())))),
         Class::HarnessFailure
@@ -1086,8 +1142,9 @@ fn a_timeout_beside_a_finding_is_a_harness_failure() {
 
 /// A witness run that passes its deadline, or that a signal kills, fails
 /// though it already wrote a whole trace and its witness result. Its trace
-/// isn't scored: the original's run is a baseline failure, and a mutant's
-/// a harness failure even beside a confirmed violation.
+/// isn't scored: the original's run and a mutant's are each a harness
+/// failure, never a baseline failure, and a mutant's is one even beside a
+/// confirmed violation.
 #[cfg(unix)]
 #[test]
 fn a_witness_run_that_times_out_or_is_killed_is_not_scored() {
@@ -1155,14 +1212,26 @@ fn a_witness_run_that_times_out_or_is_killed_is_not_scored() {
             &AtomicBool::new(false),
         )
         .expect("the run's end doesn't stop the experiment");
-        let Run::Failed(failed) = &recorded.run else {
+        let Run::Killed(failed) = &recorded.run else {
             panic!("{name}: a run that {ended} was scored: {:?}", recorded.run);
         };
         assert!(failed.contains(ended), "{name}: {failed}");
 
         let baseline = classify::sensitivity_baseline(property, &Some(Ok(recorded.clone())))
             .expect("the baseline fails");
-        assert_eq!(baseline.class, Class::BaselineFailure, "{name}");
+        assert_eq!(baseline.class, Class::HarnessFailure, "{name}");
+        assert!(
+            baseline.reason.contains(ended),
+            "{name}: {}",
+            baseline.reason
+        );
+        // The baseline's harness failure is the case's result, and no
+        // mutant runs beside it.
+        let original = SensitivityRun {
+            baseline: Some(Ok(recorded.clone())),
+            ..sensitivity_run(run(Some(ID), &[(ID, VIOLATED)]), Some(Ok(())))
+        };
+        assert_eq!(class(&original), Class::HarnessFailure, "{name}");
 
         let mutant = SensitivityRun {
             mutant: Some(Ok(recorded)),
@@ -1422,5 +1491,79 @@ fn a_campaign_build_is_rejected_only_for_a_compile_error() {
             }
             lane => panic!("{name}: {lane:?}"),
         }
+    }
+}
+
+/// `campaign_lane` reads a `zakura-sim campaign start` or `campaign
+/// evidence` that a signal killed as a killed campaign, though `start` left
+/// a manifest and snapshot: the original's lane is then a harness failure,
+/// never a baseline failure.
+#[cfg(unix)]
+#[test]
+fn a_campaign_that_a_signal_killed_is_not_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const RECORDS: &str = "mkdir -p \"$store/manifests\" \"$store/snapshots/s\"\n\
+                           echo '{\"initial_snapshot\":\"s\"}' > \"$store/manifests/r.json\"\n\
+                           echo '{\"inputs\":[]}' > \"$store/snapshots/s/snapshot.json\"";
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let catalogue = committed_catalogue();
+    let case = &catalogue.cases[0];
+    for (name, start, evidence, killed) in [
+        (
+            "start",
+            format!("{RECORDS}\nkill -KILL $$"),
+            "exit 0",
+            "`zakura-sim campaign start` died from signal 9",
+        ),
+        (
+            "evidence",
+            format!("{RECORDS}\nexit 1"),
+            "kill -KILL $$",
+            "`zakura-sim campaign evidence` died from signal 9",
+        ),
+    ] {
+        // A stand-in for `zakura-sim` whose `campaign build` makes one
+        // build, and whose `campaign start` and `campaign evidence` run
+        // `start` and `evidence`.
+        let sim = dir.path().join(name);
+        fs::write(
+            &sim,
+            format!(
+                "#!/bin/sh\n\
+                 store=$4\n\
+                 case \"$1 $2\" in\n\
+                 'campaign build') mkdir -p \"$store/builds/b\" ;;\n\
+                 'campaign start') {start} ;;\n\
+                 'campaign evidence') {evidence} ;;\n\
+                 esac\n"
+            ),
+        )
+        .expect("the script is written");
+        fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
+            .expect("the script is executable");
+        // Another test's fork can briefly hold the script open for writing.
+        while let Err(error) = Command::new(&sim).status() {
+            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lane = campaign_lane(
+            &sim,
+            &dir.path().join(format!("{name}-lane")),
+            &dir.path().join("fuzz-target"),
+            case,
+            11,
+            &catalogue,
+            dir.path(),
+            false,
+        )
+        .expect("the lane's death doesn't stop the experiment");
+        let Err(LaneError::Killed(why)) = lane else {
+            panic!("{name}: a killed campaign was read: {lane:?}");
+        };
+        assert!(why.contains(killed), "{name}: {why}");
+        let baseline = classify::discovery_baseline(&Some(Err(NoCampaign::Killed(why))))
+            .expect("the baseline fails");
+        assert_eq!(baseline.class, Class::HarnessFailure, "{name}");
     }
 }

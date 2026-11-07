@@ -66,7 +66,8 @@ mod classify;
 mod tests;
 
 use classify::{
-    CampaignFacts, Class, Classified, DiscoveryRun, Recorded, SensitivityRun, Summary, TraceFacts,
+    CampaignFacts, Class, Classified, DiscoveryRun, NoCampaign, Recorded, SensitivityRun, Summary,
+    TraceFacts,
 };
 
 /// The catalogue, relative to the repository root.
@@ -690,7 +691,7 @@ fn witness_run(
             (Ok(trace), _) => Some(trace),
             // A run that crashed or passed its deadline can leave a trace
             // with no end record. Its failure classifies it.
-            (Err(why), Run::Failed(failed)) => {
+            (Err(why), Run::Failed(failed) | Run::Killed(failed)) => {
                 failed.push_str(&format!("; its trace is unreadable: {why}"));
                 None
             }
@@ -847,7 +848,10 @@ fn discovery_case(
                 Some(Err(LaneError::Build(BuildFailure::Broken(why)))) => {
                     run.broken_build = Some(why.clone());
                 }
-                Some(Err(error)) => run.baseline = Some(Err(error.to_string())),
+                Some(Err(LaneError::Killed(why))) => {
+                    run.baseline = Some(Err(NoCampaign::Killed(why.clone())));
+                }
+                Some(Err(error)) => run.baseline = Some(Err(NoCampaign::Failed(error.to_string()))),
             }
             (*seed, run, None)
         })
@@ -911,7 +915,11 @@ fn discovery_case(
                     }
                     Err(LaneError::Run(why)) => {
                         run.patch = Some(Ok(()));
-                        run.mutant = Some(Err(why));
+                        run.mutant = Some(Err(NoCampaign::Failed(why)));
+                    }
+                    Err(LaneError::Killed(why)) => {
+                        run.patch = Some(Ok(()));
+                        run.mutant = Some(Err(NoCampaign::Killed(why)));
                     }
                     Ok(facts) => {
                         run.patch = Some(Ok(()));
@@ -939,7 +947,7 @@ fn discovery_case(
         cleanup = clean(repo_root, &tree, &[&sim_target, &fuzz_target]);
         ran?;
     }
-    let ok = |lane: &Option<Result<CampaignFacts, String>>| {
+    let ok = |lane: &Option<Result<CampaignFacts, NoCampaign>>| {
         lane.as_ref().and_then(|lane| lane.as_ref().ok()).cloned()
     };
     Ok(DiscoveryCase {
@@ -1020,13 +1028,16 @@ enum LaneError {
     Build(BuildFailure),
     /// The campaign didn't leave the records the runner reads.
     Run(String),
+    /// `campaign start` ran past its deadline, or a campaign process died
+    /// from a signal.
+    Killed(String),
 }
 
 impl std::fmt::Display for LaneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LaneError::Build(failure) => failure.fmt(f),
-            LaneError::Run(why) => f.write_str(why),
+            LaneError::Run(why) | LaneError::Killed(why) => f.write_str(why),
         }
     }
 }
@@ -1102,13 +1113,23 @@ fn campaign_lane(
     let log = dir.join("start.log");
     let deadline = Duration::from_secs(bounds.seconds_per_seed) + CAMPAIGN_GRACE;
     // `start` exits 1 for any run that isn't complete, as a run a finding
-    // stopped, so the store's records decide.
-    if run_pilot_child(&mut start, &log, Some(deadline))? == ChildEnd::TimedOut {
-        return Ok(Err(LaneError::Run(format!(
-            "`zakura-sim campaign start` ran past {} s; see {}",
-            deadline.as_secs(),
-            log.display()
-        ))));
+    // stopped, so the store's records decide. A run past the deadline, or
+    // one a signal killed, may have left records, but it didn't finish.
+    match run_pilot_child(&mut start, &log, Some(deadline))? {
+        ChildEnd::TimedOut => {
+            return Ok(Err(LaneError::Killed(format!(
+                "`zakura-sim campaign start` ran past {} s; see {}",
+                deadline.as_secs(),
+                log.display()
+            ))))
+        }
+        end @ ChildEnd::Signaled(_) => {
+            return Ok(Err(LaneError::Killed(format!(
+                "`zakura-sim campaign start` {end}; see {}",
+                log.display()
+            ))))
+        }
+        _ => {}
     }
     let Some(manifest_file) = only_entry(&store.join("manifests"))? else {
         return Ok(Err(LaneError::Run(format!(
@@ -1143,6 +1164,12 @@ fn campaign_lane(
     let log = dir.join("evidence.log");
     let evidence = match run_pilot_child(&mut evidence, &log, None)? {
         ChildEnd::Exited(0) => serde_json::from_slice::<Value>(&fs::read(&evidence_file)?)?,
+        end @ ChildEnd::Signaled(_) => {
+            return Ok(Err(LaneError::Killed(format!(
+                "`zakura-sim campaign evidence` {end}; see {}",
+                log.display()
+            ))))
+        }
         end => {
             return Ok(Err(LaneError::Run(format!(
                 "`zakura-sim campaign evidence` {end}; see {}",
@@ -1255,9 +1282,11 @@ enum Failure {
     Violation(String),
     /// libFuzzer's crash input, which a saved violation may explain.
     Crash,
+    /// libFuzzer's timeout input: a worker ran past its input timeout.
+    Timeout,
     /// Any other failure: a harness failure, crash, abandoned run,
     /// nondeterministic rerun or run without an end that the target saved,
-    /// and a libFuzzer timeout, OOM or leak.
+    /// and a libFuzzer OOM or leak.
     Other,
     /// A file that goes with a saved input, such as its trace.
     Companion,
@@ -1288,6 +1317,7 @@ fn failure_kind(path: &str) -> Failure {
         .is_some_and(|dir| matches!(*dir, "artifacts" | "compact-artifacts"));
     match segments.last() {
         Some(file) if artifact && file.starts_with("crash-") => Failure::Crash,
+        Some(file) if artifact && file.starts_with("timeout-") => Failure::Timeout,
         Some(_) if artifact => Failure::Other,
         _ => Failure::Companion,
     }
@@ -1302,7 +1332,8 @@ fn campaign_facts(
     initial_inputs: usize,
 ) -> CampaignFacts {
     let mut violated = BTreeSet::new();
-    let (mut failures, mut crashes, mut intended_input) = (Vec::new(), Vec::new(), None);
+    let (mut failures, mut killed, mut crashes, mut intended_input) =
+        (Vec::new(), Vec::new(), Vec::new(), None);
     let records = end
         .and_then(|end| end.get("failures"))
         .and_then(Value::as_array);
@@ -1319,12 +1350,13 @@ fn campaign_facts(
                 violated.insert(violation);
             }
             Failure::Crash => crashes.push(path.to_owned()),
+            Failure::Timeout => killed.push(path.to_owned()),
             Failure::Other => failures.push(path.to_owned()),
             Failure::Companion => {}
         }
     }
     if violated.is_empty() {
-        failures.extend(crashes);
+        killed.extend(crashes);
     }
     let counts = |totals: &str, field: &str| {
         evidence
@@ -1343,6 +1375,7 @@ fn campaign_facts(
         initial_inputs,
         violated: violated.into_iter().collect(),
         failures,
+        killed,
         incomplete: evidence
             .get("incomplete")
             .and_then(Value::as_array)

@@ -14,6 +14,12 @@ use serde_json::Value;
 
 use super::super::{baseline_failure, classify as planted_verdict, Run, Verdict};
 
+/// A process that ran past its deadline or died from a signal is a harness
+/// failure, never a baseline failure or a mutant's result.
+fn killed(why: impl Into<String>) -> Classified {
+    result(Class::HarnessFailure, why)
+}
+
 /// One result, as the plan's table defines it. There is no other class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -146,7 +152,9 @@ pub(super) struct SensitivityRun {
 
 /// Why `baseline` isn't a passing paired baseline for `property`: it must
 /// hold with nonzero applicability and a passing witness test, settle
-/// quiescent with zero cleanup, and pair with the catalogue's build.
+/// quiescent with zero cleanup, and pair with the catalogue's build. A
+/// baseline run that passed its deadline or died from a signal is a harness
+/// failure.
 pub(super) fn sensitivity_baseline(
     property: &str,
     baseline: &Option<Result<Recorded, String>>,
@@ -157,6 +165,9 @@ pub(super) fn sensitivity_baseline(
         Some(Err(why)) => return failed(why.clone()),
         Some(Ok(recorded)) => recorded,
     };
+    if let Run::Killed(why) = &recorded.run {
+        return Some(killed(format!("the baseline run {why}")));
+    }
     if let Some(why) = baseline_failure(property, &recorded.run) {
         return failed(why);
     }
@@ -258,10 +269,15 @@ pub(super) struct CampaignFacts {
     pub(super) initial_inputs: usize,
     /// The properties a saved input violates, in order, each once.
     pub(super) violated: Vec<String>,
-    /// Saved failures that aren't a property violation: a harness failure,
-    /// crash, abandoned run, nondeterministic rerun, run without an end, or
-    /// libFuzzer timeout or OOM, and a crash no saved violation explains.
+    /// Saved failures that aren't a property violation and that no worker
+    /// death explains: a harness failure, crash, abandoned run,
+    /// nondeterministic rerun or run without an end that the target saved,
+    /// and a libFuzzer OOM or leak.
     pub(super) failures: Vec<String>,
+    /// libFuzzer's timeout inputs, and its crash inputs no saved violation
+    /// explains: a worker that ran past its input timeout or died from a
+    /// signal.
+    pub(super) killed: Vec<String>,
     /// Every way the run's counts fall short, as the evidence lists it.
     pub(super) incomplete: Vec<String>,
     /// True if the intended property applied in some complete process.
@@ -290,16 +306,35 @@ pub(super) struct DiscoveryRun {
     /// compile error, such as a compiler killed for memory or a full disk.
     pub(super) broken_build: Option<String>,
     /// The original build's campaign, or why it couldn't run.
-    pub(super) baseline: Option<Result<CampaignFacts, String>>,
+    pub(super) baseline: Option<Result<CampaignFacts, NoCampaign>>,
     /// Whether the patch applied, changed only its declared files, and
     /// compiled. A build that broke without a compile error leaves it
     /// `None`.
     pub(super) patch: Option<Result<(), String>>,
     /// The mutant's campaign, or why it couldn't run.
-    pub(super) mutant: Option<Result<CampaignFacts, String>>,
+    pub(super) mutant: Option<Result<CampaignFacts, NoCampaign>>,
     /// The fresh-process confirmation and Exact replay of the mutant
     /// campaign's intended finding.
     pub(super) confirmation: Option<Result<(), String>>,
+}
+
+/// Why a campaign left no facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum NoCampaign {
+    /// It couldn't run, or it left no records to read, as when the original
+    /// doesn't compile.
+    Failed(String),
+    /// Its `campaign start` process ran past its deadline, or a process
+    /// died from a signal.
+    Killed(String),
+}
+
+impl std::fmt::Display for NoCampaign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoCampaign::Failed(why) | NoCampaign::Killed(why) => f.write_str(why),
+        }
+    }
 }
 
 /// What a seed's paired campaigns show about `property`: the original's
@@ -325,7 +360,7 @@ pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
     }
     let mutant = match &run.mutant {
         None => return harness("the mutant campaign didn't run".to_owned()),
-        Some(Err(why)) => return harness(why.clone()),
+        Some(Err(why)) => return harness(why.to_string()),
         Some(Ok(mutant)) => mutant,
     };
     if let Some(why) = &mutant.unpaired {
@@ -339,11 +374,8 @@ pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
     }
     // A timeout, OOM or unexplained crash never counts as detection, even
     // beside a finding.
-    if !mutant.failures.is_empty() {
-        return harness(format!(
-            "the mutant campaign left failures: {}",
-            mutant.failures.join(", ")
-        ));
+    if let Some(why) = left_failures(mutant) {
+        return harness(format!("the mutant campaign {why}"));
     }
     let others: Vec<&String> = mutant.violated.iter().filter(|p| *p != property).collect();
     if let Some(other) = others.first() {
@@ -388,9 +420,11 @@ pub(super) fn discovery(property: &str, run: &DiscoveryRun) -> Classified {
 /// campaign must complete from the frozen empty corpus, pair with the
 /// catalogue's build, and leave no violation or other failure. A baseline
 /// whose property never applies passes; the mutant's campaign then shows
-/// whether it applies.
+/// whether it applies. A baseline campaign that ran past its deadline, or
+/// whose process or worker timed out or died from a signal, is a harness
+/// failure, even beside a violation.
 pub(super) fn discovery_baseline(
-    baseline: &Option<Result<CampaignFacts, String>>,
+    baseline: &Option<Result<CampaignFacts, NoCampaign>>,
 ) -> Option<Classified> {
     let baseline = match baseline {
         None => {
@@ -399,9 +433,18 @@ pub(super) fn discovery_baseline(
                 "the baseline campaign didn't run",
             ))
         }
-        Some(Err(why)) => return Some(result(Class::BaselineFailure, why.clone())),
+        Some(Err(NoCampaign::Killed(why))) => return Some(killed(why.clone())),
+        Some(Err(NoCampaign::Failed(why))) => {
+            return Some(result(Class::BaselineFailure, why.clone()))
+        }
         Some(Ok(baseline)) => baseline,
     };
+    if !baseline.killed.is_empty() {
+        return Some(killed(format!(
+            "the baseline campaign's workers timed out or died: {}",
+            baseline.killed.join(", ")
+        )));
+    }
     if let Some(violated) = baseline.violated.first() {
         return Some(result(
             Class::BaselineFailure,
@@ -428,8 +471,8 @@ fn campaign_failure(campaign: &CampaignFacts) -> Option<String> {
             campaign.initial_inputs
         ));
     }
-    if !campaign.failures.is_empty() {
-        return Some(format!("left failures: {}", campaign.failures.join(", ")));
+    if let Some(why) = left_failures(campaign) {
+        return Some(why);
     }
     if campaign.status != "complete" || !campaign.incomplete.is_empty() {
         return Some(format!(
@@ -439,6 +482,18 @@ fn campaign_failure(campaign: &CampaignFacts) -> Option<String> {
         ));
     }
     None
+}
+
+/// The saved failures and worker deaths `campaign` left, said in words, or
+/// `None` if it left none.
+fn left_failures(campaign: &CampaignFacts) -> Option<String> {
+    let left: Vec<&str> = campaign
+        .failures
+        .iter()
+        .chain(&campaign.killed)
+        .map(String::as_str)
+        .collect();
+    (!left.is_empty()).then(|| format!("left failures: {}", left.join(", ")))
 }
 
 /// The classes of a set of results, and the intended-detection rate's

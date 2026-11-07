@@ -1477,7 +1477,7 @@ async fn finished_workers_settle_before_the_round_starts() {
         finished.push(attempt.node_id);
         io.workers.push(DiscoveryDialWorker::spawn(attempt, async {
             DiscoveryDialOutcome {
-                admitted_ip: None,
+                admitted_addr: None,
                 result: DiscoveryDialResult::Failed,
                 phase: DialPhase::WorkerFinished,
             }

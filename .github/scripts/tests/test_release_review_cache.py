@@ -31,7 +31,7 @@ class CacheAccountingTests(unittest.TestCase):
         spending = Spending(config)
         checkpoints = []
         spending.call(self.provider({"cached_tokens": 800, "cache_write_tokens": 200}, config),
-                      self.request(), checkpoint=lambda: checkpoints.append(spending.report()))
+                      self.request(), persist_reservation=lambda: checkpoints.append(spending.report()))
         self.assertEqual(spending.charged, Decimal("0.00158"))
         self.assertEqual(spending.cached_input_tokens, 800)
         reserve = spending.price(Spending.input_bound(self.request()), 4096)

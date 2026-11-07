@@ -1,0 +1,39 @@
+## Release AI review — {{ 'Complete' if complete else 'INCOMPLETE' }}
+
+{% if not complete %}
+**This is not a clean review. Coverage or final checks are unfinished.**
+{% elif findings %}
+**Potential release-blocking bugs found. Review the findings below.**
+{% else %}
+**No supported release-blocking bugs found in the reviewed scope.**
+{% endif %}
+
+| Review | Result |
+| --- | --- |
+| Coverage | **{{ reviewed }}/{{ included }} files reviewed**; {{ excluded | length }} excluded by configuration |
+| Cross-component checks | {{ 'Complete' if report.get('synthesis_complete') else 'Not completed' }} |
+| Model | {{ report.get('model', 'Not configured') | plain }} · {{ effort | plain }} reasoning |
+| Estimated API cost | {{ usage.get('estimated_usd_including_uncertain_calls') | money }} / {{ usage.get('budget_usd', '25') | money }} |
+{% if duration_minutes is not none %}
+| Review time | {{ '%.1f' | format(duration_minutes) }} minutes |
+{% endif %}
+
+**Release range:** {{ base_link }} → {{ head_link }}.
+{% if diff_url %}
+[View release diff]({{ diff_url }})
+{% endif %}
+{% if report.get('run_url') %}
+
+[Workflow run and full report]({{ report.run_url }})
+{% endif %}
+{% if report.get('errors') %}
+
+### Why the review is incomplete
+
+{% for error in report.errors %}
+- {{ error | plain }}
+{% endfor %}
+{% endif %}
+{% include 'findings.md.jinja' %}
+
+Advisory source review of consensus, cryptography, mining, and block propagation. No builds or tests were run. Excluded changes were not reviewed.

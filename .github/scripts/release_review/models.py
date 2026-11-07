@@ -6,6 +6,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -154,7 +155,7 @@ class Spending:
         return len(json.dumps(request.messages).encode()) + len(json.dumps(TURN_SCHEMA).encode()) + 8192
 
     def call(self, provider: ModelProvider, request: ModelRequest, *, sleep=time.sleep,
-             deadline: float | None = None, checkpoint=None) -> ModelReply:
+             deadline: float | None = None, persist_reservation: Callable[[], None] | None = None) -> ModelReply:
         input_bound = self.input_bound(request)
         if input_bound > self.settings.max_input_bytes:
             raise ReviewError("request exceeds the configured model input allowance")
@@ -169,8 +170,8 @@ class Spending:
             self.uncertain_calls += 1
             # Persist the reservation before network I/O so forced termination
             # cannot leave an artifact claiming that an in-flight call was free.
-            if checkpoint is not None:
-                checkpoint()
+            if persist_reservation is not None:
+                persist_reservation()
             try:
                 reply = provider.complete(request)
             except ProviderError as error:

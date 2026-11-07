@@ -1,0 +1,37 @@
+## Release AI review — {{ verdict if complete else 'INCOMPLETE' }}
+
+Advisory, read-only review. No source code or tests were executed.
+
+Range: `{{ report.get('base_tag', 'unresolved') }}` (`{{ report.get('base_sha', 'unresolved') }}`) → `{{ report.head_sha }}`.
+Reviewer revision: `{{ report.get('control_sha', 'unknown') }}`. Provider/model: {{ report.get('provider', 'unconfigured') | plain }} / {{ report.get('model', 'unconfigured') | plain }}. Reasoning effort: {{ report.get('reasoning_effort', 'unavailable') | plain }}.
+Prompt digest: `{{ report.get('prompt_digest', 'unavailable') }}`.
+
+Coverage: {{ reviewed }}/{{ included }} in-scope changed files reviewed ({{ coverage | length }} total changed files; {{ excluded | length }} excluded by configuration); cross-component synthesis {{ 'completed' if report.get('synthesis_complete') else 'not completed' }}.
+{% if report.get('excluded_paths') %}
+Configured exclusions: {{ report.excluded_paths | map('plain') | join(', ') }}.
+{% endif %}
+{% if excluded %}
+Excluded changes were not reviewed. Completion applies only to the configured scope.
+{% endif %}
+{% if structured_binary %}
+Embedded state assets are reviewed through lossless field/byte diffs. Framing and the subtree checksum are checked; chain provenance and cryptographic roots are not authenticated.
+{% endif %}
+Estimated API cost, including uncertain requests: ${{ usage.get('estimated_usd_including_uncertain_calls', '0') }} of ${{ usage.get('budget_usd', '25') }}; {{ usage.get('calls', 0) }} requests.
+{% if report.get('resume_history') %}
+Continued from {{ report.resume_history | length }} saved attempt(s); coverage and usage include those attempts under the same API ceiling.
+{% endif %}
+{% if usage.get('cached_input_tokens') %}
+Provider-reported cached input: {{ usage.cached_input_tokens }} tokens. Any configured cache discount applies only after successful usage reporting.
+{% endif %}
+{% if report.get('run_url') %}
+
+[Workflow run and full report artifacts]({{ report.run_url }})
+{% endif %}
+{% if not complete %}
+
+**This is not a clean review. Coverage or verification is unfinished.**
+{% endif %}
+{% for error in report.get('errors', []) %}
+- {{ error | plain }}
+{% endfor %}
+{% include 'findings.md.jinja' %}

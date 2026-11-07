@@ -358,7 +358,9 @@ The driver follows the P2P stack's routine and reactor pattern. No lock guards a
   stream gets `Stopped(code)`, and `SendStream::stopped` resolves with the
   code. Each stream has its own slot for the code, so a stop wakes only that
   stream's waiters. A short lock guards the slot map, never a `quinn-proto`
-  object. The task drops a stream's slot once its handle finishes, resets or
+  object. The task keeps its own copy of each code for writes and accepts,
+  so it takes the lock only on a stop and when a handle finishes, resets or
+  drops. The task drops a stream's slot once its handle finishes, resets or
   drops, so the slots are bounded by the open streams.
 - **DRV-10.** `open_bi` and `accept_bi` are cancel safe. If the caller drops
   the call after the connection task replied, the stream goes to the next
@@ -1371,5 +1373,6 @@ Changed:
 - **DRV-9.** `SendStream::stopped` resolves with the code the task keeps.
   Each stream keeps its code in its own slot, so a stop wakes only that
   stream's waiters. With one shared map, each stop would wake every request
-  worker on the connection, up to 1,024 of them.
+  worker on the connection, up to 1,024 of them. The task's writes and
+  accepts read its own copy of the code, so they take no lock.
 - **§16.** Adds the `stopped` test.

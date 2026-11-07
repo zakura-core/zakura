@@ -132,9 +132,10 @@ pub(crate) struct ConnShared {
     pub(crate) closed: watch::Sender<Option<ConnectionError>>,
     /// One slot per stream that a [`SendStream::stopped`] waits on or that
     /// the peer stopped. A slot holds the peer's STOP_SENDING code once this
-    /// node reset the stream in answer, or will reset it once it is accepted.
-    /// A later write gets `Stopped(code)` instead of the reset stream's
-    /// `ClosedStream`, and [`SendStream::stopped`] resolves.
+    /// node reset the stream in answer, or will reset it once it is accepted,
+    /// and [`SendStream::stopped`] resolves. The task keeps its own copy of
+    /// each code for writes and accepts, so it locks this map only on a stop
+    /// and when a handle finishes, resets or drops.
     ///
     /// The connection task drops a stream's slot once the handle finishes,
     /// resets or drops it. Each stream has its own slot, so a stop wakes
@@ -176,11 +177,6 @@ impl ConnShared {
         })
     }
 
-    /// The peer's STOP_SENDING code for `id`, while its handle can write.
-    pub(crate) fn stop_code(&self, id: StreamId) -> Option<VarInt> {
-        *self.stop_slots().get(&id)?.borrow()
-    }
-
     /// Keeps the peer's STOP_SENDING code for `id` and wakes that stream's
     /// [`SendStream::stopped`](crate::SendStream::stopped) waiters.
     pub(crate) fn record_stop(&self, id: StreamId, code: VarInt) {
@@ -190,13 +186,10 @@ impl ConnShared {
             .send_replace(Some(code));
     }
 
-    /// Drops the slot for `id` once its handle can't write, and returns the
-    /// peer's code if the peer stopped the stream. A waiter whose slot drops
-    /// waits only for the connection's close.
-    pub(crate) fn forget_stop(&self, id: StreamId) -> Option<VarInt> {
-        let slot = self.stop_slots().remove(&id)?;
-        let code = *slot.borrow();
-        code
+    /// Drops the slot for `id` once its handle can't write. A waiter whose
+    /// slot drops waits only for the connection's close.
+    pub(crate) fn forget_stop(&self, id: StreamId) {
+        self.stop_slots().remove(&id);
     }
 
     /// Subscribes to the slot for `id`, adding the slot if it's missing.

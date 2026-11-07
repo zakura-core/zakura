@@ -156,6 +156,13 @@ struct ConnTask<S: UdpIo> {
     acceptors: VecDeque<oneshot::Sender<Result<StreamId, ConnectionError>>>,
     accepted_spare: VecDeque<StreamId>,
     sends: HashMap<StreamId, SendState>,
+    /// The peer's STOP_SENDING code for each stream this node reset in
+    /// answer, or will reset once it is accepted, until the handle finishes,
+    /// resets or drops it. A later write gets `Stopped(code)` instead of the
+    /// reset stream's `ClosedStream`. The task writes each code here and to
+    /// `ConnShared`'s slot at once, so writes and accepts read it here
+    /// without a lock.
+    stopped: HashMap<StreamId, VarInt>,
     /// Streams whose send handles can still issue writes.
     writable_handles: HashSet<StreamId>,
     /// How many remote bidirectional streams quinn-proto has handed out. A
@@ -229,6 +236,7 @@ pub(crate) async fn run<S: UdpIo>(params: ConnTaskParams<S>) {
         acceptors: VecDeque::new(),
         accepted_spare: VecDeque::new(),
         sends: HashMap::new(),
+        stopped: HashMap::new(),
         writable_handles: HashSet::new(),
         accepted_bidi: 0,
         reads: HashMap::new(),
@@ -730,7 +738,7 @@ impl<S: UdpIo> ConnTask<S> {
                 self.serve_acceptors();
             }
             ConnCmd::Write { id, data, reply } => {
-                if let Some(code) = self.shared.stop_code(id) {
+                if let Some(&code) = self.stopped.get(&id) {
                     let _ = reply.send(Err(WriteError::Stopped(code)));
                     return;
                 }
@@ -746,7 +754,8 @@ impl<S: UdpIo> ConnTask<S> {
             }
             ConnCmd::Finish { id } | ConnCmd::DropSend { id } => {
                 self.writable_handles.remove(&id);
-                if self.shared.forget_stop(id).is_none() {
+                self.shared.forget_stop(id);
+                if self.stopped.remove(&id).is_none() {
                     match self.sends.get_mut(&id) {
                         Some(state) if !state.writes.is_empty() => state.finish_after = true,
                         _ => {
@@ -757,6 +766,7 @@ impl<S: UdpIo> ConnTask<S> {
             }
             ConnCmd::Reset { id, code } => {
                 self.writable_handles.remove(&id);
+                self.stopped.remove(&id);
                 self.shared.forget_stop(id);
                 self.fail_writes(id, WriteError::ClosedStream);
                 self.send_payload.remove(&id);
@@ -897,7 +907,7 @@ impl<S: UdpIo> ConnTask<S> {
                     self.accepted_bidi = id.index() + 1;
                     self.recv_payload.insert(id);
                     // The reset `on_stopped` deferred until this accept.
-                    if let Some(code) = self.shared.stop_code(id) {
+                    if let Some(&code) = self.stopped.get(&id) {
                         let _ = self.conn.send_stream(id).reset(code);
                     } else {
                         self.send_payload.insert(id);
@@ -968,11 +978,11 @@ impl<S: UdpIo> ConnTask<S> {
             // quinn-proto counts a remote send stream only once it is
             // accepted, so a reset acked before then underflows that count.
             // `serve_acceptors` sends the reset on accept.
-            self.shared.record_stop(id, error_code);
+            self.record_stop(id, error_code);
             return;
         }
         if self.writable_handles.contains(&id) {
-            self.shared.record_stop(id, error_code);
+            self.record_stop(id, error_code);
         }
         // RFC 9000 §3.5: answer STOP_SENDING with RESET_STREAM. quinn-proto
         // leaves this to the application, and without it the peer never
@@ -980,6 +990,13 @@ impl<S: UdpIo> ConnTask<S> {
         // stream credit.
         self.send_payload.remove(&id);
         let _ = self.conn.send_stream(id).reset(error_code);
+    }
+
+    /// Keeps the peer's code for the task's writes and accepts, and publishes
+    /// it to the stream's `stopped` waiters.
+    fn record_stop(&mut self, id: StreamId, code: VarInt) {
+        self.stopped.insert(id, code);
+        self.shared.record_stop(id, code);
     }
 
     fn fail_writes(&mut self, id: StreamId, error: WriteError) {
@@ -1279,6 +1296,7 @@ mod tests {
             acceptors: VecDeque::new(),
             accepted_spare: VecDeque::new(),
             sends: HashMap::new(),
+            stopped: HashMap::new(),
             writable_handles: HashSet::new(),
             accepted_bidi: 0,
             reads: HashMap::new(),
@@ -1761,14 +1779,75 @@ mod tests {
             };
             task.handle_cmd(close);
             assert!(!task.writable_handles.contains(&id));
+            assert!(task.stopped.is_empty());
             assert_eq!(task.shared.stop_slot_count(), 0);
             task.on_stopped(id, code);
+            assert!(task.stopped.is_empty());
             assert_eq!(
                 task.shared.stop_slot_count(),
                 0,
                 "late STOP_SENDING must not retain a code"
             );
         }
+    }
+
+    /// Writes and accepts read the task's own copy of each stop code, so they
+    /// never take `ConnShared`'s slot lock. Another thread holds that lock
+    /// meanwhile, and a write or accept that took it would wait until that
+    /// thread gives up.
+    #[tokio::test]
+    async fn writes_and_accepts_take_no_shared_lock() {
+        let (mut client, mut task) = client_task();
+        let mut server = server_endpoint();
+        let mut accepted = None;
+        pump(&mut client, &mut task, &mut server, &mut accepted);
+        let (_, peer) = accepted.as_mut().unwrap();
+        let stopped_id = peer.streams().open(Dir::Bi).unwrap();
+        peer.send_stream(stopped_id).write(b"x").unwrap();
+        pump(&mut client, &mut task, &mut server, &mut accepted);
+        // The peer stops the stream before this node accepts it.
+        let code = VarInt::from_u32(9);
+        task.on_stopped(stopped_id, code);
+        let (reply, opened) = oneshot::channel();
+        task.handle_cmd(ConnCmd::OpenBi { reply });
+        let live_id = opened.await.unwrap().unwrap();
+
+        let shared = task.shared.clone();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _slots = shared.stop_slots();
+            held_tx.send(()).unwrap();
+            done.recv_timeout(Duration::from_secs(1)).is_ok()
+        });
+        held.recv().unwrap();
+        let (reply, accept) = oneshot::channel();
+        task.handle_cmd(ConnCmd::AcceptBi { reply });
+        let (reply, stopped_write) = oneshot::channel();
+        task.handle_cmd(ConnCmd::Write {
+            id: stopped_id,
+            data: Bytes::from_static(b"x"),
+            reply,
+        });
+        let (reply, live_write) = oneshot::channel();
+        task.handle_cmd(ConnCmd::Write {
+            id: live_id,
+            data: Bytes::from_static(b"x"),
+            reply,
+        });
+        let _ = done_tx.send(());
+        assert!(
+            holder.join().unwrap(),
+            "a write or accept waited on the shared slot lock"
+        );
+
+        assert_eq!(accept.await.unwrap().unwrap(), stopped_id);
+        assert_eq!(stopped_write.await.unwrap(), Err(WriteError::Stopped(code)));
+        assert_eq!(live_write.await.unwrap(), Ok(()));
+        assert_eq!(task.shared.stop_slot_count(), 1);
+        task.handle_cmd(ConnCmd::DropSend { id: stopped_id });
+        assert!(task.stopped.is_empty());
+        assert_eq!(task.shared.stop_slot_count(), 0);
     }
 
     /// A stop wakes only its own stream's waiter, and a waiter's slot drops

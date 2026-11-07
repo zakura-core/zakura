@@ -3,7 +3,9 @@
 use super::read_close_cause::Link;
 use super::*;
 use crate::zakura::{
-    legacy_gossip::{LegacyResponseCodec, LEGACY_REQUESTS_BUDGET, MSG_RESPONSE_PONG},
+    legacy_gossip::{
+        LegacyRequestFrame, LegacyResponseCodec, LEGACY_REQUESTS_BUDGET, MSG_RESPONSE_PONG,
+    },
     regulation::OutputByteBudget,
     RequestResponseService,
 };
@@ -638,7 +640,8 @@ async fn cancelling_the_connection_ends_a_stalled_response_write() -> Result<(),
 }
 
 /// A legacy request service that counts its calls, waits for the test's release, and
-/// answers with `answer`.
+/// answers with `answer`. It rejects a frame that fails legacy request decoding as a
+/// protocol fault on the call's first poll, as `LegacyGossipSink` does.
 #[derive(Debug)]
 struct CountedRequests {
     streams: [Stream; 1],
@@ -669,13 +672,20 @@ impl RequestResponseService for CountedRequests {
         _request_id: u64,
         _max_frame_bytes: u32,
         _max_message_bytes: u32,
-        _frame: Frame,
+        frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
+            LegacyRequestFrame::decode_frame(frame).map_err(SinkReject::protocol)?;
             self.started.fetch_add(1, Ordering::Relaxed);
             let _release = self.release.acquire().await;
             Ok(self.answer.clone())
         })
+    }
+
+    fn check_request(&self, _stream_kind: u16, frame: &Frame) -> Result<(), SinkReject> {
+        LegacyRequestFrame::decode_frame(frame.clone())
+            .map(drop)
+            .map_err(SinkReject::protocol)
     }
 }
 
@@ -769,6 +779,14 @@ impl LegacyRequests {
 
     fn calls(&self) -> usize {
         self.started.load(Ordering::Relaxed)
+    }
+
+    /// Stop the response stream of the last request, as a requester that gives
+    /// up does.
+    fn stop_last_response(&mut self) -> Result<(), BoxError> {
+        let (_, peer_recv) = self.held.last_mut().ok_or("the test opened a request")?;
+        peer_recv.stop(0u32.into())?;
+        Ok(())
     }
 
     async fn until_calls(&self, calls: usize) -> Result<(), BoxError> {
@@ -948,6 +966,150 @@ async fn cancelling_a_request_returns_its_reservation() -> Result<(), BoxError> 
 
     drop(saturating);
     assert_eq!(requests.output.granted(), 0);
+    requests.link.close().await;
+    Ok(())
+}
+
+/// A requester that stops its response stream mid-call ends the call and
+/// returns its reservation and raw frame. A stop during the wait for a
+/// reservation keeps the call from running. Neither stop closes the
+/// connection.
+#[tokio::test]
+async fn a_stopped_response_stream_cancels_its_request() -> Result<(), BoxError> {
+    const OUTPUT: u64 = 8 << 20;
+    let mut requests = LegacyRequests::connect(OUTPUT, Vec::new()).await?;
+
+    let (running, connection) = requests
+        .start(LEGACY_REQUEST_BLOCKS_BY_HASH, one_block_request())
+        .await?;
+    requests.until_calls(1).await?;
+    assert_eq!(requests.output.granted(), one_block_bound().bytes);
+    requests.stop_last_response()?;
+    timeout(TEST_TIMEOUT, running)
+        .await
+        .map_err(|_| "the stop ends the running call")??;
+    assert_eq!(requests.output.granted(), 0);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    assert!(!connection.is_cancelled());
+
+    let saturating = requests
+        .output_gate()
+        .admit(OUTPUT)
+        .now_or_never()
+        .ok_or("the stop returned the budget")?;
+    let (waiting, connection) = requests
+        .start(LEGACY_REQUEST_BLOCKS_BY_HASH, one_block_request())
+        .await?;
+    requests
+        .until_raw(8 + one_block_request().len() as u64)
+        .await?;
+    requests.stop_last_response()?;
+    timeout(TEST_TIMEOUT, waiting)
+        .await
+        .map_err(|_| "the stop ends the wait for a reservation")??;
+    assert_eq!(requests.calls(), 1, "the stopped wait never ran its call");
+    assert_eq!(requests.output.granted(), OUTPUT);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    assert!(!connection.is_cancelled());
+
+    drop(saturating);
+    requests.link.close().await;
+    Ok(())
+}
+
+/// A stop never hides a protocol-invalid request. A malformed request that a
+/// requester stops while it waits on a saturated output gate still closes the
+/// connection, and its call never runs. So does one stopped as it reaches its
+/// call. A valid request that's stopped leaves the connection open, as
+/// `a_stopped_response_stream_cancels_its_request` shows.
+#[tokio::test]
+async fn a_stopped_protocol_invalid_request_still_closes_the_connection() -> Result<(), BoxError> {
+    const OUTPUT: u64 = 8 << 20;
+    let mut trailing = one_block_request();
+    trailing.push(0);
+    let mut requests = LegacyRequests::connect(OUTPUT, Vec::new()).await?;
+
+    let saturating = requests
+        .output_gate()
+        .admit(OUTPUT)
+        .now_or_never()
+        .ok_or("the gate starts empty")?;
+    let (waiting, connection) = requests
+        .start(LEGACY_REQUEST_BLOCKS_BY_HASH, trailing.clone())
+        .await?;
+    requests.until_raw(8 + trailing.len() as u64).await?;
+    assert!(!connection.is_cancelled(), "the request waits on the gate");
+    requests.stop_last_response()?;
+    timeout(TEST_TIMEOUT, waiting)
+        .await
+        .map_err(|_| "the stop ends the wait for a reservation")??;
+    assert!(connection.is_cancelled(), "the stop hid a protocol fault");
+    assert_eq!(requests.calls(), 0);
+    assert_eq!(requests.raw_budget.granted(), 0);
+    drop(saturating);
+
+    let (racing, connection) = requests.start(0xfff0, Vec::new()).await?;
+    requests.stop_last_response()?;
+    timeout(TEST_TIMEOUT, racing)
+        .await
+        .map_err(|_| "the worker ends")??;
+    assert!(
+        connection.is_cancelled(),
+        "the stop hid an unknown request type"
+    );
+    assert_eq!(requests.calls(), 0);
+    assert_eq!(requests.output.granted(), 0);
+
+    requests.link.close().await;
+    Ok(())
+}
+
+/// A stop that is already recorded when the call starts never hides the call's
+/// protocol fault, because the call arm is polled before the stop arm. A valid
+/// call still yields to that stop at its first `Pending`. The loopback can't
+/// order a stop before the call's first poll, so this drives the call's select
+/// with a stop that has already resolved.
+#[tokio::test]
+async fn an_already_stopped_call_reports_its_protocol_fault() -> Result<(), BoxError> {
+    let mut trailing = one_block_request();
+    trailing.push(0);
+    let requests = LegacyRequests::connect(8 << 20, Vec::new()).await?;
+    let context = tabled_context(None, 128);
+    let call = |payload: Vec<u8>| {
+        requests.registry.request(
+            context.peer_id.clone(),
+            LEGACY_REQUEST_STREAM_KIND,
+            7,
+            1024,
+            context.limits.max_message_bytes,
+            Frame {
+                message_type: LEGACY_REQUEST_BLOCKS_BY_HASH,
+                flags: 0,
+                payload,
+            },
+        )
+    };
+
+    let stopped = std::future::ready(());
+    zakura_rt::pin!(stopped);
+    let response = call_until_stopped(&context.connection_token, call(trailing), stopped).await;
+    assert!(
+        matches!(response, Some(Err(SinkReject::Protocol(_)))),
+        "the stop hid a protocol fault: {response:?}"
+    );
+    assert_eq!(requests.calls(), 0);
+
+    let stopped = std::future::ready(());
+    zakura_rt::pin!(stopped);
+    let response = call_until_stopped(
+        &context.connection_token,
+        call(one_block_request()),
+        stopped,
+    )
+    .await;
+    assert!(response.is_none(), "the stop ends a pending call");
+    assert_eq!(requests.calls(), 1, "the call ran up to its first wait");
+
     requests.link.close().await;
     Ok(())
 }

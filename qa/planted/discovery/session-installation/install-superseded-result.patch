@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/state.rs b/crates/zakura-network/src/zakura/discovery/state.rs
-index e81d8bc15..eabd65967 100644
+index 6f7dd9c8d..912565a90 100644
 --- a/crates/zakura-network/src/zakura/discovery/state.rs
 +++ b/crates/zakura-network/src/zakura/discovery/state.rs
-@@ -486,7 +486,7 @@ impl DiscoveryState {
+@@ -502,7 +502,7 @@ impl DiscoveryState {
          now: u64,
          changes: &mut Vec<BookChange>,
      ) -> Result<ImportOutcome, SessionRecordError> {
@@ -10,4 +10,4 @@ index e81d8bc15..eabd65967 100644
 +        if false && !self.is_current_session(session) {
              return Err(SessionRecordError::Superseded);
          }
-         Ok(self.install_connected_peer_record(record, connected, now, changes)?)
+         Ok(self.install_connected_peer_record(record, remote_ip, connected, now, changes)?)

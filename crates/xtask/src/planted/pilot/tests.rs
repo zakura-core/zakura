@@ -1445,6 +1445,11 @@ fn a_broken_build_is_a_harness_failure() {
 fn a_campaign_build_is_rejected_only_for_a_compile_error() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let dir = tempfile::tempdir().expect("a temporary directory");
     let catalogue = committed_catalogue();
     let case = &catalogue.cases[0];
@@ -1502,6 +1507,11 @@ fn a_campaign_build_is_rejected_only_for_a_compile_error() {
 #[test]
 fn a_campaign_that_a_signal_killed_is_not_read() {
     use std::os::unix::fs::PermissionsExt as _;
+
+    // `campaign_lane` runs its children against the pilot's interrupt flag.
+    let _flag = crate::sim_minimize::tests::INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     const RECORDS: &str = "mkdir -p \"$store/manifests\" \"$store/snapshots/s\"\n\
                            echo '{\"initial_snapshot\":\"s\"}' > \"$store/manifests/r.json\"\n\

@@ -1876,4 +1876,4 @@ fn millis<S: serde::Serializer>(duration: &Duration, serializer: S) -> Result<S:
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

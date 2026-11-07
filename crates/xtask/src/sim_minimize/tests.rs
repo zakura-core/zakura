@@ -10,6 +10,11 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// Held by each test that raises a signal [`INTERRUPTED`] reads, and by each
+/// test that runs a child against the flag, so a raised signal never ends
+/// another test's child.
+pub(crate) static INTERRUPT_FLAG_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `zakura-sim`: `properties` lists `race/lost-update` and
 /// `sim/no-task-panic`, `confirm` writes a confirmation whose status the
 /// input's keywords pick, and `replay` fails for a trace named `bad`. A
@@ -1076,6 +1081,9 @@ fn reading_the_source_leaves_the_git_dir_alone() {
 /// the wrapper.
 #[test]
 fn signals_set_the_interrupt_flag() {
+    let _flag = INTERRUPT_FLAG_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A test run under `nohup` starts with SIGHUP ignored.
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: the default action replaces any handler.
@@ -1093,6 +1101,7 @@ fn signals_set_the_interrupt_flag() {
         }
         assert!(INTERRUPTED.load(Ordering::SeqCst), "signal {signal}");
     }
+    INTERRUPTED.store(false, Ordering::SeqCst);
 }
 
 /// A signal ignored at startup, as `nohup` ignores SIGHUP, stays ignored,

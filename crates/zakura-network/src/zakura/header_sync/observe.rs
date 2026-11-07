@@ -355,6 +355,26 @@ pub enum ReactorEvent {
         /// The unit of work the reactor is in.
         cause: ReactorCause,
     },
+    /// `peer`'s offer waits for header room: the reactor held it back with
+    /// no headroom left for its target, not for a pause, or its locator
+    /// found no room to reserve. Reported at each such refusal.
+    HeadroomWait {
+        /// The offering peer.
+        peer: ZakuraPeerId,
+        /// The offering session.
+        session_id: u64,
+        /// The offered target.
+        target_tip_hash: block::Hash,
+        /// The offered target's height.
+        target_height: block::Height,
+    },
+    /// The cached-offer pass the reactor wanted was refused by its pass
+    /// budget, and runs at the budget's next refill, `refill_in` from now,
+    /// which the reactor arms as a deadline.
+    CachedPassDeferred {
+        /// How long until the next refill.
+        refill_in: std::time::Duration,
+    },
     /// The reactor refused a session from `peer` because `peer`'s readmission
     /// cooldown still holds. Nothing else about the reactor changes.
     SessionRefused {

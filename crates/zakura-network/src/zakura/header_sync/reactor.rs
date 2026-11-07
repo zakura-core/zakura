@@ -2504,6 +2504,11 @@ impl HeaderSyncReactor {
 
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
+        // Pruned before the fatal check, since the cooldowns are maintenance
+        // deadlines and an expired one would otherwise wake the loop again.
+        if self.state.prune_readmission_cooldowns(now) {
+            self.publish_peer_state();
+        }
         if self.report_fatal_vct_local_operation(now) {
             return;
         }
@@ -2512,9 +2517,6 @@ impl HeaderSyncReactor {
         self.state.prune_pruned_peers(now);
         self.retry_pending_closes(now);
         self.retire_unanswered_closes(now);
-        if self.state.prune_readmission_cooldowns(now) {
-            self.publish_peer_state();
-        }
         let peers: Vec<_> = self
             .sessions
             .iter()

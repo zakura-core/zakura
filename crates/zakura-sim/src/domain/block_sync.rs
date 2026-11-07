@@ -69,7 +69,8 @@ use crate::{
         BlockSyncFact, BlockSyncHolder, BlockSyncPayload, BlockSyncRetained, StorageFact, WorkOwner,
     },
     property::{
-        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status, Unit, Verdict,
+        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
+        TriggerHistory, Unit, Verdict,
     },
     Observation, ObservationLog,
 };
@@ -1012,7 +1013,7 @@ where
             needs: &[Source::View],
             status: Status::Active,
             check: check_payload_inventory::<S>,
-            witness: Some(payload_retained),
+            witness: Some(TriggerHistory::Log(payload_retained)),
         },
         Property {
             id: PropertyId::new(RETAINED_BYTE_BOUND),
@@ -1024,7 +1025,7 @@ where
             needs: &[Source::View],
             status: Status::Active,
             check: check_retained::<S>,
-            witness: Some(commit_window_filled),
+            witness: Some(TriggerHistory::Log(commit_window_filled)),
         },
         Property {
             id: PropertyId::new(RESERVED_BYTE_BOUND),
@@ -1036,7 +1037,7 @@ where
             needs: &[Source::View],
             status: Status::Active,
             check: check_reserved::<S>,
-            witness: Some(budget_charged),
+            witness: Some(TriggerHistory::Log(budget_charged)),
         },
         Property {
             id: PropertyId::new(BUDGET_LEDGERS_AGREE),
@@ -1047,7 +1048,7 @@ where
             needs: &[Source::View, Source::Schedule],
             status: Status::Active,
             check: check_ledgers::<S>,
-            witness: Some(body_handed_off),
+            witness: Some(TriggerHistory::Log(body_handed_off)),
         },
         Property {
             id: PropertyId::new(LOOKAHEAD_OVERSHOOT_BOUND),
@@ -1060,7 +1061,7 @@ where
             needs: &[Source::View, Source::Schedule],
             status: Status::Active,
             check: check_lookahead::<S>,
-            witness: Some(above_window_requested),
+            witness: Some(TriggerHistory::Log(above_window_requested)),
         },
         Property {
             id: PropertyId::new(TEARDOWN_RETURNS_BASELINE),
@@ -1071,7 +1072,7 @@ where
             needs: &[Source::View, Source::Schedule],
             status: Status::Active,
             check: check_teardown::<S>,
-            witness: Some(routine_ended_owing),
+            witness: Some(TriggerHistory::Log(routine_ended_owing)),
         },
     ]
 }

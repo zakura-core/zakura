@@ -7,7 +7,7 @@ use std::time::Duration;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::header_node::{
-        policy::{Allow, Hold, LinkEffect, OpKind, Predicates, Select, Trigger},
+        policy::{Allow, Hold, LinkEffect, OpKind, Predicates, ReplyHold, Select, Trigger},
         Base,
     },
     observe::{
@@ -16,7 +16,7 @@ use zakura_sim::{
     Boundary,
 };
 use zakura_storage::header::{
-    controlled::{OpId, PendingOp},
+    controlled::{CommittedOp, OpId, PendingOp},
     Fault, HeaderOp, Outcome,
 };
 
@@ -523,4 +523,134 @@ fn policy_is_pure_between_steps() {
     // The script moves the answers, so the comparisons above can fail.
     seen.dedup();
     assert!(seen.len() > 2, "{seen:#?}");
+}
+
+/// Operation `id`'s commit.
+fn committed(id: u64) -> StorageFact {
+    StorageFact::Committed {
+        id,
+        generation: 2,
+        state: String::new(),
+    }
+}
+
+/// Committed apply `id`, committed `since` ago.
+fn committed_op(id: u64, since: Duration) -> CommittedOp {
+    CommittedOp {
+        id: OpId(id),
+        since_commit: since,
+        caller_waiting: true,
+    }
+}
+
+/// Operation `id` completed with the engine.
+fn completed(id: u64) -> StorageFact {
+    StorageFact::Completed {
+        id,
+        outcome: "engine".to_owned(),
+        result: zakura_sim::observe::StorageResult::Applied,
+        delivered: true,
+        generation: 2,
+        state: String::new(),
+    }
+}
+
+/// A reply hold that selects every operation picks only applies, since only
+/// an apply commits. Its reply waits for its trigger, and `committed` counts
+/// the commit, not the delivery.
+#[test]
+fn a_reply_hold_picks_only_applies_and_waits_for_its_trigger() {
+    let mut predicates = Predicates::new(vec![hold(
+        Select::nth(OpKind::Locator, 1),
+        Trigger::Committed(Select::nth(OpKind::Apply, 1)),
+    )])
+    .with_reply_holds(vec![ReplyHold {
+        select: Select::default(),
+        until: Trigger::Completed(Select::nth(OpKind::Membership, 1)),
+    }]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    predicates.record(&submitted(2, OpKind::Apply, 1));
+    predicates.record(&submitted(3, OpKind::Membership, 0));
+    assert!(!predicates.holds_reply(OpId(1)), "a locator never commits");
+    assert!(predicates.holds_reply(OpId(2)));
+    assert!(!predicates.holds_reply(OpId(3)));
+    let locator = pending(1, OpKind::Locator, Duration::ZERO);
+    assert_eq!(offered(&predicates, Base::Any, &locator), []);
+
+    predicates.record(&committed(2));
+    assert_eq!(
+        offered(&predicates, Base::Any, &locator),
+        [Outcome::Engine],
+        "the commit opens a hold on `committed`"
+    );
+    let apply = committed_op(2, Duration::ZERO);
+    assert!(!predicates.delivers(&apply));
+    predicates.record(&completed(3));
+    assert!(predicates.delivers(&apply));
+}
+
+/// A reply hold's virtual time counts from the commit: time stops at the
+/// commit plus 1 s, and the reply is offered from then on.
+#[test]
+fn a_reply_holds_virtual_time_counts_from_the_commit() {
+    let mut predicates = Predicates::new(Vec::new()).with_reply_holds(vec![ReplyHold {
+        select: Select::nth(OpKind::Apply, 1),
+        until: Trigger::VirtualTime(1_000),
+    }]);
+    predicates.record(&submitted(1, OpKind::Apply, 1));
+    predicates.record(&committed(1));
+    let now = SimInstant::from_start(Duration::from_secs(60));
+    let early = committed_op(1, Duration::from_millis(400));
+    assert!(!predicates.delivers(&early));
+    let mut out = Vec::new();
+    predicates.reply_boundaries(&early, now, &mut out);
+    assert_eq!(
+        out,
+        [Boundary::Opens(SimInstant::from_start(
+            Duration::from_secs(60) + Duration::from_millis(600)
+        ))]
+    );
+
+    let open = committed_op(1, Duration::from_millis(1_000));
+    assert!(predicates.delivers(&open));
+    out.clear();
+    predicates.reply_boundaries(&open, now, &mut out);
+    assert_eq!(out, []);
+}
+
+/// A release opens its hold whatever the hold's trigger says, so a hold on
+/// `released` opens only through it, and a released hold stops time at none
+/// of its trigger's times. Releasing again does nothing, and another hold
+/// stays shut.
+#[test]
+fn a_release_opens_only_its_own_hold() {
+    let mut predicates = Predicates::new(vec![
+        hold(Select::nth(OpKind::Locator, 1), Trigger::Released),
+        hold(
+            Select::nth(OpKind::Prepare, 1),
+            Trigger::VirtualTime(60_000),
+        ),
+    ]);
+    predicates.record(&submitted(1, OpKind::Locator, 0));
+    predicates.record(&submitted(2, OpKind::Prepare, 1));
+    let locator = pending(1, OpKind::Locator, Duration::from_secs(1));
+    let prepare = pending(2, OpKind::Prepare, Duration::from_secs(1));
+    let now = SimInstant::from_start(Duration::from_secs(1));
+    assert_eq!(offered(&predicates, Base::Any, &locator), []);
+    assert_eq!(offered(&predicates, Base::Any, &prepare), []);
+    assert_eq!(
+        boundaries(&predicates, &prepare, now),
+        [Boundary::Opens(SimInstant::from_start(
+            Duration::from_secs(60)
+        ))]
+    );
+
+    predicates.release(1);
+    predicates.release(1);
+    assert_eq!(offered(&predicates, Base::Any, &locator), []);
+    assert_eq!(offered(&predicates, Base::Any, &prepare), [Outcome::Engine]);
+    assert_eq!(boundaries(&predicates, &prepare, now), []);
+
+    predicates.release(0);
+    assert_eq!(offered(&predicates, Base::Any, &locator), [Outcome::Engine]);
 }

@@ -103,6 +103,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             transaction_hashes,
             deferred_pool_balance_change: _,
+            origin: _,
             auth_data_root: _,
             receipt_order,
         } = block.into();

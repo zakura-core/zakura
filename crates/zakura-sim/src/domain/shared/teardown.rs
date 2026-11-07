@@ -17,7 +17,8 @@
 
 use crate::{
     property::{
-        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status, Verdict,
+        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
+        TriggerHistory, Verdict,
     },
     ObservationLog,
 };
@@ -61,7 +62,7 @@ pub fn teardown<S: HasView, T: Teardown<S>>() -> Property<S> {
         needs: T::NEEDS,
         status: Status::Active,
         check: check::<S, T>,
-        witness: Some(T::WITNESS),
+        witness: Some(TriggerHistory::Log(T::WITNESS)),
     }
 }
 
@@ -151,7 +152,7 @@ mod tests {
             status: SchedulerStatus::Quiescent,
             log: &log,
         };
-        let mut cx = CheckCtx::new(&step, &harness, &registered[0], &registered);
+        let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);
         let verdict = (registered[0].check)(&mut cx);
         let parts = cx.into_parts();
         Judged {

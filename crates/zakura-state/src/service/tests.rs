@@ -3256,7 +3256,7 @@ async fn missing_parent_commit_waits_until_state_shutdown() {
         .zcash_deserialize_into()
         .unwrap();
     let parent = block.header.previous_block_hash;
-    let (mut state, _, _, _) =
+    let crate::InitializedState { mut state, .. } =
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
             .await
             .unwrap();

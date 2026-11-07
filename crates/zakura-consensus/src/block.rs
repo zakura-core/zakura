@@ -571,13 +571,13 @@ where
                 let quick_checks: Result<_, VerifyBlockError> = (|| {
                     check::time_is_valid_at(block.header(), now, &height, &hash)
                         .map_err(VerifyBlockError::Time)?;
-                    let coinbase_tx = check::coinbase_is_first(&block)?;
+                    let coinbase = check::coinbase_is_first(&block)?;
                     check::shielded_action_limits_are_valid(
                         block.view().transactions(),
                         height,
                         &network,
                     )?;
-                    Ok(coinbase_tx)
+                    Ok(coinbase)
                 })();
                 let quick_checks = match quick_checks {
                     Err(error) if request.is_proposal() => return Err(error),
@@ -589,7 +589,17 @@ where
                 // header, or fails a cheap rule, never has its proofs and signatures hashed.
                 let transaction_hashes = block.view().transaction_hashes();
                 check::merkle_root_validity(&network, &block, &transaction_hashes)?;
-                let coinbase_tx = quick_checks?;
+                let check::CoinbaseSummary {
+                    coinbase_tx,
+                    has_transparent_spends,
+                } = quick_checks?;
+                if has_transparent_spends {
+                    check::transparent_spends_are_unique(&block).map_err(|error| {
+                        VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(
+                            Box::new(error),
+                        ))
+                    })?;
+                }
 
                 // Hash each transaction's authorizing data once, for the transaction requests
                 // and the state's authorizing-data check.

@@ -117,20 +117,16 @@ fn try_main() -> Result<(), BoxError> {
                         return Err(Box::new(UsageError("expected at most one `--targets`")));
                     }
                     targets = true;
-                } else if arg == "--changed-since" || arg == "--cases-changed-since" {
+                } else if arg == "--changed-since" {
                     if changed_since.is_some() {
                         return Err(Box::new(UsageError(
-                            "expected at most one of `--changed-since` and `--cases-changed-since`",
+                            "expected at most one `--changed-since`",
                         )));
                     }
-                    let rev = args.next().ok_or(UsageError(
-                        "expected a revision after `--changed-since` or `--cases-changed-since`",
-                    ))?;
-                    changed_since = Some(if arg == "--changed-since" {
-                        planted::Changes::Affecting(rev)
-                    } else {
-                        planted::Changes::OfCases(rev)
-                    });
+                    changed_since = Some(
+                        args.next()
+                            .ok_or(UsageError("expected a revision after `--changed-since`"))?,
+                    );
                 } else if property.is_none() {
                     property = Some(arg);
                 } else {
@@ -143,7 +139,7 @@ fn try_main() -> Result<(), BoxError> {
                 &repo_root()?,
                 property.as_deref(),
                 shard,
-                changed_since.as_ref(),
+                changed_since.as_deref(),
                 targets,
             )
         }
@@ -372,7 +368,7 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask check-rt-imports")?;
     writeln!(
         output,
-        "  cargo xtask planted [--shard <index>/<count>] [--changed-since <rev> | --cases-changed-since <rev>] [--targets] [<property-id>]"
+        "  cargo xtask planted [--shard <index>/<count>] [--changed-since <rev>] [--targets] [<property-id>]"
     )?;
     writeln!(
         output,
@@ -466,21 +462,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
         output,
         "With --shard, it runs only every <count>th case in path order, from position <index>."
     )?;
+    writeln!(output, "A shard that holds no case fails the run.")?;
     writeln!(
         output,
         "With --changed-since, it runs only the cases the changes since that revision affect."
-    )?;
-    writeln!(
-        output,
-        "With --cases-changed-since, it runs only the cases whose patch, case file, input or"
-    )?;
-    writeln!(
-        output,
-        "patched files changed since that revision. With --shard, either also runs the shard's"
-    )?;
-    writeln!(
-        output,
-        "cases that an added or removed case moved into it. An empty shard fails the run."
     )?;
     writeln!(
         output,

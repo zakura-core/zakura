@@ -511,100 +511,66 @@ jobs:
   # worktree under target/planted/, so the checkout stays clean, builds the
   # unpatched simulator once, and applies each patch there in turn. Each
   # case rebuilds the patched simulator and runs a campaign of fuzz inputs,
-  # which takes minutes, so the whole catalogue outgrew one job's limit.
-  # The cases split into seven shards in path order, one job each. Each
-  # night, the shard that the UTC weekday picks runs in full, and every
-  # other shard runs only its cases that changed since the previous
-  # nightly's commit, so a new or changed case runs within a night and
-  # every case runs once a week. Each shard has its own failure issue, and
-  # only a passing full run of that shard closes it, so the shards stay out
-  # of test-success. The jobs run nightly and on manual dispatch, never on
-  # pull requests or pushes. scripts/sim-long-runs.sh runs the whole
-  # catalogue on a remote host.
-  sim-planted-plan:
-    name: zakura_sim planted plan
+  # which takes minutes, so the whole catalogue outgrew this job's limit.
+  # The job runs one of seven shards, picked by the UTC weekday, so each
+  # case runs once a week. A case's shard follows from its position, so
+  # adding or removing a case can move a later case's run by up to six
+  # nights. Each shard has its own failure issue, and only a passing run of
+  # that shard closes it, so the job stays out of test-success. It runs
+  # nightly and on manual dispatch, never on pull requests or pushes.
+  # scripts/sim-long-runs.sh runs the whole catalogue on a remote host.
+  sim-planted:
+    name: zakura_sim planted
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
-      actions: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      shard: ${{ steps.plan.outputs.shard }}
-      base: ${{ steps.plan.outputs.base }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Pick tonight's full shard and the previous nightly's commit
-        id: plan
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          base="$(python3 scripts/planted-nightly.py base --run-id "${GITHUB_RUN_ID}")"
-          echo "shard=$(date -u +%w)" >> "$GITHUB_OUTPUT"
-          echo "base=${base}" >> "$GITHUB_OUTPUT"
-
-  sim-planted:
-    name: zakura_sim planted shard ${{ matrix.shard }}/7
-    needs: sim-planted-plan
-    permissions:
-      contents: read
+      issues: write
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
           cache-shared-key: zakura-sim-planted
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check the shard's planted bypass patches
-        run: |
-          if [[ "${SHARD}" == "${FULL_SHARD}" ]]; then
-            cargo xtask planted --shard "${SHARD}/7"
-          else
-            cargo xtask planted --shard "${SHARD}/7" --cases-changed-since "${BASE}"
-          fi
+      - name: Pick tonight's shard
+        id: shard
+        run: echo "index=$(date -u +%w)" >> "$GITHUB_OUTPUT"
+      # The step's limit leaves the issue step time to run.
+      - name: Check tonight's shard of the planted bypass patches
+        id: planted
+        timeout-minutes: 40
+        run: cargo xtask planted --shard "${SHARD}/7"
         env:
           RUSTFLAGS: --cfg zakura_sim
-          SHARD: ${{ matrix.shard }}
-          FULL_SHARD: ${{ needs.sim-planted-plan.outputs.shard }}
-          BASE: ${{ needs.sim-planted-plan.outputs.base }}
-
-  report-planted-shards:
-    name: report nightly planted shards
-    needs: [sim-planted-plan, sim-planted]
-    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.sim-planted-plan.result == 'success' }}
-    permissions:
-      contents: read
-      actions: read
-      issues: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - name: Create, update, or close each shard's failure issue
+          SHARD: ${{ steps.shard.outputs.index }}
+      - name: Create, update, or close the shard's failure issue
+        if: always() && github.event_name == 'schedule' && steps.shard.outputs.index != ''
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          FULL_SHARD: ${{ needs.sim-planted-plan.outputs.shard }}
-        run: >-
-          python3 scripts/planted-nightly.py report --full "${FULL_SHARD}"
-          --run-id "${GITHUB_RUN_ID}" --run-attempt "${GITHUB_RUN_ATTEMPT}"
-          --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          SHARD: ${{ steps.shard.outputs.index }}
+          SHARD_RESULT: ${{ steps.planted.outcome }}
+        run: |
+          issue_title="[nightly] zakura_sim planted shard ${SHARD}/7 failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          issue_number="$(gh issue list --state open --search "\"${issue_title}\" in:title" --json number,title --jq ".[] | select(.title == \"${issue_title}\") | .number" | head -n 1)"
+
+          if [[ "${SHARD_RESULT}" != "success" ]]; then
+            message="Planted shard ${SHARD}/7 failed: ${run_url}"
+            if [[ -n "${issue_number}" ]]; then
+              gh issue comment "${issue_number}" --body "${message}"
+            else
+              gh issue create --title "${issue_title}" --body "${message}"
+            fi
+          elif [[ -n "${issue_number}" ]]; then
+            gh issue comment "${issue_number}" --body "Planted shard ${SHARD}/7 recovered: ${run_url}"
+            gh issue close "${issue_number}" --reason completed
+          fi
 
   # The scheduler switches coroutine stacks in unsafe code, so its tests also
   # run in release mode and under AddressSanitizer on Linux x86_64. Each mode
@@ -822,7 +788,6 @@ jobs:
       - check-no-git-dependencies
       - publish-graph
       - sim-build
-      - sim-planted-plan
       - sim-sanitizers
       - sim-feedback
       - sim-targets
@@ -839,12 +804,12 @@ jobs:
           # cascade-skip with build-tests), pruned-storage is push-main only,
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check, and
-          # sim-build, sim-planted-plan, sim-sanitizers, sim-feedback and sim-targets run only on the nightly
+          # sim-build, sim-sanitizers, sim-feedback and sim-targets run only on the nightly
           # schedule and manual dispatch, so a nightly failure still fails
-          # this status and reaches report-nightly-result. The sim-planted
-          # shards report to their own issues (report-planted-shards).
+          # this status and reaches report-nightly-result. sim-planted
+          # reports to one failure issue per shard instead.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-planted-plan, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph, sim-build, sim-sanitizers, sim-feedback, sim-targets, zakura-testkit
 
   report-nightly-result:
     name: report nightly release test result

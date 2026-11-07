@@ -541,21 +541,17 @@ only from a target with a collector.
 ## Long runs
 
 The nightly CI jobs smoke the simulator's long checks. `sim-fuzz.yml` fuzzes
-each target for two minutes. `tests-unit.yml` splits `qa/planted/` into seven
-shards in path order, with one `zakura_sim planted shard <index>/7` job each.
-Each night, the shard that the UTC weekday picks runs in full, with
-`cargo xtask planted --shard <index>/7`, so each case runs once a week. Every
-other shard runs only its cases that changed since the previous nightly's
-commit, with `--cases-changed-since`, so a new or changed case runs within a
-night. If GitHub doesn't name the previous nightly's commit, the jobs use main
-as of a week before. A case's shard follows from its position in path order,
-so adding or removing a case moves every later case to another shard. The
-change filter keeps those moved cases too, so they run on the night of the
-move. Each shard has its own failure issue,
-`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing full
-run of that shard closes it (`scripts/planted-nightly.py`). A remote host runs
-the rest, including `cargo xtask planted --targets`, and its results never
-block a pull request. No CI job runs `planted --targets`.
+each target for two minutes. The `zakura_sim planted` job in `tests-unit.yml`
+runs one of seven shards of `qa/planted/`, picked by the UTC weekday, with
+`cargo xtask planted --shard <index>/7`, so each case runs once a week. A
+case's shard follows from its position in path order. Adding or removing a
+case moves every later case to another shard, so across that change a case
+can run on two nights in a row or wait up to 13 nights. A shard that holds no
+case fails the run. Each shard has its own failure issue,
+`[nightly] zakura_sim planted shard <index>/7 failed`, and only a passing run
+of that shard closes it, so a pass of another shard can't close it. A remote
+host runs the rest, including `cargo xtask planted --targets`, and its results
+never block a pull request. No CI job runs `planted --targets`.
 
 `scripts/sim-long-runs.sh` runs them from a checkout on that host. Each run
 writes under its own directory, `<out>/<UTC time>-<commit>/`. It runs

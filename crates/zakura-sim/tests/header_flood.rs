@@ -252,8 +252,8 @@ fn flooded(action: ControlAction) -> StorageScenario {
 const FLOODERS: usize = 16;
 
 /// A `Commit` step publishes a new state in the node's engine, and the
-/// reactor adopts it through its watches after the `Published` fact, never
-/// before it.
+/// reactor reads it from its committed watch and adopts it after the
+/// `Published` fact, never before it.
 #[test]
 fn a_node_side_commit_is_adopted_after_its_publication() {
     let scenario = scenario(vec![step("node", ControlAction::Commit { len: 2 })]);
@@ -275,7 +275,13 @@ fn a_node_side_commit_is_adopted_after_its_publication() {
             matches!(fact, AdoptionFact::Adopted(adoption)
                 if adoption.state_version >= version)
         };
+        let read = |fact: &AdoptionFact| {
+            matches!(fact, AdoptionFact::WatchObserved { state_version }
+                if *state_version >= version)
+        };
         assert!(!facts[..published].iter().any(adopted), "{facts:?}");
+        assert!(!facts[..published].iter().any(read), "{facts:?}");
+        assert!(facts[published..].iter().any(read), "{facts:?}");
         let adoption = facts[published..]
             .iter()
             .find_map(|fact| match fact {

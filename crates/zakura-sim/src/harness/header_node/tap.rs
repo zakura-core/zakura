@@ -533,8 +533,8 @@ impl TapState {
                     .observe(&event, now);
             }
         }
-        // Budget changes, credit, causes, headroom waits, deferred passes and
-        // taken events stay out of the log, whose format pinned Plans fix, and a
+        // Budget changes, credit, causes, headroom waits, deferred passes,
+        // taken events and watch reads stay out of the log, whose format pinned Plans fix, and a
         // teardown's returns after the run are expected.
         if matches!(
             event,
@@ -544,6 +544,7 @@ impl TapState {
                 | ReactorEvent::HeadroomWait { .. }
                 | ReactorEvent::CachedPassDeferred { .. }
                 | ReactorEvent::EventTaken { .. }
+                | ReactorEvent::WatchObserved { .. }
         ) {
             if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
                 state

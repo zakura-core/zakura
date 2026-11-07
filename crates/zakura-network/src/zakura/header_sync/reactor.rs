@@ -524,6 +524,12 @@ impl HeaderSyncReactor {
                     Some(Ok(())) => {
                         let snapshot = snapshots.borrow_and_update().clone();
                         if let Some(snapshot) = snapshot {
+                            observe!(
+                                self,
+                                ReactorEvent::WatchObserved {
+                                    state_version: snapshot.state_version,
+                                }
+                            );
                             caused!(
                                 self,
                                 ReactorCause::Watch,
@@ -643,6 +649,12 @@ impl HeaderSyncReactor {
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone())
                         {
+                            observe!(
+                                self,
+                                ReactorEvent::WatchObserved {
+                                    state_version: snapshot.state_version,
+                                }
+                            );
                             caused!(
                                 self,
                                 ReactorCause::Watch,

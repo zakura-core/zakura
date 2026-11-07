@@ -20,7 +20,7 @@ use std::{
 };
 
 use zakura_chain::{block, work::difficulty::U256};
-use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion};
+use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion, VerifiedGeneration};
 use zakura_network::zakura::{
     observe::{EventQueue, ReactorCause, ReactorEvent, TakePoint},
     Status, ZakuraPeerId,
@@ -54,6 +54,10 @@ pub struct Adoption {
     pub suffix_work: U256,
     /// The lowest retained height.
     pub oldest_retained: block::Height,
+    /// The generation new repair work captures.
+    pub verified_generation: VerifiedGeneration,
+    /// The verified body tip.
+    pub verified_best: Frontier,
 }
 
 impl Adoption {
@@ -139,6 +143,12 @@ pub enum AdoptionFact {
         /// The events left in the queue.
         queued: usize,
     },
+    /// `WatchObserved`: the run loop read committed snapshot
+    /// `state_version` from its committed watch.
+    WatchObserved {
+        /// The read snapshot's state version.
+        state_version: StateVersion,
+    },
     /// The reactor reached its turn's cached pass: a `CauseSet` to `Pass`,
     /// once per turn of its run loop.
     Pass,
@@ -156,6 +166,8 @@ impl AdoptionFact {
                 header_best,
                 suffix_work,
                 oldest_retained,
+                verified_generation,
+                verified_best,
             } => AdoptionFact::Adopted(Adoption {
                 state_version: *state_version,
                 header_generation: *header_generation,
@@ -163,6 +175,8 @@ impl AdoptionFact {
                 header_best: *header_best,
                 suffix_work: *suffix_work,
                 oldest_retained: *oldest_retained,
+                verified_generation: *verified_generation,
+                verified_best: *verified_best,
             }),
             ReactorEvent::StatusQueued {
                 peer,
@@ -200,10 +214,13 @@ impl AdoptionFact {
         })
     }
 
-    /// The turn fact `event` gives this store, if any: an `EventTaken`, or
-    /// a `CauseSet` to `Pass`. Both stay out of the log.
+    /// The turn fact `event` gives this store, if any: an `EventTaken`, a
+    /// `WatchObserved`, or a `CauseSet` to `Pass`. All stay out of the log.
     pub(super) fn of_turn(event: &ReactorEvent) -> Option<Self> {
         match event {
+            ReactorEvent::WatchObserved { state_version } => Some(AdoptionFact::WatchObserved {
+                state_version: *state_version,
+            }),
             ReactorEvent::EventTaken {
                 queue,
                 point,
@@ -625,6 +642,8 @@ mod tests {
             header_best: tip(height),
             suffix_work: U256::from(height),
             oldest_retained: anchor.height,
+            verified_generation: VerifiedGeneration::new(generation),
+            verified_best: anchor,
         }
     }
 

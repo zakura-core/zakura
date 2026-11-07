@@ -42,7 +42,7 @@ use zakura_sim::{
         wire_plans::{progress_scenario, SavedPlan},
         HarnessEntry, HarnessError, LinkEntry, LinkSpec, RecordInput, Subsystem,
     },
-    observe::{StorageFact, StorageResult, TransportFact},
+    observe::{Entry, StorageFact, StorageResult, TransportFact},
     peer::{
         honest::{CreditSpec, GrantPolicy, SubscribeSpec},
         PeerAction, PeerSpec, NODE_ADDR,
@@ -50,7 +50,7 @@ use zakura_sim::{
     record::RecordSink,
     trace::{replay_with, ReplayOptions, TraceReader},
     witness::{check_witness, Expect, WitnessScenario},
-    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, PropertyReport, RunReport,
 };
 
 /// The environment variable that tells the fresh-process replay test it
@@ -347,30 +347,48 @@ fn view_evidence(ports: &WirePorts) -> String {
     format!("{:?}\n{:?}\n", ports.sessions.facts(), adoption(ports))
 }
 
-/// A run's evidence depends only on its scenario and Plan. The progress
-/// witness twice in a row, then the leaving peer's, then each again, gives
-/// each witness's log, property reports and view-side evidence every time.
-/// The two witnesses' logs differ, so the comparison can fail.
+/// Everything a run of `scenario` under `plan` leaves: every trace record
+/// it writes, `init`, each step and `end` with its cleanup, as JSON lines,
+/// its observation log, its property reports with every violation, and its
+/// view-side evidence ([`view_evidence`]).
+fn run_evidence(
+    scenario: &WireScenario,
+    plan: PlanInput,
+) -> (Vec<String>, Vec<Entry>, Vec<PropertyReport>, String) {
+    let ports = HeaderWire::prepare(scenario);
+    let mut sink = MemorySink::default();
+    let report = run_prepared::<HeaderWire>(scenario, ports.clone(), plan, &mut sink, None)
+        .unwrap_or_else(|error| panic!("{error}"));
+    (
+        sink.lines(),
+        report.log.entries().to_vec(),
+        report.properties,
+        view_evidence(&ports),
+    )
+}
+
+/// A run's evidence depends only on its scenario and Plan
+/// ([`run_evidence`]). Each witness, the progress fixture's and the leaving
+/// peer's, gives the same evidence twice in a row, and again after the
+/// other witness ran. The two witnesses' traces differ, so the comparison
+/// can fail.
 #[test]
 fn the_progress_witnesses_repeat_a_a_and_a_b_a() {
-    let progress = || (progress_scenario(), committed_plan());
-    let leaving = || (leaving_scenario(), Plan::from_fuzz(&[]));
-    let mut evidence = Vec::new();
-    for (scenario, plan) in [progress(), progress(), leaving(), progress(), leaving()] {
-        let (report, ports) = run(&scenario, plan);
-        evidence.push((
-            report.log.entries().to_vec(),
-            report.properties,
-            view_evidence(&ports),
-        ));
-    }
-    assert!(evidence[0].2.contains("Height(51)"), "{}", evidence[0].2);
-    assert_eq!(evidence[0], evidence[1], "the progress witness, then again");
-    assert_eq!(evidence[0], evidence[3], "then after the leaving peer's");
-    assert_eq!(
-        evidence[2], evidence[4],
-        "the leaving peer's, after the progress witness"
-    );
+    let progress = || run_evidence(&progress_scenario(), committed_plan());
+    let leaving = || run_evidence(&leaving_scenario(), Plan::from_fuzz(&[]));
+    let evidence = [
+        progress(),
+        progress(),
+        leaving(),
+        leaving(),
+        progress(),
+        leaving(),
+    ];
+    assert!(evidence[0].3.contains("Height(51)"), "{}", evidence[0].3);
+    assert_eq!(evidence[0], evidence[1], "the progress witness, A/A");
+    assert_eq!(evidence[2], evidence[3], "the leaving peer's, A/A");
+    assert_eq!(evidence[0], evidence[4], "the progress witness, A/B/A");
+    assert_eq!(evidence[2], evidence[5], "the leaving peer's, A/B/A");
     assert_ne!(evidence[0].0, evidence[2].0, "the witnesses differ");
 }
 

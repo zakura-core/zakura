@@ -516,6 +516,131 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for #2100. A listener drops a dialer whose header request
+    /// times out, which starts the dialer's readmission cooldown. The drop
+    /// closes the connection, since the subscription was open, and the
+    /// dialer redials inside the cooldown. Header sync is initiator-only, so
+    /// only the dialer may open a header session there, and it keeps
+    /// re-offering one. The listener parks each offer inside the cooldown and
+    /// admits the first one after it ends, on that same connection.
+    ///
+    /// The listener has no other header session, so before the fix nothing
+    /// republished the cooldown's end until a fallback maintenance tick up to
+    /// a minute later, and every re-offer in between was parked.
+    #[tokio::test]
+    async fn a_dropped_header_peer_is_readmitted_on_its_parked_connection_after_the_cooldown(
+    ) -> Result<(), BoxError> {
+        use crate::zakura::{SessionStep, TransportEvent, TransportObserver};
+
+        const COOLDOWN: Duration = Duration::from_secs(3);
+        // The dialer's re-offer backoff is capped at 8 s, so its first
+        // re-offer after the cooldown comes within that, plus slack.
+        const READMIT_WITHIN: Duration = Duration::from_secs(12);
+
+        /// The listener's header-sync session steps, with their connections,
+        /// in order.
+        #[derive(Debug, Default)]
+        struct HeaderSteps(StdMutex<Vec<(ZakuraConnId, SessionStep)>>);
+        impl TransportObserver for HeaderSteps {
+            /// Records each header-sync session step.
+            fn observe(&self, event: TransportEvent) {
+                if let TransportEvent::SessionLifecycle {
+                    conn_id,
+                    kind: ZAKURA_STREAM_HEADER_SYNC,
+                    step,
+                } = event
+                {
+                    self.0
+                        .lock()
+                        .expect("no test panics while holding it")
+                        .push((conn_id, step));
+                }
+            }
+        }
+
+        // The dialer advertises its tip but serves no page: its port grants
+        // no reads.
+        let dialer_port = FakePort::new(0);
+        let dialer_tip = *dialer_port.grow(16).last().expect("the dialer grows a chain");
+        let (dialer, _dialer_actions) = spawn_header_publisher(82, dialer_port, dialer_tip).await?;
+
+        let network = Network::new_regtest(Default::default());
+        let anchor = (block::Height(0), network.genesis_hash());
+        let steps = Arc::new(HeaderSteps::default());
+        let listener = ZakuraTestNode::builder(83)
+            .header_sync_driver(
+                network,
+                anchor,
+                FullStateFrontiers {
+                    finalized_height: anchor.0,
+                    verified_block_tip: anchor.0,
+                    verified_block_hash: anchor.1,
+                },
+                Some(anchor),
+            )
+            .header_sync_port(FakePort::new(64))
+            .header_sync_config(crate::zakura::ZakuraHeaderSyncConfig {
+                max_unproductive_header_requests: 1,
+                unproductive_peer_cooldown: COOLDOWN,
+                ..Default::default()
+            })
+            .header_sync_request_timeout(Duration::from_millis(500))
+            .transport_observer(steps.clone())
+            .spawn()
+            .await?;
+        let mut actions = listener
+            .take_header_sync_actions()
+            .await
+            .expect("the external header driver is enabled");
+        let header_sync = listener
+            .header_sync()
+            .expect("the header service is enabled");
+        let inbound = || header_sync.peer_snapshot().inbound_peers;
+        let dialer_id = peer_id_of(&dialer).await?;
+
+        dialer.connect_native(&listener, Duration::from_secs(5)).await?;
+        answer_locator(&listener, &mut actions, dialer_tip.hash).await?;
+        let dropped = loop {
+            let action = tokio::time::timeout(Duration::from_secs(20), actions.recv())
+                .await
+                .map_err(|_| -> BoxError { "timed out waiting for the drop".into() })?
+                .ok_or("header action channel closed")?;
+            if let HeaderSyncAction::DropPeer { peer, .. } = action {
+                assert_eq!(peer, dialer_id);
+                break std::time::Instant::now();
+            }
+        };
+        let steps_at_drop = steps.0.lock().expect("no test panics while holding it").len();
+        // The cooldown started before `dropped`, so leave a margin before
+        // its end.
+        while dropped.elapsed() < COOLDOWN - Duration::from_millis(300) {
+            assert_eq!(inbound(), 0, "the dialer is readmitted inside its cooldown");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        await_until(
+            "the listener readmits the dialer's re-offer after the cooldown",
+            READMIT_WITHIN,
+            || inbound() == 1,
+        )
+        .await?;
+
+        let steps = steps.0.lock().expect("no test panics while holding it")[steps_at_drop..].to_vec();
+        let installed = steps
+            .iter()
+            .position(|(_, step)| matches!(step, SessionStep::GenerationInstalled { .. }))
+            .expect("the listener installed the readmitted session");
+        let readmitted_on = steps[installed].0;
+        assert!(
+            steps[..installed].iter().any(|(conn, step)| *conn == readmitted_on
+                && matches!(step, SessionStep::GenerationParked { .. })),
+            "the listener parked an offer on the readmitting connection first: {steps:?}"
+        );
+
+        dialer.shutdown().await;
+        listener.shutdown().await;
+        Ok(())
+    }
+
     /// The peer ID other nodes see for `node`.
     async fn peer_id_of(node: &ZakuraTestNode) -> Result<ZakuraPeerId, BoxError> {
         Ok(ZakuraPeerId::new(

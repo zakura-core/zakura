@@ -73,7 +73,8 @@ use crate::{
         BlockSyncFact, BlockSyncHolder, BlockSyncPayload, BlockSyncRetained, StorageFact, WorkOwner,
     },
     property::{
-        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status, Unit, Verdict,
+        CheckCtx, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
+        TriggerHistory, Unit, Verdict,
     },
     Observation, ObservationLog,
 };
@@ -1018,7 +1019,7 @@ where
             needs: &[Source::View],
             status: Status::Active,
             check: check_payload_inventory::<S>,
-            witness: Some(payload_retained),
+            witness: Some(TriggerHistory::Log(payload_retained)),
         },
         bound::<S, RetainedBound>(),
         bound::<S, ReservedBound>(),
@@ -1031,7 +1032,7 @@ where
             needs: &[Source::View, Source::Schedule],
             status: Status::Active,
             check: check_ledgers::<S>,
-            witness: Some(body_handed_off),
+            witness: Some(TriggerHistory::Log(body_handed_off)),
         },
         bound::<S, LookaheadBound>(),
         Property {
@@ -1043,7 +1044,7 @@ where
             needs: &[Source::View, Source::Schedule],
             status: Status::Active,
             check: check_teardown::<S>,
-            witness: Some(routine_ended_owing),
+            witness: Some(TriggerHistory::Log(routine_ended_owing)),
         },
     ]
 }

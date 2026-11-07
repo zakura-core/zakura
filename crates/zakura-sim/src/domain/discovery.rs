@@ -11,7 +11,9 @@ use zakura_scheduler::Status as SchedulerStatus;
 use crate::{
     harness::discovery::{CapacityEvidence, VERIFICATION_READERS, VERIFICATION_SLOTS},
     observe::Entry,
-    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Verdict},
+    property::{
+        CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Verdict,
+    },
     Observation, ObservationLog, Violation,
 };
 
@@ -53,7 +55,9 @@ pub fn verification_capacity<S: HasView<View = VerificationView>>() -> Property<
         status: Status::Active,
         check: check_verification_capacity::<S>,
         // A violation ends the run as soon as one worker exceeds the slots.
-        witness: Some(|log| started_workers(log) > VERIFICATION_SLOTS),
+        witness: Some(TriggerHistory::Log(|log| {
+            started_workers(log) > VERIFICATION_SLOTS
+        })),
     }
 }
 
@@ -117,7 +121,7 @@ pub fn wait_complete_wakes<S: HasView>() -> Property<S> {
         needs: &[Source::Schedule],
         status: Status::Active,
         check: check_wait_complete_wakes::<S>,
-        witness: Some(final_mark_raced_the_wait),
+        witness: Some(TriggerHistory::Log(final_mark_raced_the_wait)),
     }
 }
 

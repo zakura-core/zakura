@@ -8,7 +8,10 @@
 //! [`Reading`] variant says how the check judges it.
 
 use crate::{
-    property::{CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, Unit, Verdict},
+    property::{
+        CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Unit,
+        Verdict,
+    },
     ObservationLog,
 };
 
@@ -72,7 +75,7 @@ pub fn bound<S: HasView, B: Bound<S>>() -> Property<S> {
         needs: B::NEEDS,
         status: Status::Active,
         check: check::<S, B>,
-        witness: Some(B::WITNESS),
+        witness: Some(TriggerHistory::Log(B::WITNESS)),
     }
 }
 
@@ -170,7 +173,7 @@ mod tests {
             status: SchedulerStatus::Quiescent,
             log: &log,
         };
-        let mut cx = CheckCtx::new(&step, &harness, &registered[0], &registered);
+        let mut cx = CheckCtx::new(&step, &harness, (&registered[0], &registered), None);
         let verdict = (registered[0].check)(&mut cx);
         let parts = cx.into_parts();
         Judged {

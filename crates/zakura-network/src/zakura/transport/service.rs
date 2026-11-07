@@ -760,6 +760,11 @@ pub trait RequestResponseService: Service {
     /// is the peer's negotiated full-message cap. Responders must size outbound
     /// frame payloads against the smaller of the two so the peer never receives
     /// a frame larger than its accepted message cap.
+    ///
+    /// The future must return every [`SinkReject::Protocol`] before its first
+    /// `Pending`. The request worker drops a call whose requester stopped the
+    /// response stream, and it sees the stop only after the call is pending,
+    /// so a later protocol rejection would go unreported.
     fn request_frame<'a>(
         &'a self,
         peer_id: ZakuraPeerId,
@@ -769,6 +774,19 @@ pub trait RequestResponseService: Service {
         max_message_bytes: u32,
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>>;
+
+    /// Runs the protocol checks `request_frame` runs on `frame`, without its
+    /// work, and returns the same [`SinkReject::Protocol`] for a frame that
+    /// breaks the protocol.
+    ///
+    /// The request worker calls this when the requester stops the response
+    /// stream before `request_frame` is polled, so a stop never hides a
+    /// protocol fault. It must not start backend work or allocate a response.
+    /// A service whose `request_frame` can return `SinkReject::Protocol` must
+    /// override it with the same checks. The default accepts every frame.
+    fn check_request(&self, _stream_kind: u16, _frame: &Frame) -> Result<(), SinkReject> {
+        Ok(())
+    }
 }
 
 /// A per-stream reader owned by a service.

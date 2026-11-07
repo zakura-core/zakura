@@ -29,6 +29,10 @@ const TABLE: JsonlTraceTable = zakura_jsonl_trace::tables::LEGACY_PEER_REQUEST;
 pub(super) struct LegacyPeerTrace {
     emitter: JsonlEventEmitter,
     next_request_id: Arc<AtomicU64>,
+    /// Whether the tracer writes this table's request rows.
+    writes_requests: bool,
+    /// Whether the tracer writes a table that records request IDs: this one or `p2p_request`.
+    numbers_requests: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -127,15 +131,27 @@ enum BlockRequestResult<'a> {
 
 impl LegacyPeerTrace {
     pub(super) fn new(tracer: JsonlTracer) -> Self {
+        let writes_requests = tracer.is_table_enabled(TABLE.table());
+        let numbers_requests = writes_requests
+            || tracer.is_table_enabled(zakura_jsonl_trace::tables::P2P_REQUEST.table());
         Self {
             emitter: JsonlEventEmitter::new(tracer, zakura_jsonl_trace::node_id()),
             next_request_id: Arc::new(AtomicU64::new(1)),
+            writes_requests,
+            numbers_requests,
         }
     }
 
-    pub(super) fn next_request_id(&self) -> u64 {
+    /// Returns a new request ID, or `None` when no written table records request IDs.
+    pub(super) fn next_request_id(&self) -> Option<u64> {
         // Wrap-around is unreachable for a process-local u64 counter.
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        self.numbers_requests
+            .then(|| self.next_request_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Returns whether the tracer writes this table's request rows.
+    pub(super) fn writes_requests(&self) -> bool {
+        self.writes_requests
     }
 
     pub(super) fn find_blocks_finish(
@@ -301,6 +317,13 @@ mod tests {
         block::Hash([byte; 32])
     }
 
+    #[test]
+    fn an_untraced_peer_set_numbers_no_requests() {
+        let trace = LegacyPeerTrace::new(JsonlTracer::noop());
+        assert_eq!(trace.next_request_id(), None);
+        assert!(!trace.writes_requests());
+    }
+
     #[tokio::test]
     async fn writes_attributed_find_blocks_and_notfound_events() {
         let dir = tempfile::tempdir().expect("temporary trace directory");
@@ -308,6 +331,8 @@ mod tests {
         let trace = LegacyPeerTrace {
             emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
             next_request_id: Arc::new(AtomicU64::new(1)),
+            writes_requests: true,
+            numbers_requests: true,
         };
         let peer = PeerTraceContext {
             peer_id: 7,
@@ -362,6 +387,8 @@ mod tests {
         let trace = LegacyPeerTrace {
             emitter: JsonlEventEmitter::new(guard.tracer(), "test-node"),
             next_request_id: Arc::new(AtomicU64::new(1)),
+            writes_requests: true,
+            numbers_requests: true,
         };
         let peer = PeerTraceContext {
             peer_id: 7,

@@ -1104,21 +1104,27 @@ where
                 .expect("selected peer must be ready");
 
             let request_id = self.legacy_peer_trace.next_request_id();
-            // The selected peer was removed from the ready list above.
-            svc.connection_trace().dispatched(
-                request_id,
-                &req,
-                "p2c",
-                self.ready_services.len() + 1,
-            );
-            let find_blocks_trace = match &req {
-                Request::FindBlocks { known_blocks, stop } => Some((
+            if let Some(request_id) = request_id {
+                // The selected peer was removed from the ready list above.
+                svc.connection_trace().dispatched(
                     request_id,
-                    self.legacy_peer_trace_context(p2c_key, &svc),
-                    known_blocks.first().copied(),
-                    *stop,
-                    Instant::now(),
-                )),
+                    &req,
+                    "p2c",
+                    self.ready_services.len() + 1,
+                );
+            }
+            let find_blocks_trace = match (&req, request_id) {
+                (Request::FindBlocks { known_blocks, stop }, Some(request_id))
+                    if self.legacy_peer_trace.writes_requests() =>
+                {
+                    Some((
+                        request_id,
+                        self.legacy_peer_trace_context(p2c_key, &svc),
+                        known_blocks.first().copied(),
+                        *stop,
+                        Instant::now(),
+                    ))
+                }
                 _ => None,
             };
 
@@ -1214,19 +1220,25 @@ where
             );
             metrics::counter!("pool.route_inv.advertiser.count").increment(1);
             let request_id = self.legacy_peer_trace.next_request_id();
-            svc.connection_trace().dispatched(
-                request_id,
-                &req,
-                "advertised",
-                advertising_peer_list.len(),
-            );
-            let trace_context = match hash {
-                InventoryHash::Block(hash) => Some((
+            if let Some(request_id) = request_id {
+                svc.connection_trace().dispatched(
                     request_id,
-                    self.legacy_peer_trace_context(peer, &svc),
-                    hash,
-                    Instant::now(),
-                )),
+                    &req,
+                    "advertised",
+                    advertising_peer_list.len(),
+                );
+            }
+            let trace_context = match (hash, request_id) {
+                (InventoryHash::Block(hash), Some(request_id))
+                    if self.legacy_peer_trace.writes_requests() =>
+                {
+                    Some((
+                        request_id,
+                        self.legacy_peer_trace_context(peer, &svc),
+                        hash,
+                        Instant::now(),
+                    ))
+                }
                 _ => None,
             };
             let fut = svc.call(req);
@@ -1290,15 +1302,21 @@ where
             );
             metrics::counter!("pool.route_inv.maybe.count").increment(1);
             let request_id = self.legacy_peer_trace.next_request_id();
-            svc.connection_trace()
-                .dispatched(request_id, &req, "maybe", maybe_peer_list.len());
-            let trace_context = match hash {
-                InventoryHash::Block(hash) => Some((
-                    request_id,
-                    self.legacy_peer_trace_context(peer, &svc),
-                    hash,
-                    Instant::now(),
-                )),
+            if let Some(request_id) = request_id {
+                svc.connection_trace()
+                    .dispatched(request_id, &req, "maybe", maybe_peer_list.len());
+            }
+            let trace_context = match (hash, request_id) {
+                (InventoryHash::Block(hash), Some(request_id))
+                    if self.legacy_peer_trace.writes_requests() =>
+                {
+                    Some((
+                        request_id,
+                        self.legacy_peer_trace_context(peer, &svc),
+                        hash,
+                        Instant::now(),
+                    ))
+                }
                 _ => None,
             };
             let fut = svc.call(req);

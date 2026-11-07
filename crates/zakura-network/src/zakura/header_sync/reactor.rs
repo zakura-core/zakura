@@ -43,7 +43,7 @@ mod state;
 pub use super::scheduler::peer_work::StorageCallKind;
 
 #[cfg(any(test, zakura_sim))]
-use super::observe::{self, ReactorEvent};
+use super::observe::{self, ReactorCause, ReactorEvent};
 use state::{
     repair_candidates, vct_error_retry, CloseAttempt, LocalOperationExpiry, LocatorDisposition,
     LocatorKey, LocatorProposal, ReactorState, RepairCandidate, RepairStallDue,
@@ -71,6 +71,27 @@ macro_rules! observe {
 #[cfg(not(any(test, zakura_sim)))]
 macro_rules! observe {
     ($reactor:expr, $event:expr) => {};
+}
+
+/// Evaluates `$body` as the reactor's unit of work `$cause`: reports
+/// `$cause` as the body starts and the cause before it as the body ends,
+/// through [`HeaderSyncReactor::set_cause`]. The body must not leave early.
+#[cfg(any(test, zakura_sim))]
+macro_rules! caused {
+    ($reactor:expr, $cause:expr, $body:expr) => {{
+        let outer = $reactor.set_cause($cause);
+        let result = $body;
+        $reactor.set_cause(outer);
+        result
+    }};
+}
+
+/// Evaluates `$body` alone: release builds don't record causes.
+#[cfg(not(any(test, zakura_sim)))]
+macro_rules! caused {
+    ($reactor:expr, $cause:expr, $body:expr) => {
+        $body
+    };
 }
 
 mod dispatch;
@@ -243,6 +264,12 @@ fn build_header_sync_reactor(
             startup.config.node_serve_output_bytes,
         ),
         page_limits,
+        #[cfg(any(test, zakura_sim))]
+        credit_observer: startup
+            .observer
+            .0
+            .as_ref()
+            .and_then(|observer| observer.capacity_observer()),
     };
     let header_bytes = header_sync_header_bytes_for_network(&startup.network);
     let mut reactor = HeaderSyncReactor {
@@ -266,25 +293,29 @@ fn build_header_sync_reactor(
         state: ReactorState::new(Instant::now()),
         peer_work_queue: PeerWorkQueue::default(),
         last_snapshot_refresh_trace_at: Cell::new(None),
+        #[cfg(any(test, zakura_sim))]
+        cause: ReactorCause::Idle,
     };
     #[cfg(any(test, zakura_sim))]
     reactor
         .peer_work_queue
         .observed_by(&reactor.startup.observer);
-    if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
-        observe!(reactor, ReactorEvent::adopted(snapshot));
-        reactor.emit_snapshot_observed(None, snapshot);
-    }
-    // The returned handle holds the watch's only receiver, so it sees this value.
-    observe!(
-        reactor,
-        ReactorEvent::TipPublished {
-            height: initial_tip.0,
-            hash: initial_tip.1,
-            delivered: true,
+    caused!(reactor, ReactorCause::Startup, {
+        if let Some(snapshot) = reactor.committed_snapshot.as_ref() {
+            observe!(reactor, ReactorEvent::adopted(snapshot));
+            reactor.emit_snapshot_observed(None, snapshot);
         }
-    );
-    reactor.schedule_current_vct_repair();
+        // The returned handle holds the watch's only receiver, so it sees this value.
+        observe!(
+            reactor,
+            ReactorEvent::TipPublished {
+                height: initial_tip.0,
+                hash: initial_tip.1,
+                delivered: true,
+            }
+        );
+        reactor.schedule_current_vct_repair();
+    });
     Ok((handle, actions_rx, reactor))
 }
 
@@ -325,6 +356,9 @@ struct HeaderSyncReactor {
     state: ReactorState,
     peer_work_queue: PeerWorkQueue,
     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
+    /// The unit of work the reactor is in, as `caused!` sets it.
+    #[cfg(any(test, zakura_sim))]
+    cause: ReactorCause,
 }
 
 /// Why an active header request was retired.
@@ -488,7 +522,11 @@ impl HeaderSyncReactor {
                     Some(Ok(())) => {
                         let snapshot = snapshots.borrow_and_update().clone();
                         if let Some(snapshot) = snapshot {
-                            self.observe_latest_committed_snapshot(snapshot);
+                            caused!(
+                                self,
+                                ReactorCause::Watch,
+                                self.observe_latest_committed_snapshot(snapshot)
+                            );
                         }
                     }
                     Some(Err(_)) => committed_snapshots = None,
@@ -499,7 +537,11 @@ impl HeaderSyncReactor {
                 match repairs.changed().now_or_never() {
                     Some(Ok(())) => {
                         let status = *repairs.borrow_and_update();
-                        self.observe_vct_root_repair(status);
+                        caused!(
+                            self,
+                            ReactorCause::Watch,
+                            self.observe_vct_root_repair(status)
+                        );
                     }
                     Some(Err(_)) => vct_root_repairs = None,
                     None => {}
@@ -509,11 +551,11 @@ impl HeaderSyncReactor {
             // Session readers wait for connection acknowledgement before publishing peer events.
             let mut handled_event = false;
             if let Ok(event) = self.lifecycle.try_recv() {
-                self.handle_lifecycle(event);
+                caused!(self, ReactorCause::Event, self.handle_lifecycle(event));
                 handled_event = true;
             }
             if let Ok(event) = self.events.try_recv() {
-                self.handle_event(event);
+                caused!(self, ReactorCause::Event, self.handle_event(event));
                 handled_event = true;
             }
             let maintenance = self.next_maintenance_deadline();
@@ -534,17 +576,21 @@ impl HeaderSyncReactor {
                     }
                 }
                 permit = locator_capacity.acquire_owned(), if self.locator_capacity_waiting => {
-                    drop(permit.expect("the locator semaphore is never closed"));
-                    self.locator_capacity_waiting = false;
+                    caused!(self, ReactorCause::Capacity, {
+                        drop(permit.expect("the locator semaphore is never closed"));
+                        self.locator_capacity_waiting = false;
+                    });
                 },
                 _ = capacity_releases.changed() => {},
-                _ = time::sleep_until(maintenance) => self.refresh_statuses(),
+                _ = time::sleep_until(maintenance) => {
+                    caused!(self, ReactorCause::Maintenance, self.refresh_statuses());
+                },
                 event = self.lifecycle.recv() => match event {
-                    Some(event) => self.handle_lifecycle(event),
+                    Some(event) => caused!(self, ReactorCause::Event, self.handle_lifecycle(event)),
                     None => break HeaderRequestTerminal::Shutdown,
                 },
                 event = self.events.recv() => match event {
-                    Some(event) => self.handle_event(event),
+                    Some(event) => caused!(self, ReactorCause::Event, self.handle_event(event)),
                     None => break HeaderRequestTerminal::Shutdown,
                 },
                 _ = zakura_rt::task::yield_now(), if handled_event => {},
@@ -559,7 +605,11 @@ impl HeaderSyncReactor {
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone())
                         {
-                            self.observe_latest_committed_snapshot(snapshot);
+                            caused!(
+                                self,
+                                ReactorCause::Watch,
+                                self.observe_latest_committed_snapshot(snapshot)
+                            );
                         }
                     } else {
                         committed_snapshots = None;
@@ -575,16 +625,33 @@ impl HeaderSyncReactor {
                         if let Some(status) =
                             vct_root_repairs.as_ref().map(|repairs| *repairs.borrow())
                         {
-                            self.observe_vct_root_repair(status);
+                            caused!(
+                                self,
+                                ReactorCause::Watch,
+                                self.observe_vct_root_repair(status)
+                            );
                         }
                     } else {
                         vct_root_repairs = None;
                     }
                 }
             }
-            self.schedule_cached_statuses();
+            caused!(self, ReactorCause::Pass, self.schedule_cached_statuses());
         };
-        self.retire_all_peer_work(terminal_outcome);
+        caused!(
+            self,
+            ReactorCause::Shutdown,
+            self.retire_all_peer_work(terminal_outcome)
+        );
+    }
+
+    /// Makes `cause` the reactor's unit of work, reports it, and returns the
+    /// one before. Only `caused!` calls it.
+    #[cfg(any(test, zakura_sim))]
+    fn set_cause(&mut self, cause: ReactorCause) -> ReactorCause {
+        let outer = std::mem::replace(&mut self.cause, cause);
+        observe!(self, ReactorEvent::CauseSet { cause });
+        outer
     }
 
     /// Acknowledge admission only after the reactor has installed or refused the session.
@@ -695,17 +762,25 @@ impl HeaderSyncReactor {
             metrics::counter!("sync.header.port.unknown_settlement").increment(1);
             return;
         }
-        match outcome {
-            StorageOutcome::Completed {
-                completion,
-                retained,
-                ..
-            } => self.handle_storage_completion(*completion, retained),
-            StorageOutcome::Panicked(context) => self.handle_port_panic(*context),
-        }
+        caused!(
+            self,
+            ReactorCause::Completion { call: call.number },
+            match outcome {
+                StorageOutcome::Completed {
+                    completion,
+                    retained,
+                    ..
+                } => self.handle_storage_completion(*completion, retained),
+                StorageOutcome::Panicked(context) => self.handle_port_panic(*context),
+            }
+        );
         // Apply publishes its snapshot before completing. Observe it before another
         // event can reserve the capacity that this completion released.
-        self.refresh_committed_snapshot();
+        caused!(
+            self,
+            ReactorCause::Refresh { call: call.number },
+            self.refresh_committed_snapshot()
+        );
         #[cfg(any(test, zakura_sim))]
         observe!(
             self,

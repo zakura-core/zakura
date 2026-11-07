@@ -229,10 +229,12 @@ impl CandidateDialerState {
     /// `now`, before the supervisor's per-IP check.
     ///
     /// The endpoint starts one handshake per address, but the reservation
-    /// counts one per IP. Dialing only the first address of each IP, in record
-    /// order, keeps the two equal, so a record can't list many ports on one IP
-    /// to multiply handshakes past the per-IP cap. An IP in backoff for this
-    /// node yields no address.
+    /// counts one per IP. Dialing only the first address of each IP, in the
+    /// candidate's order, keeps the two equal, so a record can't list many
+    /// ports on one IP to multiply handshakes past the per-IP cap. The book
+    /// orders a candidate's addresses dialed first, then confirmed, then the
+    /// rest, each group in record order. An IP in backoff for this node yields
+    /// no address.
     pub(super) fn candidate_addresses(
         &self,
         candidate: &ZakuraDiscoveryDialCandidate,

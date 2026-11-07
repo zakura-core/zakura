@@ -11,7 +11,7 @@
 
 use std::{
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -78,8 +78,8 @@ impl DiscoveryDialResult {
 
 #[derive(Debug)]
 struct DiscoveryDialOutcome {
-    /// The IP whose handshake TLS authenticated, if this worker's dial got that far.
-    admitted_ip: Option<IpAddr>,
+    /// The address whose handshake TLS authenticated, if this worker's dial got that far.
+    admitted_addr: Option<SocketAddr>,
     result: DiscoveryDialResult,
     /// How the worker's task ended. Shutdown can abort a task before its first
     /// poll.
@@ -231,13 +231,15 @@ impl CandidateDialerIO {
         outcome: DiscoveryDialOutcome,
     ) {
         trace_dial_phase(&self.trace, attempt, outcome.phase);
-        if !state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now()) {
+        let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
+        if !state.complete(attempt, outcome.result, admitted_ip, Instant::now()) {
             return;
         }
         apply_discovery_dial_result(
             &self.discovery,
             &attempt.node_id,
             outcome.result,
+            outcome.admitted_addr,
             &self.trace,
         )
         .await;
@@ -251,7 +253,8 @@ impl CandidateDialerIO {
         }
         while let Some((attempt, outcome)) = self.workers.next().await {
             trace_dial_phase(&self.trace, attempt, outcome.phase);
-            state.complete(attempt, outcome.result, outcome.admitted_ip, Instant::now());
+            let admitted_ip = outcome.admitted_addr.map(|addr| addr.ip());
+            state.complete(attempt, outcome.result, admitted_ip, Instant::now());
         }
     }
 }
@@ -292,7 +295,7 @@ impl Future for DiscoveryDialWorker {
                     DialPhase::WorkerCancelled
                 };
                 DiscoveryDialOutcome {
-                    admitted_ip: None,
+                    admitted_addr: None,
                     result: DiscoveryDialResult::Failed,
                     phase,
                 }
@@ -397,7 +400,7 @@ async fn run_discovery_dial_once(
     attempt: DialAttemptKey,
 ) -> DiscoveryDialOutcome {
     let finished = |result| DiscoveryDialOutcome {
-        admitted_ip: None,
+        admitted_addr: None,
         result,
         phase: DialPhase::WorkerFinished,
     };
@@ -410,10 +413,10 @@ async fn run_discovery_dial_once(
     }
 
     let trace = endpoint.trace();
-    let (admitted_ip_tx, admitted_ip_rx) = oneshot::channel();
+    let (admitted_addr_tx, admitted_addr_rx) = oneshot::channel();
     let (registration_tx, registration_rx) = oneshot::channel();
     let report = DialReport {
-        admitted_ip: admitted_ip_tx,
+        admitted_addr: admitted_addr_tx,
         registration: registration_tx,
     };
     let dial = AbortOnDropHandle::new(spawn_erased_named("discovery_dial", {
@@ -425,8 +428,8 @@ async fn run_discovery_dial_once(
         peer_id,
         registered,
         dial,
-        admitted_ip_rx,
-        admitted_ip: None,
+        admitted_addr_rx,
+        admitted_addr: None,
         registration_rx,
         own_registration: None,
         registration: PeerRegistration::Absent,
@@ -442,10 +445,10 @@ struct DialWatch {
     peer_id: ZakuraPeerId,
     registered: watch::Receiver<Vec<ZakuraPeerId>>,
     dial: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
-    /// Carries the IP whose handshake TLS authenticated. The dial task sends it
-    /// before it registers the peer.
-    admitted_ip_rx: oneshot::Receiver<IpAddr>,
-    admitted_ip: Option<IpAddr>,
+    /// Carries the address whose handshake TLS authenticated. The dial task
+    /// sends it before it registers the peer.
+    admitted_addr_rx: oneshot::Receiver<SocketAddr>,
+    admitted_addr: Option<SocketAddr>,
     /// Carries how this attempt's own registration ended. The dial sends it
     /// before it serves the connection, so it is final once the dial ends.
     registration_rx: oneshot::Receiver<DialRegistration>,
@@ -465,12 +468,12 @@ impl DialWatch {
     /// aborts the dial.
     async fn run(mut self) -> DiscoveryDialOutcome {
         let result = self.classified().await;
-        let admitted_ip = self.admitted_ip();
-        if admitted_ip.is_some() {
+        let admitted_addr = self.admitted_addr();
+        if admitted_addr.is_some() {
             drop(self.dial.detach());
         }
         DiscoveryDialOutcome {
-            admitted_ip,
+            admitted_addr,
             result,
             phase: DialPhase::WorkerFinished,
         }
@@ -564,12 +567,12 @@ impl DialWatch {
         self.own_registration
     }
 
-    /// The IP this attempt's dial authenticated, once the dial reported it.
-    fn admitted_ip(&mut self) -> Option<IpAddr> {
-        if self.admitted_ip.is_none() {
-            self.admitted_ip = self.admitted_ip_rx.try_recv().ok();
+    /// The address this attempt's dial authenticated, once the dial reported it.
+    fn admitted_addr(&mut self) -> Option<SocketAddr> {
+        if self.admitted_addr.is_none() {
+            self.admitted_addr = self.admitted_addr_rx.try_recv().ok();
         }
-        self.admitted_ip
+        self.admitted_addr
     }
 }
 
@@ -621,13 +624,14 @@ async fn apply_discovery_dial_result(
     discovery: &ZakuraDiscoveryHandle,
     node_id: &NodeId,
     result: DiscoveryDialResult,
+    admitted_addr: Option<SocketAddr>,
     trace: &ZakuraTrace,
 ) {
     trace.emit_event(|| DiscoveryDialResultEvent::new(node_id.as_bytes(), result));
 
     match result {
         DiscoveryDialResult::Registered => {
-            discovery.mark_dial_success(node_id).await;
+            discovery.mark_dial_success(node_id, admitted_addr).await;
             metrics::counter!("zakura.p2p.discovery.dial.succeeded").increment(1);
         }
         // Another connection's registration proves none of this record's

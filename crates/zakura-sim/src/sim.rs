@@ -666,15 +666,15 @@ impl Sim {
             Outcome::Budget | Outcome::Idle { .. } => self
                 .check_evidence(st)
                 .err()
-                .or_else(|| self.unfinished_evidence()),
+                .or_else(|| self.unfinished_evidence(end)),
         }
     }
 
-    /// The first evidence source whose evidence is unfinished
+    /// The first evidence source whose evidence is unfinished at `end`
     /// ([`LiveEvidence::unfinished`]), as a failure.
-    fn unfinished_evidence(&self) -> Option<HarnessFailure> {
+    fn unfinished_evidence(&self, end: &RunEnd) -> Option<HarnessFailure> {
         self.evidence.iter().find_map(|(instance, checkpoint)| {
-            let detail = checkpoint.live()?.unfinished()?;
+            let detail = checkpoint.live()?.unfinished(end)?;
             Some(HarnessFailure::SourceEvidence {
                 source: checkpoint.kind().source(*instance),
                 detail: detail.to_owned(),

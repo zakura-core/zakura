@@ -13,6 +13,8 @@ mod runtime;
 mod sequence_file;
 mod service;
 #[cfg(zakura_sim)]
+pub use peer::DISCOVERY_INITIAL_EXCHANGE_TIMEOUT;
+#[cfg(zakura_sim)]
 pub(crate) use service::discovery_streams;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;
@@ -20,9 +22,9 @@ mod serving;
 mod state;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 pub use fuzz::{
-    trace_discovery_book_bytes, trace_discovery_state_bytes, AdmittedFact, BookEntryFact, BookFact,
-    BookStep, BookView, DiscoverySessionStep, DriverFailure, EvictionFact, HintFact, ImportFact,
-    InstallFact, SessionView,
+    discovery_book_witness_bytes, trace_discovery_book_bytes, trace_discovery_state_bytes,
+    AdmittedFact, BookEntryFact, BookFact, BookStep, BookView, DiscoverySessionStep, DriverFailure,
+    EvictionFact, HintFact, ImportFact, InstallFact, SessionView,
 };
 mod trace;
 mod verified;

@@ -30,22 +30,32 @@ use crate::zakura::{ServicePeerDirection, SessionOrigin, ZakuraPeerId};
 
 mod ledger;
 
-pub use ledger::HeaderWorkLedger;
+pub use ledger::{ClaimBreak, ClaimRule, HeaderWorkLedger};
+
+/// The header chunk budget's capacity, so a model can pin its own constant
+/// to it.
+pub const HEADER_CHUNK_BUDGET_CAPACITY: usize =
+    super::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1;
 
 /// Receives reactor events as they happen.
 ///
 /// Called synchronously on the reactor task, never while the reactor holds a
-/// lock. An implementation must not block, yield, take a `zakura_rt` lock, or
+/// lock, with two exceptions. The header budget reports a return under its
+/// own lock. A session's subscriber reports credit under the session's
+/// subscriber lock, and a grant also under its subscription tools' lock.
+/// An implementation must not block, yield, take a `zakura_rt` lock, or
 /// call into the reactor. A panic in `observe` unwinds the reactor task, even
 /// when it is called inside a port future.
 pub trait HeaderSyncObserver: Send + Sync + fmt::Debug {
     /// Records one event.
     fn observe(&self, event: ReactorEvent);
 
-    /// The observer the work queue's reservations and leases report to, or
-    /// `None` for this one. A leaked reservation or lease keeps its handle
-    /// past the reactor, so an observer that reads the reactor's lifetime
-    /// from its own handles can return one that doesn't count.
+    /// The observer the work queue's reservations, leases and budget report
+    /// to, or `None` for this one. A leaked reservation or lease keeps its
+    /// handle past the reactor, so an observer that reads the reactor's
+    /// lifetime from its own handles can return one that doesn't count.
+    /// Each admitted session reports its credit here too, and only when this
+    /// names a handle, since the service keeps sessions past the reactor.
     fn capacity_observer(&self) -> Option<Arc<dyn HeaderSyncObserver>> {
         None
     }
@@ -260,6 +270,19 @@ pub enum ReactorEvent {
         /// complete release leaves at 0.
         queue_owned: usize,
     },
+    /// The header chunk budget changed: a reservation charged it, a page's
+    /// staging moved reserved headers into a lease, or a reservation or a
+    /// lease returned headers. The budget reports every change itself,
+    /// inside the call that made it, whoever called. A return reports under
+    /// the budget's lock, before it wakes waiters.
+    BudgetChanged {
+        /// What the change was for, or `None` when nothing tagged it.
+        owner: Option<BudgetOwner>,
+        /// The change in reserved headers.
+        reserved_delta: i64,
+        /// The change in owned headers.
+        owned_delta: i64,
+    },
     /// The last handle of a page's lease dropped, returning its headers to
     /// the budget.
     LeaseReturned {
@@ -306,6 +329,55 @@ pub enum ReactorEvent {
         origin: Option<u64>,
         /// `peer`'s current session when the violation was dispatched.
         current: Option<u64>,
+    },
+    /// This node's subscriber gave `peer` credit for headers: a
+    /// subscription's first credit at its `Open`, or a `Grant` that refills
+    /// it. The subscriber reports it as it records the update, whoever
+    /// asked for it.
+    CreditIssued {
+        /// Whether an `Open` or a `Grant` gave it.
+        kind: CreditKind,
+        /// The peer the credit lets send.
+        peer: ZakuraPeerId,
+        /// The session the subscription is on.
+        session_id: u64,
+        /// The subscription.
+        subscription: u64,
+        /// The headers it adds.
+        objects: u32,
+        /// The bytes it adds.
+        bytes: u32,
+    },
+    /// The reactor started or finished a unit of work, and `cause` is the
+    /// one it's in now. Every fact the reactor's task reports after this,
+    /// until the next `CauseSet`, belongs to `cause`.
+    CauseSet {
+        /// The unit of work the reactor is in.
+        cause: ReactorCause,
+    },
+    /// `peer`'s offer waits for header room: the reactor held it back with
+    /// no headroom left for its target, not for a pause, or its locator
+    /// found no room to reserve. Reported at each such refusal. The cached
+    /// pass skipping an offer with no headroom doesn't report it, so an
+    /// offer first held back for another reason can wait for room with no
+    /// `HeadroomWait`.
+    HeadroomWait {
+        /// The offering peer.
+        peer: ZakuraPeerId,
+        /// The offering session.
+        session_id: u64,
+        /// The offered target.
+        target_tip_hash: block::Hash,
+        /// The offered target's height.
+        target_height: block::Height,
+    },
+    /// The cached-offer pass the reactor wanted was refused by its pass
+    /// budget. The budget's next refill is `refill_in` from now, and the
+    /// reactor arms it as a deadline. A later change can clear that wait
+    /// before the pass runs, as a discovery pause does.
+    CachedPassDeferred {
+        /// How long until the next refill.
+        refill_in: std::time::Duration,
     },
     /// The reactor refused a session from `peer` because `peer`'s readmission
     /// cooldown still holds. Nothing else about the reactor changes.
@@ -575,6 +647,66 @@ pub enum ReservationEnd {
     Released,
     /// It dropped any other way, as the queue's own drop at teardown does.
     Dropped,
+}
+
+/// What a [`ReactorEvent::BudgetChanged`] was for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BudgetOwner {
+    /// A reservation, by its number: its charge, the headers a page's
+    /// staging moves out of it, or its return.
+    Reservation(u64),
+    /// A page's lease returning its headers.
+    Lease {
+        /// The reservation the lease's headers came from.
+        reservation: u64,
+        /// The peer and round the queue staged the page on, once it did.
+        round: Option<(ZakuraPeerId, u64)>,
+    },
+}
+
+/// What gave a [`ReactorEvent::CreditIssued`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CreditKind {
+    /// A new subscription's `Open`.
+    Open,
+    /// A `Grant` on a live subscription.
+    Grant,
+}
+
+/// The unit of work the reactor is in, as [`ReactorEvent::CauseSet`]
+/// reports it. The reactor sets each one only at the boundary where that
+/// work starts, and restores the one before when it ends.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReactorCause {
+    /// None: the run loop between units of work, such as while it polls
+    /// its pending calls.
+    Idle,
+    /// The reactor being built.
+    Startup,
+    /// The handler of the storage call `call`'s completion.
+    Completion {
+        /// The call's number.
+        call: u64,
+    },
+    /// The committed snapshot refresh after call `call`'s handler.
+    Refresh {
+        /// The call's number.
+        call: u64,
+    },
+    /// A committed snapshot or repair status the reactor read from its
+    /// watches.
+    Watch,
+    /// A lifecycle or wire event the reactor took.
+    Event,
+    /// The deadline maintenance: timeouts, close expiry and repair
+    /// assignment.
+    Maintenance,
+    /// A locator permit coming free.
+    Capacity,
+    /// The cached status pass at the end of each turn.
+    Pass,
+    /// Retiring every peer's work as the run ends.
+    Shutdown,
 }
 
 /// Where an admitted page came from, which the reactor hands the work queue

@@ -520,17 +520,6 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .observe(&event, on_reactor);
         }
-        // The budget changes, credit and causes only the stale-completion
-        // check reads stay out of the log too, and a teardown's returns
-        // after the run are expected.
-        if matches!(
-            event,
-            ReactorEvent::BudgetChanged { .. }
-                | ReactorEvent::CreditIssued { .. }
-                | ReactorEvent::CauseSet { .. }
-        ) {
-            return;
-        }
         // Budget changes, credit and causes stay out of the log, whose
         // format pinned Plans fix, and a teardown's returns after the run
         // are expected.

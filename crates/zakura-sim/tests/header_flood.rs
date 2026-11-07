@@ -10,6 +10,7 @@ mod support;
 
 use std::{cell::RefCell, rc::Rc};
 
+use zakura_network::zakura::observe::{EventQueue, TakePoint};
 use zakura_sim::{
     harness::{
         header_node::{
@@ -25,9 +26,10 @@ use zakura_sim::{
     MemorySink, ObservationLog, PlanInput, RunConfig, RunEnd, RunReport, Sim,
 };
 
-/// The live steps a run may take. A relink takes many steps, so churn
-/// needs more than the storage default to show [`LOADED_TURNS`] turns.
-const BUDGET: u64 = 12_000;
+/// The live steps a run may take. 16 flooding or churning mirrors take
+/// many steps a turn, so a flood needs more than the storage default to
+/// show 100 turns.
+const BUDGET: u64 = 20_000;
 
 /// Where a [`Flooding`] run leaves its harness, so a test can read the view
 /// after the run.
@@ -68,8 +70,8 @@ impl Subsystem for Flooding {
     type Scenario = StorageScenario;
     type Prepared = (Ports, Slot);
 
-    /// The storage harness's config, with room for [`LOADED_TURNS`] turns
-    /// of churn.
+    /// The storage harness's config, with room for 100 turns of a flood or
+    /// churn.
     fn config(_: &StorageScenario) -> RunConfig {
         RunConfig {
             budget: BUDGET,
@@ -151,22 +153,27 @@ fn facts(view: &StorageView) -> Vec<AdoptionFact> {
         .collect()
 }
 
-/// How many events the reactor took in each turn it completed, in order: the
-/// `EventTaken` facts between consecutive `Pass` facts, starting after the
-/// first.
-fn events_per_turn(facts: &[AdoptionFact]) -> Vec<usize> {
+/// For each turn the reactor completed, in order, whether its top-of-turn
+/// take from `queue` left the queue non-empty: the turns run between
+/// consecutive `Pass` facts, starting after the first. Such a take shows
+/// `queue` was ready when the turn's `select!` competed with the watch.
+fn ready_turns(facts: &[AdoptionFact], queue: EventQueue) -> Vec<bool> {
     let mut turns = Vec::new();
-    let mut current: Option<usize> = None;
+    let mut current: Option<bool> = None;
     for fact in facts {
         match fact {
             AdoptionFact::Pass => {
-                if let Some(events) = current.replace(0) {
-                    turns.push(events);
+                if let Some(ready) = current.replace(false) {
+                    turns.push(ready);
                 }
             }
-            AdoptionFact::EventTaken => {
-                if let Some(events) = current.as_mut() {
-                    *events += 1;
+            AdoptionFact::EventTaken {
+                queue: taken,
+                point: TakePoint::TurnStart,
+                queued,
+            } if *taken == queue => {
+                if let Some(ready) = current.as_mut() {
+                    *ready |= *queued > 0;
                 }
             }
             _ => {}
@@ -175,26 +182,74 @@ fn events_per_turn(facts: &[AdoptionFact]) -> Vec<usize> {
     turns
 }
 
-/// The turns a flood or churn may take to fill its queue before every
-/// turn finds an event.
-const FILL_TURNS: usize = 8;
-
-/// The fewest loaded turns a flood or churn run must show.
-const LOADED_TURNS: usize = 50;
-
-/// Checks that once `facts` show the queue filled, within [`FILL_TURNS`],
-/// every later turn took an event, for at least [`LOADED_TURNS`] turns.
-fn loaded(facts: &[AdoptionFact]) {
-    let turns = events_per_turn(facts);
-    let filled = turns
-        .iter()
-        .position(|&events| events > 0)
-        .unwrap_or_else(|| panic!("no turn took an event: {turns:?}"));
-    assert!(filled <= FILL_TURNS, "{turns:?}");
-    let after = &turns[filled..];
-    assert!(after.len() >= LOADED_TURNS, "{turns:?}");
-    assert!(after.iter().all(|&events| events > 0), "{turns:?}");
+/// How loaded a queue was over a run: the turn it first was ready in,
+/// how many turns from then on it was ready in, out of how many, and its
+/// longest run of ready turns.
+#[derive(Debug)]
+struct Load {
+    filled: usize,
+    ready: usize,
+    turns: usize,
+    streak: usize,
 }
+
+/// How loaded `queue` was over the run `facts` record ([`ready_turns`]).
+fn load(facts: &[AdoptionFact], queue: EventQueue) -> Load {
+    let turns = ready_turns(facts, queue);
+    let filled = turns.iter().position(|&ready| ready).unwrap_or(turns.len());
+    let after = &turns[filled..];
+    let (mut streak, mut current) = (0, 0);
+    for &ready in after {
+        current = if ready { current + 1 } else { 0 };
+        streak = streak.max(current);
+    }
+    Load {
+        filled,
+        ready: after.iter().filter(|&&ready| ready).count(),
+        turns: after.len(),
+        streak,
+    }
+}
+
+/// What a flooded queue must show: filled within `fill` turns, then ready
+/// in at least `share` percent of at least 100 turns, with a run of at
+/// least `streak` ready turns in a row.
+struct Loaded {
+    fill: usize,
+    share: usize,
+    streak: usize,
+}
+
+impl Loaded {
+    /// Whether `load` meets this.
+    fn met_by(&self, load: &Load) -> bool {
+        load.filled <= self.fill
+            && load.turns >= 100
+            && load.ready * 100 >= load.turns * self.share
+            && load.streak >= self.streak
+    }
+}
+
+/// 16 mirrors, each flooding or churning as `action` says, with the node.
+fn flooded(action: ControlAction) -> StorageScenario {
+    let mut flooded = scenario(
+        (0..FLOODERS)
+            .map(|index| step(&format!("mirror-{index}"), action))
+            .collect(),
+    );
+    flooded.mirrors = vec![
+        MirrorSpec {
+            chain: Chain::main(4),
+            dialer: Dialer::Mirror,
+        };
+        FLOODERS
+    ];
+    flooded
+}
+
+/// The mirrors a flood or churn test uses. #1566's load test used 63
+/// flooding peers. 16 keep each queue loaded here.
+const FLOODERS: usize = 16;
 
 /// A `Commit` step publishes a new state in the node's engine, and the
 /// reactor adopts it through its watches after the `Published` fact, never
@@ -235,47 +290,93 @@ fn a_node_side_commit_is_adopted_after_its_publication() {
     }
 }
 
-/// Under a `Flood` step, the node admits the flooding session, and every
-/// reactor turn takes an event once the events queue fills.
+/// Under 16 `Flood` steps, the node admits every flooding session. Once the
+/// wire queue fills, each turn's top-of-turn take leaves it non-empty, so
+/// it's ready when the `select!` competes with the watch, in at least 98% of
+/// turns, with at least 100 ready turns in a row. The lifecycle queue isn't
+/// loaded.
 #[test]
 fn a_wire_flood_keeps_the_events_queue_loaded() {
-    let scenario = scenario(vec![step("mirror-0", ControlAction::Flood)]);
+    let wire = Loaded {
+        fill: 32,
+        share: 98,
+        streak: 100,
+    };
+    let lifecycle = Loaded {
+        fill: 32,
+        share: 50,
+        streak: 8,
+    };
     for input in support::inputs(4, 256) {
-        let (_, view) = run(&scenario, input);
-        loaded(&facts(&view));
-        let flood = view.sessions.last().expect("the flood linked a session");
+        let (_, view) = run(&flooded(ControlAction::Flood), input);
+        let facts = facts(&view);
+        let load = load(&facts, EventQueue::Wire);
+        assert!(wire.met_by(&load), "{load:?}");
+        let other = self::load(&facts, EventQueue::Lifecycle);
+        assert!(!lifecycle.met_by(&other), "{other:?}");
         let cooldowns = view.faults.cooldowns().facts();
-        assert!(
-            cooldowns.iter().any(|fact| matches!(fact,
-                CooldownFact::Admitted { session_id, .. } if *session_id == flood.session_id)),
-            "{cooldowns:?}"
-        );
+        let admitted = cooldowns
+            .iter()
+            .filter(|fact| matches!(fact, CooldownFact::Admitted { .. }))
+            .count();
+        assert!(admitted >= 2 * FLOODERS, "{cooldowns:?}");
     }
 }
 
-/// Under a `Churn` step, every reactor turn takes an event once the
-/// lifecycle queue fills.
+/// Under 16 `Churn` steps, once the lifecycle queue fills, each turn's
+/// top-of-turn take leaves it non-empty in at least 90% of turns, with at
+/// least 32 ready turns in a row. The wire queue isn't loaded.
 #[test]
 fn lifecycle_churn_keeps_the_lifecycle_queue_loaded() {
-    let scenario = scenario(vec![step("mirror-0", ControlAction::Churn)]);
+    let lifecycle = Loaded {
+        fill: 32,
+        share: 90,
+        streak: 32,
+    };
+    let wire = Loaded {
+        fill: 32,
+        share: 50,
+        streak: 8,
+    };
     for input in support::inputs(4, 256) {
-        let (_, view) = run(&scenario, input);
-        loaded(&facts(&view));
-        assert!(
-            view.sessions.len() > LOADED_TURNS,
-            "{}",
-            view.sessions.len()
-        );
+        let (_, view) = run(&flooded(ControlAction::Churn), input);
+        let facts = facts(&view);
+        let load = load(&facts, EventQueue::Lifecycle);
+        assert!(lifecycle.met_by(&load), "{load:?}");
+        let other = self::load(&facts, EventQueue::Wire);
+        assert!(!wire.met_by(&other), "{other:?}");
     }
 }
 
-/// Without a flood or churn, the reactor has turns that take no event, so
-/// the loaded check reads something only the floods give.
+/// Without a flood or churn, the mirror's own messages reach the wire
+/// queue, but it empties between them, so neither queue comes near the
+/// weakest load a flood test asks for. That's the trickle a flood must be
+/// told from.
 #[test]
-fn a_quiet_run_has_turns_without_events() {
-    let (_, view) = run(&scenario(Vec::new()), support::inputs(1, 256).remove(0));
-    let turns = events_per_turn(&facts(&view));
-    assert!(turns.contains(&0), "{turns:?}");
+fn a_quiet_run_loads_neither_queue() {
+    let weakest = Loaded {
+        fill: 32,
+        share: 50,
+        streak: 8,
+    };
+    for input in support::inputs(4, 256) {
+        let (_, view) = run(&scenario(Vec::new()), input);
+        let facts = facts(&view);
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                AdoptionFact::EventTaken {
+                    queue: EventQueue::Wire,
+                    ..
+                }
+            )),
+            "{facts:?}"
+        );
+        for queue in [EventQueue::Wire, EventQueue::Lifecycle] {
+            let load = load(&facts, queue);
+            assert!(!weakest.met_by(&load), "{queue:?}: {load:?}");
+        }
+    }
 }
 
 /// A shutdown picked while churn steps are still queued stops the churn

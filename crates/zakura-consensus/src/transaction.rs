@@ -1357,23 +1357,7 @@ where
         let mut checks = AsyncChecks::new();
 
         if let Some(joinsplit_data) = joinsplit_data {
-            for joinsplit in joinsplit_data.joinsplits() {
-                // # Consensus
-                //
-                // > The proof π_ZKJoinSplit MUST be valid given a
-                // > primary input formed from the relevant other fields and h_{Sig}
-                //
-                // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
-                //
-                // Queue the verification of the Groth16 spend proof
-                // for each JoinSplit description while adding the
-                // resulting future to our collection of async
-                // checks that (at a minimum) must pass for the
-                // transaction to verify.
-                checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
-                    primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)?,
-                ));
-            }
+            checks = checks.and(Self::verify_sprout_proofs(joinsplit_data)?);
 
             // # Consensus
             //
@@ -1420,6 +1404,45 @@ where
         }
 
         Ok(checks)
+    }
+
+    /// Queues the Groth16 proof check for each JoinSplit in `joinsplit_data`.
+    #[cfg(feature = "sprout")]
+    fn verify_sprout_proofs(
+        joinsplit_data: &transaction::JoinSplitData<Groth16Proof>,
+    ) -> Result<AsyncChecks, TransactionError> {
+        let mut checks = AsyncChecks::new();
+
+        for joinsplit in joinsplit_data.joinsplits() {
+            // # Consensus
+            //
+            // > The proof π_ZKJoinSplit MUST be valid given a
+            // > primary input formed from the relevant other fields and h_{Sig}
+            //
+            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
+            //
+            // Queue the verification of the Groth16 spend proof
+            // for each JoinSplit description while adding the
+            // resulting future to our collection of async
+            // checks that (at a minimum) must pass for the
+            // transaction to verify.
+            checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
+                primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)?,
+            ));
+        }
+
+        Ok(checks)
+    }
+
+    /// Refuses to verify JoinSplit proofs, because this build has no Sprout verifier.
+    ///
+    /// The refusal is a local capability limit, not a consensus verdict: see
+    /// [`TransactionError::SproutVerifierNotBuilt`].
+    #[cfg(not(feature = "sprout"))]
+    fn verify_sprout_proofs(
+        _joinsplit_data: &transaction::JoinSplitData<Groth16Proof>,
+    ) -> Result<AsyncChecks, TransactionError> {
+        Err(TransactionError::SproutVerifierNotBuilt)
     }
 
     /// Verifies a transaction's Sapling shielded data.

@@ -59,6 +59,12 @@
 //! features](https://doc.rust-lang.org/cargo/reference/features.html#command-line-feature-options)
 //! are available at compile time:
 //!
+//! ### Verification
+//!
+//! * `sprout`: verify Sprout JoinSplit proofs. ZIP 218 disallows JoinSplits from NU7 onward, so
+//!   only pre-NU7 blocks above the last checkpoint need it. Builds without it stall on such a
+//!   block that has a JoinSplit, rather than rejecting it. Enabled by default.
+//!
 //! ### Metrics
 //!
 //! * `prometheus`: export metrics to prometheus.

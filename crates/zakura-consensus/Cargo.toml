@@ -25,14 +25,22 @@ default = []
 progress-bar = ["howudoin", "zakura-state/progress-bar"]
 howudoin = []
 
+# Sprout Groth16 JoinSplit proof verification.
+#
+# ZIP 218 disallows Sprout JoinSplits from NU7 onward, so blocks after NU7 never
+# need it. Builds without this feature reject every JoinSplit as a retryable
+# local verifier failure (never as consensus-invalid), so they stall instead of
+# forking on a pre-NU7 block that is above the last checkpoint and has JoinSplits.
+sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd"]
+
 # Test-only features
 internal-bench = []
 proptest-impl = ["proptest", "proptest-derive", "zakura-chain/proptest-impl", "zakura-state/proptest-impl"]
 
 [dependencies]
-blake2b_simd = { workspace = true }
-bellman = { workspace = true }
-bls12_381 = { workspace = true }
+blake2b_simd = { workspace = true, optional = true }
+bellman = { workspace = true, optional = true }
+bls12_381 = { workspace = true, optional = true }
 halo2 = { workspace = true }
 rand_10 = { workspace = true }
 # ed25519-zebra takes `rand_core` 0.6 RNGs.
@@ -93,6 +101,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "groth16"
 harness = false
+required-features = ["sprout"]
 
 [[bench]]
 name = "halo2"

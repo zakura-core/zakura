@@ -604,7 +604,8 @@ impl DiscoveryPeer {
                 match exchange {
                     None => Labels::of(Label::Unsolicited),
                     // The node's claim refuses a `Peers` above its own
-                    // `GetPeers` limit's cap, below the row's largest.
+                    // `GetPeers` limit's cap, below the row's largest. A
+                    // usize fits u64 on every supported target.
                     Some(key)
                         if model.owed(SESSION, key).is_some()
                             && peers.zip(limit).is_some_and(|(peers, limit)| {

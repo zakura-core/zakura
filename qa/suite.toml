@@ -309,12 +309,6 @@ reason = "no target yet; `cargo xtask sim-targets` checks one once its table ent
 # stays in the report as unimplemented until its chunk registers it, and
 # then the check fails until its row here goes.
 [[pending]]
-id = "header-sync/stale-completion-inert"
-kind = "property"
-owner = "P4a"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
 id = "header-sync/capacity-release-wakes"
 kind = "property"
 owner = "P4b"

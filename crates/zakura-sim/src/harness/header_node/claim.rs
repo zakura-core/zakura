@@ -40,6 +40,9 @@ pub enum Claim {
     /// The stopped reactor is gone with a locator permit missing that no
     /// pending storage read holds.
     TeardownLocatorPermits,
+    /// A stale prepare or apply's handler had an effect on other work
+    /// ([`super::stale`]).
+    StaleCompletionEffect,
 }
 
 impl Claim {

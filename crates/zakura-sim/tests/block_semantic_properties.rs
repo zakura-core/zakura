@@ -21,7 +21,7 @@ use zakura_sim::{
             view::PairingKind,
             Policy,
         },
-        block_semantic::RESET_MID_FLIGHT_TAG,
+        block_semantic::{CAPACITY_RELEASE_TAG, RESET_MID_FLIGHT_TAG},
         block_sync::{BlockScenario, Ports, Storage},
         run_prepared, Subsystem,
     },
@@ -189,11 +189,11 @@ fn reset_mid_flight_shortfall(input: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// How many fuzz inputs [`regenerate_reset_mid_flight_input`] tries.
-const RESET_MID_FLIGHT_CANDIDATES: usize = 64;
+/// How many fuzz inputs a regenerate tool tries.
+const REGENERATE_CANDIDATES: usize = 64;
 
 /// Rewrites the committed reset-mid-flight input with the first of
-/// [`RESET_MID_FLIGHT_CANDIDATES`] fuzz inputs that fills the input's role
+/// [`REGENERATE_CANDIDATES`] fuzz inputs that fills the input's role
 /// ([`reset_mid_flight_shortfall`]), and its sidecar's SHA-256 to match. A
 /// block-sync change that moves the input off the crossing needs only this
 /// run, then `cargo xtask planted block-sync/submit-only-requested` to show
@@ -201,23 +201,57 @@ const RESET_MID_FLIGHT_CANDIDATES: usize = 64;
 #[test]
 #[ignore = "rewrites the committed input"]
 fn regenerate_reset_mid_flight_input() {
-    let bytes = byte_inputs(RESET_MID_FLIGHT_CANDIDATES, 16_384)
-        .into_iter()
-        .map(|plan| [&RESET_MID_FLIGHT_TAG[..], &plan].concat())
-        .find(|input| reset_mid_flight_shortfall(input).is_ok())
-        .expect("some candidate reaches the crossing");
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/block-sync-reset-mid-flight"
+    regenerate(
+        "block-sync-reset-mid-flight",
+        RESET_MID_FLIGHT_TAG,
+        1,
+        reset_mid_flight_shortfall,
     );
-    std::fs::write(format!("{fixture}.bin"), &bytes).expect("the fixture directory exists");
+}
+
+/// Rewrites the committed input `name` under `tests/fixtures` with the
+/// first of [`REGENERATE_CANDIDATES`] fuzz inputs, after the scenario tag
+/// `tag`, for which `shortfall` finds nothing, and its sidecar's SHA-256 to
+/// match. It runs `width` candidates at once, and still picks the first in
+/// order, so the result doesn't depend on `width`. It prints each
+/// candidate's shortfall, and panics if every candidate falls short.
+#[allow(clippy::print_stdout)]
+fn regenerate(name: &str, tag: [u8; 2], width: usize, shortfall: fn(&[u8]) -> Result<(), String>) {
+    let candidates: Vec<Vec<u8>> = byte_inputs(REGENERATE_CANDIDATES, 16_384)
+        .into_iter()
+        .map(|plan| [&tag[..], &plan].concat())
+        .collect();
+    let mut chosen = None;
+    for (batch, inputs) in candidates.chunks(width).enumerate() {
+        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let runs: Vec<_> = inputs
+                .iter()
+                .map(|input| scope.spawn(move || shortfall(input)))
+                .collect();
+            runs.into_iter()
+                .map(|run| run.join().expect("a candidate's check returns"))
+                .collect()
+        });
+        for (offset, result) in results.iter().enumerate() {
+            println!("{name}: candidate {}: {result:?}", batch * width + offset);
+        }
+        if let Some(offset) = results.iter().position(Result::is_ok) {
+            chosen = Some(&inputs[offset]);
+            break;
+        }
+    }
+    let bytes = chosen.unwrap_or_else(|| {
+        panic!("{name}: none of {REGENERATE_CANDIDATES} candidates fills the input's role")
+    });
+    let fixture = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::write(format!("{fixture}.bin"), bytes).expect("the fixture directory exists");
     let sidecar = format!("{fixture}.toml");
     let text = std::fs::read_to_string(&sidecar).expect("the input has a sidecar");
     let text: String = text
         .lines()
         .map(|line| {
             if line.starts_with("sha256 = ") {
-                format!("sha256 = \"{}\"\n", sha256(&bytes))
+                format!("sha256 = \"{}\"\n", sha256(bytes))
             } else {
                 format!("{line}\n")
             }
@@ -324,12 +358,40 @@ fn the_decoded_input_stall_input_holds_input_decoded_bound() {
 #[test]
 #[ignore = "a debug run takes about eight minutes; run it on demand with `--ignored` and `--profile planted`"]
 fn the_frontier_first_input_holds_capacity_release_wakes() {
-    witnessed(
-        committed(CAPACITY_FRONTIER_FIRST_INPUT),
-        CAPACITY_RELEASE_WAKES,
-        Expect::Holds,
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    if let Err(shortfall) = capacity_frontier_first_shortfall(CAPACITY_FRONTIER_FIRST_INPUT) {
+        panic!("{shortfall}");
+    }
+}
+
+/// Checks that `input` fills the frontier-first input's role, or returns
+/// why it falls short. Its run must be a witness that holds
+/// `capacity-release-wakes` and pairs every block storage operation, so it
+/// reaches #1523's order: the verified tip passed a released submission's
+/// height before its reply freed room beside a waiting body.
+/// `stale-completion-no-wake.patch` also needs that submission to be older
+/// than the reactor's authority. In this scenario storage releases height
+/// 1, which it admitted before the reset.
+fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
+    witnessed(committed(input), CAPACITY_RELEASE_WAKES, Expect::Holds).map(drop)
+}
+
+/// Rewrites the committed frontier-first input with the first of
+/// [`REGENERATE_CANDIDATES`] fuzz inputs that fills the input's role
+/// ([`capacity_frontier_first_shortfall`]), and its sidecar's SHA-256 to
+/// match. A block-sync change that moves the input off #1523's order needs
+/// only this run, then `cargo xtask planted block-sync/capacity-release-wakes`
+/// to show that `stale-completion-no-wake.patch` is still caught.
+#[test]
+#[ignore = "rewrites the committed input"]
+fn regenerate_capacity_frontier_first_input() {
+    // Under `--profile planted`, a capacity-release run takes a few minutes
+    // and peaks near 1.5 GB, so four candidates at once stay near 6 GB.
+    regenerate(
+        "block-sync-capacity-frontier-first",
+        CAPACITY_RELEASE_TAG,
+        4,
+        capacity_frontier_first_shortfall,
+    );
 }
 
 /// The capacity-release input whose plan handles the detached commit's

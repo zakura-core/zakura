@@ -4,7 +4,10 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -123,6 +126,18 @@ macro_rules! impl_jsonl_trace_event {
 }
 
 /// A typed, non-blocking JSONL event emitter.
+///
+/// Every row it emits starts with this envelope:
+///
+/// - `ts`: microseconds since this emitter was created.
+/// - `trace_epoch_us`: microseconds since the process trace epoch, which the first
+///   emitter created in this process fixes. Unlike `ts`, it compares across emitters
+///   and tables of one process. It is not a wall-clock time, and it restarts with the
+///   process.
+/// - `trace_rows_unconfirmed`: the [`trace_rows_unconfirmed`] count when the row was
+///   emitted.
+/// - `node`: the [`node_id`].
+/// - `process_trace_id`: the [`process_trace_id`].
 #[derive(Clone, Debug)]
 pub struct JsonlEventEmitter {
     tracer: JsonlTracer,
@@ -138,6 +153,9 @@ impl JsonlEventEmitter {
 
     /// Create an event emitter with an explicit node label.
     pub fn new(tracer: JsonlTracer, node: impl Into<std::sync::Arc<str>>) -> Self {
+        // The first emitter in the process fixes the trace epoch.
+        trace_epoch();
+
         Self {
             tracer,
             node: node.into(),
@@ -171,17 +189,20 @@ impl JsonlEventEmitter {
         let event = build();
         let row = JsonlEventEnvelope {
             ts: elapsed_micros(self.started.elapsed()),
+            trace_epoch_us: elapsed_micros(trace_epoch().elapsed()),
+            trace_rows_unconfirmed: trace_rows_unconfirmed(),
             node: &self.node,
             process_trace_id: process_trace_id(),
             event: &event,
         };
 
-        if let Ok(line) = serde_json::to_vec(&row) {
-            permit.send(JsonlWriteEvent {
+        match serde_json::to_vec(&row) {
+            Ok(line) => permit.send(JsonlWriteEvent {
                 table: E::TABLE.table(),
                 file_name: E::TABLE.file_name(),
                 line,
-            });
+            }),
+            Err(_) => record_unconfirmed_rows(1),
         }
     }
 
@@ -196,6 +217,14 @@ impl JsonlEventEmitter {
             "ts".to_string(),
             Value::from(elapsed_micros(self.started.elapsed())),
         );
+        row.insert(
+            "trace_epoch_us".to_string(),
+            Value::from(elapsed_micros(trace_epoch().elapsed())),
+        );
+        row.insert(
+            "trace_rows_unconfirmed".to_string(),
+            Value::from(trace_rows_unconfirmed()),
+        );
         row.insert("node".to_string(), Value::String(self.node.to_string()));
         row.insert(
             "process_trace_id".to_string(),
@@ -203,12 +232,13 @@ impl JsonlEventEmitter {
         );
         build(&mut row);
 
-        if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
-            permit.send(JsonlWriteEvent {
+        match serde_json::to_vec(&Value::Object(row)) {
+            Ok(line) => permit.send(JsonlWriteEvent {
                 table: table.table(),
                 file_name: table.file_name(),
                 line,
-            });
+            }),
+            Err(_) => record_unconfirmed_rows(1),
         }
     }
 }
@@ -222,6 +252,8 @@ impl Default for JsonlEventEmitter {
 #[derive(Serialize)]
 struct JsonlEventEnvelope<'a, E> {
     ts: u64,
+    trace_epoch_us: u64,
+    trace_rows_unconfirmed: u64,
     node: &'a str,
     process_trace_id: &'static str,
     #[serde(flatten)]
@@ -230,6 +262,67 @@ struct JsonlEventEnvelope<'a, E> {
 
 fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
+}
+
+/// Returns the zero point of every `trace_epoch_us` value in this process.
+///
+/// The first call fixes it, and [`JsonlEventEmitter::new`] makes that call, so the
+/// epoch is the creation of the first emitter in the process, enabled or not. It is
+/// not the operating-system process start.
+fn trace_epoch() -> std::time::Instant {
+    static TRACE_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    *TRACE_EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// The process-wide count behind [`trace_rows_unconfirmed`].
+static TRACE_ROWS_UNCONFIRMED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns how often this process's trace pipeline refused a row or could not confirm
+/// that a row was written.
+///
+/// The count rises:
+///
+/// - when an enabled tracer refuses a row because its queue is full or its writer has
+///   stopped. [`JsonlTracer::try_send`] hands the refused row back to its caller, which
+///   may offer it again. Every refusal counts, and a later offer can still succeed;
+/// - when an emitter cannot serialize a row;
+/// - when the writer discards a row because its table was disabled after a directory,
+///   open or write failure;
+/// - when a write fails. Every row still buffered for that table counts, although the
+///   operating system may have written some of them before the error;
+/// - when the writer stops with rows still queued.
+///
+/// Rows offered to a disabled tracer never count, because tracing was never on for them.
+///
+/// Every emitted row reports this count as `trace_rows_unconfirmed`. An increase means a
+/// reader cannot assume the trace is complete. It is not the number of distinct rows
+/// lost. No increase does not prove that no row was lost:
+///
+/// - a row lost after the last written row, or after every writer has stopped, raises
+///   this count, but no later row reports it;
+/// - callers that check [`JsonlTracer::is_enabled`] skip rows once the writer has
+///   stopped, and those rows never count;
+/// - a row whose slot was reserved just before its writer stopped can be lost uncounted.
+///
+/// The writer counts when it handles a batch, so its counts appear only on rows emitted
+/// after that moment. The count stops at `u64::MAX` instead of wrapping.
+pub fn trace_rows_unconfirmed() -> u64 {
+    TRACE_ROWS_UNCONFIRMED.load(Ordering::Relaxed)
+}
+
+fn record_unconfirmed_rows(rows: u64) {
+    if rows > 0 {
+        saturating_add_to(&TRACE_ROWS_UNCONFIRMED, rows);
+    }
+}
+
+/// Adds `rows` to `counter`, stopping at `u64::MAX` so the count never falls.
+fn saturating_add_to(counter: &AtomicU64, rows: u64) {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            Some(count.saturating_add(rows))
+        })
+        .expect("the update closure always returns Some, so the update cannot be refused");
 }
 
 /// Returns the process-wide node identifier used to tag JSONL trace records.
@@ -465,6 +558,9 @@ impl JsonlTracer {
     }
 
     /// Try to reserve a queue slot for a trace record.
+    ///
+    /// Callers reserve a slot only to write a row, so each `Full` or `Closed` refusal
+    /// counts once in [`trace_rows_unconfirmed`].
     pub fn try_reserve(&self) -> Result<JsonlTracePermit, JsonlTraceReserveError> {
         let TraceState::Enabled(runtime) = &self.inner else {
             return Err(JsonlTraceReserveError::Disabled);
@@ -475,21 +571,31 @@ impl JsonlTracer {
             .clone()
             .try_reserve_owned()
             .map(|permit| JsonlTracePermit { permit })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => JsonlTraceReserveError::Full,
-                TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+            .map_err(|error| {
+                record_unconfirmed_rows(1);
+                match error {
+                    TrySendError::Full(_) => JsonlTraceReserveError::Full,
+                    TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+                }
             })
     }
 
     /// Try to send a trace record without blocking.
+    ///
+    /// Each `Full` or `Closed` refusal counts once in [`trace_rows_unconfirmed`]. The
+    /// error hands the record back, so the caller may offer it again, and a later offer
+    /// can succeed.
     pub fn try_send(&self, event: JsonlWriteEvent) -> Result<(), JsonlTraceSendError> {
         let TraceState::Enabled(runtime) = &self.inner else {
             return Err(JsonlTraceSendError::Disabled(event));
         };
 
-        runtime.tx.try_send(event).map_err(|error| match error {
-            TrySendError::Full(event) => JsonlTraceSendError::Full(event),
-            TrySendError::Closed(event) => JsonlTraceSendError::Closed(event),
+        runtime.tx.try_send(event).map_err(|error| {
+            record_unconfirmed_rows(1);
+            match error {
+                TrySendError::Full(event) => JsonlTraceSendError::Full(event),
+                TrySendError::Closed(event) => JsonlTraceSendError::Closed(event),
+            }
         })
     }
 }
@@ -537,6 +643,8 @@ impl std::fmt::Debug for JsonlTracer {
 struct TableWriter {
     file: tokio::fs::File,
     encode_buf: Vec<u8>,
+    /// Rows appended since the last flush the operating system accepted.
+    unconfirmed_rows: u64,
 }
 
 impl TableWriter {
@@ -544,20 +652,23 @@ impl TableWriter {
         Self {
             file,
             encode_buf: Vec::with_capacity(buffer_flush_bytes),
+            unconfirmed_rows: 0,
         }
     }
 
     fn append_line(&mut self, line: &[u8]) {
         self.encode_buf.extend_from_slice(line);
         self.encode_buf.push(b'\n');
+        self.unconfirmed_rows = self.unconfirmed_rows.saturating_add(1);
     }
 
     async fn flush_buffer(&mut self, sync_file: bool) -> std::io::Result<()> {
-        if !self.encode_buf.is_empty() {
-            self.file.write_all(&self.encode_buf).await?;
-            self.encode_buf.clear();
-            self.file.flush().await?;
-        }
+        write_buffered_rows(
+            &mut self.file,
+            &mut self.encode_buf,
+            &mut self.unconfirmed_rows,
+        )
+        .await?;
 
         if sync_file {
             self.file.sync_data().await?;
@@ -565,6 +676,28 @@ impl TableWriter {
 
         Ok(())
     }
+}
+
+/// Writes and flushes the buffered rows in `buf` to `out`.
+///
+/// Success clears `buf` and `unconfirmed_rows`. On an error `unconfirmed_rows` still
+/// counts every buffered row, although `out` may already hold some of them.
+async fn write_buffered_rows<W>(
+    out: &mut W,
+    buf: &mut Vec<u8>,
+    unconfirmed_rows: &mut u64,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if !buf.is_empty() {
+        out.write_all(buf).await?;
+        buf.clear();
+        out.flush().await?;
+        *unconfirmed_rows = 0;
+    }
+
+    Ok(())
 }
 
 struct TraceWriter {
@@ -592,9 +725,14 @@ impl TraceWriter {
         !self.tables.is_empty() || self.disabled_tables.is_empty()
     }
 
-    async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) {
+    /// Writes `batch`, flushes the buffers that are due, and returns how many rows it
+    /// could not confirm as written.
+    async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) -> u64 {
+        let mut unconfirmed: u64 = 0;
+
         for event in batch {
             if self.disabled_tables.contains(event.table) {
+                unconfirmed = unconfirmed.saturating_add(1);
                 continue;
             }
 
@@ -608,6 +746,7 @@ impl TraceWriter {
 
             if append_result.is_err() {
                 self.disable_table(event.table);
+                unconfirmed = unconfirmed.saturating_add(1);
             }
         }
 
@@ -630,6 +769,7 @@ impl TraceWriter {
                     trace_dir = ?self.trace_dir,
                     "disabling trace table after write failure"
                 );
+                unconfirmed = unconfirmed.saturating_add(table_writer.unconfirmed_rows);
                 failed_tables.push(table_name);
             }
         }
@@ -641,10 +781,14 @@ impl TraceWriter {
         for table in failed_tables {
             self.disable_table(table);
         }
+
+        unconfirmed
     }
 
-    async fn flush_all(&mut self) {
-        self.write_batch(Vec::new(), true).await;
+    /// Flushes every open table and returns how many rows a failed write left
+    /// unconfirmed.
+    async fn flush_all(&mut self) -> u64 {
+        self.write_batch(Vec::new(), true).await
     }
 
     fn disable_table(&mut self, table: &'static str) {
@@ -725,10 +869,11 @@ async fn run_trace_writer(
                 }
             }
             _ = flush_tick.tick(), if writer.has_open_files() => {
-                writer.flush_all().await;
+                record_unconfirmed_rows(writer.flush_all().await);
 
                 if !writer.has_open_files() {
                     tracing::warn!(trace_dir = ?writer.trace_dir, "all trace tables have been disabled");
+                    record_unconfirmed_rows(drain_unwritten(&mut rx));
                     break;
                 }
 
@@ -744,7 +889,7 @@ async fn run_trace_writer(
             while let Ok(event) = rx.try_recv() {
                 batch.push(event);
             }
-            writer.write_batch(batch, true).await;
+            record_unconfirmed_rows(writer.write_batch(batch, true).await);
             break;
         }
 
@@ -794,20 +939,36 @@ async fn run_trace_writer(
             }
         }
 
-        writer
-            .write_batch(batch, force_flush || receiver_closed)
-            .await;
+        record_unconfirmed_rows(
+            writer
+                .write_batch(batch, force_flush || receiver_closed)
+                .await,
+        );
 
         if !writer.has_open_files() {
             tracing::warn!(trace_dir = ?writer.trace_dir, "all trace tables have been disabled");
+            record_unconfirmed_rows(drain_unwritten(&mut rx));
             break;
         }
 
         if receiver_closed {
-            writer.flush_all().await;
+            record_unconfirmed_rows(writer.flush_all().await);
             break;
         }
     }
+}
+
+/// Closes the queue of a writer that is stopping and returns how many queued rows it
+/// leaves unwritten.
+fn drain_unwritten(rx: &mut mpsc::Receiver<JsonlWriteEvent>) -> u64 {
+    rx.close();
+
+    let mut unwritten: u64 = 0;
+    while rx.try_recv().is_ok() {
+        unwritten = unwritten.saturating_add(1);
+    }
+
+    unwritten
 }
 
 #[cfg(test)]
@@ -863,6 +1024,8 @@ mod tests {
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
         assert!(row["ts"].is_u64());
+        assert!(row["trace_epoch_us"].is_u64());
+        assert!(row["trace_rows_unconfirmed"].is_u64());
     }
 
     #[test]
@@ -880,6 +1043,212 @@ mod tests {
         assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "raw_event");
         assert!(row["ts"].is_u64());
+        assert!(row["trace_epoch_us"].is_u64());
+        assert!(row["trace_rows_unconfirmed"].is_u64());
+    }
+
+    #[test]
+    fn trace_epoch_us_is_shared_while_ts_stays_emitter_local() {
+        fn emitted_row(rx: &mut mpsc::Receiver<JsonlWriteEvent>) -> Value {
+            let written = rx.try_recv().expect("the emitter used its reserved slot");
+            serde_json::from_slice(&written.line).expect("valid event JSON")
+        }
+        fn micros(row: &Value, field: &str) -> u64 {
+            row[field].as_u64().expect("envelope times are u64")
+        }
+        let row_event = || TestEvent {
+            event: "epoch",
+            value: 0,
+            optional: None,
+        };
+
+        let (older_tx, mut older_rx) = mpsc::channel(1);
+        let older = JsonlEventEmitter::new(JsonlTracer::new(older_tx), "older");
+        std::thread::sleep(Duration::from_millis(20));
+        let (newer_tx, mut newer_rx) = mpsc::channel(1);
+        let newer = JsonlEventEmitter::new(JsonlTracer::new(newer_tx), "newer");
+
+        newer.emit_event(row_event);
+        older.emit_event(row_event);
+        let newer_row = emitted_row(&mut newer_rx);
+        let older_row = emitted_row(&mut older_rx);
+
+        // One process-wide axis: the row emitted later reads later.
+        assert!(micros(&older_row, "trace_epoch_us") >= micros(&newer_row, "trace_epoch_us"));
+
+        // `ts` still counts from each emitter's creation, so the two emitters' zero
+        // points sit at least the 20 ms sleep apart on the shared axis.
+        let zero_point = |row: &Value| {
+            micros(row, "trace_epoch_us")
+                .checked_sub(micros(row, "ts"))
+                .expect("an emitter fixes the epoch before it starts counting `ts`")
+        };
+        let older_zero = zero_point(&older_row);
+        let newer_zero = zero_point(&newer_row);
+        assert!(
+            newer_zero >= older_zero + 19_000,
+            "emitter zero points {older_zero} and {newer_zero} are not 20 ms apart"
+        );
+    }
+
+    fn alpha_row() -> JsonlWriteEvent {
+        JsonlWriteEvent {
+            table: "alpha",
+            file_name: "alpha.jsonl",
+            line: br#"{"value":1}"#.to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_counts_each_row_for_a_failed_table_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").expect("a regular file blocks the trace directory");
+        let mut writer = TraceWriter::new(blocker.join("traces"), JsonlTraceConfig::default());
+
+        assert_eq!(
+            writer
+                .write_batch(vec![alpha_row(), alpha_row()], false)
+                .await,
+            2,
+            "the row whose open failed and the row behind it"
+        );
+        assert_eq!(
+            writer.flush_all().await,
+            0,
+            "discarded rows are not counted again"
+        );
+        assert_eq!(writer.write_batch(vec![alpha_row()], true).await, 1);
+        assert!(!writer.has_open_files());
+    }
+
+    #[tokio::test]
+    async fn failed_flush_counts_buffered_rows_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("alpha.jsonl");
+        std::fs::write(&path, b"").expect("trace file");
+        let read_only = tokio::fs::File::open(&path)
+            .await
+            .expect("the trace file was just created");
+        let mut writer = TraceWriter::new(dir.path().to_path_buf(), JsonlTraceConfig::default());
+        writer.tables.insert(
+            "alpha",
+            TableWriter::new(read_only, DEFAULT_BUFFER_FLUSH_BYTES),
+        );
+
+        assert_eq!(
+            writer
+                .write_batch(vec![alpha_row(), alpha_row(), alpha_row()], false)
+                .await,
+            0,
+            "rows wait in the buffer"
+        );
+        assert_eq!(
+            writer.flush_all().await,
+            3,
+            "a failed write leaves every buffered row unconfirmed"
+        );
+        assert_eq!(
+            writer.flush_all().await,
+            0,
+            "the failed table's rows are not counted again"
+        );
+        assert_eq!(
+            writer.write_batch(vec![alpha_row()], false).await,
+            1,
+            "the disabled table discards later rows"
+        );
+    }
+
+    /// Accepts `capacity` bytes, then fails every write.
+    struct FailsAfter {
+        written: Vec<u8>,
+        capacity: usize,
+    }
+
+    impl tokio::io::AsyncWrite for FailsAfter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let room = self.capacity.saturating_sub(self.written.len());
+            if room == 0 {
+                return std::task::Poll::Ready(Err(std::io::Error::other("device full")));
+            }
+            let accepted = room.min(buf.len());
+            self.written.extend_from_slice(&buf[..accepted]);
+            std::task::Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_write_counts_every_buffered_row_although_one_reached_the_output() {
+        let line = br#"{"value":1}"#;
+        let mut buf = Vec::new();
+        for _ in 0..3 {
+            buf.extend_from_slice(line);
+            buf.push(b'\n');
+        }
+        let mut unconfirmed_rows = 3;
+        let mut out = FailsAfter {
+            written: Vec::new(),
+            capacity: line.len() + 1,
+        };
+
+        assert!(
+            write_buffered_rows(&mut out, &mut buf, &mut unconfirmed_rows)
+                .await
+                .is_err(),
+            "the output fails after one row"
+        );
+        assert_eq!(
+            out.written, b"{\"value\":1}\n",
+            "one whole row reached the output"
+        );
+        assert_eq!(
+            unconfirmed_rows, 3,
+            "the row that reached the output still counts as unconfirmed"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_row_count_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+
+        saturating_add_to(&counter, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        saturating_add_to(&counter, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn stopping_writer_counts_rows_left_in_its_queue() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let tracer = JsonlTracer::new(tx);
+        tracer.try_send(alpha_row()).expect("the queue has room");
+        tracer.try_send(alpha_row()).expect("the queue has room");
+
+        assert_eq!(drain_unwritten(&mut rx), 2);
+        assert!(matches!(
+            tracer.try_reserve(),
+            Err(JsonlTraceReserveError::Closed)
+        ));
     }
 
     #[test]

@@ -228,6 +228,14 @@ fn the_progress_fixture_holds_honest_progress() {
     }
 }
 
+/// The progress fixture with an honest peer that disconnects once it has
+/// served its page. Under the default Plan, it leaves before the apply.
+fn leaving_scenario() -> WireScenario {
+    let mut scenario = progress_scenario();
+    scenario.peers[0].script = vec![PeerAction::Disconnect];
+    scenario
+}
+
 /// The honest peer disconnects after the node's honest session started
 /// and before the successor applies. `StableMembership` stops holding while
 /// the obligation is open, so the property ends `Inconclusive` with
@@ -238,8 +246,7 @@ fn the_progress_fixture_holds_honest_progress() {
 /// outlives the assumption it rests on.
 #[test]
 fn a_peer_that_leaves_before_the_apply_makes_honest_progress_inconclusive() {
-    let mut scenario = progress_scenario();
-    scenario.peers[0].script = vec![PeerAction::Disconnect];
+    let scenario = leaving_scenario();
     assert!(progress_fixture(&scenario));
     let (report, ports) = run(&scenario, Plan::from_fuzz(&[]));
     assert_eq!(
@@ -333,32 +340,38 @@ fn honest_progress_applies_only_in_its_fixture() {
     );
 }
 
-/// A run's evidence depends only on its scenario and Plan: Plan A twice in
-/// a row, then Plan B, then A again, gives A's log, property reports,
-/// session facts and adoption facts, with their times, every time. B's log
-/// differs, so the comparison can fail.
+/// The view-side evidence of a run in `ports`: the node's session facts,
+/// which `StableMembership` reads, and its adoption facts with their times,
+/// which discharge the property.
+fn view_evidence(ports: &WirePorts) -> String {
+    format!("{:?}\n{:?}\n", ports.sessions.facts(), adoption(ports))
+}
+
+/// A run's evidence depends only on its scenario and Plan. The progress
+/// witness twice in a row, then the leaving peer's, then each again, gives
+/// each witness's log, property reports and view-side evidence every time.
+/// The two witnesses' logs differ, so the comparison can fail.
 #[test]
-fn the_progress_witness_repeats_a_a_and_a_b_a() {
-    let scenario = progress_scenario();
+fn the_progress_witnesses_repeat_a_a_and_a_b_a() {
+    let progress = || (progress_scenario(), committed_plan());
+    let leaving = || (leaving_scenario(), Plan::from_fuzz(&[]));
     let mut evidence = Vec::new();
-    for plan in [
-        committed_plan(),
-        committed_plan(),
-        inputs(1, 16_384).remove(0),
-        committed_plan(),
-    ] {
+    for (scenario, plan) in [progress(), progress(), leaving(), progress(), leaving()] {
         let (report, ports) = run(&scenario, plan);
         evidence.push((
             report.log.entries().to_vec(),
             report.properties,
-            ports.sessions.facts(),
-            adoption(&ports),
+            view_evidence(&ports),
         ));
     }
-    assert!(adopted_at(&evidence[0].3, 51).is_some());
-    assert_eq!(evidence[0], evidence[1], "plan A, then A");
-    assert_eq!(evidence[0], evidence[3], "plan A, then B, then A");
-    assert_ne!(evidence[0].0, evidence[2].0, "plan B differs");
+    assert!(evidence[0].2.contains("Height(51)"), "{}", evidence[0].2);
+    assert_eq!(evidence[0], evidence[1], "the progress witness, then again");
+    assert_eq!(evidence[0], evidence[3], "then after the leaving peer's");
+    assert_eq!(
+        evidence[2], evidence[4],
+        "the leaving peer's, after the progress witness"
+    );
+    assert_ne!(evidence[0].0, evidence[2].0, "the witnesses differ");
 }
 
 thread_local! {
@@ -367,7 +380,7 @@ thread_local! {
 }
 
 /// `header-sync/wire`'s own run, keeping its ports in [`CAPTURED`] so the
-/// test can read the run's adoption facts after it.
+/// test can read the run's view-side evidence after it.
 fn capture_run(
     scenario: &Value,
     input: PlanInput,
@@ -380,53 +393,74 @@ fn capture_run(
     run_prepared::<HeaderWire>(&scenario, ports, input, sink, None)
 }
 
-/// The adoption facts of the run [`capture_run`] last kept, as text.
+/// The view-side evidence of the run [`capture_run`] last kept.
 fn captured() -> String {
     let ports = CAPTURED
         .with(|captured| captured.borrow_mut().take())
         .expect("the run prepared its ports");
-    format!("{:?}\n", adoption(&ports))
+    view_evidence(&ports)
 }
 
-/// The committed input, recorded, then replayed exactly in a fresh process
-/// of the same test binary, gives the adoption facts and end record its
-/// recorded run gave, and holds the property there too.
+/// Each witness, recorded, then replayed exactly in a fresh process of the
+/// same test binary, gives the view-side evidence and end record its
+/// recorded run gave, and its property outcome there too: the committed
+/// input holds the property, and the leaving peer makes it inconclusive.
 #[test]
-fn the_progress_witness_replays_in_a_fresh_process() {
+fn the_progress_witnesses_replay_in_a_fresh_process() {
     let entry = HarnessEntry {
         run: capture_run,
         ..*harness::find(HeaderWire::NAME).expect("the wire harness is registered")
     };
+    let expected = [
+        PropertyOutcome::Held { applicable: 1 },
+        PropertyOutcome::Inconclusive {
+            reason: "assumption-lost".to_owned(),
+        },
+    ];
     if let Some(dir) = std::env::var_os(CHILD) {
-        let trace = TraceReader::open(Path::new(&dir)).expect("the trace was recorded");
-        // A replay that leaves the trace's picks, draws, observations or end
-        // record errs.
-        let replay = replay_with(&trace, &entry, ReplayOptions::default())
-            .unwrap_or_else(|error| panic!("{error}"));
-        let progress = replay
-            .properties
-            .iter()
-            .find(|report| report.property == HONEST_PROGRESS)
-            .map(|report| &report.outcome);
-        assert_eq!(progress, Some(&PropertyOutcome::Held { applicable: 1 }));
-        // The parent reads the facts from the child's stdout.
-        writeln!(
-            std::io::stdout(),
-            "ADOPTION-BEGIN\n{}ADOPTION-END",
-            captured()
-        )
-        .expect("the test harness captures stdout");
+        for (index, expected) in expected.iter().enumerate() {
+            let trace = TraceReader::open(&Path::new(&dir).join(index.to_string()))
+                .expect("the trace was recorded");
+            // A replay that leaves the trace's picks, draws, observations or
+            // end record errs.
+            let replay = replay_with(&trace, &entry, ReplayOptions::default())
+                .unwrap_or_else(|error| panic!("{error}"));
+            let progress = replay
+                .properties
+                .iter()
+                .find(|report| report.property == HONEST_PROGRESS)
+                .map(|report| &report.outcome);
+            assert_eq!(progress, Some(expected));
+            // The parent reads the evidence from the child's stdout.
+            writeln!(
+                std::io::stdout(),
+                "EVIDENCE-BEGIN\n{}EVIDENCE-END",
+                captured()
+            )
+            .expect("the test harness captures stdout");
+        }
         return;
     }
     let dir = TempDir::new().expect("a temporary directory");
     let input = committed();
-    record(&entry, RecordInput::Input(&input), dir.path()).expect("the witness records");
-    let recorded = captured();
-    assert!(recorded.contains("Height(51)"), "{recorded}");
+    let leaving = serde_json::to_value(leaving_scenario()).expect("a scenario serializes");
+    let witnesses = [
+        RecordInput::Input(&input),
+        RecordInput::Plan {
+            scenario: &leaving,
+            plan: &[],
+        },
+    ];
+    let mut recorded = Vec::new();
+    for (index, witness) in witnesses.into_iter().enumerate() {
+        record(&entry, witness, &dir.path().join(index.to_string())).expect("the witness records");
+        recorded.push(captured());
+    }
+    assert!(recorded[0].contains("Height(51)"), "{}", recorded[0]);
     let child = Command::new(std::env::current_exe().expect("the test binary has a path"))
         .args([
             "--exact",
-            "the_progress_witness_replays_in_a_fresh_process",
+            "the_progress_witnesses_replay_in_a_fresh_process",
             "--nocapture",
             "--test-threads=1",
         ])
@@ -435,10 +469,11 @@ fn the_progress_witness_replays_in_a_fresh_process() {
         .expect("the test binary runs");
     let stdout = String::from_utf8_lossy(&child.stdout);
     assert!(child.status.success(), "{child:?}");
-    let replayed = stdout
-        .split_once("ADOPTION-BEGIN\n")
-        .and_then(|(_, rest)| rest.split_once("ADOPTION-END"))
-        .map(|(facts, _)| facts)
-        .unwrap_or_else(|| panic!("the child prints its adoption facts: {stdout}"));
-    assert_eq!(replayed, recorded);
+    let replayed: Vec<&str> = stdout
+        .split("EVIDENCE-BEGIN\n")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("EVIDENCE-END"))
+        .map(|(evidence, _)| evidence)
+        .collect();
+    assert_eq!(replayed, recorded, "{stdout}");
 }

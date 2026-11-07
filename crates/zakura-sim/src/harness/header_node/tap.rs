@@ -257,6 +257,7 @@ impl TapState {
             step,
             released: work.ledger.released_rounds(),
             unsettled: work.ledger.unsettled_rounds(),
+            pending: work.ledger.pending_unsettled_calls(),
             shutdown: self.shutdown.load(Ordering::Relaxed),
             settled: self.settled.load(Ordering::Relaxed),
         });

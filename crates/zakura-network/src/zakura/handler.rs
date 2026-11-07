@@ -5897,6 +5897,26 @@ fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
     )
 }
 
+/// Runs a request's service call until it answers, the connection closes or
+/// the requester stops the response stream, and returns `None` for a close or
+/// a stop.
+///
+/// The select polls the call before the stop. A call that returns its protocol
+/// rejection before its first `Pending` therefore reports it even when the
+/// stop is already recorded.
+async fn call_until_stopped<T>(
+    connection_token: &CancellationToken,
+    call: impl future::Future<Output = T>,
+    stopped: std::pin::Pin<&mut impl future::Future>,
+) -> Option<T> {
+    zakura_rt::select! {
+        biased;
+        _ = connection_token.cancelled() => None,
+        response = call => Some(response),
+        _ = stopped => None,
+    }
+}
+
 async fn request_stream_worker(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -5979,25 +5999,57 @@ async fn request_stream_worker(
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
         return;
     };
+    // A requester that gives up stops the response stream. The stop ends the
+    // output wait and the service's call, so the abandoned request releases
+    // its funding and no longer runs its backend work. The connection task
+    // already answered the stop with RESET_STREAM.
+    //
+    // A stop gives up the answer, not the protocol: a request the service
+    // would reject as protocol-invalid still closes the connection. A stop
+    // during the output wait runs the service's checks on the frame. A stop
+    // during the call can win only after the call's first `Pending`, because
+    // the select polls the call first, and a service returns its protocol
+    // rejections before then (`RequestResponseService::request_frame`).
+    let stopped = send.stopped();
+    zakura_rt::pin!(stopped);
     let mut output = zakura_rt::select! {
         biased;
         _ = context.connection_token.cancelled() => return,
         output = context.resources.output.admit(bound.bytes) => output,
+        stop = &mut stopped => {
+            if stop.is_ok() {
+                if let Err(SinkReject::Protocol(error)) =
+                    registry.check_request(prelude.stream_kind, &frame)
+                {
+                    debug!(
+                        ?error,
+                        "Zakura inbound sink rejected a stopped protocol-invalid request"
+                    );
+                    context.close_cause.record("request_protocol_reject");
+                    context.connection_token.cancel();
+                }
+            }
+            return;
+        }
     };
 
     // The raw frame's grant ends with the service's call, which cancelling the
-    // connection also ends.
-    let response = zakura_rt::select! {
-        biased;
-        _ = context.connection_token.cancelled() => return,
-        response = registry.request(
+    // connection or stopping the stream also ends.
+    let Some(response) = call_until_stopped(
+        &context.connection_token,
+        registry.request(
             context.peer_id.clone(),
             prelude.stream_kind,
             request_id,
             response_frame_cap,
             context.limits.max_message_bytes,
             frame,
-        ) => response,
+        ),
+        stopped,
+    )
+    .await
+    else {
+        return;
     };
     drop(raw_grant);
     let response_frames = match response {

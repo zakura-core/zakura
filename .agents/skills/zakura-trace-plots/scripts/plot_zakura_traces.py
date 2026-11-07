@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import gzip
 import html
-import json
+import io
 import math
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -79,41 +81,59 @@ def load_csv_throughput(csv_path: Path | None) -> tuple[list[tuple[float, float,
     return throughput, rows
 
 
+STATE_EVENTS = {"block_sync_state", "block_sync_pipeline_state"}
+
+
+def trace_segments(path: Path) -> list[Path]:
+    """Return rotated `.N` and `.N.gz` segments oldest first, then the current file."""
+    pattern = re.compile(re.escape(path.name) + r"\.(\d+)(?:\.gz)?")
+    retained = sorted(
+        (int(match.group(1)), item)
+        for item in path.parent.iterdir()
+        if (match := pattern.fullmatch(item.name))
+    )
+    return [item for _, item in reversed(retained)] + ([path] if path.exists() else [])
+
+
+def read_csv_rows(path: Path):
+    for segment in trace_segments(path):
+        data = segment.read_bytes()
+        if segment.name.endswith(".gz"):
+            data = gzip.decompress(data)
+        yield from csv.DictReader(io.StringIO(data.decode("utf-8"), newline=""))
+
+
 def load_trace_states(trace_dir: Path) -> list[tuple[float, float, float, float, float, float, float, str]]:
-    path = trace_dir / "block_sync.jsonl"
-    if not path.exists():
-        raise SystemExit(f"missing block_sync.jsonl in {trace_dir}")
+    path = trace_dir / "block_sync.csv"
+    if not trace_segments(path):
+        raise SystemExit(f"missing block_sync.csv in {trace_dir}")
 
     states: list[tuple[float, float, float, float, float, float, float, str]] = []
     first_ts: float | None = None
 
-    with path.open() as trace:
-        for line in trace:
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    for row in read_csv_rows(path):
+        # Per-commit pipeline rows carry the same pipeline counters as the
+        # periodic full snapshots.
+        if row.get("event") not in STATE_EVENTS:
+            continue
 
-            if row.get("event") != "block_sync_state":
-                continue
+        ts = number(row.get("ts")) / 1_000_000.0
+        if first_ts is None:
+            first_ts = ts
 
-            ts = number(row.get("ts")) / 1_000_000.0
-            if first_ts is None:
-                first_ts = ts
+        elapsed = ts - first_ts
+        height = number(row.get("verified_block_tip"))
+        if height <= 0:
+            continue
 
-            elapsed = ts - first_ts
-            height = number(row.get("verified_block_tip"))
-            if height <= 0:
-                continue
-
-            applying = number(row.get("applying"))
-            reorder = number(row.get("reorder"))
-            # Floor HoL: verifier/apply has almost nothing, but later bodies are buffered.
-            hol_stall = 1.0 if applying <= 10 and reorder >= 100 else 0.0
-            applying_bytes = number(row.get("applying_buffered_bytes"))
-            retained_bytes = number(row.get("retained_pipeline_wire_bytes"))
-            floor_state = str(row.get("floor_gap_state") or "")
-            states.append((elapsed, height, applying, reorder, hol_stall, applying_bytes, retained_bytes, floor_state))
+        applying = number(row.get("applying"))
+        reorder = number(row.get("reorder"))
+        # Floor HoL: verifier/apply has almost nothing, but later bodies are buffered.
+        hol_stall = 1.0 if applying <= 10 and reorder >= 100 else 0.0
+        applying_bytes = number(row.get("applying_buffered_bytes"))
+        retained_bytes = number(row.get("retained_pipeline_wire_bytes"))
+        floor_state = str(row.get("floor_gap_state") or "")
+        states.append((elapsed, height, applying, reorder, hol_stall, applying_bytes, retained_bytes, floor_state))
 
     return states
 
@@ -256,7 +276,7 @@ def write_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace_dir", help="Directory containing block_sync.jsonl and related Zakura traces")
+    parser.add_argument("trace_dir", help="Directory containing block_sync.csv and related Zakura traces")
     parser.add_argument("--csv", help="Optional feed_run CSV. Auto-detected when omitted.")
     parser.add_argument("--out-dir", default="perf-artifacts", help="Directory for generated artifacts")
     parser.add_argument("--prefix", help="Output filename prefix. Defaults to the trace label.")

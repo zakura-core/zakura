@@ -104,6 +104,9 @@ pub(super) fn load(
             let Ok(key) = key.into_string() else {
                 continue;
             };
+            if zakura_jsonl_trace::RUNTIME_ENV_VARS.contains(&key.as_str()) {
+                continue;
+            }
             if let Some(key) = key.strip_prefix(&prefix_pattern) {
                 let leaf = key.rsplit("__").next().unwrap_or(key);
                 if is_sensitive_leaf_key(leaf) {

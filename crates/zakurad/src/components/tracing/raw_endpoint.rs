@@ -1,4 +1,4 @@
-//! Opt-in, loopback-only HTTP access to the node's JSONL trace files.
+//! Opt-in, loopback-only HTTP access to the node's CSV trace files.
 //!
 //! `GET /traces` lists the tables. `GET /traces/<table>` streams one table's
 //! file with standard byte ranges, and its `ETag` names the file so that a

@@ -1,6 +1,6 @@
 # Raw trace endpoint
 
-The optional endpoint serves the node's structured JSONL trace files over local
+The optional endpoint serves the node's structured CSV trace files over local
 HTTP, so that collectors can copy and follow them while the node appends. It
 serves the existing files only. It does not enable more trace events, and it
 does not export application logs or OpenTelemetry spans.
@@ -22,12 +22,12 @@ node startup. The endpoint requires Unix.
 | Request | Response |
 | --- | --- |
 | `GET /traces` | `application/json` index of the tables. |
-| `GET /traces/<table>` | `application/x-ndjson`: the table's file, `<trace_dir>/<table>.jsonl`. |
+| `GET /traces/<table>` | `text/csv`: the table's file, `<trace_dir>/<table>.csv`. |
 | `HEAD` on either path | The same headers, with no body. |
 
 A table name is 1 to 64 characters from `a-z`, `0-9` and `_`. The endpoint
 serves every regular file in `trace_dir` whose name is a table name followed by
-`.jsonl`. It never follows a symlink.
+`.csv`. It never follows a symlink.
 
 The index lists each table's name, its length in bytes and its `ETag`:
 
@@ -37,7 +37,7 @@ The index lists each table's name, its length in bytes and its `ETag`:
 
 ```sh
 curl --fail http://127.0.0.1:9009/traces
-curl --fail http://127.0.0.1:9009/traces/block_sync -o block_sync.jsonl
+curl --fail http://127.0.0.1:9009/traces/block_sync -o block_sync.csv
 ```
 
 A response ends at the file's length when the node opened it. Rows appended

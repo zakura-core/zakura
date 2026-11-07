@@ -2,7 +2,7 @@
 //!
 //! Each test drives the real reactor through a distinct adversarial shape and asserts
 //! the core invariants (no stall, contiguous/correct commit, bounded in-flight). They
-//! emit the standard JSONL; run with `ZAKURA_TEST_TRACE=keep` and point the analysis
+//! emit the standard CSV; run with `ZAKURA_TEST_TRACE=keep` and point the analysis
 //! scripts at `target/zakura-traces/<name>/node-00` to inspect a run.
 
 use std::time::Duration;

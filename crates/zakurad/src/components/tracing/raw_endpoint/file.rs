@@ -20,7 +20,7 @@ pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 /// The index lists at most this many tables, so its size stays bounded.
 const MAX_LISTED_TABLES: usize = 1024;
 
-const SUFFIX: &str = ".jsonl";
+const SUFFIX: &str = ".csv";
 
 /// Whether `name` can name a table: 1 to 64 lowercase ASCII letters, digits or
 /// underscores. This rule alone keeps request paths inside the trace directory.
@@ -40,7 +40,7 @@ pub(super) enum OpenError {
     Io(io::Error),
 }
 
-/// One table's JSONL file, open for reading.
+/// One table's CSV file, open for reading.
 pub(super) struct TraceFile {
     file: File,
     len: u64,
@@ -48,7 +48,7 @@ pub(super) struct TraceFile {
 }
 
 impl TraceFile {
-    /// Open `<directory>/<table>.jsonl`. The open never follows a symlink and
+    /// Open `<directory>/<table>.csv`. The open never follows a symlink and
     /// never blocks on a FIFO.
     pub(super) fn open(directory: &Path, table: &str) -> Result<Self, OpenError> {
         debug_assert!(is_table_name(table), "callers validate table names");
@@ -136,7 +136,7 @@ pub(super) struct TableEntry {
     pub(super) etag: String,
 }
 
-/// List the regular `*.jsonl` files with table names, sorted by name. Symlinks
+/// List the regular `*.csv` files with table names, sorted by name. Symlinks
 /// are skipped, and the list stops at [`MAX_LISTED_TABLES`] entries.
 pub(super) fn list_tables(directory: &Path) -> io::Result<Vec<TableEntry>> {
     let mut tables = Vec::new();
@@ -206,7 +206,7 @@ mod tests {
             "../conn",
             "conn/x",
             "Conn",
-            "conn.jsonl",
+            "conn.csv",
             "c-d",
             &"x".repeat(65),
         ] {
@@ -218,7 +218,7 @@ mod tests {
     fn ranges_preserve_exact_bytes_across_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let data: Vec<u8> = (0..3 * CHUNK_BYTES + 7).map(|i| (i % 251) as u8).collect();
-        std::fs::write(dir.path().join("conn.jsonl"), &data).unwrap();
+        std::fs::write(dir.path().join("conn.csv"), &data).unwrap();
         let open = || TraceFile::open(dir.path(), "conn").unwrap();
         assert_eq!(open().len(), data.len() as u64);
         assert_eq!(read_all(open(), 0, data.len() as u64).unwrap(), data);
@@ -233,7 +233,7 @@ mod tests {
     fn appends_keep_the_tag_and_replacement_changes_it() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("conn.jsonl");
+        let path = dir.path().join("conn.csv");
         std::fs::write(&path, b"first\n").unwrap();
         let before = TraceFile::open(dir.path(), "conn").unwrap();
         let mut writer = OpenOptions::new().append(true).open(&path).unwrap();
@@ -244,7 +244,7 @@ mod tests {
         // A file opened before an append still ends at its opening length.
         assert_eq!(read_all(before, 0, 6).unwrap(), b"first\n");
 
-        std::fs::rename(&path, dir.path().join("old.jsonl")).unwrap();
+        std::fs::rename(&path, dir.path().join("old.csv")).unwrap();
         std::fs::write(&path, b"first\n").unwrap();
         assert_ne!(
             TraceFile::open(dir.path(), "conn").unwrap().etag(),
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn truncation_during_a_read_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("conn.jsonl");
+        let path = dir.path().join("conn.csv");
         std::fs::write(&path, vec![b'x'; 2 * CHUNK_BYTES]).unwrap();
         let file = TraceFile::open(dir.path(), "conn").unwrap();
         File::options()
@@ -280,13 +280,12 @@ mod tests {
             Err(OpenError::NotFound)
         ));
         std::fs::write(dir.path().join("secret"), b"secret\n").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("secret"), dir.path().join("link.jsonl"))
-            .unwrap();
-        std::fs::create_dir(dir.path().join("dir.jsonl")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret"), dir.path().join("link.csv")).unwrap();
+        std::fs::create_dir(dir.path().join("dir.csv")).unwrap();
         let _socket =
-            std::os::unix::net::UnixListener::bind(dir.path().join("socket.jsonl")).unwrap();
+            std::os::unix::net::UnixListener::bind(dir.path().join("socket.csv")).unwrap();
         let made_fifo = std::process::Command::new("mkfifo")
-            .arg(dir.path().join("fifo.jsonl"))
+            .arg(dir.path().join("fifo.csv"))
             .status()
             .unwrap();
         assert!(made_fifo.success());
@@ -304,12 +303,12 @@ mod tests {
     #[test]
     fn the_index_lists_only_regular_table_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("conn.jsonl"), b"row\n").unwrap();
-        std::fs::write(dir.path().join("block_sync.jsonl"), b"").unwrap();
-        std::fs::write(dir.path().join("Bad.jsonl"), b"row\n").unwrap();
+        std::fs::write(dir.path().join("conn.csv"), b"row\n").unwrap();
+        std::fs::write(dir.path().join("block_sync.csv"), b"").unwrap();
+        std::fs::write(dir.path().join("Bad.csv"), b"row\n").unwrap();
         std::fs::write(dir.path().join("notes.txt"), b"row\n").unwrap();
-        std::fs::create_dir(dir.path().join("dir.jsonl")).unwrap();
-        std::os::unix::fs::symlink(dir.path().join("conn.jsonl"), dir.path().join("link.jsonl"))
+        std::fs::create_dir(dir.path().join("dir.csv")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("conn.csv"), dir.path().join("link.csv"))
             .unwrap();
         let tables = list_tables(dir.path()).unwrap();
         let names: Vec<_> = tables

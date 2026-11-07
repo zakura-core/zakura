@@ -267,10 +267,7 @@ impl Endpoint {
             ETAG,
             HeaderValue::from_str(&etag).expect("tags hold only hex digits, dashes and quotes"),
         );
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/csv"));
         let content_range = match plan {
             Plan::Partial { start, end } => Some(format!("bytes {start}-{}/{len}", end - 1)),
             Plan::Unsatisfiable => Some(format!("bytes */{len}")),

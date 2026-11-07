@@ -311,7 +311,7 @@ mod tests {
                 "/traces/%2e%2e%2fsecret",
                 StatusCode::NOT_FOUND,
             ),
-            (Method::GET, "/traces/conn.jsonl", StatusCode::NOT_FOUND),
+            (Method::GET, "/traces/conn.csv", StatusCode::NOT_FOUND),
             (Method::GET, "/traces/a/b", StatusCode::NOT_FOUND),
             (Method::GET, "/metrics", StatusCode::NOT_FOUND),
         ] {

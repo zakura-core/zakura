@@ -101,7 +101,7 @@ impl HeaderSyncReactor {
                 record.rejections.already_tried.into(),
             );
             row.insert(
-                "supplier_status_wait".into(),
+                hs_trace::SUPPLIER_STATUS_WAIT.into(),
                 record.rejections.supplier_status_wait.into(),
             );
             row.insert(

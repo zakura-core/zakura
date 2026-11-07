@@ -118,14 +118,14 @@ fn append(path: &Path, bytes: &[u8]) {
 async fn whole_files_heads_and_the_index() {
     let dir = tempfile::tempdir().unwrap();
     let data = b"{\"event\":1}\npartial";
-    std::fs::write(dir.path().join("block_sync.jsonl"), data).unwrap();
-    std::fs::write(dir.path().join("conn.jsonl"), b"").unwrap();
+    std::fs::write(dir.path().join("block_sync.csv"), data).unwrap();
+    std::fs::write(dir.path().join("conn.csv"), b"").unwrap();
     let server = Server::start(dir.path()).await;
 
     let whole = server.get("/traces/block_sync", &[]).await;
     assert_eq!(whole.status, 200);
     assert_eq!(whole.body, data);
-    assert_eq!(whole.header("content-type"), Some("application/x-ndjson"));
+    assert_eq!(whole.header("content-type"), Some("text/csv"));
     assert_eq!(whole.header("cache-control"), Some("no-store"));
     assert_eq!(whole.header("accept-ranges"), Some("bytes"));
     let etag = whole.header("etag").unwrap().to_owned();
@@ -157,7 +157,7 @@ async fn whole_files_heads_and_the_index() {
 #[tokio::test]
 async fn a_follower_reads_only_appended_bytes_and_notices_replacement() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("conn.jsonl");
+    let path = dir.path().join("conn.csv");
     std::fs::write(&path, b"first\n").unwrap();
     let server = Server::start(dir.path()).await;
 
@@ -182,7 +182,7 @@ async fn a_follower_reads_only_appended_bytes_and_notices_replacement() {
     cursor += grown.body.len();
 
     // A replaced file fails If-Range, so the response is the whole new file.
-    std::fs::rename(&path, dir.path().join("old.jsonl")).unwrap();
+    std::fs::rename(&path, dir.path().join("old.csv")).unwrap();
     std::fs::write(&path, b"new file\n").unwrap();
     let range = format!("bytes={cursor}-");
     let resume = [("range", range.as_str()), ("if-range", etag.as_str())];
@@ -207,7 +207,7 @@ async fn a_follower_reads_only_appended_bytes_and_notices_replacement() {
 async fn large_files_and_ranges_stream_without_a_size_cap() {
     let dir = tempfile::tempdir().unwrap();
     let data: Vec<u8> = (0..5 * 1024 * 1024 + 3).map(|i| (i % 253) as u8).collect();
-    std::fs::write(dir.path().join("conn.jsonl"), &data).unwrap();
+    std::fs::write(dir.path().join("conn.csv"), &data).unwrap();
     let server = Server::start(dir.path()).await;
     assert_eq!(server.get("/traces/conn", &[]).await.body, data);
     let tail = server
@@ -222,9 +222,11 @@ async fn large_files_and_ranges_stream_without_a_size_cap() {
 
 #[tokio::test]
 async fn the_node_writer_appends_while_a_response_streams() {
-    use zakura_jsonl_trace::{JsonlTraceConfig, JsonlTracer, JsonlWriteEvent};
+    use zakura_jsonl_trace::{
+        JsonlTraceConfig, JsonlTracer, JsonlWriteEvent, TraceFormat, ENVELOPE_COLUMNS, EXTRA_COLUMN,
+    };
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("conn.jsonl");
+    let path = dir.path().join("conn.csv");
     let guard = JsonlTracer::spawn_guard_with_config(
         dir.path().to_owned(),
         JsonlTraceConfig {
@@ -238,8 +240,10 @@ async fn the_node_writer_appends_while_a_response_streams() {
         tracer
             .try_send(JsonlWriteEvent {
                 table: "conn",
-                file_name: "conn.jsonl",
-                line: format!("{{\"value\":{value}}}").into_bytes(),
+                file_name: "conn.csv",
+                format: TraceFormat::Csv,
+                header: &["value"],
+                line: value.to_string().into_bytes(),
             })
             .unwrap()
     };
@@ -255,22 +259,25 @@ async fn the_node_writer_appends_while_a_response_streams() {
             .unwrap();
         }
     };
+    // The writer starts the file with the envelope and table columns.
+    let mut header = ENVELOPE_COLUMNS.to_vec();
+    header.extend(["value", EXTRA_COLUMN]);
+    let first_file = format!("{}\n1\n", header.join(","));
+    let first_len = first_file.len() as u64;
     send(1);
-    wait_for_len(12).await;
+    wait_for_len(first_len).await;
     let server = Server::start(dir.path()).await;
     let first = server.get("/traces/conn", &[]).await;
-    assert_eq!(first.body, b"{\"value\":1}\n");
+    assert_eq!(first.body, first_file.as_bytes());
     let etag = first.header("etag").unwrap().to_owned();
     send(2);
-    wait_for_len(24).await;
+    wait_for_len(first_len + 2).await;
+    let range = format!("bytes={first_len}-");
     let next = server
-        .get(
-            "/traces/conn",
-            &[("range", "bytes=12-"), ("if-range", &etag)],
-        )
+        .get("/traces/conn", &[("range", &range), ("if-range", &etag)])
         .await;
     assert_eq!(next.status, 206);
-    assert_eq!(next.body, b"{\"value\":2}\n");
+    assert_eq!(next.body, b"2\n");
     server.stop().await;
     tokio::time::timeout(Duration::from_secs(2), guard.shutdown())
         .await
@@ -280,7 +287,7 @@ async fn the_node_writer_appends_while_a_response_streams() {
 #[tokio::test]
 async fn stalled_filesystem_threads_refuse_requests_until_released() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("conn.jsonl"), b"row\n").unwrap();
+    std::fs::write(dir.path().join("conn.csv"), b"row\n").unwrap();
     let endpoint = Endpoint {
         directory: dir.path().to_owned(),
         authority: "127.0.0.1:9000".to_owned(),
@@ -322,7 +329,7 @@ async fn stalled_filesystem_threads_refuse_requests_until_released() {
 #[tokio::test]
 async fn excess_connections_wait_and_shutdown_closes_open_ones() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("conn.jsonl"), b"row\n").unwrap();
+    std::fs::write(dir.path().join("conn.csv"), b"row\n").unwrap();
     let server = Server::start(dir.path()).await;
     let mut idle = Vec::new();
     for _ in 0..MAX_CONNECTIONS {
@@ -379,7 +386,7 @@ async fn excess_connections_wait_and_shutdown_closes_open_ones() {
 #[tokio::test]
 async fn malformed_requests_leave_the_listener_usable() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("conn.jsonl"), b"row\n").unwrap();
+    std::fs::write(dir.path().join("conn.csv"), b"row\n").unwrap();
     let server = Server::start(dir.path()).await;
     let address = server.address;
     for request in [

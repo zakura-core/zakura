@@ -65,7 +65,7 @@ impl From<Config> for InnerConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct InnerConfig {
-    /// Optional loopback-only HTTP endpoint for raw JSONL trace streams.
+    /// Optional loopback-only HTTP endpoint for raw CSV trace streams.
     /// Requires `[network.zakura].trace_dir`; disabled by default.
     /// See `docs/raw-trace-endpoint.md` for access controls and collection limits.
     #[serde(skip_serializing_if = "Option::is_none")]

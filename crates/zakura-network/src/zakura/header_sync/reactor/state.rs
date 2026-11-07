@@ -1200,7 +1200,7 @@ pub(super) const VCT_LOCAL_OPERATION_FATAL_AFTER: std::time::Duration =
 /// Minimum interval between repeated stalled-repair trace rows for one repair generation.
 ///
 /// The reactor emits the first row immediately, then samples while nothing changes. The bound
-/// keeps a long stalled repair from dominating the header-sync JSONL trace.
+/// keeps a long stalled repair from dominating the header-sync CSV trace.
 pub(super) const VCT_REPAIR_STALL_TRACE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10);
 

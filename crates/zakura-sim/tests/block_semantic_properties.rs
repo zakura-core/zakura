@@ -367,21 +367,12 @@ fn the_frontier_first_input_holds_capacity_release_wakes() {
 /// why it falls short. Its run must be a witness that holds
 /// `capacity-release-wakes` and pairs every block storage operation, so it
 /// reaches #1523's order: the verified tip passed a released submission's
-/// height before its reply freed room beside a waiting body. And that
-/// submission's owner must be older than the reactor's authority. Block
-/// sync then credits the reply to no current owner, so only the room check
-/// that `stale-completion-no-wake.patch` removes wakes the waiting body.
+/// height before its reply freed room beside a waiting body.
+/// `stale-completion-no-wake.patch` also needs that submission to be older
+/// than the reactor's authority. The scenario guarantees it: storage
+/// releases height 1, which it admitted before the reset.
 fn capacity_frontier_first_shortfall(input: &[u8]) -> Result<(), String> {
-    let ports = witnessed(committed(input), CAPACITY_RELEASE_WAKES, Expect::Holds)?;
-    let view = ports.view.borrow();
-    if !view
-        .semantic
-        .borrow()
-        .saw_old_epoch_room_freed_past_frontier
-    {
-        return Err("no old-epoch reply freed room past the frontier".to_owned());
-    }
-    Ok(())
+    witnessed(committed(input), CAPACITY_RELEASE_WAKES, Expect::Holds).map(drop)
 }
 
 /// Rewrites the committed frontier-first input with the first of

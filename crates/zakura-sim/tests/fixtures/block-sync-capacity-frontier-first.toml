@@ -4,9 +4,9 @@
 # The rest is Plan bytes from the simulator tests' fuzz inputs:
 # `regenerate_capacity_frontier_first_input` in block_semantic_properties.rs
 # writes the first one whose run has block sync handle a detached commit's
-# tip before its reply, so the reply of an old-epoch submission frees room
-# past the frontier beside a waiting body (#1523's order). Rerun it when a
-# block-sync change moves the input off that order.
+# tip before its reply, so the reply frees room past the frontier beside a
+# waiting body (#1523's order). Rerun it when a block-sync change moves the
+# input off that order.
 harness = "block-sync/storage"
 generator = 2
 sha256 = "ad8a54adb587b783132d3491c5cfe5078d8d5dd0ad41b0b9818c899a52599e79"

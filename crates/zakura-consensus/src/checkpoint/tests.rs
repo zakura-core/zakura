@@ -2054,3 +2054,66 @@ fn state_checkpoint_commit_context_errors_are_unscored() {
 
     assert_eq!(err.misbehavior_score(), 0);
 }
+
+/// Local origin belongs to each request, even while waiting for the rest of its range.
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_local_checkpoint_commits_are_announced_after_callers_are_dropped() {
+    use zakura_chain::serialization::ZcashSerialize;
+    let _init = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .range(0..=3)
+        .map(|(_, bytes)| Arc::<Block>::zcash_deserialize(*bytes).unwrap())
+        .collect();
+    let zakura_state::InitializedState {
+        state,
+        read_state: read,
+        block_announcements: mut announcements,
+        ..
+    } = zs::init_test_services(&Mainnet).await;
+    let list: BTreeMap<_, _> = [0usize, 3]
+        .into_iter()
+        // The only indices are 0 and 3, so both fit in u32.
+        .map(|i| (block::Height(i as u32), blocks[i].hash()))
+        .collect();
+    let mut verifier =
+        CheckpointVerifier::from_list(list, &Mainnet, None, crate::transaction::boxed_state(state))
+            .unwrap();
+    verifier.call(blocks[0].clone().into()).await.unwrap();
+    assert_eq!(
+        announcements.recv(true).await.unwrap().origin,
+        zs::BlockOrigin::Network
+    );
+    for block in &blocks[1..3] {
+        let origin = zs::BlockOrigin::LocalSubmission {
+            size: block.zcash_serialized_size(),
+        };
+        drop(verifier.call_with_origin(block.clone().into(), origin));
+    }
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
+    let last = verifier.call(blocks[3].clone().into());
+    for block in &blocks[1..3] {
+        let announcement = timeout(Duration::from_secs(10), announcements.recv(false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(announcement.hash, block.hash());
+        assert_eq!(
+            announcement.origin,
+            zs::BlockOrigin::LocalSubmission {
+                size: block.zcash_serialized_size()
+            }
+        );
+        assert!(matches!(
+            read.clone()
+                .oneshot(zs::ReadRequest::BlockInfo(block.hash().into()))
+                .await
+                .unwrap(),
+            zs::ReadResponse::BlockInfo(Some(_))
+        ));
+    }
+    last.await.unwrap();
+    let ordinary = announcements.recv(true).await.unwrap();
+    assert_eq!(ordinary.hash, blocks[3].hash());
+    assert_eq!(ordinary.origin, zs::BlockOrigin::Network);
+    assert!(futures::poll!(Box::pin(announcements.recv(true))).is_pending());
+}

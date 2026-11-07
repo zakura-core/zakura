@@ -822,6 +822,8 @@ mod tests {
                         common_ancestor: point(0),
                         target: point(1),
                         headers: 1,
+                        work: None,
+                        first: None,
                     },
                     digest: String::new(),
                     call: Some(id),

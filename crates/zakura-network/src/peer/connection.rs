@@ -2164,6 +2164,8 @@ where
 
         // Close channels first, so other tasks can start shutting down.
         self.client_rx.close();
+        self.block_advert_rx.close();
+        self.block_uploads.disconnected();
         self.request_slot.set_busy(true);
 
         // Update the shared error slot
@@ -2236,7 +2238,6 @@ where
     Tx: Sink<Message, Error = SerializationError> + Unpin,
 {
     fn drop(&mut self) {
-        self.block_uploads.disconnected();
         self.shutdown(PeerError::ConnectionDropped);
 
         self.erase_state_metrics();

@@ -40,7 +40,9 @@ pub const HEADER_CHUNK_BUDGET_CAPACITY: usize =
 /// Receives reactor events as they happen.
 ///
 /// Called synchronously on the reactor task, never while the reactor holds a
-/// lock, except that the header budget reports a return under its own lock.
+/// lock, with two exceptions. The header budget reports a return under its
+/// own lock. A session's subscriber reports credit under the session's
+/// subscriber lock, and a grant also under its subscription tools' lock.
 /// An implementation must not block, yield, take a `zakura_rt` lock, or
 /// call into the reactor. A panic in `observe` unwinds the reactor task, even
 /// when it is called inside a port future.

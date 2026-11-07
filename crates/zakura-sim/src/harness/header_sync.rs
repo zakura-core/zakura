@@ -48,7 +48,8 @@ use crate::{
     observe::StorageFact,
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
-        PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
+        PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
+        NODE_ADDR,
     },
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
@@ -832,6 +833,8 @@ pub struct WirePorts {
     pub sessions: SessionEvidence,
     /// The peers' records the identity map hasn't placed yet.
     records: PeerRecords,
+    /// The peers that closed their own connection.
+    closed: PeerCloses,
     /// The node's header capacity accounting, which its tap fills during the
     /// run.
     pub reservations: ReservationEvidence,
@@ -870,6 +873,8 @@ pub struct HeaderWire {
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
     sessions: SessionEvidence,
+    /// The peers that closed their own connection.
+    closed: PeerCloses,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -987,6 +992,7 @@ impl Subsystem for HeaderWire {
             adoption: Rc::default(),
             sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
+            closed: PeerCloses::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
         }
@@ -1086,6 +1092,7 @@ impl Subsystem for HeaderWire {
                 listening,
                 chain: ports.chains[index].clone(),
                 records: ports.records.clone(),
+                closed: ports.closed.clone(),
                 taken: 0,
             };
             sim.scheduler().spawn_root("peer", task.run());
@@ -1101,6 +1108,7 @@ impl Subsystem for HeaderWire {
             adoption,
             faults,
             sessions: ports.sessions,
+            closed: ports.closed,
             _keep: Box::new(node),
         }
     }
@@ -1229,12 +1237,18 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
 }
 
 /// Whether `assume` holds after a step of `wire`: `StableMembership` while
-/// `peer-0`'s header session is the node's only membership
-/// ([`SessionEvidence::stable_membership`]), and every other assumption
-/// always, since the scenario enforces what it declares.
+/// `peer-0` is the node's only membership
+/// ([`SessionEvidence::stable_membership`]) and hasn't closed its own
+/// connection, and every other assumption always, since the scenario
+/// enforces what it declares. Only the environment breaks it: `peer-0`'s
+/// scripted close, or another peer. A node that drops `peer-0` leaves it
+/// holding, so `header-sync/honest-progress` runs to its deadline and is
+/// violated there.
 fn wire_holds(wire: &HeaderWire, assume: Assume) -> bool {
     match assume {
-        Assume::StableMembership => wire.sessions.stable_membership("peer-0"),
+        Assume::StableMembership => {
+            wire.sessions.stable_membership("peer-0") && !wire.closed.borrow().contains(&0)
+        }
         _ => true,
     }
 }

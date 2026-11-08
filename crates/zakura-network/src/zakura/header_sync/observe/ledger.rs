@@ -65,9 +65,10 @@
 //! inconclusive and doesn't count it stuck, and
 //! [`HeaderWorkLedger::accounting_tainted`] stops the tap comparing the
 //! ledger's totals with the probe's. Checks that don't read a tainted
-//! part still judge, such as a round's queue-held leases, its source, or
-//! a lease returning while a call holds a round whose counts alone are
-//! tainted.
+//! part still judge: a round's queue-held leases, its source and first
+//! ancestor, a call's owner up to the tip a bounded prepare narrows to, a
+//! payload as long as the call holds, and a lease returning while a call
+//! holds a round whose counts alone are tainted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1048,12 +1049,15 @@ impl HeaderWorkLedger {
             )];
         };
         let mut found = Vec::new();
-        // A narrowed owner is judged by the staged tip, which tainted
-        // counts don't give.
-        if owner != round.request.owner
-            && !taint.counts
-            && !same_work(owner, round.request.owner, round.hashes.last().copied())
-        {
+        let tip = round.hashes.last().copied();
+        // A narrowed owner is judged by the staged tip, which tainted counts
+        // don't give, so then any tip passes.
+        let same = if taint.counts {
+            same_work_to_any_tip(owner, round.request.owner)
+        } else {
+            same_work(owner, round.request.owner, tip)
+        };
+        if !same {
             found.push(claim(
                 ClaimRule::WrongOwner,
                 format!(
@@ -1063,13 +1067,11 @@ impl HeaderWorkLedger {
                 ),
             ));
         }
-        let tip = round.hashes.last().copied();
         let payload_checked = payload.clone();
         if let Some(payload) = payload.filter(|payload| {
-            !taint.counts
-                && (tip != Some(payload.target)
-                    || payload.hashes != round.hashes
-                    || payload.hashes.len() != headers)
+            payload.hashes.len() != headers
+                || (!taint.counts
+                    && (tip != Some(payload.target) || payload.hashes != round.hashes))
         }) {
             found.push(claim(
                 ClaimRule::WrongPayload,
@@ -1393,6 +1395,19 @@ fn same_work(
             call == narrowed
         }
         _ => false,
+    }
+}
+
+/// [`same_work`] for a round whose staged tip is unknown: the same owner,
+/// or the same ordinary owner narrowed to any tip.
+fn same_work_to_any_tip(call: HeaderSyncWorkOwner, staged: HeaderSyncWorkOwner) -> bool {
+    match (call, staged) {
+        (HeaderSyncWorkOwner::Header(call_owner), HeaderSyncWorkOwner::Header(_)) => same_work(
+            call,
+            staged,
+            Some(call_owner.authority.branch.target_tip_hash),
+        ),
+        _ => call == staged,
     }
 }
 
@@ -2012,6 +2027,52 @@ mod tests {
             leases: Vec::new(),
         });
         claimed_as(unowned, ClaimRule::HeldUnowned);
+    }
+
+    /// A round whose staged count a claim tainted still holds only its own
+    /// owner's calls, each sending as many headers as it holds. The claim
+    /// is recorded first.
+    #[test]
+    fn a_tainted_round_still_judges_its_owner_and_payload_length() {
+        // The page reports the round holding none of the 3 it staged.
+        let base = vec![
+            opened(1, 1, 5),
+            bound(1, 1, 1),
+            started(1, 1),
+            staged(1, 1, 1, 3, 2, 0),
+        ];
+        let held = |headers| ReactorEvent::HeadersHeld {
+            call: 1,
+            kind: StorageCallKind::Prepare,
+            peer: peer(1),
+            incarnation: 1,
+            headers,
+            leases: Vec::new(),
+        };
+        let claimed = |events: Vec<ReactorEvent>, rules: &[ClaimRule]| {
+            let mut ledger = fold(events).expect("claims don't refuse the history");
+            let found: Vec<_> = ledger.take_claims().iter().map(|c| c.rule).collect();
+            assert_eq!(found, rules);
+        };
+        let mut other = owner();
+        if let HeaderSyncWorkOwner::Header(header) = &mut other {
+            header.request_id = NonZeroU64::new(2).expect("two is nonzero");
+        }
+        let mut swapped = base.clone();
+        swapped.extend([dispatched(1, prepare_of(1, other, 3)), held(3)]);
+        claimed(swapped, &[ClaimRule::UnstagedPage, ClaimRule::WrongOwner]);
+        let mut short = base.clone();
+        short.extend([dispatched(1, prepare_of(1, owner(), 3)), held(2)]);
+        claimed(short, &[ClaimRule::UnstagedPage, ClaimRule::WrongPayload]);
+        // The staged tip is unknown, so a prepare narrowed to any tip, with
+        // any headers, passes.
+        let mut narrowed = owner();
+        if let HeaderSyncWorkOwner::Header(header) = &mut narrowed {
+            header.authority.branch.target_tip_hash = block::Hash([4; 32]);
+        }
+        let mut fine = base;
+        fine.extend([dispatched(1, prepare_of(1, narrowed, 3)), held(3)]);
+        claimed(fine, &[ClaimRule::UnstagedPage]);
     }
 
     /// When the queue releases a round, its peer holds no reservation, the

@@ -1255,3 +1255,56 @@ fn a_hold_waits_for_the_reactor_to_handle_a_call() {
         assert_ne!(node.engine().snapshot().frontiers.header_best, a5);
     }
 }
+
+/// Runs a tapped reactor that reports `events` in one step and then ends,
+/// with no property reading the tap's claims. Returns the run and the
+/// claim breaks its drains found.
+fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
+    let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
+    let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
+    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let claims = tap.claims();
+    let source =
+        PolicySource::new(&mut sim, port, Policy::converging(), Effects::default()).with_tap(tap);
+    sim.add_source(Box::new(source));
+    sim.scheduler().spawn_root("reactor", async move {
+        for event in events {
+            observer.observe(event);
+        }
+    });
+    (
+        sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default()),
+        claims,
+    )
+}
+
+/// A claim break and an integrity failure in one step: the claim drains
+/// that step, so its property can report it first, and the failure waits.
+/// A step with no claim fails at once.
+#[test]
+fn a_claim_drains_before_its_steps_integrity_failure() {
+    let mut events = Vec::from(open_work(4));
+    // The page reports a header left of the 5 its reservation spent.
+    if let ReactorEvent::PageStaged { reserved_left, .. } = &mut events[3] {
+        *reserved_left = 1;
+    }
+    let reused = events[5].clone();
+    events.push(reused.clone());
+    let (report, claims) = claims_after(events);
+    let found: Vec<_> = claims.records();
+    assert!(
+        matches!(&found[..], [only] if only.detail.starts_with("OverReservation")),
+        "{found:?}"
+    );
+    // With no property to report it, the claim fails the run at its end,
+    // ahead of the failure that waited behind it.
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("OverReservation"), "{detail}");
+
+    let mut events = Vec::from(open_work(4));
+    events.push(reused);
+    let (report, claims) = claims_after(events);
+    assert_eq!(claims.records(), []);
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("CallReused: call 1"), "{detail}");
+}

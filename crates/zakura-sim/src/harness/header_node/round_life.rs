@@ -344,6 +344,13 @@ impl RoundLife {
         Ok(std::mem::take(&mut self.breaks))
     }
 
+    /// The breaks found since the last call, taken even when
+    /// [`drain`](Self::drain) failed with missing evidence, so the tap can
+    /// report them ahead of that failure.
+    pub(super) fn take_breaks(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.breaks)
+    }
+
     /// The latest adopted generation and anchor.
     fn latest(&self) -> Option<Authority> {
         self.adopted.map(|(authority, _)| authority)

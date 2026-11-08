@@ -405,8 +405,11 @@ pub enum ReactorEvent {
         headers: u64,
         /// The byte credit consumed through it, as the cursor says.
         bytes: u64,
-        /// The page's headers.
-        page_headers: u32,
+        /// The page's own last header: its declared parent's height plus
+        /// its entry count, and its last entry's hash, read from the page.
+        page_last: Frontier,
+        /// The page's entry count, read from the page.
+        page_headers: u64,
         /// The page's payload bytes.
         page_bytes: u64,
     },

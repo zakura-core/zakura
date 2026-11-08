@@ -398,6 +398,15 @@ impl SubscriberState {
         }
         #[cfg(any(test, zakura_sim))]
         if let Some(tap) = &self.credit {
+            // Read from the page itself, apart from the count and hash
+            // the cursor was built from.
+            // Widening usize to u64 is lossless on supported targets.
+            let entries = page.entries.len() as u64;
+            let last = page
+                .entries
+                .last()
+                .map_or(parent.hash, |entry| entry.header.hash());
+            let height = u64::from(parent.height.0).saturating_add(entries);
             tap.observer.observe(ReactorEvent::CursorClaimed {
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
@@ -405,8 +414,11 @@ impl SubscriberState {
                 through: Frontier::new(cursor.height, cursor.hash),
                 headers: cursor.headers,
                 bytes: cursor.bytes,
-                page_headers: count,
-                // Widening usize to u64 is lossless on supported targets.
+                page_last: Frontier::new(
+                    block::Height(u32::try_from(height).unwrap_or(u32::MAX)),
+                    last,
+                ),
+                page_headers: entries,
                 page_bytes: payload_len as u64,
             });
         }

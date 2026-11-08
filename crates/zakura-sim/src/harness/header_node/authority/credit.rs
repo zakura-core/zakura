@@ -16,8 +16,9 @@
 //!   fields: the header, and the header and byte credit consumed through
 //!   it, which the publisher compares too.
 //! - **Claims.** Each `CursorClaimed` records the cursor its subscription's
-//!   pages so far consumed: the sum of every claimed page's headers and
-//!   payload bytes, counted here from each page's own size.
+//!   pages so far consumed, ending at that page's own last header: the sum
+//!   of every claimed page's entries and payload bytes, counted here from
+//!   each page as the fact reads it.
 //! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
@@ -133,16 +134,13 @@ impl Credit {
                 through,
                 headers,
                 bytes,
+                page_last,
                 page_headers,
                 page_bytes,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
-                self.claim(
-                    &key,
-                    (*through, *headers, *bytes),
-                    *page_headers,
-                    *page_bytes,
-                );
+                let page = (*page_last, *page_headers, *page_bytes);
+                self.claim(&key, (*through, *headers, *bytes), page);
                 true
             }
             _ if !on_reactor => false,
@@ -348,14 +346,9 @@ impl Credit {
     }
 
     /// Judges a claim of `key`'s subscription that recorded `cursor` for a
-    /// page of `page_headers` headers in `page_bytes` bytes.
-    fn claim(
-        &mut self,
-        key: &Subscription,
-        cursor: Acknowledged,
-        page_headers: u32,
-        page_bytes: u64,
-    ) {
+    /// page ending at `page.0`, of `page.1` entries in `page.2` bytes.
+    fn claim(&mut self, key: &Subscription, cursor: Acknowledged, page: Acknowledged) {
+        let (page_last, page_headers, page_bytes) = page;
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
             self.breaks.push(format!(
@@ -365,10 +358,16 @@ impl Credit {
             return;
         };
         live.consumed = (
-            live.consumed.0.saturating_add(u64::from(page_headers)),
+            live.consumed.0.saturating_add(page_headers),
             live.consumed.1.saturating_add(page_bytes),
         );
         let (through, headers, bytes) = cursor;
+        if through != page_last {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} recorded \
+                 cursor {through:?} for a page ending at {page_last:?}"
+            ));
+        }
         if (headers, bytes) != live.consumed {
             self.breaks.push(format!(
                 "CommitOnlyAuthorized: session {session} subscription {subscription} recorded \

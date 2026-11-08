@@ -425,7 +425,8 @@ fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
         through,
         headers: cursor.headers,
         bytes: cursor.bytes,
-        page_headers: headers,
+        page_last: through,
+        page_headers: u64::from(headers),
         page_bytes: u64::from(headers) * credit::smallest_page(AuxSchema::None),
     }
 }
@@ -649,9 +650,9 @@ fn a_stale_handlers_credit_is_left_to_the_stale_check() {
     assert_eq!(check.drain(1), Vec::<String>::new());
 }
 
-/// A claim whose recorded cursor isn't what its pages consumed breaks, and
-/// so does an acceptance of a cursor no claim recorded, though its header
-/// was staged.
+/// A claim whose recorded cursor isn't what its pages consumed, or that
+/// ends at another header than its page, breaks, and so does an
+/// acceptance of a cursor no claim recorded, though its header was staged.
 #[test]
 fn claims_record_what_their_pages_consumed() {
     let chain = main_chain(4);
@@ -673,6 +674,14 @@ fn claims_record_what_their_pages_consumed() {
     miscounted.push(claim);
     let found = credit_breaks(&miscounted);
     assert!(found[0].contains("but its pages consumed"), "{found:?}");
+    let mut elsewhere = base();
+    let mut claim = claimed(chain[1], 2);
+    if let ReactorEvent::CursorClaimed { through, .. } = &mut claim {
+        *through = chain[0];
+    }
+    elsewhere.push(claim);
+    let found = credit_breaks(&elsewhere);
+    assert!(found[0].contains("for a page ending at"), "{found:?}");
     let mut unclaimed = base();
     unclaimed.extend([
         claimed(chain[1], 2),

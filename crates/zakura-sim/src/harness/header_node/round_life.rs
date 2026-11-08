@@ -13,14 +13,15 @@
 //!   starts a unit of work. Every slot the queue's `Slots` lists that awaits
 //!   its locator has the latest generation and anchor. Every slot holding a
 //!   current-started round whose `Started` anchor is the latest one has the
-//!   latest generation in its owner, and its round started under the latest
-//!   generation, whatever its owner says now. The queue's own record is
-//!   read, since it reports `RoundReleased` before it drops an entry. A
-//!   round whose anchor moved is the finality rebase path, which the
-//!   simulator never reaches, so it isn't judged.
+//!   latest generation and anchor in its owner, and its round started under
+//!   the latest generation, whatever its owner says now. The queue's own
+//!   record is read, since it reports `RoundReleased` before it drops an
+//!   entry. A round whose `Started` anchor isn't the latest one is the
+//!   finality rebase path, which the simulator never reaches, so it isn't
+//!   judged. The exception follows the round's start, never its owner now.
 //! - **Dispatch.** A prepare or apply dispatched for a peer whose slot holds
-//!   a live current-started round carries the latest generation in its
-//!   owner, unless the owner's anchor moved.
+//!   a live current-started round carries the latest generation and anchor
+//!   in its owner, unless the round's `Started` anchor isn't the latest.
 //! - **Changes advance the generation.** Every acted `Reset` names a header
 //!   generation above the engine's before the step that reset it. The
 //!   engine changes only in steps, one action each, so its generation read
@@ -194,16 +195,15 @@ impl RoundLife {
                 }
                 PortCall::Prepare { peer, owner, .. } | PortCall::Apply { peer, owner, .. } => {
                     let dispatched = authority_of(owner.header_authority());
-                    let live = self.slots.iter().find(|slot| {
-                        slot.peer == *peer
-                            && slot.phase.is_some()
-                            && self
-                                .rounds
-                                .get(&slot.incarnation)
-                                .is_some_and(|round| round.current)
+                    let live = self.slots.iter().find_map(|slot| {
+                        let round = self.rounds.get(&slot.incarnation)?;
+                        (slot.peer == *peer && slot.phase.is_some() && round.current)
+                            .then_some((slot, round))
                     });
-                    if let (Some(slot), Some(latest)) = (live, self.latest()) {
-                        if dispatched.1 == latest.1 && dispatched.0 != latest.0 {
+                    if let (Some((slot, round)), Some(latest)) = (live, self.latest()) {
+                        // The rebase exception follows the round's own start, so
+                        // an owner rewritten to another anchor isn't excused.
+                        if round.authority.1 == latest.1 && dispatched != latest {
                             let kind = if matches!(op, PortCall::Apply { .. }) {
                                 "apply"
                             } else {
@@ -342,11 +342,11 @@ impl RoundLife {
                              is still in the queue after the reactor adopted {}",
                             slot.incarnation, round.authority.0, latest.0
                         ));
-                    } else if held.1 == latest.1 && held.0 != latest.0 {
+                    } else if held != latest {
                         found.push(format!(
-                            "ResetInvalidatesWork: round {}'s owner holds generation {} after \
-                             the reactor adopted {}",
-                            slot.incarnation, held.0, latest.0
+                            "ResetInvalidatesWork: round {}'s owner holds generation {} and \
+                             anchor {} after the reactor adopted {} with its own",
+                            slot.incarnation, held.0, held.1, latest.0
                         ));
                     }
                 }

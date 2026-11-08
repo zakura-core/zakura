@@ -25,9 +25,14 @@ fn mirror() -> ZakuraPeerId {
 
 /// Header authority under `generation`.
 fn authority(generation: u64) -> HeaderWorkAuthority {
+    anchored(generation, ANCHOR)
+}
+
+/// Header authority under `generation` and `anchor`.
+fn anchored(generation: u64, anchor: block::Hash) -> HeaderWorkAuthority {
     HeaderWorkAuthority {
         header_generation: HeaderGeneration::new(generation),
-        branch: BranchId::new(ANCHOR, block::Hash([3; 32])),
+        branch: BranchId::new(anchor, block::Hash([3; 32])),
     }
 }
 
@@ -354,4 +359,42 @@ fn a_quiet_run_does_not_apply() {
     check.observe(&adopted(2), true);
     assert_eq!(check.drain(1), Ok(Vec::new()));
     assert!(!evidence.any());
+}
+
+/// An owner rewritten to an older generation under another anchor isn't
+/// excused as a rebase: the exception follows the round's start, whose
+/// anchor never moved. Both the slot and a dispatch under that owner break.
+#[test]
+fn a_rewritten_anchor_does_not_hide_an_old_generation() {
+    let other = block::Hash([9; 32]);
+    let mut events = vec![
+        adopted(1),
+        locator(1, 1),
+        cause(ReactorCause::Completion { call: 1 }),
+        started(1, 1),
+        ReactorEvent::Slots {
+            slots: vec![WorkSlot {
+                peer: mirror(),
+                session_id: 7,
+                target_tip_hash: block::Hash([3; 32]),
+                phase: Some(HeaderTargetPhase::Receiving),
+                incarnation: 1,
+                repair: false,
+                authority: anchored(0, other),
+            }],
+        },
+    ];
+    events.push(ReactorEvent::Dispatched {
+        call: 2,
+        op: PortCall::Apply {
+            peer: mirror(),
+            source: SourceId::from_digest([2; 32]),
+            owner: HeaderSyncWorkOwner::Header(anchored(0, other).bind(7, NonZeroU64::MIN)),
+        },
+    });
+    events.push(cause(ReactorCause::Idle));
+    let (found, _) = breaks(&[submitted(1, 1), read(1, 1)], &events);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].contains("dispatched round 1's apply"), "{found:?}");
+    assert!(found[1].contains("owner holds generation 0"), "{found:?}");
 }

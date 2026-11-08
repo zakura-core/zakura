@@ -150,7 +150,7 @@ zakura-checkpoints = [
 
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "13.0.1" }
-zakura-consensus = { path = "../zakura-consensus", version = "16.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "17.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "15.0.0" }
@@ -231,7 +231,7 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "13.0.1", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "16.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "17.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "15.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "15.0.0", features = ["proptest-impl"] }

@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "16.0.0"
+version = "17.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",

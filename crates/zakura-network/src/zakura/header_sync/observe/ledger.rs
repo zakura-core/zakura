@@ -50,6 +50,15 @@
 //! - `UnstagedPage`: its round's staged count and headers.
 //! - `ForeignLease`: the held round's and each lease's round's counts and
 //!   holds.
+//! - `UnstagedHeaders` and `HeldUnowned`: the held round's counts and
+//!   holds, since its calls return leases it never counted staged.
+//! - `WrongCall`: the held round's holds. `WrongRound`: the holds of the
+//!   round the call held and of the one it should have. `BadHandoff`: the
+//!   holds of the round its two calls hold in turn.
+//!
+//! A call's owner, payload or source being wrong leaves the accounting as
+//! production keeps it, so `WrongOwner`, `WrongPayload` and `WrongSource`
+//! taint nothing.
 //!
 //! A check that reads a tainted part doesn't judge, and never counts as
 //! passed: a tainted round never settles, so the teardown property stays
@@ -596,11 +605,13 @@ impl HeaderWorkLedger {
                                 "WrongCall: call {call} holds headers but asks for {other:?}"
                             ),
                         });
+                        self.taint_round(*incarnation, false, true);
                         self.claims.extend(found);
                         return Ok(());
                     }
                 };
                 if expected_kind != *kind || call_peer != peer {
+                    self.taint_round(*incarnation, false, true);
                     found.push(ClaimBreak {
                         rule: ClaimRule::WrongCall,
                         detail: format!(
@@ -609,6 +620,9 @@ impl HeaderWorkLedger {
                     });
                 }
                 if current != Some(*incarnation) {
+                    for round in current.iter().chain([incarnation]) {
+                        self.taint_round(*round, false, true);
+                    }
                     found.push(ClaimBreak {
                         rule: ClaimRule::WrongRound,
                         detail: format!(
@@ -629,7 +643,18 @@ impl HeaderWorkLedger {
                         ));
                     }
                 }
-                found.extend(self.hold(*call, owner, *incarnation, *headers, payload));
+                let held = self.hold(*call, owner, *incarnation, *headers, payload);
+                // A round holding unstaged or unowned headers returns leases
+                // the ledger never counted staged.
+                if held.iter().any(|claim| {
+                    matches!(
+                        claim.rule,
+                        ClaimRule::UnstagedHeaders | ClaimRule::HeldUnowned
+                    )
+                }) {
+                    self.taint_round(*incarnation, true, true);
+                }
+                found.extend(held);
                 self.claims.extend(found);
             }
             ReactorEvent::HeadersEnded {
@@ -657,6 +682,12 @@ impl HeaderWorkLedger {
                             ),
                         }
                     });
+                if wrong.is_some() {
+                    let held_round = held.incarnation;
+                    for round in [held_round, *incarnation] {
+                        self.taint_round(round, false, true);
+                    }
+                }
                 self.claims.extend(wrong);
                 if let HeaderWorkEnd::HandedToApply { apply } = end {
                     self.check_handoff(*call, *apply, *incarnation, *headers)?;
@@ -715,6 +746,8 @@ impl HeaderWorkLedger {
                              is an apply for other work"
                         ),
                     });
+                    // Both calls hold the round in turn.
+                    self.taint_round(incarnation, false, true);
                 }
                 self.handoff = Some(Handoff {
                     prepare: call,
@@ -2462,6 +2495,75 @@ mod tests {
         assert_eq!(ledger.stuck_rounds(), 0, "nor is it judged stuck");
         ledger.finish().expect("teardown is clean");
         assert_eq!(ledger.take_claims(), []);
+    }
+
+    /// A call claim taints the rounds it implicates, so their later
+    /// settlement doesn't fail as an integrity rule. A call holding more
+    /// than its round owns returns all it held, and its round never settles
+    /// or counts as stuck. A call holding another round than its peer's
+    /// current one keeps it while that round's lease returns.
+    #[test]
+    fn a_call_claim_taints_the_rounds_it_implicates() {
+        let mut unowned = vec![
+            opened(1, 1, 5),
+            bound(1, 1, 1),
+            started(1, 1),
+            staged(1, 1, 1, 3, 2, 3),
+            reservation_ended(1, 2, ReservationEnd::Released),
+            dispatched(1, apply(1)),
+            ReactorEvent::HeadersHeld {
+                call: 1,
+                kind: StorageCallKind::Apply,
+                peer: peer(1),
+                incarnation: 1,
+                headers: 4,
+                leases: Vec::new(),
+            },
+            released(1, 1),
+        ];
+        unowned.extend([
+            ReactorEvent::HeadersEnded {
+                call: 1,
+                incarnation: 1,
+                headers: 4,
+                end: HeaderWorkEnd::Refused,
+            },
+            returned(1, 1, 4),
+            ReactorEvent::CallEnded {
+                call: 1,
+                end: CallEnd::Replied,
+            },
+            ReactorEvent::Handled {
+                call: 1,
+                panicked: false,
+            },
+            retired(1, 1),
+        ]);
+        let mut ledger = fold(unowned).expect("the claim's dependent checks don't judge");
+        let rules: Vec<_> = ledger.take_claims().iter().map(|c| c.rule).collect();
+        assert_eq!(rules, [ClaimRule::HeldUnowned]);
+        assert_eq!(
+            ledger.unsettled_rounds(),
+            1,
+            "a tainted round never settles"
+        );
+        assert_eq!(ledger.stuck_rounds(), 0, "nor is it judged stuck");
+        ledger.finish().expect("teardown is clean");
+        assert_eq!(ledger.take_claims(), []);
+
+        let mut ledger = fold(after(
+            &[(1, 1), (2, 2)],
+            vec![
+                dispatched(1, prepare(1)),
+                held(1, StorageCallKind::Prepare, 1, 2),
+                released(2, 2),
+                returned(2, 2, 5),
+            ],
+        ))
+        .expect("the claim's dependent checks don't judge");
+        let rules: Vec<_> = ledger.take_claims().iter().map(|c| c.rule).collect();
+        assert_eq!(rules.first(), Some(&ClaimRule::WrongRound), "{rules:?}");
+        assert_eq!(ledger.stuck_rounds(), 0);
     }
 
     /// A staging report must show its page in the round: one whose policy

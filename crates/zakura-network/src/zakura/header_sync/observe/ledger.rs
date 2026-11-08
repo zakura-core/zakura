@@ -40,6 +40,25 @@
 //! applies the event, so later valid events don't look unknown, and goes on.
 //! A round retired while the queue still holds it is a claim rule only when
 //! a new snapshot made it obsolete.
+//!
+//! A claim that breaks may leave the ledger's accounting for an entity
+//! unlike production's, so later checks of it would fail as integrity
+//! rules, hiding the claim. Such a claim taints every entity it
+//! implicates, in what it made unreliable:
+//!
+//! - `OverReservation`: its reservation's remainder.
+//! - `UnstagedPage`: its round's staged count and headers.
+//! - `ForeignLease`: the held round's and each lease's round's counts and
+//!   holds.
+//!
+//! A check that reads a tainted part doesn't judge, and never counts as
+//! passed: a tainted round never settles, so the teardown property stays
+//! inconclusive and doesn't count it stuck, and
+//! [`HeaderWorkLedger::accounting_tainted`] stops the tap comparing the
+//! ledger's totals with the probe's. Checks that don't read a tainted
+//! part still judge, such as a round's queue-held leases, its source, or
+//! a lease returning while a call holds a round whose counts alone are
+//! tainted.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -169,9 +188,21 @@ pub struct HeaderWorkLedger {
     claims: Vec<ClaimBreak>,
     /// Every round the queue has released, by incarnation.
     released: BTreeSet<u64>,
-    /// The rounds a claimed `ForeignLease` involved, whose lease settlement
-    /// the ledger no longer judges.
-    tainted: BTreeSet<u64>,
+    /// Each live reservation whose remainder a claim made unreliable. See
+    /// the module doc.
+    tainted_reservations: BTreeSet<u64>,
+    /// Each started round whose accounting a claim made unreliable, with
+    /// what it made unreliable. See the module doc.
+    tainted_rounds: BTreeMap<u64, RoundTaint>,
+}
+
+/// What a claim made unreliable about a round. See the module doc.
+#[derive(Clone, Copy, Debug, Default)]
+struct RoundTaint {
+    /// Its staged count and headers.
+    counts: bool,
+    /// Which calls hold it, and how much.
+    holds: bool,
 }
 
 /// One live reservation.
@@ -363,9 +394,13 @@ impl HeaderWorkLedger {
                 released,
                 cause,
             } => {
+                let tainted = self.tainted_reservations.remove(reservation);
                 let live = self.reservation_mut(*reservation)?;
                 let unstaged = live.opened.saturating_sub(live.staged);
-                if *released != unstaged || (*cause == ReservationEnd::Staged && *released != 0) {
+                if !tainted
+                    && (*released != unstaged
+                        || (*cause == ReservationEnd::Staged && *released != 0))
+                {
                     return Err(format!(
                         "ReleaseMismatch: reservation {reservation} ended as {cause:?} \
                          releasing {released} of the {unstaged} headers it still held"
@@ -420,6 +455,7 @@ impl HeaderWorkLedger {
                 headers,
             } => {
                 let held = self.held_by_round().contains_key(incarnation);
+                let taint = self.taint_of(*incarnation);
                 let Some(round) = self
                     .started
                     .get_mut(incarnation)
@@ -430,8 +466,8 @@ impl HeaderWorkLedger {
                          longer owns any or isn't its peer's"
                     ));
                 };
-                if !self.tainted.contains(incarnation)
-                    && (held || round.returned + headers > round.staged)
+                if (!taint.holds && held)
+                    || (!taint.counts && round.returned + headers > round.staged)
                 {
                     return Err(format!(
                         "LeaseReturnedEarly: round {incarnation} returned {headers} headers with \
@@ -507,8 +543,9 @@ impl HeaderWorkLedger {
                     // The claim reports the defect. These rounds' leases no
                     // longer settle as the ledger tracks them, so their
                     // settlement isn't judged after it.
-                    self.tainted.insert(*incarnation);
-                    self.tainted.extend(foreign.iter().copied());
+                    for round in foreign.iter().chain([incarnation]) {
+                        self.taint_round(*round, true, true);
+                    }
                     let foreign = first;
                     found.push(ClaimBreak {
                         rule: ClaimRule::ForeignLease,
@@ -786,7 +823,9 @@ impl HeaderWorkLedger {
             ));
         }
         let claimed = self.claimed();
-        if claimed.saturating_add(headers) > HEADER_CHUNK_BUDGET_CAPACITY_V1 {
+        if !self.accounting_tainted()
+            && claimed.saturating_add(headers) > HEADER_CHUNK_BUDGET_CAPACITY_V1
+        {
             self.claims.push(ClaimBreak {
                 rule: ClaimRule::OverBudget,
                 detail: format!(
@@ -892,6 +931,8 @@ impl HeaderWorkLedger {
                 request.incarnation
             ));
         }
+        let reservation_tainted = self.tainted_reservations.contains(&reservation);
+        let round_tainted = self.taint_of(request.incarnation).counts;
         let live = self.reservation_mut(reservation)?;
         if live.round != Some(request.incarnation) || live.peer != request.peer {
             return Err(format!(
@@ -901,7 +942,8 @@ impl HeaderWorkLedger {
             ));
         }
         let unstaged = live.opened.saturating_sub(live.staged);
-        let over = (headers == 0 || headers > unstaged || reserved_left != unstaged - headers)
+        let over = (!reservation_tainted
+            && (headers == 0 || headers > unstaged || reserved_left != unstaged - headers))
             .then(|| ClaimBreak {
                 rule: ClaimRule::OverReservation,
                 detail: format!(
@@ -911,10 +953,7 @@ impl HeaderWorkLedger {
             });
         live.staged += headers;
         if over.is_some() {
-            // The claim reports the defect. Later settlement goes by the
-            // remainder production reported, even one above what was
-            // opened, so the defect fails only the claim.
-            live.opened = live.staged + reserved_left;
+            self.tainted_reservations.insert(reservation);
         }
         self.claims.extend(over);
         let round = self
@@ -926,7 +965,9 @@ impl HeaderWorkLedger {
         let before = std::mem::replace(&mut round.hashes, stored.to_vec());
         let kept = stored.get(..before.len()) == Some(&before[..]);
         let added = stored.get(before.len()..) == Some(hashes);
-        if hashes.len() != headers || !kept || !added || staged_total != round.staged {
+        if !round_tainted
+            && (hashes.len() != headers || !kept || !added || staged_total != round.staged)
+        {
             let detail = format!(
                 "UnstagedPage: a page of {headers} headers with {} hashes left round {} \
                  holding {staged_total} of the {} it staged, or holding other headers",
@@ -938,6 +979,7 @@ impl HeaderWorkLedger {
                 rule: ClaimRule::UnstagedPage,
                 detail,
             });
+            self.taint_round(request.incarnation, true, false);
         }
         Ok(())
     }
@@ -958,10 +1000,11 @@ impl HeaderWorkLedger {
         payload: Option<Payload>,
     ) -> Vec<ClaimBreak> {
         let claim = |rule, detail| ClaimBreak { rule, detail };
+        let taint = self.taint_of(incarnation);
         let Some(round) = self
             .started
             .get(&incarnation)
-            .filter(|round| round.staged > 0)
+            .filter(|round| taint.counts || round.staged > 0)
         else {
             return vec![claim(
                 ClaimRule::UnstagedHeaders,
@@ -972,7 +1015,12 @@ impl HeaderWorkLedger {
             )];
         };
         let mut found = Vec::new();
-        if !same_work(owner, round.request.owner, round.hashes.last().copied()) {
+        // A narrowed owner is judged by the staged tip, which tainted
+        // counts don't give.
+        if owner != round.request.owner
+            && !taint.counts
+            && !same_work(owner, round.request.owner, round.hashes.last().copied())
+        {
             found.push(claim(
                 ClaimRule::WrongOwner,
                 format!(
@@ -985,9 +1033,10 @@ impl HeaderWorkLedger {
         let tip = round.hashes.last().copied();
         let payload_checked = payload.clone();
         if let Some(payload) = payload.filter(|payload| {
-            tip != Some(payload.target)
-                || payload.hashes != round.hashes
-                || payload.hashes.len() != headers
+            !taint.counts
+                && (tip != Some(payload.target)
+                    || payload.hashes != round.hashes
+                    || payload.hashes.len() != headers)
         }) {
             found.push(claim(
                 ClaimRule::WrongPayload,
@@ -1027,7 +1076,7 @@ impl HeaderWorkLedger {
         // This call already counts as holding its headers.
         let held = self.held_by_round().get(&incarnation).copied().unwrap_or(0);
         let owned = round.staged.saturating_sub(round.returned);
-        if held > owned {
+        if !taint.counts && !taint.holds && held > owned {
             found.push(claim(
                 ClaimRule::HeldUnowned,
                 format!(
@@ -1055,7 +1104,7 @@ impl HeaderWorkLedger {
     /// The `LeakedLease` break if the queue released `incarnation` and, with
     /// no call holding it, it kept a lease at `when`.
     fn unreturned(&self, incarnation: u64, when: &str) -> Option<String> {
-        if self.tainted.contains(&incarnation) {
+        if self.tainted_rounds.contains_key(&incarnation) {
             return None;
         }
         let held = self.held_by_round().contains_key(&incarnation);
@@ -1071,12 +1120,13 @@ impl HeaderWorkLedger {
     }
 
     /// Forgets `incarnation` once the queue released it and all its leases
-    /// returned.
+    /// returned. A tainted round is never forgotten, so it never settles.
     fn prune(&mut self, incarnation: u64) {
-        if self
-            .started
-            .get(&incarnation)
-            .is_some_and(|round| round.released && round.returned == round.staged)
+        if !self.tainted_rounds.contains_key(&incarnation)
+            && self
+                .started
+                .get(&incarnation)
+                .is_some_and(|round| round.released && round.returned == round.staged)
         {
             self.started.remove(&incarnation);
         }
@@ -1121,12 +1171,12 @@ impl HeaderWorkLedger {
 
     /// How many released rounds haven't settled with no call that holds
     /// their headers still unended, so storage has nothing left to answer
-    /// that could settle them.
+    /// that could settle them. A tainted round isn't judged stuck.
     pub fn stuck_rounds(&self) -> usize {
         self.released
             .iter()
             .filter(|incarnation| {
-                !self.tainted.contains(incarnation)
+                !self.tainted_rounds.contains_key(incarnation)
                     && self.unsettled(**incarnation)
                     && !self.calls.values().any(|call| {
                         call.end.is_none()
@@ -1144,6 +1194,29 @@ impl HeaderWorkLedger {
         std::mem::take(&mut self.claims)
     }
 
+    /// Marks round `incarnation`'s `counts` or `holds` unreliable. See the
+    /// module doc.
+    fn taint_round(&mut self, incarnation: u64, counts: bool, holds: bool) {
+        let taint = self.tainted_rounds.entry(incarnation).or_default();
+        taint.counts |= counts;
+        taint.holds |= holds;
+    }
+
+    /// What claims made unreliable about round `incarnation`.
+    fn taint_of(&self, incarnation: u64) -> RoundTaint {
+        self.tainted_rounds
+            .get(&incarnation)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Whether a live reservation or a round the ledger keeps is tainted, so
+    /// [`reserved`](Self::reserved) and [`owned`](Self::owned) aren't
+    /// production's totals. See the module doc.
+    pub fn accounting_tainted(&self) -> bool {
+        !self.tainted_reservations.is_empty() || !self.tainted_rounds.is_empty()
+    }
+
     /// The headers the queue's accounting holds reserved: each live
     /// reservation's unstaged ones.
     pub fn reserved(&self) -> usize {
@@ -1158,7 +1231,8 @@ impl HeaderWorkLedger {
     pub fn owned(&self) -> usize {
         self.started
             .values()
-            .map(|round| round.staged - round.returned)
+            // A tainted round may have returned more than it staged.
+            .map(|round| round.staged.saturating_sub(round.returned))
             .sum()
     }
 
@@ -1243,7 +1317,7 @@ impl HeaderWorkLedger {
             });
         }
         for (incarnation, round) in &self.started {
-            if round.returned != round.staged {
+            if !self.tainted_rounds.contains_key(incarnation) && round.returned != round.staged {
                 claims.push(ClaimBreak {
                     rule: ClaimRule::LeakedLease,
                     detail: format!(
@@ -2332,6 +2406,62 @@ mod tests {
             returned(2, 1, 3),
         ]);
         refused_as(foreign, "UnknownRound");
+    }
+
+    /// A claim taints the count it made unreliable: the checks that read
+    /// it don't judge, the round never settles or counts as stuck, and the
+    /// totals aren't production's. A check that reads no tainted count,
+    /// here the leases of a round whose reservation was tainted, still
+    /// judges.
+    #[test]
+    fn a_claim_taints_only_the_counts_it_made_unreliable() {
+        let base = vec![opened(1, 1, 5), bound(1, 1, 1), started(1, 1)];
+        // The page reports 2 left of the 3 its reservation still held.
+        let mut over = base.clone();
+        over.extend([
+            staged(1, 1, 1, 2, 2, 2),
+            reservation_ended(1, 2, ReservationEnd::Released),
+            ReactorEvent::RoundReleased {
+                peer: peer(1),
+                incarnation: 1,
+                queue_owned: 2,
+            },
+        ]);
+        let mut ledger = fold(over).expect("the claim's dependent checks don't judge");
+        let rules: Vec<ClaimRule> = ledger.take_claims().iter().map(|c| c.rule).collect();
+        // The round's own counts aren't tainted, so its queue-held lease
+        // and its unreturned staged headers are both still judged.
+        assert_eq!(
+            rules,
+            [
+                ClaimRule::OverReservation,
+                ClaimRule::LeakedLease,
+                ClaimRule::LeakedLease
+            ],
+        );
+
+        // The round's report holds 1 header of the 3 it staged, and then
+        // returns all 3.
+        let mut unstaged = base;
+        unstaged.extend([
+            staged(1, 1, 1, 3, 2, 1),
+            reservation_ended(1, 2, ReservationEnd::Released),
+            released(1, 1),
+            returned(1, 1, 3),
+            returned(1, 1, 1),
+        ]);
+        let mut ledger = fold(unstaged).expect("the claim's dependent checks don't judge");
+        let rules: Vec<ClaimRule> = ledger.take_claims().iter().map(|c| c.rule).collect();
+        assert_eq!(rules, [ClaimRule::UnstagedPage]);
+        assert!(ledger.accounting_tainted());
+        assert_eq!(
+            ledger.unsettled_rounds(),
+            1,
+            "a tainted round never settles"
+        );
+        assert_eq!(ledger.stuck_rounds(), 0, "nor is it judged stuck");
+        ledger.finish().expect("teardown is clean");
+        assert_eq!(ledger.take_claims(), []);
     }
 
     /// A staging report must show its page in the round: one whose policy

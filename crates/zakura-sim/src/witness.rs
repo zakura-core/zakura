@@ -93,6 +93,19 @@ pub enum WitnessError {
     /// The verdict fits, but the run didn't reach the property's trigger
     /// history.
     LostTriggerHistory,
+    /// An adversary act the run scripted was skipped, so the witness's act
+    /// never ran ([`crate::Observation::ActSkipped`]).
+    ActSkipped {
+        /// The act's name.
+        act: String,
+    },
+    /// An adversary act the run scripted never ran
+    /// ([`crate::Observation::ActRan`]): the run ended before the Plan
+    /// picked it, or a violation stopped the run before any act ran.
+    ActNotRun {
+        /// The act's name.
+        act: String,
+    },
     /// The property's trigger history reads the harness's view, and the
     /// judge has no view showing the run's end, as when it has only the
     /// run's report.
@@ -126,6 +139,12 @@ impl fmt::Display for WitnessError {
             WitnessError::Unrelated { property } => write!(f, "{property} was violated"),
             WitnessError::LostTriggerHistory => {
                 f.write_str("witness test lost its trigger history")
+            }
+            WitnessError::ActSkipped { act } => {
+                write!(f, "the witness's act {act} was skipped and never ran")
+            }
+            WitnessError::ActNotRun { act } => {
+                write!(f, "the witness's act {act} never ran")
             }
             WitnessError::NoView => {
                 f.write_str("the trigger history reads the view, and no view shows the run's end")
@@ -276,6 +295,7 @@ impl<S: Subsystem> Registered<S> {
         expect: Expect,
     ) -> Result<(), WitnessError> {
         judge_end(end, reports, property, self.status, expect)?;
+        acts_ran(end, log)?;
         let reached = match self.trigger_history {
             None => true,
             Some(TriggerHistory::Log(history)) => history(log),
@@ -292,6 +312,51 @@ impl<S: Subsystem> Registered<S> {
             Err(WitnessError::LostTriggerHistory)
         }
     }
+}
+
+/// Requires the run's scripted adversary acts to have run, which means
+/// each wrote its frames. None may be skipped. A run that came to its end
+/// ran every one. A run a violation stopped ran at least one by the
+/// violation's step, since its later acts may never have been offered.
+fn acts_ran(end: &RunEnd, log: &ObservationLog) -> Result<(), WitnessError> {
+    use crate::Observation;
+    let mut scripted: Vec<&str> = Vec::new();
+    let mut ran: Vec<(u64, &str)> = Vec::new();
+    for entry in log.entries() {
+        match &entry.obs {
+            Observation::ActSkipped { act, .. } => {
+                return Err(WitnessError::ActSkipped { act: act.clone() })
+            }
+            Observation::ActsScripted { acts } => scripted.extend(acts.iter().map(String::as_str)),
+            Observation::ActRan { act, .. } => ran.push((entry.step, act)),
+            _ => {}
+        }
+    }
+    let Some(first) = scripted.first() else {
+        return Ok(());
+    };
+    if let Some(violation) = &end.violation {
+        return if ran.iter().any(|(step, _)| *step <= violation.step) {
+            Ok(())
+        } else {
+            Err(WitnessError::ActNotRun {
+                act: (*first).to_owned(),
+            })
+        };
+    }
+    for act in scripted {
+        match ran.iter().position(|(_, ran)| *ran == act) {
+            Some(at) => {
+                ran.swap_remove(at);
+            }
+            None => {
+                return Err(WitnessError::ActNotRun {
+                    act: act.to_owned(),
+                })
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A sink that notes whether the last record it passed on was the `end`.
@@ -445,5 +510,54 @@ mod tests {
             judge(&report, "test/own", Status::Active, Expect::Violated),
             Ok(())
         );
+    }
+
+    /// A scripted act fails the witness unless it ran: skipped, or never
+    /// picked by a run that came to its end. A run a violation stopped
+    /// needs only an act that ran by then.
+    #[test]
+    fn a_witness_needs_its_acts_to_run() {
+        use crate::Observation;
+        let ran = |act: &str| Observation::ActRan {
+            connection: 0,
+            quic_stream: 0,
+            act: act.to_owned(),
+        };
+        let scripted = Observation::ActsScripted {
+            acts: vec!["after-close".to_owned(), "over-live".to_owned()],
+        };
+        let finished = stopped_by("test/own").end;
+        let finished = RunEnd {
+            outcome: Outcome::Budget,
+            violation: None,
+            ..finished
+        };
+        let stopped = stopped_by("test/own").end;
+
+        let mut log = ObservationLog::default();
+        assert_eq!(acts_ran(&finished, &log), Ok(()), "no acts scripted");
+        log.push(scripted);
+        let not_run = |act: &str| {
+            Err(WitnessError::ActNotRun {
+                act: act.to_owned(),
+            })
+        };
+        assert_eq!(acts_ran(&finished, &log), not_run("after-close"));
+        assert_eq!(acts_ran(&stopped, &log), not_run("after-close"));
+        log.push(ran("after-close"));
+        assert_eq!(acts_ran(&finished, &log), not_run("over-live"));
+        assert_eq!(acts_ran(&stopped, &log), Ok(()));
+        log.push(ran("over-live"));
+        assert_eq!(acts_ran(&finished, &log), Ok(()));
+        log.push(Observation::ActSkipped {
+            connection: 0,
+            quic_stream: 0,
+            act: "over-live".to_owned(),
+        });
+        let skipped = Err(WitnessError::ActSkipped {
+            act: "over-live".to_owned(),
+        });
+        assert_eq!(acts_ran(&finished, &log), skipped);
+        assert_eq!(acts_ran(&stopped, &log), skipped);
     }
 }

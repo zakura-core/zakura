@@ -17,15 +17,17 @@
 //!   it, which the publisher compares too.
 //! - **Claims.** Each `CursorClaimed` records the cursor its subscription's
 //!   pages so far consumed, ending at that page's own last header: the sum
-//!   of every claimed page's entries and payload bytes, counted here from
-//!   each page as the fact reads it.
+//!   of every claimed page's entries and bytes. A page's bytes are derived
+//!   here from the page layout, its entry count and the subscription's
+//!   schema, and the bytes the claim reports charging must be those.
 //! - **Primitive totals.** Every credit fact carries what the
 //!   subscription's primitive counts after it, granted and consumed. That
 //!   must be every built update's credit and every claimed page's, as
 //!   counted here. An `Open` starts at its first locator with nothing
 //!   consumed, at the height storage gave that header: the first entry of
 //!   a locator read, or a VCT repair context's locator. An `Open` whose
-//!   first locator neither gave breaks too.
+//!   first locator neither gave breaks too, as does one whose sequence
+//!   isn't 0.
 //! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
@@ -38,8 +40,8 @@
 //! still move the subscription's state, so later updates are judged
 //! against what production did.
 //!
-//! The model restates the smallest page from the page layout, which a unit
-//! test checks against an encoded page.
+//! The model restates page sizes from the page layout, which a unit test
+//! checks against encoded pages.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -59,15 +61,22 @@ use crate::peer::{ENTRY_BYTES, PAGE_FIXED_BYTES};
 /// caps its byte window.
 const MAX_CREDIT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Bytes of a one-header Regtest page under `schema`: the page's fixed
-/// fields, one entry, and one auxiliary record under V1.
+/// Bytes of a one-header Regtest page under `schema`.
 pub(super) fn smallest_page(schema: AuxSchema) -> u64 {
+    page_size(1, schema)
+}
+
+/// Bytes of a Regtest page of `entries` headers under `schema`: the page's
+/// fixed fields, then per header its entry and, under V1, its auxiliary
+/// record.
+pub(super) fn page_size(entries: u64, schema: AuxSchema) -> u64 {
     let aux = match schema {
         AuxSchema::None => 0,
         AuxSchema::V1 => TREE_AUX_SCHEMA_V1_BYTES,
     };
     // Widening usize to u64 is lossless on supported targets.
-    (PAGE_FIXED_BYTES + ENTRY_BYTES + aux) as u64
+    let entry = (ENTRY_BYTES + aux) as u64;
+    (PAGE_FIXED_BYTES as u64).saturating_add(entries.saturating_mul(entry))
 }
 
 /// A subscription's state, as its `Open` and later facts set it.
@@ -378,9 +387,9 @@ impl Credit {
     }
 
     /// Judges a claim of `key`'s subscription that recorded `cursor` for a
-    /// page ending at `page.0`, of `page.1` entries in `page.2` bytes.
+    /// page ending at `page.0`, of `page.1` entries, charged `page.2` bytes.
     fn claim(&mut self, key: &Subscription, cursor: Acknowledged, page: Acknowledged) {
-        let (page_last, page_headers, page_bytes) = page;
+        let (page_last, page_headers, charged) = page;
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
             self.breaks.push(format!(
@@ -389,6 +398,13 @@ impl Credit {
             ));
             return;
         };
+        let page_bytes = page_size(page_headers, live.schema);
+        if charged != page_bytes {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} charged                  {charged} bytes for a page of {page_headers} headers under {:?}, which takes                  {page_bytes}",
+                live.schema
+            ));
+        }
         live.consumed = (
             live.consumed.0.saturating_add(page_headers),
             live.consumed.1.saturating_add(page_bytes),
@@ -460,10 +476,16 @@ impl Credit {
         }
     }
 
-    /// Judges an `Open`'s start: its first locator, at the height the
-    /// node's locator read gave it, with nothing consumed.
+    /// Judges an `Open`'s start: sequence 0, and its first locator, at the
+    /// height the node's locator read gave it, with nothing consumed.
     fn start(&mut self, key: &Subscription, update: &SubscribeHeaders) {
         let (_, session, subscription) = key;
+        if update.update_sequence != 0 {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s Open has                  sequence {}, not 0",
+                update.update_sequence
+            ));
+        }
         let start = update.acknowledged;
         let first = update.locator_hashes.first().copied();
         let height = first.and_then(|first| self.read_heights.get(&first).copied());

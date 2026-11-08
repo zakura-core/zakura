@@ -1,5 +1,5 @@
 # The committed fuzz input `header-storage-w-longer-fork.bin`, a fuzz-12 item 7 witness whose run
-# shows ForkWork(Less). Its 344-byte prefix is the scenario's canonical
+# shows ForkWork { earlier: 5, later: 3, work: Less }. Its 344-byte prefix is the scenario's canonical
 # encoding, then 1,024 Plan bytes.
 harness = "header-sync/storage"
 generator = 3

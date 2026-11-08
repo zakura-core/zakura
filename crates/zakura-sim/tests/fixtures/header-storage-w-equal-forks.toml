@@ -1,5 +1,5 @@
 # The committed fuzz input `header-storage-w-equal-forks.bin`, a fuzz-12 item 7 witness whose run
-# shows ForkWork(Equal). Its 344-byte prefix is the scenario's canonical
+# shows ForkWork { earlier: 4, later: 4, work: Equal }. Its 344-byte prefix is the scenario's canonical
 # encoding, then 1,024 Plan bytes.
 harness = "header-sync/storage"
 generator = 3

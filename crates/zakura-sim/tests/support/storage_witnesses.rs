@@ -344,6 +344,36 @@ pub fn stop_with_held_apply() -> StorageScenario {
     )
 }
 
+/// The node at A5 serving `mirror-0` at genesis, its first page read held
+/// for good, so that session's peer lease stays held. A publisher page job
+/// outlives its session, so a close and relink of `mirror-0` start a new
+/// session whose page job acquires for the same peer, at the peer class's
+/// limit of one lease, and is refused `CapacityBusy`.
+pub fn peer_lease_denied() -> StorageScenario {
+    let read = || Select::nth(OpKind::Read, 1);
+    StorageScenario {
+        node: Chain::main(5),
+        mirrors: vec![mirror(Chain::default(), Dialer::Mirror)],
+        policy: Policy {
+            holds: vec![hold(read(), Trigger::Released, Allow::Engine)],
+            ..Policy::converging()
+        },
+        controls: vec![
+            step(
+                SOURCE,
+                ControlAction::Close,
+                Some(Trigger::Submitted(read())),
+            ),
+            step(
+                SOURCE,
+                ControlAction::Relink,
+                Some(Trigger::Closed(SOURCE.to_owned())),
+            ),
+        ],
+        weights: Weights::default(),
+    }
+}
+
 /// The node at genesis syncing from A5 and serving a second mirror at
 /// genesis, with the first `kind` operation completing with `fault` once
 /// `after` milliseconds pass.
@@ -546,7 +576,7 @@ type Named = (&'static str, fn() -> StorageScenario);
 
 /// Every witness seed's stem and scenario, as `tests/fixtures` holds them.
 pub fn witness_seeds() -> Vec<(String, StorageScenario)> {
-    let named: [Named; 13] = [
+    let named: [Named; 14] = [
         ("reset-locator", reset_held_locator),
         ("reset-prepare", reset_held_prepare),
         ("reset-apply", reset_held_apply),
@@ -557,6 +587,7 @@ pub fn witness_seeds() -> Vec<(String, StorageScenario)> {
         ("reply-after-shutdown", reply_after_shutdown),
         ("reply-after-close", reply_after_close),
         ("stop-storage", stop_with_held_apply),
+        ("peer-lease-denied", peer_lease_denied),
         ("equal-forks", equal_forks),
         ("longer-fork", longer_fork),
         ("weighted-fork", weighted_fork),

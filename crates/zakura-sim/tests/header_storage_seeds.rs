@@ -3,8 +3,9 @@
 //! campaign starts from inputs that use the whole action grammar instead
 //! of a unit that never reaches it.
 //!
-//! Every storage seed was built for generator 2 and migrated to generator
-//! 3 with its meaning kept. Each generator-2 source is kept in
+//! The three drawn witnesses `tests/explore_state.rs` reads were built for
+//! generator 3 and name no source. Every other storage seed here was built
+//! for generator 2 and migrated to generator 3 with its meaning kept. Each generator-2 source is kept in
 //! `tests/fixtures/sources/`, named by its digest, which the seed's
 //! sidecar names in `derived_from`. Generator 3 encodes each of their
 //! scenarios as generator 2 did, so a seed differs from its source only in

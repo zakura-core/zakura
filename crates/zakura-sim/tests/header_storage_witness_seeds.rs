@@ -19,7 +19,7 @@ use zakura_sim::{
         header_sync::{grammar, Storage, StorageScenario},
         Subsystem,
     },
-    observe::{StorageFact, StoragePoint, StorageRequest},
+    observe::{StorageFact, StoragePoint, StorageRequest, StorageResult},
     seed, NullSink, Observation, RunReport,
 };
 
@@ -49,11 +49,21 @@ enum Shows {
     },
     /// A storage stop dropped a held apply.
     StopDroppedApply,
+    /// An acquire was refused `CapacityBusy` for the peer class while an
+    /// earlier read for the same peer still held its lease.
+    PeerLeaseDenied,
     /// An operation of this kind completed with this outcome.
     Failed(OpKind, &'static str),
     /// Two prepares from the same ancestor with different first headers,
     /// the later one's work comparing so with the earlier's.
-    ForkWork(std::cmp::Ordering),
+    ForkWork {
+        /// The earlier prepared fork's header count.
+        earlier: u32,
+        /// The later prepared fork's header count.
+        later: u32,
+        /// How the later fork's work compares with the earlier's.
+        work: std::cmp::Ordering,
+    },
     /// The node reached recovery's conditions after a prefix of this class.
     Recovered(&'static str),
 }
@@ -194,20 +204,39 @@ impl Shows {
                 }),
                 _ => false,
             }),
+            Shows::PeerLeaseDenied => facts.iter().any(|(at, fact)| {
+                matches!(fact, StorageFact::Completed {
+                    result: StorageResult::CapacityBusy { class },
+                    id,
+                    ..
+                } if class == "peer"
+                    && ops.iter().any(|op| op.0 == *id && op.1 == OpKind::Acquire))
+                    && ops.iter().any(|(_, kind, submitted, done)| {
+                        *kind == OpKind::Read
+                            && submitted < at
+                            && done.is_none_or(|done| done > *at)
+                    })
+            }),
             Shows::Failed(kind, outcome) => facts.iter().any(|(_, fact)| match fact {
                 StorageFact::Completed {
                     id, outcome: done, ..
                 } => done == outcome && ops.iter().any(|op| op.0 == *id && op.1 == kind),
                 _ => false,
             }),
-            Shows::ForkWork(ordering) => {
-                // Each prepared fork once: its ancestor, first header and work.
-                let mut prepares: Vec<(StoragePoint, String, U256)> = Vec::new();
+            Shows::ForkWork {
+                earlier,
+                later,
+                work: ordering,
+            } => {
+                // Each prepared fork once: its ancestor, first header, header
+                // count and work.
+                let mut prepares: Vec<(StoragePoint, String, u32, U256)> = Vec::new();
                 for (_, fact) in &facts {
                     if let StorageFact::Submitted {
                         request:
                             StorageRequest::PrepareHeaderTarget {
                                 common_ancestor,
+                                headers,
                                 first: Some(first),
                                 work: Some(work),
                                 ..
@@ -216,12 +245,20 @@ impl Shows {
                     } = fact
                     {
                         let work = U256::from_dec_str(work).expect("work is logged in decimal");
-                        if !prepares.iter().any(|(_, seen, _)| *seen == first.hash) {
-                            prepares.push((common_ancestor.clone(), first.hash.clone(), work));
+                        if !prepares.iter().any(|(_, seen, ..)| *seen == first.hash) {
+                            prepares.push((
+                                common_ancestor.clone(),
+                                first.hash.clone(),
+                                *headers,
+                                work,
+                            ));
                         }
                     }
                 }
-                matches!(&prepares[..], [a, b] if a.0 == b.0 && b.2.cmp(&a.2) == ordering)
+                // Both whole forks from one ancestor, so their lengths and
+                // work compare as the scenario names them.
+                matches!(&prepares[..], [a, b]
+                    if a.0 == b.0 && (a.2, b.2) == (earlier, later) && b.3.cmp(&a.3) == ordering)
             }
             Shows::Recovered(class) => {
                 let (Some(&recover), Some(&done)) = (
@@ -308,9 +345,32 @@ fn shows(stem: &str) -> (Shows, usize) {
             16,
         ),
         "stop-storage" => (Shows::StopDroppedApply, 16),
-        "equal-forks" => (Shows::ForkWork(Ordering::Equal), 16),
-        "longer-fork" => (Shows::ForkWork(Ordering::Less), 17),
-        "weighted-fork" => (Shows::ForkWork(Ordering::Greater), 17),
+        "peer-lease-denied" => (Shows::PeerLeaseDenied, 16),
+        // The node prepares mirror-0's branch-1 fork first.
+        "equal-forks" => (
+            Shows::ForkWork {
+                earlier: 4,
+                later: 4,
+                work: Ordering::Equal,
+            },
+            16,
+        ),
+        "longer-fork" => (
+            Shows::ForkWork {
+                earlier: 5,
+                later: 3,
+                work: Ordering::Less,
+            },
+            17,
+        ),
+        "weighted-fork" => (
+            Shows::ForkWork {
+                earlier: 5,
+                later: 3,
+                work: Ordering::Greater,
+            },
+            17,
+        ),
         _ => panic!("{stem} has no overlap to show"),
     }
 }
@@ -337,8 +397,8 @@ fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
 fn committed_witness_seeds_show_their_overlaps() {
     let entry = harness::find(Storage::NAME).unwrap();
     let seeds = storage_witnesses::witness_seeds();
-    // 13 named witnesses, 10 faults and 5 recovery classes.
-    assert_eq!(seeds.len(), 28);
+    // 14 named witnesses, 10 faults and 5 recovery classes.
+    assert_eq!(seeds.len(), 29);
     for (stem, scenario) in seeds {
         let (shows, slice) = shows(&stem);
         let committed = fs::read(fixtures().join(format!("{stem}.bin")))

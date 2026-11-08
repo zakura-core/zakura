@@ -1,0 +1,11 @@
+# The bump-skipped patch on an idle node: an invalidation of a node with
+# nothing to sync leaves the generation where it was, with no round live.
+# The queue, the reactor and the planner decide when the witness's round
+# starts and retires around the reset, so a change there can move the
+# witness off it.
+checks = ["crates/zakura-header-chain/src/transition"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.plan"

@@ -362,12 +362,6 @@ owner = "H1"
 plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
-id = "header-sync/reset-invalidates-work"
-kind = "property"
-owner = "H1"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
-
-[[pending]]
 id = "header-sync/outstanding-work-bounded"
 kind = "property"
 owner = "H1"

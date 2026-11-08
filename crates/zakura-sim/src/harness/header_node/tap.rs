@@ -108,6 +108,7 @@ use super::{
     pair::{PairError, Pairer},
     policy::LinkEffect,
     reservation::ReservationEvidence,
+    round_life::{RoundLife, RoundLifeEvidence},
     session::SessionEvidence,
     stale::{StaleCheck, StaleEvidence},
     stamp::Stamps,
@@ -198,6 +199,9 @@ struct TapState {
     /// Checks for offers a budget return should wake, keeping its facts for
     /// the view. Inert until [`ReactorTap::watch_wakes`].
     wake: Mutex<WakeCheck>,
+    /// Checks that the reactor's work follows the resets it adopts. None
+    /// until [`ReactorTap::watch_rounds`].
+    round_life: Mutex<Option<RoundLife>>,
 }
 
 /// The resource probe a tap was handed.
@@ -287,6 +291,22 @@ impl TapState {
                 detail,
             });
         }
+        let reset = match self
+            .round_life
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(rounds) => rounds.drain(step)?,
+            None => Vec::new(),
+        };
+        for detail in reset {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::ResetInvalidatesWork,
+                detail,
+            });
+        }
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         self.rounds.record(Settlement {
             step,
@@ -320,6 +340,14 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .get_or_insert(task);
         }
+    }
+
+    /// The node's engine's header generation now, or 0 once its port is
+    /// gone.
+    fn engine_generation(&self) -> u64 {
+        self.port
+            .upgrade()
+            .map_or(0, |port| port.engine().snapshot().header_generation.get())
     }
 
     /// The reactor's task, as the probe it handed over names it.
@@ -551,6 +579,14 @@ impl TapState {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .observe(&event, on_reactor);
+            if let Some(rounds) = state
+                .round_life
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                rounds.observe(&event, on_reactor);
+            }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();
                 state
@@ -839,6 +875,7 @@ impl ReactorTap {
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
                 wake: Mutex::new(WakeCheck::new(WakeEvidence::default())),
+                round_life: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -900,6 +937,18 @@ impl ReactorTap {
             wake.storage(fact);
         }
         drop(wake);
+        if let Some(rounds) = self
+            .state
+            .round_life
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            rounds.storage(
+                facts.iter().map(|(_, fact)| *fact),
+                self.state.engine_generation(),
+            );
+        }
         self.pairer.facts(facts);
     }
 
@@ -913,6 +962,19 @@ impl ReactorTap {
             .wake
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
+    }
+
+    /// Checks from now on that this reactor's work follows the resets it
+    /// adopts, as [`super::round_life`] describes, keeping when the check
+    /// applied in `evidence`. Call it before the run starts. A harness that
+    /// calls it must hand the tap the node's storage facts.
+    pub fn watch_rounds(&self, evidence: RoundLifeEvidence) {
+        *self
+            .state
+            .round_life
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(RoundLife::new(evidence, self.state.engine_generation()));
     }
 
     /// The node's stamps, which every fact the tap and the harness keep

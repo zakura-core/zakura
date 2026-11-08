@@ -23,7 +23,7 @@ use zakura_sim::{
         header_sync::{Dialer, MirrorSpec, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
-    observe::{ReactorFact, StorageFact},
+    observe::{ReactorCall, ReactorFact, StorageFact, StorageRequest, StorageResult},
     MemorySink, Observation, PlanInput, RunReport,
 };
 
@@ -158,9 +158,10 @@ pub fn two_forks() -> StorageScenario {
 }
 
 /// `mirror-0`'s session is replaced while its first locator read is held,
-/// until the node admits the second session. The new session's round
-/// starts from the old session's read, in the same generation.
-pub fn locator_reuse() -> StorageScenario {
+/// until the node admits the second session. The old session's read then
+/// serves nothing, so the new session reads again, in the same generation,
+/// and its round starts from that read.
+pub fn session_replaced_read() -> StorageScenario {
     StorageScenario {
         policy: Policy {
             holds: vec![Hold {
@@ -174,6 +175,31 @@ pub fn locator_reuse() -> StorageScenario {
         controls: vec![ControlStep {
             peer: "mirror-0".to_owned(),
             action: ControlAction::Relink,
+            when: Some(Trigger::Submitted(Select::nth(OpKind::Locator, 1))),
+        }],
+        ..held_locator()
+    }
+}
+
+/// `mirror-0`'s first locator read is held for five virtual seconds, and
+/// the mirror grows its chain by two headers once the read is submitted.
+/// The mirror's new `Status` moves the node's awaiting target to the new
+/// tip while the read is out, and in the same generation the read still
+/// serves it: the round starts from that one read.
+pub fn tip_reuse() -> StorageScenario {
+    StorageScenario {
+        policy: Policy {
+            holds: vec![Hold {
+                select: Select::nth(OpKind::Locator, 1),
+                until: Trigger::VirtualTime(5_000),
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }],
+            ..Policy::converging()
+        },
+        controls: vec![ControlStep {
+            peer: "mirror-0".to_owned(),
+            action: ControlAction::Grow { len: 2 },
             when: Some(Trigger::Submitted(Select::nth(OpKind::Locator, 1))),
         }],
         ..held_locator()
@@ -214,14 +240,15 @@ pub fn quiet_reset() -> StorageScenario {
 }
 
 /// Every witness, by name.
-fn witnesses() -> [(&'static str, StorageScenario); 8] {
+fn witnesses() -> [(&'static str, StorageScenario); 9] {
     [
         ("held-locator", held_locator()),
         ("held-prepare", held_prepare()),
         ("held-apply", held_apply()),
         ("held-reply", held_reply()),
         ("two-forks", two_forks()),
-        ("locator-reuse", locator_reuse()),
+        ("session-replaced-read", session_replaced_read()),
+        ("tip-reuse", tip_reuse()),
         ("completion-before-adoption", completion_before_adoption()),
         ("quiet-reset", quiet_reset()),
     ]
@@ -530,4 +557,152 @@ fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
             "{name}: {replayed:?}"
         );
     }
+}
+
+/// The node's storage facts, with their steps, in log order.
+fn storage(report: &RunReport) -> Vec<(u64, StorageFact)> {
+    report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                instance: 0, fact, ..
+            } => Some((entry.step, fact.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ID of the first operation `want` matches at its submission.
+fn first_op(report: &RunReport, want: impl Fn(&StorageRequest) -> bool) -> Option<u64> {
+    storage(report)
+        .into_iter()
+        .find_map(|(_, fact)| match fact {
+            StorageFact::Submitted { id, request, .. } if want(&request) => Some(id),
+            _ => None,
+        })
+}
+
+/// Operation `id`'s `Completed` result and generation.
+fn completed(report: &RunReport, id: u64) -> Option<(StorageResult, u64)> {
+    storage(report)
+        .into_iter()
+        .find_map(|(_, fact)| match fact {
+            StorageFact::Completed {
+                id: done,
+                result,
+                generation,
+                ..
+            } if done == id => Some((result, generation)),
+            _ => None,
+        })
+}
+
+/// The first `Reset` fact's generation.
+fn reset_generation(report: &RunReport) -> Option<u64> {
+    storage(report)
+        .into_iter()
+        .find_map(|(_, fact)| match fact {
+            StorageFact::Reset { generation, .. } => Some(generation),
+            _ => None,
+        })
+}
+
+/// The session and target of each locator call the reactor dispatched
+/// before its first `Started`, and that start's session and target.
+#[allow(clippy::type_complexity)]
+fn locators_before_start(report: &RunReport) -> (Vec<(u64, String)>, Option<(u64, String)>) {
+    let mut locators = Vec::new();
+    for (_, fact) in reactor(report) {
+        match fact {
+            ReactorFact::Dispatched {
+                port:
+                    ReactorCall::Locator {
+                        session_id, target, ..
+                    },
+                ..
+            } => locators.push((*session_id, target.clone())),
+            ReactorFact::Started { request, .. } => {
+                return (locators, Some((request.session_id, request.target.clone())))
+            }
+            _ => {}
+        }
+    }
+    (locators, None)
+}
+
+/// Each witness takes the path it names, so a run that holds the property
+/// some other way doesn't pass for it. The held locator read answers in
+/// the reset's generation and the reactor reads again before it starts.
+/// The held apply is refused stale. The held reply commits, then arrives in
+/// the reset's generation. A replaced session's held read serves nothing,
+/// so the new session reads again and starts. Under some plan a read held
+/// while the mirror's tip moves is the only one dispatched, and the round
+/// it starts pursues the new tip. The quiet reset acts twice and starts no
+/// round.
+#[test]
+fn each_witness_takes_the_path_it_names() {
+    let mut reused = 0;
+    for input in inputs(8, 256) {
+        let report = run(&held_locator(), input.clone());
+        let read = first_op(&report, |request| {
+            matches!(request, StorageRequest::ContinuationLocator)
+        })
+        .expect("the node reads a locator");
+        let (result, _) = completed(&report, read).expect("the held read completes");
+        let StorageResult::Locator {
+            header_generation, ..
+        } = result
+        else {
+            panic!("the held read answers a locator: {result:?}");
+        };
+        assert_eq!(Some(header_generation), reset_generation(&report));
+        let (locators, started) = locators_before_start(&report);
+        assert!(started.is_some() && locators.len() >= 2, "{locators:?}");
+
+        let report = run(&held_apply(), input.clone());
+        let apply = first_op(&report, |request| {
+            matches!(request, StorageRequest::ApplyHeaderTarget { .. })
+        })
+        .expect("the node applies");
+        assert_eq!(
+            completed(&report, apply).map(|(result, _)| result),
+            Some(StorageResult::ApplyFailed {
+                category: "stale_target_or_generation".to_owned()
+            })
+        );
+
+        let report = run(&held_reply(), input.clone());
+        let apply = first_op(&report, |request| {
+            matches!(request, StorageRequest::ApplyHeaderTarget { .. })
+        })
+        .expect("the node applies");
+        assert!(storage(&report)
+            .iter()
+            .any(|(_, fact)| matches!(fact, StorageFact::Committed { id, .. } if *id == apply)));
+        assert_eq!(
+            completed(&report, apply).map(|(_, generation)| generation),
+            reset_generation(&report)
+        );
+
+        let report = run(&session_replaced_read(), input.clone());
+        let (locators, started) = locators_before_start(&report);
+        let sessions: Vec<u64> = locators.iter().map(|(session, _)| *session).collect();
+        assert_eq!(sessions, [1, 2], "{locators:?}");
+        assert_eq!(started.map(|(session, _)| session), Some(2));
+
+        let report = run(&tip_reuse(), input.clone());
+        let (locators, started) = locators_before_start(&report);
+        if let ([(_, read_for)], Some((_, target))) = (&locators[..], started) {
+            if *read_for != target {
+                reused += 1;
+            }
+        }
+
+        let report = run(&quiet_reset(), input);
+        assert_eq!(resets(&report).len(), 2);
+        assert!(!reactor(&report).any(|(_, fact)| matches!(fact, ReactorFact::Started { .. })));
+    }
+    assert!(reused > 0, "no plan reused the read across the tip's move");
 }

@@ -398,7 +398,9 @@ fn result(result: &ResultIdentity) -> StorageResult {
             finalized: point(*finalized),
         },
         ResultIdentity::NoLocator => StorageResult::NoLocator,
-        ResultIdentity::VctResolved => StorageResult::VctResolved,
+        ResultIdentity::VctResolved { locator } => StorageResult::VctResolved {
+            locator: locator.map(point),
+        },
         ResultIdentity::VctStale => StorageResult::VctStale,
         ResultIdentity::Acquired {
             lease: key,

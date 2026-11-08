@@ -963,7 +963,12 @@ pub enum StorageResult {
     /// No locator.
     NoLocator,
     /// A resolved VCT repair context.
-    VctResolved,
+    VctResolved {
+        /// The context's locator entry. Kept view-side and off the trace,
+        /// where the variant reads as before.
+        #[serde(skip)]
+        locator: Option<StoragePoint>,
+    },
     /// A stale VCT repair context.
     VctStale,
     /// A leased path.

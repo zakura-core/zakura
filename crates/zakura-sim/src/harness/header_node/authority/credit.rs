@@ -23,7 +23,9 @@
 //!   subscription's primitive counts after it, granted and consumed. That
 //!   must be every built update's credit and every claimed page's, as
 //!   counted here. An `Open` starts at its first locator with nothing
-//!   consumed, at the height the node's locator read gave that header.
+//!   consumed, at the height storage gave that header: the first entry of
+//!   a locator read, or a VCT repair context's locator. An `Open` whose
+//!   first locator neither gave breaks too.
 //! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
@@ -410,18 +412,30 @@ impl Credit {
     }
 
     /// Notes storage's `fact`: a locator read gives its first entry's
-    /// height.
+    /// height, and a resolved VCT repair context its locator's.
     pub(super) fn storage(&mut self, fact: &StorageFact) {
-        if let StorageFact::Completed {
-            result: StorageResult::Locator { tip, .. },
-            ..
-        } = fact
-        {
-            if let Ok(bytes) = <[u8; 32]>::try_from(decode_hex(&tip.hash).as_slice()) {
-                self.read_heights
-                    .insert(block::Hash(bytes), block::Height(tip.height));
-            }
+        let entry = match fact {
+            StorageFact::Completed {
+                result: StorageResult::Locator { tip, .. },
+                ..
+            } => tip,
+            StorageFact::Completed {
+                result:
+                    StorageResult::VctResolved {
+                        locator: Some(locator),
+                    },
+                ..
+            } => locator,
+            _ => return,
+        };
+        if let Ok(bytes) = <[u8; 32]>::try_from(decode_hex(&entry.hash).as_slice()) {
+            self.note_read(block::Hash(bytes), block::Height(entry.height));
         }
+    }
+
+    /// Notes that storage gave `hash` at `height` as a locator's entry.
+    pub(super) fn note_read(&mut self, hash: block::Hash, height: block::Height) {
+        self.read_heights.insert(hash, height);
     }
 
     /// Judges the primitive `totals` a `fact` of `key`'s subscription
@@ -456,7 +470,7 @@ impl Credit {
         if first != Some(start.hash)
             || start.headers != 0
             || start.bytes != 0
-            || height.is_some_and(|height| height != start.height)
+            || height != Some(start.height)
         {
             self.breaks.push(format!(
                 "CommitOnlyAuthorized: session {session} subscription {subscription}'s Open \

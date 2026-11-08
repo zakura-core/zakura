@@ -934,6 +934,12 @@ impl EnginePort {
         owner: BodyWorkOwner,
         height: block::Height,
     ) -> Result<VctRepairContextReply, PortError> {
+        // A repair past the ceiling is stale whatever the engine holds, so
+        // it answers without the lock, whose taking is a scheduling point in
+        // a run, and a port at the default ceiling schedules as before.
+        if height > self.checkpoint_ceiling {
+            return Ok(VctRepairContextReply::Stale);
+        }
         let engine = self.engine();
         match repair::context(
             &engine,

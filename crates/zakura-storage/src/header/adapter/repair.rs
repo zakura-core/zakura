@@ -10,6 +10,8 @@
 //! recovery, which demotes a durable outcome to an unauthenticated live
 //! delivery, and nothing here recovers from disk.
 
+use std::collections::HashMap;
+
 use zakura_chain::block;
 use zakura_header_chain::{
     AuxDelivery, AuxiliaryRequirementEpisode, BodyWorkAuthority, BodyWorkOwner, EngineLimits,
@@ -355,14 +357,16 @@ fn check_excluded_inputs(
 ) -> Result<(), Refusal> {
     let headers = insert.batch.headers();
     let selected = engine.selected_projection();
+    let indexes: HashMap<_, _> = headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.hash, index))
+        .collect();
     for delivery in &insert.aux {
         let Some(input) = delivery.tree_aux else {
             continue;
         };
-        let Some(index) = headers
-            .iter()
-            .position(|header| header.hash == delivery.header_hash)
-        else {
+        let Some(&index) = indexes.get(&delivery.header_hash) else {
             continue;
         };
         let header = &headers[index];

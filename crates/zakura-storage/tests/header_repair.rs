@@ -214,3 +214,71 @@ fn a_repair_without_records_is_stale() {
         ready(port.apply_header_target(prepared)).expect_err("a recordless repair is stale");
     assert_eq!(error.category, ErrorCategory::StaleTargetOrGeneration);
 }
+
+/// A repair's range stops at the checkpoint ceiling, even where the
+/// selected chain and the bucket would let it run on.
+#[test]
+fn a_repair_range_stops_at_the_checkpoint_ceiling() {
+    let (port, headers) = chain(3, 2);
+    let context = resolved(&port, 2);
+    assert_eq!(context.selected_header_count(), 1);
+    assert_eq!(
+        context.request_target(),
+        Frontier::new(block::Height(2), headers[1].hash())
+    );
+}
+
+/// A supplier that can serve only part of the range sends a shortened
+/// context's one header, and that repair applies: the engine re-derives the
+/// one-header range's own episode.
+#[test]
+fn a_shortened_repair_applies() {
+    let (port, headers) = chain(3, 10);
+    let context = resolved(&port, 2);
+    assert_eq!(context.selected_header_count(), 2);
+    let short = context
+        .bounded_prefix(1)
+        .expect("an unconstrained range shortens to its first header");
+    let request = repair_request(&port, &short, &headers, SourceId::from_digest([0x51; 32]));
+    let prepared = ready(port.prepare_header_target(request)).expect("the repair prepares");
+    assert_eq!(
+        ready(port.apply_header_target(prepared)).expect("the shortened repair applies"),
+        ApplyHeaderTargetOutcome::Applied
+    );
+}
+
+/// Once a source's rooted payload is retained at a header, a repair there
+/// from the same source is stale even with a different payload, while
+/// another source's different payload applies.
+#[test]
+fn a_repair_from_a_retained_source_is_stale() {
+    let (port, headers) = chain(3, 10);
+    let source = SourceId::from_digest([0x51; 32]);
+    let first = repair_request(&port, &resolved(&port, 2), &headers, source);
+    let prepared = ready(port.prepare_header_target(first)).expect("the first repair prepares");
+    ready(port.apply_header_target(prepared)).expect("the first repair applies");
+
+    let context = resolved(&port, 2);
+    assert_eq!(context.selected_header_count(), 1);
+    let different = |source| {
+        let mut request = repair_request(&port, &context, &headers, source);
+        let mut entries = request.entries.into_vec();
+        let record = entries[0]
+            .tree_aux
+            .as_mut()
+            .expect("the request has records");
+        record.sapling_tx_count += 100;
+        request.entries = entries.try_into().expect("the entries still fit");
+        request
+    };
+    let again = ready(port.prepare_header_target(different(source))).expect("the repeat prepares");
+    let error = ready(port.apply_header_target(again)).expect_err("a retained source is stale");
+    assert_eq!(error.category, ErrorCategory::StaleTargetOrGeneration);
+
+    let other = SourceId::from_digest([0x52; 32]);
+    let prepared = ready(port.prepare_header_target(different(other))).expect("it prepares");
+    assert_eq!(
+        ready(port.apply_header_target(prepared)).expect("another source's payload applies"),
+        ApplyHeaderTargetOutcome::Applied
+    );
+}

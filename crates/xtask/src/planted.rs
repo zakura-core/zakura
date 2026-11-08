@@ -4,8 +4,12 @@
 //!
 //! A planted case is `qa/planted/<property-id>/<name>.patch`, a production
 //! change that bypasses the property's guard, with `<name>.toml` beside it
-//! naming the committed fuzz input that must find the bug. The input's own
-//! sidecar names its harness.
+//! naming what must find the bug: either the committed fuzz input, whose
+//! own sidecar names its harness, or a typed case, a `[typed]` table naming
+//! the harness, a committed scenario as that harness's JSON and the Plan
+//! bytes it runs under. A typed case is for a scenario the harness's
+//! grammar can't encode, such as one with a control step or more mirrors
+//! than the grammar takes.
 //!
 //! The runner checks out `HEAD` once, in a scratch worktree under
 //! `target/planted/`, and builds the unpatched simulator there once. Every
@@ -24,7 +28,9 @@
 //!    pass the witness test. A case file's `also_violates` names properties
 //!    the patch's bug breaks too, and a campaign run may violate one of
 //!    them instead;
-//! 4. resets the worktree to `HEAD`, so the next patched build recompiles
+//! 4. for a typed case, replays the patched trace in a fresh `zakura-sim
+//!    replay`, which must match Exact, since no fuzz target can confirm it;
+//! 5. resets the worktree to `HEAD`, so the next patched build recompiles
 //!    only what the two patches touch.
 //!
 //! It then removes the worktree, keeping every trace as evidence.
@@ -44,7 +50,7 @@
 //! violates it without its trigger history, so the gate stays the committed
 //! input, which must violate exactly the case's property.
 //!
-//! `--targets` runs only the cases whose committed input runs on a harness
+//! `--targets` runs only the cases whose committed fuzz input runs on a harness
 //! that a simulator fuzz target runs, as the fuzz package's
 //! `[package.metadata.zakura-sim.targets]` table maps them, and prints
 //! each target's cases, or that it has none. After step 3 it also confirms
@@ -193,9 +199,8 @@ struct Case {
     property: String,
     /// The patch.
     patch: PathBuf,
-    /// The committed fuzz input that must find it, relative to the
-    /// repository root.
-    input: PathBuf,
+    /// What must find it.
+    witness: Witness,
     /// Other paths whose change can break the catch, relative to the
     /// repository root.
     checks: Vec<PathBuf>,
@@ -207,12 +212,90 @@ struct Case {
     target: Option<String>,
 }
 
+/// What a case runs, with paths relative to the repository root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Witness {
+    /// A committed fuzz input, whose sidecar names its harness.
+    Input(PathBuf),
+    /// A committed scenario, as `harness`'s JSON, run under the Plan bytes
+    /// in `plan`.
+    Typed {
+        /// The harness.
+        harness: String,
+        /// The scenario file.
+        scenario: PathBuf,
+        /// The Plan bytes file.
+        plan: PathBuf,
+    },
+}
+
+impl Witness {
+    /// The harness it runs on, read from the input's sidecar under
+    /// `root` for a fuzz input.
+    fn harness(&self, root: &Path) -> Result<String, BoxError> {
+        match self {
+            Witness::Input(input) => harness_of(root, input),
+            Witness::Typed { harness, .. } => Ok(harness.clone()),
+        }
+    }
+
+    /// Its committed files: the input and its sidecar, or the scenario and
+    /// the Plan bytes.
+    fn files(&self) -> Vec<PathBuf> {
+        match self {
+            Witness::Input(input) => vec![input.clone(), input.with_extension("toml")],
+            Witness::Typed { scenario, plan, .. } => vec![scenario.clone(), plan.clone()],
+        }
+    }
+
+    /// Its files under `root`, as [`record`] runs them.
+    fn located(&self, root: &Path) -> Located {
+        match self {
+            Witness::Input(input) => Located::Input(root.join(input)),
+            Witness::Typed { scenario, plan, .. } => Located::Typed {
+                scenario: root.join(scenario),
+                plan: root.join(plan),
+            },
+        }
+    }
+}
+
+/// What [`record`] runs, by its files' paths.
+#[derive(Clone, Debug)]
+pub(super) enum Located {
+    /// A full fuzz input.
+    Input(PathBuf),
+    /// A scenario file and its Plan bytes file.
+    Typed {
+        /// The scenario file.
+        scenario: PathBuf,
+        /// The Plan bytes file.
+        plan: PathBuf,
+    },
+}
+
+/// A typed case's `[typed]` table.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedFile {
+    /// The harness the scenario runs on.
+    harness: String,
+    /// The scenario, as the harness's JSON, relative to the repository
+    /// root.
+    scenario: PathBuf,
+    /// The Plan bytes, relative to the repository root.
+    plan: PathBuf,
+}
+
 /// A case's `<name>.toml`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaseFile {
-    /// The committed fuzz input, relative to the repository root.
-    input: PathBuf,
+    /// The committed fuzz input, relative to the repository root. A case
+    /// names this or `typed`, never both.
+    input: Option<PathBuf>,
+    /// The typed case, for a scenario the harness's grammar can't encode.
+    typed: Option<TypedFile>,
     /// Files or directories, relative to the repository root, whose change
     /// can break the catch besides the files the patch changes and
     /// [`SHARED`], such as the rest of the patched module.
@@ -304,6 +387,8 @@ enum Verdict {
     /// The patched run violated the property, but its witness test failed,
     /// as when the run missed the trigger history.
     WitnessFails(String),
+    /// A typed case's patched trace didn't replay Exact in a fresh process.
+    ReplayMisses(String),
     /// The patched input didn't confirm through the fuzz target that runs
     /// its harness.
     TargetMisses {
@@ -356,6 +441,9 @@ impl fmt::Display for Verdict {
             Verdict::WitnessFails(why) => {
                 write!(f, "the patched run's witness test fails: {why}")
             }
+            Verdict::ReplayMisses(why) => {
+                write!(f, "the patched trace doesn't replay Exact: {why}")
+            }
             Verdict::TargetMisses { target, why } => {
                 write!(
                     f,
@@ -390,7 +478,10 @@ pub(super) fn run(
         let harnesses = sim_minimize::fuzz_targets(repo_root)?;
         let mut on_targets = Vec::new();
         for mut case in cases {
-            case.target = target_of(&harnesses, &harness_of(repo_root, &case.input)?);
+            // A typed case has no fuzz input for a target to run.
+            if let Witness::Input(input) = &case.witness {
+                case.target = target_of(&harnesses, &harness_of(repo_root, input)?);
+            }
             if case.target.is_some() {
                 on_targets.push(case);
             }
@@ -488,6 +579,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
             let case_file = patch.with_extension("toml");
             let CaseFile {
                 input,
+                typed,
                 checks,
                 also_violates,
             } = toml::from_str(
@@ -495,7 +587,31 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
                     .map_err(|error| format!("{}: {error}", case_file.display()))?,
             )
             .map_err(|error| format!("{}: {error}", case_file.display()))?;
-            for path in std::iter::once(&input).chain(&checks) {
+            let witness = match (input, typed) {
+                (Some(input), None) => Witness::Input(input),
+                (
+                    None,
+                    Some(TypedFile {
+                        harness,
+                        scenario,
+                        plan,
+                    }),
+                ) => Witness::Typed {
+                    harness,
+                    scenario,
+                    plan,
+                },
+                (input, _) => {
+                    return Err(format!(
+                        "{}: a case names either `input` or `[typed]`, and this names {}",
+                        case_file.display(),
+                        if input.is_some() { "both" } else { "neither" }
+                    )
+                    .into())
+                }
+            };
+            let files = witness.files();
+            for path in files.iter().chain(&checks) {
                 if !is_plain_relative(path) {
                     return Err(format!(
                         "{}: {} isn't a plain path relative to the repository root",
@@ -508,7 +624,7 @@ fn cases(repo_root: &Path) -> Result<Vec<Case>, BoxError> {
             Ok(Case {
                 property,
                 patch,
-                input,
+                witness,
                 checks,
                 also_violates,
                 target: None,
@@ -573,8 +689,8 @@ fn changed_since_rev(repo_root: &Path, rev: &str) -> Result<Vec<PathBuf>, BoxErr
 }
 
 /// Every path whose change can break `case`'s catch, relative to
-/// `repo_root`: the patch and its case file, the input and its sidecar, the
-/// files the patch changes, the case's checks, and [`SHARED`].
+/// `repo_root`: the patch and its case file, the witness's files, the files
+/// the patch changes, the case's checks, and [`SHARED`].
 fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
     let relative = |path: &Path| {
         path.strip_prefix(repo_root)
@@ -584,9 +700,8 @@ fn watched(repo_root: &Path, case: &Case) -> Result<Vec<PathBuf>, BoxError> {
     let mut watched = vec![
         relative(&case.patch)?,
         relative(&case.patch.with_extension("toml"))?,
-        case.input.clone(),
-        case.input.with_extension("toml"),
     ];
+    watched.extend(case.witness.files());
     watched.extend(SHARED.iter().map(PathBuf::from));
     watched.extend(patched_files(repo_root, &case.patch)?);
     watched.extend(case.checks.iter().cloned());
@@ -695,8 +810,8 @@ fn check_case(
     baseline: &Path,
     case: &Case,
 ) -> Result<Verdict, BoxError> {
-    let harness = harness_of(worktree, &case.input)?;
-    let input = worktree.join(&case.input);
+    let harness = case.witness.harness(worktree)?;
+    let input = case.witness.located(worktree);
     let baseline = record(
         Command::new(baseline),
         &harness,
@@ -730,6 +845,12 @@ fn check_case(
         Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
         verdict => return Ok(verdict),
     };
+    if let (Verdict::Caught(_), Witness::Typed { .. }) = (&verdict, &case.witness) {
+        let binary = target.join(PROFILE).join("zakura-sim");
+        if let Some(why) = replay_misses(&binary, &scratch.join("patched"))? {
+            return Ok(Verdict::ReplayMisses(why));
+        }
+    }
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
@@ -767,6 +888,9 @@ fn through_target(
     target: &str,
     harness: &str,
 ) -> Result<Option<Verdict>, BoxError> {
+    let Witness::Input(input) = &case.witness else {
+        unreachable!("`run` gives a typed case no target");
+    };
     let out = path::absolute(scratch.join("target"))?;
     if out.exists() {
         fs::remove_dir_all(&out)?;
@@ -774,7 +898,7 @@ fn through_target(
     let request = sim_minimize::Request {
         target: target.to_owned(),
         harness: harness.to_owned(),
-        input: path::absolute(worktree.join(&case.input))?,
+        input: path::absolute(worktree.join(input))?,
         property: case.property.clone(),
         out: out.clone(),
         budget: sim_minimize::Budget {
@@ -859,7 +983,7 @@ fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
         let run = record(
             Command::new(&binary),
             harness,
-            &input,
+            &Located::Input(input.clone()),
             &case.property,
             "violated",
             &dir.join(format!("run-{index}")),
@@ -979,9 +1103,10 @@ fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     command
 }
 
-/// Records `input` on `harness` with `zakura_sim`, a `zakura-sim` command,
-/// as a witness test of `property` that expects `expect`, writing the trace
-/// to `out`, and reads its `end` record and the test's result.
+/// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
+/// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
+/// `property` that expects `expect`, writing the trace to `out`, and reads
+/// its `end` record and the test's result.
 ///
 /// With a `deadline` and its interrupt flag, the command's output goes to
 /// `<out>.log`. A run past the deadline, or one that a signal killed, is
@@ -990,7 +1115,7 @@ fn cargo_sim(worktree: &Path, target: &Path) -> Command {
 fn record(
     mut zakura_sim: Command,
     harness: &str,
-    input: &Path,
+    input: &Located,
     property: &str,
     expect: &str,
     out: &Path,
@@ -1000,8 +1125,8 @@ fn record(
         fs::remove_dir_all(out)?;
     }
     zakura_sim
-        .args(["record", "--sim", harness, "--input"])
-        .arg(input)
+        .args(["record", "--sim", harness])
+        .args(input_args(input)?)
         .arg("--out")
         .arg(out)
         .args(["--witness", property, "--expect", expect]);
@@ -1048,6 +1173,36 @@ fn record(
         });
     }
     Ok(run)
+}
+
+/// `zakura-sim record`'s arguments for `input`: `--input` and the file, or
+/// `--scenario` with the scenario file's text and `--plan` with the Plan
+/// bytes file.
+fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
+    Ok(match input {
+        Located::Input(path) => vec!["--input".into(), path.into()],
+        Located::Typed { scenario, plan } => vec![
+            "--scenario".into(),
+            fs::read_to_string(scenario)
+                .map_err(|error| format!("{}: {error}", scenario.display()))?
+                .into(),
+            "--plan".into(),
+            plan.into(),
+        ],
+    })
+}
+
+/// Replays the trace in `trace` with `zakura_sim` in a fresh process, and
+/// says why it didn't match Exact, or `None` if it did.
+fn replay_misses(zakura_sim: &Path, trace: &Path) -> Result<Option<String>, BoxError> {
+    let output = Command::new(zakura_sim).arg("replay").arg(trace).output()?;
+    Ok((!output.status.success()).then(|| {
+        format!(
+            "`zakura-sim replay` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }))
 }
 
 /// Reads `line`, a trace's `end` record, for `property`.
@@ -1462,7 +1617,10 @@ mod tests {
         let harnesses = sim_minimize::fuzz_targets(&repo_root).expect("cargo metadata reads it");
         let mut on_targets = BTreeMap::new();
         for case in cases(&repo_root).expect("the planted cases parse") {
-            let harness = harness_of(&repo_root, &case.input).expect("the input has a sidecar");
+            let Witness::Input(input) = &case.witness else {
+                continue;
+            };
+            let harness = harness_of(&repo_root, input).expect("the input has a sidecar");
             if let Some(target) = target_of(&harnesses, &harness) {
                 assert_eq!(
                     harnesses.get(&target),
@@ -1697,15 +1855,130 @@ mod tests {
         }
     }
 
-    /// The committed cases parse, and each names an input with a sidecar.
+    /// The committed cases parse, and each names an input with a sidecar,
+    /// or a typed case's files.
     #[test]
     fn committed_cases_name_their_inputs() {
         let repo_root = crate::repo_root().expect("xtask lives in the workspace");
         let cases = cases(&repo_root).expect("the planted cases parse");
         assert!(cases.iter().any(|case| case.property == ID));
         for case in &cases {
-            harness_of(&repo_root, &case.input)
+            case.witness
+                .harness(&repo_root)
                 .unwrap_or_else(|error| panic!("{}: {error}", case.patch.display()));
+            for file in case.witness.files() {
+                assert!(
+                    repo_root.join(&file).is_file(),
+                    "{}: {} is committed",
+                    case.patch.display(),
+                    file.display()
+                );
+            }
         }
+    }
+
+    /// Writes `qa/planted/<ID>/case.patch` and `case.toml` with `toml` under
+    /// a fresh repository root, and reads its cases.
+    fn parse_case(toml: &str) -> Result<Vec<Case>, BoxError> {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let property = dir.path().join(PLANTED_DIR).join(ID);
+        fs::create_dir_all(&property).unwrap();
+        fs::write(property.join("case.patch"), "").unwrap();
+        fs::write(property.join("case.toml"), toml).unwrap();
+        cases(dir.path())
+    }
+
+    /// A case file names a fuzz input or a typed case, never both and never
+    /// neither, and a typed case's files are plain relative paths.
+    #[test]
+    fn a_case_names_an_input_or_a_typed_case() {
+        let input = parse_case(r#"input = "fixtures/a.bin""#).expect("an input case parses");
+        assert_eq!(input[0].witness, Witness::Input("fixtures/a.bin".into()));
+        let typed = r#"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "qa/planted/x/case.scenario.json"
+            plan = "qa/planted/x/case.plan.bin"
+        "#;
+        let typed = parse_case(typed).expect("a typed case parses");
+        assert_eq!(
+            typed[0].witness,
+            Witness::Typed {
+                harness: "header-sync/storage".to_owned(),
+                scenario: "qa/planted/x/case.scenario.json".into(),
+                plan: "qa/planted/x/case.plan.bin".into(),
+            }
+        );
+        let both = r#"
+            input = "fixtures/a.bin"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "s.json"
+            plan = "p.bin"
+        "#;
+        let error = parse_case(both).expect_err("both is refused").to_string();
+        assert!(error.contains("names both"), "{error}");
+        let error = parse_case("checks = []")
+            .expect_err("neither is refused")
+            .to_string();
+        assert!(error.contains("names neither"), "{error}");
+        let outside = r#"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "../s.json"
+            plan = "p.bin"
+        "#;
+        let error = parse_case(outside)
+            .expect_err("a path outside is refused")
+            .to_string();
+        assert!(error.contains("isn't a plain path"), "{error}");
+        let missing = r#"
+            [typed]
+            harness = "header-sync/storage"
+            scenario = "s.json"
+        "#;
+        assert!(
+            parse_case(missing).is_err(),
+            "a typed case needs its Plan bytes"
+        );
+    }
+
+    /// A typed case watches its scenario and Plan bytes, and runs with
+    /// `--scenario` holding the scenario's text.
+    #[test]
+    fn a_typed_case_watches_and_runs_its_files() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let witness = Witness::Typed {
+            harness: "header-sync/storage".to_owned(),
+            scenario: "s.json".into(),
+            plan: "p.bin".into(),
+        };
+        assert_eq!(
+            witness.files(),
+            vec![PathBuf::from("s.json"), PathBuf::from("p.bin")]
+        );
+        assert_eq!(
+            witness.harness(dir.path()).expect("a typed case names it"),
+            "header-sync/storage"
+        );
+        fs::write(dir.path().join("s.json"), r#"{"mirrors":2}"#).unwrap();
+        let args = input_args(&witness.located(dir.path())).expect("the scenario reads");
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--scenario"),
+                OsString::from(r#"{"mirrors":2}"#),
+                OsString::from("--plan"),
+                dir.path().join("p.bin").into_os_string(),
+            ]
+        );
+        let input = Witness::Input("a.bin".into());
+        assert_eq!(
+            input_args(&input.located(dir.path())).expect("an input needs no read"),
+            vec![
+                OsString::from("--input"),
+                dir.path().join("a.bin").into_os_string()
+            ]
+        );
     }
 }

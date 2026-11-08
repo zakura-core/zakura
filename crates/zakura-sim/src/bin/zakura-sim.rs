@@ -4,6 +4,7 @@
 //! zakura-sim record --sim <name> --input <file> --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable>]
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
+//!     [--witness <property> --expect <holds|violated|applicable>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
 //! zakura-sim versions --sim <name>
@@ -97,7 +98,8 @@ mod cli {
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable>]\n  \
-             zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n  \
+             zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n      \
+             [--witness <property> --expect <holds|violated|applicable>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
              zakura-sim versions --sim <name>\n  \
@@ -118,6 +120,7 @@ mod cli {
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
              result to witness.json beside the trace, and exits 1 if the test fails.\n\
+             It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -240,28 +243,22 @@ mod cli {
                 ))
             }
         };
-        let input = match (flags.input, flags.scenario, flags.plan) {
-            (Some(input), None, None) => read(&input)?,
-            (None, Some(_), Some(_)) if witness.is_some() => {
-                return Err(Error::Usage(
-                    "--witness takes a committed --input, not --scenario and --plan".to_owned(),
-                ))
+        // A typed scenario has no `input.bin`, so its trace keeps the
+        // scenario in its meta, and `replay` reruns it from there.
+        let (input, scenario, plan);
+        let what = match (flags.input, flags.scenario, flags.plan) {
+            (Some(path), None, None) => {
+                input = read(&path)?;
+                RecordInput::Input(&input)
             }
-            (None, Some(scenario), Some(plan)) => {
-                let scenario: Value = serde_json::from_str(&scenario)
+            (None, Some(text), Some(path)) => {
+                scenario = serde_json::from_str::<Value>(&text)
                     .map_err(|error| Error::Usage(format!("--scenario isn't JSON: {error}")))?;
-                let plan = read(&plan)?;
-                let trace = harness::record(
-                    entry,
-                    RecordInput::Plan {
-                        scenario: &scenario,
-                        plan: &plan,
-                    },
-                    &out,
-                )
-                .map_err(|error| Error::Failed(error.to_string()))?;
-                print_trace(&trace, &out);
-                return Ok(());
+                plan = read(&path)?;
+                RecordInput::Plan {
+                    scenario: &scenario,
+                    plan: &plan,
+                }
             }
             _ => {
                 return Err(Error::Usage(
@@ -270,14 +267,13 @@ mod cli {
             }
         };
         let Some((property, expect)) = witness else {
-            let trace = harness::record(entry, RecordInput::Input(&input), &out)
+            let trace = harness::record(entry, what, &out)
                 .map_err(|error| Error::Failed(error.to_string()))?;
             print_trace(&trace, &out);
             return Ok(());
         };
-        let (trace, result) =
-            harness::record_witness(entry, RecordInput::Input(&input), &out, &property, expect)
-                .map_err(|error| Error::Failed(error.to_string()))?;
+        let (trace, result) = harness::record_witness(entry, what, &out, &property, expect)
+            .map_err(|error| Error::Failed(error.to_string()))?;
         print_trace(&trace, &out);
         let error = result.as_ref().err().map(ToString::to_string);
         let file = json!({

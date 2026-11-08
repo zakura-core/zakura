@@ -62,6 +62,8 @@ pub enum Claim {
     ForeignPage,
     /// A staged page left its round holding other headers than it carried.
     UnstagedPage,
+    /// A page spent more headers than its reservation held.
+    OverReservation,
 }
 
 impl Claim {
@@ -76,6 +78,7 @@ impl Claim {
             ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
             ClaimRule::ForeignPage => Claim::ForeignPage,
             ClaimRule::UnstagedPage => Claim::UnstagedPage,
+            ClaimRule::OverReservation => Claim::OverReservation,
         }
     }
 }

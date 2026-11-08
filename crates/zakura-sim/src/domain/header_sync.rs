@@ -463,10 +463,11 @@ fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
 pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
 
 /// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
-const AUTHORITY_CLAIMS: [Claim; 3] = [
+const AUTHORITY_CLAIMS: [Claim; 4] = [
     Claim::CommitOnlyAuthorized,
     Claim::ForeignPage,
     Claim::UnstagedPage,
+    Claim::OverReservation,
 ];
 
 /// What the authority check reads: one reactor's claim breaks and when the

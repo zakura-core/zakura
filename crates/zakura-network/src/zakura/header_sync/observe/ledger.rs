@@ -111,6 +111,9 @@ pub enum ClaimRule {
     /// pages and then its own, in order, or a count that isn't what it
     /// staged.
     UnstagedPage,
+    /// A page spent more headers than its reservation held, or reported
+    /// another count left.
+    OverReservation,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -331,7 +334,7 @@ impl HeaderWorkLedger {
                 cause,
             } => {
                 let live = self.reservation_mut(*reservation)?;
-                let unstaged = live.opened - live.staged;
+                let unstaged = live.opened.saturating_sub(live.staged);
                 if *released != unstaged || (*cause == ReservationEnd::Staged && *released != 0) {
                     return Err(format!(
                         "ReleaseMismatch: reservation {reservation} ended as {cause:?} \
@@ -807,14 +810,17 @@ impl HeaderWorkLedger {
                 request.incarnation, live.round
             ));
         }
-        let unstaged = live.opened - live.staged;
-        if headers == 0 || headers > unstaged || reserved_left != unstaged - headers {
-            return Err(format!(
-                "OverReservation: a page of {headers} headers spent reservation {reservation}, \
-                 which held {unstaged} and reports {reserved_left} left"
-            ));
-        }
+        let unstaged = live.opened.saturating_sub(live.staged);
+        let over = (headers == 0 || headers > unstaged || reserved_left != unstaged - headers)
+            .then(|| ClaimBreak {
+                rule: ClaimRule::OverReservation,
+                detail: format!(
+                    "OverReservation: a page of {headers} headers spent reservation \
+                     {reservation}, which held {unstaged} and reports {reserved_left} left"
+                ),
+            });
         live.staged += headers;
+        self.claims.extend(over);
         let round = self
             .started
             .get_mut(&request.incarnation)
@@ -1000,7 +1006,7 @@ impl HeaderWorkLedger {
     pub fn reserved(&self) -> usize {
         self.reservations
             .values()
-            .map(|live| live.opened - live.staged)
+            .map(|live| live.opened.saturating_sub(live.staged))
             .sum()
     }
 
@@ -1701,10 +1707,10 @@ mod tests {
         claimed_as(foreign, ClaimRule::ForeignPage);
         let mut over = base.clone();
         over.push(staged(1, 1, 1, 6, 0, 6));
-        refused_as(over, "OverReservation");
+        claimed_as(over, ClaimRule::OverReservation);
         let mut miscounted = base.clone();
         miscounted.push(staged(1, 1, 1, 2, 2, 2));
-        refused_as(miscounted, "OverReservation");
+        claimed_as(miscounted, ClaimRule::OverReservation);
         let mut released = base;
         released.push(staged(1, 1, 1, 2, 3, 2));
         released.push(reservation_ended(1, 2, ReservationEnd::Released));

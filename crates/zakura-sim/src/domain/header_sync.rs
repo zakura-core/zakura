@@ -506,7 +506,8 @@ where
 /// judges each `Started` and `PageStaged`, the ledger reports a foreign or
 /// unstaged page, and the session view an admission under another
 /// identity than its link's. A break the step's drain found violates at
-/// once. It applies once a drain found a start or a staged page.
+/// once. It applies once a drain found a start, a staged page or an
+/// admission's identity join.
 fn check_commit_only_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,

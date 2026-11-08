@@ -28,7 +28,9 @@
 //! is the ledger's `ForeignPage`, and the session view's identity joins are
 //! the session evidence's, both claims of the same property.
 //!
-//! The check applies once it judged a `Started` or a `PageStaged`. A broken
+//! The check applies once it judged a `Started` or a `PageStaged`, or the
+//! session view joined an admission's identity to its link or transport
+//! row, so a run whose wrong identity starts no round still applies. A broken
 //! rule is a claim break, which the tap hands
 //! [`Claim::CommitOnlyAuthorized`](super::claim::Claim) at its drain.
 
@@ -189,7 +191,7 @@ impl Authority {
     }
 
     /// Notes that a fact made the check applicable.
-    fn applies(&self) {
+    pub(super) fn applies(&self) {
         self.evidence.with(|store| store.pending = true);
     }
 

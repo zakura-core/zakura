@@ -207,6 +207,9 @@ struct SessionLedger {
     /// direction or session ID isn't its link's or transport row's, which
     /// `header-sync/commit-only-authorized` claims.
     claims: Vec<String>,
+    /// Whether an identity join was made since the last drain, which makes
+    /// `header-sync/commit-only-authorized` applicable.
+    identity_joined: bool,
 }
 
 /// Own-9's facts about the node's sessions, as its transport reported them,
@@ -455,6 +458,12 @@ impl SessionEvidence {
         std::mem::take(&mut self.ledger().claims)
     }
 
+    /// Whether an admission's identity was joined to its link or transport
+    /// row since the last call, mismatched or not.
+    pub(crate) fn take_joined(&self) -> bool {
+        std::mem::take(&mut self.ledger().identity_joined)
+    }
+
     /// Every fact so far, in order.
     pub fn facts(&self) -> Vec<SessionFact> {
         self.ledger().facts.clone()
@@ -658,6 +667,7 @@ impl SessionLedger {
                 link.origin
             ));
         }
+        self.identity_joined = true;
         let mismatch = if link.peer != *peer {
             Some(format!("peer {}", link.name))
         } else if link.direction != direction {
@@ -729,8 +739,15 @@ impl SessionLedger {
                 row.kind
             ));
         }
-        let mismatch = if row.peer.as_deref() != Some(name.as_str()) {
-            Some(format!("peer {:?}", row.peer))
+        let Some(row_peer) = row.peer.as_deref() else {
+            return Err(format!(
+                "Own9Join: {admitted} on connection {connection}'s stream {quic_stream}, but its \
+                 Session row names no scripted peer"
+            ));
+        };
+        self.identity_joined = true;
+        let mismatch = if row_peer != name {
+            Some(format!("peer {row_peer}"))
         } else if row.session_id != session_id {
             Some(format!("session {}", row.session_id))
         } else {

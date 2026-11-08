@@ -332,12 +332,16 @@ impl TapState {
             });
         }
         let mut authorized = self.sessions.take_claims();
+        let joined = self.sessions.take_joined();
         if let Some(authority) = self
             .authority
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
+            if joined {
+                authority.applies();
+            }
             authorized.extend(authority.drain(step));
         }
         for detail in authorized {
@@ -665,8 +669,8 @@ impl TapState {
         }
         // Budget changes, credit, causes, headroom waits, deferred passes,
         // taken events, watch reads, the queue's slots and cursor
-        // acceptances stay out of the log, whose format pinned Plans fix, and a teardown's returns after
-        // the run are expected.
+        // acceptances stay out of the log, whose format pinned Plans fix,
+        // and a teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }

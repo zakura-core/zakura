@@ -1,21 +1,18 @@
 diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
-index 9905b6dafc..9b7900e6a2 100644
+index 9905b6dafc..a6bc9d9d22 100644
 --- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
 +++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
-@@ -592,7 +592,19 @@ impl Live {
+@@ -592,7 +592,16 @@ impl Live {
              subscription_id: self.id,
              update_sequence: update.sequence,
              initial_target_tip_hash: self.target,
 -            acknowledged: update.acknowledged,
-+            // Mutation: a Close acknowledges the Open's start, behind the
-+            // cursors the reactor accepted.
-+            acknowledged: if operation == Operation::Close {
-+                let start = self.locators[0];
++            // Mutation: a Grant acknowledges another cursor hash than the
++            // latest accepted one.
++            acknowledged: if operation == Operation::Grant {
 +                Cursor {
-+                    height: start.height,
-+                    hash: start.hash,
-+                    headers: 0,
-+                    bytes: 0,
++                    hash: block::Hash([0x55; 32]),
++                    ..update.acknowledged
 +                }
 +            } else {
 +                update.acknowledged

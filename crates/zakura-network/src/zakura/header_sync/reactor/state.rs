@@ -41,12 +41,12 @@ pub(super) struct ReactorState {
     /// request timeouts, or that sent headers failing validation.
     /// The reactor prunes expired entries during insertion and maintenance.
     ///
-    /// The admitted peer limits bound the count, as for
-    /// [`Self::departed_strikes`], so the insert prune, the eviction scan and
-    /// the per-publish sort stay bounded however many identities fault in one
-    /// cooldown. Past the limit the cooldown that ends first ends now. Evicting
-    /// one takes more faulting identities in one cooldown than the limits admit
-    /// at once, and it gains the evicted identity little: a cooldown only
+    /// [`HeaderSyncReactor::admitted_peer_limit`](super::HeaderSyncReactor::admitted_peer_limit)
+    /// bounds the count, as for [`Self::departed_strikes`], so the insert
+    /// prune, the eviction scan and the per-publish sort stay bounded however
+    /// many identities fault in one cooldown. Past the limit the cooldown that
+    /// ends first ends now. Evicting one takes more faulting identities in one
+    /// cooldown than the node admits at once, and it gains the evicted identity little: a cooldown only
     /// refuses the exact identity, so a fresh one already gets back in for the
     /// cost of one handshake.
     pub(super) unproductive_peer_cooldowns: HashMap<ZakuraPeerId, Instant>,

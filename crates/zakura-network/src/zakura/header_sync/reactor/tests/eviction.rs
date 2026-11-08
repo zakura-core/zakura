@@ -569,24 +569,27 @@ async fn the_backed_off_set_is_sorted_for_the_services_search() {
 }
 
 /// Fresh identities that each fault through a freed slot end the earliest
-/// cooldowns instead of growing the map past the admitted peer limits.
+/// cooldowns instead of growing the map past the node's admitted connections,
+/// however large the configured peer limits are.
 #[tokio::test(start_paused = true)]
-async fn faulting_identities_past_the_peer_limits_keep_the_cooldown_cap() {
+async fn faulting_identities_past_the_admitted_connections_keep_the_cooldown_cap() {
     let mut fixture = eviction_fixture(1, 7);
-    fixture.reactor.startup.config.peer_limits.max_inbound_peers = 1;
+    fixture.reactor.startup.config.peer_limits.max_inbound_peers = 1 << 20;
     fixture
         .reactor
         .startup
         .config
         .peer_limits
-        .max_outbound_peers = 1;
+        .max_outbound_peers = 1 << 20;
+    fixture.reactor.startup.max_connections = 10;
     let limit = fixture.reactor.admitted_peer_limit();
+    assert_eq!(limit, 10, "the admitted connections clamp the peer limits");
     let mut peers = vec![fixture.peer.clone()];
     fixture
         .reactor
         .drop_unproductive_peer(&fixture.peer, 7, "unproductive");
     let mut outbound = Vec::new();
-    for (session_id, byte) in (8_u64..).zip(0x80_u8..0x84) {
+    for (session_id, byte) in (8_u64..).zip(0x80_u8..0x80 + 12) {
         time::advance(std::time::Duration::from_secs(1)).await;
         let peer = ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has 32 bytes");
         let (send, recv) = framed_channel(8);
@@ -607,13 +610,39 @@ async fn faulting_identities_past_the_peer_limits_keep_the_cooldown_cap() {
     }
 
     let held = &fixture.reactor.state.unproductive_peer_cooldowns;
-    assert_eq!(held.len(), limit, "the admitted peer limits cap the map");
+    assert_eq!(held.len(), limit, "the admitted connections cap the map");
     assert!(
         peers[peers.len() - limit..]
             .iter()
             .all(|peer| held.contains_key(peer)),
         "the latest cooldowns stay"
     );
+}
+
+/// The per-identity cap is the smaller of the peer limits and the admitted
+/// connections, and never below the floor.
+#[tokio::test]
+async fn the_peer_identity_cap_follows_the_smaller_limit_with_a_floor() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cases = [
+        // (inbound, outbound, admitted connections, cap)
+        (256, 256, 92, 92),
+        (1 << 20, 1 << 20, 10, 10),
+        (6, 6, 92, 12),
+        (1, 1, 92, MIN_PEER_IDENTITY_STATE),
+        (256, 256, 2, MIN_PEER_IDENTITY_STATE),
+    ];
+    for (inbound, outbound, connections, cap) in cases {
+        let startup = &mut fixture.reactor.startup;
+        startup.config.peer_limits.max_inbound_peers = inbound;
+        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.max_connections = connections;
+        assert_eq!(
+            fixture.reactor.admitted_peer_limit(),
+            cap,
+            "{inbound} inbound, {outbound} outbound, {connections} connections"
+        );
+    }
 }
 
 /// Past the cap the cooldown that ends first is evicted, never the one just

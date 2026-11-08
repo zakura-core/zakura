@@ -108,6 +108,11 @@ const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The fewest peer identities whose state outlives a session that the reactor
+/// keeps, so a node with very few connection slots still remembers its last
+/// few offenders.
+const MIN_PEER_IDENTITY_STATE: usize = 8;
+
 /// Minimum interval between unchanged header-snapshot refresh trace rows.
 ///
 /// The trace records every frontier advance and reanchor.
@@ -2811,13 +2816,15 @@ impl HeaderSyncReactor {
             .count()
     }
 
-    /// How many header-sync peers this node admits at once, inbound plus
-    /// outbound. It bounds the per-identity state that outlives a session.
+    /// How many header-sync peers this node can hold at once: the inbound
+    /// plus outbound `peer_limits`, clamped to the node's admitted
+    /// connections, and at least [`MIN_PEER_IDENTITY_STATE`]. It bounds the
+    /// per-identity state that outlives a session.
     fn admitted_peer_limit(&self) -> usize {
-        let limits = self.startup.config.peer_limits;
-        limits
-            .max_inbound_peers
-            .saturating_add(limits.max_outbound_peers)
+        self.startup
+            .config
+            .serving_sessions(self.startup.max_connections)
+            .max(MIN_PEER_IDENTITY_STATE)
     }
 
     fn publish_peer_state(&self) {

@@ -383,6 +383,19 @@ pub enum ReactorEvent {
         /// How long until the next refill.
         refill_in: std::time::Duration,
     },
+    /// The run loop took an event from `queue` at `point`, leaving `queued`
+    /// more in that queue. Reported before the event is handled. A take at
+    /// [`TakePoint::TurnStart`] that leaves `queued` above zero shows the
+    /// queue was ready when the turn's `select!` polled it, since nothing
+    /// else takes from it in between.
+    EventTaken {
+        /// The queue.
+        queue: EventQueue,
+        /// Where in the turn.
+        point: TakePoint,
+        /// The events left in the queue.
+        queued: usize,
+    },
     /// The reactor refused a session from `peer` because `peer`'s readmission
     /// cooldown still holds. Nothing else about the reactor changes.
     SessionRefused {
@@ -675,6 +688,27 @@ pub enum CreditKind {
     Open,
     /// A `Grant` on a live subscription.
     Grant,
+}
+
+/// One of the reactor's two event queues, as [`ReactorEvent::EventTaken`]
+/// names it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum EventQueue {
+    /// Session connects and disconnects.
+    Lifecycle,
+    /// Peer messages, such as `Status`.
+    Wire,
+}
+
+/// Where in a turn of its run loop the reactor took an event, as
+/// [`ReactorEvent::EventTaken`] reports it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TakePoint {
+    /// The `try_recv` before the turn's `select!`, which takes at most one
+    /// event from each queue.
+    TurnStart,
+    /// The turn's `select!`.
+    Select,
 }
 
 /// The unit of work the reactor is in, as [`ReactorEvent::CauseSet`]

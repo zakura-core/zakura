@@ -2176,6 +2176,75 @@ mod tests {
         claimed_as(doubled, ClaimRule::HeldUnowned);
     }
 
+    /// A prepare that names another ancestor than its round's first page or
+    /// another source than its peer's, and an apply that pursues another tip
+    /// than its prepare, are claim breaks.
+    #[test]
+    fn a_handoff_keeps_its_ancestor_source_and_tip() {
+        let base = vec![
+            opened(1, 1, 5),
+            bound(1, 1, 1),
+            started(1, 1),
+            staged(1, 1, 1, 3, 2, 3),
+        ];
+        let hold = ReactorEvent::HeadersHeld {
+            call: 1,
+            kind: StorageCallKind::Prepare,
+            peer: peer(1),
+            incarnation: 1,
+            headers: 3,
+            leases: Vec::new(),
+        };
+        let with = |change: &dyn Fn(&mut PortCall)| {
+            let mut prepare = prepare_of(1, owner(), 3);
+            change(&mut prepare);
+            let mut events = base.clone();
+            events.extend([dispatched(1, prepare), hold.clone()]);
+            events
+        };
+        let honest = with(&|_| {});
+        let mut ledger = fold(honest.clone()).expect("an honest prepare folds");
+        assert_eq!(ledger.take_claims(), Vec::new());
+        claimed_as(
+            with(&|prepare| {
+                if let PortCall::Prepare {
+                    common_ancestor, ..
+                } = prepare
+                {
+                    *common_ancestor =
+                        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([8; 32]));
+                }
+            }),
+            ClaimRule::WrongPayload,
+        );
+        claimed_as(
+            with(&|prepare| {
+                if let PortCall::Prepare { source, .. } = prepare {
+                    *source = SourceId::from_digest([2; 32]);
+                }
+            }),
+            ClaimRule::WrongSource,
+        );
+        let mut retargeted = honest;
+        let mut apply = apply(1);
+        if let PortCall::Apply {
+            target_tip_hash, ..
+        } = &mut apply
+        {
+            *target_tip_hash = block::Hash([8; 32]);
+        }
+        retargeted.extend([
+            dispatched(2, apply),
+            ReactorEvent::HeadersEnded {
+                call: 1,
+                incarnation: 1,
+                headers: 3,
+                end: HeaderWorkEnd::HandedToApply { apply: 2 },
+            },
+        ]);
+        claimed_as(retargeted, ClaimRule::BadHandoff);
+    }
+
     /// A prepare sends exactly its round's staged headers, through the staged
     /// tip, and a lease returns to the round of its own peer.
     #[test]

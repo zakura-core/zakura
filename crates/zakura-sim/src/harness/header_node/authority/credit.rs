@@ -27,7 +27,8 @@
 //!   consumed, at the height storage gave that header: the first entry of
 //!   a locator read, or a VCT repair context's locator. An `Open` whose
 //!   first locator neither gave breaks too, as does one whose sequence
-//!   isn't 0.
+//!   isn't 0. The encoder already refuses such an `Open`, and the service
+//!   panics on it, so only a unit test reaches that check.
 //! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.

@@ -296,7 +296,7 @@ proptest! {
 }
 
 /// Canonical address matching puts an IPv4-mapped sidecar in the capped first wave.
-/// The scheduler advertises to the remaining peers only after slots become available.
+/// The scheduler announces to the remaining peers after the configured delay.
 #[test]
 fn sidecar_peer_always_receives_block_gossip() {
     const TOTAL_PEERS: usize = 59;
@@ -313,12 +313,14 @@ fn sidecar_peer_always_receives_block_gossip() {
 
     // A window below the peer count, so the sidecar's place outside it is visible.
     let config = Config {
-        advert_window_min: 32,
-        advert_window_max: 64,
+        advert_window_full_block: 32,
+        advert_window_small_block: 64,
+        advert_delay_min: std::time::Duration::from_millis(500),
+        advert_delay_max: std::time::Duration::from_millis(500),
         ..Config::default()
     };
-    // The advertisement carries no size, so the broadcast uses the minimum window.
-    let window = config.advert_window_min;
+    // The advertisement carries no size, so the broadcast uses the full-block window.
+    let window = config.advert_window_full_block;
     let block_gossip_peer_ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     let mut handles = Vec::with_capacity(TOTAL_PEERS);
@@ -393,7 +395,8 @@ fn sidecar_peer_always_receives_block_gossip() {
             assert!(handle.try_to_receive_block_advert().is_none());
         }
         // Let the executor drain all first-wave responses before advancing paused time.
-        tokio::time::sleep(std::time::Duration::from_millis(3001)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
         for handle in &mut handles {
             if let Some(advert) = handle.try_to_receive_block_advert() {
                 assert_eq!(advert.hash, block_hash);

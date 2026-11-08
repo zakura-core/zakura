@@ -9,7 +9,7 @@ use zakura_network::zakura::observe::EventQueue;
 
 use super::{
     storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
-    StorageScenario, StorageView,
+    StorageScenario, StorageView, Weights,
 };
 use crate::{
     domain::header_sync::{
@@ -135,6 +135,7 @@ impl FloodScenario {
                 ..Policy::converging()
             },
             controls,
+            weights: Weights::default(),
         }
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
-    StorageScenario, StorageView,
+    StorageScenario, StorageView, Weights,
 };
 use crate::{
     domain::header_sync::capacity_release_wakes,
@@ -150,6 +150,7 @@ fn release() -> StorageScenario {
                 Trigger::HeadroomWait("mirror-2".to_owned()),
             ),
         ],
+        weights: Weights::default(),
     }
 }
 

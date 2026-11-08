@@ -48,6 +48,7 @@ fn scenario() -> StorageScenario {
             ..Policy::converging()
         },
         controls: Vec::new(),
+        weights: Default::default(),
     }
 }
 

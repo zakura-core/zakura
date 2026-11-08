@@ -21,7 +21,8 @@
 //! locator reaching storage ([`WakeFact::Submitted`]) answers the wake, and
 //! so does its session ending ([`WakeFact::Ended`]) when the environment
 //! ended it ([`EndedBy`]). A deferred cached pass ([`WakeFact::Deferred`])
-//! moves its deadline to the pass's refill.
+//! moves its deadline to the pass's refill, but never past one refill
+//! interval after the wake opened.
 //!
 //! Each fact gets a stamp, larger than every earlier one, which the
 //! storage view hands the registry as its view-side facts.
@@ -65,6 +66,8 @@ pub enum WakeFact {
         peer: ZakuraPeerId,
         /// Its session.
         session_id: u64,
+        /// When the release opened it.
+        at: SimInstant,
     },
     /// A locator read for `peer` reached storage.
     Submitted {
@@ -244,7 +247,7 @@ impl WakeCheck {
                     .saturating_add(*reserved_delta)
                     .saturating_add(*owned_delta);
                 if reserved_delta.saturating_add(*owned_delta) < 0 {
-                    self.released(fixture);
+                    self.released(fixture, now);
                 }
             }
             ReactorEvent::CachedPassDeferred { refill_in } => {
@@ -314,9 +317,9 @@ impl WakeCheck {
         self.permits = Some(free);
     }
 
-    /// Opens the waiting peer's wake if the fixture held at this release,
-    /// as the module doc lists the checks.
-    fn released(&mut self, fixture: WakeFixture) {
+    /// Opens the waiting peer's wake at `now` if the fixture held at this
+    /// release, as the module doc lists the checks.
+    fn released(&mut self, fixture: WakeFixture, now: SimInstant) {
         let Some(wait) = self.waiting.as_ref() else {
             return;
         };
@@ -335,6 +338,7 @@ impl WakeCheck {
             self.evidence.push(WakeFact::Opened {
                 peer: wait.peer,
                 session_id: wait.session_id,
+                at: now,
             });
         }
     }

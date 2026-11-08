@@ -8,7 +8,8 @@
 //!   bytes are at most one smallest page per added header under the
 //!   subscription's schema, capped at 8 MiB, as the subscriber derives its
 //!   byte window.
-//! - **Updates.** Each `Grant` and `Close` names its `Open`'s target and
+//! - **Updates.** Each `Grant` and `Close` names its own subscription, as
+//!   the subscriber's state reports it, and its `Open`'s target and
 //!   schema, its sequence is one more than the subscription's previous
 //!   update's, and it acknowledges the subscription's latest
 //!   `CursorsAccepted`, or the `Open`'s start before any, in all four
@@ -130,6 +131,13 @@ impl Credit {
                 }
                 match kind {
                     CreditKind::Open => {
+                        if update.subscription_id != *subscription {
+                            self.breaks.push(format!(
+                                "CommitOnlyAuthorized: session {session_id} subscription \
+                                 {subscription}'s Open names subscription {}",
+                                update.subscription_id
+                            ));
+                        }
                         self.live.insert(
                             key,
                             Live {
@@ -154,9 +162,10 @@ impl Credit {
             ReactorEvent::CloseBuilt {
                 peer,
                 session_id,
+                subscription,
                 update,
             } => {
-                let key = (peer.clone(), *session_id, update.subscription_id);
+                let key = (peer.clone(), *session_id, *subscription);
                 self.update("Close", &key, update);
                 true
             }
@@ -246,6 +255,9 @@ impl Credit {
             return;
         };
         let mut found = Vec::new();
+        if update.subscription_id != *subscription {
+            found.push(format!("names subscription {}", update.subscription_id));
+        }
         if update.initial_target_tip_hash != live.target {
             found.push(format!(
                 "names target {}, not its Open's {}",

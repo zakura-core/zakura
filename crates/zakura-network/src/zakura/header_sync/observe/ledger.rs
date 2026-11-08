@@ -820,6 +820,11 @@ impl HeaderWorkLedger {
                 ),
             });
         live.staged += headers;
+        if over.is_some() {
+            // The claim reports the defect. Later settlement goes by the
+            // count production reported, so the defect fails only the claim.
+            live.staged = live.opened.saturating_sub(reserved_left);
+        }
         self.claims.extend(over);
         let round = self
             .started
@@ -1711,6 +1716,10 @@ mod tests {
         let mut miscounted = base.clone();
         miscounted.push(staged(1, 1, 1, 2, 2, 2));
         claimed_as(miscounted, ClaimRule::OverReservation);
+        let mut miscounted_then_ended = base.clone();
+        miscounted_then_ended.push(staged(1, 1, 1, 2, 2, 2));
+        miscounted_then_ended.push(reservation_ended(1, 2, ReservationEnd::Released));
+        claimed_as(miscounted_then_ended, ClaimRule::OverReservation);
         let mut released = base;
         released.push(staged(1, 1, 1, 2, 3, 2));
         released.push(reservation_ended(1, 2, ReservationEnd::Released));

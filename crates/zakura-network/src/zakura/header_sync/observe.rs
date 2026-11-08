@@ -362,7 +362,7 @@ pub enum ReactorEvent {
         peer: ZakuraPeerId,
         /// The session the subscription is on.
         session_id: u64,
-        /// The subscription.
+        /// The subscription, as the subscriber's state names it.
         subscription: u64,
         /// The headers it adds.
         objects: u32,
@@ -383,6 +383,8 @@ pub enum ReactorEvent {
         peer: ZakuraPeerId,
         /// The session the subscription is on.
         session_id: u64,
+        /// The subscription, as the subscriber's state names it.
+        subscription: u64,
         /// The update as the subscriber built it, as `CreditIssued` carries.
         update: Box<SubscribeHeaders>,
     },

@@ -1213,6 +1213,7 @@ fn observed_credit_reports_each_open_grant_and_close() {
     expected.push(ReactorEvent::CloseBuilt {
         peer: peer.clone(),
         session_id: 7,
+        subscription: id,
         update: Box::new(close),
     });
 

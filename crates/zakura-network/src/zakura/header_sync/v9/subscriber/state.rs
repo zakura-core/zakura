@@ -113,7 +113,8 @@ impl SubscriberState {
         }
     }
 
-    /// Report the credit `update` gives, if anything observes it.
+    /// Report the credit `update` gives to the live subscription, if
+    /// anything observes it.
     #[cfg(any(test, zakura_sim))]
     fn report_credit(&self, kind: CreditKind, update: &SubscribeHeaders) {
         if let Some(tap) = &self.credit {
@@ -121,7 +122,8 @@ impl SubscriberState {
                 kind,
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
-                subscription: update.subscription_id,
+                // The state's own ID, which the built update must match.
+                subscription: self.live.as_ref().map_or(0, |live| live.id),
                 objects: update.added_credit.objects,
                 bytes: update.added_credit.bytes,
                 update: Box::new(update.clone()),
@@ -553,6 +555,7 @@ impl SubscriberState {
             tap.observer.observe(ReactorEvent::CloseBuilt {
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
+                subscription: live.id,
                 update: Box::new(message.clone()),
             });
         }

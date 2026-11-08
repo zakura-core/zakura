@@ -258,6 +258,7 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
         ReactorEvent::CloseBuilt {
             peer: mirror(),
             session_id: 2,
+            subscription: 3,
             update: Box::new(grant(3, 0, 0)),
         },
         retired(round(2, 2)),

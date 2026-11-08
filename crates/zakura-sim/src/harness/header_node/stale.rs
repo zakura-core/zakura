@@ -213,10 +213,10 @@ impl StaleCheck {
             ReactorEvent::CloseBuilt {
                 peer,
                 session_id,
-                update,
+                subscription,
+                ..
             } => Some(format!(
-                "closed {peer:?}'s session {session_id} subscription {}",
-                update.subscription_id
+                "closed {peer:?}'s session {session_id} subscription {subscription}"
             )),
             ReactorEvent::Retired { request, .. }
                 if other(&(request.peer.clone(), request.incarnation)) =>

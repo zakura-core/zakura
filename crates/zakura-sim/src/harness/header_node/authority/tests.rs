@@ -456,7 +456,8 @@ fn credit_stays_within_its_reservation() {
     assert!(found[0].contains("bytes for 2 headers"), "{found:?}");
 }
 
-/// A grant or close that names another target, skips a sequence or
+/// A grant or close that names another subscription than the state's or
+/// another target, skips a sequence or
 /// acknowledges anything but the latest acceptance, down to its credit
 /// counts, breaks the update rule.
 #[test]
@@ -505,6 +506,7 @@ fn updates_carry_their_subscriptions_state() {
     let close = |target: block::Hash| ReactorEvent::CloseBuilt {
         peer: mirror(),
         session_id: 7,
+        subscription: 1,
         update: Box::new(SubscribeHeaders {
             operation: Operation::Close,
             subscription_id: 1,
@@ -520,6 +522,17 @@ fn updates_carry_their_subscriptions_state() {
         }),
     };
     assert_eq!(with(close(chain[3].hash)), Vec::<String>::new());
+    let mut renamed = close(chain[3].hash);
+    if let ReactorEvent::CloseBuilt { update, .. } = &mut renamed {
+        update.subscription_id = 2;
+    }
+    let found = with(renamed);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("Close names subscription 2")),
+        "{found:?}"
+    );
     let found = with(close(chain[2].hash));
     assert!(
         found

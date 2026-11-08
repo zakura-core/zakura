@@ -33,6 +33,7 @@ use super::{
     header_node::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
+        chain_effect::ChainEffectEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
@@ -56,9 +57,9 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, reset_invalidates_work, stale_completion_inert,
-            teardown_end_violations, teardown_returns_baseline, BudgetView, ResetView, StaleView,
-            TeardownView, WakeView,
+            chunk_budget_bound, reset_invalidates_work, stale_chain_effect_inert,
+            stale_completion_inert, teardown_end_violations, teardown_returns_baseline, BudgetView,
+            ChainView, ResetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -566,6 +567,9 @@ pub struct Ports {
     /// When the node's reset check first applied, which its tap finds
     /// during the run.
     pub round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, which its tap
+    /// finds during the run.
+    pub chain_effect: ChainEffectEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -592,6 +596,8 @@ pub struct Storage {
     stamps: Stamps,
     /// When the node's reset check first applied, from its tap.
     round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, from its tap.
+    chain_effect: ChainEffectEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -636,6 +642,20 @@ pub struct StorageView {
     pub stamps: Stamps,
     /// When the node's reset check first applied.
     pub round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied.
+    pub chain_effect: ChainEffectEvidence,
+}
+
+impl ChainView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::chain_effect`].
+    fn chain_effect(&self) -> &ChainEffectEvidence {
+        &self.chain_effect
+    }
 }
 
 impl ResetView for StorageView {
@@ -721,6 +741,7 @@ impl HasView for Storage {
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
+            chain_effect: self.chain_effect.clone(),
         }
     }
 
@@ -836,6 +857,7 @@ impl Subsystem for Storage {
             wake: WakeEvidence::default(),
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
+            chain_effect: ChainEffectEvidence::default(),
         }
     }
 
@@ -870,6 +892,7 @@ impl Subsystem for Storage {
         let ends = tap.ends();
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
+        tap.watch_chain(ports.chain_effect.clone());
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -941,6 +964,7 @@ impl Subsystem for Storage {
             stale_calls: ports.stale_calls,
             wake: ports.wake,
             round_life: ports.round_life,
+            chain_effect: ports.chain_effect,
             ends,
             stamps,
             faults,
@@ -1058,6 +1082,9 @@ pub struct WirePorts {
     /// When the node's reset check first applied, which its tap finds
     /// during the run.
     pub round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, which its tap
+    /// finds during the run.
+    pub chain_effect: ChainEffectEvidence,
 }
 
 impl WirePorts {
@@ -1103,6 +1130,8 @@ pub struct HeaderWire {
     stamps: Stamps,
     /// When the node's reset check first applied, from its tap.
     round_life: RoundLifeEvidence,
+    /// When the node's stale-chain check first applied, from its tap.
+    chain_effect: ChainEffectEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -1135,6 +1164,7 @@ impl HasView for HeaderWire {
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
+            chain_effect: self.chain_effect.clone(),
         }
     }
 
@@ -1241,6 +1271,7 @@ impl Subsystem for HeaderWire {
             wake: WakeEvidence::default(),
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
+            chain_effect: ChainEffectEvidence::default(),
         }
     }
 
@@ -1285,6 +1316,7 @@ impl Subsystem for HeaderWire {
         let ends = tap.ends();
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
+        tap.watch_chain(ports.chain_effect.clone());
 
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -1365,6 +1397,7 @@ impl Subsystem for HeaderWire {
             stale_calls: ports.stale_calls,
             wake: ports.wake,
             round_life: ports.round_life,
+            chain_effect: ports.chain_effect,
             ends,
             stamps,
             faults,
@@ -1555,14 +1588,16 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 
 /// The storage harness's properties, [`OPERATION_IDS`],
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
-/// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`] and
-/// [`RESET_INVALIDATES_WORK`], all active. A test harness that wraps [`Storage`] with its view registers
+/// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
+/// [`RESET_INVALIDATES_WORK`] and [`STALE_CHAIN_EFFECT_INERT`], all
+/// active. A test harness that wraps [`Storage`] with its view registers
 /// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 /// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
 /// [`STALE_COMPLETION_INERT`]: crate::domain::header_sync::STALE_COMPLETION_INERT
 /// [`RESET_INVALIDATES_WORK`]: crate::domain::header_sync::RESET_INVALIDATES_WORK
+/// [`STALE_CHAIN_EFFECT_INERT`]: crate::domain::header_sync::STALE_CHAIN_EFFECT_INERT
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1590,6 +1625,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         teardown_returns_baseline(),
         stale_completion_inert(),
         reset_invalidates_work(),
+        stale_chain_effect_inert(),
     ]
 }
 

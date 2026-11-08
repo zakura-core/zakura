@@ -7,6 +7,7 @@
 use crate::{
     harness::header_node::{
         capacity::{BoundaryRead, CapacityEvidence},
+        chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
@@ -380,6 +381,78 @@ where
 /// [`RESET_INVALIDATES_WORK`]'s trigger history: the check applied.
 fn reset_applied<V: ResetView>(view: &V, _: &ObservationLog) -> bool {
     view.round_life().any()
+}
+
+/// A stale apply never changes the node's engine, and the reactor's
+/// adoption never moves back.
+pub const STALE_CHAIN_EFFECT_INERT: &str = "header-sync/stale-chain-effect-inert";
+
+/// What the stale-chain check reads: one reactor's claim breaks and when
+/// the check first applied.
+pub trait ChainView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the reactor's stale-chain check first applied.
+    fn chain_effect(&self) -> &ChainEffectEvidence;
+}
+
+/// [`STALE_CHAIN_EFFECT_INERT`], as a harness whose view is a [`ChainView`]
+/// registers it.
+pub fn stale_chain_effect_inert<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: ChainView,
+{
+    Property {
+        id: PropertyId::new(STALE_CHAIN_EFFECT_INERT),
+        claim: "an apply changes the node's header engine only under the engine's own \
+                generation and anchor, and the reactor's adopted state version and header \
+                generation never decrease",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_stale_chain_effect::<S>,
+        witness: Some(TriggerHistory::View(chain_applied::<S::View>)),
+    }
+}
+
+/// Checks [`STALE_CHAIN_EFFECT_INERT`] at the boundary after a step.
+///
+/// The tap's stale-chain check ([`crate::harness::header_node::chain_effect`])
+/// judges each apply's execution against the engine just before it, and
+/// each adoption against the one before it. A break the step's drain found
+/// violates at once. It applies once a drain found an apply that changed
+/// the engine or a second adoption.
+fn check_stale_chain_effect<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: ChainView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "no stale apply changes the engine, and adoption never moves back";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::StaleChainEffect])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.chain_effect().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`STALE_CHAIN_EFFECT_INERT`]'s trigger history: the check applied.
+fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
+    view.chain_effect().any()
 }
 
 /// In the wake fixture, a budget return that leaves room for an offer

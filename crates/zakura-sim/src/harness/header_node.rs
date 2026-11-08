@@ -19,6 +19,7 @@
 
 pub mod adoption;
 pub mod capacity;
+pub mod chain_effect;
 pub mod claim;
 pub mod ends;
 pub mod fault;

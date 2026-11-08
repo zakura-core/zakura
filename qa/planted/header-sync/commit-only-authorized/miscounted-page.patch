@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+index 7b51113345..08cd940f9c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/v9/subscriber/state.rs
+@@ -323,6 +323,8 @@ impl SubscriberState {
+         }
+         // A page beyond u32::MAX headers exceeds any credit.
+         let count = u32::try_from(page.entries.len()).map_err(|_| SubscriptionFault::OverCredit)?;
++        // Mutation: a page of several headers is counted as one fewer.
++        let count = if count > 1 { count - 1 } else { count };
+         let height = parent
+             .height
+             .0

@@ -173,6 +173,9 @@ impl std::error::Error for ResetError {}
 #[cfg(zakura_sim)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineRun {
+    /// The apply's operation and what it returned, or `None` for an
+    /// operator reset.
+    pub apply: Option<(OpId, ResultIdentity)>,
     /// Before the run.
     pub before: zakura_header_chain::DurableState,
     /// After the run.
@@ -993,6 +996,7 @@ impl ControlledPort {
         #[cfg(zakura_sim)]
         let executed = durable_before.map(|before| {
             std::sync::Arc::new(EngineRun {
+                apply: Some((id, result.clone())),
                 before,
                 after: self.engine.durable_state(),
             })
@@ -1203,6 +1207,7 @@ impl ControlledPort {
             generation: self.engine.snapshot().header_generation,
             #[cfg(zakura_sim)]
             executed: std::sync::Arc::new(EngineRun {
+                apply: None,
                 before: durable_before,
                 after: self.engine.durable_state(),
             }),

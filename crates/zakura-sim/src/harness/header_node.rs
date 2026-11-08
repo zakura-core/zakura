@@ -398,6 +398,7 @@ impl ActionSource for PolicySource {
                         _ => None,
                     },
                 ));
+                tap.engine_runs(&self.storage.take_runs());
                 tapped_effects = tap.take_effects();
                 tap.observe(log)
             }

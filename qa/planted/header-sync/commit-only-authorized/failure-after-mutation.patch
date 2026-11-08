@@ -1,0 +1,16 @@
+diff --git a/crates/zakura-header-chain/src/transition/engine/mod.rs b/crates/zakura-header-chain/src/transition/engine/mod.rs
+index 50346354a1..1fbb9a922f 100644
+--- a/crates/zakura-header-chain/src/transition/engine/mod.rs
++++ b/crates/zakura-header-chain/src/transition/engine/mod.rs
+@@ -351,8 +351,9 @@ impl HeaderChainEngine {
+             .checked_add(1)
+             .ok_or(CommittedTransitionError::RevisionExhausted)?;
+         self.install_verified_plan(&transition)?;
+-        self.source_revision = next_revision;
+-        Ok(())
++        // Mutation: the install changes the engine and then reports failure.
++        let _ = next_revision;
++        Err(CommittedTransitionError::StaleSource)
+     }
+ 
+     /// Return the private identity of this exact in-memory source revision.

@@ -27,7 +27,7 @@ use std::{
 use zakura_header_chain::{Attribution, HeaderSyncWorkOwner, HeaderWorkOwner};
 use zakura_scheduler::SimInstant;
 use zakura_storage::header::{
-    controlled::{ControlledPort, Fact, FactKind, OpId, ResetKind},
+    controlled::{ControlledPort, EngineRun, Fact, FactKind, OpId, ResetKind},
     evidence::{
         CallerPresence, CapacityClass, LeaseFact, LeaseKey, OperationStage, OwnerModel, OwnerState,
         PathPosition, RequestIdentity, ResultIdentity, RetentionEnd, SignalClass, Waiter,
@@ -103,6 +103,9 @@ pub struct HeaderStorage {
     label: String,
     /// What each failed prepare and apply blamed.
     attributions: FaultAttributions,
+    /// Each apply's and reset's engine run since the last
+    /// [`take_runs`](Self::take_runs), with the fact that carried it.
+    runs: Vec<(u64, Arc<EngineRun>)>,
 }
 
 /// Whom a failed prepare or apply blamed, with each source as the hex of its
@@ -231,6 +234,7 @@ impl HeaderStorage {
             },
             id,
             attributions: FaultAttributions::default(),
+            runs: Vec::new(),
         }
     }
 
@@ -726,6 +730,14 @@ impl ActionSource for HeaderStorage {
         let last = facts.last().map_or(delivered, |fact| fact.seq);
         for fact in &facts {
             self.attributions.record(self.id.index, fact);
+            let run = match &fact.kind {
+                FactKind::Completed(completion) => completion.executed.clone(),
+                FactKind::Committed { executed, .. } | FactKind::Reset { executed, .. } => {
+                    Some(executed.clone())
+                }
+                _ => None,
+            };
+            self.runs.extend(run.map(|run| (fact.seq, run)));
         }
         let mut sent: Vec<Observation> = facts
             .into_iter()
@@ -747,6 +759,14 @@ impl ActionSource for HeaderStorage {
         // was handed may not be the run's.
         self.checkpoint.record(log.step(), &sent, last);
         checked
+    }
+}
+
+impl HeaderStorage {
+    /// Each apply's and reset's engine run the observations since the last
+    /// call logged, with the sequence number of the fact that carried it.
+    pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
+        std::mem::take(&mut self.runs)
     }
 }
 

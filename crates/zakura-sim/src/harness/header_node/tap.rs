@@ -1043,6 +1043,23 @@ impl ReactorTap {
         (observer, tap)
     }
 
+    /// Hands the authority check each apply's and reset's engine run that
+    /// the header storage source just logged.
+    pub(crate) fn engine_runs(
+        &self,
+        runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
+    ) {
+        if let Some(authority) = self
+            .state
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            authority.engine_runs(runs.iter().map(|(_, run)| run.as_ref()));
+        }
+    }
+
     /// Reads the node's storage facts that this step's drain logged, as
     /// `(seq, fact)` in order, so the next [`observe`](ActionSource::observe)
     /// can pair calls with them.

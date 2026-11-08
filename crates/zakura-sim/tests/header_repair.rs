@@ -186,10 +186,11 @@ fn ended<'a>(facts: &[&'a ReactorFact], call: u64) -> Option<&'a str> {
     })
 }
 
-/// Checks that `run` held every property and `stale-completion-inert`
-/// applied, that its one stale call was the stale peer's ordinary prepare,
-/// and that the repair prepared and applied once, retired admitted, and
-/// left the node's records constraining the next repair there.
+/// Checks that every property of `run` held or didn't apply, that
+/// `stale-completion-inert` applied, that its one stale call was the stale
+/// peer's ordinary prepare, and that the repair prepared and applied once,
+/// retired admitted, and left the node's records constraining the next
+/// repair there.
 ///
 /// A departure fixture holds the repair's prepare or apply until the node's
 /// reactor has handled the supplier's session ending, so that call ending
@@ -201,7 +202,10 @@ fn repaired(run: &Run) {
     assert_eq!(report.end.harness, None, "{:?}", report.end);
     for property in &report.properties {
         assert!(
-            !matches!(property.outcome, PropertyOutcome::Violated { .. }),
+            matches!(
+                property.outcome,
+                PropertyOutcome::Held { .. } | PropertyOutcome::NotApplicable
+            ),
             "{property:?}"
         );
     }

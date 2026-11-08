@@ -19,7 +19,8 @@
 //!   pages so far consumed, ending at that page's own last header: the sum
 //!   of every claimed page's entries and bytes. A page's bytes are derived
 //!   here from the page layout, its entry count and the subscription's
-//!   schema, and the bytes the claim reports charging must be those.
+//!   schema, and the bytes the claim reports charging must be those. The
+//!   pages' sum never exceeds what the built updates granted.
 //! - **Primitive totals.** Every credit fact carries what the
 //!   subscription's primitive counts after it, granted and consumed. That
 //!   must be every built update's credit and every claimed page's, as
@@ -29,7 +30,8 @@
 //!   first locator neither gave breaks too, as does one whose sequence
 //!   isn't 0. The encoder already refuses such an `Open`, and the service
 //!   panics on it, so only a unit test reaches that check.
-//! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
+//! - **Acceptance.** The primitive stores exactly the cursor the reactor
+//!   asked it to accept. Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
 //! - **Operations.** An `Open`'s and a `Grant`'s credit comes in an update
@@ -286,14 +288,23 @@ impl Credit {
                 through,
                 headers,
                 bytes,
+                stored,
                 totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
                 let cursor = (*through, *headers, *bytes);
+                if *stored != cursor {
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session_id} subscription {subscription}'s \
+                         primitive stored {stored:?} accepted, not the {cursor:?} asked for"
+                    ));
+                }
+                // The next update acknowledges what the primitive stored.
+                let cursor = *stored;
                 self.totals("acceptance", &key, *totals);
                 if stale_handler {
                     if let Some(live) = self.live.get_mut(&key) {
-                        live.accepted = Some(*through);
+                        live.accepted = Some(cursor.0);
                         live.acknowledged = cursor;
                     }
                     return false;
@@ -410,6 +421,13 @@ impl Credit {
             live.consumed.0.saturating_add(page_headers),
             live.consumed.1.saturating_add(page_bytes),
         );
+        if live.consumed.0 > live.granted.0 || live.consumed.1 > live.granted.1 {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s pages \
+                 consumed {:?} headers and bytes, above the {:?} its updates granted",
+                live.consumed, live.granted
+            ));
+        }
         let (through, headers, bytes) = cursor;
         if through != page_last {
             self.breaks.push(format!(

@@ -255,6 +255,11 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
             through: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
             headers: 1,
             bytes: 263,
+            stored: (
+                zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+                1,
+                263,
+            ),
             totals: Default::default(),
         },
         ReactorEvent::CloseBuilt {

@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+index 7b105fe59e..8acdfec6e9 100644
+--- a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+@@ -328,7 +328,9 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
+             .drain(..=through)
+             .last()
+             .expect("the drained range ends at a found index");
+-        subscribed.accepted = accepted;
++        // Mutation: the primitive stores the latest received page's cursor,
++        // though only the pages through `cursor` passed validation.
++        subscribed.accepted = subscribed.unaccepted.back().cloned().unwrap_or(accepted);
+         Ok(())
+     }
+ 

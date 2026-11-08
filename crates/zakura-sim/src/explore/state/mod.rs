@@ -468,6 +468,7 @@ vocabulary! {
         VerifiedReset = "verified-reset",
         /// Header storage prepared a target with more work than an earlier
         /// target from the same common ancestor whose first header differs.
+        /// A retry of an earlier prepare counts for none of the three.
         StrongerWork = "stronger-work",
         /// The same with less work.
         WeakerWork = "weaker-work",

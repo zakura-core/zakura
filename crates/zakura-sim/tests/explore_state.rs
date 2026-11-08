@@ -5,7 +5,7 @@
 
 mod support;
 
-use support::storage_witnesses::{competing_mirrors, header_apply};
+use support::storage_witnesses::{competing_mirrors, header_apply, reply_hold};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -614,8 +614,8 @@ fn witnesses() -> Vec<Witness> {
 }
 
 /// The no-hold passing control: [`StorageScenario::grow`] under a Plan whose
-/// run reaches its drain with operations pending, and prepares one chain to
-/// two targets from one ancestor.
+/// run leaves an operation pending through its drain, and prepares one chain
+/// to two targets from one ancestor.
 const GROW_TO_DRAIN: &str = "header storage grow to its drain";
 
 /// [`GROW_TO_DRAIN`]'s Plan.
@@ -849,11 +849,16 @@ fn fuzz_12_features_have_their_witnesses() {
         ("header-storage-w-longer-fork", ForkState::WeakerWork),
         ("header-storage-w-weighted-fork", ForkState::StrongerWork),
     ] {
-        let states = witness_states(stem);
-        assert!(
-            states.contains(&StateFeature::Fork(label)),
-            "{stem}: {label:?}"
-        );
+        let labels: Vec<ForkState> = witness_states(stem)
+            .into_iter()
+            .filter_map(|state| match state {
+                StateFeature::Fork(
+                    fork @ (ForkState::StrongerWork | ForkState::WeakerWork | ForkState::EqualWork),
+                ) => Some(fork),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, [label], "{stem}");
     }
     for (stem, op, part) in [
         (
@@ -875,9 +880,78 @@ fn fuzz_12_features_have_their_witnesses() {
     }
 }
 
-/// A run with no hold hits no hold stage, though it reaches its drain with
-/// operations pending, and one chain prepared to two targets from one
-/// ancestor hits no fork work.
+/// The weighted-fork seed prepares the five-header branch again after the
+/// three-header one, and that retry earns no reverse label: the seed hits
+/// only [`ForkState::StrongerWork`], as the test above checks.
+#[test]
+fn a_retried_prepare_earns_no_fork_work() {
+    let entry = zakura_sim::harness::find("header-sync/storage").unwrap();
+    let run = (entry.run_bytes)(
+        &seed("header-storage-w-weighted-fork"),
+        &mut zakura_sim::NullSink,
+        None,
+    );
+    let report = report(run.result);
+    let prepares: Vec<_> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Storage {
+                fact:
+                    StorageFact::Submitted {
+                        request:
+                            StorageRequest::PrepareHeaderTarget {
+                                common_ancestor,
+                                first: Some(first),
+                                target,
+                                ..
+                            },
+                        ..
+                    },
+                ..
+            } => Some((common_ancestor.clone(), first.hash.clone(), target.clone())),
+            _ => None,
+        })
+        .collect();
+    let retry_after_other = prepares.iter().enumerate().any(|(at, prepare)| {
+        prepares[..at].contains(prepare)
+            && prepares[..at]
+                .iter()
+                .any(|other| other.0 == prepare.0 && other.1 != prepare.1)
+    });
+    assert!(retry_after_other, "{prepares:?}");
+}
+
+/// [`reply_hold`], with its held apply's completion held too, until a
+/// virtual second. The two parts resume at the one completion.
+#[test]
+fn both_held_parts_of_one_apply_resume() {
+    use zakura_sim::explore::state::{HeldPart, HoldStage};
+    let mut scenario = reply_hold();
+    scenario.policy.holds = vec![HeaderHold {
+        select: header_apply(1),
+        until: HeaderTrigger::VirtualTime(1_000),
+        then: vec![Allow::Engine],
+        deadline_ms: None,
+    }];
+    let witness = explicit::<HeaderStorage>("apply held twice", scenario, plan());
+    let states = states(&witness);
+    for part in [HeldPart::Completion, HeldPart::Reply] {
+        for &stage in HoldStage::ALL {
+            let hold = StateFeature::Hold {
+                op: Operation::ApplyHeaderTarget,
+                part,
+                stage,
+            };
+            assert!(states.contains(&hold), "{hold:?}");
+        }
+    }
+}
+
+/// A run with no hold hits no hold stage, though an operation waits
+/// unoffered through its drain, and one chain prepared to two targets from
+/// one ancestor hits no fork work.
 #[test]
 fn unheld_operations_and_one_chain_are_passing_controls() {
     let report = report(run_harness::<HeaderStorage>(
@@ -913,10 +987,24 @@ fn unheld_operations_and_one_chain_are_passing_controls() {
             _ => {}
         }
     }
-    assert!(
-        !pending.is_empty(),
-        "the drain starts with operations pending"
-    );
+    // The drain offers no source action, so an operation still pending at
+    // the end and submitted before the last step sat unoffered through at
+    // least one drain step. Only the live-step rule keeps it from counting
+    // as blocked.
+    let drain = report
+        .end
+        .drain
+        .as_ref()
+        .expect("the budget ends in a drain");
+    let live = report.end.steps - drain.steps;
+    let waited = report.log.entries().iter().any(|entry| {
+        matches!(&entry.obs, Observation::Storage {
+            fact: StorageFact::Submitted { id, .. }, ..
+        } if pending.contains(id))
+            && entry.step + 1 < report.end.steps
+            && entry.step + 1 >= live
+    });
+    assert!(waited, "an operation waits through a drain step");
     let one_chain = prepares.iter().any(|(ancestor, first, target)| {
         prepares
             .iter()

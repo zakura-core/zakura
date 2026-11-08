@@ -78,19 +78,36 @@ struct Prepared {
 }
 
 /// A header storage operation the hold features follow, from its
-/// submission, or its commit for a held reply, until it completes.
+/// submission until it completes.
 struct Held {
     /// Its kind.
     op: Operation,
-    /// What a hold could keep back: its completion, or its reply once it
-    /// committed.
-    part: HeldPart,
-    /// The step that logged its submission or commit.
+    /// Its completion, which a hold could keep back until it committed or
+    /// completed.
+    completion: Watch,
+    /// Its reply, which a reply hold could keep back once it committed.
+    reply: Option<Watch>,
+}
+
+/// One part of a [`Held`] operation the hold features follow.
+struct Watch {
+    /// The step that logged the part's start: the submission or the commit.
     since: u64,
     /// It was blocked at the start of some live step.
     blocked: bool,
     /// A step after it was blocked offered one of its storage actions.
     released: bool,
+}
+
+impl Watch {
+    /// A part that started at step `since`.
+    fn new(since: u64) -> Watch {
+        Watch {
+            since,
+            blocked: false,
+            released: false,
+        }
+    }
 }
 
 /// A peer's frame: its connection, stream, QUIC stream and sequence
@@ -185,9 +202,10 @@ struct StateCollector {
     reading: u64,
     /// Each header storage operation not yet completed, by its key.
     held: BTreeMap<OpKey, Held>,
-    /// Each header storage lease still live, by peer: the peer class counts
-    /// each peer's leases against its limit of one.
-    leases: BTreeMap<String, BTreeSet<u64>>,
+    /// Each header storage lease still live, by storage instance and peer:
+    /// the peer class counts each peer's leases on one port against its
+    /// limit of one.
+    leases: BTreeMap<(u64, String), BTreeSet<u64>>,
 }
 
 impl Collect for StateCollector {
@@ -329,17 +347,23 @@ impl StateCollector {
             })
             .collect();
         for (&(_, instance, id), held) in &mut self.held {
-            if held.since >= cx.step {
+            // After its commit, an operation's storage action is its
+            // reply's delivery.
+            let (part, watch) = match &mut held.reply {
+                Some(reply) => (HeldPart::Reply, reply),
+                None => (HeldPart::Completion, &mut held.completion),
+            };
+            if watch.since >= cx.step {
                 continue;
             }
             let offered = enabled.contains(&(instance, id));
-            let stage = match (held.blocked, held.released, offered) {
+            let stage = match (watch.blocked, watch.released, offered) {
                 (false, _, false) => {
-                    held.blocked = true;
+                    watch.blocked = true;
                     HoldStage::Blocked
                 }
                 (true, false, true) => {
-                    held.released = true;
+                    watch.released = true;
                     HoldStage::Released
                 }
                 _ => continue,
@@ -347,7 +371,7 @@ impl StateCollector {
             map.hit(
                 StateFeature::Hold {
                     op: held.op,
-                    part: held.part,
+                    part,
                     stage,
                 }
                 .feature(),
@@ -512,7 +536,7 @@ impl StateCollector {
         hit: &mut dyn FnMut(StateFeature),
     ) {
         let key = |id: u64| (service, instance, id);
-        self.track(service, key, fact, hit);
+        self.track(service, instance, fact, hit);
         match fact {
             StorageFact::Submitted { id, request, .. } => {
                 self.submitted(key(*id), request, None, hit);
@@ -605,45 +629,44 @@ impl StateCollector {
     fn track(
         &mut self,
         service: Service,
-        key: impl Fn(u64) -> OpKey,
+        instance: u64,
         fact: &StorageFact,
         hit: &mut dyn FnMut(StateFeature),
     ) {
         if service != Service::Header {
             return;
         }
+        let key = |id: u64| (service, instance, id);
         match fact {
             StorageFact::Submitted { id, request, .. } => {
                 self.held.insert(
                     key(*id),
                     Held {
                         op: Operation::of(request),
-                        part: HeldPart::Completion,
-                        since: self.reading,
-                        blocked: false,
-                        released: false,
+                        completion: Watch::new(self.reading),
+                        reply: None,
                     },
                 );
             }
             StorageFact::Committed { id, .. } => {
                 if let Some(held) = self.held.get_mut(&key(*id)) {
-                    *held = Held {
-                        part: HeldPart::Reply,
-                        since: self.reading,
-                        blocked: false,
-                        released: false,
-                        ..*held
-                    };
+                    held.reply = Some(Watch::new(self.reading));
                 }
             }
             StorageFact::Completed { id, .. } => {
                 if let Some(held) = self.held.remove(&key(*id)) {
-                    if held.blocked {
-                        hit(StateFeature::Hold {
-                            op: held.op,
-                            part: held.part,
-                            stage: HoldStage::Resumed,
-                        });
+                    let parts = [
+                        (HeldPart::Completion, Some(&held.completion)),
+                        (HeldPart::Reply, held.reply.as_ref()),
+                    ];
+                    for (part, watch) in parts {
+                        if watch.is_some_and(|watch| watch.blocked) {
+                            hit(StateFeature::Hold {
+                                op: held.op,
+                                part,
+                                stage: HoldStage::Resumed,
+                            });
+                        }
                     }
                 }
             }
@@ -653,7 +676,10 @@ impl StateCollector {
                 }
             }
             StorageFact::Leased { lease, .. } => {
-                let live = self.leases.entry(lease.peer.clone()).or_default();
+                let live = self
+                    .leases
+                    .entry((instance, lease.peer.clone()))
+                    .or_default();
                 live.insert(lease.lease_id);
                 // A lease set is far smaller than u64.
                 let count = live.len() as u64;
@@ -663,7 +689,7 @@ impl StateCollector {
                 });
             }
             StorageFact::CapabilityEnded { lease, .. } => {
-                if let Some(live) = self.leases.get_mut(&lease.peer) {
+                if let Some(live) = self.leases.get_mut(&(instance, lease.peer.clone())) {
                     live.remove(&lease.lease_id);
                 }
             }
@@ -711,7 +737,12 @@ impl StateCollector {
             // Only forks that differ at the ancestor's child count: forks
             // that share a prefix past it aren't, and neither are a retried
             // prepare or two prefixes of one chain.
-            if let (Some(first), Some(work)) = (&first, work) {
+            let retried = self.prepared.iter().any(|earlier| {
+                earlier.ancestor == *common_ancestor
+                    && earlier.first == first
+                    && earlier.target == *target
+            });
+            if let (false, Some(first), Some(work)) = (retried, &first, work) {
                 for earlier in &self.prepared {
                     let (Some(earlier_first), Some(earlier_work)) = (&earlier.first, earlier.work)
                     else {

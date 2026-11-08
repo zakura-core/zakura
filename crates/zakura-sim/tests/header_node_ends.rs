@@ -385,3 +385,118 @@ fn the_stamps_replay_in_a_fresh_process() {
         .unwrap_or_else(|| panic!("the child prints its end facts: {stdout}"));
     assert_eq!(replayed, recorded);
 }
+
+thread_local! {
+    /// The budget [`CutStorage`] runs with, if any.
+    static BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// `header-sync/storage` with its run cut off after [`BUDGET`]'s steps and
+/// no drain, so a test can stop a run right after a pick.
+struct CutStorage(Storage);
+
+impl zakura_sim::property::HasView for CutStorage {
+    type View = zakura_sim::harness::header_sync::StorageView;
+
+    /// The storage harness's view.
+    fn view(&self) -> Self::View {
+        self.0.view()
+    }
+}
+
+impl Subsystem for CutStorage {
+    const NAME: &'static str = "test/cut-storage";
+    const GENERATOR: u32 = 1;
+    const SCENARIO_BYTES: usize = 0;
+    type Scenario = StorageScenario;
+    type Prepared = zakura_sim::harness::header_sync::Ports;
+
+    /// The storage harness's config, cut to [`BUDGET`] with no drain.
+    fn config(_: &StorageScenario) -> zakura_sim::RunConfig {
+        zakura_sim::RunConfig {
+            budget: BUDGET
+                .with(std::cell::Cell::get)
+                .expect("the test set a budget"),
+            drain_bound: 0,
+            ..zakura_sim::harness::header_sync::storage_config()
+        }
+    }
+
+    /// The storage harness's ports.
+    fn prepare(scenario: &StorageScenario) -> Self::Prepared {
+        Storage::prepare(scenario)
+    }
+
+    /// The storage harness.
+    fn build(sim: &mut zakura_sim::Sim, scenario: &StorageScenario, ports: Self::Prepared) -> Self {
+        CutStorage(Storage::build(sim, scenario, ports))
+    }
+
+    /// No properties: the test reads the end facts.
+    fn properties() -> Vec<zakura_sim::property::Property<Self>> {
+        Vec::new()
+    }
+
+    /// The storage harness's sources.
+    fn sources() -> zakura_sim::property::Sources {
+        zakura_sim::harness::header_sync::storage_sources()
+    }
+
+    /// Unused: the scenario is built by hand.
+    fn draw(_: &[u8]) -> StorageScenario {
+        unreachable!("the scenario is built by hand")
+    }
+}
+
+/// A run cut off at the step that picks its `Shutdown`, before the control
+/// task carries the step out, already holds the shutdown's end: the
+/// harness records it at the pick, not when the task stops the node.
+#[test]
+fn a_shutdown_is_recorded_before_its_task_runs() {
+    let scenario = StorageScenario {
+        controls: vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Shutdown,
+            when: Some(Trigger::Submitted(Select::nth(OpKind::Prepare, 1))),
+        }],
+        ..StorageScenario::default()
+    };
+    for input in inputs(4, 256) {
+        let ran = run(&scenario, input.clone());
+        let pick = ran
+            .report
+            .picks
+            .iter()
+            .find(|pick| pick.identity == "peer:node:shutdown")
+            .expect("the node shuts down")
+            .step;
+        BUDGET.with(|budget| budget.set(Some(pick)));
+        let ports = Storage::prepare(&scenario);
+        let ends = ports.ends.clone();
+        // Cut off mid-stop, the run may fail as an unfinished shutdown,
+        // which this test doesn't judge.
+        let report = match run_prepared::<CutStorage>(
+            &scenario,
+            ports,
+            input,
+            &mut MemorySink::default(),
+            None,
+        ) {
+            Ok(report) => report,
+            Err(HarnessError::Run { report, .. }) => *report,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(report.end.steps, pick, "the run stops at the pick");
+        assert!(
+            !report.log.entries().iter().any(|entry| matches!(
+                &entry.obs,
+                zakura_sim::Observation::TaskExited { task, .. } if task.starts_with("reactor")
+            )),
+            "the stop hasn't happened"
+        );
+        assert_eq!(
+            facts(&ends.facts()),
+            [environment("node", None, EnvironmentAction::Shutdown)]
+        );
+    }
+}

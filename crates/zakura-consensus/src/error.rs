@@ -162,8 +162,10 @@ pub enum TransactionError {
     #[error(
         "Sprout joinSplitSig MUST represent a valid signature under joinSplitPubKey of dataToBeSigned: {0}"
     )]
+    // The message of an `ed25519_zebra::Error`, which only builds with the `sprout` feature
+    // have.
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
-    Ed25519(#[from] zakura_chain::primitives::ed25519::Error),
+    Ed25519(String),
 
     #[error("Sapling bindingSig MUST represent a valid signature under the transaction binding validating key bvk of SigHash: {0}")]
     #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
@@ -377,8 +379,9 @@ impl From<BoxError> for TransactionError {
             Err(e) => err = e,
         }
 
-        match err.downcast::<zakura_chain::primitives::ed25519::Error>() {
-            Ok(e) => return TransactionError::Ed25519(*e),
+        #[cfg(feature = "sprout")]
+        match err.downcast::<ed25519_zebra::Error>() {
+            Ok(e) => return TransactionError::Ed25519(e.to_string()),
             Err(e) => err = e,
         }
         match err.downcast::<zakura_chain::primitives::redjubjub::Error>() {
@@ -638,12 +641,14 @@ mod tests {
             TransactionError::Script(zakura_script::Error::ScriptInvalid)
         );
 
-        let ed25519_error: BoxError =
-            Box::new(zakura_chain::primitives::ed25519::Error::InvalidSignature);
-        assert_eq!(
-            TransactionError::from(ed25519_error),
-            TransactionError::Ed25519(zakura_chain::primitives::ed25519::Error::InvalidSignature)
-        );
+        #[cfg(feature = "sprout")]
+        {
+            let ed25519_error: BoxError = Box::new(ed25519_zebra::Error::InvalidSignature);
+            assert_eq!(
+                TransactionError::from(ed25519_error),
+                TransactionError::Ed25519(ed25519_zebra::Error::InvalidSignature.to_string())
+            );
+        }
 
         let redjubjub_error: BoxError =
             Box::new(zakura_chain::primitives::redjubjub::Error::InvalidSignature);
@@ -668,7 +673,7 @@ mod tests {
             TransactionError::Script(zakura_script::Error::ScriptInvalid),
             TransactionError::SaplingVerificationFailed,
             TransactionError::Halo2VerificationFailed,
-            TransactionError::Ed25519(zakura_chain::primitives::ed25519::Error::InvalidSignature),
+            TransactionError::Ed25519("invalid signature".to_owned()),
             TransactionError::RedJubjub(
                 zakura_chain::primitives::redjubjub::Error::InvalidSignature,
             ),

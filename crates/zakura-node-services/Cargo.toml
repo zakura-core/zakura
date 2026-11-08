@@ -43,7 +43,7 @@ rpc-client = [
 reqwest = []
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain" , version = "13.0.1" }
+zakura-chain = { path = "../zakura-chain" , version = "14.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
 zakura-rt = { path = "../zakura-rt", version = "0.3.0" }
 tower = { workspace = true, features = ["buffer"] }

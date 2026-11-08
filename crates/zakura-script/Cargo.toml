@@ -17,7 +17,7 @@ categories = ["cryptography::cryptocurrencies"]
 [dependencies]
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
-zakura-chain = { path = "../zakura-chain", version = "13.0.1" }
+zakura-chain = { path = "../zakura-chain", version = "14.0.0" }
 
 thiserror = { workspace = true }
 

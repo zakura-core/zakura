@@ -27,7 +27,7 @@ use zakura_chain::{
         testnet::{ConfiguredActivationHeights, Parameters},
         Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
     },
-    primitives::{ed25519, Groth16Proof},
+    primitives::Groth16Proof,
     sapling,
     serialization::{
         AtLeastOne, DateTime32, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize,
@@ -43,6 +43,8 @@ use zakura_chain::{
     transparent::{self, CoinbaseSpendRestriction},
 };
 use zakura_chain::{ironwood, orchard};
+
+use ed25519_zebra as ed25519;
 
 use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
@@ -2868,7 +2870,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_inside_joinsplit_is_rejected
             Transaction::V4 {
                 joinsplit_data: Some(joinsplit_data),
                 ..
-            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()),
+            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()).to_bytes().into(),
             _ => unreachable!("Mock transaction was created incorrectly"),
         }
 
@@ -2944,7 +2946,7 @@ fn v4_transaction_with_conflicting_sprout_nullifier_across_joinsplits_is_rejecte
             Transaction::V4 {
                 joinsplit_data: Some(joinsplit_data),
                 ..
-            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()),
+            } => joinsplit_data.sig = signing_key.sign(sighash.as_ref()).to_bytes().into(),
             _ => unreachable!("Mock transaction was created incorrectly"),
         }
 
@@ -3705,7 +3707,7 @@ fn v4_with_modified_joinsplit_is_rejected() {
     zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
         v4_with_joinsplit_is_rejected_for_modification(
             JoinSplitModification::CorruptSignature,
-            TransactionError::Ed25519(ed25519::Error::InvalidSignature),
+            TransactionError::Ed25519(ed25519::Error::InvalidSignature.to_string()),
         )
         .await;
 
@@ -5754,7 +5756,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
     let joinsplit_data = JoinSplitData {
         first: joinsplit,
         rest: vec![],
-        pub_key: verification_key.into(),
+        pub_key: <[u8; 32]>::from(ed25519::VerificationKeyBytes::from(verification_key)).into(),
         sig: [0u8; 64].into(),
     };
 

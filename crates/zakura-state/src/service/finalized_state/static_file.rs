@@ -41,7 +41,11 @@
 //! Static files can arrive in a state snapshot built by someone else. Readers
 //! use safe Rust and positioned reads instead of memory maps, and check every
 //! offset against the committed config and the maximum block size before they
-//! allocate or read.
+//! allocate or read. Jar files must be regular files in a real directory, and
+//! the store never follows a symbolic link when it opens or creates one, so a
+//! snapshot can't point reads or repairs at another file. Hard links are
+//! allowed, because a tar archive can only link files inside itself, and
+//! benchmark clones share static files that way.
 
 // A poisoned lock means another thread panicked while changing the static
 // files, so callers panic too instead of getting a static file error.
@@ -432,7 +436,7 @@ fn write_config(base: &Path, config: &JarConfig) -> Result<(), StaticFileError> 
     let tmp = suffixed(base, "conf.tmp");
     let bytes = config.to_bytes();
 
-    let file = File::create(&tmp).map_err(io_error(&tmp))?;
+    let file = create_regular_file(&tmp)?;
     write_all_at(&file, &bytes, 0).map_err(io_error(&tmp))?;
     file.sync_all().map_err(io_error(&tmp))?;
     drop(file);
@@ -442,6 +446,42 @@ fn write_config(base: &Path, config: &JarConfig) -> Result<(), StaticFileError> 
         base.parent()
             .expect("jar paths are inside the static file directory"),
     )
+}
+
+/// Opens the existing jar file at `path` without following a symbolic link or
+/// blocking on a special file, and rejects anything that isn't a regular file.
+/// Snapshots can come from someone else, and a link would let reads serve, and
+/// repairs truncate, a file outside the static file directory.
+fn open_regular_file(path: &Path, writable: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "static file is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+/// Creates a new jar file at `path`, first removing any leftover entry there,
+/// so a planted link can't redirect the write to another file.
+fn create_regular_file(path: &Path) -> Result<File, StaticFileError> {
+    remove_file(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(io_error(path))
 }
 
 /// Removes `path`, treating a missing file as already removed.
@@ -478,7 +518,7 @@ impl Jar {
     ) -> Result<Option<Jar>, StaticFileError> {
         let base = jar_base(dir, first_block, expected_end);
         let conf_path = suffixed(&base, "conf");
-        let config_file = match File::open(&conf_path) {
+        let config_file = match open_regular_file(&conf_path, false) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error(&conf_path)(error)),
@@ -494,13 +534,7 @@ impl Jar {
             .ok_or_else(|| corrupt(&conf_path, "unreadable config"))?;
         config.validate(&conf_path, first_block, expected_end)?;
 
-        let open = |path: &Path| {
-            OpenOptions::new()
-                .read(true)
-                .write(writable)
-                .open(path)
-                .map_err(io_error(path))
-        };
+        let open = |path: &Path| open_regular_file(path, writable).map_err(io_error(path));
         let off_path = suffixed(&base, "off");
         let blk_path = suffixed(&base, "blk");
         let files = JarFiles {
@@ -543,13 +577,7 @@ impl Jar {
     fn create(dir: &Path, first_block: u32, expected_end: u32) -> Result<Jar, StaticFileError> {
         let base = jar_base(dir, first_block, expected_end);
         let create = |path: &Path, contents: &[u8]| {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)
-                .map_err(io_error(path))?;
+            let file = create_regular_file(path)?;
             write_all_at(&file, contents, 0).map_err(io_error(path))?;
             Ok::<_, StaticFileError>(file)
         };
@@ -823,6 +851,16 @@ impl StaticFiles {
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
             sync_dir(parent)?;
+        }
+        // A linked directory would let jar files live anywhere.
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(corrupt(&dir, "static file directory is not a directory"));
+            }
+            Err(error) if !(error.kind() == io::ErrorKind::NotFound && !writable) => {
+                return Err(io_error(&dir)(error));
+            }
+            _ => {}
         }
         let (jars, leftovers) = if writable {
             Self::scan(&dir, true)?

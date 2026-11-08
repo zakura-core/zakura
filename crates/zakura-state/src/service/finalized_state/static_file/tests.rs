@@ -548,3 +548,90 @@ fn read_only_rescans_keep_open_jars_a_prune_hid() {
         assert_blocks(&reader, &expected[keep_from as usize..]);
     }
 }
+
+/// Replaces `path` with a symbolic link to `target`.
+#[cfg(unix)]
+fn link_to(path: &Path, target: &Path) {
+    fs::remove_file(path).unwrap();
+    std::os::unix::fs::symlink(target, path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_jar_files_are_rejected_without_touching_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_dir = dir.path().join(STATIC_FILE_DIR);
+    open(dir.path(), 1_000)
+        .append_blocks(&blocks(0..10))
+        .unwrap();
+
+    // Repair would cut a linked data file's target to the committed length.
+    let outside = dir.path().join("outside");
+    fs::write(&outside, vec![7; 100_000]).unwrap();
+    link_to(&jar_base(&static_dir, 0, 999), &outside);
+
+    assert!(StaticFiles::open(static_dir.clone(), true, 1_000).is_err());
+    assert!(StaticFiles::open(static_dir, false, 1_000).is_err());
+    assert_eq!(fs::read(&outside).unwrap(), vec![7; 100_000]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_config_is_rejected_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_dir = dir.path().join(STATIC_FILE_DIR);
+    open(dir.path(), 1_000)
+        .append_blocks(&blocks(0..10))
+        .unwrap();
+
+    let conf = suffixed(&jar_base(&static_dir, 0, 999), "conf");
+    fs::remove_file(&conf).unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&conf)
+        .status()
+        .unwrap()
+        .success());
+
+    let (opened, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = opened.send(StaticFiles::open(static_dir, true, 1_000).is_err());
+    });
+    assert!(result
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the open returns instead of waiting for a FIFO writer"));
+}
+
+#[cfg(unix)]
+#[test]
+fn commits_replace_a_linked_temporary_config_instead_of_writing_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_dir = dir.path().join(STATIC_FILE_DIR);
+    let static_files = open(dir.path(), 1_000);
+    static_files.append_blocks(&blocks(0..10)).unwrap();
+
+    let outside = dir.path().join("outside");
+    fs::write(&outside, b"keep").unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        suffixed(&jar_base(&static_dir, 0, 999), "conf.tmp"),
+    )
+    .unwrap();
+
+    static_files.append_blocks(&blocks(10..20)).unwrap();
+    assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    drop(static_files);
+    assert_blocks(&open(dir.path(), 1_000), &blocks(0..20));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_static_file_directory_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let static_dir = dir.path().join(STATIC_FILE_DIR);
+    std::os::unix::fs::symlink(&elsewhere, &static_dir).unwrap();
+
+    assert!(StaticFiles::open(static_dir.clone(), true, 1_000).is_err());
+    assert!(StaticFiles::open(static_dir, false, 1_000).is_err());
+}

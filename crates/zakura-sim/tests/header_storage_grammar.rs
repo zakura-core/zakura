@@ -58,7 +58,6 @@ const OPCODES: [u8; 10] = [
     REPLY_HOLD,
 ];
 
-
 /// The default scenario's canonical prefix with two mirrors, `mirror-1` at
 /// A3 dialed by the node, and `slots` as its actions.
 fn prefix(slots: &[[u8; SLOT]]) -> Vec<u8> {

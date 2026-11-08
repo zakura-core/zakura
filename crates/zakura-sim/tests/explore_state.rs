@@ -103,13 +103,13 @@ fn state_features_have_distinct_indices_inside_their_blocks() {
     }
 }
 
-/// [`FEEDBACK_VERSION`] 2's layout: one pinned index per block, and every
+/// [`FEEDBACK_VERSION`] 3's layout: one pinned index per block, and every
 /// vocabulary's size. A change here changes what a corpus means, so it
 /// bumps the version.
 #[test]
 fn the_layout_is_pinned_to_its_version() {
     use zakura_sim::explore::state::*;
-    assert_eq!(FEEDBACK_VERSION, 2);
+    assert_eq!(FEEDBACK_VERSION, 3);
     let pinned = [
         (
             StateFeature::HeaderRetired {
@@ -158,6 +158,7 @@ fn the_layout_is_pinned_to_its_version() {
             4096 + 1024 + 3 * 6,
         ),
         (StateFeature::Fork(Fork::VerifiedReset), 8192 + 4),
+        (StateFeature::Fork(Fork::EqualWork), 8192 + 7),
         (
             StateFeature::Replacement {
                 kind: ReplacementKind::Stream,
@@ -189,6 +190,13 @@ fn the_layout_is_pinned_to_its_version() {
             16384 + 1024 + 6 * 2 + 1,
         ),
         (
+            StateFeature::HeaderLease {
+                class: CapacityClass::Fallback,
+                level: Level::OverLimit,
+            },
+            16384 + 1536 + 2 * 4 + 3,
+        ),
+        (
             StateFeature::Frame {
                 row: Row::BlockBlock,
                 direction: Direction::ToNode,
@@ -202,6 +210,14 @@ fn the_layout_is_pinned_to_its_version() {
             20480 + 2048 + 17,
         ),
         (
+            StateFeature::Hold {
+                op: Operation::ReadRange,
+                part: HeldPart::Reply,
+                stage: HoldStage::Resumed,
+            },
+            24576 + (12 * 2 + 1) * 3 + 2,
+        ),
+        (
             StateFeature::ReorgStage(ReorgStage::VerdictOther),
             28672 + 6,
         ),
@@ -212,6 +228,7 @@ fn the_layout_is_pinned_to_its_version() {
             },
             32768 + 3 * 3 + 2,
         ),
+        (StateFeature::ConditionsEstablished, 32768 + 512),
         (
             StateFeature::Retired(Retirement::ConnectionTornDown),
             36864 + 2,
@@ -259,6 +276,8 @@ fn the_layout_is_pinned_to_its_version() {
         FrameLabel::ALL.len(),
         FrameStage::ALL.len(),
         Transition::ALL.len(),
+        HeldPart::ALL.len(),
+        HoldStage::ALL.len(),
         ReorgStage::ALL.len(),
         Namespace::ALL.len(),
         ObligationPoint::ALL.len(),
@@ -270,11 +289,11 @@ fn the_layout_is_pinned_to_its_version() {
     assert_eq!(
         sizes,
         [
-            10, 2, 4, 21, 4, 9, 2, 4, 2, 2, 13, 3, 8, 4, 6, 5, 2, 3, 4, 4, 4, 2, 4, 12, 2, 13, 6,
-            18, 7, 8, 3, 3, 2, 2, 2
+            10, 2, 4, 21, 4, 9, 2, 4, 2, 2, 13, 3, 8, 4, 6, 8, 2, 3, 4, 4, 4, 2, 4, 12, 2, 13, 6,
+            18, 2, 3, 7, 8, 3, 3, 2, 2, 2
         ]
     );
-    assert_eq!(StateFeature::all().len(), 2_590);
+    assert_eq!(StateFeature::all().len(), 2_688);
     // Swapping two values inside a vocabulary keeps every size above, and
     // can keep every pinned index, but moves both values' indices. The
     // digest of every feature's index pins the whole mapping.
@@ -287,7 +306,7 @@ fn the_layout_is_pinned_to_its_version() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(
-        digest, "52ca141bc85c3915ae2916864d1338540a00ce5b0a045df9d61e399fbc1c7bbe",
+        digest, "089432c52072c3294eb11a3f5fad07bd13496e6746856a1c430540482e1a64b1",
         "the index mapping moved: bump FEEDBACK_VERSION and this digest together"
     );
 }
@@ -574,6 +593,15 @@ fn witnesses() -> Vec<Witness> {
             [&[0xFE, tag][..], &plan()].concat(),
         ));
     }
+    all.push(explicit::<HeaderStorage>(
+        GROW_TO_DRAIN,
+        StorageScenario::grow(),
+        grow_to_drain_plan(),
+    ));
+    // fuzz-12 item 7's witness seeds.
+    for (stem, _) in support::storage_witnesses::witness_seeds() {
+        all.push(drawn("header-sync/storage", &stem, seed(&stem)));
+    }
     // Competing mirrors under more plans, which also reach a reorg.
     for (index, plan) in support::byte_inputs(6, 128).into_iter().enumerate() {
         all.push(explicit::<HeaderStorage>(
@@ -583,6 +611,16 @@ fn witnesses() -> Vec<Witness> {
         ));
     }
     all
+}
+
+/// The no-hold passing control: [`StorageScenario::grow`] under a Plan whose
+/// run reaches its drain with operations pending, and prepares one chain to
+/// two targets from one ancestor.
+const GROW_TO_DRAIN: &str = "header storage grow to its drain";
+
+/// [`GROW_TO_DRAIN`]'s Plan.
+fn grow_to_drain_plan() -> Vec<u8> {
+    support::byte_inputs(1, 1_024).remove(0)
 }
 
 /// Eight blocks whose verdicts wait for the link to close, and a teardown
@@ -715,6 +753,34 @@ fn every_collected_state_has_a_witness() {
                 "selected winner",
             ][..],
         ),
+        (
+            "header-storage-w-hold-succeeds",
+            &["operation kind × blocked × release × resumed operation"][..],
+        ),
+        (
+            "header-storage-w-equal-forks",
+            &["stronger, weaker or equal work"][..],
+        ),
+        (
+            "header-storage-w-longer-fork",
+            &["stronger, weaker or equal work"][..],
+        ),
+        (
+            "header-storage-w-weighted-fork",
+            &["stronger, weaker or equal work"][..],
+        ),
+        (
+            "header-storage-w-peer-lease-denied",
+            &["exactly limit", "attempted over-limit and denied"][..],
+        ),
+        (
+            "header-storage-w-recover-closes",
+            &["conditions established"][..],
+        ),
+        (
+            "header-storage-w-stop-storage",
+            &["external acknowledgement"][..],
+        ),
     ];
     for (name, rows) in own {
         let (witness, states) = witnesses
@@ -760,6 +826,114 @@ fn every_collected_state_has_a_witness() {
             .any(|(_, states)| states.iter().any(shows));
         assert_eq!(drawn_shown, drawn, "{}: drawn", row.state);
     }
+}
+
+/// The states `name`'s witness hits.
+fn witness_states(name: &str) -> BTreeSet<StateFeature> {
+    let witness = witnesses()
+        .into_iter()
+        .find(|witness| witness.name == name)
+        .unwrap_or_else(|| panic!("no witness {name}"));
+    states(&witness)
+}
+
+/// Each fork-work label has the witness built for it, and each hold stage
+/// has one for a held completion and one for a held reply.
+#[test]
+fn fuzz_12_features_have_their_witnesses() {
+    use zakura_sim::explore::state::{HeldPart, HoldStage};
+    for (stem, label) in [
+        ("header-storage-w-equal-forks", ForkState::EqualWork),
+        // The five-header branch is prepared first, so the three-header
+        // one is weaker unweighted and stronger at weight 2.
+        ("header-storage-w-longer-fork", ForkState::WeakerWork),
+        ("header-storage-w-weighted-fork", ForkState::StrongerWork),
+    ] {
+        let states = witness_states(stem);
+        assert!(
+            states.contains(&StateFeature::Fork(label)),
+            "{stem}: {label:?}"
+        );
+    }
+    for (stem, op, part) in [
+        (
+            "header-storage-w-hold-succeeds",
+            Operation::ReadHeaderPath,
+            HeldPart::Completion,
+        ),
+        (
+            "header-storage-w-reply-hold",
+            Operation::ApplyHeaderTarget,
+            HeldPart::Reply,
+        ),
+    ] {
+        let states = witness_states(stem);
+        for &stage in HoldStage::ALL {
+            let hold = StateFeature::Hold { op, part, stage };
+            assert!(states.contains(&hold), "{stem}: {hold:?}");
+        }
+    }
+}
+
+/// A run with no hold hits no hold stage, though it reaches its drain with
+/// operations pending, and one chain prepared to two targets from one
+/// ancestor hits no fork work.
+#[test]
+fn unheld_operations_and_one_chain_are_passing_controls() {
+    let report = report(run_harness::<HeaderStorage>(
+        &StorageScenario::grow(),
+        Plan::from_fuzz(&grow_to_drain_plan()),
+        &mut zakura_sim::NullSink,
+        None,
+    ));
+    assert!(StorageScenario::grow().policy.holds.is_empty());
+    assert!(StorageScenario::grow().policy.reply_holds.is_empty());
+    let mut pending = BTreeSet::new();
+    let mut prepares = Vec::new();
+    for entry in report.log.entries() {
+        let Observation::Storage { fact, .. } = &entry.obs else {
+            continue;
+        };
+        match fact {
+            StorageFact::Submitted { id, request, .. } => {
+                pending.insert(*id);
+                if let StorageRequest::PrepareHeaderTarget {
+                    common_ancestor,
+                    target,
+                    first: Some(first),
+                    ..
+                } = request
+                {
+                    prepares.push((common_ancestor.clone(), first.hash.clone(), target.clone()));
+                }
+            }
+            StorageFact::Completed { id, .. } => {
+                pending.remove(id);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !pending.is_empty(),
+        "the drain starts with operations pending"
+    );
+    let one_chain = prepares.iter().any(|(ancestor, first, target)| {
+        prepares
+            .iter()
+            .any(|other| other.0 == *ancestor && other.1 == *first && other.2 != *target)
+    });
+    assert!(one_chain, "one chain is prepared to two targets");
+    let states = witness_states(GROW_TO_DRAIN);
+    let crossed = states.iter().find(|state| {
+        matches!(
+            state,
+            StateFeature::Hold { .. }
+                | StateFeature::Fork(
+                    ForkState::StrongerWork | ForkState::WeakerWork | ForkState::EqualWork
+                )
+        )
+    });
+    assert_eq!(crossed, None);
 }
 
 /// [`competing_mirrors`], with `mirror-0`'s first apply held until

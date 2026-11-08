@@ -14,12 +14,14 @@ use zakura_network::zakura::{ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_HEADER_SYNC
 use super::{
     Acknowledgement, Baseline, BlockStage, BudgetChange, Call, CallEnd, CapacityClass,
     CapacityEvent, Direction, Disposition, Dropped, Epoch, EpochWork, Fork, FrameLabel, FrameStage,
-    Level, Namespace, ObligationPoint, Operation, Purpose, ReorgStage, ReplacementEvent,
-    ReplacementKind, RequestEvent, RequestProgress, RetireReason, RetiredPhase, Retirement, Row,
-    Service, StateFeature, StreamService, Timing, Transition,
+    HeldPart, HoldStage, Level, Namespace, ObligationPoint, Operation, Purpose, ReorgStage,
+    ReplacementEvent, ReplacementKind, RequestEvent, RequestProgress, RetireReason, RetiredPhase,
+    Retirement, Row, Service, StateFeature, StreamService, Timing, Transition,
 };
+use zakura_chain::work::difficulty::U256;
+
 use crate::{
-    check::StepCtx,
+    check::{Phase, StepCtx},
     end::RunEnd,
     explore::feedback::{Collect, FeatureMap},
     model::is_fault_cause,
@@ -69,6 +71,26 @@ struct Prepared {
     ancestor: StoragePoint,
     /// Its last header.
     target: StoragePoint,
+    /// Its first header's hash, if it had headers.
+    first: Option<String>,
+    /// Its headers' summed work, if every header's target had work.
+    work: Option<U256>,
+}
+
+/// A header storage operation the hold features follow, from its
+/// submission, or its commit for a held reply, until it completes.
+struct Held {
+    /// Its kind.
+    op: Operation,
+    /// What a hold could keep back: its completion, or its reply once it
+    /// committed.
+    part: HeldPart,
+    /// The step that logged its submission or commit.
+    since: u64,
+    /// It was blocked at the start of some live step.
+    blocked: bool,
+    /// A step after it was blocked offered one of its storage actions.
+    released: bool,
 }
 
 /// A peer's frame: its connection, stream, QUIC stream and sequence
@@ -159,12 +181,27 @@ struct StateCollector {
     sequencer_closed: bool,
     /// The first step whose observations the collector hasn't read.
     read: u64,
+    /// The step whose observations the collector is reading.
+    reading: u64,
+    /// Each header storage operation not yet completed, by its key.
+    held: BTreeMap<OpKey, Held>,
+    /// Each header storage lease still live, by peer: the peer class counts
+    /// each peer's leases against its limit of one.
+    leases: BTreeMap<String, BTreeSet<u64>>,
 }
 
 impl Collect for StateCollector {
     /// Reads each observation logged since the last step it read: setup's
     /// at the first step, then the step's own.
     fn after_step(&mut self, cx: &StepCtx<'_>, map: FeatureMap) {
+        // The enabled set came before the step's pick ran, so it's judged
+        // against the operations pending before the step's observations.
+        if cx.phase == Phase::Live {
+            self.holds(cx, map);
+        }
+        if cx.pick.category == crate::Category::Peer && cx.pick.key == RECOVERED {
+            map.hit(StateFeature::ConditionsEstablished.feature());
+        }
         self.read_through(cx.log, cx.step, map);
     }
 
@@ -265,11 +302,64 @@ fn header_owner(request: &StorageRequest) -> Option<&WorkOwner> {
     }
 }
 
+/// The key of recovery's conditions point, a peer action of the node
+/// (see `harness::header_node::recovery`).
+const RECOVERED: &str = "node:recovered";
+
 impl StateCollector {
+    /// Hits each hold stage the step's enabled set shows. A header storage
+    /// operation logged before this step is blocked if none of its storage
+    /// actions is enabled, and once blocked, released by the first step
+    /// that enables one.
+    fn holds(&mut self, cx: &StepCtx<'_>, map: FeatureMap) {
+        // Header storage instance `n` labels its actions `header` for
+        // instance 0 and `header-n` otherwise.
+        let enabled: BTreeSet<(u64, u64)> = cx
+            .enabled
+            .iter()
+            .filter(|enabled| enabled.identity.category == crate::Category::Storage)
+            .filter_map(|enabled| {
+                let (label, rest) = enabled.identity.key.split_once(':')?;
+                let (id, _outcome) = rest.split_once(':')?;
+                let instance = match label.strip_prefix(HEADER_SERVICE)? {
+                    "" => 0,
+                    index => index.strip_prefix('-')?.parse().ok()?,
+                };
+                Some((instance, id.parse().ok()?))
+            })
+            .collect();
+        for (&(_, instance, id), held) in &mut self.held {
+            if held.since >= cx.step {
+                continue;
+            }
+            let offered = enabled.contains(&(instance, id));
+            let stage = match (held.blocked, held.released, offered) {
+                (false, _, false) => {
+                    held.blocked = true;
+                    HoldStage::Blocked
+                }
+                (true, false, true) => {
+                    held.released = true;
+                    HoldStage::Released
+                }
+                _ => continue,
+            };
+            map.hit(
+                StateFeature::Hold {
+                    op: held.op,
+                    part: held.part,
+                    stage,
+                }
+                .feature(),
+            );
+        }
+    }
+
     /// Reads the observations of every step from the first unread one
     /// through `last`.
     fn read_through(&mut self, log: &ObservationLog, last: u64, map: FeatureMap) {
         for step in self.read..=last {
+            self.reading = step;
             for observation in log.of_step(step) {
                 self.observe(observation, &mut |state| map.hit(state.feature()));
             }
@@ -422,6 +512,7 @@ impl StateCollector {
         hit: &mut dyn FnMut(StateFeature),
     ) {
         let key = |id: u64| (service, instance, id);
+        self.track(service, key, fact, hit);
         match fact {
             StorageFact::Submitted { id, request, .. } => {
                 self.submitted(key(*id), request, None, hit);
@@ -508,6 +599,78 @@ impl StateCollector {
         }
     }
 
+    /// Follows header storage operations for the hold features and leases
+    /// for the lease level, and hits a hold's resumption and each lease's
+    /// level.
+    fn track(
+        &mut self,
+        service: Service,
+        key: impl Fn(u64) -> OpKey,
+        fact: &StorageFact,
+        hit: &mut dyn FnMut(StateFeature),
+    ) {
+        if service != Service::Header {
+            return;
+        }
+        match fact {
+            StorageFact::Submitted { id, request, .. } => {
+                self.held.insert(
+                    key(*id),
+                    Held {
+                        op: Operation::of(request),
+                        part: HeldPart::Completion,
+                        since: self.reading,
+                        blocked: false,
+                        released: false,
+                    },
+                );
+            }
+            StorageFact::Committed { id, .. } => {
+                if let Some(held) = self.held.get_mut(&key(*id)) {
+                    *held = Held {
+                        part: HeldPart::Reply,
+                        since: self.reading,
+                        blocked: false,
+                        released: false,
+                        ..*held
+                    };
+                }
+            }
+            StorageFact::Completed { id, .. } => {
+                if let Some(held) = self.held.remove(&key(*id)) {
+                    if held.blocked {
+                        hit(StateFeature::Hold {
+                            op: held.op,
+                            part: held.part,
+                            stage: HoldStage::Resumed,
+                        });
+                    }
+                }
+            }
+            StorageFact::ShutDown { dropped, .. } => {
+                for id in dropped {
+                    self.held.remove(&key(*id));
+                }
+            }
+            StorageFact::Leased { lease, .. } => {
+                let live = self.leases.entry(lease.peer.clone()).or_default();
+                live.insert(lease.lease_id);
+                // A lease set is far smaller than u64.
+                let count = live.len() as u64;
+                hit(StateFeature::HeaderLease {
+                    class: CapacityClass::Peer,
+                    level: Level::of(count, 1),
+                });
+            }
+            StorageFact::CapabilityEnded { lease, .. } => {
+                if let Some(live) = self.leases.get_mut(&lease.peer) {
+                    live.remove(&lease.lease_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Records a submitted operation, and hits the forks and reorg stages
     /// its request shows.
     fn submitted(
@@ -530,6 +693,8 @@ impl StateCollector {
             owner,
             common_ancestor,
             target,
+            work,
+            first,
             ..
         } = request
         {
@@ -539,10 +704,34 @@ impl StateCollector {
             if shared {
                 hit(StateFeature::Fork(Fork::SharedAncestorPrepared));
             }
+            let first = first.as_ref().map(|first| first.hash.clone());
+            let work = work
+                .as_deref()
+                .and_then(|work| U256::from_dec_str(work).ok());
+            // Only forks that differ at the ancestor's child count: forks
+            // that share a prefix past it aren't, and neither are a retried
+            // prepare or two prefixes of one chain.
+            if let (Some(first), Some(work)) = (&first, work) {
+                for earlier in &self.prepared {
+                    let (Some(earlier_first), Some(earlier_work)) = (&earlier.first, earlier.work)
+                    else {
+                        continue;
+                    };
+                    if earlier.ancestor == *common_ancestor && earlier_first != first {
+                        hit(StateFeature::Fork(match work.cmp(&earlier_work) {
+                            std::cmp::Ordering::Greater => Fork::StrongerWork,
+                            std::cmp::Ordering::Less => Fork::WeakerWork,
+                            std::cmp::Ordering::Equal => Fork::EqualWork,
+                        }));
+                    }
+                }
+            }
             self.prepared.push(Prepared {
                 owner: owner.clone(),
                 ancestor: common_ancestor.clone(),
                 target: target.clone(),
+                first,
+                work,
             });
         }
         self.ops.insert(

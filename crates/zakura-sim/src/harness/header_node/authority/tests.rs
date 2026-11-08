@@ -905,3 +905,49 @@ fn an_open_starts_where_storage_put_its_first_locator() {
         );
     }
 }
+
+/// A dispatched prepare whose submission is another kind of request breaks
+/// the submission rule at once, with its reply still pending.
+#[test]
+fn a_submission_of_another_kind_breaks_at_once() {
+    use zakura_network::zakura::observe::PortCall;
+
+    let chain = main_chain(2);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[1].hash, genesis.hash);
+    let mut check = Authority::new(
+        AuthorityEvidence::default(),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    check.observe(
+        &ReactorEvent::Dispatched {
+            call: 1,
+            op: PortCall::Prepare {
+                peer: mirror(),
+                source: zakura_header_chain::SourceId::from_digest([2; 32]),
+                owner: round.owner,
+                common_ancestor: genesis,
+                target: chain[1],
+                hashes: vec![chain[0].hash, chain[1].hash],
+            },
+        },
+        true,
+        false,
+    );
+    let locator = crate::observe::StorageFact::Submitted {
+        id: 1,
+        request: crate::observe::StorageRequest::ContinuationLocator,
+        digest: String::new(),
+        call: Some(1),
+    };
+    check.storage([&locator]);
+    let found = check.drain(1);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("not its dispatch's prepare")),
+        "{found:?}"
+    );
+}

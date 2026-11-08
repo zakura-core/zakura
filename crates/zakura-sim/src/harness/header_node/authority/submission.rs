@@ -11,8 +11,10 @@
 //!   sealed elsewhere, which breaks the rule too.
 //!
 //! Storage tags each submission with the reactor call that made it, so the
-//! two sides join by call. The pairer ([`super::super::pair`]) still checks
-//! that they're the same kind of call.
+//! two sides join by call. A dispatched prepare or apply whose submission is
+//! another kind of request breaks the rule as soon as both are known, so a
+//! call still pending at the run's end can't hide it. The pairer
+//! ([`super::super::pair`]) checks kinds again at each call's end.
 
 use std::collections::{HashMap, HashSet};
 
@@ -119,9 +121,7 @@ impl Submission {
         let mut judged = false;
         for fact in facts {
             if let StorageFact::Submitted {
-                request:
-                    request @ (StorageRequest::PrepareHeaderTarget { .. }
-                    | StorageRequest::ApplyHeaderTarget { .. }),
+                request,
                 call: Some(call),
                 ..
             } = fact
@@ -214,8 +214,16 @@ impl Submission {
                     got_hashes,
                 );
             }
-            // The pairer reports a call whose operation is another kind.
-            _ => {}
+            (Sent::Prepare { .. }, other) | (Sent::Apply { .. }, other) => {
+                found.push(format!(
+                    "a {} request, not its dispatch's {}",
+                    request_kind(other),
+                    match sent {
+                        Sent::Prepare { .. } => "prepare",
+                        Sent::Apply { .. } => "apply",
+                    }
+                ));
+            }
         }
         self.judged.insert(call);
         self.submitted.remove(&call);
@@ -226,6 +234,14 @@ impl Submission {
         }
         true
     }
+}
+
+/// `request`'s kind, as its storage operation names it.
+fn request_kind(request: &StorageRequest) -> String {
+    format!(
+        "{:?}",
+        crate::harness::header_node::policy::OpKind::of(request).0
+    )
 }
 
 /// Pushes to `found` that `field` reached storage as `got`, if that isn't

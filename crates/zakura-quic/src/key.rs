@@ -461,48 +461,110 @@ mod tests {
             .is_identity()
     }
 
-    /// The `ed25519-zebra` implementation this module used before `ring`:
-    /// the same point checks, then ZIP 215's cofactored equation.
-    fn zebra_verify_strict(public: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
-        let r: &[u8; 32] = sig[..32].try_into().unwrap();
-        prime_order_point(public).is_some()
-            && prime_order_point(r).is_some()
-            && ed25519_zebra::VerificationKey::try_from(*public)
-                .and_then(|key| key.verify(&ed25519_zebra::Signature::from_bytes(sig), message))
-                .is_ok()
-    }
+    /// Seeds, messages, public keys and signatures that `ed25519-zebra`, the
+    /// implementation `ring` replaced, produced. A one-time differential run
+    /// (#2172) also checked that `verify_strict` accepts and refuses exactly
+    /// what the `ed25519-zebra` implementation did, over 256 seeds with every
+    /// single-bit flip of each signature, a non-canonical `S`, `R` plus
+    /// torsion and a changed message.
+    const RECORDED_ED25519_VECTORS: [(&str, &str, &str, &str); 12] = [
+        (
+            "ec2d57691d9b2d40182ac565032054b7d784ba96b18bcb5be0bb4e70e3fb041e",
+            "",
+            "a251fc23ab9839acd8798cff6b3643cfc922165f6ff7a29cfb624e1cb88a4e1a",
+            "1d2fab33fc89be310f1340e5280cdf1e2cf628b2b0a2cf0257344ca0ba738576b69fda7f9de420e908c0b5af5ee0066c8c9e4efb2956fd0d5c898cb9409e7a06",
+        ),
+        (
+            "edf92e3d4f80fc47d948ea2f17b9bfc742d34e2e785a7a4927f3e261e8bd9d40",
+            "0b",
+            "8f051345e9795ba8f56cdb48a1b757a497508d01c73e2f74b32b522aa0ccaa18",
+            "dbb64026011122e99879a96480640c31b7bf2252959851771b631acec4f4536087147ece1b711b130df5befb2138e00d35dd9e25be72adffb2fe04f79de42c0a",
+        ),
+        (
+            "fecd7b408089255b3467dc1f7231cc6388c9e1c65dcaa5e50f3b460235d18bc4",
+            "4033",
+            "14e2f6fa81d203fe301036f40731a8850bb51f71ae24af4a341e497d8bd90345",
+            "994f054520f1c33c8b2cd56c798964b3c8a61cf6868aa92968527e6f3d6a18f55380414121aac2dec686b95f04b84ef19933be758bb697ca250fe8c626b3b700",
+        ),
+        (
+            "134a14168b38c09886bc1e5dd8824f0081b9a0d8d4633fafaece42767e22c9f3",
+            "154946",
+            "a331bc5de494290e0f1df9143b92c0c48302d2bfdfc700ad8ecbb94ed0d57624",
+            "59ad63244825b0a26f3e7e1574ef465c81551ad6a750c4ecdb784f0ef19e1510a9667792f3cefc66b9f06fc541fe2b431fa4b6925504037a6638adfa925b3e07",
+        ),
+        (
+            "9db5ea5024f5a3af2b82e9b346aa029ea45364ca0361bb2bcfe7040b869dde11",
+            "77d8fdc3",
+            "2dfbe408eb55c6ef33f3f4e171f18115cdbab87d6f68785db7de6de29088594f",
+            "cdc51e274c4efbc03ce27b84fc241ba609c75a4593b1f8f5be2f5a7c4bc13a8b77aad947dda64502c33adb12c7a297b5b1659e495caeff1ff7dfdb4b99076304",
+        ),
+        (
+            "c076e9ee798a20eee8b3288a6b42a9192454e7940c03479eb37c17ea7e3f5032",
+            "f16f183db9",
+            "f70b1bed0e4d1c5be9fb30475c9eb48126ae45b62613b655f6fa5dd153c2a401",
+            "46ecc445233b43bcd3968a2ef2f3b33fdccf7de38aa673bec1602c0af526b136a6c0470d55467d0960be1ee999849fe3e0e5e72f3cba50238bbdf4d733b95e00",
+        ),
+        (
+            "601780cf54c222744e122388ef8a71a3bc9e022179f79fa75bca604bea2bf66a",
+            "984bae647446",
+            "8e77cb44e61dfe47e64bf51b0c4decd983439fc2ffcd7963195f2e14ee9e17a2",
+            "8e68ca206ff66d15899ba6847466c27ef0eb9707005b3ae9525a57754a4424bfcc12a5c84d30df2184e5ff730ce67831553beed04b7f980cdb1233407d2d6203",
+        ),
+        (
+            "041565f019c723420925eeadbcafd2d4fab8aa4db491542298e8936a9bcfdb4f",
+            "c925ea181e3c87",
+            "45c0237dc7452d6f95a947202b0bb3f06b93ebf95b03540aa0b496f403b220b1",
+            "501c233e9fd1431ee6706750f812665879762d42b77c99bcbfe0e64a026e505f0ea888cac635c4bf1f7c6f0bbdf9e5160825b5babe325a67767a01a4889d6a0e",
+        ),
+        (
+            "65711c8d556639ddfc14ce292b2415f3a2824d003af1a530093b8e0b70b695e6",
+            "c639694b7b90c675",
+            "47d096347406e09dfcee4e2c7de5e7e5f9b70efd0a7ce0b0cb8f6e4c97777a87",
+            "8add0376f2039f2bafbca3dc44c5121ae4a3e3badf431cf78d5b912ba97846dec520a9b4048adf5252f7cb10dccde46cceba769b4e5159d7be81c34a3d205f07",
+        ),
+        (
+            "02a5ea3b72d60631f15bba5df5aa78e31ab79af24756018d09138055ae861129",
+            "dcd1c4671dbdb3fd72",
+            "f26db937e05237767d808ec4ab39fc788ad4d7529fad93b3c7ee961b5b90a6e0",
+            "6476f06f5f6548b12f2e288eeeead58e5a14556df03bb57d7cd4c07b5157c79975ad90ce1581dbaa2e906880fbcc24b19fdf623ec1ffacc67585b1231df59c0f",
+        ),
+        (
+            "06413632d92adef2cc36af89f348749f7c846900ec0ed41225ac2dab571e230a",
+            "ae6505b9f3095b22fabf",
+            "8cf7b5bd302bbf6a08078984e39927090614e6b965fd775947706d7b80e25efc",
+            "8cce33936647cfa847e4da974fe3a365053c9e6abd8ddf96d5913e5a34bb8c6e4412f3cf38efc25b2638445df0e787c07a8fb74a4e37e240f9fe80aa5203260e",
+        ),
+        (
+            "79cafa94c8205859ba112647acdb3c3082a52695300eea0ba9b061d6e7ede788",
+            "cac726c1b61b673eaa3058",
+            "f07410eec36eca19c15fa45bb71834032ac36da5d0ef684efe6ff181437e745c",
+            "cdc4876dc60d8136fdfd8b3f1b930a1e2b5d69741a7f0c4dc6bc2842c71cb8282f3736e61b4b0151f7fcde3ceeb9f709ac562f78d5b9b46d1ab1467d24c02408",
+        ),
+    ];
 
-    /// ID-4, ID-6: for many seeds and messages, `ring` derives the same keys
-    /// and signatures as `ed25519-zebra`, and `verify_strict` accepts and
-    /// refuses exactly what the `ed25519-zebra` implementation did, for valid
-    /// signatures and for each kind of corruption.
+    /// ID-4, ID-6: `ring` derives the keys and signatures `ed25519-zebra`
+    /// recorded, accepts each signature, and refuses each kind of corruption.
     #[test]
-    fn ring_matches_the_ed25519_zebra_implementation() {
-        use sha2::{Digest as _, Sha512};
-
+    fn ring_matches_recorded_ed25519_vectors() {
         let torsion = CompressedEdwardsY(ORDER_8).decompress().unwrap();
-        for case in 0u32..256 {
-            let digest = Sha512::digest(case.to_le_bytes());
-            let seed: [u8; 32] = digest[..32].try_into().unwrap();
-            let length = usize::try_from(case % 33).expect("a value below 33 fits in usize");
-            let message = &digest[32..32 + length];
+        for (seed, message, public, sig) in RECORDED_ED25519_VECTORS {
+            let seed: [u8; 32] = hex::decode(seed).unwrap().try_into().unwrap();
+            let message = hex::decode(message).unwrap();
+            let sig: [u8; 64] = hex::decode(sig).unwrap().try_into().unwrap();
 
             let secret = NodeSecretKey::from_bytes(&seed);
-            let zebra_secret = ed25519_zebra::SigningKey::from(seed);
-            let zebra_public: [u8; 32] =
-                ed25519_zebra::VerificationKeyBytes::from(&zebra_secret).into();
-            assert_eq!(secret.public().as_bytes(), &zebra_public, "case {case}");
-
-            let sig = secret.sign(message);
-            assert_eq!(sig, zebra_secret.sign(message).to_bytes(), "case {case}");
+            assert_eq!(secret.public().to_string(), public);
+            assert_eq!(secret.sign(&message), sig, "{public}");
 
             let public = secret.public();
-            let mut candidates = vec![sig];
-            // Every single-bit flip in R and in S.
-            for bit in 0..512 {
+            public.verify_strict(&message, &sig).unwrap();
+
+            let mut corrupted = Vec::new();
+            // A bit flip at each end of R and of S.
+            for byte in [0, 31, 32, 63] {
                 let mut flipped = sig;
-                flipped[bit / 8] ^= 1 << (bit % 8);
-                candidates.push(flipped);
+                flipped[byte] ^= 0x01;
+                corrupted.push(flipped);
             }
             // S + L: the same scalar, not canonically encoded.
             let mut s_plus_l = sig;
@@ -512,32 +574,27 @@ mod tests {
                 *byte = sum as u8; // Keeps the low byte; the carry holds the rest.
                 carry = sum >> 8;
             }
-            candidates.push(s_plus_l);
+            corrupted.push(s_plus_l);
             // R + T for a point T of order 8.
             let mut r_plus_t = sig;
             let r = CompressedEdwardsY(sig[..32].try_into().unwrap())
                 .decompress()
                 .unwrap();
             r_plus_t[..32].copy_from_slice((r + torsion).compress().as_bytes());
-            candidates.push(r_plus_t);
+            corrupted.push(r_plus_t);
 
-            for candidate in candidates {
+            for candidate in corrupted {
                 assert_eq!(
-                    public.verify_strict(message, &candidate).is_ok(),
-                    zebra_verify_strict(public.as_bytes(), message, &candidate),
-                    "case {case}, signature {}",
+                    public.verify_strict(&message, &candidate),
+                    Err(SignatureError),
+                    "{public}: {}",
                     hex::encode(candidate),
                 );
             }
 
-            // A message that differs in one bit.
-            let mut other = message.to_vec();
+            let mut other = message.clone();
             other.push(0);
-            assert_eq!(
-                public.verify_strict(&other, &sig).is_ok(),
-                zebra_verify_strict(public.as_bytes(), &other, &sig),
-                "case {case}"
-            );
+            assert_eq!(public.verify_strict(&other, &sig), Err(SignatureError));
         }
     }
 

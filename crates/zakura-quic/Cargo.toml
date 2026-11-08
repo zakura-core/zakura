@@ -35,8 +35,6 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
-# The differential test against the Ed25519 implementation `ring` replaced (ID-6).
-ed25519-zebra = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
 

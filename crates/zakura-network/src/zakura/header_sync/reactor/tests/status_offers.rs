@@ -623,6 +623,17 @@ impl observe::HeaderSyncObserver for Recorded {
 }
 
 impl Recorded {
+    /// The `EventTaken` events recorded so far.
+    fn taken(&self) -> Vec<observe::ReactorEvent> {
+        self.0
+            .lock()
+            .expect("no test panics holding it")
+            .iter()
+            .filter(|event| matches!(event, observe::ReactorEvent::EventTaken { .. }))
+            .cloned()
+            .collect()
+    }
+
     /// The `HeadroomWait` and `CachedPassDeferred` events recorded so far.
     fn waits(&self) -> Vec<observe::ReactorEvent> {
         self.0
@@ -1732,6 +1743,134 @@ async fn a_slow_pass_earns_no_refill_while_it_runs() {
     assert!(!budget.try_take(end), "the scan time refilled nothing");
     assert_eq!(budget.next_refill(), end + CACHED_PASS_REFILL);
     assert!(budget.try_take(end + CACHED_PASS_REFILL));
+}
+
+/// The run loop reports each event it takes, from which queue, where in the
+/// turn, and how many are left. Three queued `Status` events go: the first
+/// at the turn's start with two left, so the queue is ready for the turn's
+/// `select!`, which takes the second with one left, and the next turn's
+/// start takes the last.
+#[tokio::test]
+async fn the_run_loop_reports_each_event_it_takes() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (_snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    let (peer, _outbound) = connect(&mut reactor, 1);
+    for byte in 1..=3 {
+        handle
+            .try_send(Event::Status {
+                peer: peer.clone(),
+                session_id: 0,
+                status: status_for(&snapshot, block::Hash([byte; 32])),
+            })
+            .expect("the events queue has room");
+    }
+    let task = tokio::spawn(reactor.run());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    let taken = |point, queued| observe::ReactorEvent::EventTaken {
+        queue: observe::EventQueue::Wire,
+        point,
+        queued,
+    };
+    assert_eq!(
+        recorder.taken(),
+        [
+            taken(observe::TakePoint::TurnStart, 2),
+            taken(observe::TakePoint::Select, 1),
+            taken(observe::TakePoint::TurnStart, 0),
+        ]
+    );
+}
+
+/// Runs a reactor whose committed watch starts at a snapshot, and publishes
+/// the next state version on it before the run loop starts if `early`, or
+/// once the loop waits in its `select!` otherwise. Returns the
+/// `WatchObserved` events it reported and the new version.
+async fn watch_reads(
+    early: bool,
+) -> (
+    Vec<observe::ReactorEvent>,
+    zakura_header_chain::StateVersion,
+) {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    let snapshot = committed_snapshot(zakura_header_chain::Frontier::new(
+        startup.anchor.0,
+        startup.anchor.1,
+    ));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the reactor builds");
+    let recorder = Arc::new(Recorded::default());
+    reactor.startup.observer.0 = Some(recorder.clone());
+    let mut next = snapshot;
+    next.state_version = next.state_version.checked_next().unwrap();
+    if early {
+        snapshots.send_replace(Some(next.clone()));
+    }
+    let task = tokio::spawn(reactor.run());
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    if !early {
+        snapshots.send_replace(Some(next.clone()));
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+    shutdown.cancel();
+    task.await
+        .expect("the reactor stops through normal shutdown");
+    let reads = recorder
+        .0
+        .lock()
+        .expect("no test panics holding it")
+        .iter()
+        .filter(|event| matches!(event, observe::ReactorEvent::WatchObserved { .. }))
+        .cloned()
+        .collect();
+    (reads, next.state_version)
+}
+
+/// A snapshot published before the run loop starts is read by the first
+/// turn's watch check, which reports it once.
+#[tokio::test]
+async fn the_turn_start_watch_check_reports_its_read() {
+    let (reads, version) = watch_reads(true).await;
+    assert_eq!(
+        reads,
+        [observe::ReactorEvent::WatchObserved {
+            state_version: version
+        }]
+    );
+}
+
+/// A snapshot published while the run loop waits in its `select!` is read
+/// by the committed watch's arm, which reports it once.
+#[tokio::test]
+async fn the_select_watch_arm_reports_its_read() {
+    let (reads, version) = watch_reads(false).await;
+    assert_eq!(
+        reads,
+        [observe::ReactorEvent::WatchObserved {
+            state_version: version
+        }]
+    );
 }
 
 /// A continuously ready Status queue cannot hide the snapshot that releases a resource stall.

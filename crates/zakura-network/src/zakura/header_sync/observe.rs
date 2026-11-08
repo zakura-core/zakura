@@ -12,7 +12,7 @@ use std::{any::Any, fmt, future::Future, panic::AssertUnwindSafe, pin::Pin, sync
 use zakura_chain::{block, work::difficulty::U256};
 use zakura_header_chain::{
     BodyWorkOwner, EngineSnapshot, Frontier, HeaderGeneration, HeaderSyncWorkOwner,
-    HeaderWorkAuthority, SourceId, StateVersion,
+    HeaderWorkAuthority, SourceId, StateVersion, VerifiedGeneration,
 };
 use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
@@ -383,6 +383,28 @@ pub enum ReactorEvent {
         /// How long until the next refill.
         refill_in: std::time::Duration,
     },
+    /// The run loop read committed snapshot `state_version` from its
+    /// committed watch, at the top of a turn or in the turn's `select!`.
+    /// Reported before the reactor handles the snapshot. Not reported for
+    /// the reads after a completion or a connect, which refresh the
+    /// snapshot without waiting on the watch.
+    WatchObserved {
+        /// The read snapshot's state version.
+        state_version: StateVersion,
+    },
+    /// The run loop took an event from `queue` at `point`, leaving `queued`
+    /// more in that queue. Reported before the event is handled. A take at
+    /// [`TakePoint::TurnStart`] that leaves `queued` above zero shows the
+    /// queue was ready when the turn's `select!` polled it, since nothing
+    /// else takes from it in between.
+    EventTaken {
+        /// The queue.
+        queue: EventQueue,
+        /// Where in the turn.
+        point: TakePoint,
+        /// The events left in the queue.
+        queued: usize,
+    },
     /// The reactor refused a session from `peer` because `peer`'s readmission
     /// cooldown still holds. Nothing else about the reactor changes.
     SessionRefused {
@@ -421,6 +443,11 @@ pub enum ReactorEvent {
         suffix_work: U256,
         /// The lowest height the node retains headers for.
         oldest_retained: block::Height,
+        /// The full-state verified-path generation that new repair work
+        /// captures.
+        verified_generation: VerifiedGeneration,
+        /// The verified body tip.
+        verified_best: Frontier,
     },
     /// The reactor queued `status` on `peer`'s session.
     StatusQueued {
@@ -469,6 +496,8 @@ impl ReactorEvent {
             header_best: snapshot.frontiers.header_best,
             suffix_work: snapshot.header_best_score.suffix_work.as_u256(),
             oldest_retained: snapshot.oldest_retained_height,
+            verified_generation: snapshot.verified_generation,
+            verified_best: snapshot.frontiers.verified_best,
         }
     }
 
@@ -675,6 +704,27 @@ pub enum CreditKind {
     Open,
     /// A `Grant` on a live subscription.
     Grant,
+}
+
+/// One of the reactor's two event queues, as [`ReactorEvent::EventTaken`]
+/// names it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum EventQueue {
+    /// Session connects and disconnects.
+    Lifecycle,
+    /// Peer messages, such as `Status`.
+    Wire,
+}
+
+/// Where in a turn of its run loop the reactor took an event, as
+/// [`ReactorEvent::EventTaken`] reports it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TakePoint {
+    /// The `try_recv` before the turn's `select!`, which takes at most one
+    /// event from each queue.
+    TurnStart,
+    /// The turn's `select!`.
+    Select,
 }
 
 /// The unit of work the reactor is in, as [`ReactorEvent::CauseSet`]

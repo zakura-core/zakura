@@ -882,7 +882,8 @@ impl Subsystem for Storage {
             scenario.controls.clone(),
             predicates,
         )
-        .with_port(ports.node.clone());
+        .with_port(ports.node.clone())
+        .with_adoption(adoption.clone());
         sim.add_source(Box::new(control));
         Storage {
             port: ports.node,

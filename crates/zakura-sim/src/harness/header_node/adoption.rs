@@ -20,8 +20,11 @@ use std::{
 };
 
 use zakura_chain::{block, work::difficulty::U256};
-use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion};
-use zakura_network::zakura::{observe::ReactorEvent, Status, ZakuraPeerId};
+use zakura_header_chain::{Frontier, HeaderGeneration, StateVersion, VerifiedGeneration};
+use zakura_network::zakura::{
+    observe::{EventQueue, ReactorCause, ReactorEvent, TakePoint},
+    Status, ZakuraPeerId,
+};
 
 use crate::{IdleStatus, Outcome, RunEnd};
 
@@ -51,6 +54,10 @@ pub struct Adoption {
     pub suffix_work: U256,
     /// The lowest retained height.
     pub oldest_retained: block::Height,
+    /// The generation new repair work captures.
+    pub verified_generation: VerifiedGeneration,
+    /// The verified body tip.
+    pub verified_best: Frontier,
 }
 
 impl Adoption {
@@ -117,6 +124,34 @@ pub enum AdoptionFact {
         /// The generation the read was made under.
         generation: HeaderGeneration,
     },
+    /// A `Commit` step put this state in the node's engine, outside header
+    /// sync. The harness records it, not the reactor, before any task runs
+    /// again, so it comes before every reactor fact that could read it.
+    Published {
+        /// The engine's state version after the commit.
+        state_version: StateVersion,
+        /// Its header generation.
+        header_generation: HeaderGeneration,
+    },
+    /// `EventTaken`: the reactor took an event from `queue` at `point`,
+    /// leaving `queued` more there.
+    EventTaken {
+        /// The queue.
+        queue: EventQueue,
+        /// Where in the turn.
+        point: TakePoint,
+        /// The events left in the queue.
+        queued: usize,
+    },
+    /// `WatchObserved`: the run loop read committed snapshot
+    /// `state_version` from its committed watch.
+    WatchObserved {
+        /// The read snapshot's state version.
+        state_version: StateVersion,
+    },
+    /// The reactor reached its turn's cached pass: a `CauseSet` to `Pass`,
+    /// once per turn of its run loop.
+    Pass,
 }
 
 impl AdoptionFact {
@@ -131,6 +166,8 @@ impl AdoptionFact {
                 header_best,
                 suffix_work,
                 oldest_retained,
+                verified_generation,
+                verified_best,
             } => AdoptionFact::Adopted(Adoption {
                 state_version: *state_version,
                 header_generation: *header_generation,
@@ -138,6 +175,8 @@ impl AdoptionFact {
                 header_best: *header_best,
                 suffix_work: *suffix_work,
                 oldest_retained: *oldest_retained,
+                verified_generation: *verified_generation,
+                verified_best: *verified_best,
             }),
             ReactorEvent::StatusQueued {
                 peer,
@@ -173,6 +212,29 @@ impl AdoptionFact {
             },
             _ => return None,
         })
+    }
+
+    /// The turn fact `event` gives this store, if any: an `EventTaken`, a
+    /// `WatchObserved`, or a `CauseSet` to `Pass`. All stay out of the log.
+    pub(super) fn of_turn(event: &ReactorEvent) -> Option<Self> {
+        match event {
+            ReactorEvent::WatchObserved { state_version } => Some(AdoptionFact::WatchObserved {
+                state_version: *state_version,
+            }),
+            ReactorEvent::EventTaken {
+                queue,
+                point,
+                queued,
+            } => Some(AdoptionFact::EventTaken {
+                queue: *queue,
+                point: *point,
+                queued: *queued,
+            }),
+            ReactorEvent::CauseSet {
+                cause: ReactorCause::Pass,
+            } => Some(AdoptionFact::Pass),
+            _ => None,
+        }
     }
 
     /// Whether only this store keeps the fact. `Started` and `Dispatched`
@@ -255,6 +317,21 @@ impl AdoptionEvidence {
         if !store.frozen {
             store.facts.push(Stamped { at, fact });
         }
+    }
+
+    /// Records that a `Commit` step left the node's engine at
+    /// `state_version` and `header_generation`, at the run's current time.
+    pub(super) fn publish(&self, state_version: StateVersion, header_generation: HeaderGeneration) {
+        let at = zakura_scheduler::hooks::now()
+            .map(|now| now.since_start())
+            .unwrap_or_default();
+        self.record(
+            at,
+            AdoptionFact::Published {
+                state_version,
+                header_generation,
+            },
+        );
     }
 
     /// Stops recording facts. The tap calls it when the run's log freezes,
@@ -565,6 +642,8 @@ mod tests {
             header_best: tip(height),
             suffix_work: U256::from(height),
             oldest_retained: anchor.height,
+            verified_generation: VerifiedGeneration::new(generation),
+            verified_best: anchor,
         }
     }
 

@@ -524,6 +524,12 @@ impl HeaderSyncReactor {
                     Some(Ok(())) => {
                         let snapshot = snapshots.borrow_and_update().clone();
                         if let Some(snapshot) = snapshot {
+                            observe!(
+                                self,
+                                ReactorEvent::WatchObserved {
+                                    state_version: snapshot.state_version,
+                                }
+                            );
                             caused!(
                                 self,
                                 ReactorCause::Watch,
@@ -553,10 +559,26 @@ impl HeaderSyncReactor {
             // Session readers wait for connection acknowledgement before publishing peer events.
             let mut handled_event = false;
             if let Ok(event) = self.lifecycle.try_recv() {
+                observe!(
+                    self,
+                    ReactorEvent::EventTaken {
+                        queue: observe::EventQueue::Lifecycle,
+                        point: observe::TakePoint::TurnStart,
+                        queued: self.lifecycle.len(),
+                    }
+                );
                 caused!(self, ReactorCause::Event, self.handle_lifecycle(event));
                 handled_event = true;
             }
             if let Ok(event) = self.events.try_recv() {
+                observe!(
+                    self,
+                    ReactorEvent::EventTaken {
+                        queue: observe::EventQueue::Wire,
+                        point: observe::TakePoint::TurnStart,
+                        queued: self.events.len(),
+                    }
+                );
                 caused!(self, ReactorCause::Event, self.handle_event(event));
                 handled_event = true;
             }
@@ -588,11 +610,31 @@ impl HeaderSyncReactor {
                     caused!(self, ReactorCause::Maintenance, self.refresh_statuses());
                 },
                 event = self.lifecycle.recv() => match event {
-                    Some(event) => caused!(self, ReactorCause::Event, self.handle_lifecycle(event)),
+                    Some(event) => {
+                        observe!(
+                            self,
+                            ReactorEvent::EventTaken {
+                                queue: observe::EventQueue::Lifecycle,
+                                point: observe::TakePoint::Select,
+                                queued: self.lifecycle.len(),
+                            }
+                        );
+                        caused!(self, ReactorCause::Event, self.handle_lifecycle(event))
+                    }
                     None => break HeaderRequestTerminal::Shutdown,
                 },
                 event = self.events.recv() => match event {
-                    Some(event) => caused!(self, ReactorCause::Event, self.handle_event(event)),
+                    Some(event) => {
+                        observe!(
+                            self,
+                            ReactorEvent::EventTaken {
+                                queue: observe::EventQueue::Wire,
+                                point: observe::TakePoint::Select,
+                                queued: self.events.len(),
+                            }
+                        );
+                        caused!(self, ReactorCause::Event, self.handle_event(event))
+                    }
                     None => break HeaderRequestTerminal::Shutdown,
                 },
                 _ = zakura_rt::task::yield_now(), if handled_event => {},
@@ -607,6 +649,12 @@ impl HeaderSyncReactor {
                             .as_ref()
                             .and_then(|snapshots| snapshots.borrow().clone())
                         {
+                            observe!(
+                                self,
+                                ReactorEvent::WatchObserved {
+                                    state_version: snapshot.state_version,
+                                }
+                            );
                             caused!(
                                 self,
                                 ReactorCause::Watch,

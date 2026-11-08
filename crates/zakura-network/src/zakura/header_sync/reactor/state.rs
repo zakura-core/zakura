@@ -529,13 +529,37 @@ impl ReactorState {
     }
 
     /// Arm `peer`'s request deadline `timeout` after `now`.
+    ///
+    /// The first deadline armed after a session replacement keeps the replaced
+    /// request's deadline if that one is earlier. See
+    /// [`PeerSchedule::replaced_request_deadline`].
     pub(super) fn arm_request_deadline(
         &mut self,
         peer: ZakuraPeerId,
         now: Instant,
         timeout: Duration,
     ) {
-        self.request_deadlines.insert(peer, now + timeout);
+        let carried = self
+            .peers
+            .get_mut(&peer)
+            .and_then(|schedule| schedule.replaced_request_deadline.take());
+        let deadline = now + timeout;
+        self.request_deadlines.insert(
+            peer,
+            carried.map_or(deadline, |carried| carried.min(deadline)),
+        );
+    }
+
+    /// Carry `deadline`, the deadline of the unanswered request that admitting
+    /// `peer`'s new session retired, to that session's first request.
+    pub(super) fn carry_replaced_request_deadline(
+        &mut self,
+        peer: &ZakuraPeerId,
+        deadline: Instant,
+    ) {
+        if let Some(schedule) = self.peers.get_mut(peer) {
+            schedule.replaced_request_deadline = Some(deadline);
+        }
     }
 
     pub(super) fn clear_request_deadline(&mut self, peer: &ZakuraPeerId) {
@@ -856,6 +880,13 @@ pub(super) struct PeerSchedule {
     /// Consecutive requests this peer's sessions answered with nothing usable,
     /// since it last supplied usable work. See [`ReactorState::departed_strikes`].
     pub(super) unproductive_requests: u32,
+    /// The deadline of the unanswered request that this session's admission
+    /// retired from the session it replaced.
+    ///
+    /// Without it, a peer could replace its session just before each timeout
+    /// and never be charged. The session's first request keeps this deadline
+    /// when it's earlier than its own, so a peer that answers pays nothing.
+    pub(super) replaced_request_deadline: Option<Instant>,
 }
 
 impl StorageCallKind {

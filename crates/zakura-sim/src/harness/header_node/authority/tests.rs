@@ -413,6 +413,23 @@ fn accepted(through: Frontier) -> ReactorEvent {
     }
 }
 
+/// The subscriber's claim of a page of subscription 1 with `headers`
+/// headers ending at `through`, one plain one-header page's bytes per
+/// header, as [`cursor`] counts.
+fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
+    let cursor = cursor(through);
+    ReactorEvent::CursorClaimed {
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        through,
+        headers: cursor.headers,
+        bytes: cursor.bytes,
+        page_headers: headers,
+        page_bytes: u64::from(headers) * credit::smallest_page(AuxSchema::None),
+    }
+}
+
 /// `event`, a grant, acknowledging one byte more than its cursor consumed.
 fn one_byte_more(mut event: ReactorEvent) -> ReactorEvent {
     if let ReactorEvent::CreditIssued { update, .. } = &mut event {
@@ -471,6 +488,7 @@ fn updates_carry_their_subscriptions_state() {
             adopted(),
             open(chain[3], &[genesis.hash]),
             started(round.clone(), &[genesis.hash]),
+            claimed(chain[1], 2),
             page(&round, genesis, &[chain[0].hash, chain[1].hash]),
             accepted(chain[1]),
             reserved(2, 2),
@@ -556,7 +574,9 @@ fn acceptance_reaches_only_staged_pages() {
             adopted(),
             open(chain[3], &[genesis.hash]),
             started(round.clone(), &[genesis.hash]),
+            claimed(chain[1], 2),
             page(&round, genesis, &[chain[0].hash, chain[1].hash]),
+            claimed(chain[2], 1),
             page(&round, chain[1], &[chain[2].hash]),
         ]
     };
@@ -566,8 +586,14 @@ fn acceptance_reaches_only_staged_pages() {
         credit_breaks(&events)
     };
     assert_eq!(with(&[chain[1], chain[2]]), Vec::<String>::new());
-    let late = with(&[chain[3]]);
-    assert!(late[0].contains("no staged page ends at"), "{late:?}");
+    // A late page the subscriber claimed and the reactor dropped unstaged.
+    let mut events = base();
+    events.extend([claimed(chain[3], 1), accepted(chain[3])]);
+    let late = credit_breaks(&events);
+    assert!(
+        matches!(&late[..], [only] if only.contains("no staged page ends at")),
+        "{late:?}"
+    );
     let backwards = with(&[chain[2], chain[1]]);
     assert!(backwards[0].contains("below its earlier"), "{backwards:?}");
 }
@@ -621,4 +647,96 @@ fn a_stale_handlers_credit_is_left_to_the_stale_check() {
         check.observe(&event, true, false);
     }
     assert_eq!(check.drain(1), Vec::<String>::new());
+}
+
+/// A claim whose recorded cursor isn't what its pages consumed breaks, and
+/// so does an acceptance of a cursor no claim recorded, though its header
+/// was staged.
+#[test]
+fn claims_record_what_their_pages_consumed() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[3].hash, genesis.hash);
+    let base = || {
+        vec![
+            reserved(1, 10),
+            adopted(),
+            open(chain[3], &[genesis.hash]),
+            started(round.clone(), &[genesis.hash]),
+        ]
+    };
+    let mut miscounted = base();
+    let mut claim = claimed(chain[1], 2);
+    if let ReactorEvent::CursorClaimed { bytes, .. } = &mut claim {
+        *bytes += 1;
+    }
+    miscounted.push(claim);
+    let found = credit_breaks(&miscounted);
+    assert!(found[0].contains("but its pages consumed"), "{found:?}");
+    let mut unclaimed = base();
+    unclaimed.extend([
+        claimed(chain[1], 2),
+        page(&round, genesis, &[chain[0].hash, chain[1].hash]),
+        one_byte_more_accepted(accepted(chain[1])),
+    ]);
+    let found = credit_breaks(&unclaimed);
+    assert!(found[0].contains("which no claim recorded"), "{found:?}");
+}
+
+/// `event`, an acceptance, one byte past its cursor.
+fn one_byte_more_accepted(mut event: ReactorEvent) -> ReactorEvent {
+    if let ReactorEvent::CursorsAccepted { bytes, .. } = &mut event {
+        *bytes += 1;
+    }
+    event
+}
+
+/// A built Close that adds credit or isn't a Close breaks, and so does
+/// credit that comes in an update of another operation.
+#[test]
+fn updates_are_their_operations() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let start = Frontier::new(block::Height(0), genesis.hash);
+    let base = || vec![reserved(1, 10), open(chain[3], &[genesis.hash])];
+    let close = |objects: u32, operation: Operation| ReactorEvent::CloseBuilt {
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        update: Box::new(SubscribeHeaders {
+            operation,
+            subscription_id: 1,
+            update_sequence: 1,
+            initial_target_tip_hash: chain[3].hash,
+            acknowledged: cursor(start),
+            locator_hashes: Vec::new(),
+            added_credit: Credit { objects, bytes: 0 },
+            tree_aux_schema: AuxSchema::None,
+        }),
+    };
+    for (event, why) in [
+        (close(1, Operation::Close), "built Close is a Close adding"),
+        (close(0, Operation::Grant), "built Close is a Grant"),
+    ] {
+        let mut events = base();
+        events.push(event);
+        let found = credit_breaks(&events);
+        assert!(
+            found.iter().any(|found| found.contains(why)),
+            "{why}: {found:?}"
+        );
+    }
+    let mut mislabeled = grant(2, 0, 1, start, chain[3].hash);
+    if let ReactorEvent::CreditIssued { update, .. } = &mut mislabeled {
+        update.operation = Operation::Close;
+    }
+    let mut events = base();
+    events.extend([reserved(2, 2), mislabeled]);
+    let found = credit_breaks(&events);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("Grant credit came in a Close update")),
+        "{found:?}"
+    );
 }

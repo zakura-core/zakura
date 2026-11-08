@@ -396,6 +396,20 @@ impl SubscriberState {
         } else {
             tools.claim_page(&live.id, count, payload_len, cursor)?;
         }
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            tap.observer.observe(ReactorEvent::CursorClaimed {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                subscription: live.id,
+                through: Frontier::new(cursor.height, cursor.hash),
+                headers: cursor.headers,
+                bytes: cursor.bytes,
+                page_headers: count,
+                // Widening usize to u64 is lossless on supported targets.
+                page_bytes: payload_len as u64,
+            });
+        }
         live.pages += 1;
         live.reached |= page.reaches_initial_target;
         Ok(Admitted {

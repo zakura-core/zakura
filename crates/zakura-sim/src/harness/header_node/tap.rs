@@ -670,7 +670,7 @@ impl TapState {
         }
         // Budget changes, credit and built closes, causes, headroom waits,
         // deferred passes, taken events, watch reads, the queue's slots and
-        // cursor acceptances stay out of the log, whose format pinned Plans
+        // cursor claims and acceptances stay out of the log, whose format pinned Plans
         // fix, and a teardown's returns after the run are expected.
         if matches!(
             event,
@@ -683,6 +683,7 @@ impl TapState {
                 | ReactorEvent::WatchObserved { .. }
                 | ReactorEvent::Slots { .. }
                 | ReactorEvent::CursorsAccepted { .. }
+                | ReactorEvent::CursorClaimed { .. }
                 | ReactorEvent::CloseBuilt { .. }
         ) {
             if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {

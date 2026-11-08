@@ -15,9 +15,15 @@
 //!   `CursorsAccepted`, or the `Open`'s start before any, in all four
 //!   fields: the header, and the header and byte credit consumed through
 //!   it, which the publisher compares too.
-//! - **Acceptance.** Each `CursorsAccepted` reaches the last header of a
-//!   page staged on that subscription, never a cursor no page staged, and
-//!   never one below an earlier acceptance.
+//! - **Claims.** Each `CursorClaimed` records the cursor its subscription's
+//!   pages so far consumed: the sum of every claimed page's headers and
+//!   payload bytes, counted here from each page's own size.
+//! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
+//!   reaches the last header of a page staged on that subscription, never
+//!   a cursor no page staged, and never goes below an earlier acceptance.
+//! - **Operations.** An `Open`'s and a `Grant`'s credit comes in an update
+//!   of that operation, and a built `Close` is a `Close` that adds no
+//!   credit.
 //!
 //! Credit and acceptance in a stale call's handler are
 //! `stale-completion-inert`'s effects, so they aren't judged here. They
@@ -33,6 +39,7 @@ use zakura_chain::block;
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
     observe::{CreditKind, ReactorEvent, SubscribeHeaders},
+    v9::Operation,
     AuxSchema, ZakuraPeerId, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
@@ -68,6 +75,10 @@ struct Live {
     staged: HashSet<Frontier>,
     /// The latest accepted cursor.
     accepted: Option<Frontier>,
+    /// The headers and bytes every page claimed so far consumed.
+    consumed: (u64, u64),
+    /// Each cursor a claim recorded.
+    claimed: HashSet<Acknowledged>,
 }
 
 /// A cursor's header and the header and byte credit consumed through it.
@@ -114,6 +125,26 @@ impl Credit {
                 }
                 false
             }
+            // The task that received the page reports its claim.
+            ReactorEvent::CursorClaimed {
+                peer,
+                session_id,
+                subscription,
+                through,
+                headers,
+                bytes,
+                page_headers,
+                page_bytes,
+            } => {
+                let key = (peer.clone(), *session_id, *subscription);
+                self.claim(
+                    &key,
+                    (*through, *headers, *bytes),
+                    *page_headers,
+                    *page_bytes,
+                );
+                true
+            }
             _ if !on_reactor => false,
             ReactorEvent::CreditIssued {
                 kind,
@@ -128,6 +159,17 @@ impl Credit {
                 let key = (peer.clone(), *session_id, *subscription);
                 if !stale_handler {
                     self.issue(&key, *objects, *bytes, update);
+                }
+                let operation = match kind {
+                    CreditKind::Open => Operation::Open,
+                    CreditKind::Grant => Operation::Grant,
+                };
+                if update.operation != operation {
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session_id} subscription {subscription}'s \
+                         {kind:?} credit came in a {:?} update",
+                        update.operation
+                    ));
                 }
                 match kind {
                     CreditKind::Open => {
@@ -147,6 +189,8 @@ impl Credit {
                                 acknowledged: acknowledged(update),
                                 staged: HashSet::new(),
                                 accepted: None,
+                                consumed: (0, 0),
+                                claimed: HashSet::new(),
                             },
                         );
                     }
@@ -166,6 +210,16 @@ impl Credit {
                 update,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
+                if update.operation != Operation::Close
+                    || update.added_credit.objects != 0
+                    || update.added_credit.bytes != 0
+                {
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: session {session_id} subscription {subscription}'s \
+                         built Close is a {:?} adding {:?}",
+                        update.operation, update.added_credit
+                    ));
+                }
                 self.update("Close", &key, update);
                 true
             }
@@ -293,6 +347,39 @@ impl Credit {
         }
     }
 
+    /// Judges a claim of `key`'s subscription that recorded `cursor` for a
+    /// page of `page_headers` headers in `page_bytes` bytes.
+    fn claim(
+        &mut self,
+        key: &Subscription,
+        cursor: Acknowledged,
+        page_headers: u32,
+        page_bytes: u64,
+    ) {
+        let (_, session, subscription) = key;
+        let Some(live) = self.live.get_mut(key) else {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} claimed a \
+                 page, but the subscriber never opened it"
+            ));
+            return;
+        };
+        live.consumed = (
+            live.consumed.0.saturating_add(u64::from(page_headers)),
+            live.consumed.1.saturating_add(page_bytes),
+        );
+        let (through, headers, bytes) = cursor;
+        if (headers, bytes) != live.consumed {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} recorded \
+                 cursor {through:?} at {headers} headers and {bytes} bytes, but its pages \
+                 consumed {:?}",
+                live.consumed
+            ));
+        }
+        live.claimed.insert(cursor);
+    }
+
     /// Judges an acceptance of `key`'s subscription through `cursor`.
     fn accept(&mut self, key: &Subscription, cursor: Acknowledged) {
         let (through, ..) = cursor;
@@ -304,6 +391,12 @@ impl Credit {
             ));
             return;
         };
+        if !live.claimed.contains(&cursor) {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \
+                 {cursor:?}, which no claim recorded"
+            ));
+        }
         if !live.staged.contains(&through) {
             self.breaks.push(format!(
                 "CommitOnlyAuthorized: session {session} subscription {subscription} accepted \

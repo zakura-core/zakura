@@ -1149,7 +1149,8 @@ impl HeaderSyncObserver for Recorded {
 /// it and its target's height: the `Open`'s whole window, a grant through
 /// acceptance, and a grant through `grant_due`. Each acceptance reports the
 /// cursor it accepted through, before any grant it makes due. A `Close`
-/// reports the update it built.
+/// reports the update it built, and each claimed page the cursor it
+/// recorded with the page's own size.
 #[test]
 fn observed_credit_reports_each_open_grant_and_close() {
     let (tree, chain) = chain(20);
@@ -1198,6 +1199,20 @@ fn observed_credit_reports_each_open_grant_and_close() {
                 .cursor
         })
         .collect();
+    let mut before = 0;
+    for cursor in &cursors {
+        expected.push(ReactorEvent::CursorClaimed {
+            peer: peer.clone(),
+            session_id: 7,
+            subscription: id,
+            through: Frontier::new(cursor.height, cursor.hash),
+            headers: cursor.headers,
+            bytes: cursor.bytes,
+            page_headers: 1,
+            page_bytes: cursor.bytes - before,
+        });
+        before = cursor.bytes;
+    }
     let grant = fixture
         .sub
         .accept_through(id, &cursors[3], 8)

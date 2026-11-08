@@ -388,6 +388,28 @@ pub enum ReactorEvent {
         /// The update as the subscriber built it, as `CreditIssued` carries.
         update: Box<SubscribeHeaders>,
     },
+    /// The subscriber claimed a page of `subscription`'s credit, of
+    /// `page_headers` headers in `page_bytes` bytes, and recorded the
+    /// cursor it ends at. Reported from the task that received the page.
+    CursorClaimed {
+        /// The peer the subscription is with.
+        peer: ZakuraPeerId,
+        /// The session the subscription is on.
+        session_id: u64,
+        /// The subscription.
+        subscription: u64,
+        /// The page's last header.
+        through: Frontier,
+        /// The header credit the subscription's pages consumed through it,
+        /// as the recorded cursor says.
+        headers: u64,
+        /// The byte credit consumed through it, as the cursor says.
+        bytes: u64,
+        /// The page's headers.
+        page_headers: u32,
+        /// The page's payload bytes.
+        page_bytes: u64,
+    },
     /// The subscriber accepted the cursors of `subscription` through
     /// `through`, so its next update acknowledges it.
     CursorsAccepted {

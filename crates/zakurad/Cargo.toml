@@ -83,8 +83,8 @@ x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-# Sprout JoinSplit proof verification, only needed to fully verify pre-NU7 blocks
-# above the last checkpoint. On by default for now. See the `sprout` feature in
+# Sprout JoinSplit proof and signature verification, only needed to fully verify
+# pre-NU7 blocks above the last checkpoint. On by default for now. See the `sprout` feature in
 # `zakura-consensus`.
 sprout = ["zakura-consensus/sprout"]
 
@@ -150,7 +150,7 @@ zakura-checkpoints = [
 
 [dependencies]
 zakura-chain = { path = "../zakura-chain", version = "13.0.1" }
-zakura-consensus = { path = "../zakura-consensus", version = "16.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "17.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "15.0.0" }
@@ -231,7 +231,7 @@ proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
 zakura-chain = { path = "../zakura-chain", version = "13.0.1", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "16.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "17.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "15.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "15.0.0", features = ["proptest-impl"] }

@@ -150,13 +150,13 @@ pub enum TransactionError {
     #[error("Groth16 proof is malformed: {0}")]
     MalformedGroth16(String),
 
-    /// This build cannot verify Sprout JoinSplit proofs, because it was compiled without
-    /// the `sprout` feature.
+    /// This build cannot verify Sprout JoinSplit proofs or signatures, because it was compiled
+    /// without the `sprout` feature.
     ///
     /// This is a local capability limit, not a consensus verdict: the transaction may be
     /// valid. ZIP 218 disallows JoinSplits from NU7 onward, so only pre-NU7 transactions
     /// above the last checkpoint can reach it.
-    #[error("Sprout JoinSplit proof verification is not built: rebuild with the `sprout` feature")]
+    #[error("Sprout JoinSplit verification is not built: rebuild with the `sprout` feature")]
     SproutVerifierNotBuilt,
 
     #[error(

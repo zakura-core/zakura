@@ -61,10 +61,10 @@ pub use block::{
 pub use checkpoint::{VerifyCheckpointError, MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 pub use config::Config;
 pub use error::BlockError;
-pub use primitives::{ed25519, halo2, redjubjub, redpallas};
+pub use primitives::{halo2, redjubjub, redpallas};
 
 #[cfg(feature = "sprout")]
-pub use primitives::groth16;
+pub use primitives::{ed25519, groth16};
 
 // Benchmarks only: hidden from the documentation, exported so a bench target can reach it.
 #[doc(hidden)]

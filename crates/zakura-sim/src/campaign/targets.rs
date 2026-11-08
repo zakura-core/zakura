@@ -424,11 +424,14 @@ pub fn max_len(args: &[String]) -> Option<usize> {
 
 /// The retained production bypasses under `repo`'s `qa/planted/` whose
 /// committed input is one of `seeds`, by the input's path. A typed case
-/// names no fuzz input, so no target runs it.
+/// names no fuzz input, so no target runs it. A case naming neither an
+/// input nor a typed case, or both, is an error, as `cargo xtask planted`
+/// reports it.
 pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> {
     #[derive(Deserialize)]
     struct CaseFile {
         input: Option<PathBuf>,
+        typed: Option<toml::Table>,
     }
     let mut cases = Vec::new();
     let root = repo.join(PLANTED_DIR);
@@ -442,8 +445,16 @@ pub fn bypasses(repo: &Path, seeds: &[Seed]) -> Result<Vec<BypassCase>, String> 
                     .map_err(|error| format!("reading {}: {error}", case.display()))?;
                 let file: CaseFile = toml::from_str(&text)
                     .map_err(|error| format!("parsing {}: {error}", case.display()))?;
-                let Some(input) = file.input.map(|input| repo.join(input)) else {
-                    continue;
+                let input = match (file.input, file.typed) {
+                    (Some(input), None) => repo.join(input),
+                    (None, Some(_)) => continue,
+                    (input, _) => {
+                        return Err(format!(
+                            "{}: a case names either `input` or `[typed]`, and this names {}",
+                            case.display(),
+                            if input.is_some() { "both" } else { "neither" }
+                        ))
+                    }
                 };
                 if !seeds.iter().any(|seed| same_file(&seed.path, &input)) {
                     continue;

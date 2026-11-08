@@ -845,12 +845,10 @@ fn check_case(
         Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
         verdict => return Ok(verdict),
     };
-    if let (Verdict::Caught(_), Witness::Typed { .. }) = (&verdict, &case.witness) {
-        let binary = target.join(PROFILE).join("zakura-sim");
-        if let Some(why) = replay_misses(&binary, &scratch.join("patched"))? {
-            return Ok(Verdict::ReplayMisses(why));
-        }
-    }
+    let binary = target.join(PROFILE).join("zakura-sim");
+    let verdict = typed_replay(verdict, &case.witness, || {
+        replay_misses(&binary, &scratch.join("patched"))
+    })?;
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
@@ -1189,6 +1187,27 @@ fn input_args(input: &Located) -> Result<Vec<OsString>, BoxError> {
             "--plan".into(),
             plan.into(),
         ],
+    })
+}
+
+/// `verdict`, unless `witness` is a typed case caught by its patched run and
+/// `replay`, the fresh replay of that run, says why it missed: then
+/// [`Verdict::ReplayMisses`]. A fuzz input, or a case not caught, never
+/// replays here.
+fn typed_replay(
+    verdict: Verdict,
+    witness: &Witness,
+    replay: impl FnOnce() -> Result<Option<String>, BoxError>,
+) -> Result<Verdict, BoxError> {
+    if !matches!(
+        (&verdict, witness),
+        (Verdict::Caught(_), Witness::Typed { .. })
+    ) {
+        return Ok(verdict);
+    }
+    Ok(match replay()? {
+        Some(why) => Verdict::ReplayMisses(why),
+        None => verdict,
     })
 }
 
@@ -1941,6 +1960,63 @@ mod tests {
             parse_case(missing).is_err(),
             "a typed case needs its Plan bytes"
         );
+    }
+
+    /// A typed case that its patched run caught passes only if its fresh
+    /// replay matches. A miss is its own verdict, and a fuzz input or an
+    /// uncaught case never replays here.
+    #[test]
+    fn a_typed_catch_needs_its_fresh_replay() {
+        let typed = Witness::Typed {
+            harness: "header-sync/storage".to_owned(),
+            scenario: "s.json".into(),
+            plan: "p.bin".into(),
+        };
+        let caught = || Verdict::Caught(None);
+        assert_eq!(
+            typed_replay(caught(), &typed, || Ok(None)).unwrap(),
+            caught()
+        );
+        assert_eq!(
+            typed_replay(caught(), &typed, || Ok(Some(
+                "differs at step 3".to_owned()
+            )))
+            .unwrap(),
+            Verdict::ReplayMisses("differs at step 3".to_owned())
+        );
+        let unreachable =
+            || -> Result<Option<String>, BoxError> { panic!("only a typed catch replays") };
+        let input = Witness::Input("a.bin".into());
+        assert_eq!(
+            typed_replay(caught(), &input, unreachable).unwrap(),
+            caught()
+        );
+        assert_eq!(
+            typed_replay(Verdict::Unreported, &typed, unreachable).unwrap(),
+            Verdict::Unreported
+        );
+    }
+
+    /// [`replay_misses`] reads the replay's exit status: a `zakura-sim`
+    /// that exits 0 matched, and one that exits 1 says why it didn't.
+    #[cfg(unix)]
+    #[test]
+    fn a_replay_miss_reads_the_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let fake = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let matched = fake("matched", "test \"$1\" = replay || exit 2");
+        let missed = fake("missed", "echo 'pick 3 differs' >&2; exit 1");
+        assert_eq!(replay_misses(&matched, dir.path()).unwrap(), None);
+        let why = replay_misses(&missed, dir.path())
+            .unwrap()
+            .expect("a failed replay says why");
+        assert!(why.contains("pick 3 differs"), "{why}");
     }
 
     /// A typed case watches its scenario and Plan bytes, and runs with

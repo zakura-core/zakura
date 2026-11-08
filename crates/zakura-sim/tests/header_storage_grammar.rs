@@ -475,6 +475,38 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
             "Reset",
         ),
         (
+            with_controls(vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::StorageStopped("mirror-0".to_owned())),
+            )]),
+            "StorageStopped",
+        ),
+        (
+            with_controls(vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::ReservationOpened("nobody".to_owned())),
+            )]),
+            "`nobody`",
+        ),
+        (
+            with_controls(vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::SessionAdmitted("nobody".to_owned())),
+            )]),
+            "`nobody`",
+        ),
+        (
+            with_controls(vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::Committed(Select::nth(OpKind::Apply, 65))),
+            )]),
+            "a selection's nth",
+        ),
+        (
             StorageScenario {
                 policy: Policy {
                     reply_holds: vec![ReplyHold {

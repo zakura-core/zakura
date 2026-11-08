@@ -41,7 +41,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::block;
-use zakura_header_chain::{Frontier, VctRootRepairStatus};
+use zakura_header_chain::{Frontier, VctRootRepairState, VctRootRepairStatus};
 use zakura_network::zakura::{
     framed_channel,
     observe::HeaderSyncObserver,
@@ -53,7 +53,7 @@ use zakura_network::zakura::{
     ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
-use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
+use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port, PrepareHeaderTarget};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
@@ -156,9 +156,30 @@ fn ready<F: Future>(future: F) -> F::Output {
 /// controlled port pristine, and fixture headers validate the same against
 /// any clock only outside a run.
 pub fn preload(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
+    preload_requests(port, fixture, chain, |request| request);
+}
+
+/// [`preload`], with every header carrying the fixture's tree record
+/// ([`HeaderFixture::with_tree_aux`]), as a node that holds the chain's
+/// tree roots does. Its publisher serves them to a repair.
+pub fn preload_with_tree_aux(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
+    preload_requests(port, fixture, chain, |request| {
+        fixture.with_tree_aux(request)
+    });
+}
+
+/// Commits `chain` to `port`, one segment at a time, each segment's
+/// request passed through `request` first.
+fn preload_requests(
+    port: &EnginePort,
+    fixture: &HeaderFixture,
+    chain: &Chain,
+    request: impl Fn(PrepareHeaderTarget) -> PrepareHeaderTarget,
+) {
     for (request_id, (parent, headers)) in (1..).zip(chain.segments(fixture)) {
-        let request = fixture.target_request(&port.snapshot(), parent, &headers, request_id);
-        let prepared = ready(port.prepare_header_target(request)).expect("fixture headers prepare");
+        let target =
+            request(fixture.target_request(&port.snapshot(), parent, &headers, request_id));
+        let prepared = ready(port.prepare_header_target(target)).expect("fixture headers prepare");
         ready(port.apply_header_target(prepared)).expect("fixture headers apply");
     }
 }
@@ -1076,6 +1097,17 @@ pub enum ControlAction {
     /// scheduling step until the node's shutdown, so lifecycle events stay
     /// queued.
     Churn,
+    /// Publish a VCT root repair status on the node under test's repair
+    /// watch, which the step must name, as zakura-state publishes one when
+    /// it finds tree data missing. The node's storage resolves the repair
+    /// only up to its checkpoint ceiling, which is 0 unless the harness
+    /// raised it.
+    RepairStatus {
+        /// The height whose tree data is missing, or `None` for `Idle`.
+        unavailable: Option<u32>,
+        /// The status's generation.
+        generation: u64,
+    },
 }
 
 /// What a [`ControlAction::Reset`] does, judged at its pick, since only
@@ -1110,6 +1142,7 @@ impl ControlAction {
             ControlAction::Commit { .. } => "commit",
             ControlAction::Flood => "flood",
             ControlAction::Churn => "churn",
+            ControlAction::RepairStatus { .. } => "repair-status",
         }
     }
 
@@ -1123,6 +1156,7 @@ impl ControlAction {
                 | ControlAction::Release { .. }
                 | ControlAction::StopStorage
                 | ControlAction::Commit { .. }
+                | ControlAction::RepairStatus { .. }
         )
     }
 }
@@ -1232,7 +1266,8 @@ impl Control {
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
                     | ControlAction::StopStorage
-                    | ControlAction::Commit { .. } => {
+                    | ControlAction::Commit { .. }
+                    | ControlAction::RepairStatus { .. } => {
                         unreachable!("the step loop carries out run-only steps")
                     }
                 }
@@ -1315,6 +1350,21 @@ impl Control {
             }
             ControlAction::StopStorage => port()?.shut_down(),
             ControlAction::Commit { len } => self.commit(&*port()?, len)?,
+            ControlAction::RepairStatus {
+                unavailable,
+                generation,
+            } => {
+                let state = match unavailable {
+                    Some(height) => VctRootRepairState::Unavailable {
+                        height: zakura_chain::block::Height(height),
+                    },
+                    None => VctRootRepairState::Idle,
+                };
+                self.topology.nodes[0]
+                    .vct_repairs
+                    .send(VctRootRepairStatus { state, generation })
+                    .map_err(|_| "the node's reactor no longer follows its repairs".to_owned())?;
+            }
             _ => unreachable!("only run-only steps run at their pick"),
         }
         Ok(())
@@ -1393,6 +1443,7 @@ impl ActionSource for Control {
             | ControlAction::Release { .. }
             | ControlAction::StopStorage
             | ControlAction::Commit { .. }
+            | ControlAction::RepairStatus { .. }
                 if step.peer != *node =>
             {
                 Some(format!(
@@ -1419,6 +1470,7 @@ impl ActionSource for Control {
             ControlAction::Reset(_)
             | ControlAction::Release { .. }
             | ControlAction::Commit { .. }
+            | ControlAction::RepairStatus { .. }
                 if self.shut_down =>
             {
                 Some(format!(

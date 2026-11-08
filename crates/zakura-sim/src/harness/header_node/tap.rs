@@ -619,22 +619,17 @@ impl TapState {
             ReactorEvent::SessionAdmitted { peer, .. } => {
                 Some((LinkEffect::SessionAdmitted, peer.clone()))
             }
+            ReactorEvent::SessionEnded { peer, .. } => {
+                Some((LinkEffect::SessionEnded, peer.clone()))
+            }
             _ => None,
         };
         if let Some(effect) = effect {
-            // Only a live reactor reserves or admits, so neither happens in
-            // the run's own shutdown.
+            // Only a live reactor reserves, admits or handles a disconnect,
+            // so none happens in the run's own shutdown.
             if in_run {
                 state.buffer().effects.push(effect);
             } else {
-                state.refused.store(true, Ordering::Relaxed);
-            }
-            return;
-        }
-        // Only a live reactor handles a disconnect, so this doesn't happen
-        // in the run's own shutdown either.
-        if matches!(event, ReactorEvent::SessionEnded { .. }) {
-            if !in_run {
                 state.refused.store(true, Ordering::Relaxed);
             }
             return;

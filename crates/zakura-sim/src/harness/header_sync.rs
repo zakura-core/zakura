@@ -5,12 +5,15 @@
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1), checked by header sync's generated table properties
 //! and `session/honest-never-punished` (P3d). `header-sync/release-wake`
-//! runs `header-sync/storage` on the wake fixture alone.
+//! runs `header-sync/storage` on the wake fixture alone, and
+//! `header-sync/repair` on the VCT repair fixtures.
 
 pub mod grammar;
 mod release_wake;
+mod repair;
 
 pub use release_wake::{ReleaseWake, WakeScenario};
+pub use repair::{RepairHarness, RepairScenario, REPAIR_HEIGHT, STALE_PEER, SUPPLIER, TIP};
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 

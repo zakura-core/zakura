@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use zakura_chain::block;
 use zakura_network::zakura::{
     v9::{
-        Cursor, HeadersOutcome, HeadersOutcomeCode, Message, Operation, RegtestMessage, Status,
-        SubscribeHeaders,
+        Cursor, Headers, HeadersOutcome, HeadersOutcomeCode, Message, Operation, RegtestMessage,
+        Status, SubscribeHeaders,
     },
-    AuxSchema, Credit,
+    AuxSchema, Credit, HeaderEntry,
 };
 use zakura_rt::time::Instant;
 
@@ -141,13 +141,17 @@ pub enum ContentRule {
     /// A page whose first header doesn't link to its parent: a fixture
     /// header with a byte of its parent hash flipped.
     Linkage,
+    /// A one-header first page from the header below the `Open`'s first
+    /// locator, carrying that locator's own header: a page that ends at a
+    /// locator before the target.
+    LowerLocator,
     /// `SubscriptionClosed` before the node sent `Close`.
     OutcomeWindow,
 }
 
 impl ContentRule {
     /// Every rule, by row.
-    pub const ALL: [ContentRule; 10] = [
+    pub const ALL: [ContentRule; 11] = [
         ContentRule::StatusAnchor,
         ContentRule::StatusRetention,
         ContentRule::StatusHeaderCap,
@@ -157,6 +161,7 @@ impl ContentRule {
         ContentRule::OpenLocators,
         ContentRule::OpenCursor,
         ContentRule::Linkage,
+        ContentRule::LowerLocator,
         ContentRule::OutcomeWindow,
     ];
 
@@ -170,7 +175,7 @@ impl ContentRule {
             | ContentRule::StatusSchema
             | ContentRule::StatusCap => Row::Status,
             ContentRule::OpenLocators | ContentRule::OpenCursor => Row::SubscribeHeaders,
-            ContentRule::Linkage => Row::Headers,
+            ContentRule::Linkage | ContentRule::LowerLocator => Row::Headers,
             ContentRule::OutcomeWindow => Row::HeadersOutcome,
         }
     }
@@ -900,6 +905,34 @@ impl Adversary {
                     page.entries[0].header = header.into();
                 }
                 Ok(Crafted::of(message))
+            }
+            ContentRule::LowerLocator => {
+                let (id, _) = live(honest)?;
+                let first = honest.position(id).ok_or("lower-locator: nothing served")?;
+                let parent = first
+                    .checked_sub(1)
+                    .ok_or("lower-locator: the first locator is genesis")?;
+                let target = honest
+                    .serving
+                    .get(&id)
+                    .ok_or("lower-locator: nothing served")?
+                    .target;
+                let below = honest.chain.at(parent);
+                Ok(Crafted::of(RegtestMessage::Headers(Headers {
+                    subscription_id: id,
+                    initial_target_tip_hash: target,
+                    common_ancestor_height: below.height,
+                    common_ancestor_hash: below.hash,
+                    reaches_initial_target: false,
+                    tree_aux_schema: AuxSchema::None,
+                    entries: vec![HeaderEntry {
+                        header: honest.chain.headers
+                            [usize::try_from(parent).expect("u32 fits usize")]
+                        .clone(),
+                        body_size: 0,
+                        tree_aux: None,
+                    }],
+                })))
             }
             ContentRule::OutcomeWindow => {
                 let (id, _) = live(honest)?;

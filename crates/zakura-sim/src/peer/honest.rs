@@ -686,6 +686,12 @@ impl Honest {
         Some(u32::try_from(count).expect("the count is at most MAX_HS_RANGE"))
     }
 
+    /// The height subscription `id`'s next page extends: the first locator
+    /// it served from, until it sends a page.
+    pub(super) fn position(&self, id: u64) -> Option<u32> {
+        Some(self.serving.get(&id)?.position)
+    }
+
     /// The headers left to subscription `id`'s target.
     pub(super) fn left(&self, id: u64) -> Option<u32> {
         let serving = self.serving.get(&id)?;

@@ -73,6 +73,7 @@ use self::{
     tap::{ReactorTap, TapShutdown},
 };
 use crate::{
+    observe::StorageFact,
     storage::{FaultAttributions, HeaderStorage, StorageAction, HEADER_SERVICE},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
@@ -421,11 +422,21 @@ impl ActionSource for PolicySource {
         stored?;
         tapped?;
         let mut predicates = self.predicates.borrow_mut();
+        // The node under test's name, which `Topology::new` lists first.
+        let node = self
+            .effects
+            .names
+            .borrow()
+            .first()
+            .map(|(_, name)| name.clone());
         // Only this source's storage and tap append here.
         for entry in &log.entries()[before..] {
             match &entry.obs {
                 Observation::Storage { service, fact, .. } if service == HEADER_SERVICE => {
-                    predicates.record(fact)
+                    predicates.record(fact);
+                    if let (StorageFact::ShutDown { .. }, Some(node)) = (fact, &node) {
+                        predicates.record_link(LinkEffect::StorageStopped, node);
+                    }
                 }
                 Observation::Reactor { event, .. } => predicates.record_reactor(event),
                 _ => {}

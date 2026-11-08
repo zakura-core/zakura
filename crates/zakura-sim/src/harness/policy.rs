@@ -188,6 +188,10 @@ pub enum Trigger<K> {
     /// for header room, as its tap reports: once per refusal. Never holds
     /// without a tap.
     HeadroomWait(String),
+    /// This actor's storage shut down, as its port's `shut-down` fact
+    /// reports: in header sync, the node under test's, at a `StopStorage`
+    /// step.
+    StorageStopped(String),
     /// A `Release` control step named the hold whose trigger this is.
     /// Holds only in a hold's own `until`, and a release opens its hold
     /// whatever the trigger says, so `until: released` opens only through
@@ -271,8 +275,8 @@ pub(crate) enum Event {
 /// A link effect a task made, or a reactor fact about one peer, as
 /// [`Trigger::Closed`], [`Trigger::Linked`], [`Trigger::Grown`],
 /// [`Trigger::Reset`], [`Trigger::Prepared`],
-/// [`Trigger::ReservationOpened`], [`Trigger::SessionAdmitted`] and
-/// [`Trigger::HeadroomWait`] count it.
+/// [`Trigger::ReservationOpened`], [`Trigger::SessionAdmitted`],
+/// [`Trigger::HeadroomWait`] and [`Trigger::StorageStopped`] count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkEffect {
     /// A link was made.
@@ -291,6 +295,8 @@ pub enum LinkEffect {
     SessionAdmitted,
     /// The node under test's reactor kept a peer's offer waiting for room.
     HeadroomWait,
+    /// An actor's storage shut down.
+    StorageStopped,
 }
 
 /// What [`Predicates`] knows about one stage of an operation from that
@@ -552,6 +558,7 @@ impl<F: Family> Predicates<F> {
             Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
             Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
             Trigger::HeadroomWait(peer) => links(LinkEffect::HeadroomWait, peer),
+            Trigger::StorageStopped(peer) => links(LinkEffect::StorageStopped, peer),
             Trigger::Released | Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {
                 usize::from(self.holds_in(trigger, cx))
             }

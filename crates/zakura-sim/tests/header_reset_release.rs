@@ -557,15 +557,30 @@ fn a_release_of_a_missing_hold_is_refused() {
     Storage::prepare(&scenario);
 }
 
-/// Generator 2 encodes none of the new control steps or `released`.
+/// Generator 3 encodes resets, releases and `released`, and a storage stop
+/// after a shutdown, so each round-trips through its canonical prefix. A
+/// storage stop with no shutdown before it is out of the static order.
+/// `released_read`'s release waits on an `all` trigger, which no grammar
+/// has, so its round trip uses the release alone.
 #[test]
-fn the_grammar_cant_encode_resets_releases_or_stops() {
-    assert!(grammar::encode(&reset_held_prepare()).is_err());
-    assert!(grammar::encode(&released_read()).is_err());
+fn the_grammar_encodes_resets_releases_and_stops() {
+    let mut release = released_read();
+    for step in &mut release.controls {
+        step.when = None;
+    }
     let mut stop = released_read();
     stop.policy.holds.clear();
-    stop.controls = vec![node_step(ControlAction::StopStorage, None)];
-    assert!(grammar::encode(&stop).is_err());
+    stop.controls = vec![
+        node_step(ControlAction::Shutdown, None),
+        node_step(ControlAction::StopStorage, None),
+    ];
+    for scenario in [reset_held_prepare(), release, stop.clone()] {
+        let prefix = grammar::encode(&scenario).unwrap();
+        assert_eq!(grammar::decode(&prefix).unwrap(), scenario);
+    }
+    stop.controls.remove(0);
+    let refused = grammar::encode(&stop).expect_err("a stop needs a shutdown");
+    assert!(refused.to_string().contains("out of order"), "{refused}");
 }
 
 /// The failure a step after the node's shutdown gives, as `ControlFailed`

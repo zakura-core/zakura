@@ -112,6 +112,23 @@ pub struct Sidecar {
     /// The property witnesses the seed carries. None by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witness: Vec<SeedWitness>,
+    /// The seed this one was migrated from, for a seed carried to a new
+    /// generator with its meaning kept. None by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<DerivedFrom>,
+}
+
+/// The seed a migrated seed came from: its file's SHA-256 and the generator
+/// it was built for. The seed check reads only these. That the source
+/// decoded to the same scenario under its own generator is the migrating
+/// harness's to test, since only it keeps that generator's decoder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedFrom {
+    /// The source file's SHA-256, in hex.
+    pub sha256: String,
+    /// The generator the source was built for.
+    pub generator: u32,
 }
 
 /// [`Sidecar::required`]'s default.
@@ -181,6 +198,10 @@ pub enum SeedError {
     },
     /// Two witnesses name the same property.
     DuplicateWitness(String),
+    /// A migrated seed's `derived_from` can't name its source: a digest
+    /// that isn't 64 hex digits or is the seed's own, or a generator that
+    /// isn't older than the seed's.
+    Derived(String),
 }
 
 impl fmt::Display for SeedError {
@@ -240,6 +261,7 @@ impl fmt::Display for SeedError {
             SeedError::DuplicateWitness(property) => {
                 write!(f, "two witnesses name `{property}`")
             }
+            SeedError::Derived(why) => write!(f, "the seed's `derived_from` {why}"),
         }
     }
 }
@@ -515,6 +537,23 @@ fn validate(entry: &HarnessEntry, path: &Path, sidecar: &Sidecar) -> Result<Vec<
     }
     if sidecar.source.trim().is_empty() {
         return Err(SeedError::NoSource);
+    }
+    if let Some(from) = &sidecar.derived_from {
+        if from.generator >= sidecar.generator {
+            return Err(SeedError::Derived(format!(
+                "names generator {}, not one older than the seed's {}",
+                from.generator, sidecar.generator
+            )));
+        }
+        if from.sha256.len() != 64 || !from.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SeedError::Derived(format!(
+                "names `{}`, not a SHA-256 in hex",
+                from.sha256
+            )));
+        }
+        if from.sha256.eq_ignore_ascii_case(&sidecar.sha256) {
+            return Err(SeedError::Derived("names the seed itself".to_owned()));
+        }
     }
     let mut seen = Vec::new();
     for witness in &sidecar.witness {

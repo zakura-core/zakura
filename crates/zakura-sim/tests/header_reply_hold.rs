@@ -238,11 +238,10 @@ fn a_reply_hold_of_another_kind_is_refused() {
     Storage::prepare(&scenario);
 }
 
-/// Generator 2 has no reply hold, so it can't encode one.
+/// Generator 3 encodes a reply hold, so the scenario round-trips through
+/// its canonical prefix.
 #[test]
-fn the_grammar_cant_encode_a_reply_hold() {
-    assert!(grammar::encode(&scenario()).is_err());
-    let mut plain = scenario();
-    plain.policy.reply_holds.clear();
-    assert!(grammar::encode(&plain).is_ok());
+fn the_grammar_encodes_a_reply_hold() {
+    let prefix = grammar::encode(&scenario()).unwrap();
+    assert_eq!(grammar::decode(&prefix).unwrap(), scenario());
 }

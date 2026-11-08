@@ -2,7 +2,8 @@
 //! harness's length decodes to a bounded scenario, or to a defined
 //! rejection when its version byte names another generator. A scenario's
 //! canonical prefix decodes back to it, and each action and trigger has a
-//! decoder case at the byte offsets the grammar documents.
+//! decoder case at the byte offsets the grammar documents. Generator 3
+//! keeps generator 2's meanings, which `grammar::v2` still reads.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -14,12 +15,12 @@ use zakura_sim::{
     harness::{
         self,
         header_node::{
-            policy::{Allow, Hold, OpKind, Select, Trigger},
-            Base, Chain, ControlAction, ControlStep, Fork, Policy,
+            policy::{Allow, Hold, OpKind, ReplyHold, Select, Trigger},
+            Base, Chain, ControlAction, ControlStep, Fork, Policy, Reset,
         },
         header_sync::{
             grammar::{self, GENERATOR, LAYOUT, MAX_ACTIONS, MAX_HEADERS, MAX_MIRRORS},
-            Dialer, MirrorSpec, Storage, StorageScenario,
+            Dialer, MirrorSpec, Storage, StorageScenario, Weights,
         },
         scenario::{Rejection, MAX_INPUT_BYTES},
         Subsystem,
@@ -35,7 +36,28 @@ const SLOT: usize = 10;
 const CLOSE: u8 = 0x01;
 const RELINK: u8 = 0x02;
 const GROW: u8 = 0x03;
+const SHUTDOWN: u8 = 0x04;
+const RESET: u8 = 0x05;
+const RELEASE: u8 = 0x06;
+const RECOVER: u8 = 0x07;
+const STOP_STORAGE: u8 = 0x08;
 const HOLD: u8 = 0x10;
+const REPLY_HOLD: u8 = 0x11;
+
+/// Every listed opcode.
+const OPCODES: [u8; 10] = [
+    CLOSE,
+    RELINK,
+    GROW,
+    SHUTDOWN,
+    RESET,
+    RELEASE,
+    RECOVER,
+    STOP_STORAGE,
+    HOLD,
+    REPLY_HOLD,
+];
+
 
 /// The default scenario's canonical prefix with two mirrors, `mirror-1` at
 /// A3 dialed by the node, and `slots` as its actions.
@@ -124,7 +146,7 @@ fn assert_bounded_and_canonical(scenario: &StorageScenario) {
 }
 
 /// The prefix's layout is the documented one: a 24-byte header and 32
-/// ten-byte slots, under generator 2, which the registry reports.
+/// ten-byte slots, under generator 3, which the registry reports.
 #[test]
 fn the_layout_is_the_documented_one() {
     assert_eq!(
@@ -132,9 +154,9 @@ fn the_layout_is_the_documented_one() {
         (HEADER, SLOT, 32)
     );
     assert_eq!(Storage::SCENARIO_BYTES, 344);
-    assert_eq!(GENERATOR, 2);
+    assert_eq!(GENERATOR, 3);
     let entry = harness::find(Storage::NAME).unwrap();
-    assert_eq!((entry.generator, entry.scenario_bytes), (2, 344));
+    assert_eq!((entry.generator, entry.scenario_bytes), (3, 344));
 }
 
 // The prefix leaves room for Plan bytes under the input cap.
@@ -146,9 +168,9 @@ const _: () = assert!(Storage::SCENARIO_BYTES < MAX_INPUT_BYTES);
 fn the_default_scenario_round_trips() {
     let canonical = grammar::encode(&StorageScenario::default()).unwrap();
     let mut expected = vec![0; 344];
-    // Version 2, no actions, success-only within 5 s, the node at genesis,
-    // and one mirror at A5 that dials.
-    expected[..9].copy_from_slice(&[2, 0, 0, 50, 0, 0, 0, 0, 5]);
+    // Version 3, no actions, success-only within 5 s with no weights, the
+    // node at genesis, and one mirror at A5 that dials.
+    expected[..9].copy_from_slice(&[3, 0, 0, 50, 0, 0, 0, 0, 5]);
     assert_eq!(canonical, expected);
     assert_eq!(Storage::draw(&canonical), StorageScenario::default());
     assert_bounded_and_canonical(&StorageScenario::default());
@@ -274,6 +296,10 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
         then,
         deadline_ms,
     };
+    let with_controls = |controls| StorageScenario {
+        controls,
+        ..StorageScenario::default()
+    };
     let unencodable = [
         (
             with_holds(vec![hold(
@@ -378,6 +404,99 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
                 ..StorageScenario::default()
             },
             "a growth",
+        ),
+        (
+            with_controls(vec![step("node", ControlAction::Commit { len: 1 }, None)]),
+            "Commit",
+        ),
+        (
+            with_controls(vec![step("mirror-0", ControlAction::Churn, None)]),
+            "Churn",
+        ),
+        (
+            with_controls(vec![step("mirror-0", ControlAction::Shutdown, None)]),
+            "names the node",
+        ),
+        (
+            with_controls(vec![step("node", ControlAction::Recover, None)]),
+            "`node`",
+        ),
+        (
+            with_controls(vec![step(
+                "node",
+                ControlAction::Reset(Reset::Invalidate { depth: 17 }),
+                None,
+            )]),
+            "a reset's depth",
+        ),
+        (
+            with_controls(vec![step("node", ControlAction::Release { hold: 0 }, None)]),
+            "hold 0 of 0",
+        ),
+        (
+            with_controls(vec![
+                step("mirror-0", ControlAction::Recover, None),
+                step("mirror-0", ControlAction::Close, None),
+            ]),
+            "out of order",
+        ),
+        (
+            with_controls(vec![step("node", ControlAction::StopStorage, None)]),
+            "out of order",
+        ),
+        (
+            with_controls(vec![
+                step("node", ControlAction::Shutdown, None),
+                step("mirror-0", ControlAction::Relink, None),
+            ]),
+            "out of order",
+        ),
+        (
+            with_controls(vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::Released),
+            )]),
+            "Released",
+        ),
+        (
+            with_holds(vec![hold(
+                Trigger::Count(2, Box::new(Trigger::Released)),
+                vec![],
+                None,
+            )]),
+            "Count",
+        ),
+        (
+            with_controls(vec![step(
+                "mirror-0",
+                ControlAction::Close,
+                Some(Trigger::Reset("mirror-0".to_owned())),
+            )]),
+            "Reset",
+        ),
+        (
+            StorageScenario {
+                policy: Policy {
+                    reply_holds: vec![ReplyHold {
+                        select: Select::default(),
+                        until: Trigger::VirtualTime(0),
+                    }],
+                    ..Policy::converging()
+                },
+                ..StorageScenario::default()
+            },
+            "a reply hold selects None",
+        ),
+        (
+            StorageScenario {
+                weights: Weights {
+                    branch_1: 4,
+                    branch_2: 0,
+                },
+                ..StorageScenario::default()
+            },
+            "a weight is 4",
         ),
     ];
     for (scenario, reason) in unencodable {
@@ -578,7 +697,7 @@ fn unlisted_opcodes_and_trigger_kinds_are_inert() {
             step("mirror-0", ControlAction::Relink, None),
         ],
     );
-    for opcode in (0..=u8::MAX).filter(|op| ![CLOSE, RELINK, GROW, HOLD].contains(op)) {
+    for opcode in (0..=u8::MAX).filter(|op| !OPCODES.contains(op)) {
         let inert = slot(opcode, [1; 4], [1; 5]);
         assert_eq!(
             decode(&prefix(&[close, inert, relink])),
@@ -586,7 +705,7 @@ fn unlisted_opcodes_and_trigger_kinds_are_inert() {
             "{opcode}"
         );
     }
-    for kind in 10..=u8::MAX {
+    for kind in 16..=u8::MAX {
         for opcode in [CLOSE, HOLD] {
             let inert = slot(opcode, [0; 4], [kind, 0, 0, 0, 0]);
             assert_eq!(
@@ -617,6 +736,14 @@ fn header_fields_reduce_into_their_ranges() {
     bytes[16..24].copy_from_slice(&[16, 1, 0, 2, 0, 0, 16, 0]);
     let scenario = decode(&bytes);
     assert_eq!(scenario.policy.base, Base::Any);
+    // Bits 1–2 and 3–4 give each fork branch weight 3. Bits 5–7 are ignored.
+    assert_eq!(
+        scenario.weights,
+        Weights {
+            branch_1: 3,
+            branch_2: 3
+        }
+    );
     assert_eq!(scenario.policy.bound_ms, Some(25_500));
     assert_eq!(
         scenario.node,
@@ -654,7 +781,7 @@ fn header_fields_reduce_into_their_ranges() {
 #[test]
 fn generator_changes_isolate_corpora() {
     let canonical = prefix(&[slot(CLOSE, [0; 4], [0; 5])]);
-    assert_eq!(canonical[0], 2);
+    assert_eq!(canonical[0], 3);
     for version in (0..=u8::MAX).filter(|version| u32::from(*version) != GENERATOR) {
         let mut other = canonical.clone();
         other[0] = version;
@@ -666,7 +793,7 @@ fn generator_changes_isolate_corpora() {
     }
     for len in [0, 1, 343, 345] {
         assert_eq!(
-            grammar::decode(&vec![2; len]),
+            grammar::decode(&vec![3; len]),
             Err(Rejection::Length { found: len })
         );
     }
@@ -730,10 +857,17 @@ fn empty_and_truncated_inputs_draw_defined_scenarios() {
 /// one, or none, so most slots hold actions.
 fn accepted(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes.resize(Storage::SCENARIO_BYTES, 0);
-    bytes[0] = 2;
+    bytes[0] = 3;
     for slot in bytes[HEADER..].as_chunks_mut::<SLOT>().0 {
-        slot[0] = [CLOSE, RELINK, GROW, HOLD, HOLD, 0xff][usize::from(slot[0]) % 6];
-        slot[5] %= 11;
+        let opcodes = [CLOSE, RELINK, GROW, HOLD, HOLD, 0xff];
+        let new = [SHUTDOWN, RESET, RELEASE, RECOVER, STOP_STORAGE, REPLY_HOLD];
+        // Generator 2's opcodes as often as before, the new ones in a
+        // third of the slots.
+        slot[0] = match slot[9] % 3 {
+            0 => new[usize::from(slot[0]) % new.len()],
+            _ => opcodes[usize::from(slot[0]) % opcodes.len()],
+        };
+        slot[5] %= 17;
     }
     bytes
 }
@@ -753,7 +887,7 @@ proptest! {
     ) {
         match mode {
             0 => {}
-            1 => bytes[0] = 2,
+            1 => bytes[0] = 3,
             _ => bytes = accepted(bytes),
         }
         match grammar::decode(&bytes) {
@@ -801,4 +935,253 @@ fn generated_inputs_run_to_a_defined_end() {
             .count();
     }
     assert!(picked > 0, "no run took a control step");
+}
+
+/// One hold that opens at once and offers nothing, which a release can name.
+fn parked() -> Hold {
+    Hold {
+        select: Select::default(),
+        until: Trigger::VirtualTime(0),
+        then: vec![],
+        deadline_ms: None,
+    }
+}
+
+/// Generator 3's opcodes decode to their actions at the documented operand
+/// offsets: node steps name the node whatever their mirror byte, a reset's
+/// bit 0 picks invalidate or reconsider, a release names a hold mod the
+/// hold count, and a reply hold's selection is of applies whatever its kind
+/// byte.
+#[test]
+fn each_generator_3_opcode_has_a_decoder_case() {
+    let none = [0; 5];
+    let hold = slot(HOLD, [0; 4], none);
+    let cases = [
+        (
+            vec![slot(SHUTDOWN, [1, 0, 0, 0], none)],
+            expected(vec![], vec![step("node", ControlAction::Shutdown, None)]),
+        ),
+        (
+            vec![slot(RESET, [0, 20, 0, 0], none)],
+            expected(
+                vec![],
+                vec![step(
+                    "node",
+                    ControlAction::Reset(Reset::Invalidate { depth: 3 }),
+                    None,
+                )],
+            ),
+        ),
+        (
+            vec![slot(RESET, [3, 20, 0, 0], none)],
+            expected(
+                vec![],
+                vec![step("node", ControlAction::Reset(Reset::Reconsider), None)],
+            ),
+        ),
+        (
+            // Two holds, so release 5 names hold 1.
+            vec![hold, hold, slot(RELEASE, [5, 0, 0, 0], none)],
+            expected(
+                vec![parked(), parked()],
+                vec![step("node", ControlAction::Release { hold: 1 }, None)],
+            ),
+        ),
+        (
+            vec![slot(RECOVER, [3, 0, 0, 0], none)],
+            expected(vec![], vec![step("mirror-1", ControlAction::Recover, None)]),
+        ),
+        (
+            vec![
+                slot(SHUTDOWN, [0; 4], none),
+                slot(STOP_STORAGE, [1, 0, 0, 0], none),
+            ],
+            expected(
+                vec![],
+                vec![
+                    step("node", ControlAction::Shutdown, None),
+                    step("node", ControlAction::StopStorage, None),
+                ],
+            ),
+        ),
+        (
+            // The kind byte, Read here, is ignored, and so is the held bit.
+            vec![slot(REPLY_HOLD, [0x84, 2, 0, 0], none)],
+            StorageScenario {
+                policy: Policy {
+                    reply_holds: vec![ReplyHold {
+                        select: Select::nth(OpKind::Apply, 2),
+                        until: Trigger::VirtualTime(0),
+                    }],
+                    ..Policy::converging()
+                },
+                ..expected(vec![], vec![])
+            },
+        ),
+    ];
+    for (slots, scenario) in cases {
+        assert_eq!(decode(&prefix(&slots)), scenario, "{slots:?}");
+        assert_bounded_and_canonical(&scenario);
+    }
+}
+
+/// Generator 3's trigger kinds decode on a hold and, except `released`,
+/// on a control step. `released` on a control step drops its slot, and its
+/// count byte is ignored.
+#[test]
+fn each_generator_3_trigger_kind_has_a_decoder_case() {
+    let mirror_1 = || "mirror-1".to_owned();
+    let node = || "node".to_owned();
+    let cases = [
+        (
+            [10, 0, 1, 0, 0],
+            Some(Trigger::ReservationOpened(mirror_1())),
+        ),
+        (
+            [11, 2, 3, 0, 0],
+            Some(Trigger::Count(
+                2,
+                Box::new(Trigger::SessionAdmitted(mirror_1())),
+            )),
+        ),
+        ([12, 0, 9, 9, 9], Some(Trigger::Reset(node()))),
+        ([13, 5, 9, 9, 9], None),
+        (
+            [14, 0, 7, 1, 0],
+            Some(Trigger::Committed(Select::nth(OpKind::Apply, 1))),
+        ),
+        ([15, 0, 9, 9, 9], Some(Trigger::StorageStopped(node()))),
+    ];
+    for (trigger, decoded) in cases {
+        let control = slot(CLOSE, [0; 4], trigger);
+        let controls = decoded
+            .clone()
+            .map(|when| vec![step("mirror-0", ControlAction::Close, Some(when))])
+            .unwrap_or_default();
+        assert_eq!(
+            decode(&prefix(&[control])),
+            expected(vec![], controls),
+            "{trigger:?}"
+        );
+        let until = decoded.unwrap_or(Trigger::Released);
+        let scenario = expected(
+            vec![Hold {
+                until: until.clone(),
+                ..parked()
+            }],
+            vec![],
+        );
+        assert_eq!(
+            decode(&prefix(&[slot(HOLD, [0; 4], trigger)])),
+            scenario,
+            "{trigger:?}"
+        );
+        assert_bounded_and_canonical(&scenario);
+        if until != Trigger::Released {
+            let reply = slot(REPLY_HOLD, [0; 4], trigger);
+            assert_eq!(decode(&prefix(&[reply])).policy.reply_holds[0].until, until);
+        }
+    }
+    // `released` isn't a reply hold's trigger either.
+    assert!(
+        decode(&prefix(&[slot(REPLY_HOLD, [0; 4], [13, 0, 0, 0, 0])]))
+            .policy
+            .reply_holds
+            .is_empty()
+    );
+}
+
+/// Decoding drops a control slot whose place makes it invalid whatever the
+/// run does: any step after a shutdown but one storage stop, a storage stop
+/// without a shutdown, any step after a recover, and a release with no
+/// hold to name. The slots around a dropped one keep their order.
+#[test]
+fn decoding_keeps_the_static_order() {
+    let none = [0; 5];
+    let close = slot(CLOSE, [0; 4], none);
+    let shutdown = slot(SHUTDOWN, [0; 4], none);
+    let stop = slot(STOP_STORAGE, [0; 4], none);
+    let recover = slot(RECOVER, [0; 4], none);
+    let release = slot(RELEASE, [0; 4], none);
+    let actions = |slots: &[[u8; SLOT]]| -> Vec<ControlAction> {
+        decode(&prefix(slots))
+            .controls
+            .iter()
+            .map(|step| step.action)
+            .collect()
+    };
+    use ControlAction::{Close, Recover, Shutdown, StopStorage};
+    assert_eq!(actions(&[stop, close]), [Close]);
+    assert_eq!(
+        actions(&[shutdown, close, shutdown, stop, stop, close]),
+        [Shutdown, StopStorage]
+    );
+    assert_eq!(
+        actions(&[close, recover, close, shutdown, recover]),
+        [Close, Recover]
+    );
+    assert_eq!(actions(&[shutdown, recover, stop]), [Shutdown, StopStorage]);
+    assert_eq!(actions(&[release, close]), [Close]);
+    for slots in [
+        &[shutdown, close, shutdown, stop, stop, close][..],
+        &[close, recover, close],
+        &[release, close],
+    ] {
+        assert_bounded_and_canonical(&decode(&prefix(slots)));
+    }
+}
+
+/// Generator 2's decoder reads generator 2's meanings: the weight bits, the
+/// new opcodes and the new trigger kinds are inert under it, while
+/// generator 3 reads them.
+#[test]
+fn generator_2_reads_only_its_own_meanings() {
+    let close = slot(CLOSE, [0; 4], [0; 5]);
+    let mut bytes = prefix(&[
+        close,
+        slot(CLOSE, [0; 4], [10, 0, 0, 0, 0]),
+        slot(REPLY_HOLD, [0; 4], [0; 5]),
+        slot(SHUTDOWN, [0; 4], [0; 5]),
+    ]);
+    bytes[2] = 0b1_1110;
+    let three = decode(&bytes);
+    assert_eq!(
+        three.weights,
+        Weights {
+            branch_1: 3,
+            branch_2: 3
+        }
+    );
+    assert_eq!(three.controls.len(), 3);
+    assert_eq!(three.policy.reply_holds.len(), 1);
+    bytes[0] = 2;
+    let two = grammar::v2::decode(&bytes).unwrap();
+    assert_eq!(
+        two,
+        expected(vec![], vec![step("mirror-0", ControlAction::Close, None)])
+    );
+    assert!(grammar::v2::decode(&bytes).is_ok());
+    bytes[0] = 3;
+    assert_eq!(
+        grammar::v2::decode(&bytes),
+        Err(Rejection::Version { found: 3 })
+    );
+}
+
+/// A generator-2 input migrates to the same scenario under generator 3,
+/// with its Plan bytes kept, and only a generator-2 input migrates.
+#[test]
+fn migration_keeps_a_scenario_and_its_plan() {
+    let mut v2 = prefix(&[slot(GROW, [1, 2, 0, 0], [6, 0, 1, 0, 0])]);
+    v2[0] = 2;
+    let plan = [7u8, 1, 2, 3];
+    let input = [v2.as_slice(), &plan].concat();
+    let migrated = grammar::migrate(&input).unwrap();
+    assert_eq!(&migrated[Storage::SCENARIO_BYTES..], &plan);
+    assert_eq!(
+        decode(&migrated[..Storage::SCENARIO_BYTES]),
+        grammar::v2::decode(&v2).unwrap()
+    );
+    assert!(grammar::migrate(&migrated).is_err());
+    assert!(grammar::migrate(&input[..343]).is_err());
 }

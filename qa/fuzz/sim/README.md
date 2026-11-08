@@ -35,7 +35,7 @@ whose target has no harness or no campaign.
 - `header_sync_storage` runs `header-sync/storage`. Its 344-byte prefix
   encodes the scenario in the action grammar of
   `zakura_sim::harness::header_sync::grammar`. A prefix whose first byte
-  isn't the harness's generator, 2, runs the default scenario. Pass
+  isn't the harness's generator, 3, runs the default scenario. Pass
   `-max_len=4096`, the input size the grammar is built for, and
   `-len_control=0`. A run takes tens to hundreds of milliseconds, so
   libFuzzer's default length control keeps mutations inside the prefix for
@@ -384,6 +384,13 @@ version, the file's SHA-256, the SHA-256 of the scenario the seed decodes to,
 the test or plan the seed comes from, and the property witnesses it carries.
 A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
 scenario prefix, such as a saved Plan's tag, that encodes its scenario.
+A seed carried to a new generator with its meaning kept names its source in
+a `[derived_from]` table: the source file's SHA-256 and the generator it was
+built for. The seed check checks that the table names an older generator
+and another file. The migrating harness's own test checks that the source
+decodes, under its generator, to the scenario the seed decodes to. The
+`header-sync/storage` seeds were migrated from generator 2 this way, by
+`grammar::migrate`.
 
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one

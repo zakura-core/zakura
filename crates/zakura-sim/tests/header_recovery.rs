@@ -772,9 +772,12 @@ fn recovery_replays_exact_in_a_fresh_process() {
     }
 }
 
-/// Generator 2 has no recover, so it can't encode one.
+/// Generator 3 encodes a recover, so every witness round-trips through its
+/// canonical prefix, and the fuzzer can reach each one.
 #[test]
-fn the_grammar_cant_encode_a_recover() {
-    assert!(grammar::encode(&scenario(vec![recover(None)])).is_err());
-    assert!(grammar::encode(&scenario(vec![step(SOURCE, ControlAction::Close, None)])).is_ok());
+fn the_grammar_encodes_every_recovery_witness() {
+    for (class, scenario) in witnesses() {
+        let prefix = grammar::encode(&scenario).unwrap_or_else(|error| panic!("{class}: {error}"));
+        assert_eq!(grammar::decode(&prefix).unwrap(), scenario, "{class}");
+    }
 }

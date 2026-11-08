@@ -1199,7 +1199,9 @@ where
 /// the body to match the header's commitments, the same checks a sender makes before it relays
 /// early. A header or commitment failure keeps a score. Missing parent context is not scored,
 /// because an honest peer can relay a child of a tip this node has not committed yet. A
-/// deterministic failure of an authenticated block enters `relay`'s rejection set.
+/// deterministic failure of an authenticated block enters `relay`'s rejection set, even when it
+/// already has no score, such as a duplicate spend, so later deliveries of the hash skip
+/// verification. An unscored failure keeps its error.
 async fn early_relay_failure<S>(
     state_service: S,
     network: &Network,
@@ -1211,7 +1213,12 @@ async fn early_relay_failure<S>(
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
 {
-    if error.misbehavior_score() == 0 || error.is_auth_commitment_mismatch() {
+    if error.is_auth_commitment_mismatch() {
+        return error;
+    }
+    let scored = error.misbehavior_score() != 0;
+    let rejectable = relay.is_some() && is_deterministic_failure(&error);
+    if !scored && !rejectable {
         return error;
     }
     // Before NU5, the header commits to the final Sapling root, which needs tree updates to
@@ -1235,11 +1242,17 @@ where
             zs::PreparedMinedRelayEligibility::Authorized
             | zs::PreparedMinedRelayEligibility::CommitFirst,
         ) => {
-            if let Some(relay) = relay.filter(|_| is_deterministic_failure(&error)) {
+            if let Some(relay) = relay.filter(|_| rejectable) {
                 relay.reject(hash);
             }
-            VerifyBlockError::EarlyRelay(Box::new(error))
+            if scored {
+                VerifyBlockError::EarlyRelay(Box::new(error))
+            } else {
+                error
+            }
         }
+        // Authentication only decides whether a scored failure keeps its score.
+        _ if !scored => error,
         Ok(zs::PreparedMinedRelayEligibility::Unavailable) => {
             VerifyBlockError::EarlyRelayUnavailable(Box::new(error))
         }

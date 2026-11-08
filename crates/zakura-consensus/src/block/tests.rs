@@ -4375,6 +4375,91 @@ async fn authenticated_early_relay_failure_is_unscored_and_rejected() {
     }
 }
 
+/// A deterministic failure that already has no score, such as a duplicate spend, still rejects
+/// an authenticated hash, so redeliveries skip verification. The error itself is unchanged.
+#[tokio::test(start_paused = true)]
+async fn authenticated_unscored_deterministic_failure_is_rejected() {
+    use zs::PreparedMinedRelayEligibility::{Authorized, CommitFirst, Unavailable};
+
+    let duplicate_spend = || {
+        VerifyBlockError::Transaction(TransactionError::DuplicateTransparentSpend(
+            transparent::OutPoint {
+                hash: zakura_chain::transaction::Hash([9; 32]),
+                index: 0,
+            },
+        ))
+    };
+    assert_eq!(duplicate_spend().misbehavior_score(), 0);
+    assert!(is_deterministic_failure(&duplicate_spend()));
+
+    let block_bytes = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES.as_slice();
+    let hash = Arc::<Block>::zcash_deserialize(block_bytes)
+        .expect("test vector decodes")
+        .hash();
+    for (eligibility, rejected) in [
+        (Authorized, true),
+        (CommitFirst, true),
+        (Unavailable, false),
+    ] {
+        let relay = EarlyRelay::default();
+        let error =
+            classify_early_relay_failure(block_bytes, &relay, Ok(eligibility), duplicate_spend())
+                .await;
+        assert!(
+            matches!(
+                error,
+                VerifyBlockError::Transaction(TransactionError::DuplicateTransparentSpend(_))
+            ),
+            "{eligibility:?}: {error:?}"
+        );
+        assert_eq!(error.misbehavior_score(), 0);
+        assert_eq!(relay.is_rejected(hash), rejected, "{eligibility:?}");
+    }
+
+    // An authentication failure doesn't give an unscored failure a score.
+    let relay = EarlyRelay::default();
+    let error = classify_early_relay_failure(
+        block_bytes,
+        &relay,
+        Err(zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryRoot {
+                actual: [0; 32],
+                expected: [1; 32],
+            },
+        )),
+        duplicate_spend(),
+    )
+    .await;
+    assert_eq!(error.misbehavior_score(), 0);
+    assert!(!relay.is_rejected(hash));
+}
+
+/// An unscored failure that isn't deterministic needs no state check. The state mock panics if
+/// the check runs.
+#[tokio::test(start_paused = true)]
+async fn unscored_retryable_early_relay_failure_skips_the_state_check() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .expect("test vector decodes");
+    let state = service_fn(|request: zs::Request| async move {
+        panic!("retryable unscored failures need no state check: {request:?}");
+        #[allow(unreachable_code)]
+        Ok::<zs::Response, BoxError>(zs::Response::Committed(block::Hash([0; 32])))
+    });
+    let error = early_relay_failure(
+        state,
+        &Network::Mainnet,
+        block.into(),
+        None,
+        Some(&EarlyRelay::default()),
+        VerifyBlockError::ParentUnavailable {
+            parent: block::Hash([3; 32]),
+        },
+    )
+    .await;
+    assert!(matches!(error, VerifyBlockError::ParentUnavailable { .. }));
+}
+
 /// Without a committed parent, the failure is unscored but its hash is not rejected, because
 /// the block could not be authenticated.
 #[tokio::test(start_paused = true)]

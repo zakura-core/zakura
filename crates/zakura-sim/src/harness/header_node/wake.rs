@@ -23,7 +23,7 @@
 //! ([`WakeFact::Deferred`]) moves its deadline to the pass's refill, but
 //! never past one refill interval after the wake opened.
 //!
-//! Each fact gets a stamp, larger than every earlier one, which the
+//! Each fact takes the node's next stamp ([`super::stamp`]), which the
 //! storage view hands the registry as its view-side facts.
 
 use std::{
@@ -39,6 +39,7 @@ use zakura_network::zakura::{
 };
 use zakura_scheduler::SimInstant;
 
+use super::stamp::Stamps;
 use crate::observe::{StorageFact, StorageRequest};
 
 /// The wake fixture a harness declares. It fixes one waiting mirror whose
@@ -88,6 +89,8 @@ pub enum WakeFact {
 struct Store {
     /// The fixture the scenario declared, if any.
     fixture: Option<WakeFixture>,
+    /// Where its stamps come from: the node's, once its tap watches it.
+    stamps: Stamps,
     /// Each fact with its stamp, in stamp order.
     facts: Vec<(u64, WakeFact)>,
 }
@@ -102,8 +105,14 @@ impl WakeEvidence {
     pub fn new(fixture: Option<WakeFixture>) -> WakeEvidence {
         WakeEvidence(Arc::new(Mutex::new(Store {
             fixture,
+            stamps: Stamps::default(),
             facts: Vec::new(),
         })))
+    }
+
+    /// Stamps facts from `stamps`, the node's, from now on.
+    pub(super) fn stamp_with(&self, stamps: Stamps) {
+        self.with(|store| store.stamps = stamps);
     }
 
     /// Runs `read` on the store. Nothing else is called while the lock is
@@ -120,21 +129,9 @@ impl WakeEvidence {
     /// Keeps `fact` with the next stamp.
     fn push(&self, fact: WakeFact) {
         self.with(|store| {
-            let stamp = store.facts.last().map_or(1, |(stamp, _)| stamp + 1);
+            let stamp = store.stamps.next();
             store.facts.push((stamp, fact));
         });
-    }
-
-    /// The stamps after `after`, or all of them, in order.
-    pub fn stamps_after(&self, after: Option<u64>) -> Vec<u64> {
-        self.with(|store| {
-            store
-                .facts
-                .iter()
-                .map(|(stamp, _)| *stamp)
-                .filter(|stamp| after.is_none_or(|after| *stamp > after))
-                .collect()
-        })
     }
 
     /// The fact with `stamp`, if any.
@@ -142,9 +139,9 @@ impl WakeEvidence {
         self.with(|store| {
             store
                 .facts
-                .iter()
-                .find(|(at, _)| *at == stamp)
-                .map(|(_, fact)| fact.clone())
+                .binary_search_by_key(&stamp, |(at, _)| *at)
+                .ok()
+                .map(|index| store.facts[index].1.clone())
         })
     }
 

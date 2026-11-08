@@ -34,12 +34,14 @@ use super::{
         adoption::{Acceptance, AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
+        ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
         reservation::ReservationEvidence,
         session::SessionEvidence,
         stale::StaleEvidence,
+        stamp::Stamps,
         tap::ReactorTap,
         wake::WakeEvidence,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
@@ -555,6 +557,10 @@ pub struct Ports {
     /// unless whoever prepared the ports declared a wake fixture
     /// ([`WakeEvidence::new`]).
     pub wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit, which
+    /// the harness and the node's tap record during the run. It holds the
+    /// node's stamps.
+    pub ends: EndEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -574,6 +580,11 @@ pub struct Storage {
     stale_calls: StaleEvidence,
     /// The node's wake facts, from its tap.
     wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit, from
+    /// its tap.
+    ends: EndEvidence,
+    /// The node's stamps, from its tap.
+    stamps: Stamps,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -612,6 +623,10 @@ pub struct StorageView {
     pub stale_calls: StaleEvidence,
     /// The node's wake facts, which its tap finds during the run.
     pub wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit.
+    pub ends: EndEvidence,
+    /// The node's stamps, which every view-side fact above takes.
+    pub stamps: Stamps,
 }
 
 impl BudgetView for StorageView {
@@ -682,6 +697,8 @@ impl HasView for Storage {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            ends: self.ends.clone(),
+            stamps: self.stamps.clone(),
         }
     }
 
@@ -700,9 +717,10 @@ impl HasView for Storage {
         found
     }
 
-    /// The node's wake facts' stamps ([`WakeEvidence::stamps_after`]).
+    /// The node's stamps after `after` ([`Stamps::after`]), from every
+    /// view-side store its tap and harness keep.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
-        Some(self.wake.stamps_after(after))
+        Some(self.stamps.after(after))
     }
 }
 
@@ -794,6 +812,7 @@ impl Subsystem for Storage {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            ends: EndEvidence::default(),
         }
     }
 
@@ -820,10 +839,13 @@ impl Subsystem for Storage {
             ports.capacity.clone(),
             ports.rounds.clone(),
             ports.stale_calls.clone(),
+            ports.ends.clone(),
         );
         tap.watch_wakes(ports.wake.clone());
         let adoption = tap.adoption();
         let claims = tap.claims();
+        let ends = tap.ends();
+        let stamps = tap.stamps();
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -894,6 +916,8 @@ impl Subsystem for Storage {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            ends,
+            stamps,
             faults,
             topology,
         }
@@ -1003,6 +1027,9 @@ pub struct WirePorts {
     pub stale_calls: StaleEvidence,
     /// The node's wake facts, which its tap finds during the run.
     pub wake: WakeEvidence,
+    /// The node's end facts, which its tap records during the run. It holds
+    /// the node's stamps.
+    pub ends: EndEvidence,
 }
 
 impl WirePorts {
@@ -1041,6 +1068,11 @@ pub struct HeaderWire {
     stale_calls: StaleEvidence,
     /// The node's wake facts, from its tap.
     wake: WakeEvidence,
+    /// The harness's environment actions and the reactor's own exit, from
+    /// its tap.
+    ends: EndEvidence,
+    /// The node's stamps, from its tap.
+    stamps: Stamps,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -1070,6 +1102,8 @@ impl HasView for HeaderWire {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            ends: self.ends.clone(),
+            stamps: self.stamps.clone(),
         }
     }
 
@@ -1090,12 +1124,11 @@ impl HasView for HeaderWire {
         found
     }
 
-    /// The node's adoption facts after `after`
-    /// ([`AdoptionEvidence::stamps_after`]), which answer
-    /// `header-sync/honest-progress`'s obligation. They're the only facts
-    /// the wire harness stamps.
+    /// The node's stamps after `after` ([`Stamps::after`]), from every
+    /// view-side store its tap keeps. Its adoption facts answer
+    /// `header-sync/honest-progress`'s obligation.
     fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
-        Some(self.adoption.stamps_after(after))
+        Some(self.stamps.after(after))
     }
 }
 
@@ -1175,6 +1208,7 @@ impl Subsystem for HeaderWire {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            ends: EndEvidence::default(),
         }
     }
 
@@ -1212,9 +1246,12 @@ impl Subsystem for HeaderWire {
             ports.capacity.clone(),
             ports.rounds.clone(),
             ports.stale_calls.clone(),
+            ports.ends.clone(),
         );
         let adoption = tap.adoption();
         let claims = tap.claims();
+        let ends = tap.ends();
+        let stamps = tap.stamps();
 
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -1294,6 +1331,8 @@ impl Subsystem for HeaderWire {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            ends,
+            stamps,
             faults,
             sessions: ports.sessions,
             _keep: Box::new(node),

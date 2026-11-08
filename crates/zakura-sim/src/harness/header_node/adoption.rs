@@ -26,6 +26,7 @@ use zakura_network::zakura::{
     Status, ZakuraPeerId,
 };
 
+use super::stamp::Stamps;
 use crate::{IdleStatus, Outcome, RunEnd};
 
 /// How long after an adoption that changes a session's status the reactor
@@ -270,6 +271,8 @@ pub fn settled(end: &RunEnd) -> bool {
 /// reactor reported it at.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stamped {
+    /// Its stamp, from the node's ([`super::stamp`]).
+    pub stamp: u64,
     /// When.
     pub at: Duration,
     /// What.
@@ -290,6 +293,9 @@ pub enum Acceptance {
 /// What the observer and the view share.
 #[derive(Debug, Default)]
 struct Store {
+    /// Where its stamps come from.
+    stamps: Stamps,
+    /// Each fact, in stamp order.
     facts: Vec<Stamped>,
     /// The time of the tap's last drain.
     horizon: Duration,
@@ -311,11 +317,21 @@ impl AdoptionEvidence {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records `fact`, reported at `at`, unless the evidence is frozen.
+    /// Evidence that stamps its facts from `stamps`.
+    pub(super) fn stamped_by(stamps: Stamps) -> AdoptionEvidence {
+        AdoptionEvidence(Arc::new(Mutex::new(Store {
+            stamps,
+            ..Store::default()
+        })))
+    }
+
+    /// Records `fact`, reported at `at`, with the next stamp, unless the
+    /// evidence is frozen.
     pub(super) fn record(&self, at: Duration, fact: AdoptionFact) {
         let mut store = self.store();
         if !store.frozen {
-            store.facts.push(Stamped { at, fact });
+            let stamp = store.stamps.next();
+            store.facts.push(Stamped { stamp, at, fact });
         }
     }
 
@@ -359,22 +375,14 @@ impl AdoptionEvidence {
         self.store().facts.clone()
     }
 
-    /// The stamps of the facts after stamp `after`, or of every fact with
-    /// `None`, in increasing order. A fact's stamp is its position in
-    /// [`AdoptionEvidence::facts`] from 1, so it orders the facts as the
-    /// reactor reported them.
-    pub fn stamps_after(&self, after: Option<u64>) -> Vec<u64> {
-        let recorded = u64::try_from(self.store().facts.len()).expect("a run keeps few facts");
-        (after.map_or(1, |after| after.saturating_add(1))..=recorded).collect()
-    }
-
-    /// The fact with stamp `stamp` ([`AdoptionEvidence::stamps_after`]).
+    /// The fact with stamp `stamp`, if this store holds it.
     pub fn fact_at(&self, stamp: u64) -> Option<AdoptionFact> {
-        let index = usize::try_from(stamp.checked_sub(1)?).ok()?;
-        self.store()
+        let store = self.store();
+        store
             .facts
-            .get(index)
-            .map(|stamped| stamped.fact.clone())
+            .binary_search_by_key(&stamp, |stamped| stamped.stamp)
+            .ok()
+            .map(|index| store.facts[index].fact.clone())
     }
 
     /// The latest time the run is known to have reached.

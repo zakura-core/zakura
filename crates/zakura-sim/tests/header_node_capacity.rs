@@ -353,6 +353,7 @@ fn probe_failure(
         CapacityEvidence::default(),
         SettlementEvidence::default(),
         StaleEvidence::default(),
+        Default::default(),
     );
     sim.add_source(Box::new(tap));
     let nodes = spawn(&mut sim, &fixture, &observer);

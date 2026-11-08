@@ -22,12 +22,16 @@
 //! existed, or the run fails as `UnpairedDrop`. A run that ends before the
 //! teardown is done leaves that open.
 //!
-//! A reactor that goes away during the run fails it as `ReactorGone`, unless
-//! the harness stopped it on purpose. A [`TapShutdown`] tells the tap so
-//! before the stop begins. The drain that finds the reactor gone is then the
-//! tap's final read: it logs the reactor's last events and runs the teardown
-//! checks above, and the node has settled unless they fail. A reactor that
-//! unwound still fails as `ReactorGone`. A run that ends idle, or at its
+//! A reactor that unwinds during the run fails it as `ReactorGone`. One that
+//! returns by itself, without unwinding, ended its own work: the drain that
+//! finds it gone records [`EndFact::ReactorExited`] in the tap's
+//! [`EndEvidence`], runs the open-work checks above, and the run goes on with
+//! the evidence it has. The harness can also stop the reactor on purpose. A
+//! [`TapShutdown`] tells the tap so before the stop begins. The drain that
+//! finds the reactor gone is then the tap's final read: it logs the
+//! reactor's last events and runs the teardown checks above, and the node
+//! has settled unless they fail. A reactor that unwound still fails as
+//! `ReactorGone`. A run that ends idle, or at its
 //! budget with a drain that ran dry, before that read fails as
 //! `ShutdownIncomplete`. One whose drain was cut off at its bound leaves the
 //! stop honestly unfinished, which `header-sync/teardown-returns-baseline`
@@ -68,6 +72,9 @@
 //! tap's checkpoint covers these reads, so the run fails unless they happen
 //! at every boundary.
 //!
+//! Every view-side fact the tap keeps, in any of its stores, takes the next
+//! of the node's [`Stamps`], as [`super::stamp`] describes.
+//!
 //! Recording an event takes only std locks, which are never held across any
 //! other call, so the tap adds no scheduling point to the reactor.
 
@@ -96,12 +103,14 @@ use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
+    ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
     policy::LinkEffect,
     reservation::ReservationEvidence,
     session::SessionEvidence,
     stale::{StaleCheck, StaleEvidence},
+    stamp::Stamps,
     wake::{WakeCheck, WakeEvidence},
 };
 use crate::{
@@ -150,6 +159,12 @@ struct TapState {
     unwound: AtomicBool,
     /// Set when the harness began stopping the reactor on purpose.
     shutdown: AtomicBool,
+    /// Set once a drain recorded the reactor's own exit.
+    exited: AtomicBool,
+    /// The node's stamps, which every store here takes its facts' from.
+    stamps: Stamps,
+    /// The harness's environment actions and the reactor's own exit.
+    ends: EndEvidence,
     buffer: Mutex<Buffer>,
     /// Checks each call's identity and retained headers as events arrive.
     work: Mutex<WorkCheck>,
@@ -395,6 +410,17 @@ impl TapShutdown {
         self.0.shutdown.store(true, Ordering::Relaxed);
     }
 
+    /// Records that the harness's `action` on `peer` ends `connection`, or
+    /// every connection for a shutdown, as [`super::ends`] describes. Call
+    /// it where the harness acts, before the action takes effect.
+    pub fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
+        self.0.ends.record(EndFact::Environment {
+            peer: peer.to_owned(),
+            connection,
+            action,
+        });
+    }
+
     /// Whether the stop is done: it began, and the reactor dropped its
     /// observer without unwinding.
     pub fn stopped(&self) -> bool {
@@ -415,13 +441,14 @@ impl LiveEvidence for TapState {
     }
 
     /// `PortGone` once an event found the node's port dropped, and
-    /// `ReactorGone` once the observer is, unless the harness stopped the
-    /// reactor and it ended without unwinding.
+    /// `ReactorGone` once the reactor is gone after unwinding or panicking.
+    /// A reactor that ended without either, stopped or not, isn't a tap
+    /// failure.
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
-        } else if self.reactor_gone() && !self.stopped() {
-            Some("ReactorGone: the tapped reactor ended during the run")
+        } else if self.reactor_gone() && !self.ended_cleanly() {
+            Some("ReactorGone: the tapped reactor unwound during the run")
         } else {
             None
         }
@@ -697,8 +724,9 @@ impl ReactorTap {
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
     /// also kept in `reservations`, its resource probe read, checked and
     /// kept in `capacity`, its released rounds at each drain kept in
-    /// `rounds`, and its stale prepare and apply calls kept in
-    /// `stale_calls`.
+    /// `rounds`, its stale prepare and apply calls kept in `stale_calls`,
+    /// and the node's end facts kept in `ends`, whose stamps every store
+    /// the tap keeps takes.
     ///
     /// # Panics
     ///
@@ -713,6 +741,7 @@ impl ReactorTap {
         capacity: CapacityEvidence,
         rounds: SettlementEvidence,
         stale_calls: StaleEvidence,
+        ends: EndEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         ReactorTap::tapped(
             sim,
@@ -720,7 +749,7 @@ impl ReactorTap {
             node,
             sessions,
             reservations,
-            (Some(capacity), rounds, stale_calls),
+            (Some(capacity), rounds, stale_calls, ends),
         )
     }
 
@@ -747,6 +776,7 @@ impl ReactorTap {
                 None,
                 SettlementEvidence::default(),
                 StaleEvidence::default(),
+                EndEvidence::default(),
             ),
         )
     }
@@ -758,10 +788,11 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
-        (capacity, rounds, stale_calls): (
+        (capacity, rounds, stale_calls, ends): (
             Option<CapacityEvidence>,
             SettlementEvidence,
             StaleEvidence,
+            EndEvidence,
         ),
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
@@ -770,7 +801,8 @@ impl ReactorTap {
             let sessions = sessions.clone();
             move || sessions.freeze()
         });
-        let adoption = AdoptionEvidence::default();
+        let stamps = ends.stamps();
+        let adoption = AdoptionEvidence::stamped_by(stamps.clone());
         sim.on_frozen({
             let adoption = adoption.clone();
             move || adoption.freeze()
@@ -789,6 +821,9 @@ impl ReactorTap {
                 port_gone: AtomicBool::new(false),
                 unwound: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
+                exited: AtomicBool::new(false),
+                stamps,
+                ends,
                 buffer: Mutex::default(),
                 work: Mutex::default(),
                 sessions,
@@ -869,13 +904,27 @@ impl ReactorTap {
     }
 
     /// Checks this reactor's wakes against `wake`'s fixture from now on,
-    /// keeping the facts in `wake`. Call it before the run starts.
+    /// keeping the facts in `wake`, stamped from the node's stamps. Call it
+    /// before the run starts.
     pub fn watch_wakes(&self, wake: WakeEvidence) {
+        wake.stamp_with(self.state.stamps.clone());
         *self
             .state
             .wake
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
+    }
+
+    /// The node's stamps, which every fact the tap and the harness keep
+    /// view-side takes.
+    pub fn stamps(&self) -> Stamps {
+        self.state.stamps.clone()
+    }
+
+    /// The harness's environment actions and the reactor's own exit, which
+    /// the harness and the tap fill as they happen.
+    pub fn ends(&self) -> EndEvidence {
+        self.state.ends.clone()
     }
 
     /// The reactor's adoption facts, which the tap fills as they happen.
@@ -1343,6 +1392,10 @@ impl ActionSource for ReactorTap {
                 _ if self.state.ended_cleanly() => self.state.open_work().map(|()| {
                     if self.state.shutdown.load(Ordering::Relaxed) {
                         self.state.settled.store(true, Ordering::Relaxed);
+                    } else if !self.state.exited.swap(true, Ordering::Relaxed) {
+                        self.state
+                            .ends
+                            .record(EndFact::ReactorExited { step: log.step() });
                     }
                 }),
                 _ => Ok(()),

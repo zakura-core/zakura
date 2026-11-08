@@ -11,7 +11,8 @@
 //! [`tap::ReactorTap`] logs a node's reactor events beside its storage facts,
 //! and keeps its adopted state in an [`adoption::AdoptionEvidence`].
 //! A `Shutdown` step stops the node under test on purpose, which its tap
-//! expects. The tap and the topology's links keep the node's
+//! expects. Each harness action that ends a link or the node is recorded in
+//! the tap's [`ends::EndEvidence`] where it happens. The tap and the topology's links keep the node's
 //! [`session`] view, and the tap keeps its header capacity accounting in a
 //! [`reservation::ReservationEvidence`], and its resource probe's reads in a
 //! [`capacity::CapacityEvidence`].
@@ -19,12 +20,14 @@
 pub mod adoption;
 pub mod capacity;
 pub mod claim;
+pub mod ends;
 pub mod fault;
 mod pair;
 pub mod policy;
 pub mod reservation;
 pub mod session;
 pub mod stale;
+pub mod stamp;
 pub mod tap;
 pub mod wake;
 
@@ -66,6 +69,7 @@ use zakura_storage::header::{
 
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
+    ends::EnvironmentAction,
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
@@ -697,7 +701,7 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
             return;
         }
         let (link, _far) = topology.open(index, 0, true);
-        link.close();
+        topology.close(&link);
         if topology.stopping() {
             return;
         }
@@ -757,6 +761,22 @@ impl Topology {
         if let Some(tap) = &self.tap {
             tap.begin();
         }
+        self.environment(&self.nodes[0].name, None, EnvironmentAction::Shutdown);
+    }
+
+    /// Records in the node under test's tap that the harness's `action` on
+    /// `peer` ends `connection`, as [`ends`] describes.
+    fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
+        if let Some(tap) = &self.tap {
+            tap.environment(peer, connection, action);
+        }
+    }
+
+    /// Closes `link` as the harness's own action, which the node under
+    /// test's tap records first.
+    fn close(&self, link: &Link) {
+        self.environment(&link.peer, Some(link.conn_id), EnvironmentAction::Close);
+        link.close();
     }
 
     /// Whether a `Shutdown` step's stop of the node under test is done: its
@@ -843,13 +863,23 @@ impl Topology {
     /// [`Topology::link`], with the dialer's side handed back as its
     /// streams, from the node and to it, instead of joining the dialer's
     /// service, when `far_end` is set.
+    ///
+    /// A link that replaces an earlier one to the same peer is a relink,
+    /// which the node under test's tap records ([`ends`]) before it happens.
     fn open(&self, dialer: usize, listener: usize, far_end: bool) -> (Link, Option<FarEnd>) {
+        let peer = if dialer == 0 { listener } else { dialer };
+        if let Some(old) = self.link_to(&self.nodes[peer].name) {
+            self.environment(
+                &self.nodes[peer].name,
+                Some(old.conn_id),
+                EnvironmentAction::Relink,
+            );
+        }
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];
-        let peer = if dialer == 0 { listener } else { dialer };
         let origin = SessionOrigin {
             connection: id,
             quic_stream: None,
@@ -1211,7 +1241,7 @@ impl Control {
                         .unwrap_or_else(|| panic!("the scenario links `{}`", step.peer))
                 };
                 match step.action {
-                    ControlAction::Close => link().close(),
+                    ControlAction::Close => topology.close(&link()),
                     ControlAction::Relink => {
                         let link = link();
                         topology.link(link.dialer, link.listener);

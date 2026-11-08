@@ -12,7 +12,10 @@
 //!   engine when the fact's state digest differs from the engine's before.
 //!   The engine changes only in steps of one action each, so its
 //!   generation, anchor and digest read at the end of the previous step's
-//!   observation are the ones before.
+//!   observation are the ones before. The rule is the fixed-finality one:
+//!   the simulator never advances finality, so production's finality
+//!   rebase, which can commit an owner from an older anchor after rebasing
+//!   it, never runs here, and any other authority is stale.
 //! - **Delivery** isn't judged here. A delivered completion's direct
 //!   effects are `header-sync/stale-completion-inert`'s.
 //! - **Adoption.** The reactor's `SnapshotAdopted` state version and
@@ -21,8 +24,8 @@
 //! The check applies once an apply changed the engine, or the reactor
 //! adopted a second snapshot. A broken rule is a claim break, which the
 //! tap hands [`Claim::StaleChainEffect`](super::claim::Claim) at its drain.
-//! An apply execution whose submission storage never reported is missing
-//! evidence, which fails the run.
+//! An apply execution, or any completion, whose submission storage never
+//! reported is missing evidence, which fails the run.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -84,6 +87,8 @@ pub(super) struct ChainEffect {
     engine: EngineAt,
     /// Each apply operation's owner scope, by storage operation.
     applies: HashMap<u64, WorkScope>,
+    /// Every storage operation submitted so far.
+    submitted: HashSet<u64>,
     /// The apply operations that committed with their reply held.
     committed: HashSet<u64>,
     /// The last adoption's state version and header generation.
@@ -101,6 +106,7 @@ impl ChainEffect {
         ChainEffect {
             engine,
             applies: HashMap::new(),
+            submitted: HashSet::new(),
             committed: HashSet::new(),
             adopted: None,
             breaks: Vec::new(),
@@ -146,16 +152,21 @@ impl ChainEffect {
     ) {
         for fact in facts {
             match fact {
-                StorageFact::Submitted {
-                    id,
-                    request: StorageRequest::ApplyHeaderTarget { owner, .. },
-                    ..
-                } => {
-                    self.applies.insert(*id, owner.scope.clone());
+                StorageFact::Submitted { id, request, .. } => {
+                    self.submitted.insert(*id);
+                    if let StorageRequest::ApplyHeaderTarget { owner, .. } = request {
+                        self.applies.insert(*id, owner.scope.clone());
+                    }
                 }
                 StorageFact::Committed { id, state, .. } => {
                     self.committed.insert(*id);
                     self.executed(*id, state);
+                }
+                StorageFact::Completed { id, .. } if !self.submitted.contains(id) => {
+                    self.missing.get_or_insert(format!(
+                        "ChainEffectJoin: operation {id} completed with no submission storage \
+                         reported"
+                    ));
                 }
                 StorageFact::Completed { id, state, .. }
                     if !self.committed.contains(id) && self.applies.contains_key(id) =>

@@ -369,6 +369,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("skipped-retirement"),
     },
     Coverage {
+        property: super::super::domain::header_sync::STALE_CHAIN_EFFECT_INERT,
+        passing: passes(
+            "tests/header_stale_chain.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("stale-adoption"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::CAPACITY_RELEASE_WAKES,
         passing: passes(
             "tests/header_release_wake.rs",

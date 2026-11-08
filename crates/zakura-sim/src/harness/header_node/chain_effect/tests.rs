@@ -159,13 +159,19 @@ fn adoption_never_moves_back() {
     }
 }
 
-/// An apply execution with no reported submission is missing evidence.
+/// An apply execution, held or run straight through, with no reported
+/// submission is missing evidence.
 #[test]
 fn an_unsubmitted_apply_is_missing_evidence() {
-    let mut check = ChainEffect::new(ChainEffectEvidence::default(), engine(2, "s0"));
-    check.storage(&[committed(4, "s1")], engine(3, "s1"));
-    assert!(check
-        .drain(1)
-        .expect_err("the submission is missing")
-        .starts_with("ChainEffectJoin"));
+    for fact in [committed(4, "s1"), completed(4, "s1")] {
+        let mut check = ChainEffect::new(ChainEffectEvidence::default(), engine(2, "s0"));
+        check.storage(&[fact.clone()], engine(3, "s1"));
+        assert!(
+            check
+                .drain(1)
+                .expect_err("the submission is missing")
+                .starts_with("ChainEffectJoin"),
+            "{fact:?}"
+        );
+    }
 }

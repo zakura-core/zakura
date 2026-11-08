@@ -1398,7 +1398,24 @@ impl PeerTask {
                                 return self.fail("only an adversary can act");
                             };
                             match adversary.act(act, honest) {
-                                Ok(acted) => frames = acted,
+                                Ok(Some(acted)) => frames = acted,
+                                // Its precondition expired after it was
+                                // offered. The skip is logged on the
+                                // header stream, so a witness test can see
+                                // the act never ran.
+                                Ok(None) => match &header {
+                                    Some(stream) => self.record(
+                                        remote,
+                                        stream.id,
+                                        RecordBody::ActSkipped { act: act.name() },
+                                    ),
+                                    None => {
+                                        return self.fail(format!(
+                                            "{} was skipped with no header stream to log it on",
+                                            act.name()
+                                        ))
+                                    }
+                                },
                                 Err(why) => return self.fail(why),
                             }
                         }

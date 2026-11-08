@@ -376,7 +376,9 @@ fn judge(
             WitnessError::Unregistered | WitnessError::NoTriggerHistory | WitnessError::NoView => {
                 ConfirmStatus::WitnessUnsupported
             }
-            WitnessError::LostTriggerHistory => ConfirmStatus::WitnessLost,
+            WitnessError::LostTriggerHistory | WitnessError::ActSkipped { .. } => {
+                ConfirmStatus::WitnessLost
+            }
             WitnessError::HarnessEnd(_) | WitnessError::NoEnd => ConfirmStatus::IncompleteEvidence,
             // The first run violated the property alone, so a rerun that
             // finds anything else disagrees with it.

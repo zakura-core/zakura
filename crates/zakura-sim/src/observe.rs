@@ -396,6 +396,17 @@ pub enum Observation {
         /// The QUIC stream of the peer's header stream then.
         quic_stream: u64,
     },
+    /// A scripted adversary's act was skipped: its precondition held when
+    /// the Plan offered it and no longer did when the peer ran it, so it
+    /// sent nothing. A witness test fails on it, since its act never ran.
+    ActSkipped {
+        /// The connection, from the identity map.
+        connection: u64,
+        /// The QUIC stream of the peer's header stream then.
+        quic_stream: u64,
+        /// The act's name.
+        act: String,
+    },
     /// A scripted peer read and decoded one frame the node wrote.
     PeerReceived {
         /// The connection, from the identity map.

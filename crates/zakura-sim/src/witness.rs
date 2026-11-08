@@ -93,6 +93,12 @@ pub enum WitnessError {
     /// The verdict fits, but the run didn't reach the property's trigger
     /// history.
     LostTriggerHistory,
+    /// An adversary act the run scripted was skipped, so the witness's act
+    /// never ran ([`crate::Observation::ActSkipped`]).
+    ActSkipped {
+        /// The act's name.
+        act: String,
+    },
     /// The property's trigger history reads the harness's view, and the
     /// judge has no view showing the run's end, as when it has only the
     /// run's report.
@@ -126,6 +132,9 @@ impl fmt::Display for WitnessError {
             WitnessError::Unrelated { property } => write!(f, "{property} was violated"),
             WitnessError::LostTriggerHistory => {
                 f.write_str("witness test lost its trigger history")
+            }
+            WitnessError::ActSkipped { act } => {
+                write!(f, "the witness's act {act} was skipped and never ran")
             }
             WitnessError::NoView => {
                 f.write_str("the trigger history reads the view, and no view shows the run's end")
@@ -276,6 +285,7 @@ impl<S: Subsystem> Registered<S> {
         expect: Expect,
     ) -> Result<(), WitnessError> {
         judge_end(end, reports, property, self.status, expect)?;
+        none_skipped(log)?;
         let reached = match self.trigger_history {
             None => true,
             Some(TriggerHistory::Log(history)) => history(log),
@@ -291,6 +301,18 @@ impl<S: Subsystem> Registered<S> {
         } else {
             Err(WitnessError::LostTriggerHistory)
         }
+    }
+}
+
+/// Fails if `log` holds a skipped act, since a witness's scripted acts
+/// must each have sent their frames.
+fn none_skipped(log: &ObservationLog) -> Result<(), WitnessError> {
+    match log.entries().iter().find_map(|entry| match &entry.obs {
+        crate::Observation::ActSkipped { act, .. } => Some(act.clone()),
+        _ => None,
+    }) {
+        Some(act) => Err(WitnessError::ActSkipped { act }),
+        None => Ok(()),
     }
 }
 
@@ -444,6 +466,24 @@ mod tests {
         assert_eq!(
             judge(&report, "test/own", Status::Active, Expect::Violated),
             Ok(())
+        );
+    }
+
+    /// A skipped act fails the witness, since its frame was never sent.
+    #[test]
+    fn a_skipped_act_fails_the_witness() {
+        let mut log = ObservationLog::default();
+        assert_eq!(none_skipped(&log), Ok(()));
+        log.push(crate::Observation::ActSkipped {
+            connection: 0,
+            quic_stream: 0,
+            act: "after-close".to_owned(),
+        });
+        assert_eq!(
+            none_skipped(&log),
+            Err(WitnessError::ActSkipped {
+                act: "after-close".to_owned()
+            })
         );
     }
 }

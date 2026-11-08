@@ -6,11 +6,19 @@
 //! setup history. [`AdversarySpec`] can keep it from announcing, so the node
 //! never subscribes, or from serving, so the node's subscription stays live
 //! with its credit unspent. An act is offered only once its setup history
-//! is done ([`Adversary::wake`]). When it runs, it asserts its precondition
+//! is done ([`Adversary::wake`]). When it runs, it checks its precondition
 //! from the models again, computes its boundary from the models' state at
 //! that moment, and checks that the models give the frame exactly the label
 //! set the act is for before sending it. A frame with a fault is labelled
 //! on a copy of the models, so it changes no model state.
+//!
+//! A frame can arrive between the offer and the run and end the
+//! precondition. Then the act is skipped: it sends nothing and the peer
+//! logs [`crate::Observation::ActSkipped`]. A witness test fails on a skip,
+//! since "ran" means the act's frame went out. A fuzz campaign sees a
+//! skipped act as not covered: no frame, so the properties it targets stay
+//! not applicable. A frame the act can't build or label still fails the
+//! run.
 
 use std::{collections::BTreeSet, time::Duration};
 
@@ -517,12 +525,17 @@ impl Adversary {
         ready.then_some(past)
     }
 
-    /// Carries out `act`: asserts its precondition, builds its frames from
+    /// Carries out `act`: checks its precondition, builds its frames from
     /// the models' state now, and labels each, failing unless the models
-    /// give the act's frame exactly its label set.
-    pub(crate) fn act(&mut self, act: Act, honest: &mut Honest) -> Result<Vec<Outgoing>, String> {
+    /// give the act's frame exactly its label set. Returns `None`, sending
+    /// nothing, if the precondition no longer holds (see the module doc).
+    pub(crate) fn act(
+        &mut self,
+        act: Act,
+        honest: &mut Honest,
+    ) -> Result<Option<Vec<Outgoing>>, String> {
         if self.wake(act, honest).is_none() {
-            return Err(format!("{}'s precondition doesn't hold", act.name()));
+            return Ok(None);
         }
         let mut out = Vec::new();
         let frame = match act {
@@ -646,7 +659,7 @@ impl Adversary {
                         break;
                     }
                 }
-                return Ok(vec![Outgoing::burst(burst)]);
+                return Ok(Some(vec![Outgoing::burst(burst)]));
             }
             Act::BadContent { rule } => self.bad_content(rule, honest)?,
         };
@@ -659,7 +672,7 @@ impl Adversary {
             sent.withhold();
         }
         out.push(sent);
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Follows a node frame before the honest script does: a page for one
@@ -1123,5 +1136,30 @@ mod tests {
         assert!(long_page.labels().contains(Label::OverCredit));
         assert_eq!(Act::SecondOpen.label(), Label::Conformant);
         assert_eq!(Act::ExtraEnding.label(), Label::Unsolicited);
+    }
+
+    /// An act whose precondition no longer holds is skipped: it sends
+    /// nothing and doesn't fail the run.
+    #[test]
+    fn an_expired_act_is_skipped() {
+        let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
+        let spec = crate::peer::HonestSpec {
+            chain: 5,
+            subscribe: None,
+        };
+        let chain = std::sync::Arc::new(crate::peer::HonestChain::new(&fixture, 5));
+        let mut honest = Honest::with(spec, chain, true, true);
+        let mut adversary = Adversary::new(AdversarySpec {
+            announce: true,
+            serve: true,
+            withhold: false,
+        });
+        for act in [Act::AfterClose, Act::SecondOpen, Act::OverLive] {
+            assert!(adversary.wake(act, &honest).is_none(), "{act:?}");
+            assert!(
+                matches!(adversary.act(act, &mut honest), Ok(None)),
+                "{act:?}"
+            );
+        }
     }
 }

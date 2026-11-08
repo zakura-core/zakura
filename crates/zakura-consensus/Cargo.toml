@@ -98,6 +98,14 @@ zakura-test = { path = "../zakura-test/", version = "4.0.0" }
 
 criterion = { workspace = true }
 
+# `block_verification_workloads` builds and signs transactions with the wallet builder.
+bls12_381 = { workspace = true }
+jubjub = { workspace = true }
+secp256k1 = { workspace = true }
+tempfile = { workspace = true }
+zcash_primitives = { workspace = true, features = ["transparent-inputs"] }
+zcash_transparent = { workspace = true, features = ["transparent-inputs"] }
+
 [[bench]]
 name = "groth16"
 harness = false
@@ -113,6 +121,10 @@ harness = false
 
 [[bench]]
 name = "worst_case_tx_verification"
+harness = false
+
+[[bench]]
+name = "block_verification_workloads"
 harness = false
 
 [[bench]]

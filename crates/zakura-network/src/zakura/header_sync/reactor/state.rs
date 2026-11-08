@@ -79,15 +79,17 @@ pub(super) struct ReactorState {
     /// steady traffic cannot keep postponing the retry.
     pub(super) pending_closes: HashMap<ZakuraPeerId, (u64, Instant)>,
     /// What `HistoryPruned` taught the reactor about each peer. It outlives
-    /// the peer's sessions, so reconnecting cannot reset its backoff, and
-    /// maintenance drops entries once they no longer matter.
+    /// the peer's sessions, so reconnecting alone cannot reset its backoff,
+    /// and maintenance drops entries once they no longer matter.
     ///
     /// [`HeaderSyncReactor::admitted_peer_limit`](super::HeaderSyncReactor::admitted_peer_limit)
     /// bounds the count, so identities that each answer `HistoryPruned` once
     /// and leave cannot grow it. Past the limit the entry that stops mattering
-    /// first goes, a departed peer's before a connected one's. An evicted peer
-    /// only loses its backoff, so it costs one more round without penalty if
-    /// it returns.
+    /// first goes, a departed peer's before a connected one's. Eviction forgets
+    /// both waits and their doubled delays. So a peer that returns before they
+    /// would have ended can repeat a schema 1 round and a round without
+    /// records, each ending `HistoryPruned` without penalty, and then backs off
+    /// again from [`PRUNED_BACKOFF_MIN`].
     pub(super) pruned_peers: HashMap<ZakuraPeerId, PrunedPeer>,
     pub(super) completed_targets: CompletedHeaderTargets,
     /// State version of the latest ordinary admission refused by a committed resource stall.

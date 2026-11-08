@@ -468,6 +468,70 @@ fn departed_pruned_peers_stay_within_the_admitted_peer_limit() {
     }
 }
 
+/// Eviction follows when entries stop mattering, not when they were made. A
+/// departed peer whose fallback doubled outlasts newer peers with a first
+/// fallback.
+#[tokio::test(start_paused = true)]
+async fn pruned_peer_eviction_keeps_the_longer_backoff() {
+    let (mut reactor, mut actions, snapshot) = fallback_reactor_admitting(10);
+    let limit = reactor.admitted_peer_limit();
+    let target = block::Hash([0x53; 32]);
+    let status = pruned_status(&snapshot, target);
+
+    let (old, mut old_outbound) = connect(&mut reactor, 0x60);
+    refresh(&mut reactor, &old, &status);
+    let open = answer_locator(&mut reactor, &mut actions, &old, &mut old_outbound, target);
+    end(&mut reactor, &old, &open, HeadersOutcomeCode::HistoryPruned);
+    let open = answer_locator(&mut reactor, &mut actions, &old, &mut old_outbound, target);
+    time::advance(PRUNED_BACKOFF_MIN).await;
+    end(
+        &mut reactor,
+        &old,
+        &open,
+        HeadersOutcomeCode::SubscriptionSuperseded,
+    );
+    refresh(&mut reactor, &old, &status);
+    let probe = answer_locator(&mut reactor, &mut actions, &old, &mut old_outbound, target);
+    assert_eq!(probe.tree_aux_schema, AuxSchema::V1, "the backoff ended");
+    reactor.deliver_outcome(
+        old.clone(),
+        0,
+        HeadersOutcome {
+            subscription_id: probe.subscription_id,
+            initial_target_tip_hash: target,
+            outcome: HeadersOutcomeCode::HistoryPruned,
+        },
+    );
+    reactor.handle_peer_disconnected(&old, 0, "test");
+    let old_fallback = reactor.state.pruned_peers[&old]
+        .aux_fallback
+        .expect("the failed probe renewed the fallback");
+    assert_eq!(old_fallback.delay, PRUNED_BACKOFF_MIN * 2);
+
+    for index in 0..u8::try_from(limit).expect("the test cap fits a peer ID byte") {
+        let (peer, mut outbound) = connect(&mut reactor, 0x80 + index);
+        refresh(&mut reactor, &peer, &status);
+        let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+        reactor.deliver_outcome(
+            peer.clone(),
+            0,
+            HeadersOutcome {
+                subscription_id: open.subscription_id,
+                initial_target_tip_hash: target,
+                outcome: HeadersOutcomeCode::HistoryPruned,
+            },
+        );
+        reactor.handle_peer_disconnected(&peer, 0, "test");
+    }
+
+    assert_eq!(reactor.state.pruned_peers.len(), limit);
+    assert_eq!(
+        reactor.state.pruned_peers[&old].aux_fallback,
+        Some(old_fallback),
+        "the oldest entry stops mattering last, so a newer one goes"
+    );
+}
+
 /// `HistoryPruned` from a replaced session, or for a round that already
 /// ended, leaves the peer's schema alone.
 #[test]

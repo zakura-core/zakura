@@ -856,9 +856,6 @@ impl StaticFiles {
                     .lock()
                     .expect("static file lock is never poisoned"),
             );
-            for base in leftovers {
-                delete_jar_files(&base)?;
-            }
             let jars: Vec<Jar> = self
                 .jars
                 .read()
@@ -866,6 +863,14 @@ impl StaticFiles {
                 .values()
                 .cloned()
                 .collect();
+            for base in leftovers {
+                // An append before this repair can recreate a leftover jar under
+                // the same name and commit blocks to it.
+                if jars.iter().any(|jar| jar.files.base == base) {
+                    continue;
+                }
+                delete_jar_files(&base)?;
+            }
             for jar in jars {
                 jar.cut_to_committed_lengths()?;
             }

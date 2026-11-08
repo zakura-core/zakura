@@ -143,7 +143,8 @@ pub enum ContentRule {
     Linkage,
     /// A one-header first page from the header below the `Open`'s first
     /// locator, carrying that locator's own header: a page that ends at a
-    /// locator before the target.
+    /// locator before the target. Only before the subscription's first page,
+    /// and only when this peer holds that first locator.
     LowerLocator,
     /// `SubscriptionClosed` before the node sent `Close`.
     OutcomeWindow,
@@ -465,6 +466,18 @@ impl Adversary {
             .as_ref()
             .filter(|sub| !sub.ended && !sub.close_sent);
         let ready = match act {
+            // Only the documented first page: none sent yet, from a first
+            // locator this peer holds above genesis.
+            Act::BadContent {
+                rule: ContentRule::LowerLocator,
+            } => node_subscription
+                .filter(|id| {
+                    models
+                        .unspent(SESSION, *id)
+                        .is_some_and(|unspent| unspent.objects >= 1)
+                })
+                .and_then(|id| honest.unserved_first_locator(id))
+                .is_some_and(|first| first > 0),
             _ if act.needs_node_subscription() => node_subscription
                 .and_then(|id| models.unspent(SESSION, id))
                 .is_some_and(|unspent| unspent.objects >= 1),
@@ -908,7 +921,10 @@ impl Adversary {
             }
             ContentRule::LowerLocator => {
                 let (id, _) = live(honest)?;
-                let first = honest.position(id).ok_or("lower-locator: nothing served")?;
+                let first = honest.unserved_first_locator(id).ok_or(
+                    "lower-locator: the subscription already has a page, or this peer doesn't \
+                     hold its first locator",
+                )?;
                 let parent = first
                     .checked_sub(1)
                     .ok_or("lower-locator: the first locator is genesis")?;

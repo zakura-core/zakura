@@ -6,7 +6,7 @@
 
 mod support;
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, process::Command};
 
 use support::{byte_inputs, inputs};
 use zakura_sim::{
@@ -456,5 +456,78 @@ fn regenerate_reset_witnesses() {
         let json = serde_json::to_string_pretty(&scenario).expect("scenarios serialize");
         fs::write(fixture(name, "json"), json + "\n").expect("the fixture directory exists");
         fs::write(fixture(name, "plan"), committed_plan()).expect("the fixture directory exists");
+    }
+}
+
+/// The reset property's report and the full log depend only on the
+/// scenario and the plan: the held-prepare witness under plan A twice, then
+/// B, then A again, gives A's every time, and B's log differs.
+#[test]
+fn the_reset_witness_repeats_a_a_and_a_b_a() {
+    let scenario = held_prepare();
+    let plans = [committed_plan(), vec![7; 256]];
+    let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
+        .into_iter()
+        .map(|plan| {
+            let report = run(&scenario, zakura_sim::Plan::from_fuzz(plan));
+            (
+                format!("{:?}", report.log.entries()),
+                format!("{:?}", outcome(&report, RESET_INVALIDATES_WORK)),
+            )
+        })
+        .collect();
+    assert_eq!(runs[0], runs[1], "plan A, then A");
+    assert_eq!(runs[0], runs[3], "plan A, then B, then A");
+    assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
+}
+
+/// `record --witness` judges each committed witness as `cargo xtask
+/// planted` runs it, expecting a hold, and `replay` reruns the trace Exact
+/// in a fresh process.
+#[test]
+fn the_committed_witnesses_record_and_replay_in_a_fresh_process() {
+    let zakura_sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .expect("the binary runs")
+    };
+    for (name, _) in committed_witnesses() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let trace = dir.path().join("trace");
+        let scenario = fs::read_to_string(fixture(name, "json")).expect("the witness is committed");
+        let recorded = zakura_sim(&[
+            "record",
+            "--sim",
+            Storage::NAME,
+            "--scenario",
+            &scenario,
+            "--plan",
+            fixture(name, "plan").to_str().expect("the path is UTF-8"),
+            "--out",
+            trace.to_str().expect("the path is UTF-8"),
+            "--witness",
+            RESET_INVALIDATES_WORK,
+            "--expect",
+            "holds",
+        ]);
+        assert!(recorded.status.success(), "{name}: {recorded:?}");
+        let witness: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(trace.join(zakura_sim::harness::WITNESS_FILE))
+                .expect("witness.json"),
+        )
+        .expect("witness.json is JSON");
+        assert_eq!(
+            witness["passed"],
+            serde_json::Value::Bool(true),
+            "{name}: {witness}"
+        );
+        let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+        let stdout = String::from_utf8_lossy(&replayed.stdout);
+        assert!(
+            replayed.status.success()
+                && stdout.contains("every pick, draw and observation matched"),
+            "{name}: {replayed:?}"
+        );
     }
 }

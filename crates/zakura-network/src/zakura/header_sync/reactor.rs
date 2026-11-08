@@ -284,6 +284,7 @@ fn build_header_sync_reactor(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
+        maintenance_deferred: false,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
@@ -339,6 +340,9 @@ struct HeaderSyncReactor {
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
+    /// Whether the last due maintenance waited for an unsettled operation queue.
+    /// See [`Self::maintenance_due`].
+    maintenance_deferred: bool,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
@@ -490,11 +494,41 @@ pub(super) fn selected_port_aux_delivery(
         .min_by_key(|delivery| (!delivery.is_authenticated(), delivery.delivery_id))
 }
 
+/// A waker that records whether a poll asked to be polled again.
+///
+/// `settle_ready_inputs` polls with it to tell a settled queue from one that
+/// may still hide a ready result.
+struct Repoll {
+    flag: std::sync::Arc<RepollFlag>,
+    waker: std::task::Waker,
+}
+
+impl Repoll {
+    /// Creates a waker whose wakes only raise its flag.
+    fn new() -> Self {
+        let flag = std::sync::Arc::new(RepollFlag::default());
+        let waker = futures::task::waker(flag.clone());
+        Self { flag, waker }
+    }
+}
+
+/// The flag behind [`Repoll`]'s waker.
+#[derive(Default)]
+struct RepollFlag(std::sync::atomic::AtomicBool);
+
+impl futures::task::ArcWake for RepollFlag {
+    /// Records the request to poll again.
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
+        let repoll = Repoll::new();
         let terminal_outcome = loop {
             if self
                 .state
@@ -508,53 +542,8 @@ impl HeaderSyncReactor {
             if self.startup.shutdown.is_cancelled() {
                 break HeaderRequestTerminal::Shutdown;
             }
-            // Retire already-ready state operations before any event can enforce
-            // their hard deadlines. Bound this pass to the current operation set.
-            for _ in 0..self.pending_port_operations.len() {
-                let Some(Some(completion)) = self.pending_port_operations.next().now_or_never()
-                else {
-                    break;
-                };
-                self.handle_port_completion(completion);
-            }
             // Inspect watches on every turn, even when peer queues never become empty.
-            // `changed` delivers a final unseen value before reporting channel closure.
-            if let Some(snapshots) = committed_snapshots.as_mut() {
-                match snapshots.changed().now_or_never() {
-                    Some(Ok(())) => {
-                        let snapshot = snapshots.borrow_and_update().clone();
-                        if let Some(snapshot) = snapshot {
-                            observe!(
-                                self,
-                                ReactorEvent::WatchObserved {
-                                    state_version: snapshot.state_version,
-                                }
-                            );
-                            caused!(
-                                self,
-                                ReactorCause::Watch,
-                                self.observe_latest_committed_snapshot(snapshot)
-                            );
-                        }
-                    }
-                    Some(Err(_)) => committed_snapshots = None,
-                    None => {}
-                }
-            }
-            if let Some(repairs) = vct_root_repairs.as_mut() {
-                match repairs.changed().now_or_never() {
-                    Some(Ok(())) => {
-                        let status = *repairs.borrow_and_update();
-                        caused!(
-                            self,
-                            ReactorCause::Watch,
-                            self.observe_vct_root_repair(status)
-                        );
-                    }
-                    Some(Err(_)) => vct_root_repairs = None,
-                    None => {}
-                }
-            }
+            self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs, &repoll);
             // One item from each queue per turn prevents either queue monopolizing the loop.
             // Session readers wait for connection acknowledgement before publishing peer events.
             let mut handled_event = false;
@@ -607,7 +596,7 @@ impl HeaderSyncReactor {
                 },
                 _ = capacity_releases.changed() => {},
                 _ = time::sleep_until(maintenance) => {
-                    caused!(self, ReactorCause::Maintenance, self.refresh_statuses());
+                    self.maintenance_due(&mut committed_snapshots, &mut vct_root_repairs, &repoll);
                 },
                 event = self.lifecycle.recv() => match event {
                     Some(event) => {
@@ -693,6 +682,83 @@ impl HeaderSyncReactor {
             ReactorCause::Shutdown,
             self.retire_all_peer_work(terminal_outcome)
         );
+    }
+
+    /// Handles every storage completion that is ready now, then reads both
+    /// watches, so a deadline checked afterward can't win over a ready result.
+    ///
+    /// Returns whether the operation queue settled. It hasn't when its last poll
+    /// asked to be polled again, which `FuturesUnordered` does while another
+    /// thread is mid-wake on its ready queue or after futures yield. A ready
+    /// result can still be hidden then. Such a poll is retried within the
+    /// drain's bound, one more than the operation count.
+    fn settle_ready_inputs(
+        &mut self,
+        committed_snapshots: &mut Option<
+            watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        >,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+        repoll: &Repoll,
+    ) -> bool {
+        let mut settled = false;
+        let mut cx = std::task::Context::from_waker(&repoll.waker);
+        for _ in 0..=self.pending_port_operations.len() {
+            repoll
+                .flag
+                .0
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            match self.pending_port_operations.poll_next_unpin(&mut cx) {
+                std::task::Poll::Ready(Some(completion)) => self.handle_port_completion(completion),
+                std::task::Poll::Ready(None) => {
+                    settled = true;
+                    break;
+                }
+                std::task::Poll::Pending => {
+                    if !repoll.flag.0.load(std::sync::atomic::Ordering::Relaxed) {
+                        settled = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // `changed` delivers a final unseen value before reporting channel closure.
+        if let Some(snapshots) = committed_snapshots.as_mut() {
+            match snapshots.changed().now_or_never() {
+                Some(Ok(())) => {
+                    let snapshot = snapshots.borrow_and_update().clone();
+                    if let Some(snapshot) = snapshot {
+                        observe!(
+                            self,
+                            ReactorEvent::WatchObserved {
+                                state_version: snapshot.state_version,
+                            }
+                        );
+                        caused!(
+                            self,
+                            ReactorCause::Watch,
+                            self.observe_latest_committed_snapshot(snapshot)
+                        );
+                    }
+                }
+                Some(Err(_)) => *committed_snapshots = None,
+                None => {}
+            }
+        }
+        if let Some(repairs) = vct_root_repairs.as_mut() {
+            match repairs.changed().now_or_never() {
+                Some(Ok(())) => {
+                    let status = *repairs.borrow_and_update();
+                    caused!(
+                        self,
+                        ReactorCause::Watch,
+                        self.observe_vct_root_repair(status)
+                    );
+                }
+                Some(Err(_)) => *vct_root_repairs = None,
+                None => {}
+            }
+        }
+        settled
     }
 
     /// Makes `cause` the reactor's unit of work, reports it, and returns the
@@ -2662,6 +2728,46 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Runs maintenance once its deadline is due, after the inputs that could
+    /// retire due work for free.
+    ///
+    /// A due deadline can't win over a ready completion or repair status. If the
+    /// operation queue didn't settle, maintenance waits one turn so the queue can
+    /// show what it hid. It doesn't wait twice in a row, so a future that keeps
+    /// yielding can't hold off the deadlines.
+    fn maintenance_due(
+        &mut self,
+        committed_snapshots: &mut Option<
+            watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        >,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+        repoll: &Repoll,
+    ) {
+        let settled = self.settle_ready_inputs(committed_snapshots, vct_root_repairs, repoll);
+        if !settled && !self.maintenance_deferred {
+            self.maintenance_deferred = true;
+            return;
+        }
+        self.maintenance_deferred = false;
+        caused!(self, ReactorCause::Maintenance, self.run_maintenance());
+    }
+
+    /// Enforces the deadlines that a ready completion or repair status could
+    /// retire for free, then refreshes statuses.
+    ///
+    /// Only [`Self::maintenance_due`] calls this.
+    fn run_maintenance(&mut self) {
+        let now = Instant::now();
+        if !self.report_fatal_vct_local_operation(now) {
+            self.refresh_vct_repair_stall(now);
+            self.retire_timed_out_requests(now);
+        }
+        self.refresh_statuses();
+    }
+
+    /// Refreshes statuses and the other work that no ready input can retire.
+    ///
+    /// Request and local-operation deadlines are left to `run_maintenance`.
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
         // Pruned before the fatal check, since the cooldowns are maintenance
@@ -2669,11 +2775,9 @@ impl HeaderSyncReactor {
         if self.state.prune_readmission_cooldowns(now) {
             self.publish_peer_state();
         }
-        if self.report_fatal_vct_local_operation(now) {
+        if self.state.local_operation_fatal() {
             return;
         }
-        self.refresh_vct_repair_stall(now);
-        self.retire_timed_out_requests(now);
         self.state.prune_pruned_peers(now);
         self.retry_pending_closes(now);
         self.retire_unanswered_closes(now);

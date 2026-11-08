@@ -818,6 +818,176 @@ async fn ready_vct_completion_precedes_unseen_snapshot_at_deadline() {
     task.await.unwrap();
 }
 
+/// An unrelated completion handled first cannot fire the fatal for a VCT
+/// apply that finished at its hard deadline.
+///
+/// The apply publishes its snapshot before it completes, and the unrelated
+/// locator read sits ahead of it in the ready queue. Handling the read observes
+/// that snapshot while the apply still looks like it's running.
+#[tokio::test(start_paused = true)]
+async fn an_earlier_completion_cannot_fire_the_fatal_for_a_finished_vct_apply() {
+    let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    assert_eq!(port.apply_calls.load(Ordering::SeqCst), 1);
+    let mut snapshot = fixture.reactor.committed_snapshot.clone().unwrap();
+    let (updates, snapshots) = watch::channel(Some(snapshot.clone()));
+    fixture.reactor.startup.committed_snapshots = Some(snapshots);
+    // A new future is queued as ready when it's pushed, so the read comes
+    // before the apply's wake-up at the deadline.
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+    updates.send(Some(snapshot)).unwrap();
+
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    let fatal = fatal_events.try_recv();
+    assert!(
+        matches!(fatal, Err(mpsc::error::TryRecvError::Empty)),
+        "a finished apply must not fire the fatal: {fatal:?}"
+    );
+    assert!(!task.is_finished());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+/// A port future that asks to be polled again on every poll and never ends.
+struct Yielding;
+
+impl std::future::Future for Yielding {
+    type Output = StorageOutcome;
+
+    /// Wakes itself and stays pending.
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<StorageOutcome> {
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+/// Settling keeps polling past a queue that asks to be polled again, so two
+/// yielding futures ahead of a finished apply can't hide it.
+#[tokio::test(start_paused = true)]
+async fn settling_finds_a_finished_apply_behind_yielding_futures() {
+    let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port, HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    // `FuturesUnordered` returns `Pending` once two futures yield in one poll.
+    fixture
+        .reactor
+        .pending_port_operations
+        .push(Box::pin(Yielding));
+    fixture
+        .reactor
+        .pending_port_operations
+        .push(Box::pin(Yielding));
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+
+    let settled = fixture
+        .reactor
+        .settle_ready_inputs(&mut None, &mut None, &Repoll::new());
+
+    assert!(
+        fixture.reactor.state.vct_local_operation.is_none(),
+        "the finished apply is handled"
+    );
+    assert!(!settled, "the yielding futures keep asking to be polled");
+}
+
+/// Due maintenance waits one turn for a queue that asks to be polled again,
+/// and doesn't wait a second time, so yielding futures can't hold off the fatal.
+#[tokio::test(start_paused = true)]
+async fn an_unsettled_queue_delays_maintenance_only_once() {
+    let mut fixture = VctLocalFixture::new(
+        PendingVctLocalPort::pending(true),
+        HeaderTargetPhase::Applying,
+    );
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    fixture
+        .reactor
+        .pending_port_operations
+        .push(Box::pin(Yielding));
+    fixture
+        .reactor
+        .pending_port_operations
+        .push(Box::pin(Yielding));
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    let repoll = Repoll::new();
+
+    fixture
+        .reactor
+        .maintenance_due(&mut None, &mut None, &repoll);
+    assert!(matches!(
+        fixture.fatal_events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    fixture
+        .reactor
+        .maintenance_due(&mut None, &mut None, &repoll);
+    let fatal = fixture
+        .fatal_events
+        .try_recv()
+        .expect("the second due maintenance enforces the hard deadline");
+    assert_eq!(fatal.owner, fixture.owner);
+}
+
+/// Due maintenance reads a ready repair status before it enforces the
+/// supplier's deadline, so a repair that ended charges its supplier nothing.
+#[tokio::test(start_paused = true)]
+async fn due_maintenance_reads_a_ready_repair_status_first() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    fixture
+        .reactor
+        .startup
+        .config
+        .max_unproductive_header_requests = 1;
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    assert!(fixture.reactor.state.request_deadlines.contains_key(peer));
+    let session = fixture.reactor.sessions[peer].session.clone();
+    let (repairs_tx, repairs_rx) = watch::channel(fixture.reactor.vct_repair_status);
+    let mut repairs = Some(repairs_rx);
+    repairs_tx
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Idle,
+            generation: 99,
+        })
+        .expect("the test holds the receiver");
+    time::advance(fixture.reactor.startup.request_timeout).await;
+
+    fixture
+        .reactor
+        .maintenance_due(&mut None, &mut repairs, &Repoll::new());
+
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    assert!(
+        !session.cancel_token().is_cancelled(),
+        "the supplier of an ended repair is not charged"
+    );
+}
+
 #[test]
 fn normal_header_operations_have_no_vct_fatal_deadline() {
     let port = PendingVctLocalPort::pending(true);

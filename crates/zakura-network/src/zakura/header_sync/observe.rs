@@ -375,6 +375,8 @@ pub enum ReactorEvent {
         /// The height of the subscription's target, which the update names
         /// only by hash.
         target_height: block::Height,
+        /// The subscription primitive's totals after it recorded the update.
+        totals: CreditTotals,
     },
     /// The subscriber built a `Close` for `subscription`. It adds no credit,
     /// so it isn't a [`ReactorEvent::CreditIssued`].
@@ -387,6 +389,8 @@ pub enum ReactorEvent {
         subscription: u64,
         /// The update as the subscriber built it, as `CreditIssued` carries.
         update: Box<SubscribeHeaders>,
+        /// The subscription primitive's totals after it recorded the close.
+        totals: CreditTotals,
     },
     /// The subscriber claimed a page of `subscription`'s credit, of
     /// `page_headers` headers in `page_bytes` bytes, and recorded the
@@ -405,10 +409,16 @@ pub enum ReactorEvent {
         headers: u64,
         /// The byte credit consumed through it, as the cursor says.
         bytes: u64,
-        /// The page's headers.
-        page_headers: u32,
+        /// The page's own last header: its declared parent's height plus
+        /// its entry count, and its last entry's hash, read from the page.
+        page_last: Frontier,
+        /// The page's entry count, read from the page.
+        page_headers: u64,
         /// The page's payload bytes.
         page_bytes: u64,
+        /// The subscription primitive's totals after the claim, apart from
+        /// the cursor.
+        totals: CreditTotals,
     },
     /// The subscriber accepted the cursors of `subscription` through
     /// `through`, so its next update acknowledges it.
@@ -426,6 +436,8 @@ pub enum ReactorEvent {
         headers: u64,
         /// The byte credit the subscription's pages consumed through it.
         bytes: u64,
+        /// The subscription primitive's totals after the acceptance.
+        totals: CreditTotals,
     },
     /// The reactor started or finished a unit of work, and `cause` is the
     /// one it's in now. Every fact the reactor's task reports after this,
@@ -807,6 +819,20 @@ pub enum BudgetOwner {
         /// The peer and round the queue staged the page on, once it did.
         round: Option<(ZakuraPeerId, u64)>,
     },
+}
+
+/// The credit a subscription's primitive counts: what every update granted
+/// and what every claimed page consumed, in headers and bytes.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct CreditTotals {
+    /// Headers granted.
+    pub granted_headers: u64,
+    /// Bytes granted.
+    pub granted_bytes: u64,
+    /// Headers consumed.
+    pub consumed_headers: u64,
+    /// Bytes consumed.
+    pub consumed_bytes: u64,
 }
 
 /// What gave a [`ReactorEvent::CreditIssued`].

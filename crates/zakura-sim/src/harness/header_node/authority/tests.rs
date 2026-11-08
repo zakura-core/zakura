@@ -8,7 +8,7 @@ use zakura_header_chain::{
     VerifiedGeneration,
 };
 use zakura_network::zakura::{
-    observe::{RequestRef, ReservationEnd, ReservationPurpose},
+    observe::{CreditTotals, RequestRef, ReservationEnd, ReservationPurpose},
     v9::{Cursor, Headers, Operation, RegtestMessage, SubscribeHeaders},
     wire_codec::encode_frame,
     AuxSchema, Credit, HeaderEntry,
@@ -88,6 +88,7 @@ fn open(target: Frontier, locators: &[block::Hash]) -> ReactorEvent {
             tree_aux_schema: AuxSchema::None,
         }),
         target_height: target.height,
+        totals: Default::default(),
     }
 }
 
@@ -138,6 +139,60 @@ fn page(request: &RequestRef, ancestor: Frontier, hashes: &[block::Hash]) -> Rea
     }
 }
 
+/// `events` with each credit fact's primitive totals filled in as an
+/// honest primitive counts them: every update's credit and every claimed
+/// page's, per subscription.
+fn honest(events: &[ReactorEvent]) -> Vec<ReactorEvent> {
+    let mut counted: std::collections::HashMap<(u64, u64), CreditTotals> = Default::default();
+    events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            match &mut event {
+                ReactorEvent::CreditIssued {
+                    session_id,
+                    subscription,
+                    update,
+                    totals,
+                    ..
+                } => {
+                    let count = counted.entry((*session_id, *subscription)).or_default();
+                    count.granted_headers += u64::from(update.added_credit.objects);
+                    count.granted_bytes += u64::from(update.added_credit.bytes);
+                    *totals = *count;
+                }
+                ReactorEvent::CursorClaimed {
+                    session_id,
+                    subscription,
+                    page_headers,
+                    page_bytes,
+                    totals,
+                    ..
+                } => {
+                    let count = counted.entry((*session_id, *subscription)).or_default();
+                    count.consumed_headers += *page_headers;
+                    count.consumed_bytes += *page_bytes;
+                    *totals = *count;
+                }
+                ReactorEvent::CloseBuilt {
+                    session_id,
+                    subscription,
+                    totals,
+                    ..
+                }
+                | ReactorEvent::CursorsAccepted {
+                    session_id,
+                    subscription,
+                    totals,
+                    ..
+                } => *totals = *counted.entry((*session_id, *subscription)).or_default(),
+                _ => {}
+            }
+            event
+        })
+        .collect()
+}
+
 /// The breaks `events` give, fed in order on the reactor's task.
 fn breaks(events: &[ReactorEvent]) -> Vec<String> {
     breaks_declaring(&[], events)
@@ -156,14 +211,20 @@ fn breaks_declaring(
         declared.iter().copied(),
     );
     check.observe(&reserved(99, 10), true, false);
-    for event in events {
+    for event in &honest(events) {
         check.observe(event, true, false);
     }
     check.drain(1)
 }
 
-/// The breaks `events` give with no reservation fed first.
+/// The breaks `events` give with no reservation fed first, their totals
+/// filled in honestly.
 fn credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
+    raw_credit_breaks(&honest(events))
+}
+
+/// [`credit_breaks`], with `events`' totals as given.
+fn raw_credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
     let mut check = Authority::new(
         AuthorityEvidence::default(),
         HeaderFixture::regtest(),
@@ -199,7 +260,7 @@ fn a_page_on_a_scenario_branch_holds() {
             [],
         );
         check.observe(&reserved(99, 10), true, false);
-        for event in &events {
+        for event in &honest(&events) {
             check.observe(event, true, false);
         }
         check.drain(1)
@@ -385,6 +446,7 @@ fn grant(
         bytes,
         update: Box::new(update),
         target_height: block::Height(4),
+        totals: Default::default(),
     }
 }
 
@@ -410,6 +472,7 @@ fn accepted(through: Frontier) -> ReactorEvent {
         through,
         headers: cursor.headers,
         bytes: cursor.bytes,
+        totals: Default::default(),
     }
 }
 
@@ -425,8 +488,10 @@ fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
         through,
         headers: cursor.headers,
         bytes: cursor.bytes,
-        page_headers: headers,
+        page_last: through,
+        page_headers: u64::from(headers),
         page_bytes: u64::from(headers) * credit::smallest_page(AuxSchema::None),
+        totals: Default::default(),
     }
 }
 
@@ -538,6 +603,7 @@ fn updates_carry_their_subscriptions_state() {
             },
             tree_aux_schema: AuxSchema::None,
         }),
+        totals: Default::default(),
     };
     assert_eq!(with(close(chain[3].hash)), Vec::<String>::new());
     let mut renamed = close(chain[3].hash);
@@ -637,21 +703,24 @@ fn a_stale_handlers_credit_is_left_to_the_stale_check() {
         [0],
         [],
     );
-    for event in [reserved(1, 10), open(chain[3], &[genesis.hash])] {
-        check.observe(&event, true, false);
-    }
-    for event in [grant(5, 0, 1, genesis, chain[3].hash), accepted(chain[2])] {
-        check.observe(&event, true, true);
-    }
-    for event in [reserved(2, 2), grant(2, 0, 2, chain[2], chain[3].hash)] {
-        check.observe(&event, true, false);
+    let events = honest(&[
+        reserved(1, 10),
+        open(chain[3], &[genesis.hash]),
+        grant(5, 0, 1, genesis, chain[3].hash),
+        accepted(chain[2]),
+        reserved(2, 2),
+        grant(2, 0, 2, chain[2], chain[3].hash),
+    ]);
+    for (at, event) in events.iter().enumerate() {
+        // The middle grant and acceptance come in a stale call's handler.
+        check.observe(event, true, (2..4).contains(&at));
     }
     assert_eq!(check.drain(1), Vec::<String>::new());
 }
 
-/// A claim whose recorded cursor isn't what its pages consumed breaks, and
-/// so does an acceptance of a cursor no claim recorded, though its header
-/// was staged.
+/// A claim whose recorded cursor isn't what its pages consumed, or that
+/// ends at another header than its page, breaks, and so does an
+/// acceptance of a cursor no claim recorded, though its header was staged.
 #[test]
 fn claims_record_what_their_pages_consumed() {
     let chain = main_chain(4);
@@ -673,6 +742,22 @@ fn claims_record_what_their_pages_consumed() {
     miscounted.push(claim);
     let found = credit_breaks(&miscounted);
     assert!(found[0].contains("but its pages consumed"), "{found:?}");
+    let mut undercharged = base();
+    undercharged.push(claimed(chain[1], 2));
+    let mut undercharged = honest(&undercharged);
+    if let Some(ReactorEvent::CursorClaimed { totals, .. }) = undercharged.last_mut() {
+        totals.consumed_bytes -= 1;
+    }
+    let found = raw_credit_breaks(&undercharged);
+    assert!(found[0].contains("primitive counts"), "{found:?}");
+    let mut elsewhere = base();
+    let mut claim = claimed(chain[1], 2);
+    if let ReactorEvent::CursorClaimed { through, .. } = &mut claim {
+        *through = chain[0];
+    }
+    elsewhere.push(claim);
+    let found = credit_breaks(&elsewhere);
+    assert!(found[0].contains("for a page ending at"), "{found:?}");
     let mut unclaimed = base();
     unclaimed.extend([
         claimed(chain[1], 2),
@@ -713,6 +798,7 @@ fn updates_are_their_operations() {
             added_credit: Credit { objects, bytes: 0 },
             tree_aux_schema: AuxSchema::None,
         }),
+        totals: Default::default(),
     };
     for (event, why) in [
         (close(1, Operation::Close), "built Close is a Close adding"),
@@ -737,6 +823,32 @@ fn updates_are_their_operations() {
         found
             .iter()
             .any(|found| found.contains("Grant credit came in a Close update")),
+        "{found:?}"
+    );
+}
+
+/// An Open that starts with something consumed breaks, and so do primitive
+/// totals that count more credit than the built updates granted.
+#[test]
+fn the_primitive_counts_what_the_updates_and_pages_did() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let mut started = open(chain[3], &[genesis.hash]);
+    if let ReactorEvent::CreditIssued { update, .. } = &mut started {
+        update.acknowledged.headers = 1;
+    }
+    let found = credit_breaks(&[reserved(1, 10), started]);
+    assert!(
+        found.iter().any(|found| found.contains("Open starts at")),
+        "{found:?}"
+    );
+    let mut stored = honest(&[reserved(1, 10), open(chain[3], &[genesis.hash])]);
+    if let Some(ReactorEvent::CreditIssued { totals, .. }) = stored.last_mut() {
+        totals.granted_headers += 1;
+    }
+    let found = raw_credit_breaks(&stored);
+    assert!(
+        found.iter().any(|found| found.contains("primitive counts")),
         "{found:?}"
     );
 }

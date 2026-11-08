@@ -233,6 +233,10 @@ impl Authority {
     /// Notes one drain's storage `facts`, judging the submissions they
     /// make.
     pub(super) fn storage<'f>(&mut self, facts: impl IntoIterator<Item = &'f StorageFact>) {
+        let facts: Vec<&StorageFact> = facts.into_iter().collect();
+        for fact in &facts {
+            self.credit.storage(fact);
+        }
         if self.submission.storage(facts) {
             self.applies();
         }

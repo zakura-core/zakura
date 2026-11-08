@@ -29,7 +29,7 @@ use crate::zakura::{
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
-    header_sync::observe::{CreditKind, HeaderSyncObserver, ReactorEvent},
+    header_sync::observe::{CreditKind, CreditTotals, HeaderSyncObserver, ReactorEvent},
     ZakuraPeerId,
 };
 
@@ -1172,25 +1172,41 @@ fn observed_credit_reports_each_open_grant_and_close() {
         target: chain[20],
         schema: AuxSchema::None,
     };
-    let credit = |kind, message: SubscribeHeaders| ReactorEvent::CreditIssued {
+    // The primitive's totals after each fact: every update's credit so far
+    // and every claimed page's.
+    let totals = |granted: &[&SubscribeHeaders], consumed: Option<&Cursor>| CreditTotals {
+        granted_headers: granted
+            .iter()
+            .map(|update| u64::from(update.added_credit.objects))
+            .sum(),
+        granted_bytes: granted
+            .iter()
+            .map(|update| u64::from(update.added_credit.bytes))
+            .sum(),
+        consumed_headers: consumed.map_or(0, |cursor| cursor.headers),
+        consumed_bytes: consumed.map_or(0, |cursor| cursor.bytes),
+    };
+    let credit = |kind, message: &SubscribeHeaders, totals| ReactorEvent::CreditIssued {
         kind,
         peer: peer.clone(),
         session_id: 7,
         subscription: id,
         objects: message.added_credit.objects,
         bytes: message.added_credit.bytes,
-        update: Box::new(message),
+        update: Box::new(message.clone()),
         target_height: chain[20].height,
+        totals,
     };
-    let accepted = |through: &Cursor| ReactorEvent::CursorsAccepted {
+    let accepted = |through: &Cursor, totals| ReactorEvent::CursorsAccepted {
         peer: peer.clone(),
         session_id: 7,
         subscription: id,
         through: Frontier::new(through.height, through.hash),
         headers: through.headers,
         bytes: through.bytes,
+        totals,
     };
-    let mut expected = vec![credit(CreditKind::Open, open)];
+    let mut expected = vec![credit(CreditKind::Open, &open, totals(&[&open], None))];
     let cursors: Vec<_> = (1..=8)
         .map(|height| {
             fixture
@@ -1208,8 +1224,10 @@ fn observed_credit_reports_each_open_grant_and_close() {
             through: Frontier::new(cursor.height, cursor.hash),
             headers: cursor.headers,
             bytes: cursor.bytes,
+            page_last: Frontier::new(cursor.height, cursor.hash),
             page_headers: 1,
             page_bytes: cursor.bytes - before,
+            totals: totals(&[&open], Some(cursor)),
         });
         before = cursor.bytes;
     }
@@ -1218,18 +1236,25 @@ fn observed_credit_reports_each_open_grant_and_close() {
         .accept_through(id, &cursors[3], 8)
         .expect("a received cursor")
         .expect("four headers reach the prefix");
-    expected.push(accepted(&cursors[3]));
-    expected.push(credit(CreditKind::Grant, grant));
+    let all = Some(&cursors[7]);
+    expected.push(accepted(&cursors[3], totals(&[&open], all)));
+    expected.push(credit(
+        CreditKind::Grant,
+        &grant,
+        totals(&[&open, &grant], all),
+    ));
     assert_eq!(fixture.sub.accept_through(id, &cursors[7], 2), Ok(None));
-    expected.push(accepted(&cursors[7]));
-    let grant = fixture.sub.grant_due(8).expect("a larger budget refills");
-    expected.push(credit(CreditKind::Grant, grant));
+    expected.push(accepted(&cursors[7], totals(&[&open, &grant], all)));
+    let second = fixture.sub.grant_due(8).expect("a larger budget refills");
+    let granted = totals(&[&open, &grant, &second], all);
+    expected.push(credit(CreditKind::Grant, &second, granted));
     let close = fixture.sub.close().expect("the live subscription closes");
     expected.push(ReactorEvent::CloseBuilt {
         peer: peer.clone(),
         session_id: 7,
         subscription: id,
         update: Box::new(close),
+        totals: granted,
     });
 
     let reported: Vec<_> = std::mem::take(&mut *recorded.0.lock().expect("unpoisoned"));
@@ -1913,7 +1938,9 @@ fn subscriber_state_runs_on_plain_tools() {
     let update = tools
         .open(plan.id, plan.window, plan.start)
         .expect("the tools record the Open");
-    let first = state.opened(plan, update).subscription_id;
+    let first = state
+        .opened(plan, update, CreditTotals::default())
+        .subscription_id;
     assert!(state.retract(&mut tools, first));
     assert_eq!((state.live(), tools.len()), (None, 0));
 
@@ -1924,7 +1951,9 @@ fn subscriber_state_runs_on_plain_tools() {
     let update = tools
         .open(plan.id, plan.window, plan.start)
         .expect("the tools record the Open");
-    let second = state.opened(plan, update).subscription_id;
+    let second = state
+        .opened(plan, update, CreditTotals::default())
+        .subscription_id;
     assert_ne!(first, second);
     let frame = page_frame(
         &tree,

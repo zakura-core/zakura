@@ -18,6 +18,7 @@ use zakura_rt::sync::counter::{AtomicU64, Ordering};
 
 #[cfg(zakura_sim)]
 pub use super::scheduler::peer_work::{HeaderResourceProbe, HeaderResources};
+pub use super::v9::SubscribeHeaders;
 use super::{
     events::HeaderPortOperation, ActiveHeaderRequest, HeaderSyncMisbehavior, HeaderTargetPurpose,
     Status,
@@ -166,6 +167,10 @@ pub enum ReactorEvent {
         request: RequestRef,
         /// Why the request was started.
         purpose: HeaderTargetPurpose,
+        /// The locator the reactor handed on for it: the read's entries for
+        /// a new `Open`, or the one continuation entry for a resumed
+        /// subscription.
+        locator: Vec<block::Hash>,
     },
     /// An active request was explicitly retired. Reported once the work
     /// queue has released its round.
@@ -252,6 +257,9 @@ pub enum ReactorEvent {
         headers: usize,
         /// How many headers the reservation still holds.
         reserved_left: usize,
+        /// The common ancestor the page declared, which its first header
+        /// extends.
+        ancestor: Frontier,
         /// The page's header hashes, in order.
         hashes: Vec<block::Hash>,
         /// The hashes the round holds where the page went, as the queue's
@@ -360,6 +368,25 @@ pub enum ReactorEvent {
         objects: u32,
         /// The bytes it adds.
         bytes: u32,
+        /// The update as the subscriber built it, the last owner boundary
+        /// before encoding: its sequence, acknowledgement, target, schema,
+        /// and an `Open`'s locators.
+        update: Box<SubscribeHeaders>,
+        /// The height of the subscription's target, which the update names
+        /// only by hash.
+        target_height: block::Height,
+    },
+    /// The subscriber accepted the cursors of `subscription` through
+    /// `through`, so its next update acknowledges it.
+    CursorsAccepted {
+        /// The peer the subscription is with.
+        peer: ZakuraPeerId,
+        /// The session the subscription is on.
+        session_id: u64,
+        /// The subscription.
+        subscription: u64,
+        /// The last header the accepted cursors reach.
+        through: Frontier,
     },
     /// The reactor started or finished a unit of work, and `cause` is the
     /// one it's in now. Every fact the reactor's task reports after this,
@@ -493,6 +520,12 @@ impl ReactorEvent {
         Self::Started {
             request: RequestRef::of(active),
             purpose: active.purpose.clone(),
+            locator: active
+                .sent_locator
+                .entries()
+                .iter()
+                .map(|entry| entry.hash)
+                .collect(),
         }
     }
 

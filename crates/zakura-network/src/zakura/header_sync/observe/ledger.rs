@@ -273,7 +273,9 @@ impl HeaderWorkLedger {
                     self.check_returned(incarnation, &format!("call {call} was handled"));
                 }
             }
-            ReactorEvent::Started { request, purpose } => self.start(request, purpose)?,
+            ReactorEvent::Started {
+                request, purpose, ..
+            } => self.start(request, purpose)?,
             ReactorEvent::Retired {
                 request, reason, ..
             } => {
@@ -1194,6 +1196,7 @@ mod tests {
         ReactorEvent::Started {
             request: request(byte, incarnation),
             purpose: crate::zakura::header_sync::HeaderTargetPurpose::Normal,
+            locator: Vec::new(),
         }
     }
 
@@ -1248,6 +1251,7 @@ mod tests {
             frame: None,
             headers,
             reserved_left: left,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; headers],
             stored: vec![TIP; headers],
             staged_total: total,
@@ -1673,6 +1677,7 @@ mod tests {
             frame: None,
             headers: 2,
             reserved_left: 3,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; 2],
             stored: vec![TIP; 2],
             staged_total: 2,
@@ -1897,6 +1902,7 @@ mod tests {
                 selected_target: zakura_header_chain::Frontier::new(block::Height(5), TIP),
                 repair_generation: 1,
             },
+            locator: Vec::new(),
         };
         fold(vec![repair(401), bound_to(401), repairing.clone()])
             .expect("a repair may reserve its whole request");
@@ -1944,6 +1950,7 @@ mod tests {
             frame: None,
             headers: 2,
             reserved_left: 3,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; 2],
             stored: vec![TIP; 2],
             staged_total: 2,
@@ -1969,6 +1976,7 @@ mod tests {
                 ReactorEvent::Started {
                     request: changed,
                     purpose: crate::zakura::header_sync::HeaderTargetPurpose::Normal,
+                    locator: Vec::new(),
                 },
             ],
             "UnreservedStart",
@@ -2111,6 +2119,7 @@ mod tests {
             frame: None,
             headers: 2,
             reserved_left: 3,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; 2],
             stored: vec![TIP, block::Hash([8; 32])],
             staged_total: 2,

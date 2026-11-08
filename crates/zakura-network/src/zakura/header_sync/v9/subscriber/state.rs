@@ -124,6 +124,12 @@ impl SubscriberState {
                 subscription: update.subscription_id,
                 objects: update.added_credit.objects,
                 bytes: update.added_credit.bytes,
+                update: Box::new(update.clone()),
+                target_height: self
+                    .live
+                    .as_ref()
+                    .filter(|live| live.id == update.subscription_id)
+                    .map_or(block::Height(0), |live| live.target_height),
             });
         }
     }
@@ -456,6 +462,15 @@ impl SubscriberState {
         }
         tools.accept(&id, cursor)?;
         live.accepted = *cursor;
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            tap.observer.observe(ReactorEvent::CursorsAccepted {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                subscription: id,
+                through: Frontier::new(cursor.height, cursor.hash),
+            });
+        }
         Ok(self.grant_due(tools, staging))
     }
 

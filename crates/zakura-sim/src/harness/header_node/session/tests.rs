@@ -78,6 +78,7 @@ fn started(owner: HeaderSyncWorkOwner) -> ReactorEvent {
             target_tip_hash: block::Hash([1; 32]),
         },
         purpose: HeaderTargetPurpose::Normal,
+        locator: Vec::new(),
     }
 }
 
@@ -277,7 +278,10 @@ fn departed_session_work_breaks() {
 
 /// The retirement of `owner`'s request.
 fn retired(owner: HeaderSyncWorkOwner) -> ReactorEvent {
-    let ReactorEvent::Started { request, purpose } = started(owner) else {
+    let ReactorEvent::Started {
+        request, purpose, ..
+    } = started(owner)
+    else {
         unreachable!("`started` builds a start");
     };
     ReactorEvent::Retired {

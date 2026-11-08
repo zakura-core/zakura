@@ -112,6 +112,30 @@ fn ended(call: u64) -> ReactorEvent {
     }
 }
 
+/// A `Grant` on `subscription` adding `objects` headers and `bytes`.
+fn grant(
+    subscription: u64,
+    objects: u32,
+    bytes: u32,
+) -> zakura_network::zakura::v9::SubscribeHeaders {
+    use zakura_network::zakura::v9::{Cursor, Operation, SubscribeHeaders};
+    SubscribeHeaders {
+        operation: Operation::Grant,
+        subscription_id: subscription,
+        update_sequence: 1,
+        initial_target_tip_hash: block::Hash([1; 32]),
+        acknowledged: Cursor {
+            height: block::Height(0),
+            hash: block::Hash([0; 32]),
+            headers: 0,
+            bytes: 0,
+        },
+        locator_hashes: Vec::new(),
+        added_credit: zakura_network::zakura::Credit { objects, bytes },
+        tree_aux_schema: zakura_network::zakura::AuxSchema::None,
+    }
+}
+
 /// The reactor's move into `cause`.
 fn cause(cause: ReactorCause) -> ReactorEvent {
     ReactorEvent::CauseSet { cause }
@@ -219,6 +243,8 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
             subscription: 3,
             objects: 10,
             bytes: 1_000,
+            update: Box::new(grant(3, 10, 1_000)),
+            target_height: block::Height(1),
         },
         retired(round(2, 2)),
         ReactorEvent::RoundReleased {
@@ -229,6 +255,7 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
         ReactorEvent::Started {
             request: round(2, 3),
             purpose: HeaderTargetPurpose::Normal,
+            locator: Vec::new(),
         },
         ReactorEvent::ReservationOpened {
             reservation: 5,

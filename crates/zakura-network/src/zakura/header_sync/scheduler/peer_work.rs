@@ -779,7 +779,7 @@ impl PeerWorkQueue {
         }
         self.policy.stage_page(peer, ancestor, entries, cursor);
         #[cfg(any(test, zakura_sim))]
-        self.report_staged(peer, hashes);
+        self.report_staged(peer, ancestor, hashes);
         debug_assert_eq!(
             self.owned_header_count(peer),
             self.policy
@@ -1063,10 +1063,10 @@ impl PeerWorkQueue {
 /// The queue's reports to its observer.
 #[cfg(any(test, zakura_sim))]
 impl PeerWorkQueue {
-    /// Report the page staged last, with its `hashes` and the headers its
-    /// round now holds, as the policy has it. Its spent reservation's end
-    /// reports after.
-    fn report_staged(&mut self, peer: &ZakuraPeerId, hashes: Vec<block::Hash>) {
+    /// Report the page staged last, with the `ancestor` it declared, its
+    /// `hashes` and the headers its round now holds, as the policy has it.
+    /// Its spent reservation's end reports after.
+    fn report_staged(&mut self, peer: &ZakuraPeerId, ancestor: Frontier, hashes: Vec<block::Hash>) {
         if let Some(staged) = self.observing.staged.take() {
             let entries = self
                 .policy
@@ -1086,6 +1086,7 @@ impl PeerWorkQueue {
                 frame: staged.arrival.frame,
                 headers: staged.headers,
                 reserved_left: staged.reserved_left,
+                ancestor,
                 hashes,
                 stored,
                 staged_total,
@@ -2057,6 +2058,7 @@ mod tests {
                 frame: Some(frame),
                 headers: hashes.len(),
                 reserved_left,
+                ancestor: snapshot().frontiers.finalized,
                 stored: hashes.clone(),
                 hashes,
                 staged_total,

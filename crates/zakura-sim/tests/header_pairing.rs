@@ -425,6 +425,7 @@ fn open_work(byte: u8) -> [ReactorEvent; 7] {
         ReactorEvent::Started {
             request: request.clone(),
             purpose: HeaderTargetPurpose::Normal,
+            locator: Vec::new(),
         },
         ReactorEvent::PageStaged {
             from_peer: peer.clone(),
@@ -435,6 +436,7 @@ fn open_work(byte: u8) -> [ReactorEvent; 7] {
             frame: None,
             headers: 5,
             reserved_left: 0,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), hash),
             hashes: vec![hash; 5],
             stored: vec![hash; 5],
             staged_total: 5,

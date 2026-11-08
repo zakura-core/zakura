@@ -180,7 +180,9 @@ impl RoundLife {
                 self.adopted = Some(latest);
             }
             ReactorEvent::Slots { slots } => self.slots = slots.clone(),
-            ReactorEvent::Started { request, purpose } => {
+            ReactorEvent::Started {
+                request, purpose, ..
+            } => {
                 let authority = authority_of(request.owner.header_authority());
                 let current = self.latest() == Some(authority);
                 self.rounds

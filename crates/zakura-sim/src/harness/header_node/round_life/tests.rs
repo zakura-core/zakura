@@ -86,6 +86,7 @@ fn started(incarnation: u64, generation: u64) -> ReactorEvent {
             target_tip_hash: block::Hash([3; 32]),
         },
         purpose: HeaderTargetPurpose::Normal,
+        locator: Vec::new(),
     }
 }
 

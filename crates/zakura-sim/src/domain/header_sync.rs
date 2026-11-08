@@ -463,7 +463,7 @@ fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
 pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
 
 /// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
-const AUTHORITY_CLAIMS: [Claim; 12] = [
+const AUTHORITY_CLAIMS: [Claim; 13] = [
     Claim::CommitOnlyAuthorized,
     Claim::ForeignPage,
     Claim::UnstagedPage,
@@ -476,6 +476,7 @@ const AUTHORITY_CLAIMS: [Claim; 12] = [
     Claim::ForeignLease,
     Claim::HeldUnowned,
     Claim::UnstagedHeaders,
+    Claim::WrongSource,
 ];
 
 /// What the authority check reads: one reactor's claim breaks and when the

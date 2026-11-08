@@ -44,7 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use zakura_chain::block;
-use zakura_header_chain::HeaderSyncWorkOwner;
+use zakura_header_chain::{Frontier, HeaderSyncWorkOwner, SourceId};
 use zakura_rt::collections::HashMap;
 
 use super::{
@@ -133,6 +133,8 @@ pub enum ClaimRule {
     HeldUnowned,
     /// A call held a round that staged no page.
     UnstagedHeaders,
+    /// A prepare supplied its round from another source than its peer's.
+    WrongSource,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -199,6 +201,8 @@ struct Round {
     returned: usize,
     /// Its staged headers' hashes, in order.
     hashes: Vec<block::Hash>,
+    /// The ancestor its first page declared.
+    ancestor: Option<Frontier>,
     /// Whether the queue released it.
     released: bool,
 }
@@ -211,18 +215,22 @@ struct StagedHeaders<'a> {
     reserved_left: usize,
     /// The page's header hashes.
     hashes: &'a [block::Hash],
+    /// The ancestor the page declared.
+    ancestor: Frontier,
     /// Every hash the round stored, the page's and its earlier pages'.
     stored: &'a [block::Hash],
     /// How many headers the round held after the page.
     staged_total: usize,
 }
 
-/// What a prepare sends: the target it names and the hashes of the headers
-/// it actually sends.
+/// What a prepare sends: the target it names, the hashes of the headers it
+/// actually sends, the ancestor they extend and their supplier.
 #[derive(Clone, Debug)]
 struct Payload {
     target: block::Hash,
     hashes: Vec<block::Hash>,
+    common_ancestor: Frontier,
+    source: SourceId,
 }
 
 /// A prepare's headers on their way to an apply call.
@@ -370,6 +378,7 @@ impl HeaderWorkLedger {
                 subscription,
                 headers,
                 reserved_left,
+                ancestor,
                 hashes,
                 stored,
                 staged_total,
@@ -396,6 +405,7 @@ impl HeaderWorkLedger {
                         headers: *headers,
                         reserved_left: *reserved_left,
                         hashes,
+                        ancestor: *ancestor,
                         stored,
                         staged_total: *staged_total,
                     },
@@ -504,10 +514,11 @@ impl HeaderWorkLedger {
                 let (expected_kind, call_peer, owner, payload) = match &record.op {
                     PortCall::Prepare {
                         peer,
+                        source,
                         owner,
+                        common_ancestor,
                         target,
                         hashes,
-                        ..
                     } => (
                         StorageCallKind::Prepare,
                         peer,
@@ -515,6 +526,8 @@ impl HeaderWorkLedger {
                         Some(Payload {
                             target: target.hash,
                             hashes: hashes.clone(),
+                            common_ancestor: *common_ancestor,
+                            source: *source,
                         }),
                     ),
                     PortCall::Apply { peer, owner, .. } => {
@@ -624,16 +637,21 @@ impl HeaderWorkLedger {
                     peer,
                     source,
                     owner,
+                    target,
                     ..
                 }),
                 Some(PortCall::Apply {
                     peer: apply_peer,
                     source: apply_source,
                     owner: apply_owner,
-                    ..
+                    target_tip_hash,
                 }),
             ) => {
-                if peer != apply_peer || source != apply_source || owner != apply_owner {
+                if peer != apply_peer
+                    || source != apply_source
+                    || owner != apply_owner
+                    || target.hash != *target_tip_hash
+                {
                     self.claims.push(ClaimBreak {
                         rule: ClaimRule::BadHandoff,
                         detail: format!(
@@ -707,6 +725,7 @@ impl HeaderWorkLedger {
                 staged: 0,
                 returned: 0,
                 hashes: Vec::new(),
+                ancestor: None,
                 released: false,
             },
         );
@@ -837,6 +856,7 @@ impl HeaderWorkLedger {
             headers,
             reserved_left,
             hashes,
+            ancestor,
             stored,
             staged_total,
         } = page;
@@ -883,6 +903,7 @@ impl HeaderWorkLedger {
             .get_mut(&request.incarnation)
             .expect("the round was found above");
         round.staged += headers;
+        round.ancestor.get_or_insert(ancestor);
         let before = std::mem::replace(&mut round.hashes, stored.to_vec());
         let kept = stored.get(..before.len()) == Some(&before[..]);
         let added = stored.get(before.len()..) == Some(hashes);
@@ -943,6 +964,7 @@ impl HeaderWorkLedger {
             ));
         }
         let tip = round.hashes.last().copied();
+        let payload_checked = payload.clone();
         if let Some(payload) = payload.filter(|payload| {
             tip != Some(payload.target)
                 || payload.hashes != round.hashes
@@ -958,6 +980,30 @@ impl HeaderWorkLedger {
                     payload.target
                 ),
             ));
+        }
+        if let Some(payload) = payload_checked.as_ref() {
+            if round.ancestor != Some(payload.common_ancestor) {
+                found.push(claim(
+                    ClaimRule::WrongPayload,
+                    format!(
+                        "WrongPayload: call {call} names ancestor {:?} for round {incarnation}, \
+                         whose first page declared {:?}",
+                        payload.common_ancestor, round.ancestor
+                    ),
+                ));
+            }
+            // A round's source is its peer's, as the reactor derives it.
+            let derived = SourceId::from_digest(round.request.peer.digest());
+            if payload.source != derived {
+                found.push(claim(
+                    ClaimRule::WrongSource,
+                    format!(
+                        "WrongSource: call {call} supplies round {incarnation} from {:?}, but \
+                         its peer's source is {derived:?}",
+                        payload.source
+                    ),
+                ));
+            }
         }
         // This call already counts as holding its headers.
         let held = self.held_by_round().get(&incarnation).copied().unwrap_or(0);

@@ -80,6 +80,8 @@ pub enum Claim {
     HeldUnowned,
     /// A call held a round that staged no page.
     UnstagedHeaders,
+    /// A prepare supplied its round from another source than its peer's.
+    WrongSource,
 }
 
 impl Claim {
@@ -103,6 +105,7 @@ impl Claim {
             ClaimRule::ForeignLease => Claim::ForeignLease,
             ClaimRule::HeldUnowned => Claim::HeldUnowned,
             ClaimRule::UnstagedHeaders => Claim::UnstagedHeaders,
+            ClaimRule::WrongSource => Claim::WrongSource,
         }
     }
 }

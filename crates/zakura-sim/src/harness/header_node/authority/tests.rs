@@ -470,15 +470,23 @@ fn grant(
     }
 }
 
-/// The cursor at `at` of a subscription from genesis that received one
-/// plain one-header page per header.
+/// The cursor at `at` of a subscription from genesis whose pages were the
+/// tests' split: headers 1 and 2 in one plain page, then one per header.
 fn cursor(at: Frontier) -> Cursor {
     let headers = u64::from(at.height.0);
+    let bytes = match headers {
+        0 => 0,
+        1 | 2 => credit::page_size(headers, AuxSchema::None),
+        _ => {
+            credit::page_size(2, AuxSchema::None)
+                + (headers - 2) * credit::smallest_page(AuxSchema::None)
+        }
+    };
     Cursor {
         height: at.height,
         hash: at.hash,
         headers,
-        bytes: headers * credit::smallest_page(AuxSchema::None),
+        bytes,
     }
 }
 
@@ -496,9 +504,8 @@ fn accepted(through: Frontier) -> ReactorEvent {
     }
 }
 
-/// The subscriber's claim of a page of subscription 1 with `headers`
-/// headers ending at `through`, one plain one-header page's bytes per
-/// header, as [`cursor`] counts.
+/// The subscriber's claim of a plain page of subscription 1 with `headers`
+/// headers ending at `through`, as [`cursor`] counts it.
 fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
     let cursor = cursor(through);
     ReactorEvent::CursorClaimed {
@@ -510,7 +517,7 @@ fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
         bytes: cursor.bytes,
         page_last: through,
         page_headers: u64::from(headers),
-        page_bytes: u64::from(headers) * credit::smallest_page(AuxSchema::None),
+        page_bytes: credit::page_size(u64::from(headers), AuxSchema::None),
         totals: Default::default(),
     }
 }
@@ -684,28 +691,39 @@ fn acceptance_reaches_only_staged_pages() {
     assert!(backwards[0].contains("below its earlier"), "{backwards:?}");
 }
 
-/// The model's smallest plain page is an encoded one-header page's payload.
+/// The model's plain page sizes are encoded pages' payloads, of one header
+/// and of several.
 #[test]
-fn the_smallest_page_is_an_encoded_one_header_page() {
+fn page_sizes_are_encoded_pages() {
     let fixture = HeaderFixture::regtest();
-    let header = fixture.extend(fixture.anchor(), 1, 0).remove(0);
-    let page = RegtestMessage::Headers(Headers {
-        subscription_id: 1,
-        initial_target_tip_hash: header.hash(),
-        common_ancestor_height: block::Height(0),
-        common_ancestor_hash: fixture.anchor().hash,
-        reaches_initial_target: true,
-        tree_aux_schema: AuxSchema::None,
-        entries: vec![HeaderEntry {
-            header,
-            body_size: 0,
-            tree_aux: None,
-        }],
-    });
-    let frame = encode_frame(&page).expect("a one-header page encodes");
+    for count in [1, 3] {
+        let headers = fixture.extend(fixture.anchor(), count, 0);
+        let page = RegtestMessage::Headers(Headers {
+            subscription_id: 1,
+            initial_target_tip_hash: headers.last().expect("one at least").hash(),
+            common_ancestor_height: block::Height(0),
+            common_ancestor_hash: fixture.anchor().hash,
+            reaches_initial_target: true,
+            tree_aux_schema: AuxSchema::None,
+            entries: headers
+                .into_iter()
+                .map(|header| HeaderEntry {
+                    header,
+                    body_size: 0,
+                    tree_aux: None,
+                })
+                .collect(),
+        });
+        let frame = encode_frame(&page).expect("a page encodes");
+        assert_eq!(
+            credit::page_size(u64::from(count), AuxSchema::None),
+            u64::try_from(frame.payload.len()).expect("small"),
+            "{count} headers"
+        );
+    }
     assert_eq!(
         credit::smallest_page(AuxSchema::None),
-        u64::try_from(frame.payload.len()).expect("small")
+        credit::page_size(1, AuxSchema::None)
     );
 }
 
@@ -763,6 +781,20 @@ fn claims_record_what_their_pages_consumed() {
     miscounted.push(claim);
     let found = credit_breaks(&miscounted);
     assert!(found[0].contains("but its pages consumed"), "{found:?}");
+    // The primitive charged a byte less than the page's layout takes, and
+    // the cursor and totals agree with what it charged.
+    let mut short = base();
+    let mut claim = claimed(chain[1], 2);
+    if let ReactorEvent::CursorClaimed {
+        bytes, page_bytes, ..
+    } = &mut claim
+    {
+        *bytes -= 1;
+        *page_bytes -= 1;
+    }
+    short.push(claim);
+    let found = credit_breaks(&short);
+    assert!(found[0].contains("which takes"), "{found:?}");
     let mut undercharged = base();
     undercharged.push(claimed(chain[1], 2));
     let mut undercharged = honest(&undercharged);
@@ -848,8 +880,9 @@ fn updates_are_their_operations() {
     );
 }
 
-/// An Open that starts with something consumed breaks, and so do primitive
-/// totals that count more credit than the built updates granted.
+/// An Open that starts with something consumed or at a sequence other than
+/// 0 breaks, and so do primitive totals that count more credit than the
+/// built updates granted.
 #[test]
 fn the_primitive_counts_what_the_updates_and_pages_did() {
     let chain = main_chain(4);
@@ -861,6 +894,17 @@ fn the_primitive_counts_what_the_updates_and_pages_did() {
     let found = credit_breaks(&[reserved(1, 10), started]);
     assert!(
         found.iter().any(|found| found.contains("Open starts at")),
+        "{found:?}"
+    );
+    let mut sequenced = open(chain[3], &[genesis.hash]);
+    if let ReactorEvent::CreditIssued { update, .. } = &mut sequenced {
+        update.update_sequence = 1;
+    }
+    let found = credit_breaks(&[reserved(1, 10), sequenced]);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("sequence 1, not 0")),
         "{found:?}"
     );
     let mut stored = honest(&[reserved(1, 10), open(chain[3], &[genesis.hash])]);

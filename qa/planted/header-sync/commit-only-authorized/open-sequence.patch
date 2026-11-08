@@ -1,0 +1,23 @@
+diff --git a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+index 5dc70a5d16..9ab2a48adf 100644
+--- a/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
++++ b/crates/zakura-network/src/zakura/regulation/subscription/subscriber.rs
+@@ -206,7 +206,8 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
+             key,
+             Subscribed {
+                 credit: granted,
+-                sequence: 0,
++                // Mutation: the subscription opens at sequence 1.
++                sequence: 1,
+                 received: start.clone(),
+                 pages: 0,
+                 unaccepted: VecDeque::new(),
+@@ -216,7 +217,7 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
+             },
+         );
+         Ok(Update {
+-            sequence: 0,
++            sequence: 1,
+             acknowledged: start,
+             added: credit,
+         })

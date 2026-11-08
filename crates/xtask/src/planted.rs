@@ -832,29 +832,46 @@ fn check_case(
             "the patched build failed: {error}"
         )));
     }
-    let patched = record(
-        Command::new(target.join(PROFILE).join("zakura-sim")),
+    let verdict = judge_patched(
+        &target.join(PROFILE).join("zakura-sim"),
         &harness,
         &input,
-        &case.property,
-        "violated",
-        &scratch.join("patched"),
-        None,
+        case,
+        scratch,
     )?;
-    let verdict = match classify(&case.property, &patched) {
-        Verdict::Caught(None) => campaign(target, &harness, case, &scratch.join("campaign"))?,
-        verdict => return Ok(verdict),
-    };
-    let binary = target.join(PROFILE).join("zakura-sim");
-    let verdict = typed_replay(verdict, &case.witness, || {
-        replay_misses(&binary, &scratch.join("patched"))
-    })?;
     match (&verdict, &case.target) {
         (Verdict::Caught(_), Some(fuzz)) => {
             Ok(through_target(worktree, builds, scratch, case, fuzz, &harness)?.unwrap_or(verdict))
         }
         _ => Ok(verdict),
     }
+}
+
+/// Records `input` on `harness` with the patched `zakura_sim` binary into
+/// `scratch`'s `patched`, and judges it: the patched run's verdict, then,
+/// for a catch, the campaign's, then, for a typed case, its fresh replay's.
+fn judge_patched(
+    zakura_sim: &Path,
+    harness: &str,
+    input: &Located,
+    case: &Case,
+    scratch: &Path,
+) -> Result<Verdict, BoxError> {
+    let trace = scratch.join("patched");
+    let patched = record(
+        Command::new(zakura_sim),
+        harness,
+        input,
+        &case.property,
+        "violated",
+        &trace,
+        None,
+    )?;
+    let verdict = match classify(&case.property, &patched) {
+        Verdict::Caught(None) => campaign(zakura_sim, harness, case, &scratch.join("campaign"))?,
+        verdict => return Ok(verdict),
+    };
+    typed_replay(verdict, &case.witness, || replay_misses(zakura_sim, &trace))
 }
 
 /// The fuzz target that runs `harness`, from the fuzz package's targets
@@ -965,14 +982,13 @@ fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
 }
 
 /// Records [`CAMPAIGN_INPUTS`] fuzz inputs on `harness` with the patched
-/// build in `target`, which [`check_case`] built. Each input
-/// and its trace go under `dir`.
-fn campaign(target: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
+/// `binary`, which [`check_case`] built. Each input and its trace go under
+/// `dir`.
+fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Verdict, BoxError> {
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }
     fs::create_dir_all(dir)?;
-    let binary = target.join(PROFILE).join("zakura-sim");
     let mut caught = 0;
     let mut missed = BTreeMap::new();
     for (index, bytes) in campaign_inputs(&case.property).into_iter().enumerate() {
@@ -1994,6 +2010,81 @@ mod tests {
         assert_eq!(
             typed_replay(Verdict::Unreported, &typed, unreachable).unwrap(),
             Verdict::Unreported
+        );
+    }
+
+    /// The runner's patched judgment replays a caught typed case's own
+    /// patched trace: with a `zakura-sim` whose runs violate the case's
+    /// property, a replay that matches keeps the catch, and one that doesn't
+    /// makes it [`Verdict::ReplayMisses`]. A fuzz-input case never replays.
+    #[cfg(unix)]
+    #[test]
+    fn the_runner_replays_a_caught_typed_case() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let end = end(Some(ID), &[(ID, VIOLATED)]);
+        // `record` writes a violating trace and a passed witness under
+        // `--out`. `replay` exits with `$code` for the case's own patched
+        // trace, and 9 for any other path.
+        let fake = |name: &str, code: u8| {
+            let path = dir.path().join(name);
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = replay ]; then\n\
+                 case \"$2\" in */case/patched) exit {code} ;; *) exit 9 ;; esac\n\
+                 fi\n\
+                 out=; prev=\n\
+                 for arg in \"$@\"; do [ \"$prev\" = --out ] && out=$arg; prev=$arg; done\n\
+                 mkdir -p \"$out\"\n\
+                 printf '%s\\n' '{end}' > \"$out/trace.jsonl\"\n\
+                 printf '%s\\n' '{{\"passed\":true,\"error\":null}}' > \"$out/witness.json\"\n"
+            );
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let matches = fake("matches", 0);
+        let misses = fake("misses", 1);
+        let scratch = dir.path().join("case");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(dir.path().join("s.json"), "{}").unwrap();
+        let typed = Case {
+            property: ID.to_owned(),
+            patch: dir.path().join("case.patch"),
+            witness: Witness::Typed {
+                harness: "header-sync/storage".to_owned(),
+                scenario: "s.json".into(),
+                plan: "p.bin".into(),
+            },
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            target: None,
+        };
+        let judge = |binary: &Path, case: &Case| {
+            judge_patched(
+                binary,
+                "header-sync/storage",
+                &case.witness.located(dir.path()),
+                case,
+                &scratch,
+            )
+            .expect("the fake binary runs")
+        };
+        assert!(
+            matches!(judge(&matches, &typed), Verdict::Caught(Some(_))),
+            "a matching replay keeps the catch"
+        );
+        assert!(
+            matches!(judge(&misses, &typed), Verdict::ReplayMisses(_)),
+            "a failed replay of the patched trace isn't a catch"
+        );
+        let input = Case {
+            witness: Witness::Input("a.bin".into()),
+            ..typed.clone()
+        };
+        assert!(
+            matches!(judge(&misses, &input), Verdict::Caught(Some(_))),
+            "a fuzz-input case doesn't replay here"
         );
     }
 

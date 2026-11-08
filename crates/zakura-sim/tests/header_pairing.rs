@@ -1277,9 +1277,9 @@ fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
     )
 }
 
-/// A claim break and an integrity failure in one step: the claim drains
-/// that step, so its property can report it first, and the failure waits.
-/// A step with no claim fails at once.
+/// A claim break and an integrity failure in one step, in either order: the
+/// claim drains that step, so its property can report it first, and the
+/// failure waits. A step with no claim fails at once.
 #[test]
 fn a_claim_drains_before_its_steps_integrity_failure() {
     let mut events = Vec::from(open_work(4));
@@ -1306,4 +1306,21 @@ fn a_claim_drains_before_its_steps_integrity_failure() {
     assert_eq!(claims.records(), []);
     let detail = evidence_failure(&report);
     assert!(detail.starts_with("CallReused: call 1"), "{detail}");
+
+    // The failure first, from a reservation number reused before the page,
+    // then the claim: the ledger still folds the rest of the step.
+    let mut events = Vec::from(open_work(4));
+    if let ReactorEvent::PageStaged { reserved_left, .. } = &mut events[3] {
+        *reserved_left = 1;
+    }
+    let reopened = events[0].clone();
+    events.insert(3, reopened);
+    let (report, claims) = claims_after(events);
+    let found = claims.records();
+    assert!(
+        matches!(&found[..], [only] if only.detail.starts_with("OverReservation")),
+        "{found:?}"
+    );
+    let detail = evidence_failure(&report);
+    assert!(detail.starts_with("OverReservation"), "{detail}");
 }

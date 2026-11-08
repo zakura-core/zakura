@@ -12,8 +12,9 @@
 //!
 //! Storage tags each submission with the reactor call that made it, so the
 //! two sides join by call. A dispatched prepare or apply whose submission is
-//! another kind of request breaks the rule as soon as both are known, so a
-//! call still pending at the run's end can't hide it. The pairer
+//! another kind of request breaks the rule as soon as both are known, and
+//! so does a second request from one call, so a call still pending at the
+//! run's end can't hide either. The pairer
 //! ([`super::super::pair`]) checks kinds again at each call's end.
 
 use std::collections::{HashMap, HashSet};
@@ -126,6 +127,18 @@ impl Submission {
                 ..
             } = fact
             {
+                // A prepare or apply call submits one request.
+                if self.dispatched.contains_key(call)
+                    && (self.judged.contains(call) || self.submitted.contains_key(call))
+                {
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: call {call} reached storage again, with a {} \
+                         request",
+                        request_kind(request)
+                    ));
+                    judged = true;
+                    continue;
+                }
                 self.submitted.insert(*call, request.clone());
                 judged |= self.judge(*call);
             }

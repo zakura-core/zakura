@@ -951,3 +951,64 @@ fn a_submission_of_another_kind_breaks_at_once() {
         "{found:?}"
     );
 }
+
+/// A prepare call that reaches storage a second time breaks the submission
+/// rule at once, though its first request matched its dispatch.
+#[test]
+fn a_second_submission_from_one_call_breaks_at_once() {
+    use zakura_network::zakura::observe::PortCall;
+
+    let chain = main_chain(2);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[1].hash, genesis.hash);
+    let mut check = Authority::new(
+        AuthorityEvidence::default(),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    let source = zakura_header_chain::SourceId::from_digest([2; 32]);
+    check.observe(
+        &ReactorEvent::Dispatched {
+            call: 1,
+            op: PortCall::Prepare {
+                peer: mirror(),
+                source,
+                owner: round.owner,
+                common_ancestor: genesis,
+                target: chain[1],
+                hashes: vec![chain[0].hash, chain[1].hash],
+            },
+        },
+        true,
+        false,
+    );
+    let prepare = |id| crate::observe::StorageFact::Submitted {
+        id,
+        request: crate::observe::StorageRequest::PrepareHeaderTarget {
+            owner: crate::storage::work_owner(round.owner),
+            source: crate::storage::hex(&source.digest()),
+            common_ancestor: crate::storage::point(genesis),
+            target: crate::storage::point(chain[1]),
+            headers: 2,
+            work: None,
+            first: None,
+            hashes: vec![
+                crate::storage::hash(chain[0].hash),
+                crate::storage::hash(chain[1].hash),
+            ],
+        },
+        digest: String::new(),
+        call: Some(1),
+    };
+    check.storage([&prepare(1)]);
+    assert_eq!(check.drain(1), Vec::<String>::new());
+    check.storage([&prepare(2)]);
+    let found = check.drain(2);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("reached storage again")),
+        "{found:?}"
+    );
+}

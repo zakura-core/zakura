@@ -150,7 +150,7 @@ pub fn apply_at_close() -> StorageScenario {
 }
 
 /// A reset of the node, offered once `when` holds.
-fn reset(reset: Reset, when: Trigger) -> ControlStep {
+pub fn reset(reset: Reset, when: Trigger) -> ControlStep {
     step(NODE, ControlAction::Reset(reset), Some(when))
 }
 
@@ -285,9 +285,9 @@ pub fn reply_hold() -> StorageScenario {
     }
 }
 
-/// The node at genesis syncing from A5, its first apply's reply held 2 s
-/// past its commit, and `action` on `peer` once that apply commits.
-fn reply_then(peer: &str, action: ControlAction) -> StorageScenario {
+/// The node at genesis syncing from A5, its first apply's reply held until
+/// `until`, and `action` on `peer` once that apply commits.
+fn reply_then(peer: &str, action: ControlAction, until: Trigger) -> StorageScenario {
     let mut scenario = syncing(
         0,
         5,
@@ -300,22 +300,26 @@ fn reply_then(peer: &str, action: ControlAction) -> StorageScenario {
     );
     scenario.policy.reply_holds = vec![ReplyHold {
         select: Select::nth(OpKind::Apply, 1),
-        until: Trigger::VirtualTime(2_000),
+        until,
     }];
     scenario
 }
 
-/// Commit, then a shutdown drops the reactor's apply future, then deliver:
-/// the reply reaches no waiter.
+/// Commit, then a shutdown drops the reactor's apply future, then deliver
+/// 2 s past the commit: the reply reaches no waiter.
 pub fn reply_after_shutdown() -> StorageScenario {
-    reply_then(NODE, ControlAction::Shutdown)
+    reply_then(NODE, ControlAction::Shutdown, Trigger::VirtualTime(2_000))
 }
 
 /// The passing control for [`reply_after_shutdown`]: closing the link
-/// retires the apply's owner but leaves its future waiting, so the reply is
-/// delivered.
+/// retires the apply's owner but leaves its future waiting, so the reply,
+/// held until the link has closed, is delivered.
 pub fn reply_after_close() -> StorageScenario {
-    reply_then(SOURCE, ControlAction::Close)
+    reply_then(
+        SOURCE,
+        ControlAction::Close,
+        Trigger::Closed(SOURCE.to_owned()),
+    )
 }
 
 /// The node at genesis syncing from A5, its first apply held until storage
@@ -500,8 +504,10 @@ pub fn release_fault(fault: Allow, after: u64) -> StorageScenario {
 /// Each fault witness: the kind, the fault, its outcome's name, and when
 /// it's offered. A port fault is legal at once and a timeout once the
 /// adapter's 30 s deadline passes. Prepare and apply have only
-/// `local-resource`. No honest run submits a membership read, so it has
-/// none.
+/// `local-resource`. Membership has none: no scenario probed submitted a
+/// membership read, among the default, close-relink, grow, holds and
+/// triggers scenarios, competing mirrors, and five layouts of a node
+/// serving a caught-up mirror while syncing from another.
 pub fn fault_witnesses() -> Vec<(OpKind, Allow, &'static str, u64)> {
     let mut faults = Vec::new();
     for kind in [

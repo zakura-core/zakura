@@ -696,6 +696,42 @@ fn every_collected_state_has_a_witness() {
         });
         assert_eq!(lost, None, "{}: no caller to lose", witness.name);
     }
+    // Each drawn header storage seed shows the rows it's committed for on
+    // its own run, so another witness can't stand in for it.
+    let own = [
+        (
+            "header storage locator dropped at its timeout",
+            &["completion after cancellation request"][..],
+        ),
+        (
+            "header storage apply pending at close",
+            &["completion after owner retirement"][..],
+        ),
+        (
+            "header storage competing mirrors",
+            &[
+                "two distinct peer offers",
+                "shared ancestor",
+                "selected winner",
+            ][..],
+        ),
+    ];
+    for (name, rows) in own {
+        let (witness, states) = witnesses
+            .iter()
+            .zip(&reached)
+            .find(|(witness, _)| witness.name == name)
+            .unwrap_or_else(|| panic!("no witness {name}"));
+        assert!(witness.drawn, "{name}");
+        for state in rows {
+            let row = REQUIRED.iter().find(|row| row.state == *state).unwrap();
+            let Coverage::Collected { shows, drawn, .. } = row.coverage else {
+                panic!("{state} is collected");
+            };
+            assert!(drawn, "{state} is drawn");
+            assert!(states.iter().any(shows), "{name} doesn't show {state}");
+        }
+    }
     for row in REQUIRED {
         let Coverage::Collected {
             harnesses,

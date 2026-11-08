@@ -10,6 +10,7 @@ mod support;
 use std::{fs, path::PathBuf};
 
 use support::{byte_inputs, storage_witnesses};
+use zakura_chain::work::difficulty::U256;
 use zakura_sim::{
     explore::{classify, ExploreOutcome},
     harness::{
@@ -18,7 +19,7 @@ use zakura_sim::{
         header_sync::{grammar, Storage, StorageScenario},
         Subsystem,
     },
-    observe::{StorageFact, StorageRequest},
+    observe::{StorageFact, StoragePoint, StorageRequest},
     seed, NullSink, Observation, RunReport,
 };
 
@@ -53,8 +54,8 @@ enum Shows {
     /// Two prepares from the same ancestor with different first headers,
     /// the later one's work comparing so with the earlier's.
     ForkWork(std::cmp::Ordering),
-    /// The node reached recovery's conditions.
-    Recovered,
+    /// The node reached recovery's conditions after a prefix of this class.
+    Recovered(&'static str),
 }
 
 /// The storage facts `report` logged, with their steps.
@@ -200,11 +201,13 @@ impl Shows {
                 _ => false,
             }),
             Shows::ForkWork(ordering) => {
-                let mut prepares: Vec<(String, String)> = Vec::new();
+                // Each prepared fork once: its ancestor, first header and work.
+                let mut prepares: Vec<(StoragePoint, String, U256)> = Vec::new();
                 for (_, fact) in &facts {
                     if let StorageFact::Submitted {
                         request:
                             StorageRequest::PrepareHeaderTarget {
+                                common_ancestor,
                                 first: Some(first),
                                 work: Some(work),
                                 ..
@@ -212,15 +215,49 @@ impl Shows {
                         ..
                     } = fact
                     {
-                        if !prepares.iter().any(|(seen, _)| *seen == first.hash) {
-                            prepares.push((first.hash.clone(), work.clone()));
+                        let work = U256::from_dec_str(work).expect("work is logged in decimal");
+                        if !prepares.iter().any(|(_, seen, _)| *seen == first.hash) {
+                            prepares.push((common_ancestor.clone(), first.hash.clone(), work));
                         }
                     }
                 }
-                let work = |at: usize| prepares[at].1.parse::<u128>().unwrap_or_default();
-                prepares.len() == 2 && work(1).cmp(&work(0)) == ordering
+                matches!(&prepares[..], [a, b] if a.0 == b.0 && b.2.cmp(&a.2) == ordering)
             }
-            Shows::Recovered => !picked(report, "recovered").is_empty(),
+            Shows::Recovered(class) => {
+                let (Some(&recover), Some(&done)) = (
+                    picked(report, "recover").first(),
+                    picked(report, "recovered").first(),
+                ) else {
+                    return false;
+                };
+                let before = |at: &u64| *at < recover;
+                recover < done
+                    && match class {
+                        "closes" => {
+                            picked(report, "close").first().is_some_and(before)
+                                && picked(report, "recovery-relink")
+                                    .first()
+                                    .is_some_and(|relink| *relink > recover)
+                        }
+                        "holds" => pending_at(OpKind::Prepare, recover),
+                        "faults" => facts.iter().any(|(at, fact)| {
+                            before(at)
+                                && matches!(fact, StorageFact::Completed { id, outcome, .. }
+                                    if outcome == "local-resource"
+                                        && ops.iter().any(|op| op.0 == *id && op.1 == OpKind::Prepare))
+                        }),
+                        "invalidations" => {
+                            resets
+                                .iter()
+                                .any(|(at, kind)| before(at) && *kind == "invalidate")
+                                && resets.contains(&(recover, "reconsider"))
+                        }
+                        "reply-holds" => committed.iter().any(|(at, id)| {
+                            before(at) && delivered(*id).is_some_and(|(done, _)| done > recover)
+                        }),
+                        _ => false,
+                    }
+            }
         }
     }
 }
@@ -235,8 +272,11 @@ fn shows(stem: &str) -> (Shows, usize) {
         .strip_prefix("header-storage-w-")
         .expect("witness stems share a prefix");
     if let Some(class) = witness.strip_prefix("recover-") {
-        assert!(!class.is_empty());
-        return (Shows::Recovered, 16);
+        let class = ["closes", "holds", "faults", "invalidations", "reply-holds"]
+            .into_iter()
+            .find(|known| *known == class)
+            .unwrap_or_else(|| panic!("{stem} names no prefix class"));
+        return (Shows::Recovered(class), 16);
     }
     if let Some((kind, allow, outcome, _)) = storage_witnesses::fault_witnesses()
         .into_iter()

@@ -3,6 +3,6 @@
 # encoding, then 1,024 Plan bytes.
 harness = "header-sync/storage"
 generator = 3
-sha256 = "59b57a74468b1b4d39a4bf572cc1bfb9c94846c440eacdb017a1168159ba5589"
-scenario_sha256 = "51fec5dd873497376c69957b25a2e2cd0e8f19e2b903f997847302ea0f3e0909"
+sha256 = "3cedac19586240d85add3fead7a4bad6df054682e1030ca6b31c32d568104831"
+scenario_sha256 = "e9fb136451cee64ac469e70ce59e511db0ebe6e5a6cf7af64b7ff899efad31e6"
 source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

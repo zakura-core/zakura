@@ -56,11 +56,11 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Ran {
     }
 }
 
-/// The connection of `peer`'s first link.
-fn first_link(sessions: &[SessionFact], peer: &str) -> u64 {
+/// The connections of `peer`'s links, in the order they opened.
+fn links(sessions: &[SessionFact], peer: &str) -> Vec<u64> {
     sessions
         .iter()
-        .find_map(|fact| match fact {
+        .filter_map(|fact| match fact {
             SessionFact::LinkOpened {
                 peer: linked,
                 connection,
@@ -68,7 +68,23 @@ fn first_link(sessions: &[SessionFact], peer: &str) -> u64 {
             } if linked == peer => Some(*connection),
             _ => None,
         })
+        .collect()
+}
+
+/// The connection of `peer`'s first link.
+fn first_link(sessions: &[SessionFact], peer: &str) -> u64 {
+    links(sessions, peer)
+        .first()
+        .copied()
         .unwrap_or_else(|| panic!("{peer} is linked: {sessions:#?}"))
+}
+
+/// The connection of `peer`'s second link, its relink.
+fn second_link(sessions: &[SessionFact], peer: &str) -> u64 {
+    links(sessions, peer)
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| panic!("{peer} is relinked: {sessions:#?}"))
 }
 
 /// The environment fact for `action` on `peer`'s `connection`.
@@ -86,9 +102,9 @@ fn facts(ends: &[(u64, EndFact)]) -> Vec<EndFact> {
 }
 
 /// In the close-and-relink scenario, each mirror's `Close` and `Relink` step
-/// records its end once, in script order, naming the connection it closes
-/// or replaces: the mirror's first link, which stays its newest until the
-/// relink. The reactor never exits by itself.
+/// records its end once, in script order: the close names the mirror's
+/// first link, and the relink names the new link it opens. The reactor
+/// never exits by itself.
 #[test]
 fn close_and_relink_steps_record_the_connections_they_end() {
     let scenario = StorageScenario::close_relink();
@@ -100,9 +116,17 @@ fn close_and_relink_steps_record_the_connections_they_end() {
             facts(&ran.ends),
             [
                 environment("mirror-0", Some(zero), EnvironmentAction::Close),
-                environment("mirror-0", Some(zero), EnvironmentAction::Relink),
+                environment(
+                    "mirror-0",
+                    Some(second_link(&ran.sessions, "mirror-0")),
+                    EnvironmentAction::Relink
+                ),
                 environment("mirror-1", Some(one), EnvironmentAction::Close),
-                environment("mirror-1", Some(one), EnvironmentAction::Relink),
+                environment(
+                    "mirror-1",
+                    Some(second_link(&ran.sessions, "mirror-1")),
+                    EnvironmentAction::Relink
+                ),
             ],
             "{:#?}",
             ran.sessions
@@ -142,7 +166,7 @@ fn a_service_side_close_records_no_end() {
             facts(&ran.ends),
             [environment(
                 "mirror-0",
-                Some(first),
+                Some(second_link(&ran.sessions, "mirror-0")),
                 EnvironmentAction::Relink
             )],
         );
@@ -157,6 +181,72 @@ fn a_service_side_close_records_no_end() {
         service_closed > 0,
         "no plan's service closed the first link"
     );
+}
+
+/// A churn and a `Relink` of the same mirror overlap, so two relinks can be
+/// open at once. Each relink names its own new connection, never another
+/// relink's: every link after the first has exactly one relink fact, and
+/// every close fact names a link that opened. A shutdown stops the churn.
+#[test]
+fn overlapping_relinks_each_name_their_own_connection() {
+    let admitted = |count| {
+        Some(Trigger::Count(
+            count,
+            Box::new(Trigger::SessionAdmitted("mirror-0".to_owned())),
+        ))
+    };
+    let scenario = StorageScenario {
+        node: zakura_sim::harness::header_node::Chain::main(4),
+        mirrors: vec![zakura_sim::harness::header_sync::MirrorSpec {
+            chain: zakura_sim::harness::header_node::Chain::main(4),
+            dialer: zakura_sim::harness::header_sync::Dialer::Mirror,
+        }],
+        controls: vec![
+            ControlStep {
+                peer: "mirror-0".to_owned(),
+                action: ControlAction::Churn,
+                when: None,
+            },
+            ControlStep {
+                peer: "mirror-0".to_owned(),
+                action: ControlAction::Relink,
+                when: admitted(3),
+            },
+            ControlStep {
+                peer: "node".to_owned(),
+                action: ControlAction::Shutdown,
+                when: admitted(6),
+            },
+        ],
+        ..StorageScenario::default()
+    };
+    for input in inputs(8, 256) {
+        let ran = run(&scenario, input);
+        let opened = links(&ran.sessions, "mirror-0");
+        let relinked: Vec<u64> = ran
+            .ends
+            .iter()
+            .filter_map(|(_, fact)| match fact {
+                EndFact::Environment {
+                    action: EnvironmentAction::Relink,
+                    connection,
+                    ..
+                } => *connection,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(relinked, opened[1..], "{:#?}", ran.ends);
+        for (_, fact) in &ran.ends {
+            if let EndFact::Environment {
+                action: EnvironmentAction::Close,
+                connection: Some(connection),
+                ..
+            } = fact
+            {
+                assert!(opened.contains(connection), "{connection}: {opened:?}");
+            }
+        }
+    }
 }
 
 /// A `Shutdown` step records one end for the node under test, with no

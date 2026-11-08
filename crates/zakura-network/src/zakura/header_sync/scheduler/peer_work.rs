@@ -1909,8 +1909,102 @@ mod tests {
         };
         assert_eq!(recorder.take_slots(), [vec![applying]]);
 
+        // The removal reports the round released before the slot is gone.
         assert!(queue.remove(&peer(1)).is_some());
-        assert_eq!(recorder.take_slots(), [Vec::new()]);
+        let events = recorder.take_all();
+        let released = events
+            .iter()
+            .position(|event| matches!(event, ReactorEvent::RoundReleased { .. }));
+        let gone = events
+            .iter()
+            .position(|event| *event == ReactorEvent::Slots { slots: Vec::new() });
+        assert!(
+            matches!((released, gone), (Some(released), Some(gone)) if released < gone),
+            "{events:?}"
+        );
+    }
+
+    /// The awaiting slots follow a restage to another target, an eviction
+    /// at capacity, which reports the evicted peer gone and the new one in
+    /// one list, and an unstarted removal. A body repair's round reports as
+    /// a repair.
+    #[test]
+    fn awaiting_slots_follow_restages_evictions_and_removals() {
+        let (mut queue, recorder, _observer) = observed_queue();
+        recorder.take_slots();
+        let awaiting = |marker: u8, target: &AdvertisedHeaderTarget| WorkSlot {
+            peer: peer(marker),
+            session_id: target.session_id,
+            target_tip_hash: target.status.selected_tip_hash,
+            phase: None,
+            incarnation: 0,
+            repair: false,
+            authority: target.scope,
+        };
+
+        let moved = advertisement(2);
+        assert_eq!(
+            queue.stage(peer(1), moved.clone(), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert_eq!(recorder.take_slots(), [vec![awaiting(1, &moved)]]);
+
+        let lower = advertisement(3);
+        for marker in 2..=MAX_STAGED_TARGETS_V1 {
+            let marker = u8::try_from(marker).expect("the target-slot count fits u8");
+            assert_eq!(
+                queue.stage(
+                    peer(marker),
+                    lower.clone(),
+                    PeerWorkPriority::LowerComparableWork
+                ),
+                QueueWorkResult::NeedsLocator
+            );
+        }
+        let full = recorder.take_slots().pop().expect("each stage reports");
+        assert_eq!(full.len(), MAX_STAGED_TARGETS_V1);
+        let newcomer = u8::try_from(MAX_STAGED_TARGETS_V1 + 1).expect("fits u8");
+        assert_eq!(
+            queue.stage(peer(newcomer), advertisement(4), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        let [evicted] = &recorder.take_slots()[..] else {
+            panic!("one report for the eviction and the stage");
+        };
+        assert_eq!(evicted.len(), MAX_STAGED_TARGETS_V1);
+        assert!(
+            !evicted.iter().any(|slot| slot.peer == peer(2)),
+            "{evicted:?}"
+        );
+        assert!(evicted.contains(&awaiting(newcomer, &advertisement(4))));
+
+        queue.remove_unstarted(&peer(newcomer));
+        let [removed] = &recorder.take_slots()[..] else {
+            panic!("one report for the removal");
+        };
+        assert!(!removed.iter().any(|slot| slot.peer == peer(newcomer)));
+    }
+
+    /// A round whose owner is a body repair's reports as a repair.
+    #[test]
+    fn a_body_repair_round_reports_as_a_repair() {
+        let (mut queue, recorder, _observer) = observed_queue();
+        let local = snapshot();
+        let mut request = active_request(1, advertisement(1), &local, Vec::new());
+        request.owner = zakura_header_chain::BodyWorkAuthority {
+            header: request.owner.header_authority(),
+            verified_generation: local.verified_generation,
+            body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+        }
+        .bind(7, std::num::NonZeroU64::MIN)
+        .into();
+        assert!(queue.reserve_request(&peer(1), 1));
+        recorder.take_slots();
+        assert!(queue.start(request));
+        let [started] = &recorder.take_slots()[..] else {
+            panic!("one report for the start");
+        };
+        assert!(started[0].repair, "{started:?}");
     }
 
     /// An observed round reports its reservation's opening, binding and end,

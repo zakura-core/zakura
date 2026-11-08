@@ -865,19 +865,18 @@ impl Topology {
     /// streams, from the node and to it, instead of joining the dialer's
     /// service, when `far_end` is set.
     ///
-    /// A link that replaces an earlier one to the same peer is a relink,
-    /// which the node under test's tap records ([`ends`]) before it happens.
+    /// A link to a peer that was linked before is a relink, which the node
+    /// under test's tap records ([`ends`]) before the link exists, naming
+    /// the new connection. Two relinks of one peer can overlap at the
+    /// service's scheduling points, so the earlier session the node replaces
+    /// is the admission's to say, not this record's.
     fn open(&self, dialer: usize, listener: usize, far_end: bool) -> (Link, Option<FarEnd>) {
         let peer = if dialer == 0 { listener } else { dialer };
-        if let Some(old) = self.link_to(&self.nodes[peer].name) {
-            self.environment(
-                &self.nodes[peer].name,
-                Some(old.conn_id),
-                EnvironmentAction::Relink,
-            );
-        }
         let id = self.last_id.get() + 1;
         self.last_id.set(id);
+        if self.link_to(&self.nodes[peer].name).is_some() {
+            self.environment(&self.nodes[peer].name, Some(id), EnvironmentAction::Relink);
+        }
         let (to_listener, from_dialer) = framed_channel(LINK_DEPTH);
         let (to_dialer, from_listener) = framed_channel(LINK_DEPTH);
         let tokens = [CancellationToken::new(), CancellationToken::new()];

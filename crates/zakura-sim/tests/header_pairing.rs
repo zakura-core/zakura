@@ -39,9 +39,14 @@ use zakura_scheduler::SimInstant;
 use zakura_sim::{
     harness::{
         header_node::{
+            capacity::CapacityEvidence,
+            claim::{ClaimEvidence, SettlementEvidence},
             ends::EndEvidence,
             policy::{Allow, Hold, OpKind, Select, Trigger},
             preload,
+            reservation::ReservationEvidence,
+            session::SessionEvidence,
+            stale::StaleEvidence,
             tap::ReactorTap,
             Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, HeaderNode, Policy,
             PolicySource, Topology,
@@ -185,10 +190,31 @@ enum Stop {
 /// by `stop` with no `Shutdown` notice. Returns the run and the tap's end
 /// facts.
 fn dropped_call_run(stop: Stop) -> (RunReport, EndEvidence) {
+    let (report, ends, _) = dropped_call_run_reading(stop);
+    (report, ends)
+}
+
+/// [`dropped_call_run`], with the tap also reading the reactor's resource
+/// probe into the returned evidence, and keeping its claim breaks.
+fn dropped_call_run_reading(
+    stop: Stop,
+) -> (RunReport, EndEvidence, (CapacityEvidence, ClaimEvidence)) {
     let mut sim = Sim::new(storage_config(), PlanInput::Bytes(Vec::new()));
     let port = Arc::new(ControlledPort::new(&HeaderFixture::regtest()));
-    let (observer, tap) = ReactorTap::new(&mut sim, &port, "node");
+    let capacity = CapacityEvidence::default();
+    let (observer, tap) = ReactorTap::with_evidence(
+        &mut sim,
+        &port,
+        "node",
+        SessionEvidence::default(),
+        ReservationEvidence::default(),
+        capacity.clone(),
+        SettlementEvidence::default(),
+        StaleEvidence::default(),
+        EndEvidence::default(),
+    );
     let ends = tap.ends();
+    let claims = tap.claims();
     let source = held_vct_source(&mut sim, &port, tap);
     sim.add_source(Box::new(source));
     let (held, reactor) = repairing_reactor(&port, observer);
@@ -209,7 +235,36 @@ fn dropped_call_run(stop: Stop) -> (RunReport, EndEvidence) {
     });
     let report = sim.run(&mut zakura_sim::NoChecks, &mut MemorySink::default());
     drop(held);
-    (report, ends)
+    (report, ends, (capacity, claims))
+}
+
+/// A reactor that exits by itself gets the teardown checks a stopped one
+/// does: once it's gone, each probe read is a teardown read, and an honest
+/// exit, aborted or returned, leaves nothing reserved or owned and no claim
+/// broken.
+#[test]
+fn an_exited_reactor_gets_teardown_reads() {
+    for stop in [Stop::Abort, Stop::Return] {
+        let (report, ends, (capacity, claims)) = dropped_call_run_reading(stop);
+        assert_eq!(report.end.harness, None, "{stop:?}: {:?}", report.end);
+        let exited = ends.reactor_exited().expect("the reactor exits");
+        let teardown: Vec<_> = capacity
+            .readings()
+            .into_iter()
+            .filter(|reading| reading.teardown)
+            .collect();
+        assert!(
+            teardown.first().is_some_and(|first| first.step == exited),
+            "{stop:?}: the exit's drain reads the teardown: {teardown:?}"
+        );
+        assert!(
+            teardown
+                .iter()
+                .all(|reading| reading.reserved == 0 && reading.owned == 0),
+            "{stop:?}: {teardown:?}"
+        );
+        assert_eq!(claims.records(), Vec::new(), "{stop:?}");
+    }
 }
 
 /// A real reactor that ends with a call pending in real storage, aborted or

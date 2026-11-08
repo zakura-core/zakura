@@ -51,6 +51,7 @@ fn write_explanation(out: &mut String, trace: &Trace, log: &ObservationLog) -> s
             By::Bytes => "chosen",
             By::Default => "default",
             By::Forced => "forced",
+            By::Recovery => "recovery",
         };
         writeln!(
             out,
@@ -86,7 +87,7 @@ fn pick(identity: &str) -> String {
 fn mark(by: By) -> char {
     match by {
         By::Bytes => '*',
-        By::Default | By::Forced => ' ',
+        By::Default | By::Forced | By::Recovery => ' ',
     }
 }
 

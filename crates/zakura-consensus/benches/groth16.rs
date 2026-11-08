@@ -16,10 +16,8 @@ use bellman::groth16::PreparedVerifyingKey;
 use bls12_381::Bls12;
 
 use zakura_chain::{
-    block::Block,
-    primitives::{ed25519, Groth16Proof},
-    serialization::ZcashDeserializeInto,
-    sprout::JoinSplit,
+    block::Block, primitives::Groth16Proof, serialization::ZcashDeserializeInto, sprout::JoinSplit,
+    transaction::JoinSplitPubKey,
 };
 
 use zakura_consensus::groth16::{Item, SPROUT};
@@ -29,7 +27,7 @@ use zakura_consensus::groth16::{Item, SPROUT};
 #[derive(Clone)]
 struct JoinSplitSource {
     joinsplit: JoinSplit<Groth16Proof>,
-    pub_key: ed25519::VerificationKeyBytes,
+    pub_key: JoinSplitPubKey,
 }
 
 /// Extracts JoinSplit/pub-key pairs from the mainnet test blocks.

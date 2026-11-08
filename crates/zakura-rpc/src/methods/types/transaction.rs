@@ -18,7 +18,6 @@ use zakura_chain::{
         subsidy::{block_subsidy, funding_stream_values, miner_fee_share, miner_subsidy},
         Network, NetworkUpgrade,
     },
-    primitives::ed25519,
     sapling::ValueCommitment,
     serialization::{CompactSizeMessage, ZcashSerialize},
     transaction::{
@@ -539,7 +538,7 @@ pub struct TransactionObject {
         rename = "joinSplitSig"
     )]
     #[getset(get_copy = "pub")]
-    pub(crate) joinsplit_sig: Option<[u8; ed25519::Signature::BYTE_SIZE]>,
+    pub(crate) joinsplit_sig: Option<[u8; transaction::JoinSplitSig::BYTE_SIZE]>,
 
     /// Orchard actions of the transaction.
     #[serde(rename = "orchard", skip_serializing_if = "Option::is_none")]

@@ -1418,7 +1418,12 @@ where
         // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
         // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
         let mut ed25519_verifier = primitives::ed25519::VERIFIER.clone();
-        let ed25519_item = (joinsplit_data.pub_key, joinsplit_data.sig, shielded_sighash).into();
+        let ed25519_item = (
+            ed25519_zebra::VerificationKeyBytes::from(joinsplit_data.pub_key.0),
+            ed25519_zebra::Signature::from(joinsplit_data.sig.0),
+            shielded_sighash,
+        )
+            .into();
 
         let queueing = primitives::flush::Queueing::for_request();
         checks.push(async move {

@@ -129,6 +129,14 @@ pub fn prune_finalized_state(
         }
 
         db.write_batch(batch)?;
+
+        // The marker is committed, so if this fails, the next open deletes them.
+        if let Err(error) = db.delete_pruned_static_files() {
+            tracing::warn!(
+                ?error,
+                "failed to delete pruned static files, the next open will retry"
+            );
+        }
     }
 
     if let Some((compact_from, compact_until)) = summary.compacted_height_range {

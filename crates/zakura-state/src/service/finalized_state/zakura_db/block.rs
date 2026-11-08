@@ -11,12 +11,12 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ops::RangeBounds,
+    ops::{Bound, RangeBounds},
     sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
-use itertools::Itertools;
+use itertools::{EitherOrBoth, Itertools};
 use zakura_node_services::block_memory::{
     AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, ReadMemoryExhausted,
     TransactionHandle,
@@ -131,17 +131,27 @@ impl ZakuraDb {
     ///
     /// Valid Zcash blocks always have at least a coinbase transaction, so the
     /// presence of the first transaction location is the body-availability
-    /// marker. A `false` result means the body is not serveable: either no body
-    /// has been committed yet (a header-only frontier height above the body tip),
-    /// or the body was committed and later pruned (pruning removes `tx_by_loc`
-    /// rows but retains the header). This is a body predicate, not a
-    /// "header-only" marker.
+    /// marker, in static files for moved heights and in `tx_by_loc` otherwise.
+    /// A `false` result means the body is not serveable: either no body has
+    /// been committed yet (a header-only frontier height above the body tip),
+    /// or the body was committed and later pruned (pruning removes bodies but
+    /// retains the header). This is a body predicate, not a "header-only"
+    /// marker.
     #[allow(clippy::unwrap_in_result)]
     pub fn contains_body_at_height(&self, height: block::Height) -> bool {
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
         let first_tx = TransactionLocation::min_for_height(height);
 
-        self.db.zs_contains(&tx_by_loc, &first_tx)
+        // Moved heights only read static files, see `Self::is_moved_height`.
+        if self.is_moved_height(height) {
+            return self.static_file_contains(height);
+        }
+        let in_tx_by_loc = self.db.zs_contains(&tx_by_loc, &first_tx);
+        // The block may have moved while this read ran, see `Self::raw_transaction_at`.
+        if self.is_moved_height(height) {
+            return self.static_file_contains(height);
+        }
+        in_tx_by_loc
     }
 
     /// Returns the finalized hash for a given `block::Height` if it is present.
@@ -400,10 +410,13 @@ impl ZakuraDb {
 
         // Transactions
 
-        let transactions: Vec<RawBytes> = self
-            .raw_transactions_by_height(height)
-            .map(|(_, tx)| tx)
-            .collect();
+        let transactions = self.raw_block_transactions(height);
+        // Every block has a coinbase, so no transactions means the body is
+        // missing. A secondary can see that when the primary prunes a jar
+        // its own, older pruning marker still retains.
+        if transactions.is_empty() {
+            return None;
+        }
 
         if self.raw_block_transactions_may_be_pruned(height) {
             let transaction_hashes = self.transaction_hashes_for_block(height.into())?;
@@ -566,14 +579,13 @@ impl ZakuraDb {
         &self,
         hash: transaction::Hash,
     ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, ReadMemoryExhausted> {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
         let Some(location) = self.transaction_location(hash) else {
             return Ok(None);
         };
         let Some(header) = self.block_header(location.height.into()) else {
             return Ok(None);
         };
-        let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
+        let Some(raw) = self.raw_transaction_at(location) else {
             return Ok(None);
         };
         let transaction = self.decode_transaction(&raw)?;
@@ -587,17 +599,36 @@ impl ZakuraDb {
         &self,
         hash: transaction::Hash,
     ) -> Option<(Arc<Transaction>, Height, DateTime<Utc>)> {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-
         let transaction_location = self.transaction_location(hash)?;
 
         let block_time = self
             .block_header(transaction_location.height.into())
             .map(|header| header.time);
 
-        self.db
-            .zs_get(&tx_by_loc, &transaction_location)
-            .and_then(|tx| block_time.map(|time| (tx, transaction_location.height, time)))
+        let raw = self.raw_transaction_at(transaction_location)?;
+        let tx = Arc::<Transaction>::from_bytes(raw.raw_bytes());
+
+        block_time.map(|time| (tx, transaction_location.height, time))
+    }
+
+    /// Returns the raw transaction at `location`, from static files or `tx_by_loc`.
+    ///
+    /// Moved heights only read static files, see [`Self::is_moved_height`], so
+    /// a body whose static file is gone or unreadable reads as missing. Other
+    /// heights read `tx_by_loc`, then check again whether the height moved
+    /// while this read ran, because a move adds a block to static files
+    /// before it deletes the rows.
+    #[allow(clippy::unwrap_in_result)]
+    fn raw_transaction_at(&self, location: TransactionLocation) -> Option<RawBytes> {
+        if self.is_moved_height(location.height) {
+            return self.static_file_transaction(location);
+        }
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let row = self.db.zs_get(&tx_by_loc, &location);
+        if self.is_moved_height(location.height) {
+            return self.static_file_transaction(location);
+        }
+        row
     }
 
     /// Reserve an upper bound on `raw`'s decoded transaction, decode it, and settle
@@ -624,17 +655,36 @@ impl ZakuraDb {
         )
     }
 
-    /// Returns an iterator of all raw [`Transaction`]s for a provided block
-    /// height in finalized state.
+    /// Returns the raw transactions of block `height` in finalized state, from
+    /// static files or `tx_by_loc`. Returns no transactions if the body is missing.
     #[allow(clippy::unwrap_in_result)]
-    fn raw_transactions_by_height(
-        &self,
-        height: Height,
-    ) -> impl Iterator<Item = (TransactionLocation, RawBytes)> + '_ {
-        self.raw_transactions_by_location_range(
-            TransactionLocation::min_for_height(height)
-                ..=TransactionLocation::max_for_height(height),
-        )
+    fn raw_block_transactions(&self, height: Height) -> Vec<RawBytes> {
+        // Moved heights only read static files, see `Self::raw_transaction_at`.
+        if self.is_moved_height(height) {
+            return self
+                .static_file_block_transactions(height)
+                .unwrap_or_default();
+        }
+
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let transactions: Vec<RawBytes> = self
+            .db
+            .zs_forward_range_iter(
+                tx_by_loc,
+                TransactionLocation::min_for_height(height)
+                    ..=TransactionLocation::max_for_height(height),
+            )
+            .map(|(_, raw): (TransactionLocation, RawBytes)| raw)
+            .collect();
+
+        // The block may have moved while this read ran.
+        if self.is_moved_height(height) {
+            return self
+                .static_file_block_transactions(height)
+                .unwrap_or_default();
+        }
+
+        transactions
     }
 
     /// Returns an iterator of all [`Transaction`]s in the provided range
@@ -673,12 +723,13 @@ impl ZakuraDb {
     where
         R: RangeBounds<TransactionLocation>,
     {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        self.db.zs_forward_range_iter(tx_by_loc, range)
+        self.raw_transactions_by_location_range(range)
+            .map(|(location, raw)| (location, Transaction::from_bytes(raw.raw_bytes())))
     }
 
     /// Returns an iterator of all raw [`Transaction`]s in the provided range
-    /// of [`TransactionLocation`]s in finalized state.
+    /// of [`TransactionLocation`]s in finalized state, from `tx_by_loc` and
+    /// static files merged in location order.
     #[allow(clippy::unwrap_in_result)]
     pub fn raw_transactions_by_location_range<R>(
         &self,
@@ -687,8 +738,48 @@ impl ZakuraDb {
     where
         R: RangeBounds<TransactionLocation>,
     {
+        let bounds = (range.start_bound().cloned(), range.end_bound().cloned());
+
+        // RocksDB iterators read a snapshot taken when they are created. Creating
+        // it before listing static file ranges means a concurrent move can only
+        // add a block to both sides, never remove it from both.
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        self.db.zs_forward_range_iter(tx_by_loc, range)
+        let rows = self.db.zs_forward_range_iter(tx_by_loc, range);
+
+        let start = match bounds.0 {
+            Bound::Included(location) | Bound::Excluded(location) => location.height,
+            Bound::Unbounded => Height(0),
+        };
+        let end = match bounds.1 {
+            Bound::Included(location) | Bound::Excluded(location) => location.height,
+            Bound::Unbounded => Height::MAX,
+        };
+        // Read after the snapshot, so rows the snapshot still holds for heights
+        // moved since then are dropped too, and static files supply them.
+        let moved_through = self.static_file_transactions_tip();
+        let static_rows = self
+            .static_file_ranges_within(start..=end)
+            .into_iter()
+            .flat_map(|heights| (heights.start().0..=heights.end().0).map(Height))
+            .flat_map(move |height| {
+                self.static_file_block_transactions(height)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, raw)| (TransactionLocation::from_usize(height, index), raw))
+            })
+            .filter(move |(location, _)| bounds.contains(location));
+
+        // Moved heights only read static files, see `Self::is_moved_height`.
+        let rows = rows.filter(move |(location, _)| {
+            location.height == Height(0) || moved_through.is_none_or(|tip| location.height > tip)
+        });
+        rows.merge_join_by(static_rows, |row, static_row| row.0.cmp(&static_row.0))
+            .map(|rows| match rows {
+                EitherOrBoth::Left(row) | EitherOrBoth::Right(row) | EitherOrBoth::Both(_, row) => {
+                    row
+                }
+            })
     }
 
     /// Returns `true` if raw transaction bytes exist in the half-open height range

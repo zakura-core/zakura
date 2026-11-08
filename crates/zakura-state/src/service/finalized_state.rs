@@ -31,6 +31,7 @@ use zakura_chain::{
 use zakura_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
     chain::BLOCK_INFO,
+    static_file::StaticFileMover,
     transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
 };
 
@@ -82,8 +83,6 @@ pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 pub(super) mod header_chain;
-// The state database starts using these in the next change of this stack.
-#[allow(dead_code)]
 pub(crate) mod static_file;
 pub mod treestate_artifact;
 pub mod treestate_export;
@@ -320,6 +319,12 @@ pub struct FinalizedState {
     //
     // Everything contained in this state must be shared by all clones, or read-only.
     //
+    /// Moves finalized transaction bodies into static files after commits.
+    ///
+    /// Declared before `db`, so dropping the last clone stops the mover before
+    /// this clone's database handle closes.
+    static_file_mover: Arc<StaticFileMover>,
+
     /// The underlying database.
     ///
     /// `rocksdb` allows reads and writes via a shared reference,
@@ -422,6 +427,7 @@ impl FinalizedState {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             checkpoint_raw_tx_retention_start: None,
             checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
+            static_file_mover: Arc::default(),
             db,
             vct: VctCommitState::new(vct, is_vct_sync_below_last_checkpoint),
         };
@@ -491,6 +497,12 @@ impl FinalizedState {
                 // TODO: Call ZakuradApp.shutdown or drop its Tracing component before calling exit_process to flush logs to stdout
                 Self::exit_process();
             }
+        }
+
+        // Resume moves an earlier run left waiting, such as an upgraded
+        // database's history, without waiting for the next block commit.
+        if !read_only {
+            new_state.static_file_mover.notify(&new_state.db);
         }
 
         Ok(new_state)
@@ -1382,6 +1394,8 @@ impl FinalizedState {
                 self.checkpoint_raw_tx_archive_backlog
                     .store(false, Ordering::Relaxed);
             }
+
+            self.static_file_mover.notify(&self.db);
 
             // TODO: move the stop height check to the syncer (#3442)
             if self.is_at_stop_height(height) {

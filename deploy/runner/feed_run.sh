@@ -17,6 +17,13 @@
 # open churn and any NoMigration version bump can never write through to the
 # pristine source snapshot.
 #
+# Transaction static files stay hard-linked, because copying them costs tens of
+# GB per run. A run only appends past the source's committed lengths and replaces
+# configs by rename, so the next clone's open trims those bytes and the source
+# stays readable. Two runs at once would trim each other's committed bytes, so a
+# lock on the source allows one run per snapshot at a time. This assumes the
+# source was shut down cleanly, so its static files match its database.
+#
 # Usage: feed_run.sh LABEL BIN [stop] [met] [maxsec]
 set -uo pipefail
 
@@ -97,6 +104,12 @@ if [ -n "${BENCH_FROM_GENESIS:-}" ]; then
   rm -rf "$FORK"
   mkdir -p "$FORK/$DBREL"
 else
+  # Held by this shell and the node it starts, so it lasts the whole run.
+  exec 9>"$MASTER/.feedrun.lock"
+  if ! flock -n 9; then
+    echo "FATAL: another feed_run is using $MASTER; its static files can't be shared by two runs"
+    exit 1
+  fi
   echo "[$LABEL] safe-cloning $MASTER -> $FORK"
   rm -rf "$FORK"
   mkdir -p "$FORK/$(dirname "$DBREL")"

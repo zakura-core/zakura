@@ -137,7 +137,7 @@ pub(crate) async fn startup_upgrades_previous_database_test() -> Result<()> {
     let test_dir = output.dir.take().expect("the saved database is kept");
     let state_config = config.mirrored_state_config();
     let current_version = zakura_state::state_database_format_version_in_code();
-    let previous_version = semver::Version::new(29, 1, 0);
+    let previous_version = semver::Version::new(30, 0, 0);
     let kind = zakura_state::constants::STATE_DATABASE_KIND;
     let current_path = state_config.db_path(kind, current_version.major, &net);
     let previous_path = state_config.db_path(kind, previous_version.major, &net);
@@ -150,7 +150,7 @@ pub(crate) async fn startup_upgrades_previous_database_test() -> Result<()> {
             None,
             "startup upgrade test",
         )?;
-        // v30 changes the version boundary, while retaining v29's chain row encodings.
+        // v31 changes the version boundary, while retaining v30's chain row encodings.
         zakura_state::write_database_format_version_to_disk(
             &state_config,
             kind,

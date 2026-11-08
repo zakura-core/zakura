@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-recover-invalidations.bin`, a fuzz-12 item 7 witness whose run
+# shows Recovered. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "ee035130252797d008682fa20b64854dcc394aefc1e919f14e99a6fb676f9a2e"
+scenario_sha256 = "16bed9a78ea35168dd89444b4b68b6b90e0f463142cd9cb305a7cb4b296eb7c5"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-reply-after-shutdown.bin`, a fuzz-12 item 7 witness whose run
+# shows DeliveredAfter { action: "shutdown", delivered: false }. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "b77d3cfa5b5559096221d77ffa2cedfbf6788736f265c47434f621178c81ce01"
+scenario_sha256 = "43b535635ad1dbd47cf87d390639f8f1220317fc5d4932d70dceb79f5d741658"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

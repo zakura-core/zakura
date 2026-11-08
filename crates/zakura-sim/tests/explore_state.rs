@@ -32,13 +32,10 @@ use zakura_sim::{
         },
         block_sync::{BlockScenario, Storage as BlockStorage},
         header_node::{
-            policy::{
-                Allow, Hold as HeaderHold, OpKind, Select as HeaderSelect, Trigger as HeaderTrigger,
-            },
-            Chain, ControlAction as HeaderAction, ControlStep as HeaderControl, Fork,
+            policy::{Allow, Hold as HeaderHold, Trigger as HeaderTrigger},
             Policy as HeaderPolicy,
         },
-        header_sync::{Dialer, HeaderWire, MirrorSpec, Storage as HeaderStorage, StorageScenario},
+        header_sync::{HeaderWire, Storage as HeaderStorage, StorageScenario},
         run_harness,
         wire_plans::act_scenario,
         HarnessError, Subsystem,

@@ -250,13 +250,17 @@ fn committed_storage_seeds_are_migrated_generator_2_seeds() {
                 .into_owned()
         })
         .collect();
-    assert_eq!(stems.len(), SEEDS.len() + DRAWN.len() + 1, "{stems:?}");
+    // `tests/header_storage_witness_seeds.rs` owns the item 7 witnesses.
+    let witness = |stem: &str| stem.starts_with("header-storage-w-");
+    let ours = stems.iter().filter(|stem| !witness(stem)).count();
+    assert_eq!(ours, SEEDS.len() + DRAWN.len() + 1, "{stems:?}");
     assert!(stems.contains(&"header-sync-storage-default".to_owned()));
-    for seed in &report.admitted {
+    for (seed, name) in report.admitted.iter().zip(&stems) {
         let stem = seed.path.display();
-        if DRAWN
-            .iter()
-            .any(|(drawn, ..)| seed.path.ends_with(format!("{drawn}.bin")))
+        if witness(name)
+            || DRAWN
+                .iter()
+                .any(|(drawn, ..)| seed.path.ends_with(format!("{drawn}.bin")))
         {
             assert_eq!(seed.sidecar.derived_from, None, "{stem}");
             continue;

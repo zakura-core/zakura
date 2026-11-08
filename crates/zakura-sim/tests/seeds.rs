@@ -90,6 +90,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
             workers: 1,
         });
     }
+    if let Some((_, scenario)) = storage_witnesses::witness_seeds()
+        .into_iter()
+        .find(|(witness, _)| witness == stem)
+    {
+        return value(scenario);
+    }
     match stem {
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {

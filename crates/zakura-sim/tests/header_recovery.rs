@@ -18,20 +18,20 @@ use std::{
     sync::Arc,
 };
 
-use support::inputs;
+use support::{inputs, storage_witnesses};
 use tempfile::TempDir;
 use zakura_scheduler::SimInstant;
 use zakura_sim::{
     check::after_step,
     harness::{
         header_node::{
-            policy::{Hold, OpKind, ReplyHold, Select, Trigger},
+            policy::Trigger,
             recovery::{
                 live_sessions, membership_changed, session_lasts, Member, RecoveryEvidence,
                 RecoveryRecord,
             },
             session::{SessionEvidence, SessionFact},
-            Chain, ControlAction, ControlStep, Policy, Reset,
+            Chain, ControlAction, ControlStep, Policy,
         },
         header_sync::{grammar, Dialer, MirrorSpec, Storage, StorageScenario, Weights},
         run_prepared, Subsystem,
@@ -227,61 +227,7 @@ impl Run {
 
 /// Every witness, by the prefix class it recovers from.
 fn witnesses() -> Vec<(&'static str, StorageScenario)> {
-    let mut holds = scenario(vec![recover(Some(Trigger::Submitted(Select::nth(
-        OpKind::Prepare,
-        1,
-    ))))]);
-    holds.policy.holds.push(Hold {
-        select: Select::nth(OpKind::Prepare, 1),
-        until: Trigger::Released,
-        then: vec![policy_engine()],
-        deadline_ms: None,
-    });
-    // Every prepare fails until the recover, a minute in.
-    let mut faults = scenario(vec![recover(Some(Trigger::VirtualTime(60_000)))]);
-    faults.policy.holds.push(Hold {
-        select: Select {
-            kind: Some(OpKind::Prepare),
-            ..Select::default()
-        },
-        until: Trigger::VirtualTime(0),
-        then: vec![zakura_sim::harness::header_node::policy::Allow::LocalResource],
-        deadline_ms: None,
-    });
-    let invalidations = scenario(vec![
-        step(
-            NODE,
-            ControlAction::Reset(Reset::Invalidate { depth: 0 }),
-            Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
-        ),
-        recover(None),
-    ]);
-    let mut reply_holds = scenario(vec![recover(Some(Trigger::Committed(Select::nth(
-        OpKind::Apply,
-        1,
-    ))))]);
-    reply_holds.policy.reply_holds.push(ReplyHold {
-        select: Select::nth(OpKind::Apply, 1),
-        until: Trigger::VirtualTime(3_600_000),
-    });
-    vec![
-        (
-            "closes",
-            scenario(vec![
-                step(SOURCE, ControlAction::Close, None),
-                recover(None),
-            ]),
-        ),
-        ("holds", holds),
-        ("faults", faults),
-        ("invalidations", invalidations),
-        ("reply holds", reply_holds),
-    ]
-}
-
-/// The hold outcome that runs the operation.
-fn policy_engine() -> zakura_sim::harness::header_node::policy::Allow {
-    zakura_sim::harness::header_node::policy::Allow::Engine
+    storage_witnesses::recovery_witnesses()
 }
 
 /// The storage facts `run` logged, with their steps.

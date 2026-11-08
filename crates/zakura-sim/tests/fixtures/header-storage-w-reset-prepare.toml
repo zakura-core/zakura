@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-reset-prepare.bin`, a fuzz-12 item 7 witness whose run
+# shows HeldAcrossReset(Prepare). Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "f75996f5dfa2ee08335ed607116105686d5227bd4661aa269e49eefcc01e239b"
+scenario_sha256 = "e197f218dd3568f0240181c91f6a4db03ff74ae864a28189ebcb25db38b9ad07"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

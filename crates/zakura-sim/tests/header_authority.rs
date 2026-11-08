@@ -23,9 +23,10 @@ use zakura_sim::{
         header_sync::{Dialer, MirrorSpec, Storage, StorageScenario},
         run_prepared, Subsystem,
     },
-    observe::ReactorFact,
+    observe::{ReactorFact, StorageFact, StorageRequest, StorageResult},
     MemorySink, Observation, PlanInput, RunReport,
 };
+use zakura_storage::header::fixture::HeaderFixture;
 
 /// A mirror holding `chain`, which dials the node.
 fn mirror(chain: Chain) -> MirrorSpec {
@@ -191,18 +192,77 @@ fn every_witness_holds_and_applies() {
     }
 }
 
-/// Each witness takes the path it names: both forks' rounds start, on two
-/// targets; the multi-page sync reaches A300 in one round; and a replaced
-/// session's round starts on the new session.
+/// The targets the node applied, in order, by hash as the log writes it.
+fn applied(report: &RunReport) -> Vec<String> {
+    let mut targets = std::collections::HashMap::new();
+    let mut applied = Vec::new();
+    for entry in report.log.entries() {
+        let Observation::Storage { fact, .. } = &entry.obs else {
+            continue;
+        };
+        match fact {
+            StorageFact::Submitted {
+                request: StorageRequest::ApplyHeaderTarget { target, .. },
+                id,
+                ..
+            } => {
+                targets.insert(*id, target.clone());
+            }
+            StorageFact::Completed {
+                id,
+                result: StorageResult::Applied,
+                ..
+            } => applied.extend(targets.get(id).cloned()),
+            _ => {}
+        }
+    }
+    applied
+}
+
+/// `hash` as the log writes it.
+fn logged(hash: zakura_chain::block::Hash) -> String {
+    hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Each witness takes the path it names: the node applies the fork's tip,
+/// then the grown main chain's, and ends on the main chain; the multi-page
+/// sync reaches A300 in one round; and a replaced session's round starts
+/// on the new session.
 #[test]
 fn each_witness_takes_the_path_it_names() {
+    let fixture = HeaderFixture::regtest();
+    let fork_tip = logged(
+        Chain {
+            main: 3,
+            fork: Some(Fork { branch: 1, len: 5 }),
+        }
+        .tip(&fixture)
+        .hash,
+    );
+    let main_tip = Chain::main(10).tip(&fixture);
     for input in inputs(8, 256) {
-        let started = starts(&run(&forks_sharing_a_header(), input.clone()));
-        let targets: std::collections::BTreeSet<_> = started
+        let scenario = forks_sharing_a_header();
+        let ports = Storage::prepare(&scenario);
+        let node = ports.node.clone();
+        let report = run_prepared::<Storage>(
+            &scenario,
+            ports,
+            input.clone(),
+            &mut MemorySink::default(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        let applied = applied(&report);
+        let fork_at = applied.iter().position(|target| *target == fork_tip);
+        let main_at = applied
             .iter()
-            .map(|(_, _, target)| target.clone())
-            .collect();
-        assert!(targets.len() >= 2, "{started:?}");
+            .position(|target| *target == logged(main_tip.hash));
+        assert!(
+            matches!((fork_at, main_at), (Some(fork), Some(main)) if fork < main),
+            "{applied:?}"
+        );
+        assert_eq!(node.engine().snapshot().frontiers.header_best, main_tip);
 
         let scenario = multi_page_sync();
         let ports = Storage::prepare(&scenario);
@@ -290,26 +350,27 @@ fn regenerate_authority_witnesses() {
     }
 }
 
-/// The forks witness's log and the property's report depend only on the
+/// Each witness's log and the property's report depend only on the
 /// scenario and the plan: plan A twice, then B, then A again, gives A's
 /// every time, and B's log differs.
 #[test]
-fn the_authority_witness_repeats_a_a_and_a_b_a() {
-    let scenario = forks_sharing_a_header();
-    let plans = [committed_plan(), vec![7; 256]];
-    let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
-        .into_iter()
-        .map(|plan| {
-            let report = run(&scenario, zakura_sim::Plan::from_fuzz(plan));
-            (
-                format!("{:?}", report.log.entries()),
-                format!("{:?}", outcome(&report, COMMIT_ONLY_AUTHORIZED)),
-            )
-        })
-        .collect();
-    assert_eq!(runs[0], runs[1], "plan A, then A");
-    assert_eq!(runs[0], runs[3], "plan A, then B, then A");
-    assert_ne!(runs[0].0, runs[2].0, "plan B's log differs");
+fn every_authority_witness_repeats_a_a_and_a_b_a() {
+    for (name, scenario) in witnesses() {
+        let plans = [committed_plan(), vec![7; 256]];
+        let runs: Vec<(String, String)> = [&plans[0], &plans[0], &plans[1], &plans[0]]
+            .into_iter()
+            .map(|plan| {
+                let report = run(&scenario, zakura_sim::Plan::from_fuzz(plan));
+                (
+                    format!("{:?}", report.log.entries()),
+                    format!("{:?}", outcome(&report, COMMIT_ONLY_AUTHORIZED)),
+                )
+            })
+            .collect();
+        assert_eq!(runs[0], runs[1], "{name}: plan A, then A");
+        assert_eq!(runs[0], runs[3], "{name}: plan A, then B, then A");
+        assert_ne!(runs[0].0, runs[2].0, "{name}: plan B's log differs");
+    }
 }
 
 /// `record --witness` judges each committed witness as `cargo xtask

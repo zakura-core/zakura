@@ -23,7 +23,9 @@ use zakura_sim::{
     },
     harness::{
         header_node::{Chain, Policy},
-        header_sync::{HeaderWire, WireScenario, FAMILY, HEADER_FAULT_PENALIZED},
+        header_sync::{
+            storage_properties, HeaderWire, WireScenario, FAMILY, HEADER_FAULT_PENALIZED,
+        },
         run_prepared,
         wire_plans::{act_scenario, SavedPlan},
         HarnessError, LinkSpec, NetScenario, Subsystem,
@@ -256,8 +258,18 @@ fn the_harness_registers_the_generated_header_ids() {
         .collect();
     expected.push(HONEST_NEVER_PUNISHED.to_owned());
     expected.push(HONEST_PROGRESS.to_owned());
-    assert_eq!(registered[5], HEADER_FAULT_PENALIZED);
-    assert_eq!(registered[6..], expected[..]);
+    // The storage harness's properties come first, then the fault
+    // property, then the generated ones.
+    let fault = registered
+        .iter()
+        .position(|id| id == HEADER_FAULT_PENALIZED)
+        .expect("the wire harness registers the fault property");
+    assert_eq!(
+        fault,
+        storage_properties::<HeaderWire>().len(),
+        "{registered:?}"
+    );
+    assert_eq!(registered[fault + 1..], expected[..]);
 }
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`,

@@ -138,6 +138,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_reset_invalidates.rs"
+test = "regenerate_reset_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset witnesses from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_storage_seeds.rs"
 test = "regenerate_storage_seeds"
 run = false

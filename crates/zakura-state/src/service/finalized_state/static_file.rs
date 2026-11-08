@@ -460,8 +460,25 @@ fn open_regular_file(path: &Path, writable: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    // Opens a link itself instead of its target, so the check below sees it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    // The handle's own metadata, which doesn't follow a link.
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = false;
+    if is_link || !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "static file is not a regular file",
@@ -471,7 +488,8 @@ fn open_regular_file(path: &Path, writable: bool) -> io::Result<File> {
 }
 
 /// Creates a new jar file at `path`, first removing any leftover entry there,
-/// so a planted link can't redirect the write to another file.
+/// so a planted link can't redirect the write to another file. On Windows,
+/// `create_new` already opens without following a link.
 fn create_regular_file(path: &Path) -> Result<File, StaticFileError> {
     remove_file(path)?;
     let mut options = OpenOptions::new();

@@ -916,7 +916,12 @@ impl Subsystem for Storage {
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
         tap.watch_chain(ports.chain_effect.clone());
-        tap.watch_authority(ports.authority.clone(), ports.fixture.clone());
+        let branches = scenario
+            .mirrors
+            .iter()
+            .flat_map(|mirror| mirror.chain.branches())
+            .chain(scenario.node.branches());
+        tap.watch_authority(ports.authority.clone(), ports.fixture.clone(), branches, []);
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1349,7 +1354,18 @@ impl Subsystem for HeaderWire {
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
         tap.watch_chain(ports.chain_effect.clone());
-        tap.watch_authority(ports.authority.clone(), ports.fixture.clone());
+        let declared = ports
+            .chains
+            .iter()
+            .flatten()
+            .filter_map(|chain| chain.invalid_link());
+        // Every peer serves an honest chain on branch 0.
+        tap.watch_authority(
+            ports.authority.clone(),
+            ports.fixture.clone(),
+            scenario.node.branches(),
+            declared,
+        );
 
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();

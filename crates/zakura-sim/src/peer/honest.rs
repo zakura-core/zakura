@@ -194,6 +194,14 @@ impl HonestChain {
         self.invalid
     }
 
+    /// The invalid tip's parent's hash and its own, if the chain has one.
+    pub fn invalid_link(&self) -> Option<(block::Hash, block::Hash)> {
+        let tip = self.invalid?;
+        // The invalid tip is the last header.
+        let header = self.headers.last()?;
+        Some((header.previous_block_hash, tip.hash))
+    }
+
     /// The height of the header `hash` on this chain, the anchor's
     /// included.
     pub(super) fn height(&self, hash: block::Hash) -> Option<u32> {

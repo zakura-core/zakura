@@ -87,6 +87,7 @@ use std::{
     time::Duration,
 };
 
+use zakura_chain::block;
 use zakura_network::zakura::{
     observe::{
         CallEnd, ClaimBreak, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase,
@@ -1085,14 +1086,22 @@ impl ReactorTap {
 
     /// Checks from now on that each round's owner is bound to its `Open`
     /// and each staged page lies on its requested path among `fixture`'s
-    /// headers, as [`super::authority`] describes, keeping when the check
-    /// applied in `evidence`. Call it before the run starts.
-    pub fn watch_authority(&self, evidence: AuthorityEvidence, fixture: HeaderFixture) {
+    /// headers on `branches` and the scenario's `declared` `(parent,
+    /// header)` hash pairs, as [`super::authority`] describes, keeping when
+    /// the check applied in `evidence`. Call it before the run starts.
+    pub fn watch_authority(
+        &self,
+        evidence: AuthorityEvidence,
+        fixture: HeaderFixture,
+        branches: impl IntoIterator<Item = u8>,
+        declared: impl IntoIterator<Item = (block::Hash, block::Hash)>,
+    ) {
         *self
             .state
             .authority
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Authority::new(evidence, fixture));
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Authority::new(evidence, fixture, branches, declared));
     }
 
     /// The node's stamps, which every fact the tap and the harness keep

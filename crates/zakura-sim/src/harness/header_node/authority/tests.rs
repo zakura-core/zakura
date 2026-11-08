@@ -128,11 +128,93 @@ fn page(request: &RequestRef, ancestor: Frontier, hashes: &[block::Hash]) -> Rea
 
 /// The breaks `events` give, fed in order on the reactor's task.
 fn breaks(events: &[ReactorEvent]) -> Vec<String> {
-    let mut check = Authority::new(AuthorityEvidence::default(), HeaderFixture::regtest());
+    breaks_declaring(&[], events)
+}
+
+/// [`breaks`], with `declared` `(parent, header)` pairs beyond the fixture.
+fn breaks_declaring(
+    declared: &[(block::Hash, block::Hash)],
+    events: &[ReactorEvent],
+) -> Vec<String> {
+    let mut check = Authority::new(
+        AuthorityEvidence::default(),
+        HeaderFixture::regtest(),
+        [0, 1, 2],
+        declared.iter().copied(),
+    );
     for event in events {
         check.observe(event, true);
     }
     check.drain(1)
+}
+
+/// A page on a fork branch the scenario uses holds, and on one it doesn't
+/// use breaks the path rule.
+#[test]
+fn a_page_on_a_scenario_branch_holds() {
+    let fixture = HeaderFixture::regtest();
+    let genesis = fixture.anchor();
+    let fork = fixture.extend(genesis, 2, 5);
+    let tip = Frontier::new(block::Height(2), fork[1].hash());
+    let round = request(1, tip.hash, genesis.hash);
+    let events = [
+        adopted(),
+        open(tip, &[genesis.hash]),
+        started(round.clone(), &[genesis.hash]),
+        page(&round, genesis, &[fork[0].hash(), fork[1].hash()]),
+    ];
+    let with = |branches: &[u8]| {
+        let mut check = Authority::new(
+            AuthorityEvidence::default(),
+            HeaderFixture::regtest(),
+            branches.iter().copied(),
+            [],
+        );
+        for event in &events {
+            check.observe(event, true);
+        }
+        check.drain(1)
+    };
+    assert_eq!(with(&[0, 5]), Vec::<String>::new());
+    let found = with(&[0, 1, 2]);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("isn't a fixture or declared child")),
+        "{found:?}"
+    );
+}
+
+/// A page ending at a header the scenario declares beyond the fixture, as
+/// an invalid tip a peer advertises, holds. The same page without the
+/// declaration breaks the path rule.
+#[test]
+fn a_declared_header_is_on_its_path() {
+    let chain = main_chain(3);
+    let genesis = HeaderFixture::regtest().anchor();
+    let invalid = Frontier::new(block::Height(3), block::Hash([9; 32]));
+    let round = request(1, invalid.hash, genesis.hash);
+    let events = [
+        adopted(),
+        open(invalid, &[genesis.hash]),
+        started(round.clone(), &[genesis.hash]),
+        page(
+            &round,
+            genesis,
+            &[chain[0].hash, chain[1].hash, invalid.hash],
+        ),
+    ];
+    assert_eq!(
+        breaks_declaring(&[(chain[1].hash, invalid.hash)], &events),
+        Vec::<String>::new()
+    );
+    let found = breaks(&events);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("isn't a fixture or declared child")),
+        "{found:?}"
+    );
 }
 
 /// A round bound to its Open that stages the chain to its target in two
@@ -207,7 +289,10 @@ fn a_page_off_its_path_breaks() {
         breaks(&events)
     };
     let skipped = with(vec![page(&round, genesis, &[chain[1].hash])]);
-    assert!(skipped[0].contains("isn't a fixture child"), "{skipped:?}");
+    assert!(
+        skipped[0].contains("isn't a fixture or declared child"),
+        "{skipped:?}"
+    );
     let undeclared = with(vec![page(&round, chain[0], &[chain[1].hash])]);
     assert!(
         undeclared[0].contains("not one of its Open's locators"),

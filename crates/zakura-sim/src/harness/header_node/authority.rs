@@ -2,9 +2,11 @@
 //! the reactor's facts as its tap receives them.
 //!
 //! The model is the fixture: every header a run can hold is
-//! [`HeaderFixture::extend`]'s child of its parent on branch 0, 1 or 2,
-//! so a page's headers are checked one by one as children of the header
-//! before, with no list of chains. Authority comes from what the node
+//! [`HeaderFixture::extend`]'s child of its parent on one of the branches
+//! the scenario's chains use, or one the scenario declares beyond it (an honest chain's invalid tip,
+//! which its peer advertises and storage rejects at prepare), so a page's
+//! headers are checked one by one as children of the header before, with
+//! no list of chains. Content is storage's to judge, not this check's. Authority comes from what the node
 //! asked for, the `Open` the subscriber built for each subscription, and
 //! never from production's own guards.
 //!
@@ -50,9 +52,6 @@ use zakura_storage::header::fixture::HeaderFixture;
 /// A subscription, by its peer, session and ID.
 type Subscription = (ZakuraPeerId, u64, u64);
 
-/// The fixture branches a header can be on.
-const BRANCHES: [u8; 3] = [0, 1, 2];
-
 /// An `Open` as the subscriber built it.
 #[derive(Clone, Debug)]
 struct Open {
@@ -97,6 +96,11 @@ impl AuthorityEvidence {
 /// The check's state.
 pub(super) struct Authority {
     fixture: HeaderFixture,
+    /// The fixture branches the scenario's chains use.
+    branches: Vec<u8>,
+    /// The headers the scenario declares beyond the fixture, by their
+    /// parent's hash.
+    declared: HashMap<block::Hash, Vec<block::Hash>>,
     /// The reactor's adopted finality anchor.
     anchor: Option<block::Hash>,
     /// Each subscription's `Open`.
@@ -110,11 +114,26 @@ pub(super) struct Authority {
 }
 
 impl Authority {
-    /// A check on `fixture`'s headers that keeps when it applied in
-    /// `evidence`.
-    pub(super) fn new(evidence: AuthorityEvidence, fixture: HeaderFixture) -> Authority {
+    /// A check on `fixture`'s headers on `branches` and the `declared`
+    /// ones beyond it, each a `(parent, header)` hash pair, that keeps when
+    /// it applied in `evidence`.
+    pub(super) fn new(
+        evidence: AuthorityEvidence,
+        fixture: HeaderFixture,
+        branches: impl IntoIterator<Item = u8>,
+        declared: impl IntoIterator<Item = (block::Hash, block::Hash)>,
+    ) -> Authority {
+        let mut branches: Vec<u8> = branches.into_iter().collect();
+        branches.sort_unstable();
+        branches.dedup();
+        let mut children: HashMap<block::Hash, Vec<block::Hash>> = HashMap::new();
+        for (parent, header) in declared {
+            children.entry(parent).or_default().push(header);
+        }
         Authority {
             fixture,
+            branches,
+            declared: children,
             anchor: None,
             opens: HashMap::new(),
             started: HashSet::new(),
@@ -288,7 +307,7 @@ impl Authority {
             let height = block::Height(parent.height.0.saturating_add(1));
             if !self.children(parent).contains(hash) {
                 found.push(format!(
-                    "carried {hash} at height {}, which isn't a fixture child of {parent:?}",
+                    "carried {hash} at height {}, which isn't a fixture or declared child of {parent:?}",
                     height.0
                 ));
                 break;
@@ -319,9 +338,20 @@ impl Authority {
         }
     }
 
-    /// The fixture headers that can extend `parent`, one per branch.
-    fn children(&self, parent: Frontier) -> [block::Hash; 3] {
-        BRANCHES.map(|branch| self.fixture.extend(parent, 1, branch)[0].hash())
+    /// The headers that can extend `parent`: the fixture's, one per
+    /// branch the scenario uses, and the scenario's declared ones.
+    fn children(&self, parent: Frontier) -> Vec<block::Hash> {
+        self.branches
+            .iter()
+            .map(|branch| self.fixture.extend(parent, 1, *branch)[0].hash())
+            .chain(
+                self.declared
+                    .get(&parent.hash)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .collect()
     }
 }
 

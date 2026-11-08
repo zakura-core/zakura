@@ -134,6 +134,11 @@ impl Chain {
         segments
     }
 
+    /// The fixture branches its headers are on: 0, and its fork's.
+    pub fn branches(&self) -> impl Iterator<Item = u8> {
+        std::iter::once(0).chain(self.fork.map(|fork| fork.branch))
+    }
+
     /// The chain's tip.
     pub fn tip(&self, fixture: &HeaderFixture) -> Frontier {
         self.segments(fixture)

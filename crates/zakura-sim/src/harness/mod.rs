@@ -17,6 +17,7 @@ pub mod block_work;
 pub mod coverage;
 pub mod discovery;
 pub mod discovery_machine;
+pub mod discovery_service;
 pub mod fixtures;
 pub mod header_node;
 pub mod header_sync;
@@ -487,6 +488,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),
+    entry::<header_sync::ReleaseWake>(),
     entry::<block_sync::Storage>(),
     entry::<header_sync::HeaderWire>(),
 ];

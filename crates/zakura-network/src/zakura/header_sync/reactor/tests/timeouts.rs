@@ -245,7 +245,7 @@ fn direct_vct_reactor_with_fatal_events(
     (handle, reactor, snapshot, fatal_rx)
 }
 
-fn prepared_vct_target(
+pub(super) fn prepared_vct_target(
     reactor: &HeaderSyncReactor,
     snapshot: &zakura_header_chain::EngineSnapshot,
     peer: &ZakuraPeerId,

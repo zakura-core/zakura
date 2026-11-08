@@ -1101,7 +1101,8 @@ pub(super) struct SchedulingOpportunity {
 pub(super) const CACHED_PASS_BURST: u32 = 32;
 
 /// The interval that refills one full cached-offer pass.
-pub(super) const CACHED_PASS_REFILL: std::time::Duration = std::time::Duration::from_millis(1);
+pub(in crate::zakura::header_sync) const CACHED_PASS_REFILL: std::time::Duration =
+    std::time::Duration::from_millis(1);
 
 /// A token bucket of full cached-offer passes; see [`CACHED_PASS_BURST`].
 #[derive(Clone, Copy, Debug)]

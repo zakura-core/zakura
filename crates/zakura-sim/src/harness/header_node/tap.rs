@@ -14,19 +14,24 @@
 //! A call caught panicking ends the run with
 //! [`HarnessFailure::ReactorPortPanicked`] once its drain is logged.
 //!
-//! The reactor's teardown is done once the observer is gone, since every pending
-//! call's future holds a clone through its drop. Every dropped call's operation
-//! must have its drop receipt by then, unless storage's shutdown removed it while
-//! the call still existed, or the run fails as `UnpairedDrop`. A run that ends
-//! before the teardown is done leaves that open.
+//! The reactor's teardown is done once its task, which its resource probe
+//! names, has ended, since every pending call's future ends with it. A tap no
+//! reactor handed a probe goes by its observer instead, which only the
+//! reactor holds. Every dropped call's operation must have its drop receipt
+//! by then, unless storage's shutdown removed it while the call still
+//! existed, or the run fails as `UnpairedDrop`. A run that ends before the
+//! teardown is done leaves that open.
 //!
 //! A reactor that goes away during the run fails it as `ReactorGone`, unless
 //! the harness stopped it on purpose. A [`TapShutdown`] tells the tap so
-//! before the stop begins. The drain that finds the observer gone is then the
+//! before the stop begins. The drain that finds the reactor gone is then the
 //! tap's final read: it logs the reactor's last events and runs the teardown
-//! checks above. A reactor that unwound still fails as `ReactorGone`, and a
-//! run that ends idle or at its budget before that read fails as
-//! `ShutdownIncomplete`.
+//! checks above, and the node has settled unless they fail. A reactor that
+//! unwound still fails as `ReactorGone`. A run that ends idle, or at its
+//! budget with a drain that ran dry, before that read fails as
+//! `ShutdownIncomplete`. One whose drain was cut off at its bound leaves the
+//! stop honestly unfinished, which `header-sync/teardown-returns-baseline`
+//! reports as inconclusive.
 //!
 //! The reactor's reservations and admissions stay out of the log, like its
 //! retained-header ownership, so pinned Plans keep their format. The tap hands
@@ -47,6 +52,13 @@
 //! So do the readmission cooldowns the reactor starts and the sessions it
 //! refuses. The tap keeps them, with the time of each and of each admission,
 //! in a [`CooldownEvidence`] that the harness's view reads.
+//!
+//! A broken claim rule, a rule a production bug alone can break and a
+//! property's claim names ([`super::claim`]), doesn't fail the run at once.
+//! The tap records it in its [`ClaimEvidence`] at the drain that found it,
+//! for the owning property to report at that step. A break no property
+//! reported fails the run at the next drain, or at the run's end, as any
+//! other rule does, so a harness without that property never drops it.
 //!
 //! A tap made with a [`CapacityEvidence`] also reads the reactor's resource
 //! probe after each drain, and checks it against the ownership check's
@@ -70,23 +82,27 @@ use std::{
 
 use zakura_network::zakura::{
     observe::{
-        CallEnd, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase, HeaderWorkLedger,
-        PortCall, ReactorEvent, RefusalCause, RequestRef, StorageCallKind, WaitCause,
+        CallEnd, ClaimBreak, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase,
+        HeaderWorkLedger, PortCall, ReactorEvent, RefusalCause, RequestRef, StorageCallKind,
+        WaitCause,
     },
     HeaderSyncMisbehavior, HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_rt::sim::RunId;
-use zakura_scheduler::{SimInstant, TaskId};
+use zakura_scheduler::{SimInstant, TaskExit, TaskId};
 use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
-    capacity::{self, CapacityEvidence, CapacityReading, Expected},
+    capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
+    claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
     policy::LinkEffect,
     reservation::ReservationEvidence,
     session::SessionEvidence,
+    stale::{StaleCheck, StaleEvidence},
+    wake::{WakeCheck, WakeEvidence},
 };
 use crate::{
     draws::Failure,
@@ -94,7 +110,8 @@ use crate::{
     observe::{ReactorCall, ReactorFact, ReactorPurpose, ReactorRequest, StorageFact},
     sim::MidPoll,
     storage::{body_owner, hash, hex, point, scope, work_owner},
-    ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Sim,
+    ActionSource, Boundary, HarnessFailure, Identity, Observation, ObservationLog, Outcome, RunEnd,
+    Sim,
 };
 
 /// The run's reader of one reactor's events. Dropping it while the run is
@@ -151,6 +168,21 @@ struct TapState {
     off_reactor: Mutex<Option<TaskId>>,
     /// The reactor's cooldowns, refusals and admissions, for the view.
     cooldowns: CooldownEvidence,
+    /// The claim rules its drains found broken, for the view.
+    claims: ClaimEvidence,
+    /// Set once a drain found the stopped reactor's teardown done.
+    settled: AtomicBool,
+    /// The teardown claims reads after the stopped reactor was gone found,
+    /// each reported once.
+    teardown_claims: Mutex<Vec<Claim>>,
+    /// The released rounds each drain found, for the view.
+    rounds: SettlementEvidence,
+    /// Checks each stale call's handler as its facts arrive, keeping the
+    /// stale calls it finds for the view.
+    stale: Mutex<StaleCheck>,
+    /// Checks for offers a budget return should wake, keeping its facts for
+    /// the view. Inert until [`ReactorTap::watch_wakes`].
+    wake: Mutex<WakeCheck>,
 }
 
 /// The resource probe a tap was handed.
@@ -165,11 +197,15 @@ enum ProbeSlot {
     Replaced,
 }
 
-/// The tap's ownership check, and the first rule a history broke.
+/// The tap's ownership check, the first integrity rule a history broke,
+/// and the claim breaks not yet drained.
 #[derive(Default)]
 struct WorkCheck {
     ledger: HeaderWorkLedger,
     broken: Option<String>,
+    claims: Vec<ClaimBreak>,
+    /// Whether the teardown check ran.
+    finished: bool,
 }
 
 /// Events recorded and not yet drained.
@@ -191,12 +227,61 @@ impl TapState {
         self.buffer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Feeds `event` to the ownership check, keeping the first broken rule.
+    /// Feeds `event` to the ownership check, keeping the first broken
+    /// integrity rule and every claim break.
     fn check_work(&self, event: &ReactorEvent) {
         let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
         if work.broken.is_none() {
             work.broken = work.ledger.observe(event).err();
+            let claims = work.ledger.take_claims();
+            work.claims.extend(claims);
         }
+    }
+
+    /// Fails with the first claim break an earlier drain found that no
+    /// property reported, then records the claim breaks since the last drain
+    /// as the drain of `step` found them, and the released rounds the ledger
+    /// holds now.
+    fn drain_claims(&self, step: u64) -> Result<(), String> {
+        if let Some(record) = self.claims.unreported(Some(step)) {
+            return Err(record.detail);
+        }
+        let claims = mem::take(
+            &mut self
+                .work
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .claims,
+        );
+        for broken in claims {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::of(broken.rule),
+                detail: broken.detail,
+            });
+        }
+        let stale = self
+            .stale
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(step);
+        for detail in stale {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::StaleCompletionEffect,
+                detail,
+            });
+        }
+        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        self.rounds.record(Settlement {
+            step,
+            released: work.ledger.released_rounds(),
+            unsettled: work.ledger.unsettled_rounds(),
+            stuck: work.ledger.stuck_rounds(),
+            shutdown: self.shutdown.load(Ordering::Relaxed),
+            settled: self.settled.load(Ordering::Relaxed),
+        });
+        Ok(())
     }
 
     /// The first rule this run's history broke.
@@ -211,15 +296,31 @@ impl TapState {
         let Some(task) = zakura_scheduler::hooks::current_task() else {
             return;
         };
-        let reactor = match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
-            ProbeSlot::Held(probe) => TaskId::from(probe.task()),
-            ProbeSlot::Missing | ProbeSlot::Replaced => return,
+        let Some(reactor) = self.reactor_task() else {
+            return;
         };
         if task != reactor {
             self.off_reactor
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get_or_insert(task);
+        }
+    }
+
+    /// The reactor's task, as the probe it handed over names it.
+    fn reactor_task(&self) -> Option<TaskId> {
+        match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
+            ProbeSlot::Held(probe) => Some(TaskId::from(probe.task())),
+            ProbeSlot::Missing | ProbeSlot::Replaced => None,
+        }
+    }
+
+    /// Whether the task reporting now is the reactor's. Without a probe, or
+    /// outside a task, the tap can't tell, and takes it as the reactor's.
+    fn on_reactor(&self) -> bool {
+        match (zakura_scheduler::hooks::current_task(), self.reactor_task()) {
+            (Some(task), Some(reactor)) => task == reactor,
+            _ => true,
         }
     }
 
@@ -232,16 +333,54 @@ impl TapState {
 
     /// The call or retained headers that a finished reactor left open.
     fn open_work(&self) -> Result<(), String> {
-        let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-        work.ledger.finish()
+        let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+        if mem::replace(&mut work.finished, true) {
+            return Ok(());
+        }
+        work.ledger.finish()?;
+        let claims = work.ledger.take_claims();
+        work.claims.extend(claims);
+        Ok(())
     }
 
-    /// Whether the harness stopped the reactor and it ended without
-    /// unwinding.
+    /// Whether the harness stopped the reactor and it ended cleanly.
     fn stopped(&self) -> bool {
-        self.shutdown.load(Ordering::Relaxed)
-            && self.observer.strong_count() == 0
-            && !self.unwound.load(Ordering::Relaxed)
+        self.shutdown.load(Ordering::Relaxed) && self.ended_cleanly()
+    }
+
+    /// Whether the reactor ended without panicking or unwinding.
+    fn ended_cleanly(&self) -> bool {
+        matches!(
+            self.reactor_exit(),
+            Some(TaskExit::Completed | TaskExit::Cancelled)
+        ) && !self.unwound.load(Ordering::Relaxed)
+    }
+
+    /// Whether the reactor is gone.
+    fn reactor_gone(&self) -> bool {
+        self.reactor_exit().is_some()
+    }
+
+    /// How the reactor ended, or `None` while it runs: its task's exit, for
+    /// the task its probe names, so a resource that outlives the reactor
+    /// holding an observer clone can neither keep it alive nor hide a
+    /// panic. A tap no reactor handed a probe goes by its observer, which
+    /// only the reactor holds, and whether it unwound.
+    fn reactor_exit(&self) -> Option<TaskExit> {
+        match &*self.probe.lock().unwrap_or_else(PoisonError::into_inner) {
+            ProbeSlot::Held(probe) => {
+                zakura_scheduler::hooks::task_exit(TaskId::from(probe.task()))
+            }
+            ProbeSlot::Missing | ProbeSlot::Replaced => {
+                (self.observer.strong_count() == 0).then(|| {
+                    if self.unwound.load(Ordering::Relaxed) {
+                        TaskExit::Panicked
+                    } else {
+                        TaskExit::Completed
+                    }
+                })
+            }
+        }
     }
 }
 
@@ -281,8 +420,8 @@ impl LiveEvidence for TapState {
     fn health(&self) -> Option<&'static str> {
         if self.port_gone.load(Ordering::Relaxed) {
             Some("PortGone: the tapped node's port was dropped during the run")
-        } else if self.observer.strong_count() == 0 && !self.stopped() {
-            Some("ReactorGone: the tapped reactor dropped its observer during the run")
+        } else if self.reactor_gone() && !self.stopped() {
+            Some("ReactorGone: the tapped reactor ended during the run")
         } else {
             None
         }
@@ -291,10 +430,18 @@ impl LiveEvidence for TapState {
     /// `ShutdownIncomplete` once the harness began stopping the reactor and
     /// it still holds its observer, so its last events and the teardown
     /// checks haven't happened.
-    fn unfinished(&self) -> Option<&'static str> {
-        (self.shutdown.load(Ordering::Relaxed) && self.observer.strong_count() > 0).then_some(
-            "ShutdownIncomplete: the run ended before the stopped reactor dropped its observer",
-        )
+    ///
+    /// A budget end whose drain was cut off at its bound leaves the stop
+    /// honestly unfinished, which the teardown property reports as
+    /// inconclusive. Any other end means no task could run, yet the reactor
+    /// never let go.
+    fn unfinished(&self, end: &RunEnd) -> Option<&'static str> {
+        // A cut-off stop is the teardown property's to report, if one read
+        // the last drain's settlement.
+        let cut_off = end.drain.as_ref().is_some_and(|drain| drain.exhausted)
+            && self.rounds.read_at(end.steps);
+        (!cut_off && self.shutdown.load(Ordering::Relaxed) && !self.reactor_gone())
+            .then_some("ShutdownIncomplete: the run ended before the stopped reactor's task ended")
     }
 }
 
@@ -371,6 +518,50 @@ impl TapState {
         // so no second list here can drift from them.
         if in_run {
             state.sessions.reactor(&event);
+            let on_reactor = state.on_reactor();
+            state
+                .stale
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .observe(&event, on_reactor);
+            if on_reactor {
+                let now = zakura_scheduler::hooks::now().unwrap_or_default();
+                state
+                    .wake
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .observe(&event, now);
+            }
+        }
+        // Budget changes, credit, causes, headroom waits, deferred passes,
+        // taken events and watch reads stay out of the log, whose format pinned Plans fix, and a
+        // teardown's returns after the run are expected.
+        if matches!(
+            event,
+            ReactorEvent::BudgetChanged { .. }
+                | ReactorEvent::CreditIssued { .. }
+                | ReactorEvent::CauseSet { .. }
+                | ReactorEvent::HeadroomWait { .. }
+                | ReactorEvent::CachedPassDeferred { .. }
+                | ReactorEvent::EventTaken { .. }
+                | ReactorEvent::WatchObserved { .. }
+        ) {
+            if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
+                state
+                    .buffer()
+                    .effects
+                    .push((LinkEffect::HeadroomWait, peer.clone()));
+            }
+            // The events it takes and its turns, kept in order with what it
+            // adopts. The run's own shutdown takes events and sets causes
+            // too, so only the run's are kept.
+            if let (Some(now), Some(fact)) = (
+                zakura_scheduler::hooks::now().filter(|_| in_run),
+                AdoptionFact::of_turn(&event),
+            ) {
+                state.adoption.record(now.since_start(), fact);
+            }
+            return;
         }
         let at = zakura_scheduler::hooks::now()
             .filter(|_| in_run)
@@ -502,12 +693,15 @@ impl ReactorTap {
     }
 
     /// [`ReactorTap::with_sessions`], with the reactor's capacity accounting
-    /// also kept in `reservations`, and its resource probe read, checked and
-    /// kept in `capacity`.
+    /// also kept in `reservations`, its resource probe read, checked and
+    /// kept in `capacity`, its released rounds at each drain kept in
+    /// `rounds`, and its stale prepare and apply calls kept in
+    /// `stale_calls`.
     ///
     /// # Panics
     ///
     /// As [`ReactorTap::with_sessions`] does.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_evidence(
         sim: &mut Sim,
         port: &Arc<ControlledPort>,
@@ -515,8 +709,17 @@ impl ReactorTap {
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
         capacity: CapacityEvidence,
+        rounds: SettlementEvidence,
+        stale_calls: StaleEvidence,
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
-        ReactorTap::tapped(sim, port, node, sessions, reservations, Some(capacity))
+        ReactorTap::tapped(
+            sim,
+            port,
+            node,
+            sessions,
+            reservations,
+            (Some(capacity), rounds, stale_calls),
+        )
     }
 
     /// [`ReactorTap::new`], with the reactor's session view kept in
@@ -538,7 +741,11 @@ impl ReactorTap {
             node,
             sessions,
             ReservationEvidence::default(),
-            None,
+            (
+                None,
+                SettlementEvidence::default(),
+                StaleEvidence::default(),
+            ),
         )
     }
 
@@ -549,7 +756,11 @@ impl ReactorTap {
         node: &str,
         sessions: SessionEvidence,
         reservations: ReservationEvidence,
-        capacity: Option<CapacityEvidence>,
+        (capacity, rounds, stale_calls): (
+            Option<CapacityEvidence>,
+            SettlementEvidence,
+            StaleEvidence,
+        ),
     ) -> (Arc<dyn HeaderSyncObserver>, ReactorTap) {
         let run = zakura_rt::sim::run_id().expect("a Sim's scheduler enters a runtime run");
         sessions.bind(run);
@@ -585,6 +796,12 @@ impl ReactorTap {
                 capacity,
                 off_reactor: Mutex::default(),
                 cooldowns,
+                claims: ClaimEvidence::default(),
+                settled: AtomicBool::new(false),
+                teardown_claims: Mutex::default(),
+                rounds,
+                stale: Mutex::new(StaleCheck::new(stale_calls)),
+                wake: Mutex::new(WakeCheck::new(WakeEvidence::default())),
             }))
         });
         let state = observer.0.clone();
@@ -596,6 +813,26 @@ impl ReactorTap {
             live,
         );
         let id = sim.register(checkpoint.clone());
+        // A claim break no property reported by the run's end fails it, as
+        // a later drain would have.
+        sim.on_end({
+            let claims = state.claims.clone();
+            let failure = sim.failure();
+            let source = checkpoint.kind().source(id.index);
+            move |end, _, _| {
+                if end.outcome == Outcome::Harness {
+                    return;
+                }
+                if let Some(record) = claims.unreported(None) {
+                    failure
+                        .borrow_mut()
+                        .get_or_insert(HarnessFailure::SourceEvidence {
+                            source,
+                            detail: record.detail,
+                        });
+                }
+            }
+        });
         let tap = ReactorTap {
             state,
             checkpoint,
@@ -616,7 +853,27 @@ impl ReactorTap {
         &mut self,
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
+        let facts: Vec<_> = facts.into_iter().collect();
+        let mut wake = self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (_, fact) in &facts {
+            wake.storage(fact);
+        }
+        drop(wake);
         self.pairer.facts(facts);
+    }
+
+    /// Checks this reactor's wakes against `wake`'s fixture from now on,
+    /// keeping the facts in `wake`. Call it before the run starts.
+    pub fn watch_wakes(&self, wake: WakeEvidence) {
+        *self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
     }
 
     /// The reactor's adoption facts, which the tap fills as they happen.
@@ -628,6 +885,18 @@ impl ReactorTap {
     /// as they happen.
     pub fn cooldowns(&self) -> CooldownEvidence {
         self.state.cooldowns.clone()
+    }
+
+    /// The claim rules the tap's drains found broken, which it fills as
+    /// they happen.
+    pub fn claims(&self) -> ClaimEvidence {
+        self.state.claims.clone()
+    }
+
+    /// The reactor's settlement at each drain, which the tap fills as the
+    /// drains happen.
+    pub fn rounds(&self) -> SettlementEvidence {
+        self.state.rounds.clone()
     }
 
     /// The notice the harness gives this tap when it stops the reactor.
@@ -647,7 +916,10 @@ impl ReactorTap {
     /// the ownership check's accounting. Once a reactor the harness stopped
     /// is gone, every read is a teardown read. A reactor that unwound, or
     /// went away unstopped, left its counts mid-change and fails the run on
-    /// its own, so its reads aren't checked.
+    /// its own, so its reads aren't checked. A read that finds the budget's
+    /// lock held is noted unread, with whether the reactor was stopped
+    /// mid-poll, and a claim break goes to the tap's [`ClaimEvidence`] as
+    /// the module doc says.
     fn read_capacity(&self, step: u64) -> Result<(), String> {
         let Some(evidence) = &self.state.capacity else {
             return Ok(());
@@ -672,7 +944,7 @@ impl ReactorTap {
             }
             ProbeSlot::Held(probe) => probe.clone(),
         };
-        let gone = self.state.observer.strong_count() == 0;
+        let gone = self.state.reactor_gone();
         if self.state.unwound.load(Ordering::Relaxed) || (gone && !self.state.stopped()) {
             return Ok(());
         }
@@ -689,7 +961,16 @@ impl ReactorTap {
                 TaskId::from(probe.task()).index()
             ));
         }
+        let mid_poll = self.mid_poll.contains(TaskId::from(probe.task()));
         let Some(read) = zakura_rt::sim::boundary_read(|| probe.read()) else {
+            evidence.unread(
+                step,
+                if mid_poll {
+                    BoundaryRead::UnreadMidPoll
+                } else {
+                    BoundaryRead::UnreadQuiet
+                },
+            );
             return Ok(());
         };
         let expected = if gone {
@@ -701,11 +982,15 @@ impl ReactorTap {
                     .map_or(0, |port| port.owner_state().permits.len()),
             }
         } else {
-            let quiet = !self.mid_poll.contains(TaskId::from(probe.task()));
             Expected::Live {
-                accounted: quiet.then(|| self.state.accounted()),
+                accounted: (!mid_poll).then(|| self.state.accounted()),
             }
         };
+        self.state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .permits(read.locator_permits);
         evidence.record(CapacityReading {
             step,
             reserved: read.reserved,
@@ -714,7 +999,31 @@ impl ReactorTap {
             compared: matches!(expected, Expected::Live { accounted: Some(_) }),
             teardown: gone,
         });
-        capacity::check(&probe, read, expected)
+        match capacity::check(&probe, read, expected) {
+            Ok(()) => Ok(()),
+            Err(Broken::Claim(claim, detail)) => {
+                // Every teardown read is checked, since storage can still
+                // hold a permit when the reactor goes and return it later,
+                // but each teardown claim is reported once.
+                let mut seen = self
+                    .state
+                    .teardown_claims
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !gone || !seen.contains(&claim) {
+                    if gone {
+                        seen.push(claim);
+                    }
+                    self.state.claims.record(ClaimRecord {
+                        step,
+                        claim,
+                        detail,
+                    });
+                }
+                Ok(())
+            }
+            Err(Broken::Integrity(detail)) => Err(detail),
+        }
     }
 
     /// Takes the reservations and admissions recorded since the last call,
@@ -1024,19 +1333,20 @@ impl ActionSource for ReactorTap {
         }
         match paired {
             Ok(()) => match self.pairer.waiting_drop() {
-                Some((call, op)) if self.state.observer.strong_count() == 0 => Err(format!(
+                Some((call, op)) if self.state.reactor_gone() => Err(format!(
                     "UnpairedDrop: the reactor's teardown is done with call {call} dropped and \
                      its operation {op} given no drop receipt, and no shutdown removed it while \
                      the call still existed"
                 )),
-                _ if self.state.observer.strong_count() == 0
-                    && !self.state.unwound.load(Ordering::Relaxed) =>
-                {
-                    self.state.open_work()
-                }
+                _ if self.state.ended_cleanly() => self.state.open_work().map(|()| {
+                    if self.state.shutdown.load(Ordering::Relaxed) {
+                        self.state.settled.store(true, Ordering::Relaxed);
+                    }
+                }),
                 _ => Ok(()),
             }
-            .and_then(|()| self.read_capacity(log.step())),
+            .and_then(|()| self.read_capacity(log.step()))
+            .and_then(|()| self.state.drain_claims(log.step())),
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or

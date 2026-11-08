@@ -297,6 +297,11 @@ impl HasView for Planted {
             adoption: Default::default(),
             sessions: Default::default(),
             faults: Default::default(),
+            capacity: Default::default(),
+            claims: Default::default(),
+            rounds: Default::default(),
+            stale_calls: Default::default(),
+            wake: Default::default(),
         }
     }
 }

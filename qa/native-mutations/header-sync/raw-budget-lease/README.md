@@ -8,9 +8,10 @@ the lease and nothing returns it.
 
 The plan's mutation here was a kept clone of a staged lease. That clone also
 holds back the lease's `LeaseReturned`, and the ownership ledger already
-fails it as `LeakedLease` when the queue releases the round, as
-`kept-queue-lease` shows. An untagged lease is the owned-side stray that only
-the probe can see.
+finds it as `LeakedLease` when the queue releases the round, which violates
+`header-sync/teardown-returns-baseline`, as the planted `kept-queue-lease`
+shows. An untagged lease is the owned-side stray that only the probe can
+see.
 
 The witness is `the_probe_matches_the_accounting_through_close_relink_and_shutdown`
 in `crates/zakura-sim/tests/header_node_capacity.rs`. The first quiet

@@ -835,6 +835,13 @@ pub enum StorageRequest {
         target: StoragePoint,
         /// How many headers.
         headers: u32,
+        /// The headers' summed block work, in decimal: the target's work
+        /// above `common_ancestor`. `None` if a header's target has no
+        /// work.
+        work: Option<String>,
+        /// The first header, `common_ancestor`'s child on the target's
+        /// branch. `None` for a request with no headers.
+        first: Option<StoragePoint>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {
@@ -1417,6 +1424,16 @@ pub enum BlockSyncFact {
         holder: BlockSyncHolder,
         /// `retained` or `released`.
         change: String,
+    },
+    /// The sequencer refused a body it took from its input as stale: the
+    /// body's owner names a body work epoch other than the one the
+    /// sequencer applied.
+    StaleScope {
+        /// The refused body.
+        body: BlockSyncBody,
+        /// The body work epoch the sequencer applied when it judged the
+        /// body, or `None` before it had one.
+        scope_epoch: Option<u64>,
     },
     /// A serving response took its execution lease, or released it.
     ServingLease {

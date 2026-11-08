@@ -36,8 +36,9 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, capacity accounting, session admissions, refusals and ends,
-    /// readmission cooldowns, or the adopted state and its publications.
+    /// reservations, capacity accounting, budget changes, credit, causes,
+    /// session admissions, refusals and ends, readmission cooldowns, or the
+    /// adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
         self.take_all()
             .into_iter()
@@ -52,6 +53,13 @@ impl Recorder {
                         | ReactorEvent::PageStaged { .. }
                         | ReactorEvent::LeaseReturned { .. }
                         | ReactorEvent::RoundReleased { .. }
+                        | ReactorEvent::BudgetChanged { .. }
+                        | ReactorEvent::CreditIssued { .. }
+                        | ReactorEvent::CauseSet { .. }
+                        | ReactorEvent::HeadroomWait { .. }
+                        | ReactorEvent::CachedPassDeferred { .. }
+                        | ReactorEvent::EventTaken { .. }
+                        | ReactorEvent::WatchObserved { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }
@@ -689,6 +697,91 @@ fn repair_retry_retirement_is_observed() {
     );
 }
 
+/// A completion's handler runs under its call's `Completion` cause and the
+/// refresh after it under `Refresh`, each restoring the cause before it, so
+/// the handler's effects and only those carry `Completion`.
+#[tokio::test]
+async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (..) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
+    let seeded = active(&reactor, &peer);
+    recorder.take_all();
+
+    assert!(matches!(
+        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        StorageDispatch::Started(_)
+    ));
+    complete_next(&mut reactor).await;
+
+    let cause = |cause| ReactorEvent::CauseSet { cause };
+    let events: Vec<_> = recorder
+        .take_all()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ReactorEvent::CauseSet { .. }
+                    | ReactorEvent::CallEnded { .. }
+                    | ReactorEvent::Retired { .. }
+                    | ReactorEvent::Handled { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            ReactorEvent::CallEnded {
+                call: 1,
+                end: CallEnd::Replied,
+            },
+            cause(ReactorCause::Completion { call: 1 }),
+            retired(&seeded, HeaderRequestTerminal::TargetRejected),
+            cause(ReactorCause::Idle),
+            cause(ReactorCause::Refresh { call: 1 }),
+            cause(ReactorCause::Idle),
+            ReactorEvent::Handled {
+                call: 1,
+                panicked: false,
+            },
+        ]
+    );
+}
+
+/// A nested unit of work reports its cause, then restores the outer one,
+/// which restores the reactor's own.
+#[test]
+fn a_nested_cause_restores_the_outer_one() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, _) = observed_reactor(
+        Arc::new(ScriptedPort::default()),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    recorder.take_all();
+    caused!(
+        reactor,
+        ReactorCause::Startup,
+        caused!(reactor, ReactorCause::Watch, ())
+    );
+    let cause = |cause| ReactorEvent::CauseSet { cause };
+    assert_eq!(
+        recorder.take_all(),
+        [
+            cause(ReactorCause::Startup),
+            cause(ReactorCause::Watch),
+            cause(ReactorCause::Startup),
+            cause(ReactorCause::Idle),
+        ]
+    );
+}
+
 /// `Handled` follows every effect of the apply's callback.
 #[tokio::test]
 async fn handled_follows_the_callbacks_effects() {
@@ -849,6 +942,92 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
 #[tokio::test]
 async fn stale_apply_bracket_leaves_the_replacement_alone() {
     assert_stale_call_leaves_the_replacement_alone(HeaderTargetPhase::Applying).await;
+}
+
+/// A repair round whose peer departs while it prepares is kept: the
+/// disconnect retires nothing, and the prepare's reply is handled against
+/// that same round. So `header-sync/stale-completion-inert` counts a repair
+/// stale only by its retirement, never by its session alone, and it tells a
+/// repair by the body repair owner its calls name. It decides that at the
+/// call's end, before the handler runs. This fixture's repair isn't
+/// assigned, so the handler then retires it as obsolete, and every
+/// retirement or release it makes is the kept round's.
+#[tokio::test]
+async fn a_kept_repair_prepare_settles_its_own_round_after_its_peer_departs() {
+    let gate = Arc::new(TokioSemaphore::new(0));
+    let port = Arc::new(ScriptedPort {
+        gate: Some(gate.clone()),
+        ..ScriptedPort::default()
+    });
+    let recorder = Arc::new(Recorder::default());
+    let (mut reactor, snapshot) = observed_reactor(
+        port.clone(),
+        Some(recorder.clone()),
+        crate::zakura::ZakuraTrace::noop(),
+    );
+    let peer = peer();
+    let _outbound = connect(&mut reactor, &peer, 7);
+    let (source, owner, context) = super::timeouts::seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Preparing,
+    );
+    assert!(owner.body_owner().is_some(), "a repair has a body owner");
+    port.prepared
+        .lock()
+        .expect("no test panics while holding it")
+        .push(super::timeouts::prepared_vct_target(
+            &reactor, &snapshot, &peer, source, owner, &context,
+        ));
+    let kept = active(&reactor, &peer);
+    let operation = prepare_operation(&reactor, &peer, kept.purpose.clone(), kept.entries.clone());
+    recorder.take_all();
+    assert!(matches!(
+        reactor.dispatch_action(operation),
+        StorageDispatch::Started(_)
+    ));
+    reactor.handle_peer_disconnected(&peer, 7, "test disconnect");
+    gate.add_permits(1);
+    complete_next(&mut reactor).await;
+
+    let events = recorder.take_all();
+    let ended = events
+        .iter()
+        .position(|event| matches!(event, ReactorEvent::CallEnded { call: 1, .. }))
+        .expect("the prepare ended");
+    assert!(
+        events[..ended]
+            .iter()
+            .any(|event| matches!(event, ReactorEvent::SessionEnded { session_id: 7, .. })),
+        "{events:?}"
+    );
+    assert!(
+        !events[..ended].iter().any(|event| matches!(
+            event,
+            ReactorEvent::Retired { .. } | ReactorEvent::RoundReleased { .. }
+        )),
+        "the departure keeps the repair round: {events:?}"
+    );
+    assert!(
+        events[..ended].iter().any(|event| matches!(
+            event,
+            ReactorEvent::Dispatched {
+                call: 1,
+                op: PortCall::Prepare { owner: prepared, .. },
+            } if prepared.body_owner().is_some()
+        )),
+        "the prepare names the repair's body owner: {events:?}"
+    );
+    let round = kept.incarnation().get();
+    for event in bracket(&events, 1) {
+        match event {
+            ReactorEvent::Retired { request, .. } => assert_eq!(request.incarnation, round),
+            ReactorEvent::RoundReleased { incarnation, .. } => assert_eq!(*incarnation, round),
+            _ => {}
+        }
+    }
 }
 
 /// A stale prepare for a replaced session completes while its replacement
@@ -1904,6 +2083,8 @@ async fn adopted_state_and_its_publications_are_observed() {
         header_best: snapshot.frontiers.header_best,
         suffix_work: snapshot.header_best_score.suffix_work.as_u256(),
         oldest_retained: snapshot.oldest_retained_height,
+        verified_generation: snapshot.verified_generation,
+        verified_best: snapshot.frontiers.verified_best,
     };
     let published = |tip: zakura_header_chain::Frontier, delivered| ReactorEvent::TipPublished {
         height: tip.height,

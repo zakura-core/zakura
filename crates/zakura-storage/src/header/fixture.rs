@@ -3,7 +3,10 @@
 //! Every fixture starts at the Regtest genesis block. Regtest checks only the
 //! shape of each proof-of-work solution, so a fixture header is the genesis
 //! header with a new parent, nonce and time, as in the header-chain fuzz
-//! harness, and it still passes the real `prepare_headers`.
+//! harness, and it still passes the real `prepare_headers`. Fork branches 1
+//! and 2 may carry a weight, a harder target that gives each of their
+//! headers more work. Regtest's proof-of-work waiver also skips the
+//! contextual check that a header's target is the expected one.
 
 use std::{num::NonZeroU64, sync::Arc};
 
@@ -11,18 +14,25 @@ use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{self, genesis::regtest_genesis_block},
     parameters::Network,
+    work::difficulty::{CompactDifficulty, U256},
 };
 use zakura_header_chain::{
     EngineSnapshot, Frontier, HeaderWorkAuthority, SourceId, TargetCompletion,
 };
 use zakura_node_services::header_chain::{PrepareHeaderTarget, TargetEntry};
 
-/// The Regtest network and its genesis block, the anchor of every fixture.
+/// The Regtest network and its genesis block, the anchor of every fixture,
+/// and the weights of fork branches 1 and 2.
 #[derive(Clone, Debug)]
 pub struct HeaderFixture {
     network: Network,
     genesis: Arc<block::Block>,
+    /// Branch 1's and branch 2's weight. See [`Self::with_weight`].
+    weights: [u8; 2],
 }
+
+/// The heaviest weight a branch can take.
+pub const MAX_WEIGHT: u8 = 3;
 
 impl HeaderFixture {
     /// The default Regtest network, anchored at its genesis block.
@@ -30,7 +40,46 @@ impl HeaderFixture {
         HeaderFixture {
             network: Network::new_regtest(Default::default()),
             genesis: regtest_genesis_block(),
+            weights: [0; 2],
         }
+    }
+
+    /// This fixture with `branch`'s headers at `weight`: their target is
+    /// the genesis target shifted right by `weight` bits, so each header
+    /// has about `2^weight` times the work of a genesis-target header.
+    /// Weight 0 keeps the genesis target exactly. Branch 0 and branches
+    /// above 2 always keep it.
+    ///
+    /// # Panics
+    ///
+    /// If `branch` isn't 1 or 2, or `weight` is above [`MAX_WEIGHT`].
+    pub fn with_weight(mut self, branch: u8, weight: u8) -> Self {
+        assert!(
+            matches!(branch, 1 | 2),
+            "only branches 1 and 2 take a weight, not branch {branch}"
+        );
+        assert!(
+            weight <= MAX_WEIGHT,
+            "a weight is 0 to {MAX_WEIGHT}, not {weight}"
+        );
+        self.weights[usize::from(branch - 1)] = weight;
+        self
+    }
+
+    /// The compact target of `branch`'s headers. See [`Self::with_weight`].
+    pub fn target(&self, branch: u8) -> CompactDifficulty {
+        let genesis = self.genesis.header.difficulty_threshold;
+        let weight = match branch {
+            1 | 2 => self.weights[usize::from(branch - 1)],
+            _ => 0,
+        };
+        if weight == 0 {
+            return genesis;
+        }
+        let expanded = genesis
+            .to_expanded()
+            .expect("the Regtest genesis target is valid");
+        (expanded / (U256::one() << weight)).to_compact()
     }
 
     /// The fixture's network.
@@ -81,9 +130,9 @@ impl HeaderFixture {
     }
 
     /// The fixture header at `height` on `branch`, extending `parent_hash`
-    /// and committing to `merkle_root`. [`Self::extend`] builds each header
-    /// this way with the genesis root. The block fixture passes its body's
-    /// root.
+    /// and committing to `merkle_root`, with `branch`'s target.
+    /// [`Self::extend`] builds each header this way with the genesis root.
+    /// The block fixture passes its body's root.
     pub(crate) fn header_at(
         &self,
         parent_hash: block::Hash,
@@ -94,6 +143,7 @@ impl HeaderFixture {
         let mut header = *self.genesis.header;
         header.previous_block_hash = parent_hash;
         header.merkle_root = merkle_root;
+        header.difficulty_threshold = self.target(branch);
         header.nonce.0[0] = branch;
         header.nonce.0[1..5].copy_from_slice(&height.to_le_bytes());
         header.time = self

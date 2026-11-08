@@ -14,11 +14,12 @@
 //!
 //! A frame can arrive between the offer and the run and end the
 //! precondition. Then the act is skipped: it sends nothing and the peer
-//! logs [`crate::Observation::ActSkipped`]. A witness test fails on a skip,
-//! since "ran" means the act's frame went out. A fuzz campaign sees a
-//! skipped act as not covered: no frame, so the properties it targets stay
-//! not applicable. A frame the act can't build or label still fails the
-//! run.
+//! logs [`crate::Observation::ActSkipped`]. An act that ran logs
+//! [`crate::Observation::ActRan`] once its frames are written. A witness
+//! test fails unless its acts ran (see `witness::acts_ran`). A fuzz
+//! campaign sees a skipped act as not covered: no frame, so the properties
+//! it targets stay not applicable. A frame the act can't build or label
+//! still fails the run.
 
 use std::{collections::BTreeSet, time::Duration};
 

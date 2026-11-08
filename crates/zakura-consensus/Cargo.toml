@@ -84,8 +84,9 @@ proptest-derive = { workspace = true, optional = true }
 
 [dev-dependencies]
 eyre = { workspace = true }
+# Only tests built with `sprout` use these: they sign JoinSplit data and
+# exercise the Sprout Ed25519 batch verifier.
 ed25519-zebra = { workspace = true }
-# Tests sign mock JoinSplit data with ed25519-zebra keys.
 rand_core = { workspace = true, features = ["getrandom"] }
 
 hex = { workspace = true }

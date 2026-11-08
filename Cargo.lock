@@ -2798,7 +2798,6 @@ dependencies = [
  "byteorder",
  "chrono",
  "criterion",
- "ed25519-zebra",
  "eyre",
  "futures",
  "getset",

@@ -918,6 +918,12 @@ impl Adversary {
                     .ok_or("lower-locator: nothing served")?
                     .target;
                 let below = honest.chain.at(parent);
+                // The first locator's header is the chain's at that height.
+                let header = usize::try_from(parent)
+                    .ok()
+                    .and_then(|index| honest.chain.headers.get(index))
+                    .ok_or(SHORT_CHAIN)?
+                    .clone();
                 Ok(Crafted::of(RegtestMessage::Headers(Headers {
                     subscription_id: id,
                     initial_target_tip_hash: target,
@@ -926,9 +932,7 @@ impl Adversary {
                     reaches_initial_target: false,
                     tree_aux_schema: AuxSchema::None,
                     entries: vec![HeaderEntry {
-                        header: honest.chain.headers
-                            [usize::try_from(parent).expect("u32 fits usize")]
-                        .clone(),
+                        header,
                         body_size: 0,
                         tree_aux: None,
                     }],

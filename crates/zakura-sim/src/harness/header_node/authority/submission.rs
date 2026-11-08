@@ -7,7 +7,8 @@
 //! - **Apply.** Storage's request has the dispatch's owner, source and
 //!   target, and the sealed insertion starts from the common ancestor of
 //!   the prepare that handed the apply its headers and holds exactly that
-//!   prepare's dispatched headers. An insertion storage couldn't open was
+//!   prepare's dispatched headers. An apply no prepare handed its headers
+//!   to breaks the rule. An insertion storage couldn't open was
 //!   sealed elsewhere, which breaks the rule too.
 //!
 //! Storage tags each submission with the reactor call that made it, so the
@@ -151,8 +152,8 @@ impl Submission {
         std::mem::take(&mut self.breaks)
     }
 
-    /// Judges call `call`'s submission once its dispatch, its request and,
-    /// for an apply, its prepare are known. Returns whether it judged it.
+    /// Judges call `call`'s submission once its dispatch and its request are
+    /// known. Returns whether it judged it.
     fn judge(&mut self, call: u64) -> bool {
         let (Some(sent), Some(request)) = (self.dispatched.get(&call), self.submitted.get(&call))
         else {
@@ -200,32 +201,39 @@ impl Submission {
                     hashes: got_hashes,
                 },
             ) => {
-                let Some(Sent::Prepare {
-                    ancestor,
-                    hashes: prepared,
-                    ..
-                }) = self
-                    .prepare_of
-                    .get(&call)
-                    .and_then(|prepare| self.dispatched.get(prepare))
-                else {
-                    return false;
-                };
                 compare(&mut found, "owner", owner, got_owner);
                 compare(&mut found, "source", source, got_source);
                 compare(&mut found, "target", target, got_target);
-                compare(
-                    &mut found,
-                    "sealed parent",
-                    &Some(ancestor.hash.clone()),
-                    parent,
-                );
-                compare(
-                    &mut found,
-                    "sealed headers",
-                    &Some(prepared.clone()),
-                    got_hashes,
-                );
+                // The reactor hands an apply its prepare's headers before
+                // the apply first polls storage, so the handoff is known by
+                // the submission's drain.
+                match self
+                    .prepare_of
+                    .get(&call)
+                    .and_then(|prepare| self.dispatched.get(prepare))
+                {
+                    Some(Sent::Prepare {
+                        ancestor,
+                        hashes: prepared,
+                        ..
+                    }) => {
+                        compare(
+                            &mut found,
+                            "sealed parent",
+                            &Some(ancestor.hash.clone()),
+                            parent,
+                        );
+                        compare(
+                            &mut found,
+                            "sealed headers",
+                            &Some(prepared.clone()),
+                            got_hashes,
+                        );
+                    }
+                    _ => found.push(
+                        "an apply request, but no prepare handed the apply its headers".to_owned(),
+                    ),
+                }
             }
             (Sent::Prepare { .. }, other) | (Sent::Apply { .. }, other) => {
                 found.push(format!(

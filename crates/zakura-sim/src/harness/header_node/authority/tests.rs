@@ -155,9 +155,9 @@ fn breaks_declaring(
         [0, 1, 2],
         declared.iter().copied(),
     );
-    check.observe(&reserved(99, 10), true);
+    check.observe(&reserved(99, 10), true, false);
     for event in events {
-        check.observe(event, true);
+        check.observe(event, true, false);
     }
     check.drain(1)
 }
@@ -171,7 +171,7 @@ fn credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
         [],
     );
     for event in events {
-        check.observe(event, true);
+        check.observe(event, true, false);
     }
     check.drain(1)
 }
@@ -198,9 +198,9 @@ fn a_page_on_a_scenario_branch_holds() {
             branches.iter().copied(),
             [],
         );
-        check.observe(&reserved(99, 10), true);
+        check.observe(&reserved(99, 10), true, false);
         for event in &events {
-            check.observe(event, true);
+            check.observe(event, true, false);
         }
         check.drain(1)
     };
@@ -564,4 +564,30 @@ fn the_smallest_page_is_an_encoded_one_header_page() {
         credit::smallest_page(AuxSchema::None),
         u64::try_from(frame.payload.len()).expect("small")
     );
+}
+
+/// Credit and acceptance in a stale call's handler are
+/// `stale-completion-inert`'s, so an unbacked grant there and an
+/// acceptance through a cursor no page staged break nothing here, and a
+/// later update acknowledges what the stale handler accepted.
+#[test]
+fn a_stale_handlers_credit_is_left_to_the_stale_check() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let mut check = Authority::new(
+        AuthorityEvidence::default(),
+        HeaderFixture::regtest(),
+        [0],
+        [],
+    );
+    for event in [reserved(1, 10), open(chain[3], &[genesis.hash])] {
+        check.observe(&event, true, false);
+    }
+    for event in [grant(5, 0, 1, genesis, chain[3].hash), accepted(chain[2])] {
+        check.observe(&event, true, true);
+    }
+    for event in [reserved(2, 2), grant(2, 0, 2, chain[2], chain[3].hash)] {
+        check.observe(&event, true, false);
+    }
+    assert_eq!(check.drain(1), Vec::<String>::new());
 }

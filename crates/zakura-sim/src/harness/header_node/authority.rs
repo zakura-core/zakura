@@ -149,9 +149,10 @@ impl Authority {
     }
 
     /// Judges `event`, which the reactor's own task reported when
-    /// `on_reactor`, then notes what it says.
-    pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool) {
-        if self.credit.observe(event, on_reactor) {
+    /// `on_reactor`, in a stale call's handler when `stale_handler`, then
+    /// notes what it says.
+    pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool, stale_handler: bool) {
+        if self.credit.observe(event, on_reactor, stale_handler) {
             self.applies();
         }
         if !on_reactor {

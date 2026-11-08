@@ -630,11 +630,11 @@ impl TapState {
         if in_run {
             state.sessions.reactor(&event);
             let on_reactor = state.on_reactor();
-            state
-                .stale
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .observe(&event, on_reactor);
+            let stale_handler = {
+                let mut stale = state.stale.lock().unwrap_or_else(PoisonError::into_inner);
+                stale.observe(&event, on_reactor);
+                stale.in_stale_handler()
+            };
             if let Some(rounds) = state
                 .round_life
                 .lock()
@@ -657,7 +657,7 @@ impl TapState {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
             {
-                authority.observe(&event, on_reactor);
+                authority.observe(&event, on_reactor, stale_handler);
             }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();

@@ -15,7 +15,10 @@ use support::{
     steer::{before, steer, Steer},
 };
 use zakura_sim::{
-    domain::{header_sync_progress::HONEST_PROGRESS, session::HONEST_NEVER_PUNISHED},
+    domain::{
+        header_sync::COMMIT_ONLY_AUTHORIZED, header_sync_progress::HONEST_PROGRESS,
+        session::HONEST_NEVER_PUNISHED,
+    },
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
@@ -31,7 +34,11 @@ use zakura_sim::{
         DatagramOutcome, Entry, ReactorCall, ReactorFact, StorageFact, StorageRequest,
         StorageResult, TransportFact,
     },
-    peer::{adversary::Act, honest::HonestSpec, peer_addr, PeerAction, PeerSpec, NODE_ADDR},
+    peer::{
+        adversary::{Act, ContentRule},
+        honest::HonestSpec,
+        peer_addr, PeerAction, PeerSpec, NODE_ADDR,
+    },
     seed, Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
     StepCtx,
 };
@@ -913,12 +920,17 @@ fn regenerate_saved_plans() {
         let base = fixtures().join(format!("header-wire-{}", plan.name()));
         fs::write(base.with_extension("bin"), &input).expect("the fixture directory exists");
         let scenario = serde_json::to_value(plan.scenario()).expect("scenarios serialize");
-        // The progress fixture is a planted case's input, which `cargo xtask
-        // planted` records as a witness expecting a hold.
+        // The progress fixture and the two refused-page acts are planted
+        // cases' inputs, which `cargo xtask planted` records as witnesses
+        // expecting a hold.
+        let holds = |property: &str| {
+            format!("\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n")
+        };
         let witness = match plan {
-            SavedPlan::HonestProgress => {
-                format!("\n[[witness]]\nproperty = \"{HONEST_PROGRESS}\"\nexpect = \"holds\"\n")
-            }
+            SavedPlan::HonestProgress => holds(HONEST_PROGRESS),
+            SavedPlan::Act(Act::BadContent {
+                rule: ContentRule::Linkage | ContentRule::LowerLocator,
+            }) => holds(COMMIT_ONLY_AUTHORIZED),
             SavedPlan::HonestSync | SavedPlan::Act(_) => String::new(),
         };
         let sidecar = format!(

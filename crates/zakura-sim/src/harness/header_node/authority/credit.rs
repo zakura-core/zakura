@@ -16,6 +16,11 @@
 //!   page staged on that subscription, never a cursor no page staged, and
 //!   never one below an earlier acceptance.
 //!
+//! Credit and acceptance in a stale call's handler are
+//! `stale-completion-inert`'s effects, so they aren't judged here. They
+//! still move the subscription's state, so later updates are judged
+//! against what production did.
+//!
 //! The model restates the smallest page from the page layout, which a unit
 //! test checks against an encoded page.
 
@@ -74,10 +79,16 @@ pub(super) struct Credit {
 
 impl Credit {
     /// Notes `event`, judging it if it's a credit fact. `on_reactor` says
-    /// the reactor's own task reported it. Reservations are noted from any
-    /// task, since a reservation's last handle may drop elsewhere.
-    /// Returns whether it judged a credit fact.
-    pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool) -> bool {
+    /// the reactor's own task reported it, and `stale_handler` that it came
+    /// in a stale call's handler. Reservations are noted from any task,
+    /// since a reservation's last handle may drop elsewhere. Returns
+    /// whether it judged a credit fact.
+    pub(super) fn observe(
+        &mut self,
+        event: &ReactorEvent,
+        on_reactor: bool,
+        stale_handler: bool,
+    ) -> bool {
         match event {
             ReactorEvent::ReservationOpened {
                 reservation,
@@ -109,7 +120,9 @@ impl Credit {
                 ..
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
-                self.issue(&key, *objects, *bytes, update);
+                if !stale_handler {
+                    self.issue(&key, *objects, *bytes, update);
+                }
                 match kind {
                     CreditKind::Open => {
                         self.live.insert(
@@ -124,9 +137,14 @@ impl Credit {
                             },
                         );
                     }
+                    CreditKind::Grant if stale_handler => {
+                        if let Some(live) = self.live.get_mut(&key) {
+                            live.sequence = update.update_sequence;
+                        }
+                    }
                     CreditKind::Grant => self.update("Grant", &key, update),
                 }
-                true
+                !stale_handler
             }
             ReactorEvent::CloseBuilt {
                 peer,
@@ -162,6 +180,13 @@ impl Credit {
                 through,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
+                if stale_handler {
+                    if let Some(live) = self.live.get_mut(&key) {
+                        live.accepted = Some(*through);
+                        live.acknowledged = *through;
+                    }
+                    return false;
+                }
                 self.accept(&key, *through);
                 true
             }

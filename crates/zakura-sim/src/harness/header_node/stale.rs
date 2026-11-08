@@ -152,6 +152,13 @@ impl StaleCheck {
         self.note(event);
     }
 
+    /// Whether the reactor is in a stale call's handler: its last
+    /// `CauseSet` named the `Completion` of a call that ended stale.
+    pub(super) fn in_stale_handler(&self) -> bool {
+        matches!(self.cause, ReactorCause::Completion { call }
+            if self.calls.get(&call).is_some_and(|call| call.stale.is_some()))
+    }
+
     /// The breaks found since the last call, and the step their drain is.
     /// Stale calls found since then are stamped with `step`.
     pub(super) fn drain(&mut self, step: u64) -> Vec<String> {

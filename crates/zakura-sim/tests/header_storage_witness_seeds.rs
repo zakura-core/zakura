@@ -66,6 +66,11 @@ enum Shows {
     },
     /// The node reached recovery's conditions after a prefix of this class.
     Recovered(&'static str),
+    /// The first read, held until two other reads completed, completed
+    /// through the engine with a page after them. That's `holds()`'s first
+    /// hold succeeding, which the migrated seed's slice doesn't show: its
+    /// held read ends `PageUnavailable`.
+    SucceededAfterHold,
 }
 
 /// The storage facts `report` logged, with their steps.
@@ -217,6 +222,27 @@ impl Shows {
                             && done.is_none_or(|done| done > *at)
                     })
             }),
+            Shows::SucceededAfterHold => {
+                let Some(&(first, _, _, Some(done))) = ops.iter().find(|op| op.1 == OpKind::Read)
+                else {
+                    return false;
+                };
+                let before = ops
+                    .iter()
+                    .filter(|op| {
+                        op.1 == OpKind::Read && op.0 != first && op.3.is_some_and(|at| at < done)
+                    })
+                    .count();
+                before >= 2
+                    && facts.iter().any(|(_, fact)| {
+                        matches!(fact, StorageFact::Completed {
+                            id,
+                            outcome,
+                            result: StorageResult::Page { .. },
+                            ..
+                        } if *id == first && outcome == "engine")
+                    })
+            }
             Shows::Failed(kind, outcome) => facts.iter().any(|(_, fact)| match fact {
                 StorageFact::Completed {
                     id, outcome: done, ..
@@ -301,8 +327,8 @@ impl Shows {
 
 /// What each witness seed's run shows, by stem, and which [`PLAN_BYTES`]
 /// slice of the [`byte_inputs`] stream is its Plan. Most use slice 16.
-/// The reconsider, the release and two forks use a slice whose run orders
-/// their overlap that way.
+/// The hold, the reconsider, the release and two forks use a slice whose
+/// run orders their overlap that way.
 fn shows(stem: &str) -> (Shows, usize) {
     use std::cmp::Ordering;
     let witness = stem
@@ -327,6 +353,7 @@ fn shows(stem: &str) -> (Shows, usize) {
         "reset-prepare" => (Shows::HeldAcrossReset(OpKind::Prepare), 16),
         "reset-apply" => (Shows::HeldAcrossReset(OpKind::Apply), 16),
         "reset-reply" => (Shows::ResetBetweenCommitAndDelivery, 16),
+        "hold-succeeds" => (Shows::SucceededAfterHold, 2),
         "reconsider" => (Shows::ReconsiderMidRound, 20),
         "release" => (Shows::ReleasedRead, 17),
         "reply-hold" => (Shows::ReplyOutlasted, 16),
@@ -397,8 +424,8 @@ fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
 fn committed_witness_seeds_show_their_overlaps() {
     let entry = harness::find(Storage::NAME).unwrap();
     let seeds = storage_witnesses::witness_seeds();
-    // 14 named witnesses, 10 faults and 5 recovery classes.
-    assert_eq!(seeds.len(), 29);
+    // 15 named witnesses, 10 faults and 5 recovery classes.
+    assert_eq!(seeds.len(), 30);
     for (stem, scenario) in seeds {
         let (shows, slice) = shows(&stem);
         let committed = fs::read(fixtures().join(format!("{stem}.bin")))

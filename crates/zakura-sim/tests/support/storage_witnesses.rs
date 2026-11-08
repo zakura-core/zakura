@@ -576,7 +576,8 @@ type Named = (&'static str, fn() -> StorageScenario);
 
 /// Every witness seed's stem and scenario, as `tests/fixtures` holds them.
 pub fn witness_seeds() -> Vec<(String, StorageScenario)> {
-    let named: [Named; 14] = [
+    let named: [Named; 15] = [
+        ("hold-succeeds", StorageScenario::holds),
         ("reset-locator", reset_held_locator),
         ("reset-prepare", reset_held_prepare),
         ("reset-apply", reset_held_apply),

@@ -17,7 +17,19 @@ pub(super) fn fallback_reactor() -> (
     mpsc::Receiver<HeaderPortOperation>,
     zakura_header_chain::EngineSnapshot,
 ) {
+    fallback_reactor_admitting(crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS)
+}
+
+/// A reactor at the Regtest genesis whose node admits `max_connections`.
+fn fallback_reactor_admitting(
+    max_connections: usize,
+) -> (
+    HeaderSyncReactor,
+    mpsc::Receiver<HeaderPortOperation>,
+    zakura_header_chain::EngineSnapshot,
+) {
     let mut startup = startup(CancellationToken::new());
+    startup.max_connections = max_connections;
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
     let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
@@ -377,6 +389,83 @@ async fn history_pruned_without_records_rotates_and_backs_off() {
         target,
     );
     assert_unpunished(&reactor, &mut actions, &pruned);
+}
+
+/// Identities that each answer `HistoryPruned` once and leave keep at most the
+/// admitted peer limit of entries. A connected peer keeps its backoff, though
+/// it stops mattering before any departed one.
+#[test]
+fn departed_pruned_peers_stay_within_the_admitted_peer_limit() {
+    let (mut reactor, mut actions, snapshot) = fallback_reactor_admitting(10);
+    let limit = reactor.admitted_peer_limit();
+    assert_eq!(limit, 10, "the node's admitted connections set the cap");
+    let target = block::Hash([0x53; 32]);
+    let status = pruned_status(&snapshot, target);
+
+    // Both rounds end `HistoryPruned`, so the held peer's discovery pauses
+    // and later rounds go to the departing peers.
+    let (held, mut held_outbound) = connect(&mut reactor, 0x70);
+    refresh(&mut reactor, &held, &status);
+    let open = answer_locator(
+        &mut reactor,
+        &mut actions,
+        &held,
+        &mut held_outbound,
+        target,
+    );
+    end(
+        &mut reactor,
+        &held,
+        &open,
+        HeadersOutcomeCode::HistoryPruned,
+    );
+    let open = answer_locator(
+        &mut reactor,
+        &mut actions,
+        &held,
+        &mut held_outbound,
+        target,
+    );
+    assert_eq!(open.tree_aux_schema, AuxSchema::None);
+    end(
+        &mut reactor,
+        &held,
+        &open,
+        HeadersOutcomeCode::HistoryPruned,
+    );
+
+    let departed: Vec<ZakuraPeerId> = (0..12_u8)
+        .map(|index| {
+            let (peer, mut outbound) = connect(&mut reactor, 0x80 + index);
+            refresh(&mut reactor, &peer, &status);
+            let open = answer_locator(&mut reactor, &mut actions, &peer, &mut outbound, target);
+            assert_eq!(open.tree_aux_schema, AuxSchema::V1);
+            reactor.deliver_outcome(
+                peer.clone(),
+                0,
+                HeadersOutcome {
+                    subscription_id: open.subscription_id,
+                    initial_target_tip_hash: target,
+                    outcome: HeadersOutcomeCode::HistoryPruned,
+                },
+            );
+            reactor.handle_peer_disconnected(&peer, 0, "test");
+            peer
+        })
+        .collect();
+
+    let pruned_peers = &reactor.state.pruned_peers;
+    assert_eq!(pruned_peers.len(), limit);
+    assert!(
+        pruned_peers.contains_key(&held),
+        "a connected peer's entry outlasts the departed ones"
+    );
+    for peer in &departed[departed.len() - (limit - 1)..] {
+        assert!(
+            pruned_peers.contains_key(peer),
+            "the latest departed peers are held"
+        );
+    }
 }
 
 /// `HistoryPruned` from a replaced session, or for a round that already

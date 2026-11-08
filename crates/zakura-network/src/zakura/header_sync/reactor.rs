@@ -1409,9 +1409,10 @@ impl HeaderSyncReactor {
             .committed_snapshot
             .as_ref()
             .map(|snapshot| snapshot.frontiers.header_best);
+        let max_pruned_peers = self.admitted_peer_limit();
         if self
             .state
-            .note_history_pruned(peer, schema, tip, Instant::now())
+            .note_history_pruned(peer, schema, tip, Instant::now(), max_pruned_peers)
         {
             metrics::counter!("sync.header.target.aux_fallback").increment(1);
         }

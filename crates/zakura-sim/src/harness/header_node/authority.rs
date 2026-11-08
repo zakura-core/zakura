@@ -30,7 +30,10 @@
 //! is the ledger's `ForeignPage`, and the session view's identity joins are
 //! the session evidence's, both claims of the same property.
 //!
-//! The check applies once it judged a `Started` or a `PageStaged`, or the
+//! The credit the subscriber builds is judged beside these, in [`credit`].
+//!
+//! The check applies once it judged a `Started`, a `PageStaged` or a credit
+//! fact, or the
 //! session view joined an admission's identity to its link or transport
 //! row, so a run whose wrong identity starts no round still applies. A broken
 //! rule is a claim break, which the tap hands
@@ -109,6 +112,7 @@ pub(super) struct Authority {
     started: HashSet<Subscription>,
     /// Each subscription's last staged header.
     staged: HashMap<Subscription, Frontier>,
+    credit: credit::Credit,
     breaks: Vec<String>,
     evidence: AuthorityEvidence,
 }
@@ -138,6 +142,7 @@ impl Authority {
             opens: HashMap::new(),
             started: HashSet::new(),
             staged: HashMap::new(),
+            credit: credit::Credit::default(),
             breaks: Vec::new(),
             evidence,
         }
@@ -146,6 +151,9 @@ impl Authority {
     /// Judges `event`, which the reactor's own task reported when
     /// `on_reactor`, then notes what it says.
     pub(super) fn observe(&mut self, event: &ReactorEvent, on_reactor: bool) {
+        if self.credit.observe(event, on_reactor) {
+            self.applies();
+        }
         if !on_reactor {
             return;
         }
@@ -206,7 +214,9 @@ impl Authority {
                 store.applicable.get_or_insert(step);
             }
         });
-        std::mem::take(&mut self.breaks)
+        let mut breaks = std::mem::take(&mut self.breaks);
+        breaks.extend(self.credit.take_breaks());
+        breaks
     }
 
     /// Notes that a fact made the check applicable.
@@ -354,6 +364,8 @@ impl Authority {
             .collect()
     }
 }
+
+mod credit;
 
 #[cfg(test)]
 mod tests;

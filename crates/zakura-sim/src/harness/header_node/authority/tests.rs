@@ -8,9 +8,10 @@ use zakura_header_chain::{
     VerifiedGeneration,
 };
 use zakura_network::zakura::{
-    observe::RequestRef,
-    v9::{Cursor, Operation, SubscribeHeaders},
-    AuxSchema, Credit,
+    observe::{RequestRef, ReservationEnd, ReservationPurpose},
+    v9::{Cursor, Headers, Operation, RegtestMessage, SubscribeHeaders},
+    wire_codec::encode_frame,
+    AuxSchema, Credit, HeaderEntry,
 };
 
 use super::*;
@@ -47,6 +48,17 @@ fn adopted() -> ReactorEvent {
     }
 }
 
+/// The mirror's reservation `reservation` of `headers` headers.
+fn reserved(reservation: u64, headers: usize) -> ReactorEvent {
+    ReactorEvent::ReservationOpened {
+        reservation,
+        peer: mirror(),
+        purpose: ReservationPurpose::Ordinary,
+        headers,
+        request: None,
+    }
+}
+
 /// The subscriber's `Open` of subscription 1 on session 7 to `target`,
 /// from `locators`.
 fn open(target: Frontier, locators: &[block::Hash]) -> ReactorEvent {
@@ -56,7 +68,7 @@ fn open(target: Frontier, locators: &[block::Hash]) -> ReactorEvent {
         session_id: 7,
         subscription: 1,
         objects: 10,
-        bytes: 10_000,
+        bytes: 2_630,
         update: Box::new(SubscribeHeaders {
             operation: Operation::Open,
             subscription_id: 1,
@@ -71,7 +83,7 @@ fn open(target: Frontier, locators: &[block::Hash]) -> ReactorEvent {
             locator_hashes: locators.to_vec(),
             added_credit: Credit {
                 objects: 10,
-                bytes: 10_000,
+                bytes: 2_630,
             },
             tree_aux_schema: AuxSchema::None,
         }),
@@ -132,6 +144,7 @@ fn breaks(events: &[ReactorEvent]) -> Vec<String> {
 }
 
 /// [`breaks`], with `declared` `(parent, header)` pairs beyond the fixture.
+/// The `Open`'s reservation comes first.
 fn breaks_declaring(
     declared: &[(block::Hash, block::Hash)],
     events: &[ReactorEvent],
@@ -141,6 +154,21 @@ fn breaks_declaring(
         HeaderFixture::regtest(),
         [0, 1, 2],
         declared.iter().copied(),
+    );
+    check.observe(&reserved(99, 10), true);
+    for event in events {
+        check.observe(event, true);
+    }
+    check.drain(1)
+}
+
+/// The breaks `events` give with no reservation fed first.
+fn credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
+    let mut check = Authority::new(
+        AuthorityEvidence::default(),
+        HeaderFixture::regtest(),
+        [0],
+        [],
     );
     for event in events {
         check.observe(event, true);
@@ -170,6 +198,7 @@ fn a_page_on_a_scenario_branch_holds() {
             branches.iter().copied(),
             [],
         );
+        check.observe(&reserved(99, 10), true);
         for event in &events {
             check.observe(event, true);
         }
@@ -325,5 +354,214 @@ fn a_page_off_its_path_breaks() {
             .iter()
             .any(|found| found.contains("without ending at the target")),
         "{overrun:?}"
+    );
+}
+
+/// A grant of subscription 1 adding `objects` headers and `bytes` bytes,
+/// with `sequence`, acknowledging `acknowledged` and naming `target`.
+fn grant(
+    objects: u32,
+    bytes: u32,
+    sequence: u32,
+    acknowledged: Frontier,
+    target: block::Hash,
+) -> ReactorEvent {
+    let update = SubscribeHeaders {
+        operation: Operation::Grant,
+        subscription_id: 1,
+        update_sequence: sequence,
+        initial_target_tip_hash: target,
+        acknowledged: Cursor {
+            height: acknowledged.height,
+            hash: acknowledged.hash,
+            headers: 0,
+            bytes: 0,
+        },
+        locator_hashes: Vec::new(),
+        added_credit: Credit { objects, bytes },
+        tree_aux_schema: AuxSchema::None,
+    };
+    ReactorEvent::CreditIssued {
+        kind: CreditKind::Grant,
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        objects,
+        bytes,
+        update: Box::new(update),
+        target_height: block::Height(4),
+    }
+}
+
+/// The subscriber's acceptance of subscription 1 through `through`.
+fn accepted(through: Frontier) -> ReactorEvent {
+    ReactorEvent::CursorsAccepted {
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        through,
+    }
+}
+
+/// An `Open` within its reservation holds. One past it, or one whose
+/// reservation a cancellation returned first, breaks issuance. So does a
+/// byte credit past one smallest page per header.
+#[test]
+fn credit_stays_within_its_reservation() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor().hash;
+    assert_eq!(
+        credit_breaks(&[reserved(1, 10), open(chain[3], &[genesis])]),
+        Vec::<String>::new()
+    );
+    let over = credit_breaks(&[reserved(1, 9), open(chain[3], &[genesis])]);
+    assert!(over[0].contains("granted 10 headers"), "{over:?}");
+    let cancelled = credit_breaks(&[
+        reserved(1, 10),
+        ReactorEvent::ReservationEnded {
+            reservation: 1,
+            released: 10,
+            cause: ReservationEnd::Cancelled,
+        },
+        open(chain[3], &[genesis]),
+    ]);
+    assert!(cancelled[0].contains("hold 0"), "{cancelled:?}");
+    let page = u32::try_from(credit::smallest_page(AuxSchema::None)).expect("small");
+    let start = Frontier::new(block::Height(0), genesis);
+    let base = || vec![reserved(1, 10), open(chain[3], &[genesis]), reserved(2, 2)];
+    let mut fits = base();
+    fits.push(grant(2, 2 * page, 1, start, chain[3].hash));
+    assert_eq!(credit_breaks(&fits), Vec::<String>::new());
+    let mut bytes = base();
+    bytes.push(grant(2, 2 * page + 1, 1, start, chain[3].hash));
+    let found = credit_breaks(&bytes);
+    assert!(found[0].contains("bytes for 2 headers"), "{found:?}");
+}
+
+/// A grant or close that names another target, skips a sequence or
+/// acknowledges anything but the latest acceptance breaks the update rule.
+#[test]
+fn updates_carry_their_subscriptions_state() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[3].hash, genesis.hash);
+    let base = || {
+        vec![
+            reserved(1, 10),
+            adopted(),
+            open(chain[3], &[genesis.hash]),
+            started(round.clone(), &[genesis.hash]),
+            page(&round, genesis, &[chain[0].hash, chain[1].hash]),
+            accepted(chain[1]),
+            reserved(2, 2),
+        ]
+    };
+    let with = |update: ReactorEvent| {
+        let mut events = base();
+        events.push(update);
+        credit_breaks(&events)
+    };
+    assert_eq!(
+        with(grant(2, 0, 1, chain[1], chain[3].hash)),
+        Vec::<String>::new()
+    );
+    for (update, why) in [
+        (grant(2, 0, 1, chain[1], chain[2].hash), "names target"),
+        (
+            grant(2, 0, 2, chain[1], chain[3].hash),
+            "has sequence 2, not 1",
+        ),
+        (grant(2, 0, 1, genesis, chain[3].hash), "acknowledges"),
+    ] {
+        let found = with(update);
+        assert!(
+            found.iter().any(|found| found.contains(why)),
+            "{why}: {found:?}"
+        );
+    }
+    let close = |target: block::Hash| ReactorEvent::CloseBuilt {
+        peer: mirror(),
+        session_id: 7,
+        update: Box::new(SubscribeHeaders {
+            operation: Operation::Close,
+            subscription_id: 1,
+            update_sequence: 1,
+            initial_target_tip_hash: target,
+            acknowledged: Cursor {
+                height: chain[1].height,
+                hash: chain[1].hash,
+                headers: 0,
+                bytes: 0,
+            },
+            locator_hashes: Vec::new(),
+            added_credit: Credit {
+                objects: 0,
+                bytes: 0,
+            },
+            tree_aux_schema: AuxSchema::None,
+        }),
+    };
+    assert_eq!(with(close(chain[3].hash)), Vec::<String>::new());
+    let found = with(close(chain[2].hash));
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("Close names target")),
+        "{found:?}"
+    );
+}
+
+/// Acceptance through a staged page's last header holds. Through a cursor
+/// no page staged, as a dropped late page's, or below an earlier
+/// acceptance, it breaks.
+#[test]
+fn acceptance_reaches_only_staged_pages() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[3].hash, genesis.hash);
+    let base = || {
+        vec![
+            reserved(1, 10),
+            adopted(),
+            open(chain[3], &[genesis.hash]),
+            started(round.clone(), &[genesis.hash]),
+            page(&round, genesis, &[chain[0].hash, chain[1].hash]),
+            page(&round, chain[1], &[chain[2].hash]),
+        ]
+    };
+    let with = |through: &[Frontier]| {
+        let mut events = base();
+        events.extend(through.iter().map(|through| accepted(*through)));
+        credit_breaks(&events)
+    };
+    assert_eq!(with(&[chain[1], chain[2]]), Vec::<String>::new());
+    let late = with(&[chain[3]]);
+    assert!(late[0].contains("no staged page ends at"), "{late:?}");
+    let backwards = with(&[chain[2], chain[1]]);
+    assert!(backwards[0].contains("below its earlier"), "{backwards:?}");
+}
+
+/// The model's smallest plain page is an encoded one-header page's payload.
+#[test]
+fn the_smallest_page_is_an_encoded_one_header_page() {
+    let fixture = HeaderFixture::regtest();
+    let header = fixture.extend(fixture.anchor(), 1, 0).remove(0);
+    let page = RegtestMessage::Headers(Headers {
+        subscription_id: 1,
+        initial_target_tip_hash: header.hash(),
+        common_ancestor_height: block::Height(0),
+        common_ancestor_hash: fixture.anchor().hash,
+        reaches_initial_target: true,
+        tree_aux_schema: AuxSchema::None,
+        entries: vec![HeaderEntry {
+            header,
+            body_size: 0,
+            tree_aux: None,
+        }],
+    });
+    let frame = encode_frame(&page).expect("a one-header page encodes");
+    assert_eq!(
+        credit::smallest_page(AuxSchema::None),
+        u64::try_from(frame.payload.len()).expect("small")
     );
 }

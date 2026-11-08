@@ -545,7 +545,16 @@ impl SubscriberState {
         let live = self.live.as_mut().ok_or(SubscribeRefused::Unknown)?;
         let update = tools.close(&live.id)?;
         live.close_sent = true;
-        Ok(live.message(Operation::Close, update))
+        let message = live.message(Operation::Close, update);
+        #[cfg(any(test, zakura_sim))]
+        if let Some(tap) = &self.credit {
+            tap.observer.observe(ReactorEvent::CloseBuilt {
+                peer: tap.peer.clone(),
+                session_id: tap.session_id,
+                update: Box::new(message.clone()),
+            });
+        }
+        Ok(message)
     }
 
     /// The live subscription's ID, if there is one.

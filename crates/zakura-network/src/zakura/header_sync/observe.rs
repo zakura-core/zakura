@@ -376,6 +376,16 @@ pub enum ReactorEvent {
         /// only by hash.
         target_height: block::Height,
     },
+    /// The subscriber built a `Close` for `subscription`. It adds no credit,
+    /// so it isn't a [`ReactorEvent::CreditIssued`].
+    CloseBuilt {
+        /// The peer the subscription is with.
+        peer: ZakuraPeerId,
+        /// The session the subscription is on.
+        session_id: u64,
+        /// The update as the subscriber built it, as `CreditIssued` carries.
+        update: Box<SubscribeHeaders>,
+    },
     /// The subscriber accepted the cursors of `subscription` through
     /// `through`, so its next update acknowledges it.
     CursorsAccepted {

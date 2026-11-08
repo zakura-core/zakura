@@ -1148,9 +1148,10 @@ impl HeaderSyncObserver for Recorded {
 /// with its peer, session and subscription, the update exactly as it built
 /// it and its target's height: the `Open`'s whole window, a grant through
 /// acceptance, and a grant through `grant_due`. Each acceptance reports the
-/// cursor it accepted through, before any grant it makes due.
+/// cursor it accepted through, before any grant it makes due. A `Close`
+/// reports the update it built.
 #[test]
-fn observed_credit_reports_each_open_and_grant() {
+fn observed_credit_reports_each_open_grant_and_close() {
     let (tree, chain) = chain(20);
     let recorded = Arc::new(Recorded::default());
     let peer = ZakuraPeerId::new(vec![9; 32]).expect("32 bytes is a valid peer ID");
@@ -1206,6 +1207,12 @@ fn observed_credit_reports_each_open_and_grant() {
     expected.push(accepted(&cursors[7]));
     let grant = fixture.sub.grant_due(8).expect("a larger budget refills");
     expected.push(credit(CreditKind::Grant, grant));
+    let close = fixture.sub.close().expect("the live subscription closes");
+    expected.push(ReactorEvent::CloseBuilt {
+        peer: peer.clone(),
+        session_id: 7,
+        update: Box::new(close),
+    });
 
     let reported: Vec<_> = std::mem::take(&mut *recorded.0.lock().expect("unpoisoned"));
     assert_eq!(reported, expected);

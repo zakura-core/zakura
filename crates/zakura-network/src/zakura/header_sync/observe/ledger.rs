@@ -63,6 +63,9 @@ struct Held {
     incarnation: u64,
     headers: usize,
     ended: bool,
+    /// The other rounds whose leases the call holds, which a
+    /// `ForeignLease` claim reported.
+    foreign: Vec<u64>,
 }
 
 /// What the ledger knows about one dispatched call.
@@ -240,6 +243,8 @@ struct Handoff {
     apply: u64,
     incarnation: u64,
     headers: usize,
+    /// The other rounds whose leases pass with the headers.
+    foreign: Vec<u64>,
 }
 
 impl HeaderWorkLedger {
@@ -490,7 +495,14 @@ impl HeaderWorkLedger {
                 leases,
             } => {
                 let mut found = Vec::new();
-                if let Some(foreign) = leases.iter().find(|round| **round != *incarnation) {
+                let foreign: Vec<u64> = leases
+                    .iter()
+                    .filter(|round| **round != *incarnation)
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                if let Some(foreign) = foreign.first() {
                     found.push(ClaimBreak {
                         rule: ClaimRule::ForeignLease,
                         detail: format!(
@@ -510,6 +522,7 @@ impl HeaderWorkLedger {
                     incarnation: *incarnation,
                     headers: *headers,
                     ended: false,
+                    foreign,
                 });
                 let (expected_kind, call_peer, owner, payload) = match &record.op {
                     PortCall::Prepare {
@@ -601,9 +614,10 @@ impl HeaderWorkLedger {
                             ),
                         }
                     });
+                let foreign = held.foreign.clone();
                 self.claims.extend(wrong);
                 if let HeaderWorkEnd::HandedToApply { apply } = end {
-                    self.check_handoff(*call, *apply, *incarnation, *headers)?;
+                    self.check_handoff(*call, *apply, *incarnation, *headers, foreign)?;
                 }
             }
             _ => {}
@@ -620,6 +634,7 @@ impl HeaderWorkLedger {
         apply: u64,
         incarnation: u64,
         headers: usize,
+        foreign: Vec<u64>,
     ) -> Result<(), String> {
         let prepare = self.calls.get(&call).map(|record| &record.op);
         let applied = self.calls.get(&apply);
@@ -665,6 +680,7 @@ impl HeaderWorkLedger {
                     apply,
                     incarnation,
                     headers,
+                    foreign,
                 });
                 Ok(())
             }
@@ -1140,7 +1156,9 @@ impl HeaderWorkLedger {
     }
 
     /// How many headers calls hold now, by round. A handoff's headers count
-    /// for their round until its apply takes them.
+    /// for their round until its apply takes them. A round whose lease a
+    /// call holds for another round, a claimed `ForeignLease`, counts as
+    /// held with no headers.
     pub fn held_by_round(&self) -> BTreeMap<u64, usize> {
         let mut held = BTreeMap::new();
         let calls = self
@@ -1148,13 +1166,16 @@ impl HeaderWorkLedger {
             .values()
             .filter_map(|record| record.held.as_ref())
             .filter(|held| !held.ended)
-            .map(|held| (held.incarnation, held.headers));
+            .map(|held| (held.incarnation, held.headers, &held.foreign));
         let handoff = self
             .handoff
             .iter()
-            .map(|handoff| (handoff.incarnation, handoff.headers));
-        for (incarnation, headers) in calls.chain(handoff) {
+            .map(|handoff| (handoff.incarnation, handoff.headers, &handoff.foreign));
+        for (incarnation, headers, foreign) in calls.chain(handoff) {
             *held.entry(incarnation).or_insert(0) += headers;
+            for round in foreign {
+                held.entry(*round).or_insert(0);
+            }
         }
         held
     }
@@ -2381,6 +2402,34 @@ mod tests {
             },
         ]);
         claimed_as(foreign, ClaimRule::ForeignLease);
+        // The foreign lease's round counts as held through the call, so its
+        // release while the call holds it is no leak.
+        let mut ledger = fold(after(
+            &[(1, 1), (2, 2)],
+            vec![
+                dispatched(1, prepare(1)),
+                ReactorEvent::HeadersHeld {
+                    call: 1,
+                    kind: StorageCallKind::Prepare,
+                    peer: peer(1),
+                    incarnation: 1,
+                    headers: 5,
+                    leases: vec![1, 2],
+                },
+                ReactorEvent::RoundReleased {
+                    peer: peer(2),
+                    incarnation: 2,
+                    queue_owned: 0,
+                },
+            ],
+        ))
+        .expect("a claimed foreign lease doesn't refuse the history");
+        let rules: Vec<_> = ledger
+            .take_claims()
+            .iter()
+            .map(|claim| claim.rule)
+            .collect();
+        assert_eq!(rules, [ClaimRule::ForeignLease]);
     }
 
     /// A prepare or apply that ends without holding its round's headers

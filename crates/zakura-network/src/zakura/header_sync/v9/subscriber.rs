@@ -360,13 +360,20 @@ impl Subscriber {
         let plan = self.state.plan_open(status, locators, schema, staging)?;
         let exchange = self.fence.open().ok_or(SubscribeError::Fenced)?;
         let writer = exchange.writer();
-        let mut tools = self.tools.lock();
-        let update = tools.open_fenced(plan.id, plan.window, plan.start, exchange)?;
-        // Read under the lock that recorded the `Open`, which a second lock
-        // would add a scheduling point to.
+        #[cfg(not(any(test, zakura_sim)))]
+        let update = self
+            .tools
+            .lock()
+            .open_fenced(plan.id, plan.window, plan.start, exchange)?;
+        // The totals are read under the lock that recorded the `Open`, which
+        // a second lock would add a scheduling point to.
         #[cfg(any(test, zakura_sim))]
-        let totals = state::totals(&tools, plan.id);
-        drop(tools);
+        let (update, totals) = {
+            let mut tools = self.tools.lock();
+            let update = tools.open_fenced(plan.id, plan.window, plan.start, exchange)?;
+            let totals = state::totals(&tools, plan.id);
+            (update, totals)
+        };
         Ok((sim_arg!(self.state.opened(plan, update); totals), writer))
     }
 

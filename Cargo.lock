@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "zakura"
-version = "1.8.5"
+version = "1.8.6"
 dependencies = [
  "bytes",
  "chrono",
@@ -2942,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "5.2.0"
+version = "5.2.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-node-services"
-version = "5.2.0"
+version = "5.2.1"
 dependencies = [
  "base64",
  "bytes",
@@ -3251,7 +3251,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "16.0.0"
+version = "16.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3361,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-script"
-version = "5.0.5"
+version = "5.0.6"
 dependencies = [
  "hex",
  "ripemd",
@@ -3465,7 +3465,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "15.0.0"
+version = "15.0.1"
 dependencies = [
  "chrono",
  "derive-new",
@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "clap",
  "eyre",

@@ -257,6 +257,28 @@ fn writable_opens_change_nothing_until_repair() {
 }
 
 #[test]
+fn repair_keeps_a_leftover_jar_an_append_recommitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let static_dir = dir.path().join(STATIC_FILE_DIR);
+    let static_files = open(dir.path(), 1_000);
+    static_files.append_blocks(&blocks(0..10)).unwrap();
+    drop(static_files);
+
+    // A crash after creating a jar's files, before its first config.
+    Jar::create(&static_dir, 1_000, 1_999).unwrap();
+
+    // Writes don't need a repair first, so one recreates and commits that jar.
+    let reopened = StaticFiles::open(static_dir.clone(), true, 1_000).unwrap();
+    reopened.append_blocks(&blocks(1_000..1_010)).unwrap();
+    reopened.repair().unwrap();
+    drop(reopened);
+
+    let reopened = open(dir.path(), 1_000);
+    assert_blocks(&reopened, &blocks(0..10));
+    assert_blocks(&reopened, &blocks(1_000..1_010));
+}
+
+#[test]
 fn jars_sharing_a_first_block_are_not_hidden() {
     let dir = tempfile::tempdir().unwrap();
     let static_dir = dir.path().join(STATIC_FILE_DIR);

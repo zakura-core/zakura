@@ -937,8 +937,8 @@ where
             // still needs to fetch and verify the block body in that case.
             //
             // A pruned state deletes old bodies but keeps their headers and hash index, so the
-            // body lookup misses blocks that we verified long ago. Looking up the verified
-            // height at the same time keeps it off the latency of new blocks.
+            // body lookup misses blocks that we verified long ago. Look up the verified
+            // height concurrently with the body; both reads must finish before requesting a block.
             let (body, verified_height) = futures::join!(
                 state
                     .clone()
@@ -1952,8 +1952,9 @@ mod tests {
         }
     }
 
-    /// Downloads a block that a pruned state already holds at `stored_height`, with the tip at
-    /// `tip_height`, and returns the download's result and the block requests sent to peers.
+    /// Mocks a pruned state reporting `stored_height`, with the tip at `tip_height`, and returns
+    /// the download's result and the block requests sent to peers. The peer always returns
+    /// Mainnet block 1, so these tests check request dispatch, not successful verification.
     async fn download_known_block(
         stored_height: block::Height,
         tip_height: block::Height,
@@ -2013,7 +2014,8 @@ mod tests {
             ),
             DownloadAction::AddedToQueue
         );
-        // A block that is requested reaches the verifier, which never answers.
+        // Bound the wait if the downloaded block passes the height checks and reaches the
+        // verifier, which never answers. The post-download checks can also reject block 1.
         let result = tokio::time::timeout(Duration::from_millis(500), downloads.next())
             .await
             .ok()

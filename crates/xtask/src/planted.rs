@@ -995,7 +995,7 @@ fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
         let input = dir.join(format!("input-{index}.bin"));
         fs::write(&input, bytes)?;
         let run = record(
-            Command::new(&binary),
+            Command::new(binary),
             harness,
             &Located::Input(input.clone()),
             &case.property,

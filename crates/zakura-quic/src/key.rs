@@ -6,10 +6,9 @@
 //! The text forms match Iroh's, so existing key files and `id@addr` bootstrap
 //! entries keep parsing and every key yields the same node ID.
 //!
-//! Signing and the verification equation use `ed25519-zebra`, which Zakura's
-//! discovery records already use for the same key. `curve25519-dalek` checks
-//! the public key and each signature's `R` point before the equation runs
-//! (ID-6).
+//! Signing and the verification equation use `ring`, which the QUIC and TLS
+//! stack already depends on. `curve25519-dalek` checks the public key and each
+//! signature's `R` point before the equation runs (ID-6).
 
 use std::{
     fmt,
@@ -19,7 +18,7 @@ use std::{
 };
 
 use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
-use ed25519_zebra::{Signature, SigningKey, VerificationKey};
+use ring::signature::{Ed25519KeyPair, KeyPair as _, UnparsedPublicKey, ED25519};
 use zeroize::Zeroize as _;
 
 /// Length of an Ed25519 public key or secret seed, in bytes.
@@ -78,23 +77,21 @@ impl NodeId {
     /// Verifies `signature` over `message` (ID-6).
     ///
     /// The key `A` and the signature's `R` must be canonical, not of small
-    /// order and torsion-free, and `S` must be canonical. With `A` and `R` in
-    /// the prime-order subgroup,
-    /// `ed25519-zebra`'s cofactored equation accepts exactly the signatures the
-    /// cofactorless equation accepts, so this accepts a subset of what
-    /// `ed25519-dalek`'s `verify_strict` accepts.
+    /// order and torsion-free, and `S` must be canonical. `ring` then checks
+    /// the cofactorless equation `R = SB - kA`. With `A` and `R` in the
+    /// prime-order subgroup, it accepts exactly the signatures the cofactored
+    /// equation accepts, so this accepts a subset of what `ed25519-dalek`'s
+    /// `verify_strict` accepts.
     pub fn verify_strict(&self, message: &[u8], signature: &[u8]) -> Result<(), SignatureError> {
-        let signature = Signature::from_slice(signature).map_err(|_| SignatureError)?;
+        let signature: &[u8; 64] = signature.try_into().map_err(|_| SignatureError)?;
+        let r = signature
+            .first_chunk::<KEY_LENGTH>()
+            .ok_or(SignatureError)?;
         prime_order_point(&self.0).ok_or(SignatureError)?;
-        prime_order_point(signature.r_bytes()).ok_or(SignatureError)?;
-        self.verifying_key()
-            .verify(&signature, message)
+        prime_order_point(r).ok_or(SignatureError)?;
+        UnparsedPublicKey::new(&ED25519, &self.0)
+            .verify(message, signature)
             .map_err(|_| SignatureError)
-    }
-
-    fn verifying_key(&self) -> VerificationKey {
-        VerificationKey::try_from(self.0)
-            .expect("from_bytes checked that the bytes decompress to a curve point")
     }
 }
 
@@ -184,21 +181,36 @@ pub struct SignatureError;
 
 /// A node's Ed25519 secret seed (ID-3).
 ///
-/// It zeroizes on drop. `Debug` and `Display` never show the seed, and it has
-/// no `Serialize` impl.
+/// It holds only the seed and its public key, and zeroizes the seed on drop.
+/// [`sign`](Self::sign) expands the seed for each signature, and `ring` does
+/// not zeroize that expanded key when the call returns. `Debug` and `Display`
+/// never show the seed, and it has no `Serialize` impl.
 #[derive(Clone)]
-pub struct NodeSecretKey(SigningKey);
+pub struct NodeSecretKey {
+    seed: [u8; KEY_LENGTH],
+    public: NodeId,
+}
 
 impl Drop for NodeSecretKey {
     fn drop(&mut self) {
-        self.0.zeroize();
+        self.seed.zeroize();
     }
 }
 
 impl NodeSecretKey {
     /// Builds a key from its 32-byte seed. The public key derives per RFC 8032 (ID-4).
     pub fn from_bytes(seed: &[u8; KEY_LENGTH]) -> Self {
-        Self(SigningKey::from(*seed))
+        let public = expand(seed)
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("ring's Ed25519 public keys are 32 bytes");
+        Self {
+            seed: *seed,
+            // A key derived from a seed is a multiple of the base point, so it
+            // passes every check `NodeId::from_bytes` makes.
+            public: NodeId(public),
+        }
     }
 
     /// Generates a key from the operating system's random source.
@@ -213,7 +225,7 @@ impl NodeSecretKey {
 
     /// Returns the 32-byte seed. Callers must not log it.
     pub fn to_bytes(&self) -> [u8; KEY_LENGTH] {
-        self.0.to_bytes()
+        self.seed
     }
 
     /// Returns the seed as 64 lowercase hex characters, the key-file form (ID-5).
@@ -226,13 +238,22 @@ impl NodeSecretKey {
 
     /// Returns this key's node ID.
     pub fn public(&self) -> NodeId {
-        NodeId(self.0.verification_key().into())
+        self.public
     }
 
     /// Signs `message` with Ed25519.
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        self.0.sign(message).to_bytes()
+        expand(&self.seed)
+            .sign(message)
+            .as_ref()
+            .try_into()
+            .expect("ring's Ed25519 signatures are 64 bytes")
     }
+}
+
+/// Expands `seed` into an Ed25519 key pair, per RFC 8032.
+fn expand(seed: &[u8; KEY_LENGTH]) -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(seed).expect("ring accepts every 32-byte seed")
 }
 
 impl fmt::Debug for NodeSecretKey {
@@ -412,6 +433,114 @@ mod tests {
         (a + b).compress().to_bytes()
     }
 
+    /// Returns whether ZIP 215's cofactored equation [8](SB - R - kA) = 0
+    /// holds, with k = H(R || A || M). Neither the point checks nor `ring`
+    /// run, so a test can show that a signature only those refuse is
+    /// otherwise valid.
+    fn cofactored_equation_holds(public: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
+        use curve25519_dalek::{
+            constants::ED25519_BASEPOINT_POINT, traits::IsIdentity as _, Scalar,
+        };
+        use sha2::{Digest as _, Sha512};
+
+        let (r_bytes, s_bytes) = sig.split_at(32);
+        let a = CompressedEdwardsY(*public).decompress().unwrap();
+        let r = CompressedEdwardsY(r_bytes.try_into().unwrap())
+            .decompress()
+            .unwrap();
+        let s = Scalar::from_canonical_bytes(s_bytes.try_into().unwrap()).unwrap();
+        let k: [u8; 64] = Sha512::new()
+            .chain_update(r_bytes)
+            .chain_update(public)
+            .chain_update(message)
+            .finalize()
+            .into();
+        let k = Scalar::from_bytes_mod_order_wide(&k);
+        (s * ED25519_BASEPOINT_POINT - r - k * a)
+            .mul_by_cofactor()
+            .is_identity()
+    }
+
+    /// The `ed25519-zebra` implementation this module used before `ring`:
+    /// the same point checks, then ZIP 215's cofactored equation.
+    fn zebra_verify_strict(public: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
+        let r: &[u8; 32] = sig[..32].try_into().unwrap();
+        prime_order_point(public).is_some()
+            && prime_order_point(r).is_some()
+            && ed25519_zebra::VerificationKey::try_from(*public)
+                .and_then(|key| key.verify(&ed25519_zebra::Signature::from_bytes(sig), message))
+                .is_ok()
+    }
+
+    /// ID-4, ID-6: for many seeds and messages, `ring` derives the same keys
+    /// and signatures as `ed25519-zebra`, and `verify_strict` accepts and
+    /// refuses exactly what the `ed25519-zebra` implementation did, for valid
+    /// signatures and for each kind of corruption.
+    #[test]
+    fn ring_matches_the_ed25519_zebra_implementation() {
+        use sha2::{Digest as _, Sha512};
+
+        let torsion = CompressedEdwardsY(ORDER_8).decompress().unwrap();
+        for case in 0u32..256 {
+            let digest = Sha512::digest(case.to_le_bytes());
+            let seed: [u8; 32] = digest[..32].try_into().unwrap();
+            let length = usize::try_from(case % 33).expect("a value below 33 fits in usize");
+            let message = &digest[32..32 + length];
+
+            let secret = NodeSecretKey::from_bytes(&seed);
+            let zebra_secret = ed25519_zebra::SigningKey::from(seed);
+            let zebra_public: [u8; 32] =
+                ed25519_zebra::VerificationKeyBytes::from(&zebra_secret).into();
+            assert_eq!(secret.public().as_bytes(), &zebra_public, "case {case}");
+
+            let sig = secret.sign(message);
+            assert_eq!(sig, zebra_secret.sign(message).to_bytes(), "case {case}");
+
+            let public = secret.public();
+            let mut candidates = vec![sig];
+            // Every single-bit flip in R and in S.
+            for bit in 0..512 {
+                let mut flipped = sig;
+                flipped[bit / 8] ^= 1 << (bit % 8);
+                candidates.push(flipped);
+            }
+            // S + L: the same scalar, not canonically encoded.
+            let mut s_plus_l = sig;
+            let mut carry = 0u16;
+            for (byte, l) in s_plus_l[32..].iter_mut().zip(L) {
+                let sum = u16::from(*byte) + u16::from(l) + carry;
+                *byte = sum as u8; // Keeps the low byte; the carry holds the rest.
+                carry = sum >> 8;
+            }
+            candidates.push(s_plus_l);
+            // R + T for a point T of order 8.
+            let mut r_plus_t = sig;
+            let r = CompressedEdwardsY(sig[..32].try_into().unwrap())
+                .decompress()
+                .unwrap();
+            r_plus_t[..32].copy_from_slice((r + torsion).compress().as_bytes());
+            candidates.push(r_plus_t);
+
+            for candidate in candidates {
+                assert_eq!(
+                    public.verify_strict(message, &candidate).is_ok(),
+                    zebra_verify_strict(public.as_bytes(), message, &candidate),
+                    "case {case}, signature {}",
+                    hex::encode(candidate),
+                );
+            }
+
+            // A message that differs in one bit.
+            let mut other = message.to_vec();
+            other.push(0);
+            assert_eq!(
+                public.verify_strict(&other, &sig).is_ok(),
+                zebra_verify_strict(public.as_bytes(), &other, &sig),
+                "case {case}"
+            );
+        }
+    }
+
     #[test]
     fn small_order_keys_are_refused() {
         assert_eq!(
@@ -508,8 +637,7 @@ mod tests {
 
         // Sign with R' = rB + T for a point T of order 8, and compute S for
         // the challenge over R'. ZIP 215's cofactored equation ignores T, so
-        // `ed25519-zebra` alone accepts this signature; the torsion check on
-        // R refuses it.
+        // it alone accepts this signature; the torsion check on R refuses it.
         let secret: NodeSecretKey = RFC8032_SEED.parse().unwrap();
         let public = secret.public();
         let expanded = Sha512::digest(secret.to_bytes());
@@ -535,8 +663,7 @@ mod tests {
         sig[..32].copy_from_slice(&r_point);
         sig[32..].copy_from_slice(s.as_bytes());
 
-        let zebra = VerificationKey::try_from(*public.as_bytes()).unwrap();
-        zebra.verify(&Signature::from_bytes(&sig), b"msg").unwrap();
+        assert!(cofactored_equation_holds(public.as_bytes(), b"msg", &sig));
         assert_eq!(public.verify_strict(b"msg", &sig), Err(SignatureError));
     }
 
@@ -549,8 +676,8 @@ mod tests {
     }
 
     /// ID-6: a mixed-order key A' = aB + T with a signature whose challenge
-    /// is over A'. ZIP 215's cofactored equation ignores T, so
-    /// `ed25519-zebra` alone accepts it; only the torsion check on A refuses.
+    /// is over A'. ZIP 215's cofactored equation ignores T, so it alone
+    /// accepts the signature; only the torsion check on A refuses.
     #[test]
     fn mixed_order_key_with_a_cofactored_valid_signature_is_refused() {
         use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, Scalar};
@@ -578,8 +705,7 @@ mod tests {
         sig[..32].copy_from_slice(&r_point);
         sig[32..].copy_from_slice(s.as_bytes());
 
-        let zebra = VerificationKey::try_from(mixed).unwrap();
-        zebra.verify(&Signature::from_bytes(&sig), b"msg").unwrap();
+        assert!(cofactored_equation_holds(&mixed, b"msg", &sig));
         let mixed = NodeId::from_bytes(&mixed).expect("a mixed-order key parses");
         assert_eq!(mixed.verify_strict(b"msg", &sig), Err(SignatureError));
     }

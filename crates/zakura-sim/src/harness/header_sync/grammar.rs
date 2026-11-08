@@ -285,17 +285,18 @@ pub mod v2 {
 /// Carries generator-2 fuzz `input` to this generator: decodes its prefix
 /// as generator 2 did, encodes the same scenario's canonical prefix, and
 /// keeps its Plan bytes, which start at the same offset since both
-/// prefixes are 344 bytes.
+/// prefixes are 344 bytes. An input shorter than a prefix has its missing
+/// bytes read as 0, as the harness reads it, and no Plan bytes.
 ///
 /// # Errors
 ///
-/// If `input` is shorter than a prefix, or its prefix isn't generator 2's.
+/// If the input's prefix isn't generator 2's.
 pub fn migrate(input: &[u8]) -> Result<Vec<u8>, String> {
-    let at = LAYOUT.prefix_len();
-    let (prefix, plan) = input
-        .split_at_checked(at)
-        .ok_or_else(|| format!("the input has {} bytes, fewer than a prefix", input.len()))?;
-    let scenario = v2::decode(prefix).map_err(|rejection| rejection.to_string())?;
+    let at = LAYOUT.prefix_len().min(input.len());
+    let (prefix, plan) = input.split_at(at);
+    let mut prefix = prefix.to_vec();
+    prefix.resize(LAYOUT.prefix_len(), 0);
+    let scenario = v2::decode(&prefix).map_err(|rejection| rejection.to_string())?;
     let mut migrated = encode(&scenario).map_err(|error| {
         format!(
             "generator 3 can't encode a generator-2 scenario: {}",

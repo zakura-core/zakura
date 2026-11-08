@@ -1168,7 +1168,8 @@ fn generator_2_reads_only_its_own_meanings() {
 }
 
 /// A generator-2 input migrates to the same scenario under generator 3,
-/// with its Plan bytes kept, and only a generator-2 input migrates.
+/// with its Plan bytes kept, a short one too, and only a generator-2 input
+/// migrates.
 #[test]
 fn migration_keeps_a_scenario_and_its_plan() {
     let mut v2 = prefix(&[slot(GROW, [1, 2, 0, 0], [6, 0, 1, 0, 0])]);
@@ -1182,5 +1183,20 @@ fn migration_keeps_a_scenario_and_its_plan() {
         grammar::v2::decode(&v2).unwrap()
     );
     assert!(grammar::migrate(&migrated).is_err());
-    assert!(grammar::migrate(&input[..343]).is_err());
+    // A short input reads its missing bytes as 0, as the harness does: cut
+    // through the growth's slot, it migrates to the scenario its padded
+    // prefix decodes to, with no Plan bytes.
+    for cut in [1, HEADER + 2, HEADER + 7, 343] {
+        let short = &input[..cut];
+        let mut padded = short.to_vec();
+        padded.resize(Storage::SCENARIO_BYTES, 0);
+        let migrated = grammar::migrate(short).unwrap();
+        assert_eq!(migrated.len(), Storage::SCENARIO_BYTES, "{cut}");
+        assert_eq!(
+            decode(&migrated),
+            grammar::v2::decode(&padded).unwrap(),
+            "{cut}"
+        );
+    }
+    assert!(grammar::migrate(&[]).is_err());
 }

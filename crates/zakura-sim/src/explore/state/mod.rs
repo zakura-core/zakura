@@ -1409,7 +1409,7 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompletionCancellation,
         "completion after cancellation request",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| {
             matches!(
                 f,
@@ -1430,7 +1430,7 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompletionCancellation,
         "completion after owner retirement",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| {
             matches!(
                 f,
@@ -1452,14 +1452,14 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompetingForks,
         "two distinct peer offers",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| *f == StateFeature::Fork(Fork::DistinctOffersActive),
     ),
     collected(
         Family::CompetingForks,
         "shared ancestor",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| *f == StateFeature::Fork(Fork::SharedAncestorPrepared),
     ),
     waiting(
@@ -1475,7 +1475,7 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompetingForks,
         "selected winner",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| *f == StateFeature::Fork(Fork::WinnerApplied),
     ),
     collected(

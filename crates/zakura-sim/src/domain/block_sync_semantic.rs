@@ -339,6 +339,9 @@ pub struct SemanticModel {
     /// Whether the run reached a newer body-work epoch while storage held a
     /// submission from an older one.
     pub saw_reset_while_held: bool,
+    /// Whether the sequencer refused a body as stale because the body work
+    /// epoch it applied was newer than the body owner's.
+    pub saw_old_epoch_body_refused: bool,
     /// Whether a verdict reached block sync while a submission holder still
     /// held its token.
     pub saw_verdict_while_held: bool,
@@ -743,6 +746,13 @@ impl SemanticModel {
                     .filter(|submission| submission.detached)
                     .map(|submission| submission.decoded_attributed_memory_bytes);
                 self.applying_decoded = applying.chain(detached).fold(0, u64::saturating_add);
+            }
+            BlockSyncFact::StaleScope { body, scope_epoch } => {
+                self.saw_old_epoch_body_refused |= body
+                    .owner
+                    .body_work_epoch
+                    .zip(*scope_epoch)
+                    .is_some_and(|(owned, applied)| owned < applied);
             }
             BlockSyncFact::Reactor { transition, state } => {
                 self.reactor_queries
@@ -1339,9 +1349,12 @@ fn query_reached_storage(log: &ObservationLog) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::{
-        BlockSyncBody, BlockSyncRetained, BodyScope, StorageBranch, StoragePoint, StreamId,
-        WorkScope,
+    use crate::{
+        observe::{
+            BlockSyncBody, BlockSyncReactorState, BlockSyncRetained, BodyScope, StorageBranch,
+            StoragePoint, StreamId, WorkScope,
+        },
+        record::machine::{BodyAuthority, ReactorAction},
     };
 
     /// A log built one step at a time.
@@ -1857,5 +1870,86 @@ mod tests {
         assert_eq!(decoded_handoffs(1, cap, 1), []);
         assert_eq!(decoded_handoffs(4, cap, 1), []);
         assert_eq!(decoded_handoffs(4, cap, 2).len(), 1);
+    }
+
+    /// The reactor reports epoch 2's authority, and the sequencer takes
+    /// an epoch-1 body from its input before it applies epoch 2. It buffers
+    /// the body as current, so the model sees no refusal.
+    fn dequeued_in_the_gap() -> History {
+        let mut history = History::default();
+        history
+            .step()
+            .sync(BlockSyncFact::Reactor {
+                transition: ReactorAction::AuthorityChanged {
+                    authority: BodyAuthority {
+                        header: owner(0, 0, 2).scope,
+                        verified_generation: 1,
+                        body_work_epoch: 2,
+                    },
+                    epoch_changed: true,
+                },
+                state: BlockSyncReactorState {
+                    pending: None,
+                    next_query_id: Some(1),
+                    retry_armed: false,
+                    retry_forced: false,
+                    dispatch_closed: false,
+                    scope: None,
+                    verified_tip: 0,
+                    request_floor: 0,
+                    header_tip: 8,
+                    reset_epoch: 1,
+                    reaction_epoch: 1,
+                },
+            })
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Queued {
+                    allocation: 1,
+                    decoded_attributed_memory_bytes: 0,
+                },
+                "released",
+            )
+            .holder(
+                owner(1, 1, 1),
+                BlockSyncHolder::Reorder { allocation: 1 },
+                "retained",
+            );
+        history
+    }
+
+    /// The sequencer refuses `owner`'s body under epoch `applied`.
+    fn refused(owner: WorkOwner, applied: Option<u64>) -> BlockSyncFact {
+        BlockSyncFact::StaleScope {
+            body: BlockSyncBody {
+                height: HEIGHT,
+                owner,
+                bytes: 100,
+            },
+            scope_epoch: applied,
+        }
+    }
+
+    /// An old-epoch body the sequencer takes before it applies the newer
+    /// epoch is no refusal, though the reactor's authority already moved.
+    #[test]
+    fn an_old_epoch_body_dequeued_before_the_sequencer_applies_the_reset_is_not_refused() {
+        let history = dequeued_in_the_gap();
+        assert!(!SemanticModel::of(&history.log).saw_old_epoch_body_refused);
+    }
+
+    /// Only the sequencer's refusal of an older epoch's body under a newer
+    /// applied epoch counts: not one of a newer body under an older scope,
+    /// nor one before the sequencer had a scope.
+    #[test]
+    fn only_a_refusal_under_a_newer_applied_epoch_counts() {
+        let saw = |fact| {
+            let mut history = dequeued_in_the_gap();
+            history.step().sync(fact);
+            SemanticModel::of(&history.log).saw_old_epoch_body_refused
+        };
+        assert!(saw(refused(owner(1, 2, 1), Some(2))));
+        assert!(!saw(refused(owner(1, 2, 2), Some(1))));
+        assert!(!saw(refused(owner(1, 2, 1), None)));
     }
 }

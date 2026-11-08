@@ -135,6 +135,7 @@ fn reset_held_prepare() -> StorageScenario {
                 Some(Trigger::Completed(Select::nth(OpKind::Prepare, 1))),
             ),
         ],
+        weights: Default::default(),
     }
 }
 
@@ -212,6 +213,7 @@ fn reset_held_apply() -> StorageScenario {
                 Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
             ),
         ],
+        weights: Default::default(),
     }
 }
 
@@ -275,6 +277,7 @@ fn a_held_reply_is_delivered_in_the_reset_generation() {
             ControlAction::Reset(Reset::Invalidate { depth: 0 }),
             Some(Trigger::Committed(Select::nth(OpKind::Apply, 1))),
         )],
+        weights: Default::default(),
     };
     for input in inputs(8, 256) {
         let report = run(&scenario, input);
@@ -321,6 +324,7 @@ fn resets_with_nothing_to_do_publish_nothing() {
                 Some(Trigger::Reset("node".to_owned())),
             ),
         ],
+        weights: Default::default(),
     };
     for input in inputs(4, 256) {
         let report = run(&scenario, input);
@@ -357,6 +361,7 @@ fn released_read() -> StorageScenario {
                 Trigger::Completed(Select::nth(OpKind::Apply, 1)),
             ])),
         )],
+        weights: Default::default(),
     }
 }
 
@@ -418,6 +423,7 @@ fn a_storage_stop_logs_the_held_apply_as_dropped() {
             ),
             node_step(ControlAction::StopStorage, None),
         ],
+        weights: Default::default(),
     };
     for input in inputs(8, 256) {
         let report = run(&scenario, input);
@@ -579,6 +585,7 @@ fn failure_after_shutdown(step: ControlStep) -> String {
             ..Policy::converging()
         },
         controls: vec![node_step(ControlAction::Shutdown, None), step],
+        weights: Default::default(),
     };
     run_prepared::<Storage>(
         &scenario,

@@ -40,8 +40,9 @@ const RELEASE_INPUT: &[u8] = include_bytes!("fixtures/header-release-wake.bin");
 /// The committed deferred input,
 /// `tests/fixtures/header-release-wake-deferred.bin`:
 /// [`WakeScenario::Deferred`]'s scenario byte, then Plan bytes. The
-/// release's cached pass is deferred to the refill, and the planted case
-/// that drops the refill deadline violates the property on it.
+/// release's cached pass is deferred to the refill, and the planted cases
+/// that drop the refill deadline or the refill itself violate the property
+/// on it.
 const DEFERRED_INPUT: &[u8] = include_bytes!("fixtures/header-release-wake-deferred.bin");
 
 /// A committed input's file stem, its fixture, and how

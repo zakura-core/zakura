@@ -126,6 +126,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed input from the fixed build, where the source wakes"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/replay_exact.rs"
+test = "regenerate_discovery_book_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed input from the witness zakura-network encodes"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -136,6 +142,18 @@ file = "crates/zakura-sim/tests/header_storage_seeds.rs"
 test = "regenerate_storage_seeds"
 run = false
 reason = "a tool, not a test: it rewrites the committed seeds"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_reset_mid_flight_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed reset-mid-flight input"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/block_semantic_properties.rs"
+test = "regenerate_capacity_frontier_first_input"
+run = false
+reason = "a tool, not a test: it rewrites the committed frontier-first input"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/header_flood_watch.rs"
@@ -226,9 +244,12 @@ seconds = 900
 weekly-seconds = 3600
 rss-mb = 2048
 
+# The simulator's scheduled run is a smoke: it shows each target still builds
+# and runs, and isn't meant to find bugs. Sunday's run is the same smoke. Long
+# campaigns run on a remote host, as qa/fuzz/sim's README says under Long runs.
 [campaign.sim]
-seconds = 900
-weekly-seconds = 3600
+seconds = 120
+weekly-seconds = 120
 rss-mb = 4096
 
 # The header-chain targets. Their `args` also set their campaign's limits.
@@ -325,12 +346,6 @@ reason = "no target yet; `cargo xtask sim-targets` checks one once its table ent
 id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/honest-progress"
-kind = "property"
-owner = "P4c"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
 
 [[pending]]

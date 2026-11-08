@@ -19,8 +19,7 @@ use crate::{components::sync::SyncStatus, BoxError};
 
 use BlockGossipError::*;
 
-/// Bounds a full paced broadcast, including several upload waves.
-pub(super) const BLOCK_GOSSIP_TIMEOUT: Duration = Duration::from_secs(90);
+pub(super) use zn::constants::BLOCK_GOSSIP_TIMEOUT;
 
 /// Bounds the state read of a committed tip's size. A tip block is in memory, so this read is
 /// fast; if it is slow, the broadcast proceeds without the size rather than waiting.
@@ -210,7 +209,7 @@ where
 /// Reads the serialized size of the committed block `hash` from the state.
 ///
 /// Returns `None` if the block is not found, or the read fails or takes longer than
-/// [`BLOCK_SIZE_READ_TIMEOUT`]. The broadcast then uses its minimum advert window.
+/// [`BLOCK_SIZE_READ_TIMEOUT`]. The broadcast then uses its full-block advert window.
 async fn committed_block_size<RS>(read_state: RS, hash: block::Hash) -> Option<u32>
 where
     RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>,

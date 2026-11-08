@@ -9,6 +9,9 @@
 //! point in every run. The node takes inbound dials through `quic.serve`
 //! and dials out through the public `ZakuraEndpoint::dial`.
 //!
+//! [`WireEndpoint`] is that endpoint and handler for any service set, so
+//! the discovery node (disc-2.1) runs behind the same transport and tap.
+//!
 //! The tap is the transport observer. It buffers each event, and the run
 //! drains the buffer at every observation into [`Observation::Transport`],
 //! checked through its checkpoint as reactor taps are. A connection's events
@@ -24,6 +27,7 @@
 
 use std::{
     collections::BTreeMap,
+    future::Future,
     mem,
     net::SocketAddr,
     sync::{
@@ -74,11 +78,7 @@ type Bound = Option<(ZakuraEndpoint, ZakuraLocalLimits)>;
 pub struct WireNode {
     /// The reactor, its port and its handle.
     pub header: HeaderNode,
-    seed: [u8; 32],
-    /// Set once the node serves.
-    endpoint: watch::Receiver<Bound>,
-    /// Where its failed dials go.
-    dials: DialReporter,
+    endpoint: WireEndpoint,
 }
 
 impl WireNode {
@@ -96,8 +96,65 @@ impl WireNode {
         observer: Arc<dyn TransportObserver>,
         dials: DialReporter,
     ) -> Self {
-        let (bound, endpoint) = watch::channel(None);
         let service: Arc<dyn Service> = Arc::new(HeaderSyncService::new(header.handle.clone()));
+        let endpoint = WireEndpoint::spawn(
+            sim,
+            network,
+            net,
+            seed,
+            observer,
+            dials,
+            move |_, _| (vec![service], ()),
+            |_, _, ()| async {},
+        );
+        WireNode { header, endpoint }
+    }
+
+    /// [`WireEndpoint::dial`].
+    pub fn dial(&self, sim: &mut Sim, index: usize, listening: watch::Receiver<bool>) {
+        self.endpoint.dial(sim, index, listening);
+    }
+}
+
+/// A node's endpoint on real QUIC: the handler in front of the node's
+/// service set, its transport tap's observer, and its dials.
+pub struct WireEndpoint {
+    seed: [u8; 32],
+    /// Set once the node serves.
+    endpoint: watch::Receiver<Bound>,
+    /// Where its failed dials go.
+    dials: DialReporter,
+}
+
+impl WireEndpoint {
+    /// Binds a node to [`NODE_ADDR`] on `net`, with the key and endpoint
+    /// inputs `seed` gives index 0, behind a handler that registers the
+    /// services `services` builds from the node's supervisor and limits, at
+    /// production limits on `network`, and reports to `observer`, with
+    /// failed dials to `dials`. Once the node serves, it runs `started` on
+    /// the endpoint, its limits and what `services` handed it, and keeps
+    /// what that returns for the run. All of it runs in the node's own root
+    /// task, so the handler draws its session-ID seed from the `Plan` at the
+    /// same point in every run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn<T, F, K>(
+        sim: &mut Sim,
+        network: &Network,
+        net: SimNet,
+        seed: [u8; 32],
+        observer: Arc<dyn TransportObserver>,
+        dials: DialReporter,
+        services: impl FnOnce(&ZakuraSupervisorHandle, &ZakuraLocalLimits) -> (Vec<Arc<dyn Service>>, T)
+            + Send
+            + 'static,
+        started: impl FnOnce(ZakuraEndpoint, ZakuraLocalLimits, T) -> F + Send + 'static,
+    ) -> Self
+    where
+        T: Send,
+        F: Future<Output = K> + Send,
+        K: Send,
+    {
+        let (bound, endpoint) = watch::channel(None);
         let config = config(network);
         sim.scheduler().spawn_root("wire-node", async move {
             let limits = ZakuraLocalLimits::from_config(&config);
@@ -109,9 +166,11 @@ impl WireNode {
                 SeededInputs::new(seed, 0).endpoint_inputs(),
             )
             .expect("the node binds its address");
-            let registry = ServiceRegistry::new(vec![service]).expect("header sync registers");
+            let supervisor = ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip);
+            let (services, handed) = services(&supervisor, &limits);
+            let registry = ServiceRegistry::new(services).expect("the node's services register");
             let handler = ZakuraProtocolHandler::new_with_registry_and_trace(
-                ZakuraSupervisorHandle::new(config.zakura.max_connections_per_ip),
+                supervisor,
                 config.network.clone(),
                 ZakuraHandshakeConfig::for_network(&config.network),
                 limits.clone(),
@@ -121,12 +180,14 @@ impl WireNode {
             .with_local_node_id(quic.local_id())
             .with_transport_observer(observer);
             quic.serve(handler.clone()).expect("the node serves");
-            bound.send_replace(Some((ZakuraEndpoint::new(quic, handler), limits)));
-            // The endpoint lives as long as the run.
+            let endpoint = ZakuraEndpoint::new(quic, handler);
+            bound.send_replace(Some((endpoint.clone(), limits.clone())));
+            // What the node started, and the endpoint, live as long as the
+            // run.
+            let _started = started(endpoint, limits, handed).await;
             std::future::pending::<()>().await;
         });
-        WireNode {
-            header,
+        WireEndpoint {
             seed,
             endpoint,
             dials,

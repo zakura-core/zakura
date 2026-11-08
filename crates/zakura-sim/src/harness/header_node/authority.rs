@@ -52,6 +52,8 @@ use zakura_network::zakura::{
 };
 use zakura_storage::header::fixture::HeaderFixture;
 
+use crate::observe::StorageFact;
+
 /// A subscription, by its peer, session and ID.
 type Subscription = (ZakuraPeerId, u64, u64);
 
@@ -218,6 +220,13 @@ impl Authority {
         let mut breaks = std::mem::take(&mut self.breaks);
         breaks.extend(self.credit.take_breaks());
         breaks
+    }
+
+    /// Notes one drain's storage `facts`.
+    pub(super) fn storage<'f>(&mut self, facts: impl IntoIterator<Item = &'f StorageFact>) {
+        for fact in facts {
+            self.credit.storage(fact);
+        }
     }
 
     /// Notes that a fact made the check applicable.

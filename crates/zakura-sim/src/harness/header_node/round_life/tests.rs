@@ -123,6 +123,7 @@ fn open() -> ReactorEvent {
             tree_aux_schema: zakura_network::zakura::AuxSchema::None,
         }),
         target_height: block::Height(3),
+        totals: Default::default(),
     }
 }
 
@@ -135,6 +136,7 @@ fn accepted(hash: block::Hash) -> ReactorEvent {
         through: Frontier::new(block::Height(1), hash),
         headers: 1,
         bytes: 263,
+        totals: Default::default(),
     }
 }
 

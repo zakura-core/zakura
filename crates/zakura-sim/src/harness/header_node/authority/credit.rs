@@ -18,8 +18,12 @@
 //! - **Claims.** Each `CursorClaimed` records the cursor its subscription's
 //!   pages so far consumed, ending at that page's own last header: the sum
 //!   of every claimed page's entries and payload bytes, counted here from
-//!   each page as the fact reads it. What the subscription's primitive
-//!   counts as consumed after the claim must be that sum too.
+//!   each page as the fact reads it.
+//! - **Primitive totals.** Every credit fact carries what the
+//!   subscription's primitive counts after it, granted and consumed. That
+//!   must be every built update's credit and every claimed page's, as
+//!   counted here. An `Open` starts at its first locator with nothing
+//!   consumed, at the height the node's locator read gave that header.
 //! - **Acceptance.** Each `CursorsAccepted` names a claimed cursor whole,
 //!   reaches the last header of a page staged on that subscription, never
 //!   a cursor no page staged, and never goes below an earlier acceptance.
@@ -40,12 +44,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use zakura_chain::block;
 use zakura_header_chain::Frontier;
 use zakura_network::zakura::{
-    observe::{CreditKind, ReactorEvent, SubscribeHeaders},
+    observe::{CreditKind, CreditTotals, ReactorEvent, SubscribeHeaders},
     v9::Operation,
     AuxSchema, ZakuraPeerId, TREE_AUX_SCHEMA_V1_BYTES,
 };
 
 use super::Subscription;
+use crate::observe::{StorageFact, StorageResult};
 use crate::peer::{ENTRY_BYTES, PAGE_FIXED_BYTES};
 
 /// The most bytes one update may grant, as the `SubscribeHeaders` row
@@ -81,6 +86,8 @@ struct Live {
     consumed: (u64, u64),
     /// Each cursor a claim recorded.
     claimed: HashSet<Acknowledged>,
+    /// The headers and bytes every built update granted.
+    granted: (u64, u64),
 }
 
 /// A cursor's header and the header and byte credit consumed through it.
@@ -93,6 +100,8 @@ pub(super) struct Credit {
     /// their headers.
     unbacked: HashMap<ZakuraPeerId, BTreeMap<u64, usize>>,
     live: HashMap<Subscription, Live>,
+    /// The height of each locator read's first entry, by hash.
+    read_heights: HashMap<block::Hash, block::Height>,
     breaks: Vec<String>,
 }
 
@@ -138,11 +147,12 @@ impl Credit {
                 page_last,
                 page_headers,
                 page_bytes,
-                charged,
+                totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
                 let page = (*page_last, *page_headers, *page_bytes);
-                self.claim(&key, (*through, *headers, *bytes), page, *charged);
+                self.claim(&key, (*through, *headers, *bytes), page);
+                self.totals("claim", &key, *totals);
                 true
             }
             _ if !on_reactor => false,
@@ -154,12 +164,17 @@ impl Credit {
                 objects,
                 bytes,
                 update,
+                totals,
                 ..
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
                 if !stale_handler {
                     self.issue(&key, *objects, *bytes, update);
                 }
+                let added = (
+                    u64::from(update.added_credit.objects),
+                    u64::from(update.added_credit.bytes),
+                );
                 let operation = match kind {
                     CreditKind::Open => Operation::Open,
                     CreditKind::Grant => Operation::Grant,
@@ -180,8 +195,9 @@ impl Credit {
                                 update.subscription_id
                             ));
                         }
+                        self.start(&key, update);
                         self.live.insert(
-                            key,
+                            key.clone(),
                             Live {
                                 target: update.initial_target_tip_hash,
                                 schema: update.tree_aux_schema,
@@ -191,6 +207,7 @@ impl Credit {
                                 accepted: None,
                                 consumed: (0, 0),
                                 claimed: HashSet::new(),
+                                granted: (0, 0),
                             },
                         );
                     }
@@ -201,6 +218,13 @@ impl Credit {
                     }
                     CreditKind::Grant => self.update("Grant", &key, update),
                 }
+                if let Some(live) = self.live.get_mut(&key) {
+                    live.granted = (
+                        live.granted.0.saturating_add(added.0),
+                        live.granted.1.saturating_add(added.1),
+                    );
+                }
+                self.totals("credit", &key, *totals);
                 !stale_handler
             }
             ReactorEvent::CloseBuilt {
@@ -208,8 +232,10 @@ impl Credit {
                 session_id,
                 subscription,
                 update,
+                totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
+                self.totals("Close", &key, *totals);
                 if update.operation != Operation::Close
                     || update.added_credit.objects != 0
                     || update.added_credit.bytes != 0
@@ -248,9 +274,11 @@ impl Credit {
                 through,
                 headers,
                 bytes,
+                totals,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
                 let cursor = (*through, *headers, *bytes);
+                self.totals("acceptance", &key, *totals);
                 if stale_handler {
                     if let Some(live) = self.live.get_mut(&key) {
                         live.accepted = Some(*through);
@@ -348,15 +376,8 @@ impl Credit {
     }
 
     /// Judges a claim of `key`'s subscription that recorded `cursor` for a
-    /// page ending at `page.0`, of `page.1` entries in `page.2` bytes,
-    /// after which its primitive counted `charged` consumed.
-    fn claim(
-        &mut self,
-        key: &Subscription,
-        cursor: Acknowledged,
-        page: Acknowledged,
-        charged: (u64, u64),
-    ) {
+    /// page ending at `page.0`, of `page.1` entries in `page.2` bytes.
+    fn claim(&mut self, key: &Subscription, cursor: Acknowledged, page: Acknowledged) {
         let (page_last, page_headers, page_bytes) = page;
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
@@ -377,13 +398,6 @@ impl Credit {
                  cursor {through:?} for a page ending at {page_last:?}"
             ));
         }
-        if charged != live.consumed {
-            self.breaks.push(format!(
-                "CommitOnlyAuthorized: session {session} subscription {subscription}'s credit \
-                 counts {charged:?} consumed after a claim, but its pages consumed {:?}",
-                live.consumed
-            ));
-        }
         if (headers, bytes) != live.consumed {
             self.breaks.push(format!(
                 "CommitOnlyAuthorized: session {session} subscription {subscription} recorded \
@@ -393,6 +407,63 @@ impl Credit {
             ));
         }
         live.claimed.insert(cursor);
+    }
+
+    /// Notes storage's `fact`: a locator read gives its first entry's
+    /// height.
+    pub(super) fn storage(&mut self, fact: &StorageFact) {
+        if let StorageFact::Completed {
+            result: StorageResult::Locator { tip, .. },
+            ..
+        } = fact
+        {
+            if let Ok(bytes) = <[u8; 32]>::try_from(decode_hex(&tip.hash).as_slice()) {
+                self.read_heights
+                    .insert(block::Hash(bytes), block::Height(tip.height));
+            }
+        }
+    }
+
+    /// Judges the primitive `totals` a `fact` of `key`'s subscription
+    /// reported against every built update's credit and every claimed
+    /// page's.
+    fn totals(&mut self, fact: &str, key: &Subscription, totals: CreditTotals) {
+        let (_, session, subscription) = key;
+        let Some(live) = self.live.get(key) else {
+            return;
+        };
+        let reported = (
+            (totals.granted_headers, totals.granted_bytes),
+            (totals.consumed_headers, totals.consumed_bytes),
+        );
+        if reported != (live.granted, live.consumed) {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s primitive \
+                 counts {totals:?} after a {fact}, but its updates granted {:?} and its pages \
+                 consumed {:?}",
+                live.granted, live.consumed
+            ));
+        }
+    }
+
+    /// Judges an `Open`'s start: its first locator, at the height the
+    /// node's locator read gave it, with nothing consumed.
+    fn start(&mut self, key: &Subscription, update: &SubscribeHeaders) {
+        let (_, session, subscription) = key;
+        let start = update.acknowledged;
+        let first = update.locator_hashes.first().copied();
+        let height = first.and_then(|first| self.read_heights.get(&first).copied());
+        if first != Some(start.hash)
+            || start.headers != 0
+            || start.bytes != 0
+            || height.is_some_and(|height| height != start.height)
+        {
+            self.breaks.push(format!(
+                "CommitOnlyAuthorized: session {session} subscription {subscription}'s Open \
+                 starts at {start:?}, not its first locator {first:?} at {height:?} with \
+                 nothing consumed"
+            ));
+        }
     }
 
     /// Judges an acceptance of `key`'s subscription through `cursor`.
@@ -441,4 +512,12 @@ fn acknowledged(update: &SubscribeHeaders) -> Acknowledged {
         cursor.headers,
         cursor.bytes,
     )
+}
+
+/// The bytes of the lowercase hex string `text`, or none if it isn't one.
+fn decode_hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .filter_map(|at| u8::from_str_radix(text.get(at..at + 2)?, 16).ok())
+        .collect()
 }

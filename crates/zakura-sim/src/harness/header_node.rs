@@ -68,9 +68,7 @@ use zakura_storage::header::{
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
-    recovery::{
-        Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RECOVERY_BOUND, RELINK, UNREACHED,
-    },
+    recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RELINK, UNREACHED},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
@@ -312,7 +310,7 @@ impl PolicySource {
     /// This source, retiring every hold once `recovery` starts: from then
     /// on each operation is offered only `engine`, or `rejected` where
     /// that's the only legal outcome, each held reply is delivered, and each
-    /// must be done within [`RECOVERY_BOUND`] of the later of its
+    /// must be done within [`recovery::RECOVERY_BOUND`] of the later of its
     /// submission, or its commit, and the `Recover` pick.
     pub fn with_recovery(self, recovery: RecoveryEvidence) -> Self {
         PolicySource { recovery, ..self }
@@ -369,13 +367,7 @@ impl ActionSource for PolicySource {
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         self.storage.boundaries(now, out);
         if let Some(started) = self.recovery.started() {
-            // Each operation's deadline is the bound after the later of its
-            // own start and recovery's.
-            let since = now.saturating_duration_since(started);
-            let by = |own: Duration| {
-                let left = RECOVERY_BOUND.saturating_sub(own.min(since));
-                Boundary::Deadline(crate::harness::policy::after(now, left))
-            };
+            let by = |own: Duration| Boundary::Deadline(recovery::deadline(now, started, own));
             out.extend(self.port.pending().iter().map(|op| by(op.since_submit)));
             out.extend(self.port.committed().iter().map(|op| by(op.since_commit)));
             return;

@@ -409,6 +409,16 @@ impl Driver {
     }
 }
 
+/// When an operation must be done by, at `now`, once recovery started at
+/// `started`: [`RECOVERY_BOUND`] after the later of the start and the
+/// operation's own submission, or commit for a held reply, which was `own`
+/// before `now`.
+pub(super) fn deadline(now: SimInstant, started: SimInstant, own: Duration) -> SimInstant {
+    let since = now.saturating_duration_since(started);
+    let left = RECOVERY_BOUND.saturating_sub(own.min(since));
+    crate::harness::policy::after(now, left)
+}
+
 /// What establishing recovery offers next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Next {
@@ -472,6 +482,26 @@ mod tests {
     /// `ms` milliseconds into the run.
     fn at(ms: u64) -> SimInstant {
         SimInstant::from_start(Duration::from_millis(ms))
+    }
+
+    #[test]
+    fn each_operation_is_bounded_from_the_later_of_its_start_and_recovery() {
+        // Recovery started at 10 s. One operation was submitted at 9.7 s and
+        // one at 10.5 s, and it's 10.7 s now: they're due at 11 s and 11.5 s.
+        let (started, now) = (at(10_000), at(10_700));
+        assert_eq!(
+            deadline(now, started, Duration::from_millis(1_000)),
+            at(11_000)
+        );
+        assert_eq!(
+            deadline(now, started, Duration::from_millis(200)),
+            at(11_500)
+        );
+        // One overdue a second already is due now, and time can't pass it.
+        assert_eq!(
+            deadline(at(12_000), started, Duration::from_secs(5)),
+            at(12_000)
+        );
     }
 
     #[test]

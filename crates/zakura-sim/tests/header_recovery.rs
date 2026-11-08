@@ -614,6 +614,69 @@ fn membership_and_the_source_follow_the_session_facts() {
     );
 }
 
+/// When each storage operation's limit falls in `run`, from the recover on:
+/// for each operation that completed after the recover, the virtual time it
+/// completed and the latest it may have, 1 s after the later of the recover
+/// and its submission, or its commit for a held reply.
+fn bounded_completions(run: &Run) -> Vec<(u64, SimInstant, SimInstant)> {
+    let time = |step: u64| {
+        run.seen
+            .iter()
+            .find(|seen| seen.step == step)
+            .map_or(SimInstant::from_start(std::time::Duration::ZERO), |seen| {
+                seen.now
+            })
+    };
+    let started = run
+        .picked(&format!("peer:{SOURCE}:recover"))
+        .expect("the recover is picked");
+    let mut begun = std::collections::BTreeMap::new();
+    let mut found = Vec::new();
+    for (step, fact) in storage_facts(run) {
+        match fact {
+            StorageFact::Submitted { id, .. } | StorageFact::Committed { id, .. } => {
+                begun.insert(id, time(step));
+            }
+            StorageFact::Completed { id, .. } if step > started.step => {
+                let from = begun[&id].max(started.now);
+                let limit = from
+                    .checked_add(zakura_sim::harness::header_node::recovery::RECOVERY_BOUND)
+                    .unwrap();
+                found.push((id, time(step), limit));
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Every operation that completes after the recover does so within 1 s of
+/// the later of the recover and its own start: a held prepare and a held
+/// reply that were waiting at the recover, and every operation submitted
+/// after it. The held classes always have one. After an invalidation the
+/// reconsideration puts the node back on its tip, so it may have none.
+#[test]
+fn recovery_bounds_every_storage_operation() {
+    let mut total = 0;
+    for (class, scenario) in witnesses() {
+        for input in inputs(8, 256) {
+            let run = run(&scenario, input);
+            let bounded = bounded_completions(&run);
+            if matches!(class, "holds" | "reply holds" | "closes") {
+                assert!(!bounded.is_empty(), "{class}");
+            }
+            total += bounded.len();
+            for (id, at, limit) in bounded {
+                assert!(
+                    at <= limit,
+                    "{class}: operation {id} at {at:?}, past {limit:?}"
+                );
+            }
+        }
+    }
+    assert!(total > 40, "{total}");
+}
+
 /// Every pick and observation of `run`.
 fn history(run: &Run) -> Vec<String> {
     run.seen
@@ -652,8 +715,22 @@ fn zakura_sim(args: &[&str]) -> Output {
         .expect("the binary runs")
 }
 
-/// `record` runs a recovery witness in one process, and `replay` reruns its
-/// trace Exact in another.
+/// The step records of the trace in `dir`, without its meta line, which
+/// names the trace and its recording.
+fn step_lines(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with(r#"{"meta""#))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `record` runs a recovery witness from its bytes in one process, a second
+/// `record` recomputes it from the same bytes in another, and `replay`
+/// reruns the first trace Exact in a third. The two recordings make the
+/// same picks and draws, so the policy recomputes them from the bytes, not
+/// only from a record.
 #[test]
 fn recovery_replays_exact_in_a_fresh_process() {
     let PlanInput::Bytes(plan) = &inputs(1, 256)[0] else {
@@ -662,20 +739,26 @@ fn recovery_replays_exact_in_a_fresh_process() {
     for (class, scenario) in witnesses() {
         let dir = TempDir::new().unwrap();
         let plan_file = dir.path().join("plan");
-        let trace = dir.path().join("trace");
         std::fs::write(&plan_file, plan).unwrap();
-        let recorded = zakura_sim(&[
-            "record",
-            "--sim",
-            Storage::NAME,
-            "--scenario",
-            &serde_json::to_string(&scenario).unwrap(),
-            "--plan",
-            plan_file.to_str().unwrap(),
-            "--out",
-            trace.to_str().unwrap(),
-        ]);
-        assert!(recorded.status.success(), "{class}: {recorded:?}");
+        let record = |out: &std::path::Path| {
+            zakura_sim(&[
+                "record",
+                "--sim",
+                Storage::NAME,
+                "--scenario",
+                &serde_json::to_string(&scenario).unwrap(),
+                "--plan",
+                plan_file.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+            ])
+        };
+        let (trace, again) = (dir.path().join("trace"), dir.path().join("again"));
+        for out in [&trace, &again] {
+            let recorded = record(out);
+            assert!(recorded.status.success(), "{class}: {recorded:?}");
+        }
+        assert_eq!(step_lines(&trace), step_lines(&again), "{class}");
         let lines = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
         assert!(lines.contains(r#""by":"recovery""#), "{class}");
         assert!(lines.contains("peer:node:recovered"), "{class}");

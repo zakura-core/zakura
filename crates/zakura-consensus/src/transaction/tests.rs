@@ -3607,6 +3607,7 @@ async fn v5_transaction_with_conflicting_transparent_spend_is_rejected() {
 /// Test if signed V4 transaction with a dummy [`sprout::JoinSplit`] is accepted.
 ///
 /// This test verifies if the transaction verifier correctly accepts a signed transaction.
+#[cfg(feature = "sprout")]
 #[test]
 fn v4_with_signed_sprout_transfer_is_accepted() {
     let _init_guard = zakura_test::init();
@@ -3648,10 +3649,56 @@ fn v4_with_signed_sprout_transfer_is_accepted() {
     })
 }
 
+/// Test that a build without the `sprout` feature refuses a valid mainnet Sprout transfer
+/// as a retryable local failure, so the block carrying it is never recorded as invalid.
+#[cfg(not(feature = "sprout"))]
+#[test]
+fn v4_with_signed_sprout_transfer_is_retryable_without_sprout_feature() {
+    use zakura_header_chain::{BodyVerificationClass, TransientBodyFailureKind};
+
+    let _init_guard = zakura_test::init();
+    zakura_test::MULTI_THREADED_RUNTIME.block_on(async {
+        let network = Network::Mainnet;
+
+        let (height, transaction) = test_transactions(&network)
+            .rev()
+            .filter(|(_, transaction)| {
+                !transaction.is_coinbase() && transaction.inputs().is_empty()
+            })
+            .find(|(_, transaction)| transaction.sprout_groth16_joinsplits().next().is_some())
+            .expect("No transaction found with Groth16 JoinSplits");
+
+        let state_service =
+            service_fn(|_| async { unreachable!("State service should not be called") });
+        let verifier = Verifier::new_for_tests(&network, state_service);
+
+        let error = verifier
+            .oneshot(Request::Block {
+                transaction_id: transaction.unmined_id(),
+                transaction: transaction.into(),
+                known_utxos: Arc::new(HashMap::new()),
+                parent_utxos: Arc::new(HashMap::new()),
+                known_outpoint_hashes: Arc::new(HashSet::new()),
+                height,
+                time: DateTime::<Utc>::MAX_UTC,
+            })
+            .await
+            .expect_err("a build without Sprout cannot verify a JoinSplit proof");
+
+        assert_eq!(error, TransactionError::SproutVerifierNotBuilt);
+        assert_eq!(
+            error.body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable),
+        );
+        assert_eq!(error.mempool_misbehavior_score(), 0);
+    })
+}
+
 /// Test if an V4 transaction with a modified [`sprout::JoinSplit`] is rejected.
 ///
 /// This test verifies if the transaction verifier correctly rejects the transaction because of the
 /// invalid JoinSplit.
+#[cfg(feature = "sprout")]
 #[test]
 fn v4_with_modified_joinsplit_is_rejected() {
     let _init_guard = zakura_test::init();
@@ -3676,6 +3723,7 @@ fn v4_with_modified_joinsplit_is_rejected() {
     })
 }
 
+#[cfg(feature = "sprout")]
 async fn v4_with_joinsplit_is_rejected_for_modification(
     modification: JoinSplitModification,
     expected_error: TransactionError,
@@ -4139,6 +4187,10 @@ fn v4_with_duplicate_sapling_spends() {
 }
 
 /// Test if a V4 transaction with Sapling outputs but no spends is accepted by the verifier.
+///
+/// With no transparent inputs and no Sapling spends, the selected transaction is funded by a
+/// Sprout JoinSplit, so verifying it needs the Sprout verifier.
+#[cfg(feature = "sprout")]
 #[test]
 fn v4_with_sapling_outputs_and_no_spends() {
     let _init_guard = zakura_test::init();
@@ -5710,6 +5762,7 @@ fn mock_sprout_join_split_data() -> (JoinSplitData<Groth16Proof>, ed25519::Signi
 }
 
 /// A type of JoinSplit modification to test.
+#[cfg(feature = "sprout")]
 #[derive(Clone, Copy)]
 enum JoinSplitModification {
     // Corrupt a signature, making it invalid.
@@ -5721,6 +5774,7 @@ enum JoinSplitModification {
 }
 
 /// Modify a [`JoinSplitData`] following the given modification type.
+#[cfg(feature = "sprout")]
 fn modify_joinsplit_data(
     joinsplit_data: &mut JoinSplitData<Groth16Proof>,
     modification: JoinSplitModification,

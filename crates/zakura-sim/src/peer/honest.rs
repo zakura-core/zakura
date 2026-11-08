@@ -227,6 +227,10 @@ pub(super) struct Serving {
     target_height: u32,
     /// The height of the last header sent, or of the page parent to come.
     position: u32,
+    /// Where serving started: the first locator this peer holds.
+    start: u32,
+    /// The `Open`'s first locator.
+    first_locator: Option<block::Hash>,
 }
 
 /// This peer's subscription to the node.
@@ -617,6 +621,8 @@ impl Honest {
                 target: update.initial_target_tip_hash,
                 target_height,
                 position,
+                start: position,
+                first_locator: update.locator_hashes.first().copied(),
             },
         );
         self.pump()
@@ -686,10 +692,12 @@ impl Honest {
         Some(u32::try_from(count).expect("the count is at most MAX_HS_RANGE"))
     }
 
-    /// The height subscription `id`'s next page extends: the first locator
-    /// it served from, until it sends a page.
-    pub(super) fn position(&self, id: u64) -> Option<u32> {
-        Some(self.serving.get(&id)?.position)
+    /// The height of subscription `id`'s first locator, if this peer holds
+    /// that locator and has sent the subscription no page yet.
+    pub(super) fn unserved_first_locator(&self, id: u64) -> Option<u32> {
+        let serving = self.serving.get(&id)?;
+        let holds_first = serving.first_locator == Some(self.chain.at(serving.start).hash);
+        (serving.position == serving.start && holds_first).then_some(serving.start)
     }
 
     /// The headers left to subscription `id`'s target.
@@ -838,6 +846,39 @@ mod tests {
         assert_eq!(honest.grant_opens(), None, "the grant was taken");
         let again = honest.release_grant().expect("a held policy releases");
         assert!(again.is_empty(), "nothing is held until the next page");
+    }
+
+    /// A subscription's first locator is eligible for the lower-locator act
+    /// only while nothing was sent and only if this peer holds that very
+    /// locator: not on a fork below it, and not after a page.
+    #[test]
+    fn the_unserved_first_locator_is_the_opens_own() {
+        let fixture = HeaderFixture::regtest();
+        let chain = Arc::new(HonestChain::new(&fixture, 50));
+        let spec = HonestSpec {
+            chain: 50,
+            subscribe: None,
+        };
+        let mut honest = Honest::with(spec, chain.clone(), false, false);
+        let serving = |position, first_locator| Serving {
+            target: chain.at(50).hash,
+            target_height: 50,
+            position,
+            start: 40,
+            first_locator,
+        };
+        let held = Some(chain.at(40).hash);
+        honest.serving.insert(1, serving(40, held));
+        assert_eq!(honest.unserved_first_locator(1), Some(40));
+        // The Open's first locator is on a fork; this peer started lower.
+        honest
+            .serving
+            .insert(1, serving(40, Some(block::Hash([0x55; 32]))));
+        assert_eq!(honest.unserved_first_locator(1), None);
+        // A page already went out.
+        honest.serving.insert(1, serving(41, held));
+        assert_eq!(honest.unserved_first_locator(1), None);
+        assert_eq!(honest.unserved_first_locator(2), None);
     }
 
     /// The page sizes the honest publisher uses are the table's: its

@@ -8,6 +8,7 @@ use crate::BoxError;
 
 pub(crate) mod batch_control;
 mod cache;
+#[cfg(feature = "sprout")]
 pub mod ed25519;
 pub(crate) mod fallback;
 pub(crate) mod flush;

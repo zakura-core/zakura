@@ -83,8 +83,8 @@ x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-# Sprout JoinSplit proof verification, only needed to fully verify pre-NU7 blocks
-# above the last checkpoint. On by default for now. See the `sprout` feature in
+# Sprout JoinSplit proof and signature verification, only needed to fully verify
+# pre-NU7 blocks above the last checkpoint. On by default for now. See the `sprout` feature in
 # `zakura-consensus`.
 sprout = ["zakura-consensus/sprout"]
 

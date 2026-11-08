@@ -25,13 +25,13 @@ default = []
 progress-bar = ["howudoin", "zakura-state/progress-bar"]
 howudoin = []
 
-# Sprout Groth16 JoinSplit proof verification.
+# Sprout JoinSplit verification: the Groth16 proofs and the Ed25519 joinSplitSig.
 #
 # ZIP 218 disallows Sprout JoinSplits from NU7 onward, so blocks after NU7 never
 # need it. Builds without this feature reject every JoinSplit as a retryable
 # local verifier failure (never as consensus-invalid), so they stall instead of
 # forking on a pre-NU7 block that is above the last checkpoint and has JoinSplits.
-sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd"]
+sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd", "dep:rand_core"]
 
 # Test-only features
 internal-bench = []
@@ -43,8 +43,8 @@ bellman = { workspace = true, optional = true }
 bls12_381 = { workspace = true, optional = true }
 halo2 = { workspace = true }
 rand_10 = { workspace = true }
-# ed25519-zebra takes `rand_core` 0.6 RNGs.
-rand_core = { workspace = true, features = ["getrandom"] }
+# The Sprout Ed25519 batch verifier passes `rand_core` 0.6 RNGs to ed25519-zebra.
+rand_core = { workspace = true, features = ["getrandom"], optional = true }
 rayon = { workspace = true }
 
 chrono = { workspace = true }
@@ -84,6 +84,8 @@ proptest-derive = { workspace = true, optional = true }
 [dev-dependencies]
 eyre = { workspace = true }
 ed25519-zebra = { workspace = true }
+# Tests sign mock JoinSplit data with ed25519-zebra keys.
+rand_core = { workspace = true, features = ["getrandom"] }
 
 hex = { workspace = true }
 proptest = { workspace = true }

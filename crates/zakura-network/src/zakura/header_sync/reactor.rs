@@ -947,21 +947,23 @@ impl HeaderSyncReactor {
             )
         });
         let replaces_existing_peer = self.sessions.contains_key(&peer);
-        let mut unanswered_deadline = None;
+        let mut unanswered_budget = None;
         if replaces_existing_peer && !owns_local_repair_operation {
             // A receiving request's deadline is reset by each page, so it
             // still measures how long the peer has left the request unanswered.
-            unanswered_deadline = self
+            let now = Instant::now();
+            unanswered_budget = self
                 .peer_work_queue
                 .active(&peer)
                 .is_some_and(|active| active.phase == HeaderTargetPhase::Receiving)
                 .then(|| self.state.request_deadlines.get(&peer).copied())
-                .flatten();
+                .flatten()
+                .map(|deadline| deadline.saturating_duration_since(now));
             self.retire_peer_work(&peer, HeaderRequestTerminal::SessionReplaced);
         }
         let replaced_schedule = self.state.admit_session(&peer, Instant::now());
-        if let Some(deadline) = unanswered_deadline {
-            self.state.carry_replaced_request_deadline(&peer, deadline);
+        if let Some(budget) = unanswered_budget {
+            self.state.carry_replaced_request_budget(&peer, budget);
         }
         let previous = self.sessions.insert(
             peer.clone(),

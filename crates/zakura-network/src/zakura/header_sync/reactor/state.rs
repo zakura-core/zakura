@@ -121,7 +121,9 @@ impl ReactorState {
     ///
     /// A replacement keeps the earlier session's unproductive-request strikes, and
     /// a reconnect before `now` passes the departed session's hold resumes them,
-    /// so neither replacing nor reconnecting a session resets them.
+    /// so neither replacing nor reconnecting a session resets them. A
+    /// replacement also keeps an unconsumed
+    /// [`PeerSchedule::replaced_request_budget`].
     ///
     /// A new peer joins the back of the repair supplier order. A replacement
     /// keeps its position until [`Self::rotate_supplier`] moves it.
@@ -139,14 +141,19 @@ impl ReactorState {
             .remove(peer)
             .filter(|(_, until)| *until > now)
             .map(|(strikes, _)| strikes);
+        let replaced_request_budget = previous
+            .as_ref()
+            .and_then(|previous| previous.replaced_request_budget);
         let strikes = previous
             .map(|previous| previous.unproductive_requests)
             .or(departed)
             .unwrap_or(0);
-        self.peers
+        let schedule = self
+            .peers
             .get_mut(peer)
-            .expect("the fresh schedule was just inserted")
-            .unproductive_requests = strikes;
+            .expect("the fresh schedule was just inserted");
+        schedule.unproductive_requests = strikes;
+        schedule.replaced_request_budget = replaced_request_budget;
         if !replaced {
             self.vct_supplier_order.push_back(peer.clone());
         }
@@ -530,9 +537,9 @@ impl ReactorState {
 
     /// Arm `peer`'s request deadline `timeout` after `now`.
     ///
-    /// The first deadline armed after a session replacement keeps the replaced
-    /// request's deadline if that one is earlier. See
-    /// [`PeerSchedule::replaced_request_deadline`].
+    /// The first deadline armed after a session replacement is capped by the
+    /// replaced request's remaining time. See
+    /// [`PeerSchedule::replaced_request_budget`].
     pub(super) fn arm_request_deadline(
         &mut self,
         peer: ZakuraPeerId,
@@ -542,23 +549,20 @@ impl ReactorState {
         let carried = self
             .peers
             .get_mut(&peer)
-            .and_then(|schedule| schedule.replaced_request_deadline.take());
-        let deadline = now + timeout;
-        self.request_deadlines.insert(
-            peer,
-            carried.map_or(deadline, |carried| carried.min(deadline)),
-        );
+            .and_then(|schedule| schedule.replaced_request_budget.take());
+        let timeout = carried.map_or(timeout, |carried| carried.min(timeout));
+        self.request_deadlines.insert(peer, now + timeout);
     }
 
-    /// Carry `deadline`, the deadline of the unanswered request that admitting
+    /// Carry `budget`, the time left on the unanswered request that admitting
     /// `peer`'s new session retired, to that session's first request.
-    pub(super) fn carry_replaced_request_deadline(
-        &mut self,
-        peer: &ZakuraPeerId,
-        deadline: Instant,
-    ) {
+    pub(super) fn carry_replaced_request_budget(&mut self, peer: &ZakuraPeerId, budget: Duration) {
         if let Some(schedule) = self.peers.get_mut(peer) {
-            schedule.replaced_request_deadline = Some(deadline);
+            schedule.replaced_request_budget = Some(
+                schedule
+                    .replaced_request_budget
+                    .map_or(budget, |carried| carried.min(budget)),
+            );
         }
     }
 
@@ -880,13 +884,16 @@ pub(super) struct PeerSchedule {
     /// Consecutive requests this peer's sessions answered with nothing usable,
     /// since it last supplied usable work. See [`ReactorState::departed_strikes`].
     pub(super) unproductive_requests: u32,
-    /// The deadline of the unanswered request that this session's admission
-    /// retired from the session it replaced.
+    /// The time that was left on the unanswered request a session
+    /// replacement retired, until the next request start consumes it.
     ///
     /// Without it, a peer could replace its session just before each timeout
-    /// and never be charged. The session's first request keeps this deadline
-    /// when it's earlier than its own, so a peer that answers pays nothing.
-    pub(super) replaced_request_deadline: Option<Instant>,
+    /// and never be charged. The next request's timeout is capped by this
+    /// budget, counted from when the request is sent, so the node's own delay
+    /// before sending isn't charged to the peer. A peer that answers re-arms a
+    /// full timeout and pays nothing. A further replacement before any request
+    /// keeps the budget.
+    pub(super) replaced_request_budget: Option<Duration>,
 }
 
 impl StorageCallKind {

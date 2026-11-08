@@ -349,6 +349,35 @@ impl EvictionFixture {
         assert_eq!(active.phase, HeaderTargetPhase::Receiving);
     }
 
+    /// Answer the request `start_request` sent `session_id` with one page of
+    /// one header that extends the anchor but doesn't reach the target.
+    fn answer_started_request(&mut self, session_id: u64) {
+        let anchor = self.snapshot.frontiers.finalized;
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(&self.peer)
+            .expect("the started request is active");
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = anchor.hash;
+        header.time += chrono::Duration::seconds(1);
+        let response = Headers {
+            subscription_id: active.request_id.get(),
+            initial_target_tip_hash: active.target.status.selected_tip_hash,
+            common_ancestor_height: anchor.height,
+            common_ancestor_hash: anchor.hash,
+            reaches_initial_target: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header: Arc::new(header),
+                body_size: 0,
+                tree_aux: None,
+            }],
+        };
+        self.reactor
+            .deliver_page(self.peer.clone(), session_id, response);
+    }
+
     /// Replace the admitted session with `session_id`, and return its token.
     fn replace_session(&mut self, session_id: u64) -> CancellationToken {
         let cancel = CancellationToken::new();
@@ -367,8 +396,9 @@ impl EvictionFixture {
 }
 
 /// A replacement can't restart the clock on a request its peer never
-/// answered. The replacement's first request keeps the earlier deadline, so
-/// replacing the session one second before each timeout still gets charged.
+/// answered. The replacement's first request gets only the time that was
+/// left, so replacing the session one second before each timeout still gets
+/// charged.
 #[tokio::test(start_paused = true)]
 async fn a_replacement_keeps_its_unanswered_requests_deadline() {
     let mut fixture = eviction_fixture(1, 7);
@@ -393,32 +423,72 @@ async fn a_replacement_keeps_its_unanswered_requests_deadline() {
     );
 }
 
-/// The carried deadline binds only the replacement's first deadline. A page
-/// that answers the request re-arms it in full, so a peer that answers pays
-/// nothing for the replacement.
+/// A second replacement before the first one gets a request keeps the
+/// carried time, so replacing twice per timeout doesn't reset it.
 #[tokio::test(start_paused = true)]
-async fn an_answered_replacement_request_gets_a_full_timeout() {
+async fn a_second_replacement_keeps_the_carried_time() {
     let mut fixture = eviction_fixture(1, 7);
     let timeout = fixture.reactor.startup.request_timeout;
     let started = Instant::now();
     fixture.start_request(7);
     time::advance(timeout - std::time::Duration::from_secs(1)).await;
-    let replacement = fixture.replace_session(8);
-    fixture.start_request(8);
+    let _first = fixture.replace_session(8);
+    let second = fixture.replace_session(9);
+
+    fixture.start_request(9);
     assert_eq!(
         fixture.reactor.state.request_deadlines.get(&fixture.peer),
         Some(&(started + timeout))
     );
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(second.is_cancelled());
+}
 
-    // The page path re-arms the deadline this way when a page is staged.
-    let answered = Instant::now();
-    fixture
-        .reactor
-        .state
-        .arm_request_deadline(fixture.peer.clone(), answered, timeout);
+/// The carried time counts from when the node sends the replacement's first
+/// request, so the node's own delay before sending isn't charged to the peer.
+#[tokio::test(start_paused = true)]
+async fn a_delayed_first_request_still_gets_the_carried_time() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    fixture.start_request(7);
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let replacement = fixture.replace_session(8);
+    // The node doesn't send the replacement a request until well after the
+    // replaced request's deadline.
+    time::advance(timeout).await;
+
+    let sent = Instant::now();
+    fixture.start_request(8);
     assert_eq!(
         fixture.reactor.state.request_deadlines.get(&fixture.peer),
-        Some(&(answered + timeout))
+        Some(&(sent + std::time::Duration::from_secs(1)))
+    );
+    fixture.reactor.retire_timed_out_requests(Instant::now());
+    assert!(
+        !replacement.is_cancelled(),
+        "the peer isn't charged before it could answer"
+    );
+}
+
+/// The carried time binds only the replacement's first deadline. A staged
+/// page re-arms it in full, so a peer that answers pays nothing for the
+/// replacement.
+#[tokio::test(start_paused = true)]
+async fn an_answered_replacement_request_gets_a_full_timeout() {
+    let mut fixture = eviction_fixture(1, 7);
+    let timeout = fixture.reactor.startup.request_timeout;
+    fixture.start_request(7);
+    time::advance(timeout - std::time::Duration::from_secs(1)).await;
+    let replacement = fixture.replace_session(8);
+    fixture.start_request(8);
+
+    let answered = Instant::now();
+    fixture.answer_started_request(8);
+    assert_eq!(
+        fixture.reactor.state.request_deadlines.get(&fixture.peer),
+        Some(&(answered + timeout)),
+        "the staged page re-arms a full timeout"
     );
     time::advance(std::time::Duration::from_secs(1)).await;
     fixture.reactor.retire_timed_out_requests(Instant::now());

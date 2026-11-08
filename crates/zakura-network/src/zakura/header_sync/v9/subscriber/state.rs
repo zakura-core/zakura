@@ -469,6 +469,8 @@ impl SubscriberState {
                 session_id: tap.session_id,
                 subscription: id,
                 through: Frontier::new(cursor.height, cursor.hash),
+                headers: cursor.headers,
+                bytes: cursor.bytes,
             });
         }
         Ok(self.grant_due(tools, staging))

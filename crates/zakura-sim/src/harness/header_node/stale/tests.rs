@@ -215,9 +215,9 @@ fn a_retired_round_makes_its_call_stale_and_keeps_its_own_returns() {
 
 /// Under a stale handler, every effect on other work breaks the claim: a
 /// charge, a return of another round's lease or of an unbound reservation,
-/// credit, a cursor acceptance, another round's retirement or release, a
-/// start, a reservation and a prepare's dispatch. A locator dispatch isn't
-/// one.
+/// credit, a cursor acceptance, a built close, another round's retirement
+/// or release, a start, a reservation and a prepare's dispatch. A locator
+/// dispatch isn't one.
 #[test]
 fn a_stale_handler_breaks_on_each_effect_on_other_work() {
     let mut events = retired_window();
@@ -252,6 +252,13 @@ fn a_stale_handler_breaks_on_each_effect_on_other_work() {
             session_id: 2,
             subscription: 3,
             through: zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+            headers: 1,
+            bytes: 263,
+        },
+        ReactorEvent::CloseBuilt {
+            peer: mirror(),
+            session_id: 2,
+            update: Box::new(grant(3, 0, 0)),
         },
         retired(round(2, 2)),
         ReactorEvent::RoundReleased {

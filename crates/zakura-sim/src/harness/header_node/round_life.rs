@@ -235,6 +235,7 @@ impl RoundLife {
                 session_id,
                 subscription,
                 through,
+                ..
             } => {
                 self.accepted
                     .insert((peer.clone(), *session_id, *subscription), through.hash);

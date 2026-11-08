@@ -11,7 +11,9 @@
 //! - **Updates.** Each `Grant` and `Close` names its `Open`'s target and
 //!   schema, its sequence is one more than the subscription's previous
 //!   update's, and it acknowledges the subscription's latest
-//!   `CursorsAccepted`, or the `Open`'s start before any.
+//!   `CursorsAccepted`, or the `Open`'s start before any, in all four
+//!   fields: the header, and the header and byte credit consumed through
+//!   it, which the publisher compares too.
 //! - **Acceptance.** Each `CursorsAccepted` reaches the last header of a
 //!   page staged on that subscription, never a cursor no page staged, and
 //!   never one below an earlier acceptance.
@@ -60,12 +62,15 @@ struct Live {
     sequence: u32,
     /// What the next update must acknowledge: the latest accepted cursor,
     /// or the `Open`'s start.
-    acknowledged: Frontier,
+    acknowledged: Acknowledged,
     /// The last header of each page staged on the subscription.
     staged: HashSet<Frontier>,
     /// The latest accepted cursor.
     accepted: Option<Frontier>,
 }
+
+/// A cursor's header and the header and byte credit consumed through it.
+type Acknowledged = (Frontier, u64, u64);
 
 /// The credit half's state.
 #[derive(Debug, Default)]
@@ -178,16 +183,19 @@ impl Credit {
                 session_id,
                 subscription,
                 through,
+                headers,
+                bytes,
             } => {
                 let key = (peer.clone(), *session_id, *subscription);
+                let cursor = (*through, *headers, *bytes);
                 if stale_handler {
                     if let Some(live) = self.live.get_mut(&key) {
                         live.accepted = Some(*through);
-                        live.acknowledged = *through;
+                        live.acknowledged = cursor;
                     }
                     return false;
                 }
-                self.accept(&key, *through);
+                self.accept(&key, cursor);
                 true
             }
             _ => false,
@@ -273,8 +281,9 @@ impl Credit {
         }
     }
 
-    /// Judges an acceptance of `key`'s subscription through `through`.
-    fn accept(&mut self, key: &Subscription, through: Frontier) {
+    /// Judges an acceptance of `key`'s subscription through `cursor`.
+    fn accept(&mut self, key: &Subscription, cursor: Acknowledged) {
+        let (through, ..) = cursor;
         let (_, session, subscription) = key;
         let Some(live) = self.live.get_mut(key) else {
             self.breaks.push(format!(
@@ -300,11 +309,16 @@ impl Credit {
             ));
         }
         live.accepted = Some(through);
-        live.acknowledged = through;
+        live.acknowledged = cursor;
     }
 }
 
-/// The frontier `update` acknowledges.
-fn acknowledged(update: &SubscribeHeaders) -> Frontier {
-    Frontier::new(update.acknowledged.height, update.acknowledged.hash)
+/// The cursor `update` acknowledges.
+fn acknowledged(update: &SubscribeHeaders) -> Acknowledged {
+    let cursor = update.acknowledged;
+    (
+        Frontier::new(cursor.height, cursor.hash),
+        cursor.headers,
+        cursor.bytes,
+    )
 }

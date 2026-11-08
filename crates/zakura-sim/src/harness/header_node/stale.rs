@@ -13,9 +13,9 @@
 //!
 //! A stale call's handler, the facts under its `Completion` cause, may only
 //! return its own round's budget. A charge, a return that doesn't join its
-//! round, any credit or cursor acceptance, a retirement or release of
-//! another round, a start, a reservation, or a prepare or apply dispatch
-//! breaks
+//! round, any credit, cursor acceptance or built `Close`, a retirement or
+//! release of another round, a start, a reservation, or a prepare or apply
+//! dispatch breaks
 //! [`Claim::StaleCompletionEffect`]. A return joins a round through its
 //! reservation: a continuation's `ReservationOpened` names its round, a
 //! first or repair reservation's `ReservationBound` does once its round
@@ -209,6 +209,14 @@ impl StaleCheck {
                 ..
             } => Some(format!(
                 "accepted {peer:?}'s subscription {subscription} through {through:?}"
+            )),
+            ReactorEvent::CloseBuilt {
+                peer,
+                session_id,
+                update,
+            } => Some(format!(
+                "closed {peer:?}'s session {session_id} subscription {}",
+                update.subscription_id
             )),
             ReactorEvent::Retired { request, .. }
                 if other(&(request.peer.clone(), request.incarnation)) =>

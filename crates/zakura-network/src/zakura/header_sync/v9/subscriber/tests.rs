@@ -1186,6 +1186,8 @@ fn observed_credit_reports_each_open_grant_and_close() {
         session_id: 7,
         subscription: id,
         through: Frontier::new(through.height, through.hash),
+        headers: through.headers,
+        bytes: through.bytes,
     };
     let mut expected = vec![credit(CreditKind::Open, open)];
     let cursors: Vec<_> = (1..=8)

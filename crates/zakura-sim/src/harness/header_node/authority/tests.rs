@@ -371,12 +371,7 @@ fn grant(
         subscription_id: 1,
         update_sequence: sequence,
         initial_target_tip_hash: target,
-        acknowledged: Cursor {
-            height: acknowledged.height,
-            hash: acknowledged.hash,
-            headers: 0,
-            bytes: 0,
-        },
+        acknowledged: cursor(acknowledged),
         locator_hashes: Vec::new(),
         added_credit: Credit { objects, bytes },
         tree_aux_schema: AuxSchema::None,
@@ -393,14 +388,37 @@ fn grant(
     }
 }
 
+/// The cursor at `at` of a subscription from genesis that received one
+/// plain one-header page per header.
+fn cursor(at: Frontier) -> Cursor {
+    let headers = u64::from(at.height.0);
+    Cursor {
+        height: at.height,
+        hash: at.hash,
+        headers,
+        bytes: headers * credit::smallest_page(AuxSchema::None),
+    }
+}
+
 /// The subscriber's acceptance of subscription 1 through `through`.
 fn accepted(through: Frontier) -> ReactorEvent {
+    let cursor = cursor(through);
     ReactorEvent::CursorsAccepted {
         peer: mirror(),
         session_id: 7,
         subscription: 1,
         through,
+        headers: cursor.headers,
+        bytes: cursor.bytes,
     }
+}
+
+/// `event`, a grant, acknowledging one byte more than its cursor consumed.
+fn one_byte_more(mut event: ReactorEvent) -> ReactorEvent {
+    if let ReactorEvent::CreditIssued { update, .. } = &mut event {
+        update.acknowledged.bytes += 1;
+    }
+    event
 }
 
 /// An `Open` within its reservation holds. One past it, or one whose
@@ -439,7 +457,8 @@ fn credit_stays_within_its_reservation() {
 }
 
 /// A grant or close that names another target, skips a sequence or
-/// acknowledges anything but the latest acceptance breaks the update rule.
+/// acknowledges anything but the latest acceptance, down to its credit
+/// counts, breaks the update rule.
 #[test]
 fn updates_carry_their_subscriptions_state() {
     let chain = main_chain(4);
@@ -472,6 +491,10 @@ fn updates_carry_their_subscriptions_state() {
             "has sequence 2, not 1",
         ),
         (grant(2, 0, 1, genesis, chain[3].hash), "acknowledges"),
+        (
+            one_byte_more(grant(2, 0, 1, chain[1], chain[3].hash)),
+            "acknowledges",
+        ),
     ] {
         let found = with(update);
         assert!(
@@ -487,12 +510,7 @@ fn updates_carry_their_subscriptions_state() {
             subscription_id: 1,
             update_sequence: 1,
             initial_target_tip_hash: target,
-            acknowledged: Cursor {
-                height: chain[1].height,
-                hash: chain[1].hash,
-                headers: 0,
-                bytes: 0,
-            },
+            acknowledged: cursor(chain[1]),
             locator_hashes: Vec::new(),
             added_credit: Credit {
                 objects: 0,

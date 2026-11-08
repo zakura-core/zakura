@@ -133,6 +133,8 @@ fn accepted(hash: block::Hash) -> ReactorEvent {
         session_id: 7,
         subscription: 1,
         through: Frontier::new(block::Height(1), hash),
+        headers: 1,
+        bytes: 263,
     }
 }
 

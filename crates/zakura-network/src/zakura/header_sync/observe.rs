@@ -397,6 +397,11 @@ pub enum ReactorEvent {
         subscription: u64,
         /// The last header the accepted cursors reach.
         through: Frontier,
+        /// The header credit the subscription's pages consumed through it,
+        /// as its cursor records.
+        headers: u64,
+        /// The byte credit the subscription's pages consumed through it.
+        bytes: u64,
     },
     /// The reactor started or finished a unit of work, and `cause` is the
     /// one it's in now. Every fact the reactor's task reports after this,

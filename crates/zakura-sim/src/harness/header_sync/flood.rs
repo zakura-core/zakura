@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
-    StorageScenario, StorageView,
+    StorageScenario, StorageView, Weights,
 };
 use crate::{
     domain::header_sync::{watch_observed_under_flood, watch_observed_under_lifecycle_flood},
@@ -124,6 +124,7 @@ impl FloodScenario {
                 ..Policy::converging()
             },
             controls,
+            weights: Weights::default(),
         }
     }
 }

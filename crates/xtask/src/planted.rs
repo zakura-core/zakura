@@ -19,9 +19,11 @@
 //! 1. records the input with the unpatched build, which must hold the
 //!    property with no violation of any property and pass its witness test
 //!    expecting `holds`;
-//! 2. applies the patch, rebuilds and records the input again, which must
-//!    violate exactly the case's property and pass its witness test
-//!    expecting `violated`;
+//! 2. applies the patch, which must not change, delete or rename the
+//!    case's witness files (its input and sidecar, or its scenario and
+//!    Plan bytes), so both runs read the same committed witness. It then
+//!    rebuilds and records the input again, which must violate exactly the
+//!    case's property and pass its witness test expecting `violated`;
 //! 3. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
 //!    inputs, drawn from a seed that the property's ID fixes, each of which
 //!    must hold or violate only the case's property, and a violation must
@@ -40,10 +42,10 @@
 //! simulator's own witness tests use, and writes the result beside the
 //! trace.
 //!
-//! A patch that doesn't apply, a build that fails, a harness failure, a
-//! violation of another property, a patch the input doesn't catch, and a
-//! catch that misses the trigger history are each reported as their own
-//! failure, never as a catch. The campaign reports how many of its inputs
+//! A patch that doesn't apply or changes a witness file, a build that
+//! fails, a harness failure, a violation of another property, a patch the
+//! input doesn't catch, and a catch that misses the trigger history are
+//! each reported as their own failure, never as a catch. The campaign reports how many of its inputs
 //! caught the patch, and how the others' runs ended. It fails the case only
 //! on a run that fails, ends at a harness failure, violates another
 //! property not in `also_violates`, doesn't report the case's property, or
@@ -373,6 +375,9 @@ enum Verdict {
     BaselineFails(String),
     /// The patch doesn't apply to `HEAD`.
     PatchDoesntApply(String),
+    /// The patch changes, deletes or renames these witness files of the
+    /// case.
+    PatchesWitness(Vec<PathBuf>),
     /// The patched build or run failed before it wrote a trace.
     Failed(String),
     /// The patched run ended at a harness failure.
@@ -429,6 +434,14 @@ impl fmt::Display for Verdict {
             }
             Verdict::BaselineFails(why) => write!(f, "the unpatched baseline fails: {why}"),
             Verdict::PatchDoesntApply(why) => write!(f, "the patch doesn't apply: {why}"),
+            Verdict::PatchesWitness(files) => {
+                f.write_str("the patch changes the case's witness files")?;
+                for (index, file) in files.iter().enumerate() {
+                    let lead = if index == 0 { ": " } else { ", " };
+                    write!(f, "{lead}{}", file.display())?;
+                }
+                Ok(())
+            }
             Verdict::Failed(why) => write!(f, "the patched run failed: {why}"),
             Verdict::Harness(why) => write!(f, "the patched run hit a harness failure: {why}"),
             Verdict::Unrelated(property) => {
@@ -824,8 +837,8 @@ fn check_case(
     if let Some(why) = baseline_failure(&case.property, &baseline) {
         return Ok(Verdict::BaselineFails(why));
     }
-    if let Err(why) = apply(worktree, &case.patch) {
-        return Ok(Verdict::PatchDoesntApply(why));
+    if let Some(verdict) = apply_case_patch(worktree, case)? {
+        return Ok(verdict);
     }
     if let Err(error) = run_command(&mut cargo_sim(worktree, target)) {
         return Ok(Verdict::Failed(format!(
@@ -845,6 +858,39 @@ fn check_case(
         }
         _ => Ok(verdict),
     }
+}
+
+/// Applies `case`'s patch to `worktree`, a checkout of `HEAD`. `Some` is
+/// the verdict of a case that can't go on: the patch doesn't apply, or it
+/// changes, deletes or renames one of the case's witness files. The
+/// patched runs read those files after the patch while the baseline read
+/// the committed ones, so a catch might come from the changed witness
+/// rather than the code change.
+fn apply_case_patch(worktree: &Path, case: &Case) -> Result<Option<Verdict>, BoxError> {
+    if let Err(why) = apply(worktree, &case.patch) {
+        return Ok(Some(Verdict::PatchDoesntApply(why)));
+    }
+    // `--no-renames` lists a renamed file's old path, not only its new one.
+    let output = git(worktree)
+        .args(["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"])
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git diff` failed in {}: {}",
+            worktree.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    let changed = String::from_utf8(output.stdout)?;
+    let changed: Vec<&Path> = changed.split_terminator('\0').map(Path::new).collect();
+    let touched: Vec<PathBuf> = case
+        .witness
+        .files()
+        .into_iter()
+        .filter(|file| changed.contains(&file.as_path()))
+        .collect();
+    Ok((!touched.is_empty()).then_some(Verdict::PatchesWitness(touched)))
 }
 
 /// Records `input` on `harness` with the patched `zakura_sim` binary into
@@ -1744,6 +1790,99 @@ mod tests {
             .status()
             .expect("git runs");
         assert!(status.success(), "git {args:?}");
+    }
+
+    /// A case's patch may change only code: one that changes, deletes or
+    /// renames a witness file, typed or fuzz input, stops the case before
+    /// anything runs on the patched checkout.
+    #[test]
+    fn a_patch_may_not_change_the_witness() {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        let patches = tempfile::tempdir().expect("a patch directory");
+        let root = repo.path();
+        for (path, text) in [
+            ("src/lib.rs", "fn a() {}\n"),
+            ("s.json", "{}\n"),
+            ("p.bin", "plan\n"),
+            ("a.bin", "input\n"),
+            ("a.toml", "harness = \"h\"\n"),
+        ] {
+            fs::create_dir_all(root.join(path).parent().expect("a parent"))
+                .expect("the directory is created");
+            fs::write(root.join(path), text).expect("the file is written");
+        }
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-qm", "witnesses"]);
+        // Makes a patch from `edit`'s changes, then resets the checkout.
+        let patch = |name: &str, edit: &dyn Fn()| {
+            edit();
+            git_ok(root, &["add", "-A"]);
+            let diff = git(root)
+                .args(["diff", "--cached", "-M", "--binary"])
+                .output()
+                .expect("git diff runs");
+            assert!(diff.status.success());
+            git_ok(root, &["reset", "-q", "--hard", "HEAD"]);
+            let path = patches.path().join(name);
+            fs::write(&path, diff.stdout).expect("the patch is written");
+            path
+        };
+        let write = |path: &'static str| move || fs::write(root.join(path), "changed\n").unwrap();
+        let code = patch("code.patch", &write("src/lib.rs"));
+        let plan = patch("plan.patch", &|| {
+            write("src/lib.rs")();
+            write("p.bin")();
+        });
+        let moved = patch("moved.patch", &|| {
+            fs::rename(root.join("s.json"), root.join("t.json")).unwrap()
+        });
+        let sidecar = patch("sidecar.patch", &write("a.toml"));
+        let input = patch("input.patch", &|| {
+            fs::remove_file(root.join("a.bin")).unwrap()
+        });
+        let typed = Case {
+            property: ID.to_owned(),
+            patch: code.clone(),
+            witness: Witness::Typed {
+                harness: "h".to_owned(),
+                scenario: "s.json".into(),
+                plan: "p.bin".into(),
+            },
+            checks: Vec::new(),
+            also_violates: Vec::new(),
+            target: None,
+        };
+        let fuzz = Case {
+            witness: Witness::Input("a.bin".into()),
+            ..typed.clone()
+        };
+        let judge = |case: &Case, patch: &Path| {
+            let case = Case {
+                patch: patch.to_owned(),
+                ..case.clone()
+            };
+            let verdict = apply_case_patch(root, &case).expect("git runs");
+            git_ok(root, &["reset", "-q", "--hard", "HEAD"]);
+            git_ok(root, &["clean", "-fdq"]);
+            verdict
+        };
+        let touches = |files: &[&str]| {
+            Some(Verdict::PatchesWitness(
+                files.iter().map(PathBuf::from).collect(),
+            ))
+        };
+        assert_eq!(judge(&typed, &code), None, "a code patch goes on");
+        assert_eq!(judge(&fuzz, &code), None, "a code patch goes on");
+        assert_eq!(judge(&typed, &plan), touches(&["p.bin"]));
+        assert_eq!(judge(&typed, &moved), touches(&["s.json"]));
+        assert_eq!(judge(&fuzz, &sidecar), touches(&["a.toml"]));
+        assert_eq!(judge(&fuzz, &input), touches(&["a.bin"]));
+        assert_eq!(
+            judge(&typed, &input),
+            None,
+            "another case's input isn't this witness"
+        );
     }
 
     /// A renamed file or directory reports its old paths and its new ones,

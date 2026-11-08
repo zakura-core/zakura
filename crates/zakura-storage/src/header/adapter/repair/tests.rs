@@ -44,11 +44,12 @@ fn outcome(code: u8) -> ([Option<[u8; 32]>; 2], Option<block::Hash>) {
 }
 
 /// Each outcome's row carries the base delivery and the raw outcome fields
-/// zakura-state writes, and recovering the row gives the live delivery
-/// back. A scheduling body-size correction stays off the row, since
+/// zakura-state writes, and those fields rebuild the live outcome. That
+/// isn't zakura-state's recovery, which validates a row's outcome and then
+/// discards it. A scheduling body-size correction stays off the row, since
 /// zakura-state keeps it in its own column.
 #[test]
-fn each_outcome_round_trips_through_its_row() {
+fn each_outcome_is_rebuilt_from_its_row() {
     let base = delivery();
     for code in 0..=3 {
         let (digests, boundary) = outcome(code);

@@ -8,7 +8,7 @@ use zakura_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
     },
-    block::{BlockRef, Hash, Header, Height},
+    block::{merkle::Root, BlockRef, Hash, Header, Height},
     parameters::{
         subsidy::{
             founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
@@ -546,10 +546,29 @@ pub fn merkle_root_validity(
     block: &BlockRef,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
+    let merkle_root = transaction_hashes.iter().copied().collect();
+    merkle_root_validity_with_root(network, block, transaction_hashes, merkle_root)
+}
+
+/// Checks the transaction binding using CPU workers for large Merkle levels.
+/// Offload large inputs to a blocking task, because the shared Rayon pool may be busy.
+pub(super) fn merkle_root_validity_in_parallel(
+    network: &Network,
+    block: &BlockRef,
+    transaction_hashes: &[transaction::Hash],
+) -> Result<(), BlockError> {
+    let merkle_root = Root::from_hashes_in_parallel(transaction_hashes.iter().copied());
+    merkle_root_validity_with_root(network, block, transaction_hashes, merkle_root)
+}
+
+fn merkle_root_validity_with_root(
+    network: &Network,
+    block: &BlockRef,
+    transaction_hashes: &[transaction::Hash],
+    merkle_root: Root,
+) -> Result<(), BlockError> {
     // Check the header commitments first. The network upgrade check trusts the coinbase height,
     // which a peer can rewrite without changing a V5 block's hash.
-    let merkle_root = transaction_hashes.iter().cloned().collect();
-
     if block.header().merkle_root != merkle_root {
         return Err(BlockError::BadMerkleRoot {
             actual: merkle_root,

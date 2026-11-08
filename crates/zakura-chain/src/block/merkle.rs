@@ -216,6 +216,24 @@ impl std::iter::FromIterator<transaction::Hash> for Root {
     where
         I: IntoIterator<Item = transaction::Hash>,
     {
+        Self::from_hashes(hashes, false)
+    }
+}
+
+impl Root {
+    /// Builds a transaction Merkle root, hashing large levels on the Rayon pool.
+    ///
+    /// This waits for CPU workers, so async callers must use a blocking task.
+    /// Ordinary iterator collection stays serial.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hashes` is empty, because a block must contain a coinbase transaction.
+    pub fn from_hashes_in_parallel(hashes: impl IntoIterator<Item = transaction::Hash>) -> Self {
+        Self::from_hashes(hashes, true)
+    }
+
+    fn from_hashes(hashes: impl IntoIterator<Item = transaction::Hash>, parallel: bool) -> Self {
         let mut hashes = hashes.into_iter().map(|hash| hash.0).collect::<Vec<_>>();
         while hashes.len() > 1 {
             let pair = |chunk: &[[u8; 32]]| match chunk {
@@ -225,7 +243,7 @@ impl std::iter::FromIterator<transaction::Hash> for Root {
             };
             // Split large levels across threads. Small levels stay on this thread, where
             // splitting costs more than it saves.
-            hashes = if hashes.len() >= PARALLEL_MERKLE_LEVEL_MIN {
+            hashes = if parallel && hashes.len() >= PARALLEL_MERKLE_LEVEL_MIN {
                 hashes.par_chunks(2).map(pair).collect()
             } else {
                 hashes.chunks(2).map(pair).collect()
@@ -444,7 +462,7 @@ mod tests {
 
             // Cover the cutoff and levels that shrink across it, including odd levels
             // whose last hash must be paired with itself.
-            for count in [511u32, 512, 513, 1023, 1024, 1025, 3001] {
+            for count in [1u32, 2, 511, 512, 513, 1023, 1024, 1025, 3001] {
                 let leaves: Vec<[u8; 32]> = (0..count)
                     .map(|i| {
                         let mut leaf = [0u8; 32];
@@ -462,8 +480,15 @@ mod tests {
                     level = next;
                 }
 
-                let root =
-                    pool.install(|| leaves.into_iter().map(transaction::Hash).collect::<Root>());
+                let serial = leaves
+                    .iter()
+                    .copied()
+                    .map(transaction::Hash)
+                    .collect::<Root>();
+                let root = pool.install(|| {
+                    Root::from_hashes_in_parallel(leaves.into_iter().map(transaction::Hash))
+                });
+                assert_eq!(root, serial);
                 assert_eq!(
                     root,
                     Root(level[0]),

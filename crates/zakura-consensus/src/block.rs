@@ -54,6 +54,24 @@ const AUTH_DATA_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Matches the transaction hashing cutoff; large serial workloads also leave Tokio workers free.
+const BLOCKING_HASH_MIN_TRANSACTIONS: usize = 64;
+
+/// Runs large-block hashing away from async workers, including waits for the Rayon pool.
+/// Small blocks stay inline to avoid a blocking-pool handoff.
+async fn run_block_hashing<T: Send + 'static>(
+    block: BlockHandle,
+    hash: impl FnOnce(BlockHandle) -> T + Send + 'static,
+) -> T {
+    if block.view().transactions().len() < BLOCKING_HASH_MIN_TRANSACTIONS {
+        hash(block)
+    } else {
+        tokio::task::spawn_blocking(move || hash(block))
+            .await
+            .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
+    }
+}
+
 /// Asynchronous semantic block verification.
 #[derive(Debug)]
 pub struct SemanticBlockVerifier<S, V> {
@@ -587,13 +605,20 @@ where
                 // The Merkle root check needs only transaction IDs. Authorizing data is hashed
                 // after it and after the quick checks, so a body that does not match its
                 // header, or fails a cheap rule, never has its proofs and signatures hashed.
-                let transaction_hashes = block.view().transaction_hashes();
-                check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+                let hashing_network = network.clone();
+                let transaction_hashes = run_block_hashing(block.clone(), move |block| {
+                    let hashes = block.view().transaction_hashes();
+                    check::merkle_root_validity_in_parallel(&hashing_network, &block, &hashes)?;
+                    Ok::<_, BlockError>(hashes)
+                })
+                .await?;
                 let coinbase_tx = quick_checks?;
 
                 // Hash each transaction's authorizing data once, for the transaction requests
                 // and the state's authorizing-data check.
-                let auth_data_digests = block.view().auth_data_digests();
+                let auth_data_digests =
+                    run_block_hashing(block.clone(), |block| block.view().auth_data_digests())
+                        .await;
                 auth_data_root = Some(auth_data_digests.root);
 
                 // ZIP 234 derives the block subsidy from the NSM value balance after the parent

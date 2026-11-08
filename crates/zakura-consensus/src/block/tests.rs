@@ -38,6 +38,54 @@ use super::*;
 
 mod nsm_fees;
 
+/// A wait in large-block hashing must not stop unrelated work on a single async worker.
+#[tokio::test(flavor = "current_thread")]
+async fn large_block_hashing_leaves_async_worker_available() {
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis vector deserializes");
+    block.transactions.resize(
+        BLOCKING_HASH_MIN_TRANSACTIONS,
+        block.transactions[0].clone(),
+    );
+    let expected = block
+        .transactions
+        .iter()
+        .map(|tx| tx.hash())
+        .collect::<Vec<_>>();
+    let (started, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let hashing = tokio::spawn(run_block_hashing(Arc::new(block).into(), move |block| {
+        started.send(()).expect("the async caller is waiting");
+        // Bound the wait so a regression fails instead of deadlocking the test runtime.
+        let async_worker_progressed = released
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        (async_worker_progressed, block.view().transaction_hashes())
+    }));
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        waiting.await.expect("the hashing task starts");
+        tokio::task::yield_now().await;
+        // This can only release the hashing task while it waits if Tokio remains available.
+        let _ = release.send(());
+        let (progressed, hashes) = hashing.await.expect("hashing finishes without panic");
+        assert!(progressed, "async work must progress while hashing waits");
+        assert_eq!(&*hashes, expected.as_slice());
+    })
+    .await
+    .expect("hashing and unrelated async work finish within the timeout");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_block_hashing_stays_on_the_calling_thread() {
+    let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+        .expect("the genesis vector deserializes");
+    let caller = std::thread::current().id();
+    let worker = run_block_hashing(Arc::new(block).into(), |_| std::thread::current().id()).await;
+    assert_eq!(worker, caller);
+}
+
 fn prepared_test_verifier(
     network: &Network,
 ) -> impl Service<Request, Response = block::Hash, Error = VerifyBlockError> {
@@ -2659,6 +2707,8 @@ fn merkle_root_validity_rejects_duplicate_transaction_hash() -> Result<(), Repor
     Arc::make_mut(&mut block.header).merkle_root = transaction_hashes.iter().cloned().collect();
 
     let result = check::merkle_root_validity(&network, &block, &transaction_hashes);
+    assert_eq!(result, Err(BlockError::DuplicateTransaction));
+    let result = check::merkle_root_validity_in_parallel(&network, &block, &transaction_hashes);
     assert_eq!(result, Err(BlockError::DuplicateTransaction));
 
     Ok(())

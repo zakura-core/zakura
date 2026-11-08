@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+index f3dc86650b..c8c6f02992 100644
+--- a/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
++++ b/crates/zakura-network/src/zakura/header_sync/scheduler/peer_work/policy.rs
+@@ -1123,7 +1123,7 @@ impl WorkPolicy {
+             return false;
+         };
+         request.common_ancestor.get_or_insert(ancestor);
+-        request.entries.extend(entries);
++        request.entries.extend(entries.into_iter().rev());
+         request.cursor = Some(cursor);
+         true
+     }

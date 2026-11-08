@@ -35,7 +35,8 @@
 //!   of the read, its subscription's last accepted cursor, which is where
 //!   production continues from. A round is on a new `Open` when the
 //!   subscriber issued an `Open` for its subscription that no earlier round
-//!   started on.
+//!   started on, and resumed when an earlier round did. A round on a
+//!   subscription the subscriber never opened is another property's.
 //!
 //! The check applies once an adoption changes the generation while a
 //! current-started round is live, an ordinary round starts, or a reset is
@@ -465,7 +466,12 @@ impl RoundLife {
             }
         }
         let handed: Vec<String> = locator.iter().map(|entry| hash(*entry)).collect();
-        if self.opened.contains(subscription) && !self.started.contains(subscription) {
+        // A round on a subscription nobody opened is owner binding's to
+        // judge, under `header-sync/commit-only-authorized`.
+        if !self.opened.contains(subscription) {
+            return;
+        }
+        if !self.started.contains(subscription) {
             if handed != read.hashes {
                 self.breaks.push(format!(
                     "ResetInvalidatesWork: round {incarnation} on a new Open handed on locator \

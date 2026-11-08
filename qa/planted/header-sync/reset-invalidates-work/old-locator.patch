@@ -1,0 +1,28 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..73446aa948 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -295,6 +295,7 @@ fn build_header_sync_reactor(
+         state: ReactorState::new(Instant::now()),
+         peer_work_queue: PeerWorkQueue::default(),
+         last_snapshot_refresh_trace_at: Cell::new(None),
++        saved_locator: None,
+         #[cfg(any(test, zakura_sim))]
+         cause: ReactorCause::Idle,
+     };
+@@ -358,6 +359,7 @@ struct HeaderSyncReactor {
+     state: ReactorState,
+     peer_work_queue: PeerWorkQueue,
+     last_snapshot_refresh_trace_at: Cell<Option<Instant>>,
++    saved_locator: Option<zakura_header_chain::HeaderLocator>,
+     /// The unit of work the reactor is in, as `caused!` sets it.
+     #[cfg(any(test, zakura_sim))]
+     cause: ReactorCause,
+@@ -2254,6 +2256,7 @@ impl HeaderSyncReactor {
+             metrics::counter!("sync.header.target.locator_unavailable").increment(1);
+             return;
+         };
++        let locator = self.saved_locator.get_or_insert(locator).clone();
+         let Some(local) = self.committed_snapshot.clone() else {
+             self.peer_work_queue.remove_unstarted(&peer);
+             return;

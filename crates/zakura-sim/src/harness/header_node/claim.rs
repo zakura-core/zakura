@@ -53,6 +53,15 @@ pub enum Claim {
     /// An apply changed the engine under an older generation or anchor, or
     /// the reactor's adoption moved back ([`super::chain_effect`]).
     StaleChainEffect,
+    /// A round's owner isn't bound to its `Open`, a staged page isn't on
+    /// its requested path ([`super::authority`]), or the node admitted a
+    /// session under another identity than its link's.
+    CommitOnlyAuthorized,
+    /// A page was staged on a round another session or subscription
+    /// requested.
+    ForeignPage,
+    /// A staged page left its round holding other headers than it carried.
+    UnstagedPage,
 }
 
 impl Claim {
@@ -65,6 +74,8 @@ impl Claim {
             ClaimRule::OpenOwnership => Claim::OpenOwnership,
             ClaimRule::OpenReservation => Claim::OpenReservation,
             ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
+            ClaimRule::ForeignPage => Claim::ForeignPage,
+            ClaimRule::UnstagedPage => Claim::UnstagedPage,
         }
     }
 }

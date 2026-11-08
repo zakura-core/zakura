@@ -203,6 +203,10 @@ struct SessionLedger {
     idle: Option<bool>,
     /// The first rule the run broke.
     broken: Option<String>,
+    /// The identity mismatches not yet drained: an admission whose peer,
+    /// direction or session ID isn't its link's or transport row's, which
+    /// `header-sync/commit-only-authorized` claims.
+    claims: Vec<String>,
 }
 
 /// Own-9's facts about the node's sessions, as its transport reported them,
@@ -443,6 +447,14 @@ impl SessionEvidence {
         self.ledger().broken.clone()
     }
 
+    /// The identity mismatches found since the last call: admissions whose
+    /// peer, direction or session ID isn't the one their link's origin or
+    /// transport row carries. The service builds each `PeerSession` itself,
+    /// so such a mismatch is a production defect with every fact truthful.
+    pub(crate) fn take_claims(&self) -> Vec<String> {
+        std::mem::take(&mut self.ledger().claims)
+    }
+
     /// Every fact so far, in order.
     pub fn facts(&self) -> Vec<SessionFact> {
         self.ledger().facts.clone()
@@ -639,9 +651,14 @@ impl SessionLedger {
                  {origin:?}, which names no link"
             ));
         };
-        let mismatch = if link.origin != origin {
-            Some(format!("origin {:?}", link.origin))
-        } else if link.peer != *peer {
+        if link.origin != origin {
+            return Err(format!(
+                "SessionJoin: the node admitted session {session_id} from {name}, {direction:?}, \
+                 with origin {origin:?}, but its link has origin {:?}",
+                link.origin
+            ));
+        }
+        let mismatch = if link.peer != *peer {
             Some(format!("peer {}", link.name))
         } else if link.direction != direction {
             Some(format!("direction {:?}", link.direction))
@@ -651,10 +668,11 @@ impl SessionLedger {
             None
         };
         if let Some(expected) = mismatch {
-            return Err(format!(
-                "SessionJoin: the node admitted session {session_id} from {name}, {direction:?}, \
-                 with origin {origin:?}, but its link has {expected}"
-            ));
+            let detail = format!(
+                "CommitOnlyAuthorized: the node admitted session {session_id} from {name}, \
+                 {direction:?}, with origin {origin:?}, but its link has {expected}"
+            );
+            self.claims.push(detail);
         }
         if std::mem::replace(&mut link.admitted, true) {
             return Err(format!(
@@ -704,9 +722,14 @@ impl SessionLedger {
                 rows.len()
             ));
         };
-        let mismatch = if row.kind != ZAKURA_STREAM_HEADER_SYNC {
-            Some(format!("kind {}", row.kind))
-        } else if row.peer.as_deref() != Some(name.as_str()) {
+        if row.kind != ZAKURA_STREAM_HEADER_SYNC {
+            return Err(format!(
+                "Own9Join: {admitted} on connection {connection}'s stream {quic_stream}, but its \
+                 Session row has kind {}",
+                row.kind
+            ));
+        }
+        let mismatch = if row.peer.as_deref() != Some(name.as_str()) {
             Some(format!("peer {:?}", row.peer))
         } else if row.session_id != session_id {
             Some(format!("session {}", row.session_id))
@@ -714,9 +737,9 @@ impl SessionLedger {
             None
         };
         if let Some(expected) = mismatch {
-            return Err(format!(
-                "Own9Join: {admitted} on connection {connection}'s stream {quic_stream}, but its \
-                 Session row has {expected}"
+            self.claims.push(format!(
+                "CommitOnlyAuthorized: {admitted} on connection {connection}'s stream \
+                 {quic_stream}, but its Session row has {expected}"
             ));
         }
         let installs = own9
@@ -731,9 +754,9 @@ impl SessionLedger {
             ));
         }
         if generation != session_id {
-            return Err(format!(
-                "Own9Join: {admitted} as generation {generation}, but the handler installs each \
-                 generation under its session ID"
+            self.claims.push(format!(
+                "CommitOnlyAuthorized: {admitted} as generation {generation}, but the handler \
+                 installs each generation under its session ID"
             ));
         }
         own9.origins.insert((peer.clone(), session_id), origin);

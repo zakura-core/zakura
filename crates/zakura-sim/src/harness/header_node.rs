@@ -18,6 +18,7 @@
 //! [`capacity::CapacityEvidence`].
 
 pub mod adoption;
+pub mod authority;
 pub mod capacity;
 pub mod chain_effect;
 pub mod claim;

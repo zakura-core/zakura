@@ -104,6 +104,12 @@ pub enum ClaimRule {
     /// A round a new snapshot made obsolete retired while the queue still
     /// held it.
     UnreleasedObsoleteRound,
+    /// A page was staged on a round another session or subscription
+    /// requested.
+    ForeignPage,
+    /// A staged page left its round holding other headers than it carried,
+    /// or a count that isn't what it staged.
+    UnstagedPage,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -350,12 +356,15 @@ impl HeaderWorkLedger {
                     || *from_session != request.session_id
                     || *subscription != request.request_id
                 {
-                    return Err(format!(
-                        "ForeignPage: a page from session {from_session}, subscription \
-                         {subscription} was staged on round {}, which session {} requested as \
-                         {}",
-                        request.incarnation, request.session_id, request.request_id
-                    ));
+                    self.claims.push(ClaimBreak {
+                        rule: ClaimRule::ForeignPage,
+                        detail: format!(
+                            "ForeignPage: a page from session {from_session}, subscription \
+                             {subscription} was staged on round {}, which session {} requested \
+                             as {}",
+                            request.incarnation, request.session_id, request.request_id
+                        ),
+                    });
                 }
                 self.stage(
                     *reservation,
@@ -812,13 +821,17 @@ impl HeaderWorkLedger {
         round.staged += headers;
         round.hashes.extend_from_slice(stored);
         if hashes.len() != headers || stored != hashes || staged_total != round.staged {
-            return Err(format!(
+            let detail = format!(
                 "UnstagedPage: a page of {headers} headers with {} hashes left round {} \
                  holding {staged_total} of the {} it staged, or holding other headers",
                 hashes.len(),
                 request.incarnation,
                 round.staged
-            ));
+            );
+            self.claims.push(ClaimBreak {
+                rule: ClaimRule::UnstagedPage,
+                detail,
+            });
         }
         Ok(())
     }
@@ -1682,7 +1695,7 @@ mod tests {
             stored: vec![TIP; 2],
             staged_total: 2,
         });
-        refused_as(foreign, "ForeignPage");
+        claimed_as(foreign, ClaimRule::ForeignPage);
         let mut over = base.clone();
         over.push(staged(1, 1, 1, 6, 0, 6));
         refused_as(over, "OverReservation");
@@ -2090,17 +2103,17 @@ mod tests {
     }
 
     /// A staging report must show its page in the round: one whose policy
-    /// holds fewer headers than the round staged fails.
+    /// holds fewer headers than the round staged is a claim break.
     #[test]
     fn a_staged_page_is_in_its_round() {
-        refused_as(
+        claimed_as(
             vec![
                 opened(1, 1, 5),
                 bound(1, 1, 1),
                 started(1, 1),
                 staged(1, 1, 1, 3, 2, 0),
             ],
-            "UnstagedPage",
+            ClaimRule::UnstagedPage,
         );
     }
 
@@ -2124,7 +2137,7 @@ mod tests {
             stored: vec![TIP, block::Hash([8; 32])],
             staged_total: 2,
         });
-        refused_as(misstored, "UnstagedPage");
+        claimed_as(misstored, ClaimRule::UnstagedPage);
         let mut foreign = base;
         foreign.extend([
             staged(1, 1, 1, 3, 2, 3),

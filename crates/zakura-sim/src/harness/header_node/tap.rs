@@ -802,6 +802,10 @@ impl ReactorTap {
             move || sessions.freeze()
         });
         let stamps = ends.stamps();
+        sim.on_frozen({
+            let ends = ends.clone();
+            move || ends.freeze()
+        });
         let adoption = AdoptionEvidence::stamped_by(stamps.clone());
         sim.on_frozen({
             let adoption = adoption.clone();
@@ -964,10 +968,10 @@ impl ReactorTap {
     /// Reads the reactor's resource probe, if this tap reads one, checks the
     /// read as [`capacity::check`] says, and keeps it as a reading of `step`.
     /// While the reactor is alive, a quiet boundary's read is compared with
-    /// the ownership check's accounting. Once a reactor the harness stopped
-    /// is gone, every read is a teardown read. A reactor that unwound, or
-    /// went away unstopped, left its counts mid-change and fails the run on
-    /// its own, so its reads aren't checked. A read that finds the budget's
+    /// the ownership check's accounting. Once the reactor is gone without
+    /// unwinding, stopped by the harness or exited by itself, every read is
+    /// a teardown read. A reactor that unwound left its counts mid-change
+    /// and fails the run on its own, so its reads aren't checked. A read that finds the budget's
     /// lock held is noted unread, with whether the reactor was stopped
     /// mid-poll, and a claim break goes to the tap's [`ClaimEvidence`] as
     /// the module doc says.
@@ -996,7 +1000,7 @@ impl ReactorTap {
             ProbeSlot::Held(probe) => probe.clone(),
         };
         let gone = self.state.reactor_gone();
-        if self.state.unwound.load(Ordering::Relaxed) || (gone && !self.state.stopped()) {
+        if self.state.unwound.load(Ordering::Relaxed) || (gone && !self.state.ended_cleanly()) {
             return Ok(());
         }
         if let Some(task) = *self

@@ -190,7 +190,9 @@ where
 /// `OpenOwnership`, `LeakedLease` in the ledger's teardown check), and the
 /// budget holds nothing and every locator permit is free but those storage
 /// still holds for pending reads (`TeardownReserved`, `TeardownOwned`,
-/// `TeardownLocatorPermits` on the probe reads once it's gone).
+/// `TeardownLocatorPermits` on the probe reads once it's gone). A reactor
+/// that exits by itself, without unwinding, gets the same probe reads and
+/// claims, though only a stopped one settles the node.
 ///
 /// Any of those breaks the step's drain found violates. It applies once the
 /// queue released a round or the node settled. A run that ends with a

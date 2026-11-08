@@ -18,7 +18,8 @@
 //!   Accounting reported from another task fails as `AccountingOffReactor`,
 //!   since then no boundary is known quiet.
 //! - `TeardownReserved`, `TeardownOwned` and `TeardownLocatorPermits`: once
-//!   a reactor the harness stopped is gone, nothing stays reserved or owned,
+//!   the reactor is gone without unwinding, stopped by the harness or
+//!   exited by itself, nothing stays reserved or owned,
 //!   and every locator permit is free except one for each locator read
 //!   storage still holds pending. They're claim rules too, checked on every
 //!   read after the reactor is gone against what storage holds then, and
@@ -55,7 +56,8 @@ pub struct CapacityReading {
     pub locator_permits: usize,
     /// Whether it was compared with the queue's accounting.
     pub compared: bool,
-    /// Whether it was a teardown read, after a stopped reactor was gone.
+    /// Whether it was a teardown read, after the reactor was gone without
+    /// unwinding.
     pub teardown: bool,
 }
 
@@ -236,7 +238,7 @@ fn check_accounting(
                 Err(Broken::Claim(
                     Claim::TeardownReserved,
                     format!(
-                        "TeardownReserved: the stopped reactor is gone with {} headers still \
+                        "TeardownReserved: the reactor is gone with {} headers still \
                          reserved",
                         read.reserved
                     ),
@@ -245,7 +247,7 @@ fn check_accounting(
                 Err(Broken::Claim(
                     Claim::TeardownOwned,
                     format!(
-                        "TeardownOwned: the stopped reactor is gone with {} headers still owned",
+                        "TeardownOwned: the reactor is gone with {} headers still owned",
                         read.owned
                     ),
                 ))
@@ -253,7 +255,7 @@ fn check_accounting(
                 Err(Broken::Claim(
                     Claim::TeardownLocatorPermits,
                     format!(
-                        "TeardownLocatorPermits: the stopped reactor is gone with {} of {} \
+                        "TeardownLocatorPermits: the reactor is gone with {} of {} \
                          locator permits free, and storage holds {storage_permits}",
                         read.locator_permits,
                         probe.locator_capacity()

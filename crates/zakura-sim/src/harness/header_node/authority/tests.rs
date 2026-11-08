@@ -1056,3 +1056,102 @@ fn a_second_submission_from_one_call_breaks_at_once() {
         "{found:?}"
     );
 }
+
+/// An apply's owner, source and target are judged against its dispatch
+/// whether or not a prepare handed it headers. Without a handoff it breaks
+/// the submission rule at once, with its fields also compared. With one,
+/// a matching sealed insertion holds.
+#[test]
+fn an_apply_is_judged_with_or_without_a_handoff() {
+    use zakura_network::zakura::observe::{HeaderWorkEnd, PortCall};
+
+    let chain = main_chain(2);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[1].hash, genesis.hash);
+    let source = zakura_header_chain::SourceId::from_digest([2; 32]);
+    let dispatch = |check: &mut Authority| {
+        for (call, op) in [
+            (
+                1,
+                PortCall::Prepare {
+                    peer: mirror(),
+                    source,
+                    owner: round.owner,
+                    common_ancestor: genesis,
+                    target: chain[1],
+                    hashes: vec![chain[0].hash, chain[1].hash],
+                },
+            ),
+            (
+                2,
+                PortCall::Apply {
+                    peer: mirror(),
+                    source,
+                    owner: round.owner,
+                    target_tip_hash: chain[1].hash,
+                },
+            ),
+        ] {
+            check.observe(&ReactorEvent::Dispatched { call, op }, true, false);
+        }
+    };
+    let apply = |source: zakura_header_chain::SourceId| crate::observe::StorageFact::Submitted {
+        id: 2,
+        request: crate::observe::StorageRequest::ApplyHeaderTarget {
+            owner: crate::storage::work_owner(round.owner),
+            source: crate::storage::hex(&source.digest()),
+            parent: Some(crate::storage::hash(genesis.hash)),
+            target: crate::storage::hash(chain[1].hash),
+            hashes: Some(vec![
+                crate::storage::hash(chain[0].hash),
+                crate::storage::hash(chain[1].hash),
+            ]),
+        },
+        digest: String::new(),
+        call: Some(2),
+    };
+    let new_check = || {
+        Authority::new(
+            AuthorityEvidence::default(),
+            HeaderFixture::regtest(),
+            [0],
+            [],
+        )
+    };
+
+    let mut unhanded = new_check();
+    dispatch(&mut unhanded);
+    unhanded.storage([&apply(source)]);
+    let found = unhanded.drain(1);
+    assert!(
+        matches!(&found[..], [only] if only.contains("no prepare handed the apply")),
+        "{found:?}"
+    );
+
+    let mut other_source = new_check();
+    dispatch(&mut other_source);
+    other_source.storage([&apply(zakura_header_chain::SourceId::from_digest([3; 32]))]);
+    let found = other_source.drain(1);
+    assert!(
+        found.iter().any(|found| found.contains("source"))
+            && found
+                .iter()
+                .any(|found| found.contains("no prepare handed the apply")),
+        "{found:?}"
+    );
+
+    let mut handed = new_check();
+    dispatch(&mut handed);
+    handed.observe(
+        &ReactorEvent::HeadersEnded {
+            call: 1,
+            incarnation: 1,
+            headers: 2,
+            end: HeaderWorkEnd::HandedToApply { apply: 2 },
+        },
+        true,
+        false,
+    );
+    handed.storage([&apply(source)]);
+    assert_eq!(handed.drain(1), Vec::<String>::new());
+}

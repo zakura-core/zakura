@@ -459,8 +459,10 @@ fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
 /// The node stages, prepares and commits only headers it asked for, and
 /// credits only what it reserved: each round's owner is bound to the `Open`
 /// the node built for it, each staged page belongs to its round's session
-/// and subscription and lies on the requested path, and every credit fact,
-/// update and acceptance carries its subscription's state faithfully.
+/// and subscription and lies on the requested path, every credit fact,
+/// update and acceptance carries its subscription's state faithfully, and
+/// each prepare and apply hands on its round's work and reaches storage as
+/// dispatched.
 pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
 
 /// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
@@ -503,7 +505,9 @@ where
                 admits each session under its link's identity, each staged page belongs to its \
                 round's session and subscription and lies on the path it asked for, and the \
                 subscriber's credit, updates and acceptances stay within what the node reserved \
-                and carry each subscription's state faithfully",
+                and carry each subscription's state faithfully, and each prepare and apply hands \
+                on its round's staged work from its peer's source and reaches storage exactly as \
+                dispatched",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -517,8 +521,10 @@ where
 ///
 /// The tap's authority check ([`crate::harness::header_node::authority`])
 /// judges each `Started` and `PageStaged` and, in its credit half, each
-/// credit fact, built update and acceptance; the ledger reports a foreign
-/// or unstaged page or an over-spent reservation, and the session view an
+/// credit fact, built update and acceptance, and in its submission rule
+/// each prepare's and apply's request storage received; the ledger reports
+/// a foreign or unstaged page, an over-spent reservation, and a handoff to
+/// another owner, payload, source, round or apply, and the session view an
 /// admission under another identity than its link's. A break the step's
 /// drain found violates at once. It applies once a drain found a start, a
 /// staged page, a credit fact or an admission's identity join.
@@ -529,8 +535,9 @@ where
 {
     let view = cx.view();
     let step = cx.step;
-    let expected = "the node stages only headers it asked for, under the owner it bound, and \
-                    credits only what it reserved, as each subscription's state says";
+    let expected = "the node stages, prepares and applies only headers it asked for, under the \
+                    owner it bound and as dispatched, and credits only what it reserved, as each \
+                    subscription's state says";
     let mut breaks = view.claims().at(step, &AUTHORITY_CLAIMS).into_iter();
     if let Some(first) = breaks.next() {
         for other in breaks {

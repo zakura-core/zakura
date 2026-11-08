@@ -29,7 +29,13 @@
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
 //!   and the read storage answered it with has a generation and anchor no
-//!   older than the latest adopted ones then.
+//!   older than the latest adopted ones then. The locator the reactor hands
+//!   on comes from that read: a round on a new `Open` hands on the read's
+//!   hashes in order, and a resumed subscription's round hands on one entry
+//!   of the read, its subscription's last accepted cursor, which is where
+//!   production continues from. A round is on a new `Open` when the
+//!   subscriber issued an `Open` for its subscription that no earlier round
+//!   started on.
 //!
 //! The check applies once an adoption changes the generation while a
 //! current-started round is live, an ordinary round starts, or a reset is
@@ -39,28 +45,37 @@
 //! which fails the run.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
 };
 
 use zakura_chain::block;
 use zakura_network::zakura::{
-    observe::{PortCall, ReactorCause, ReactorEvent, WorkSlot},
-    HeaderTargetPurpose,
+    observe::{CreditKind, PortCall, ReactorCause, ReactorEvent, WorkSlot},
+    HeaderTargetPurpose, ZakuraPeerId,
 };
 
-use crate::observe::{StorageFact, StorageResult};
+use crate::{
+    observe::{StorageFact, StorageResult},
+    storage::hash,
+};
 
 /// A header generation and the finality anchor's hash, as authority names
 /// them.
 type Authority = (u64, block::Hash);
 
 /// A locator read's result, as storage reported it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Read {
     generation: u64,
     anchor_height: u32,
+    /// Its entries' hashes, in order, the tip first.
+    hashes: Vec<String>,
 }
+
+/// A subscription, by its peer, session and ID, which a round's request ID
+/// is.
+type Subscription = (ZakuraPeerId, u64, u64);
 
 /// A started round, as its `Started` reported it.
 #[derive(Clone, Copy, Debug)]
@@ -121,6 +136,12 @@ pub(super) struct RoundLife {
     submitted: HashMap<u64, u64>,
     /// Each locator read's result, by storage operation.
     reads: HashMap<u64, Read>,
+    /// The subscriptions the subscriber issued an `Open` for.
+    opened: HashSet<Subscription>,
+    /// The subscriptions a round started on.
+    started: HashSet<Subscription>,
+    /// Each subscription's last accepted cursor's hash.
+    accepted: HashMap<Subscription, block::Hash>,
     /// The engine's header generation before the current step.
     engine: u64,
     /// The breaks already found, so a slot kept across units breaks once.
@@ -143,6 +164,9 @@ impl RoundLife {
             locators: HashMap::new(),
             submitted: HashMap::new(),
             reads: HashMap::new(),
+            opened: HashSet::new(),
+            started: HashSet::new(),
+            accepted: HashMap::new(),
             engine,
             reported: BTreeSet::new(),
             breaks: Vec::new(),
@@ -181,15 +205,38 @@ impl RoundLife {
             }
             ReactorEvent::Slots { slots } => self.slots = slots.clone(),
             ReactorEvent::Started {
-                request, purpose, ..
+                request,
+                purpose,
+                locator,
             } => {
                 let authority = authority_of(request.owner.header_authority());
                 let current = self.latest() == Some(authority);
                 self.rounds
                     .insert(request.incarnation, Round { authority, current });
+                let subscription = (request.peer.clone(), request.session_id, request.request_id);
                 if *purpose == HeaderTargetPurpose::Normal {
-                    self.judge_start(request.incarnation, authority);
+                    self.judge_start(request.incarnation, authority, &subscription, locator);
                 }
+                self.started.insert(subscription);
+            }
+            ReactorEvent::CreditIssued {
+                kind: CreditKind::Open,
+                peer,
+                session_id,
+                subscription,
+                ..
+            } => {
+                self.opened
+                    .insert((peer.clone(), *session_id, *subscription));
+            }
+            ReactorEvent::CursorsAccepted {
+                peer,
+                session_id,
+                subscription,
+                through,
+            } => {
+                self.accepted
+                    .insert((peer.clone(), *session_id, *subscription), through.hash);
             }
             ReactorEvent::Dispatched { call, op } => match op {
                 PortCall::Locator { scope, .. } => {
@@ -248,6 +295,7 @@ impl RoundLife {
                         StorageResult::Locator {
                             header_generation,
                             finalized,
+                            hashes,
                             ..
                         },
                     ..
@@ -257,6 +305,7 @@ impl RoundLife {
                         Read {
                             generation: *header_generation,
                             anchor_height: finalized.height,
+                            hashes: hashes.clone(),
                         },
                     );
                 }
@@ -363,7 +412,13 @@ impl RoundLife {
 
     /// Judges round `incarnation`'s ordinary start under `authority`
     /// against the locator call whose completion it ran under.
-    fn judge_start(&mut self, incarnation: u64, authority: Authority) {
+    fn judge_start(
+        &mut self,
+        incarnation: u64,
+        authority: Authority,
+        subscription: &Subscription,
+        locator: &[block::Hash],
+    ) {
         self.applies();
         let ReactorCause::Completion { call } = self.cause else {
             self.breaks.push(format!(
@@ -391,7 +446,7 @@ impl RoundLife {
             .submitted
             .get(&call)
             .and_then(|op| self.reads.get(op))
-            .copied();
+            .cloned();
         let Some(read) = read else {
             self.missing.get_or_insert(format!(
                 "RoundLifeJoin: round {incarnation} started from locator call {call}, whose \
@@ -408,6 +463,35 @@ impl RoundLife {
                     read.generation, read.anchor_height
                 ));
             }
+        }
+        let handed: Vec<String> = locator.iter().map(|entry| hash(*entry)).collect();
+        if self.opened.contains(subscription) && !self.started.contains(subscription) {
+            if handed != read.hashes {
+                self.breaks.push(format!(
+                    "ResetInvalidatesWork: round {incarnation} on a new Open handed on locator \
+                     {handed:?}, not its read's {:?}",
+                    read.hashes
+                ));
+            }
+            return;
+        }
+        let accepted = self
+            .accepted
+            .get(subscription)
+            .map(|through| hash(*through));
+        let [entry] = &handed[..] else {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: resumed round {incarnation} handed on {} locator \
+                 entries, not one",
+                handed.len()
+            ));
+            return;
+        };
+        if !read.hashes.contains(entry) || accepted.as_ref() != Some(entry) {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: resumed round {incarnation} continues from {entry}, not \
+                 its subscription's last accepted cursor {accepted:?} in its read"
+            ));
         }
     }
 }

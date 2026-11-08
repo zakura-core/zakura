@@ -241,6 +241,8 @@ pub enum ResultIdentity {
     Locator {
         /// Its first entry, the selected tip.
         tip: Frontier,
+        /// Every entry's hash, in order, the tip first.
+        hashes: Vec<block::Hash>,
         /// The header generation it was read at.
         header_generation: HeaderGeneration,
         /// The finalized anchor it was read at.
@@ -335,6 +337,7 @@ impl ResultIdentity {
                         .entries()
                         .first()
                         .expect("a selected-path locator is never empty"),
+                    hashes: locator.entries().iter().map(|entry| entry.hash).collect(),
                     header_generation,
                     finalized,
                 }

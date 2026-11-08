@@ -951,6 +951,10 @@ pub enum StorageResult {
     Locator {
         /// Its first entry, the selected tip.
         tip: StoragePoint,
+        /// Every entry's hash, in order, the tip first. Kept view-side and
+        /// off the trace, whose format pinned traces fix.
+        #[serde(skip)]
+        hashes: Vec<String>,
         /// The header generation it was read at.
         header_generation: u64,
         /// The finalized anchor it was read at.

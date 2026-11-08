@@ -1434,6 +1434,12 @@ fn completions_carry_typed_identities() {
         locator.result,
         ResultIdentity::Locator {
             tip: chain[2],
+            hashes: chain[..=2]
+                .iter()
+                .rev()
+                .chain([&anchor])
+                .map(|entry| entry.hash)
+                .collect(),
             header_generation: snapshot.header_generation,
             finalized: anchor,
         }

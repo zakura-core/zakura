@@ -1041,6 +1041,15 @@ impl ReactorTap {
                 chain.storage(facts.iter().map(|(_, fact)| *fact), engine);
             }
         }
+        if let Some(authority) = self
+            .state
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            authority.storage(facts.iter().map(|(_, fact)| *fact));
+        }
         self.pairer.facts(facts);
     }
 

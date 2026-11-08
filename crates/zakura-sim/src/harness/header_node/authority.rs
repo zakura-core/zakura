@@ -30,7 +30,9 @@
 //! is the ledger's `ForeignPage`, and the session view's identity joins are
 //! the session evidence's, both claims of the same property.
 //!
-//! The credit the subscriber builds is judged beside these, in [`credit`].
+//! The credit the subscriber builds is judged beside these, in [`credit`],
+//! and the requests storage receives against their dispatches, in
+//! [`submission`].
 //!
 //! The check applies once it judged a `Started`, a `PageStaged` or a credit
 //! fact, or the
@@ -51,6 +53,8 @@ use zakura_network::zakura::{
     HeaderTargetPurpose, ZakuraPeerId,
 };
 use zakura_storage::header::fixture::HeaderFixture;
+
+use crate::observe::StorageFact;
 
 /// A subscription, by its peer, session and ID.
 type Subscription = (ZakuraPeerId, u64, u64);
@@ -113,6 +117,7 @@ pub(super) struct Authority {
     /// Each subscription's last staged header.
     staged: HashMap<Subscription, Frontier>,
     credit: credit::Credit,
+    submission: submission::Submission,
     breaks: Vec<String>,
     evidence: AuthorityEvidence,
 }
@@ -143,6 +148,7 @@ impl Authority {
             started: HashSet::new(),
             staged: HashMap::new(),
             credit: credit::Credit::default(),
+            submission: submission::Submission::default(),
             breaks: Vec::new(),
             evidence,
         }
@@ -157,6 +163,9 @@ impl Authority {
         }
         if !on_reactor {
             return;
+        }
+        if self.submission.observe(event) {
+            self.applies();
         }
         match event {
             ReactorEvent::SnapshotAdopted { finalized, .. } => self.anchor = Some(finalized.hash),
@@ -217,7 +226,16 @@ impl Authority {
         });
         let mut breaks = std::mem::take(&mut self.breaks);
         breaks.extend(self.credit.take_breaks());
+        breaks.extend(self.submission.take_breaks());
         breaks
+    }
+
+    /// Notes one drain's storage `facts`, judging the submissions they
+    /// make.
+    pub(super) fn storage<'f>(&mut self, facts: impl IntoIterator<Item = &'f StorageFact>) {
+        if self.submission.storage(facts) {
+            self.applies();
+        }
     }
 
     /// Notes that a fact made the check applicable.
@@ -367,6 +385,7 @@ impl Authority {
 }
 
 mod credit;
+mod submission;
 
 #[cfg(test)]
 mod tests;

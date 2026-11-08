@@ -50,8 +50,8 @@
 //! settles, so the teardown property stays inconclusive and doesn't count
 //! it stuck, and [`HeaderWorkLedger::accounting_tainted`] stops the tap
 //! comparing the ledger's totals with the probe's. Checks that don't read
-//! a tainted count, such as a round's queue-held leases or a lease
-//! returning while a call holds it, still judge.
+//! a tainted count still judge: a round's queue-held leases, a lease
+//! returning while a call holds it, and a call's owner and payload length.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -893,32 +893,36 @@ impl HeaderWorkLedger {
         headers: usize,
         payload: Option<Payload>,
     ) -> Result<(), String> {
-        // A tainted round's staged count and headers are production's word,
-        // so nothing here judges against them.
-        if self.tainted_rounds.contains(&incarnation) {
-            return Ok(());
-        }
+        // A tainted round's staged count and headers aren't production's,
+        // so only the checks that don't read them judge it: its owner, up to
+        // the staged tip a bounded prepare narrows to, and a payload as long
+        // as the call holds.
+        let tainted = self.tainted_rounds.contains(&incarnation);
         let Some(round) = self
             .started
             .get(&incarnation)
-            .filter(|round| round.staged > 0)
+            .filter(|round| tainted || round.staged > 0)
         else {
             return Err(format!(
                 "UnstagedHeaders: call {call} holds round {incarnation}, which staged no page"
             ));
         };
-        if !same_work(owner, round.request.owner, round.hashes.last().copied()) {
+        let tip = round.hashes.last().copied();
+        let same = if tainted {
+            same_work_to_any_tip(owner, round.request.owner)
+        } else {
+            same_work(owner, round.request.owner, tip)
+        };
+        if !same {
             return Err(format!(
                 "WrongOwner: call {call} holds round {incarnation} for {owner:?}, but its pages \
                  were staged for {:?}",
                 round.request.owner
             ));
         }
-        let tip = round.hashes.last().copied();
         if let Some(payload) = payload.filter(|payload| {
-            tip != Some(payload.target)
-                || payload.hashes != round.hashes
-                || payload.hashes.len() != headers
+            payload.hashes.len() != headers
+                || (!tainted && (tip != Some(payload.target) || payload.hashes != round.hashes))
         }) {
             return Err(format!(
                 "WrongPayload: call {call} sends {} headers toward {:?} for round \
@@ -929,8 +933,8 @@ impl HeaderWorkLedger {
             ));
         }
         let held = self.held_by_round().get(&incarnation).copied().unwrap_or(0);
-        let owned = round.staged - round.returned;
-        if held + headers > owned {
+        let owned = round.staged.saturating_sub(round.returned);
+        if !tainted && held + headers > owned {
             return Err(format!(
                 "HeldUnowned: call {call} holds {headers} headers of round {incarnation}, whose \
                  calls already hold {held} of the {owned} it owns"
@@ -1195,6 +1199,19 @@ fn same_work(
             call == narrowed
         }
         _ => false,
+    }
+}
+
+/// [`same_work`] for a round whose staged tip is unknown: the same owner,
+/// or the same ordinary owner narrowed to any tip.
+fn same_work_to_any_tip(call: HeaderSyncWorkOwner, staged: HeaderSyncWorkOwner) -> bool {
+    match (call, staged) {
+        (HeaderSyncWorkOwner::Header(call_owner), HeaderSyncWorkOwner::Header(_)) => same_work(
+            call,
+            staged,
+            Some(call_owner.authority.branch.target_tip_hash),
+        ),
+        _ => call == staged,
     }
 }
 
@@ -1811,6 +1828,57 @@ mod tests {
             leases: Vec::new(),
         });
         refused_as(unowned, "HeldUnowned");
+    }
+
+    /// A round whose staged count a claim tainted still holds only its own
+    /// owner's calls, each sending as many headers as it holds. The claim
+    /// is recorded first.
+    #[test]
+    fn a_tainted_round_still_judges_its_owner_and_payload_length() {
+        // The page reports the round holding none of the 3 it staged.
+        let base = vec![
+            opened(1, 1, 5),
+            bound(1, 1, 1),
+            started(1, 1),
+            staged(1, 1, 1, 3, 2, 0),
+        ];
+        let held = |headers| ReactorEvent::HeadersHeld {
+            call: 1,
+            kind: StorageCallKind::Prepare,
+            peer: peer(1),
+            incarnation: 1,
+            headers,
+            leases: Vec::new(),
+        };
+        let refused = |events: Vec<ReactorEvent>, rule: &str| {
+            let mut ledger = HeaderWorkLedger::default();
+            let error = events
+                .iter()
+                .find_map(|event| ledger.observe(event).err())
+                .expect("the ledger refuses this history");
+            assert!(error.starts_with(rule), "{error}");
+            let rules: Vec<_> = ledger.take_claims().iter().map(|c| c.rule).collect();
+            assert_eq!(rules, [ClaimRule::UnstagedPage]);
+        };
+        let mut other = owner();
+        if let HeaderSyncWorkOwner::Header(header) = &mut other {
+            header.request_id = NonZeroU64::new(2).expect("two is nonzero");
+        }
+        let mut swapped = base.clone();
+        swapped.extend([dispatched(1, prepare_of(1, other, 3)), held(3)]);
+        refused(swapped, "WrongOwner");
+        let mut short = base.clone();
+        short.extend([dispatched(1, prepare_of(1, owner(), 3)), held(2)]);
+        refused(short, "WrongPayload");
+        // The staged tip is unknown, so a prepare narrowed to any tip, with
+        // any headers, passes.
+        let mut narrowed = owner();
+        if let HeaderSyncWorkOwner::Header(header) = &mut narrowed {
+            header.authority.branch.target_tip_hash = block::Hash([4; 32]);
+        }
+        let mut fine = base;
+        fine.extend([dispatched(1, prepare_of(1, narrowed, 3)), held(3)]);
+        fold(fine).expect("only the owner and payload length are judged");
     }
 
     /// When the queue releases a round, its peer holds no reservation, the

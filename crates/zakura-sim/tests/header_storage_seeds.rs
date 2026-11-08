@@ -4,10 +4,11 @@
 //! of a unit that never reaches it.
 //!
 //! Every storage seed was built for generator 2 and migrated to generator
-//! 3 with its meaning kept. Generator 3 encodes each of their scenarios as
-//! generator 2 did, apart from the version byte, so a seed's generator-2
-//! source is its bytes with that byte set back to 2, which its sidecar's
-//! `derived_from` names by digest.
+//! 3 with its meaning kept. Each generator-2 source is kept in
+//! `tests/fixtures/sources/`, named by its digest, which the seed's
+//! sidecar names in `derived_from`. Generator 3 encodes each of their
+//! scenarios as generator 2 did, so a seed differs from its source only in
+//! the version byte.
 #![cfg(zakura_sim)]
 
 mod support;
@@ -28,11 +29,32 @@ use zakura_sim::{
 /// The generator the storage seeds were built for before generator 3.
 const SOURCE_GENERATOR: u8 = 2;
 
-/// `input` as its generator-2 source: the same bytes under version byte 2.
-fn source_of(input: &[u8]) -> Vec<u8> {
+/// The kept generator-2 source whose digest is `sha256`, or `None` if
+/// there's none.
+fn kept_source(sha256: &str) -> Option<Vec<u8>> {
+    fs::read(
+        fixtures()
+            .join(seed::SOURCES_DIR)
+            .join(format!("{sha256}.bin")),
+    )
+    .ok()
+}
+
+/// The digest of `input`'s generator-2 source, which is kept: the same
+/// bytes under version byte 2.
+///
+/// # Panics
+///
+/// If no such source is kept, since a seed that wasn't migrated has none.
+fn source_digest(input: &[u8]) -> String {
     let mut source = input.to_vec();
     source[0] = SOURCE_GENERATOR;
-    source
+    let digest = seed::sha256(&source);
+    assert!(
+        kept_source(&digest).is_some(),
+        "no generator-2 source {digest} is kept, so the input wasn't migrated"
+    );
+    digest
 }
 
 /// The Plan bytes after each seed's prefix.
@@ -173,7 +195,7 @@ fn regenerate_storage_seeds() {
             scenario = seed::scenario_sha256(
                 &serde_json::to_value(&scenario).expect("scenarios serialize")
             ),
-            source = seed::sha256(&source_of(&input)),
+            source = source_digest(&input),
         );
         for (_, property) in WITNESSES.iter().filter(|(seed, _)| *seed == stem) {
             sidecar.push_str(&format!(
@@ -185,10 +207,10 @@ fn regenerate_storage_seeds() {
 }
 
 /// Every committed storage seed is a generator-2 seed migrated with its
-/// meaning kept: its sidecar names its source by digest and generator, the
-/// source is its bytes under version byte 2, generator 2 decodes the source
-/// to the scenario generator 3 decodes the seed to, and migrating the
-/// source gives the seed back, Plan bytes and all.
+/// meaning kept: its sidecar names a kept source by digest and generator,
+/// generator 2 decodes the source to the scenario generator 3 decodes the
+/// seed to, migrating the source gives the seed back, Plan bytes and all,
+/// and the two differ only in the version byte.
 #[test]
 fn committed_storage_seeds_are_migrated_generator_2_seeds() {
     let report = seed::load(&[fixtures()], Some(Storage::NAME)).expect("the fixtures list");
@@ -214,8 +236,11 @@ fn committed_storage_seeds_are_migrated_generator_2_seeds() {
             .as_ref()
             .unwrap_or_else(|| panic!("{stem} names its source"));
         assert_eq!(from.generator, u32::from(SOURCE_GENERATOR), "{stem}");
-        let source = source_of(&seed.input);
+        let source = kept_source(&from.sha256).unwrap_or_else(|| panic!("{stem}"));
         assert_eq!(seed::sha256(&source), from.sha256, "{stem}");
+        let mut relabelled = seed.input.clone();
+        relabelled[0] = SOURCE_GENERATOR;
+        assert_eq!(source, relabelled, "{stem}");
         let prefix = Storage::SCENARIO_BYTES;
         assert_eq!(
             grammar::v2::decode(&source[..prefix]).unwrap(),

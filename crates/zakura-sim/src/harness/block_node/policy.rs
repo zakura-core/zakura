@@ -189,7 +189,8 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         | policy::Trigger::Released
         | policy::Trigger::ReservationOpened(_)
         | policy::Trigger::SessionAdmitted(_)
-        | policy::Trigger::HeadroomWait(_) => true,
+        | policy::Trigger::HeadroomWait(_)
+        | policy::Trigger::StorageStopped(_) => true,
         policy::Trigger::ReplyTaken(select) => {
             !matches!(select.kind, Some(BlockKind::Read | BlockKind::MirrorRead))
         }
@@ -207,6 +208,10 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         policy::Trigger::Committed(_) => format!(
             "a block scenario can't wait for {found:?}: block storage commits and replies in \
              one completion"
+        ),
+        policy::Trigger::StorageStopped(_) => format!(
+            "a block scenario can't wait for {found:?}: only a header node's storage stop \
+             records one"
         ),
         policy::Trigger::ReservationOpened(_)
         | policy::Trigger::SessionAdmitted(_)

@@ -1012,6 +1012,23 @@ impl Subsystem for Storage {
         .holds_when(recovery_holds)
     }
 
+    /// Whether [`grammar::decode`] reads `prefix` rather than rejecting its
+    /// version byte.
+    fn accepts(prefix: &[u8]) -> bool {
+        grammar::decode(prefix).is_ok()
+    }
+
+    /// [`grammar::migrate`], for a generator-2 input.
+    fn migrate(source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
+        match generator {
+            2 => grammar::migrate(source),
+            _ => Err(format!(
+                "{} migrates generator 2 only, not {generator}",
+                Self::NAME
+            )),
+        }
+    }
+
     /// The scenario [`grammar::decode`] reads from `prefix`. A prefix
     /// written for another generator draws the default scenario.
     ///

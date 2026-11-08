@@ -386,11 +386,12 @@ A `kind = "plan"` seed holds Plan bytes alone, and its `prefix` gives the
 scenario prefix, such as a saved Plan's tag, that encodes its scenario.
 A seed carried to a new generator with its meaning kept names its source in
 a `[derived_from]` table: the source file's SHA-256 and the generator it was
-built for. The seed check checks that the table names an older generator
-and another file. The migrating harness's own test checks that the source
-decodes, under its generator, to the scenario the seed decodes to. The
-`header-sync/storage` seeds were migrated from generator 2 this way, by
-`grammar::migrate`.
+built for. The source is kept as `sources/<sha256>.bin` beside the seed, and
+the seed check migrates it again with the harness's own migration, which
+must give the seed's input. The `header-sync/storage` seeds were migrated
+from generator 2 this way, by `grammar::migrate`. A seed whose prefix is for
+another generator than its harness's is rejected, even when the harness
+would draw a fallback scenario for it.
 
 `cargo xtask sim-seeds` validates every seed against the current generators.
 A required seed that fails, such as one built for an older generator or one

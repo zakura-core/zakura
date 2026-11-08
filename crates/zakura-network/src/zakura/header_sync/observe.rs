@@ -402,19 +402,19 @@ pub enum ReactorEvent {
         session_id: u64,
         /// The subscription.
         subscription: u64,
-        /// The page's last header.
+        /// The header of the cursor the subscription primitive stored after
+        /// the claim, which should be the page's last.
         through: Frontier,
-        /// The header credit the subscription's pages consumed through it,
-        /// as the recorded cursor says.
+        /// The header credit consumed through it, as the stored cursor says.
         headers: u64,
-        /// The byte credit consumed through it, as the cursor says.
+        /// The byte credit consumed through it, as the stored cursor says.
         bytes: u64,
         /// The page's own last header: its declared parent's height plus
         /// its entry count, and its last entry's hash, read from the page.
         page_last: Frontier,
         /// The page's entry count, read from the page.
         page_headers: u64,
-        /// The page's payload bytes.
+        /// The payload bytes the subscriber charged for the page.
         page_bytes: u64,
         /// The subscription primitive's totals after the claim, apart from
         /// the cursor.

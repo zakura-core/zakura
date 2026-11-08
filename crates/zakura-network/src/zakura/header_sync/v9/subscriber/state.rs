@@ -420,13 +420,17 @@ impl SubscriberState {
                 .last()
                 .map_or(parent.hash, |entry| entry.header.hash());
             let height = u64::from(parent.height.0).saturating_add(entries);
+            // The cursor the primitive stored, not the one handed to it.
+            let stored = *tools
+                .received(&live.id)
+                .expect("the live subscription is in the tools");
             tap.observer.observe(ReactorEvent::CursorClaimed {
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
                 subscription: live.id,
-                through: Frontier::new(cursor.height, cursor.hash),
-                headers: cursor.headers,
-                bytes: cursor.bytes,
+                through: Frontier::new(stored.height, stored.hash),
+                headers: stored.headers,
+                bytes: stored.bytes,
                 page_last: Frontier::new(
                     block::Height(u32::try_from(height).unwrap_or(u32::MAX)),
                     last,

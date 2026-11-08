@@ -1073,10 +1073,7 @@ impl PeerWorkQueue {
                 .active(peer)
                 .map_or(&[][..], |active| &active.entries[..]);
             let staged_total = entries.len();
-            let stored = entries[staged_total.saturating_sub(staged.headers)..]
-                .iter()
-                .map(|entry| entry.header.hash())
-                .collect();
+            let stored = entries.iter().map(|entry| entry.header.hash()).collect();
             staged.observer.observe(ReactorEvent::PageStaged {
                 from_peer: staged.arrival.from_peer,
                 from_session: staged.arrival.from_session,
@@ -2048,7 +2045,7 @@ mod tests {
             }]
         );
 
-        let staged = |hashes: Vec<block::Hash>, reserved_left, staged_total, frame| {
+        let staged = |hashes: Vec<block::Hash>, stored, reserved_left, staged_total, frame| {
             ReactorEvent::PageStaged {
                 from_peer: peer(1),
                 from_session: 7,
@@ -2059,7 +2056,7 @@ mod tests {
                 headers: hashes.len(),
                 reserved_left,
                 ancestor: snapshot().frontiers.finalized,
-                stored: hashes.clone(),
+                stored,
                 hashes,
                 staged_total,
             }
@@ -2073,7 +2070,7 @@ mod tests {
             recorder.take(),
             [
                 changed(BudgetOwner::Reservation(1), -2, 2),
-                staged(vec![first, second], 1, 2, 9),
+                staged(vec![first, second], vec![first, second], 1, 2, 9),
             ]
         );
 
@@ -2083,7 +2080,7 @@ mod tests {
             recorder.take(),
             [
                 changed(BudgetOwner::Reservation(1), -1, 1),
-                staged(vec![third], 0, 3, 10),
+                staged(vec![third], vec![first, second, third], 0, 3, 10),
                 ReactorEvent::ReservationEnded {
                     reservation: 1,
                     released: 0,

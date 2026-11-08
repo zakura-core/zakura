@@ -262,8 +262,8 @@ pub enum ReactorEvent {
         ancestor: Frontier,
         /// The page's header hashes, in order.
         hashes: Vec<block::Hash>,
-        /// The hashes the round holds where the page went, as the queue's
-        /// policy stored them.
+        /// Every hash the round holds after the page, in order, as the
+        /// queue's policy stored them.
         stored: Vec<block::Hash>,
         /// How many headers the round holds staged now, as the queue's
         /// policy has them.

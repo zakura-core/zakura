@@ -107,8 +107,9 @@ pub enum ClaimRule {
     /// A page was staged on a round another session or subscription
     /// requested.
     ForeignPage,
-    /// A staged page left its round holding other headers than it carried,
-    /// or a count that isn't what it staged.
+    /// A staged page left its round holding other headers than its earlier
+    /// pages and then its own, in order, or a count that isn't what it
+    /// staged.
     UnstagedPage,
 }
 
@@ -188,7 +189,7 @@ struct StagedHeaders<'a> {
     reserved_left: usize,
     /// The page's header hashes.
     hashes: &'a [block::Hash],
-    /// The hashes the round stored where the page went.
+    /// Every hash the round stored, the page's and its earlier pages'.
     stored: &'a [block::Hash],
     /// How many headers the round held after the page.
     staged_total: usize,
@@ -819,8 +820,10 @@ impl HeaderWorkLedger {
             .get_mut(&request.incarnation)
             .expect("the round was found above");
         round.staged += headers;
-        round.hashes.extend_from_slice(stored);
-        if hashes.len() != headers || stored != hashes || staged_total != round.staged {
+        let before = std::mem::replace(&mut round.hashes, stored.to_vec());
+        let kept = stored.get(..before.len()) == Some(&before[..]);
+        let added = stored.get(before.len()..) == Some(hashes);
+        if hashes.len() != headers || !kept || !added || staged_total != round.staged {
             let detail = format!(
                 "UnstagedPage: a page of {headers} headers with {} hashes left round {} \
                  holding {staged_total} of the {} it staged, or holding other headers",
@@ -1266,7 +1269,7 @@ mod tests {
             reserved_left: left,
             ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; headers],
-            stored: vec![TIP; headers],
+            stored: vec![TIP; total],
             staged_total: total,
         }
     }
@@ -2117,8 +2120,9 @@ mod tests {
         );
     }
 
-    /// A page whose round stored other headers where it went fails, and so
-    /// does a call holding a lease staged for another round.
+    /// A page whose round stored other headers where it went fails, as does
+    /// one that left an earlier page's header changed, and so does a call
+    /// holding a lease staged for another round.
     #[test]
     fn a_round_stores_its_pages_and_holds_its_own_leases() {
         let base = vec![opened(1, 1, 5), bound(1, 1, 1), started(1, 1)];
@@ -2138,6 +2142,25 @@ mod tests {
             staged_total: 2,
         });
         claimed_as(misstored, ClaimRule::UnstagedPage);
+        let mut rewritten = base.clone();
+        rewritten.extend([
+            staged(1, 1, 1, 2, 3, 2),
+            ReactorEvent::PageStaged {
+                from_peer: peer(1),
+                from_session: 1,
+                request: request(1, 1),
+                reservation: 1,
+                subscription: 1,
+                frame: None,
+                headers: 1,
+                reserved_left: 2,
+                ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
+                hashes: vec![TIP],
+                stored: vec![TIP, block::Hash([8; 32]), TIP],
+                staged_total: 3,
+            },
+        ]);
+        claimed_as(rewritten, ClaimRule::UnstagedPage);
         let mut foreign = base;
         foreign.extend([
             staged(1, 1, 1, 3, 2, 3),

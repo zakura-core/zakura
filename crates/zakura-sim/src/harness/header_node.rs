@@ -68,7 +68,9 @@ use zakura_storage::header::{
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
-    recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RECOVERY_BOUND, RELINK},
+    recovery::{
+        Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RECOVERY_BOUND, RELINK, UNREACHED,
+    },
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
@@ -1507,9 +1509,13 @@ impl ActionSource for Control {
                     }
                     return;
                 }
+                UNREACHED => {
+                    driver.evidence.give_up();
+                    return;
+                }
                 RELINK => {
                     let step = ControlStep {
-                        peer: driver.relinked(),
+                        peer: driver.evidence.relinked(),
                         action: ControlAction::Relink,
                         when: None,
                     };

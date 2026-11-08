@@ -12,8 +12,10 @@
 //!   still live, or
 //! - `peer:<source>:recovery-relink`, while it has none, unless the node's
 //!   readmission cooldown for the source still lasts. Time stops where it
-//!   ends. After [`RECOVERY_RELINKS`] relinks recovery offers nothing more,
-//!   and the view reports it unreached.
+//!   ends.
+//! - `peer:node:recovery-unreached`, once [`RECOVERY_RELINKS`] relinks are
+//!   carried out and settled without a live source. Its pick ends recovery
+//!   unreached, which offers nothing more.
 //!
 //! A quiet step has handled every admission, refusal, replacement and
 //! disconnect an earlier step queued, since an unhandled one leaves its
@@ -47,6 +49,9 @@ pub(super) const RECOVERED: u64 = u64::MAX;
 
 /// The `recovery-relink` action's local index in the control source.
 pub(super) const RELINK: u64 = u64::MAX - 1;
+
+/// The `recovery-unreached` action's local index in the control source.
+pub(super) const UNREACHED: u64 = u64::MAX - 2;
 
 /// What recovery reads: the node's and the mirrors' engines, the node's
 /// session view and cooldown facts, its configured readmission cooldown, and
@@ -106,6 +111,9 @@ pub enum RecoveryState {
     },
     /// The conditions held together at the `recovered` pick.
     Recovered(Box<RecoveryRecord>),
+    /// Every relink was carried out and settled without a live source, at
+    /// the `recovery-unreached` pick.
+    Unreached,
 }
 
 /// A run's recovery, shared by the control source and the harness's view.
@@ -139,17 +147,36 @@ impl RecoveryEvidence {
     pub fn record(&self) -> Option<RecoveryRecord> {
         match &self.0.borrow().as_ref()?.state {
             RecoveryState::Recovered(record) => Some((**record).clone()),
-            RecoveryState::Establishing { .. } => None,
+            RecoveryState::Establishing { .. } | RecoveryState::Unreached => None,
         }
     }
 
-    /// Whether recovery used every relink without reaching the conditions.
-    /// It offers nothing more then, so it ends unreached.
+    /// Whether recovery ended unreached: every relink settled without a
+    /// live source. It offers nothing more then.
     pub fn unreached(&self) -> bool {
         matches!(
             self.0.borrow().as_ref().map(|recovery| &recovery.state),
-            Some(RecoveryState::Establishing { relinks }) if *relinks >= RECOVERY_RELINKS
+            Some(RecoveryState::Unreached)
         )
+    }
+
+    /// Counts a relink pick and returns the source to relink.
+    pub(super) fn relinked(&self) -> String {
+        let mut recovery = self.0.borrow_mut();
+        let recovery = recovery
+            .as_mut()
+            .expect("a relink is offered only while recovery establishes");
+        if let RecoveryState::Establishing { relinks } = &mut recovery.state {
+            *relinks += 1;
+        }
+        recovery.source.clone()
+    }
+
+    /// Ends recovery unreached, at the `recovery-unreached` pick.
+    pub(super) fn give_up(&self) {
+        if let Some(recovery) = self.0.borrow_mut().as_mut() {
+            recovery.state = RecoveryState::Unreached;
+        }
     }
 
     /// Starts recovery from `source` at `started`.
@@ -164,10 +191,12 @@ impl RecoveryEvidence {
 
 /// The node's live admitted sessions in `facts`: each admitted session whose
 /// link is still open, which no later session replaced and whose
-/// disconnect hasn't ended it.
+/// disconnect hasn't ended it. A session admitted after its link closed
+/// isn't live.
 pub fn live_sessions(facts: &[SessionFact]) -> Vec<Member> {
     let mut live: Vec<(Member, Option<u64>)> = Vec::new();
     let mut connections: Vec<(u64, u64)> = Vec::new();
+    let mut closed: Vec<u64> = Vec::new();
     for fact in facts {
         match fact {
             SessionFact::LinkOpened {
@@ -186,6 +215,9 @@ pub fn live_sessions(facts: &[SessionFact]) -> Vec<Member> {
                     .iter()
                     .find(|(session, _)| session == session_id)
                     .map(|(_, connection)| *connection);
+                if connection.is_some_and(|connection| closed.contains(&connection)) {
+                    continue;
+                }
                 live.push((
                     Member {
                         peer: peer.clone(),
@@ -199,6 +231,7 @@ pub fn live_sessions(facts: &[SessionFact]) -> Vec<Member> {
             }
             SessionFact::LinkClosed { connection, .. } => {
                 live.retain(|(_, link)| *link != Some(*connection));
+                closed.push(*connection);
             }
             SessionFact::SessionRefused { .. } | SessionFact::SessionRetired { .. } => {}
         }
@@ -342,7 +375,10 @@ impl Driver {
             Some((source, Next::Relink)) => {
                 out.push((Identity::peer(&source, "recovery-relink"), RELINK));
             }
-            Some((_, Next::WaitUntil(_) | Next::Nothing)) | None => {}
+            Some((_, Next::GiveUp)) => {
+                out.push((Identity::peer("node", "recovery-unreached"), UNREACHED));
+            }
+            Some((_, Next::WaitUntil(_))) | None => {}
         }
     }
 
@@ -352,18 +388,6 @@ impl Driver {
         if let Some((_, Next::WaitUntil(until))) = self.next(now) {
             out.push(crate::Boundary::Opens(until));
         }
-    }
-
-    /// Counts a relink pick and returns the source to relink.
-    pub(super) fn relinked(&self) -> String {
-        let mut recovery = self.evidence.0.borrow_mut();
-        let recovery = recovery
-            .as_mut()
-            .expect("a relink is offered only while recovery establishes");
-        if let RecoveryState::Establishing { relinks } = &mut recovery.state {
-            *relinks += 1;
-        }
-        recovery.source.clone()
     }
 
     /// Writes the record at the `recovered` pick.
@@ -395,8 +419,9 @@ pub(super) enum Next {
     /// The source has no live session, but the node's cooldown for it lasts
     /// until this instant, where time stops.
     WaitUntil(SimInstant),
-    /// Every relink is spent without a live session: recovery is unreached.
-    Nothing,
+    /// Every relink is carried out and settled without a live source, so
+    /// `recovery-unreached` is offered.
+    GiveUp,
 }
 
 /// What establishing recovery offers at `now`, after `relinks` relinks,
@@ -408,7 +433,7 @@ pub(super) fn next(relinks: u8, live: bool, cooldown: Option<Duration>, now: Sim
         return Next::Recovered;
     }
     if relinks >= RECOVERY_RELINKS {
-        return Next::Nothing;
+        return Next::GiveUp;
     }
     match cooldown.map(SimInstant::from_start) {
         Some(until) if until > now => Next::WaitUntil(until),
@@ -499,22 +524,26 @@ mod tests {
     }
 
     #[test]
-    fn three_relinks_without_a_session_leave_recovery_unreached() {
+    fn recovery_ends_unreached_only_once_the_third_relink_settles() {
         assert_eq!(next(RECOVERY_RELINKS - 1, false, None, at(0)), Next::Relink);
-        assert_eq!(next(RECOVERY_RELINKS, false, None, at(0)), Next::Nothing);
+        assert_eq!(next(RECOVERY_RELINKS, false, None, at(0)), Next::GiveUp);
         assert_eq!(
             next(RECOVERY_RELINKS, false, Some(Duration::from_secs(9)), at(0)),
-            Next::Nothing,
-            "no time boundary once recovery gave up"
+            Next::GiveUp,
+            "no time boundary once every relink is spent"
         );
         let evidence = RecoveryEvidence::default();
         evidence.start("mirror-0".into(), at(0));
-        assert!(!evidence.unreached());
-        if let Some(recovery) = evidence.0.borrow_mut().as_mut() {
-            recovery.state = RecoveryState::Establishing {
-                relinks: RECOVERY_RELINKS,
-            };
+        for _ in 0..RECOVERY_RELINKS {
+            assert_eq!(evidence.relinked(), "mirror-0");
         }
+        // The third relink is picked but not yet settled: still
+        // establishing, and its admission still recovers.
+        assert!(!evidence.unreached());
+        assert_eq!(next(RECOVERY_RELINKS, true, None, at(0)), Next::Recovered);
+        // It settled without a live source, and the quiet step's pick ends
+        // recovery.
+        evidence.give_up();
         assert!(evidence.unreached());
         assert_eq!(evidence.record(), None);
     }

@@ -204,8 +204,11 @@ impl Run {
             Some(&record.source_tip.0),
             "the chain ends at the source's tip"
         );
-        // The node reaches the source's recorded tip, and nothing changes
-        // the membership or ends the source's session after the record.
+        // The barrier opens only once no task is ready, so a node with a
+        // live source has finished syncing from it: it's at the source's
+        // tip at the record already, and still there at the end. Nothing
+        // changes the membership or ends the source's session after it.
+        assert_eq!(record.node_tip.0, record.source_tip.0);
         assert_eq!(
             self.node.engine().snapshot().frontiers.header_best,
             record.source_tip.0
@@ -445,10 +448,10 @@ fn a_recover_of_the_node_fails_the_run() {
     assert!(failed.contains("a recover names a mirror"), "{failed}");
 }
 
-/// With a second mirror that the prefix relinks and then closes, recovery
-/// waits for the reactor to settle that link: once `recovered` is picked,
-/// no later fact admits or ends a session, and the record's membership is
-/// exactly the live sessions.
+/// With a second mirror that the prefix relinks and then closes, the
+/// relinked session's admission is still queued when its link closes. In
+/// every plan the reactor then admits it and ends it, and all of that comes
+/// before `recovered`, which never counts it as live.
 #[test]
 fn recovered_waits_for_other_links_to_settle() {
     let mut scenario = scenario(vec![
@@ -460,23 +463,44 @@ fn recovered_waits_for_other_links_to_settle() {
         chain: Chain::main(5),
         dialer: Dialer::Mirror,
     });
-    let mut settled = 0;
     for input in inputs(16, 256) {
         let run = run(&scenario, input);
         let record = run.recovered();
         let facts = run.sessions.facts();
-        assert_eq!(record.membership, live_sessions(&facts[..record.facts]));
-        assert!(!record
-            .membership
+        // The relinked session: mirror-1's second link.
+        let (connection, session) = facts
             .iter()
-            .any(|m| m.peer == "mirror-1" && m.session_id != 2));
-        // The relinked session's admission, if the reactor made one, came
-        // before the record.
-        settled += usize::from(facts[..record.facts].iter().any(
-            |fact| matches!(fact, SessionFact::SessionAdmitted { peer, .. } if peer == "mirror-1"),
-        ));
+            .filter_map(|fact| match fact {
+                SessionFact::LinkOpened {
+                    peer,
+                    connection,
+                    session_id,
+                    ..
+                } if peer == "mirror-1" => Some((*connection, *session_id)),
+                _ => None,
+            })
+            .nth(1)
+            .expect("the prefix relinks mirror-1");
+        let at = |found: &dyn Fn(&SessionFact) -> bool| {
+            facts
+                .iter()
+                .position(found)
+                .unwrap_or_else(|| panic!("session {session}: {facts:?}"))
+        };
+        let closed = at(
+            &|fact| matches!(fact, SessionFact::LinkClosed { connection: c, .. } if *c == connection),
+        );
+        let admitted = at(
+            &|fact| matches!(fact, SessionFact::SessionAdmitted { session_id, .. } if *session_id == session),
+        );
+        let ended = at(
+            &|fact| matches!(fact, SessionFact::SessionEnded { session_id, .. } if *session_id == session),
+        );
+        assert!(closed < admitted && admitted < ended, "{facts:?}");
+        assert!(ended < record.facts, "{facts:?}");
+        assert_eq!(record.membership, live_sessions(&facts[..record.facts]));
+        assert!(!record.membership.iter().any(|m| m.session_id == session));
     }
-    assert!(settled > 0, "some plan admits the second mirror");
 }
 
 /// A scenario with a recover declares hdr-13's five assumptions, and one
@@ -558,6 +582,18 @@ fn membership_and_the_source_follow_the_session_facts() {
     });
     assert!(membership_changed(&closed, at));
     assert!(session_lasts(&closed, at, &source));
+
+    // A session admitted after its link closed isn't live: the close
+    // came first, so a lost disconnect can't make it the source.
+    let late = vec![
+        opened(SOURCE, 1, 1),
+        SessionFact::LinkClosed {
+            peer: SOURCE.into(),
+            connection: 1,
+        },
+        admitted(SOURCE, 1, None),
+    ];
+    assert!(live_sessions(&late).is_empty());
 
     // A replacement ends the source's old session.
     let mut replaced = before.clone();

@@ -6,7 +6,10 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{mpsc, watch, Semaphore},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, watch, Semaphore,
+    },
     task::JoinHandle,
     time::{self, Instant},
 };
@@ -100,7 +103,7 @@ mod dispatch;
 mod repair;
 mod trace;
 
-use dispatch::{end_retained, PendingPortOperation, StorageCompletion, StorageOutcome};
+use dispatch::{end_retained, PortOperations, StorageCompletion, StorageOutcome};
 use repair::vct_repair_predecessor;
 use trace::{header_direction_label, ordered_send_error_label};
 
@@ -279,12 +282,11 @@ fn build_header_sync_reactor(
         events: events_rx,
         lifecycle: lifecycle_rx,
         actions: actions_tx,
-        pending_port_operations: FuturesUnordered::new(),
+        pending_port_operations: PortOperations::default(),
         locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
         locator_capacity_waiting: false,
-        maintenance_deferred: false,
         tip: tip_tx,
         peers: peers_tx,
         candidates: candidates_tx,
@@ -336,13 +338,10 @@ struct HeaderSyncReactor {
     lifecycle: mpsc::Receiver<super::events::LifecycleEvent>,
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
-    pending_port_operations: FuturesUnordered<PendingPortOperation>,
+    pending_port_operations: PortOperations,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
-    /// Whether the last due maintenance waited for an unsettled operation queue.
-    /// See [`Self::maintenance_due`].
-    maintenance_deferred: bool,
     tip: watch::Sender<(block::Height, block::Hash)>,
     peers: watch::Sender<ServicePeerSnapshot>,
     candidates: watch::Sender<ZakuraHeaderSyncCandidateState>,
@@ -496,8 +495,8 @@ pub(super) fn selected_port_aux_delivery(
 
 /// A waker that records whether a poll asked to be polled again.
 ///
-/// `settle_ready_inputs` polls with it to tell a settled queue from one that
-/// may still hide a ready result.
+/// `settle_ready_inputs` polls with it to tell a drained queue from one that
+/// asked to be polled again.
 struct Repoll {
     flag: std::sync::Arc<RepollFlag>,
     waker: std::task::Waker,
@@ -506,20 +505,19 @@ struct Repoll {
 impl Repoll {
     /// Creates a waker whose wakes only raise its flag.
     fn new() -> Self {
-        let flag = std::sync::Arc::new(RepollFlag::default());
+        let flag = std::sync::Arc::new(RepollFlag(AtomicBool::new(false)));
         let waker = futures::task::waker(flag.clone());
         Self { flag, waker }
     }
 }
 
 /// The flag behind [`Repoll`]'s waker.
-#[derive(Default)]
-struct RepollFlag(std::sync::atomic::AtomicBool);
+struct RepollFlag(AtomicBool);
 
 impl futures::task::ArcWake for RepollFlag {
     /// Records the request to poll again.
     fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
-        arc_self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        arc_self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -687,11 +685,12 @@ impl HeaderSyncReactor {
     /// Handles every storage completion that is ready now, then reads both
     /// watches, so a deadline checked afterward can't win over a ready result.
     ///
-    /// Returns whether the operation queue settled. It hasn't when its last poll
-    /// asked to be polled again, which `FuturesUnordered` does while another
-    /// thread is mid-wake on its ready queue or after futures yield. A ready
-    /// result can still be hidden then. Such a poll is retried within the
-    /// drain's bound, one more than the operation count.
+    /// `FuturesUnordered` returns `Pending` and asks to be polled again after
+    /// futures yield, or while another thread is mid-wake on its ready queue.
+    /// The drain retries such a poll within its bound, one more than the
+    /// operation count. The VCT local operation, whose deadline is fatal, is
+    /// polled directly, so its result never waits on that queue. See
+    /// [`PortOperations`].
     fn settle_ready_inputs(
         &mut self,
         committed_snapshots: &mut Option<
@@ -699,26 +698,15 @@ impl HeaderSyncReactor {
         >,
         vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
         repoll: &Repoll,
-    ) -> bool {
-        let mut settled = false;
+    ) {
         let mut cx = std::task::Context::from_waker(&repoll.waker);
         for _ in 0..=self.pending_port_operations.len() {
-            repoll
-                .flag
-                .0
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            repoll.flag.0.store(false, Ordering::Relaxed);
             match self.pending_port_operations.poll_next_unpin(&mut cx) {
                 std::task::Poll::Ready(Some(completion)) => self.handle_port_completion(completion),
-                std::task::Poll::Ready(None) => {
-                    settled = true;
-                    break;
-                }
-                std::task::Poll::Pending => {
-                    if !repoll.flag.0.load(std::sync::atomic::Ordering::Relaxed) {
-                        settled = true;
-                        break;
-                    }
-                }
+                std::task::Poll::Ready(None) => break,
+                std::task::Poll::Pending if !repoll.flag.0.load(Ordering::Relaxed) => break,
+                std::task::Poll::Pending => {}
             }
         }
         // `changed` delivers a final unseen value before reporting channel closure.
@@ -758,7 +746,6 @@ impl HeaderSyncReactor {
                 None => {}
             }
         }
-        settled
     }
 
     /// Makes `cause` the reactor's unit of work, reports it, and returns the
@@ -2729,12 +2716,8 @@ impl HeaderSyncReactor {
     }
 
     /// Runs maintenance once its deadline is due, after the inputs that could
-    /// retire due work for free.
-    ///
-    /// A due deadline can't win over a ready completion or repair status. If the
-    /// operation queue didn't settle, maintenance waits one turn so the queue can
-    /// show what it hid. It doesn't wait twice in a row, so a future that keeps
-    /// yielding can't hold off the deadlines.
+    /// retire due work for free, so a due deadline can't win over a ready
+    /// completion or repair status.
     fn maintenance_due(
         &mut self,
         committed_snapshots: &mut Option<
@@ -2743,12 +2726,7 @@ impl HeaderSyncReactor {
         vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
         repoll: &Repoll,
     ) {
-        let settled = self.settle_ready_inputs(committed_snapshots, vct_root_repairs, repoll);
-        if !settled && !self.maintenance_deferred {
-            self.maintenance_deferred = true;
-            return;
-        }
-        self.maintenance_deferred = false;
+        self.settle_ready_inputs(committed_snapshots, vct_root_repairs, repoll);
         caused!(self, ReactorCause::Maintenance, self.run_maintenance());
     }
 

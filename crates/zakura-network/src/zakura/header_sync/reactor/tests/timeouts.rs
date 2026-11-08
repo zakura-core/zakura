@@ -26,6 +26,9 @@ struct PendingVctLocalPort {
     apply_release: Arc<Notify>,
     prepare_delay: Option<std::time::Duration>,
     apply_delay: Option<std::time::Duration>,
+    /// When set, the apply finishes once this time passes, without waking
+    /// its waker, like a result the shared ready queue hasn't shown yet.
+    apply_silent_until: Option<Instant>,
     apply_succeeds: bool,
 }
 
@@ -38,6 +41,7 @@ impl PendingVctLocalPort {
             apply_release: Arc::new(Notify::new()),
             prepare_delay: None,
             apply_delay: None,
+            apply_silent_until: None,
             apply_succeeds,
         }
     }
@@ -49,6 +53,12 @@ impl PendingVctLocalPort {
     fn with_apply_delay(delay: std::time::Duration) -> Arc<Self> {
         let mut port = Self::new(true);
         port.apply_delay = Some(delay);
+        Arc::new(port)
+    }
+
+    fn with_silent_apply(until: Instant) -> Arc<Self> {
+        let mut port = Self::new(true);
+        port.apply_silent_until = Some(until);
         Arc::new(port)
     }
 
@@ -129,13 +139,24 @@ impl port::Port for PendingVctLocalPort {
         let calls = self.apply_calls.clone();
         let release = self.apply_release.clone();
         let delay = self.apply_delay;
+        let silent_until = self.apply_silent_until;
         let succeeds = self.apply_succeeds;
         let owner = target.owner();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            match delay {
-                Some(delay) => time::sleep(delay).await,
-                None => release.notified().await,
+            match (silent_until, delay) {
+                (Some(until), _) => {
+                    std::future::poll_fn(|_| {
+                        if Instant::now() >= until {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await
+                }
+                (None, Some(delay)) => time::sleep(delay).await,
+                (None, None) => release.notified().await,
             }
             if succeeds {
                 Ok(port::ApplyHeaderTargetOutcome::Applied)
@@ -883,72 +904,69 @@ impl std::future::Future for Yielding {
 }
 
 /// Settling keeps polling past a queue that asks to be polled again, so two
-/// yielding futures ahead of a finished apply can't hide it.
+/// yielding futures ahead of a finished call can't hide it.
 #[tokio::test(start_paused = true)]
-async fn settling_finds_a_finished_apply_behind_yielding_futures() {
-    let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
-    let mut fixture = VctLocalFixture::new(port, HeaderTargetPhase::Applying);
-    fixture.dispatch();
-    poll_pending_operation(&mut fixture.reactor);
-    // `FuturesUnordered` returns `Pending` once two futures yield in one poll.
-    fixture
-        .reactor
-        .pending_port_operations
-        .push(Box::pin(Yielding));
-    fixture
-        .reactor
-        .pending_port_operations
-        .push(Box::pin(Yielding));
-    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
-
-    let settled = fixture
-        .reactor
-        .settle_ready_inputs(&mut None, &mut None, &Repoll::new());
-
-    assert!(
-        fixture.reactor.state.vct_local_operation.is_none(),
-        "the finished apply is handled"
-    );
-    assert!(!settled, "the yielding futures keep asking to be polled");
-}
-
-/// Due maintenance waits one turn for a queue that asks to be polled again,
-/// and doesn't wait a second time, so yielding futures can't hold off the fatal.
-#[tokio::test(start_paused = true)]
-async fn an_unsettled_queue_delays_maintenance_only_once() {
+async fn settling_finds_a_finished_call_behind_yielding_futures() {
     let mut fixture = VctLocalFixture::new(
         PendingVctLocalPort::pending(true),
         HeaderTargetPhase::Applying,
     );
+    // `FuturesUnordered` returns `Pending` once two futures yield in one poll.
+    fixture
+        .reactor
+        .pending_port_operations
+        .push(Box::pin(Yielding), false);
+    fixture
+        .reactor
+        .pending_port_operations
+        .push(Box::pin(Yielding), false);
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+    assert_eq!(fixture.reactor.pending_port_operations.len(), 3);
+
+    fixture
+        .reactor
+        .settle_ready_inputs(&mut None, &mut None, &Repoll::new());
+
+    assert_eq!(
+        fixture.reactor.pending_port_operations.len(),
+        2,
+        "the finished locator read is handled"
+    );
+}
+
+/// Due maintenance polls the VCT local operation directly, so a finished
+/// apply whose wake the shared ready queue hasn't shown can't fire the fatal.
+#[tokio::test(start_paused = true)]
+async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
+    let port =
+        PendingVctLocalPort::with_silent_apply(Instant::now() + VCT_LOCAL_OPERATION_FATAL_AFTER);
+    let mut fixture = VctLocalFixture::new(port, HeaderTargetPhase::Applying);
     fixture.dispatch();
     poll_pending_operation(&mut fixture.reactor);
-    fixture
-        .reactor
-        .pending_port_operations
-        .push(Box::pin(Yielding));
-    fixture
-        .reactor
-        .pending_port_operations
-        .push(Box::pin(Yielding));
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
-    let repoll = Repoll::new();
 
     fixture
         .reactor
-        .maintenance_due(&mut None, &mut None, &repoll);
-    assert!(matches!(
-        fixture.fatal_events.try_recv(),
-        Err(mpsc::error::TryRecvError::Empty)
-    ));
+        .maintenance_due(&mut None, &mut None, &Repoll::new());
 
-    fixture
-        .reactor
-        .maintenance_due(&mut None, &mut None, &repoll);
-    let fatal = fixture
-        .fatal_events
-        .try_recv()
-        .expect("the second due maintenance enforces the hard deadline");
-    assert_eq!(fatal.owner, fixture.owner);
+    let fatal = fixture.fatal_events.try_recv();
+    assert!(
+        matches!(fatal, Err(mpsc::error::TryRecvError::Empty)),
+        "a finished apply must not fire the fatal: {fatal:?}"
+    );
+    assert!(fixture.reactor.state.vct_local_operation.is_none());
+    assert!(fixture.reactor.pending_port_operations.is_empty());
 }
 
 /// Due maintenance reads a ready repair status before it enforces the

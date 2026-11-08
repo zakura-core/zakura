@@ -388,27 +388,38 @@ fn a_commit_retires_the_other_forks_round() {
 }
 
 /// Under some plans the reset lands between the locator read's completion
-/// and the reactor's handling of it: the round starts after the `Reset`
-/// fact, under the old generation, and retires obsolete later. Every rule
+/// and the reactor's handling of it: a round starts after the `Reset` fact
+/// under a generation older than the reset's, so before the reactor adopted
+/// it, and that same round retires obsolete when it does. Every rule
 /// holds.
 #[test]
 fn a_round_started_before_adopting_a_reset_retires_obsolete() {
     let mut late = 0;
     for input in inputs(32, 256) {
         let report = run(&completion_before_adoption(), input);
-        let Some(&reset) = resets(&report).first() else {
+        let (Some(&reset), Some(generation)) = (resets(&report).first(), reset_generation(&report))
+        else {
             continue;
         };
-        let started_after = reactor(&report)
-            .find(|(step, fact)| *step > reset && matches!(fact, ReactorFact::Started { .. }))
-            .map(|(step, _)| step);
-        let retired_after = |from: u64| {
-            reactor(&report).any(|(step, fact)| {
-                step >= from
-                    && matches!(fact, ReactorFact::Retired { reason, .. } if reason == "snapshot_obsolete")
-            })
+        // A round that starts after the reset published, under an older
+        // generation, so the reactor hadn't adopted the reset yet.
+        let late_start = reactor(&report).find_map(|(step, fact)| match fact {
+            ReactorFact::Started { request, .. }
+                if step > reset && request.owner.scope.header_generation < generation =>
+            {
+                Some((step, request.clone()))
+            }
+            _ => None,
+        });
+        let Some((started, request)) = late_start else {
+            continue;
         };
-        if started_after.is_some_and(retired_after) {
+        // That same round retires obsolete once the reactor adopts it.
+        if reactor(&report).any(|(step, fact)| {
+            step >= started
+                && matches!(fact, ReactorFact::Retired { request: retired, reason, .. }
+                    if *retired == request && reason == "snapshot_obsolete")
+        }) {
             late += 1;
         }
     }

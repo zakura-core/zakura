@@ -92,12 +92,17 @@ fn dispatched(apply: bool, owner: HeaderSyncWorkOwner) -> ReactorEvent {
                 peer,
                 source,
                 owner,
+                target_tip_hash: zakura_chain::block::Hash([1; 32]),
             }
         } else {
             PortCall::Prepare {
                 peer,
                 source,
                 owner,
+                common_ancestor: zakura_header_chain::Frontier::new(
+                    zakura_chain::block::Height(0),
+                    zakura_chain::block::Hash([0; 32]),
+                ),
                 target: zakura_header_chain::Frontier::new(
                     zakura_chain::block::Height(1),
                     zakura_chain::block::Hash([0; 32]),

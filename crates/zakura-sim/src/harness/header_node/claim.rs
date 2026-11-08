@@ -64,6 +64,22 @@ pub enum Claim {
     UnstagedPage,
     /// A page spent more headers than its reservation held.
     OverReservation,
+    /// A call held a round's headers for another owner than its pages'.
+    WrongOwner,
+    /// A prepare sent other headers than its round's staged ones.
+    WrongPayload,
+    /// A prepare handed its headers to an apply for other work.
+    BadHandoff,
+    /// A call held or ended another round than it should.
+    WrongRound,
+    /// A call that isn't the prepare or apply it names held headers.
+    WrongCall,
+    /// A call held headers with another round's lease.
+    ForeignLease,
+    /// A round's calls held more headers than it owns.
+    HeldUnowned,
+    /// A call held a round that staged no page.
+    UnstagedHeaders,
 }
 
 impl Claim {
@@ -79,6 +95,14 @@ impl Claim {
             ClaimRule::ForeignPage => Claim::ForeignPage,
             ClaimRule::UnstagedPage => Claim::UnstagedPage,
             ClaimRule::OverReservation => Claim::OverReservation,
+            ClaimRule::WrongOwner => Claim::WrongOwner,
+            ClaimRule::WrongPayload => Claim::WrongPayload,
+            ClaimRule::BadHandoff => Claim::BadHandoff,
+            ClaimRule::WrongRound => Claim::WrongRound,
+            ClaimRule::WrongCall => Claim::WrongCall,
+            ClaimRule::ForeignLease => Claim::ForeignLease,
+            ClaimRule::HeldUnowned => Claim::HeldUnowned,
+            ClaimRule::UnstagedHeaders => Claim::UnstagedHeaders,
         }
     }
 }

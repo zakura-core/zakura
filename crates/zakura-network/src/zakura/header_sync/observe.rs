@@ -644,6 +644,9 @@ pub enum PortCall {
         source: SourceId,
         /// The request that owns the target.
         owner: HeaderSyncWorkOwner,
+        /// The common ancestor the call names, which its first header
+        /// extends.
+        common_ancestor: Frontier,
         /// The target the call names for its headers.
         target: Frontier,
         /// The hashes of the headers the call actually sends, in order.
@@ -657,6 +660,8 @@ pub enum PortCall {
         source: SourceId,
         /// The request that owns the target.
         owner: HeaderSyncWorkOwner,
+        /// The target the sealed insertion pursues, as it names it.
+        target_tip_hash: block::Hash,
     },
 }
 
@@ -683,6 +688,7 @@ impl PortCall {
                 peer,
                 source,
                 owner,
+                common_ancestor,
                 target,
                 entries,
                 ..
@@ -690,6 +696,7 @@ impl PortCall {
                 peer: peer.clone(),
                 source: *source,
                 owner: *owner,
+                common_ancestor: *common_ancestor,
                 target: *target,
                 hashes: entries.iter().map(|entry| entry.header.hash()).collect(),
             },
@@ -697,11 +704,13 @@ impl PortCall {
                 peer,
                 source,
                 owner,
+                target,
                 ..
             } => Self::Apply {
                 peer: peer.clone(),
                 source: *source,
                 owner: *owner,
+                target_tip_hash: target.target_tip_hash(),
             },
             HeaderPortOperation::Misbehavior { .. } | HeaderPortOperation::DropPeer { .. } => {
                 return None

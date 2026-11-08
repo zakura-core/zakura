@@ -114,6 +114,25 @@ pub enum ClaimRule {
     /// A page spent more headers than its reservation held, or reported
     /// another count left.
     OverReservation,
+    /// A call held a round's headers for another owner than the one its
+    /// pages were staged for.
+    WrongOwner,
+    /// A prepare sent other headers than its round's staged ones, in
+    /// order, or toward another tip.
+    WrongPayload,
+    /// A prepare handed its headers to an apply for other work.
+    BadHandoff,
+    /// A call held, or ended, another round than its peer's current one or
+    /// the one it held.
+    WrongRound,
+    /// A call that isn't the prepare or apply it names held headers.
+    WrongCall,
+    /// A call held headers with a lease staged for another round.
+    ForeignLease,
+    /// A round's calls held more headers than it owns.
+    HeldUnowned,
+    /// A call held a round that staged no page.
+    UnstagedHeaders,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -460,14 +479,28 @@ impl HeaderWorkLedger {
                 headers,
                 leases,
             } => {
+                let mut found = Vec::new();
                 if let Some(foreign) = leases.iter().find(|round| **round != *incarnation) {
-                    return Err(format!(
-                        "ForeignLease: call {call} holds round {incarnation} with a lease \
-                         staged for round {foreign}"
-                    ));
+                    found.push(ClaimBreak {
+                        rule: ClaimRule::ForeignLease,
+                        detail: format!(
+                            "ForeignLease: call {call} holds round {incarnation} with a lease \
+                             staged for round {foreign}"
+                        ),
+                    });
                 }
                 let current = self.rounds.get(peer).copied();
                 let record = self.record_mut(*call)?;
+                if record.held.is_some() {
+                    return Err(format!("HeldTwice: call {call} took headers again"));
+                }
+                // The call holds the headers whatever a claim below finds, as
+                // production's did, so later facts settle against it.
+                record.held = Some(Held {
+                    incarnation: *incarnation,
+                    headers: *headers,
+                    ended: false,
+                });
                 let (expected_kind, call_peer, owner, payload) = match &record.op {
                     PortCall::Prepare {
                         peer,
@@ -488,24 +521,32 @@ impl HeaderWorkLedger {
                         (StorageCallKind::Apply, peer, *owner, None)
                     }
                     other => {
-                        return Err(format!(
-                            "WrongCall: call {call} holds headers but asks for {other:?}"
-                        ))
+                        found.push(ClaimBreak {
+                            rule: ClaimRule::WrongCall,
+                            detail: format!(
+                                "WrongCall: call {call} holds headers but asks for {other:?}"
+                            ),
+                        });
+                        self.claims.extend(found);
+                        return Ok(());
                     }
                 };
                 if expected_kind != *kind || call_peer != peer {
-                    return Err(format!(
-                        "WrongCall: call {call} names {kind:?} for another peer or kind"
-                    ));
+                    found.push(ClaimBreak {
+                        rule: ClaimRule::WrongCall,
+                        detail: format!(
+                            "WrongCall: call {call} names {kind:?} for another peer or kind"
+                        ),
+                    });
                 }
                 if current != Some(*incarnation) {
-                    return Err(format!(
-                        "WrongRound: call {call} holds round {incarnation}, but its peer's \
-                         current round is {current:?}"
-                    ));
-                }
-                if record.held.is_some() {
-                    return Err(format!("HeldTwice: call {call} took headers again"));
+                    found.push(ClaimBreak {
+                        rule: ClaimRule::WrongRound,
+                        detail: format!(
+                            "WrongRound: call {call} holds round {incarnation}, but its peer's \
+                             current round is {current:?}"
+                        ),
+                    });
                 }
                 if let Some(handoff) = self.handoff.take() {
                     if handoff.apply != *call
@@ -519,13 +560,8 @@ impl HeaderWorkLedger {
                         ));
                     }
                 }
-                self.hold(*call, owner, *incarnation, *headers, payload)?;
-                let record = self.record_mut(*call)?;
-                record.held = Some(Held {
-                    incarnation: *incarnation,
-                    headers: *headers,
-                    ended: false,
-                });
+                found.extend(self.hold(*call, owner, *incarnation, *headers, payload));
+                self.claims.extend(found);
             }
             ReactorEvent::HeadersEnded {
                 call,
@@ -541,13 +577,18 @@ impl HeaderWorkLedger {
                     return Err(format!("EndedTwice: call {call} ended its headers again"));
                 }
                 held.ended = true;
-                if held.incarnation != *incarnation || held.headers != *headers {
-                    return Err(format!(
-                        "WrongRound: call {call} held round {} with {} headers, and ended round \
-                         {incarnation} with {headers}",
-                        held.incarnation, held.headers
-                    ));
-                }
+                let wrong =
+                    (held.incarnation != *incarnation || held.headers != *headers).then(|| {
+                        ClaimBreak {
+                            rule: ClaimRule::WrongRound,
+                            detail: format!(
+                                "WrongRound: call {call} held round {} with {} headers, and ended \
+                             round {incarnation} with {headers}",
+                                held.incarnation, held.headers
+                            ),
+                        }
+                    });
+                self.claims.extend(wrong);
                 if let HeaderWorkEnd::HandedToApply { apply } = end {
                     self.check_handoff(*call, *apply, *incarnation, *headers)?;
                 }
@@ -589,8 +630,18 @@ impl HeaderWorkLedger {
                     peer: apply_peer,
                     source: apply_source,
                     owner: apply_owner,
+                    ..
                 }),
-            ) if peer == apply_peer && source == apply_source && owner == apply_owner => {
+            ) => {
+                if peer != apply_peer || source != apply_source || owner != apply_owner {
+                    self.claims.push(ClaimBreak {
+                        rule: ClaimRule::BadHandoff,
+                        detail: format!(
+                            "BadHandoff: call {call} handed its headers to call {apply}, which \
+                             is an apply for other work"
+                        ),
+                    });
+                }
                 self.handoff = Some(Handoff {
                     prepare: call,
                     apply,
@@ -601,7 +652,7 @@ impl HeaderWorkLedger {
             }
             _ => Err(format!(
                 "BadHandoff: call {call} handed its headers to call {apply}, which is not an \
-                 apply for the same work"
+                 apply"
             )),
         }
     }
@@ -856,7 +907,8 @@ impl HeaderWorkLedger {
     /// for the owner that started it or that owner narrowed to its staged
     /// tip.
     /// A prepare's `payload` must name the round's staged tip and send
-    /// exactly its staged headers, as many as the call holds.
+    /// exactly its staged headers, as many as the call holds. Returns the
+    /// claim breaks found.
     fn hold(
         &self,
         call: u64,
@@ -864,21 +916,30 @@ impl HeaderWorkLedger {
         incarnation: u64,
         headers: usize,
         payload: Option<Payload>,
-    ) -> Result<(), String> {
+    ) -> Vec<ClaimBreak> {
+        let claim = |rule, detail| ClaimBreak { rule, detail };
         let Some(round) = self
             .started
             .get(&incarnation)
             .filter(|round| round.staged > 0)
         else {
-            return Err(format!(
-                "UnstagedHeaders: call {call} holds round {incarnation}, which staged no page"
-            ));
+            return vec![claim(
+                ClaimRule::UnstagedHeaders,
+                format!(
+                    "UnstagedHeaders: call {call} holds round {incarnation}, which staged no \
+                     page"
+                ),
+            )];
         };
+        let mut found = Vec::new();
         if !same_work(owner, round.request.owner, round.hashes.last().copied()) {
-            return Err(format!(
-                "WrongOwner: call {call} holds round {incarnation} for {owner:?}, but its pages \
-                 were staged for {:?}",
-                round.request.owner
+            found.push(claim(
+                ClaimRule::WrongOwner,
+                format!(
+                    "WrongOwner: call {call} holds round {incarnation} for {owner:?}, but its \
+                     pages were staged for {:?}",
+                    round.request.owner
+                ),
             ));
         }
         let tip = round.hashes.last().copied();
@@ -887,23 +948,30 @@ impl HeaderWorkLedger {
                 || payload.hashes != round.hashes
                 || payload.hashes.len() != headers
         }) {
-            return Err(format!(
-                "WrongPayload: call {call} sends {} headers toward {:?} for round \
-                 {incarnation}, which holds {headers} staged through {tip:?}, and they aren't \
-                 its staged headers in order",
-                payload.hashes.len(),
-                payload.target
+            found.push(claim(
+                ClaimRule::WrongPayload,
+                format!(
+                    "WrongPayload: call {call} sends {} headers toward {:?} for round \
+                     {incarnation}, which holds {headers} staged through {tip:?}, and they \
+                     aren't its staged headers in order",
+                    payload.hashes.len(),
+                    payload.target
+                ),
             ));
         }
+        // This call already counts as holding its headers.
         let held = self.held_by_round().get(&incarnation).copied().unwrap_or(0);
-        let owned = round.staged - round.returned;
-        if held + headers > owned {
-            return Err(format!(
-                "HeldUnowned: call {call} holds {headers} headers of round {incarnation}, whose \
-                 calls already hold {held} of the {owned} it owns"
+        let owned = round.staged.saturating_sub(round.returned);
+        if held > owned {
+            found.push(claim(
+                ClaimRule::HeldUnowned,
+                format!(
+                    "HeldUnowned: call {call} holds {headers} headers of round {incarnation}, \
+                     so its calls hold {held} of the {owned} it owns"
+                ),
             ));
         }
-        Ok(())
+        found
     }
 
     /// Requires every lease of `incarnation`, if the queue released it and
@@ -1195,6 +1263,7 @@ mod tests {
             peer: peer(byte),
             source: SourceId::from_digest([byte; 32]),
             owner,
+            common_ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             target: zakura_header_chain::Frontier::new(block::Height(5), TIP),
             hashes: vec![TIP; headers],
         }
@@ -1205,6 +1274,7 @@ mod tests {
             peer: peer(byte),
             source: SourceId::from_digest([byte; 32]),
             owner: owner(),
+            target_tip_hash: TIP,
         }
     }
 
@@ -1420,10 +1490,10 @@ mod tests {
         ledger.finish().expect("every call ended");
     }
 
-    /// #1845: a capture naming a retired round fails.
+    /// #1845: a capture naming a retired round is a claim break.
     #[test]
     fn a_capture_must_name_its_peers_current_round() {
-        refused_as(
+        claimed_as(
             after(
                 &[(1, 1), (2, 2)],
                 vec![
@@ -1431,11 +1501,12 @@ mod tests {
                     held(1, StorageCallKind::Prepare, 1, 2),
                 ],
             ),
-            "WrongRound",
+            ClaimRule::WrongRound,
         );
     }
 
-    /// #1846: a handoff to the prepare's own call fails.
+    /// #1846: a handoff to the prepare's own call fails, and one to an
+    /// apply for other work is a claim break.
     #[test]
     fn a_handoff_must_name_an_apply_for_the_same_work() {
         let base = after(
@@ -1452,7 +1523,7 @@ mod tests {
         let mut other_peer = base;
         other_peer.push(dispatched(2, apply(2)));
         other_peer.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
-        refused_as(other_peer, "BadHandoff");
+        claimed_as(other_peer, ClaimRule::BadHandoff);
     }
 
     /// A handoff must reach an open apply, which takes the same round and
@@ -1570,7 +1641,7 @@ mod tests {
             headers: 4,
             end: HeaderWorkEnd::Stale,
         });
-        refused_as(wrong, "WrongRound");
+        claimed_as(wrong, ClaimRule::WrongRound);
 
         let mut open = fold(held_call).expect("a held call folds");
         assert!(open
@@ -1753,7 +1824,7 @@ mod tests {
             headers: 3,
             leases: Vec::new(),
         });
-        refused_as(swapped, "WrongOwner");
+        claimed_as(swapped, ClaimRule::WrongOwner);
         let mut unowned = base;
         unowned.push(dispatched(1, apply(1)));
         unowned.push(ReactorEvent::HeadersHeld {
@@ -1764,7 +1835,7 @@ mod tests {
             headers: 4,
             leases: Vec::new(),
         });
-        refused_as(unowned, "HeldUnowned");
+        claimed_as(unowned, ClaimRule::HeldUnowned);
     }
 
     /// When the queue releases a round, its peer holds no reservation, the
@@ -2048,7 +2119,7 @@ mod tests {
         fold(narrowed).expect("a prepare narrowed to the staged tip holds the round");
         let mut elsewhere = base.clone();
         elsewhere.extend([dispatched(1, toward(block::Hash([8; 32]))), hold(1, 3)]);
-        refused_as(elsewhere, "WrongOwner");
+        claimed_as(elsewhere, ClaimRule::WrongOwner);
         let mut doubled = base;
         doubled.extend([
             dispatched(1, prepare_of(1, owner(), 3)),
@@ -2056,7 +2127,7 @@ mod tests {
             dispatched(2, prepare_of(1, owner(), 3)),
             hold(2, 3),
         ]);
-        refused_as(doubled, "HeldUnowned");
+        claimed_as(doubled, ClaimRule::HeldUnowned);
     }
 
     /// A prepare sends exactly its round's staged headers, through the staged
@@ -2079,7 +2150,7 @@ mod tests {
         };
         let mut short = base.clone();
         short.extend([dispatched(1, prepare_of(1, owner(), 2)), hold.clone()]);
-        refused_as(short, "WrongPayload");
+        claimed_as(short, ClaimRule::WrongPayload);
         let mut elsewhere = base.clone();
         elsewhere.extend([
             dispatched(
@@ -2088,6 +2159,7 @@ mod tests {
                     peer: peer(1),
                     source: SourceId::from_digest([1; 32]),
                     owner: owner(),
+                    common_ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
                     target: zakura_header_chain::Frontier::new(
                         block::Height(5),
                         block::Hash([8; 32]),
@@ -2097,7 +2169,7 @@ mod tests {
             ),
             hold.clone(),
         ]);
-        refused_as(elsewhere, "WrongPayload");
+        claimed_as(elsewhere, ClaimRule::WrongPayload);
         // The same count toward and ending at the staged tip, but another
         // header in the middle.
         let mut substituted = base.clone();
@@ -2108,13 +2180,14 @@ mod tests {
                     peer: peer(1),
                     source: SourceId::from_digest([1; 32]),
                     owner: owner(),
+                    common_ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
                     target: zakura_header_chain::Frontier::new(block::Height(5), TIP),
                     hashes: vec![TIP, block::Hash([8; 32]), TIP],
                 },
             ),
             hold,
         ]);
-        refused_as(substituted, "WrongPayload");
+        claimed_as(substituted, ClaimRule::WrongPayload);
         let mut foreign = base;
         foreign.extend([
             reservation_ended(1, 2, ReservationEnd::Released),
@@ -2192,7 +2265,7 @@ mod tests {
                 leases: vec![1, 2],
             },
         ]);
-        refused_as(foreign, "ForeignLease");
+        claimed_as(foreign, ClaimRule::ForeignLease);
     }
 
     /// A prepare or apply that ends without holding its round's headers

@@ -453,6 +453,14 @@ fn assert_released_before_retired(events: &[ReactorEvent], active: &ActiveHeader
     );
 }
 
+/// The tip `operation`, an apply call, seals.
+fn sealed_tip(operation: &HeaderPortOperation) -> block::Hash {
+    let HeaderPortOperation::ApplyHeaderTarget { target, .. } = operation else {
+        unreachable!("only an apply seals a tip")
+    };
+    target.target_tip_hash()
+}
+
 /// The apply call for `peer`'s active request, sealed as its own preparation.
 fn apply_operation(reactor: &HeaderSyncReactor, peer: &ZakuraPeerId) -> HeaderPortOperation {
     let active = active(reactor, peer);
@@ -718,8 +726,9 @@ async fn a_completion_and_its_refresh_each_run_under_their_own_cause() {
     let seeded = active(&reactor, &peer);
     recorder.take_all();
 
+    let apply = apply_operation(&reactor, &peer);
     assert!(matches!(
-        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        reactor.dispatch_action(apply),
         StorageDispatch::Started(_)
     ));
     complete_next(&mut reactor).await;
@@ -801,8 +810,10 @@ async fn handled_follows_the_callbacks_effects() {
     let seeded = active(&reactor, &peer);
     recorder.take();
 
+    let apply = apply_operation(&reactor, &peer);
+    let target_tip_hash = sealed_tip(&apply);
     assert!(matches!(
-        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        reactor.dispatch_action(apply),
         StorageDispatch::Started(_)
     ));
     complete_next(&mut reactor).await;
@@ -816,6 +827,7 @@ async fn handled_follows_the_callbacks_effects() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    target_tip_hash,
                 },
             },
             ReactorEvent::CallEnded {
@@ -869,12 +881,15 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
         .phase = phase;
     let old = active(&reactor, &peer);
     let (operation, op) = if phase == HeaderTargetPhase::Applying {
+        let operation = apply_operation(&reactor, &peer);
+        let target_tip_hash = sealed_tip(&operation);
         (
-            apply_operation(&reactor, &peer),
+            operation,
             PortCall::Apply {
                 peer: peer.clone(),
                 source,
                 owner,
+                target_tip_hash,
             },
         )
     } else {
@@ -884,16 +899,22 @@ async fn assert_stale_call_leaves_the_replacement_alone(phase: HeaderTargetPhase
             HeaderTargetPurpose::Normal,
             old.entries.clone(),
         );
-        let HeaderPortOperation::PrepareHeaderTarget { target, .. } = &operation else {
+        let HeaderPortOperation::PrepareHeaderTarget {
+            common_ancestor,
+            target,
+            ..
+        } = &operation
+        else {
             unreachable!("`prepare_operation` always builds a prepare")
         };
-        let target = *target;
+        let (common_ancestor, target) = (*common_ancestor, *target);
         (
             operation,
             PortCall::Prepare {
                 peer: peer.clone(),
                 source,
                 owner,
+                common_ancestor,
                 target,
                 hashes: old
                     .entries
@@ -1135,12 +1156,16 @@ async fn synthetic_prepare_ends_not_submitted() {
 
     for (call, operation) in [(1, mismatched_repair), (2, oversized)] {
         let HeaderPortOperation::PrepareHeaderTarget {
-            target, entries, ..
+            common_ancestor,
+            target,
+            entries,
+            ..
         } = &operation
         else {
             unreachable!("`prepare_operation` always builds a prepare")
         };
-        let (target, hashes) = (
+        let (common_ancestor, target, hashes) = (
+            *common_ancestor,
             *target,
             entries
                 .iter()
@@ -1159,6 +1184,7 @@ async fn synthetic_prepare_ends_not_submitted() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    common_ancestor,
                     target,
                     hashes,
                 },
@@ -1209,8 +1235,10 @@ async fn port_panic_before_and_after_submission() {
         let seeded = active(&reactor, &peer);
         recorder.take();
 
+        let apply = apply_operation(&reactor, &peer);
+        let target_tip_hash = sealed_tip(&apply);
         assert!(matches!(
-            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            reactor.dispatch_action(apply),
             StorageDispatch::Started(_)
         ));
         complete_next(&mut reactor).await;
@@ -1224,6 +1252,7 @@ async fn port_panic_before_and_after_submission() {
                         peer: peer.clone(),
                         source,
                         owner,
+                        target_tip_hash,
                     },
                 },
                 ReactorEvent::CallEnded {
@@ -1276,8 +1305,10 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
     let (source, owner, _) = seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
     observer.recorder.take();
 
+    let apply = apply_operation(&reactor, &peer);
+    let target_tip_hash = sealed_tip(&apply);
     assert!(matches!(
-        reactor.dispatch_action(apply_operation(&reactor, &peer)),
+        reactor.dispatch_action(apply),
         StorageDispatch::Started(_)
     ));
     let polled = AssertUnwindSafe(reactor.pending_port_operations.next())
@@ -1297,6 +1328,7 @@ async fn observer_panic_in_a_port_future_unwinds_the_reactor() {
                     peer: peer.clone(),
                     source,
                     owner,
+                    target_tip_hash,
                 },
             },
             ReactorEvent::CallEnded {
@@ -1327,8 +1359,9 @@ async fn observer_panic_unwinds_with_its_own_payload() {
         let _outbound = connect(&mut reactor, &peer, 7);
         seed_applying_request(&mut reactor, &snapshot, peer.clone(), 7);
 
+        let apply = apply_operation(&reactor, &peer);
         assert!(matches!(
-            reactor.dispatch_action(apply_operation(&reactor, &peer)),
+            reactor.dispatch_action(apply),
             StorageDispatch::Started(_)
         ));
         let payload = AssertUnwindSafe(reactor.pending_port_operations.next())

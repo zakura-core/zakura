@@ -1382,6 +1382,7 @@ fn call(call: PortCall) -> ReactorCall {
             peer: supplier,
             source,
             owner,
+            ..
         } => ReactorCall::Apply {
             peer: peer(&supplier),
             source: hex(&source.digest()),

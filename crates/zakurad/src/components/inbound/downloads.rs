@@ -934,8 +934,10 @@ where
                 None => zn::Request::BlocksByHash(request_hashes),
             };
 
-            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) =
-                network.oneshot(request).await.map_err(|e| (e, None))?
+            let response = network.oneshot(request).await.map_err(|e| (e, None))?;
+            let early_relay_delivery = matches!(response, zn::Response::EarlyBlocks(_));
+            let (block, advertiser_addr) = if let zn::Response::Blocks(blocks)
+            | zn::Response::EarlyBlocks(blocks) = response
             {
                 // A peer must answer a single-hash block request with exactly one
                 // block entry. A malformed or empty response is a peer fault (e.g.
@@ -1156,8 +1158,13 @@ where
                 None => None,
             };
 
+            let request = if early_relay_delivery {
+                zakura_consensus::Request::CommitEarlyRelay(block)
+            } else {
+                zakura_consensus::Request::Commit(block)
+            };
             verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
+                .oneshot(request)
                 .await
                 .map(|hash| (hash, block_height))
                 .map_err(|e| (e, advertiser_addr))

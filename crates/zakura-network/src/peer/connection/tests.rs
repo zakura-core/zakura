@@ -100,6 +100,22 @@ fn new_protected_test_connection<A>() -> (
     new_test_connection_with_protection(true)
 }
 
+/// Creates a new [`Connection`] instance for testing whose peer negotiated early block relay.
+pub(crate) fn new_early_relay_test_connection<A>() -> (
+    Connection<
+        MockService<Request, Response, A>,
+        SinkMapErr<mpsc::Sender<Message>, fn(mpsc::SendError) -> SerializationError>,
+    >,
+    mpsc::Sender<ClientRequest>,
+    MockService<Request, Response, A>,
+    mpsc::Receiver<Message>,
+    ErrorSlot,
+) {
+    let mut connection = new_test_connection_with_protection(false);
+    Arc::make_mut(&mut connection.0.connection_info).early_block_relay = true;
+    connection
+}
+
 /// Creates a new [`Connection`] instance for testing, setting whether it is an
 /// operator-configured protected peer.
 fn new_test_connection_with_protection<A>(
@@ -158,6 +174,7 @@ fn new_test_connection_with_protection<A>(
         remote,
         negotiated_version: fake_version,
         is_protected_peer,
+        early_block_relay: false,
     };
     let addr_label = connection_info.connected_addr.get_transient_addr_label();
 
@@ -234,6 +251,7 @@ fn new_never_closing_test_connection<A>(
         remote,
         negotiated_version: fake_version,
         is_protected_peer: false,
+        early_block_relay: false,
     };
     let addr_label = connection_info.connected_addr.get_transient_addr_label();
 

@@ -114,6 +114,8 @@ pub enum RequestIdentity {
         /// The first header, `common_ancestor`'s child on the target's
         /// branch. `None` for a request with no headers.
         first: Option<Frontier>,
+        /// Every header's hash, in the order the request sends them.
+        hashes: Vec<block::Hash>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {
@@ -126,6 +128,9 @@ pub enum RequestIdentity {
         parent_hash: Option<block::Hash>,
         /// The target.
         target_tip_hash: block::Hash,
+        /// The sealed insertion's header hashes, in order, or `None` when
+        /// `parent_hash` is.
+        hashes: Option<Vec<block::Hash>>,
     },
     /// `selected_chain_contains`.
     SelectedChainContains {
@@ -136,12 +141,12 @@ pub enum RequestIdentity {
 
 impl RequestIdentity {
     /// The identity of `request`, for the adapter holding `key`. An apply's
-    /// parent is sealed in its target, so the caller that opened the target
-    /// passes it as `apply_parent`. Other requests ignore it.
+    /// parent and headers are sealed in its target, so the caller that
+    /// opened the target passes them as `sealed`. Other requests ignore it.
     pub(crate) fn of(
         request: &HeaderRequest,
         key: &AdapterKey,
-        apply_parent: Option<block::Hash>,
+        sealed: Option<(block::Hash, Vec<block::Hash>)>,
     ) -> Self {
         match request {
             HeaderRequest::ContinuationLocator => RequestIdentity::ContinuationLocator,
@@ -186,13 +191,23 @@ impl RequestIdentity {
                     let height = prepare.common_ancestor.height.next().ok()?;
                     Some(Frontier::new(height, entry.header.hash()))
                 }),
+                hashes: prepare
+                    .entries
+                    .as_slice()
+                    .iter()
+                    .map(|entry| entry.header.hash())
+                    .collect(),
             },
-            HeaderRequest::ApplyHeaderTarget { target } => RequestIdentity::ApplyHeaderTarget {
-                owner: target.owner(),
-                source: target.source(),
-                parent_hash: apply_parent,
-                target_tip_hash: target.target_tip_hash(),
-            },
+            HeaderRequest::ApplyHeaderTarget { target } => {
+                let (parent_hash, hashes) = sealed.unzip();
+                RequestIdentity::ApplyHeaderTarget {
+                    owner: target.owner(),
+                    source: target.source(),
+                    parent_hash,
+                    target_tip_hash: target.target_tip_hash(),
+                    hashes,
+                }
+            }
             HeaderRequest::SelectedChainContains { hash } => {
                 RequestIdentity::SelectedChainContains { hash: *hash }
             }

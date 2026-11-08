@@ -501,6 +501,7 @@ mod tests {
             source: "02".into(),
             parent: Some("dd".into()),
             target: "bb".into(),
+            hashes: None,
         };
         let obs = [
             storage(
@@ -662,6 +663,7 @@ mod tests {
             headers: 3,
             work: Some("12".into()),
             first: Some(point(1, "cc")),
+            hashes: Vec::new(),
         };
         assert_eq!(
             serde_json::to_string(&request).unwrap(),

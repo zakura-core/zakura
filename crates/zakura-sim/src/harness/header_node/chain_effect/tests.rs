@@ -37,6 +37,7 @@ fn apply(id: u64, generation: u64, anchor: &str) -> StorageFact {
             source: String::new(),
             parent: None,
             target: "t".to_owned(),
+            hashes: None,
         },
         digest: String::new(),
         call: Some(1),

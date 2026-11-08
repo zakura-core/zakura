@@ -1481,10 +1481,16 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
     let mut hasher = Sha256::new();
     hasher.update(b"zakura-storage-header-request-v2");
     hasher.update(format!("{request:?}").as_bytes());
-    let (request, rejected, apply_parent) = match request {
+    let (request, rejected, sealed) = match request {
         HeaderRequest::ApplyHeaderTarget { target } => match target.into_insert(key) {
             Ok(insert) => {
                 let parent = insert.parent_hash;
+                let hashes = insert
+                    .batch
+                    .headers()
+                    .iter()
+                    .map(|header| header.hash)
+                    .collect();
                 hasher.update(insert.source.digest());
                 hasher.update(insert.parent_hash.0);
                 hasher.update(insert.target_tip_hash.0);
@@ -1499,7 +1505,7 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
                 (
                     HeaderRequest::ApplyHeaderTarget { target },
                     false,
-                    Some(parent),
+                    Some((parent, hashes)),
                 )
             }
             Err(target) => (HeaderRequest::ApplyHeaderTarget { target }, true, None),
@@ -1516,7 +1522,7 @@ fn inspect(request: HeaderRequest, key: &AdapterKey) -> Inspected {
         }
     };
     Inspected {
-        identity: RequestIdentity::of(&request, key, apply_parent),
+        identity: RequestIdentity::of(&request, key, sealed),
         request,
         request_digest: hasher.finalize().into(),
         rejected,

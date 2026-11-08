@@ -352,6 +352,7 @@ pub fn request(request: &RequestIdentity) -> StorageRequest {
             headers,
             work,
             first,
+            hashes,
         } => StorageRequest::PrepareHeaderTarget {
             owner: work_owner(*owner),
             source: peer(*source),
@@ -360,17 +361,22 @@ pub fn request(request: &RequestIdentity) -> StorageRequest {
             headers: *headers,
             work: work.map(|work| work.as_u256().to_string()),
             first: first.map(point),
+            hashes: hashes.iter().map(|each| hash(*each)).collect(),
         },
         RequestIdentity::ApplyHeaderTarget {
             owner,
             source,
             parent_hash,
             target_tip_hash,
+            hashes,
         } => StorageRequest::ApplyHeaderTarget {
             owner: work_owner(*owner),
             source: peer(*source),
             parent: parent_hash.map(hash),
             target: hash(*target_tip_hash),
+            hashes: hashes
+                .as_ref()
+                .map(|hashes| hashes.iter().map(|each| hash(*each)).collect()),
         },
         RequestIdentity::SelectedChainContains { hash: asked } => {
             StorageRequest::SelectedChainContains { hash: hash(*asked) }

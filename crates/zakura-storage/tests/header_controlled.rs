@@ -1546,6 +1546,7 @@ fn completions_carry_typed_identities() {
                 .to_work()
                 .map(Into::into),
             first: Some(Frontier::new(block::Height(4), next[0].hash())),
+            hashes: vec![next[0].hash()],
         }
     );
     assert_eq!(prepare.result, ResultIdentity::Prepared);

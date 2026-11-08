@@ -385,6 +385,7 @@ mod tests {
                 source: source.to_owned(),
                 parent: None,
                 target: "11".to_owned(),
+                hashes: None,
             },
             digest: String::new(),
             call: Some(id),

@@ -193,6 +193,23 @@ fn honest(events: &[ReactorEvent]) -> Vec<ReactorEvent> {
         .collect()
 }
 
+/// Notes, for each Open in `events`, that a locator read gave its first
+/// locator where the Open says it starts, as a test's storage would.
+fn read_starts(check: &mut Authority, events: &[ReactorEvent]) {
+    for event in events {
+        if let ReactorEvent::CreditIssued {
+            kind: CreditKind::Open,
+            update,
+            ..
+        } = event
+        {
+            if let Some(first) = update.locator_hashes.first() {
+                check.note_read(*first, update.acknowledged.height);
+            }
+        }
+    }
+}
+
 /// The breaks `events` give, fed in order on the reactor's task.
 fn breaks(events: &[ReactorEvent]) -> Vec<String> {
     breaks_declaring(&[], events)
@@ -211,6 +228,7 @@ fn breaks_declaring(
         declared.iter().copied(),
     );
     check.observe(&reserved(99, 10), true, false);
+    read_starts(&mut check, events);
     for event in &honest(events) {
         check.observe(event, true, false);
     }
@@ -231,6 +249,7 @@ fn raw_credit_breaks(events: &[ReactorEvent]) -> Vec<String> {
         [0],
         [],
     );
+    read_starts(&mut check, events);
     for event in events {
         check.observe(event, true, false);
     }
@@ -260,6 +279,7 @@ fn a_page_on_a_scenario_branch_holds() {
             [],
         );
         check.observe(&reserved(99, 10), true, false);
+        read_starts(&mut check, &events);
         for event in &honest(&events) {
             check.observe(event, true, false);
         }
@@ -711,6 +731,7 @@ fn a_stale_handlers_credit_is_left_to_the_stale_check() {
         reserved(2, 2),
         grant(2, 0, 2, chain[2], chain[3].hash),
     ]);
+    read_starts(&mut check, &events);
     for (at, event) in events.iter().enumerate() {
         // The middle grant and acceptance come in a stale call's handler.
         check.observe(event, true, (2..4).contains(&at));
@@ -851,4 +872,36 @@ fn the_primitive_counts_what_the_updates_and_pages_did() {
         found.iter().any(|found| found.contains("primitive counts")),
         "{found:?}"
     );
+}
+
+/// An Open whose start height isn't the one storage gave its first locator
+/// breaks, and so does one whose first locator no read gave.
+#[test]
+fn an_open_starts_where_storage_put_its_first_locator() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let open = open(chain[3], &[genesis.hash]);
+    let with = |read: Option<block::Height>| {
+        let mut check = Authority::new(
+            AuthorityEvidence::default(),
+            HeaderFixture::regtest(),
+            [0],
+            [],
+        );
+        if let Some(height) = read {
+            check.note_read(genesis.hash, height);
+        }
+        for event in &honest(&[reserved(1, 10), open.clone()]) {
+            check.observe(event, true, false);
+        }
+        check.drain(1)
+    };
+    assert_eq!(with(Some(block::Height(0))), Vec::<String>::new());
+    for read in [Some(block::Height(1)), None] {
+        let found = with(read);
+        assert!(
+            found.iter().any(|found| found.contains("Open starts at")),
+            "{read:?}: {found:?}"
+        );
+    }
 }

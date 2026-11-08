@@ -242,6 +242,13 @@ impl Authority {
         }
     }
 
+    /// Notes that storage gave `hash` at `height` as a locator's entry, as
+    /// a test feeds it.
+    #[cfg(test)]
+    fn note_read(&mut self, hash: block::Hash, height: block::Height) {
+        self.credit.note_read(hash, height);
+    }
+
     /// Notes that a fact made the check applicable.
     pub(super) fn applies(&self) {
         self.evidence.with(|store| store.pending = true);

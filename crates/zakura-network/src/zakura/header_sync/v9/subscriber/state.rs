@@ -407,6 +407,10 @@ impl SubscriberState {
                 .last()
                 .map_or(parent.hash, |entry| entry.header.hash());
             let height = u64::from(parent.height.0).saturating_add(entries);
+            let charged = tools
+                .credit(&live.id)
+                .expect("the live subscription is in the tools")
+                .consumed();
             tap.observer.observe(ReactorEvent::CursorClaimed {
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
@@ -420,6 +424,7 @@ impl SubscriberState {
                 ),
                 page_headers: entries,
                 page_bytes: payload_len as u64,
+                charged: (charged.objects, charged.bytes),
             });
         }
         live.pages += 1;

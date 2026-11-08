@@ -1211,6 +1211,7 @@ fn observed_credit_reports_each_open_grant_and_close() {
             page_last: Frontier::new(cursor.height, cursor.hash),
             page_headers: 1,
             page_bytes: cursor.bytes - before,
+            charged: (cursor.headers, cursor.bytes),
         });
         before = cursor.bytes;
     }

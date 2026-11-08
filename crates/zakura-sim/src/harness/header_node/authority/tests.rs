@@ -428,6 +428,7 @@ fn claimed(through: Frontier, headers: u32) -> ReactorEvent {
         page_last: through,
         page_headers: u64::from(headers),
         page_bytes: u64::from(headers) * credit::smallest_page(AuxSchema::None),
+        charged: (cursor.headers, cursor.bytes),
     }
 }
 
@@ -674,6 +675,14 @@ fn claims_record_what_their_pages_consumed() {
     miscounted.push(claim);
     let found = credit_breaks(&miscounted);
     assert!(found[0].contains("but its pages consumed"), "{found:?}");
+    let mut undercharged = base();
+    let mut claim = claimed(chain[1], 2);
+    if let ReactorEvent::CursorClaimed { charged, .. } = &mut claim {
+        charged.1 -= 1;
+    }
+    undercharged.push(claim);
+    let found = credit_breaks(&undercharged);
+    assert!(found[0].contains("counts"), "{found:?}");
     let mut elsewhere = base();
     let mut claim = claimed(chain[1], 2);
     if let ReactorEvent::CursorClaimed { through, .. } = &mut claim {

@@ -412,6 +412,9 @@ pub enum ReactorEvent {
         page_headers: u64,
         /// The page's payload bytes.
         page_bytes: u64,
+        /// The header and byte credit the subscription's primitive counts
+        /// as consumed after the claim, apart from the cursor.
+        charged: (u64, u64),
     },
     /// The subscriber accepted the cursors of `subscription` through
     /// `through`, so its next update acknowledges it.

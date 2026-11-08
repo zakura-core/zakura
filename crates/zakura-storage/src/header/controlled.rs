@@ -168,6 +168,17 @@ impl fmt::Display for ResetError {
 
 impl std::error::Error for ResetError {}
 
+/// An engine run's durable state just before and just after it, for the
+/// simulator's commit-contents and durable-state checks.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineRun {
+    /// Before the run.
+    pub before: zakura_header_chain::DurableState,
+    /// After the run.
+    pub after: zakura_header_chain::DurableState,
+}
+
 /// What [`ControlledPort::complete`] or [`ControlledPort::deliver`] did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Completion {
@@ -196,6 +207,9 @@ pub struct Completion {
     pub generation: HeaderGeneration,
     /// [`EnginePort::state_digest`] once the completion finished.
     pub state_digest: [u8; 32],
+    /// The apply's engine run, if this completion ran one.
+    #[cfg(zakura_sim)]
+    pub executed: Option<std::sync::Arc<EngineRun>>,
 }
 
 /// One published change.
@@ -268,6 +282,9 @@ pub enum FactKind {
         generation: HeaderGeneration,
         /// [`EnginePort::state_digest`] once the commit finished.
         state_digest: [u8; 32],
+        /// The apply's engine run.
+        #[cfg(zakura_sim)]
+        executed: std::sync::Arc<EngineRun>,
     },
     /// Head: the run reset the engine's header selection with an operator
     /// event.
@@ -278,6 +295,9 @@ pub enum FactKind {
         target: block::Hash,
         /// The engine's header generation once it committed.
         generation: HeaderGeneration,
+        /// The operator event's engine run.
+        #[cfg(zakura_sim)]
+        executed: std::sync::Arc<EngineRun>,
     },
     /// Head: the run completed an operation, or delivered a committed
     /// apply's reply.
@@ -859,6 +879,9 @@ impl ControlledPort {
             lease_ends,
             generation: self.engine.snapshot().header_generation,
             state_digest: self.engine.state_digest(),
+            // The engine ran at the commit, whose fact carries the run.
+            #[cfg(zakura_sim)]
+            executed: None,
         };
         kinds.push(FactKind::Completed(Box::new(completion.clone())));
         let published = self.ops().publish(now, kinds);
@@ -936,6 +959,9 @@ impl ControlledPort {
         // Only a commit reads the snapshot around its run, to tell whether
         // the apply installed one.
         let before = hold.then(|| self.engine.snapshot());
+        #[cfg(zakura_sim)]
+        let durable_before = (early.is_none() && op == HeaderOp::ApplyHeaderTarget)
+            .then(|| self.engine.durable_state());
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
         let (reply, effects, result) = match early {
@@ -964,8 +990,24 @@ impl ControlledPort {
             kinds.push(FactKind::PermitDropped { id });
         }
         kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
+        #[cfg(zakura_sim)]
+        let executed = durable_before.map(|before| {
+            std::sync::Arc::new(EngineRun {
+                before,
+                after: self.engine.durable_state(),
+            })
+        });
         if before.is_some_and(|before| before != self.engine.snapshot()) {
-            return Ok(self.hold_reply(id, now, txn, reply, result, kinds));
+            return Ok(self.hold_reply(
+                id,
+                now,
+                txn,
+                reply,
+                result,
+                kinds,
+                #[cfg(zakura_sim)]
+                executed.expect("a commit runs an apply's engine"),
+            ));
         }
         let (caller, abandoned, identity, request_digest) = {
             let mut ops = self.ops();
@@ -1017,6 +1059,8 @@ impl ControlledPort {
                 lease_ends,
                 generation,
                 state_digest,
+                #[cfg(zakura_sim)]
+                executed,
             };
             kinds.push(FactKind::Completed(Box::new(completion.clone())));
             let published = ops.publish(now, kinds);
@@ -1044,6 +1088,7 @@ impl ControlledPort {
         reply: HeaderReply,
         result: ResultIdentity,
         mut kinds: Vec<FactKind>,
+        #[cfg(zakura_sim)] executed: std::sync::Arc<EngineRun>,
     ) -> Commit {
         let generation = self.engine.snapshot().header_generation;
         let state_digest = self.engine.state_digest();
@@ -1060,6 +1105,8 @@ impl ControlledPort {
             id,
             generation,
             state_digest,
+            #[cfg(zakura_sim)]
+            executed,
         });
         let published = ops.publish(now, kinds);
         assert_eq!(
@@ -1141,6 +1188,8 @@ impl ControlledPort {
                 }
             }
         };
+        #[cfg(zakura_sim)]
+        let durable_before = self.engine.durable_state();
         let applied = self
             .engine
             .operator(target, kind == ResetKind::Invalidate)
@@ -1152,6 +1201,11 @@ impl ControlledPort {
             kind,
             target,
             generation: self.engine.snapshot().header_generation,
+            #[cfg(zakura_sim)]
+            executed: std::sync::Arc::new(EngineRun {
+                before: durable_before,
+                after: self.engine.durable_state(),
+            }),
         };
         let mut ops = self.ops();
         match kind {

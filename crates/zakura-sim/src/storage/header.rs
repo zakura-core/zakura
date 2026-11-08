@@ -531,6 +531,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             id,
             generation,
             state_digest,
+            ..
         } => StorageFact::Committed {
             id: id.0,
             generation: generation.get(),
@@ -540,6 +541,7 @@ fn observation(fact: Fact, instance: u64) -> Observation {
             kind,
             target,
             generation,
+            ..
         } => StorageFact::Reset {
             kind: match kind {
                 ResetKind::Invalidate => "invalidate",

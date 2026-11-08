@@ -634,19 +634,25 @@ fn a_commit_publishes_before_its_reply_is_delivered() {
             caller_waiting: true
         }
     ));
-    assert_eq!(
-        port.take_facts()
-            .into_iter()
-            .map(|fact| (fact.txn, fact.kind))
-            .collect::<Vec<_>>(),
-        [(
-            txn,
-            FactKind::Committed {
-                id: OpId(1),
-                generation,
-                state_digest,
-            }
-        )]
+    let facts: Vec<_> = port
+        .take_facts()
+        .into_iter()
+        .map(|fact| (fact.txn, fact.kind))
+        .collect();
+    assert!(
+        matches!(
+            &facts[..],
+            [(
+                at,
+                FactKind::Committed {
+                    id: OpId(1),
+                    generation: committed,
+                    state_digest: digest,
+                    ..
+                }
+            )] if *at == txn && *committed == generation && *digest == state_digest
+        ),
+        "{facts:?}"
     );
 
     // Another apply completes between the commit and the delivery.
@@ -812,13 +818,17 @@ fn a_reset_invalidates_and_reconsiders_the_tip() {
     assert!(watch
         .has_changed()
         .expect("the engine port holds the sender"));
-    assert_eq!(
-        invalidated,
-        FactKind::Reset {
-            kind: ResetKind::Invalidate,
-            target: chain[2].hash,
-            generation: after.header_generation,
-        }
+    assert!(
+        matches!(
+            invalidated,
+            FactKind::Reset {
+                kind: ResetKind::Invalidate,
+                target,
+                generation,
+                ..
+            } if target == chain[2].hash && generation == after.header_generation
+        ),
+        "{invalidated:?}"
     );
 
     let reconsidered = port

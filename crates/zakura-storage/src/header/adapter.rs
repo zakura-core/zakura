@@ -203,6 +203,13 @@ impl EnginePort {
         self.engine().snapshot()
     }
 
+    /// The engine's whole durable state, for the simulator to judge an
+    /// execution against.
+    #[cfg(zakura_sim)]
+    pub fn durable_state(&self) -> zakura_header_chain::DurableState {
+        self.engine().durable_state()
+    }
+
     /// Locks the engine. A panic while it was held can't leave it half
     /// changed, since installing a transition is its only mutation and
     /// leaves the engine unchanged on error.

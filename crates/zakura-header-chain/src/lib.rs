@@ -28,6 +28,8 @@ pub use discovery::{
 pub use error::{Attribution, ErrorCategory, ErrorSubject, HeaderChainError, RuleId};
 #[cfg(any(test, feature = "fuzz-impl"))]
 pub use fuzz::{replay_fork_transition_bytes, ForkReplaySummary};
+#[cfg(any(test, feature = "test-support", zakura_sim))]
+pub use graph::GraphState;
 pub use graph::{
     BodyRuleId, BodyUnavailableSummary, BodyValidationState, ChainScore,
     ConsensusInvalidBodyTombstone, DurableNodeError, EligibilityReason, EligibilityState, Frontier,

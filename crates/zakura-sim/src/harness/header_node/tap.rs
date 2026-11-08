@@ -452,10 +452,12 @@ impl TapState {
     }
 
     /// The headers the ownership check's accounting holds reserved and
-    /// owned, unless a claim tainted them.
+    /// owned, unless a claim tainted them or an integrity failure stopped
+    /// the ledger.
     fn accounted(&self) -> Option<(usize, usize)> {
         let work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-        (!work.ledger.accounting_tainted()).then(|| (work.ledger.reserved(), work.ledger.owned()))
+        (work.broken.is_none() && !work.ledger.accounting_tainted())
+            .then(|| (work.ledger.reserved(), work.ledger.owned()))
     }
 
     /// The call or retained headers that a finished reactor left open.
@@ -1653,8 +1655,7 @@ impl ActionSource for ReactorTap {
                     }
                 }),
                 _ => Ok(()),
-            }
-            .and_then(|()| self.read_capacity(step)),
+            },
             // A reactor that unwound, from a callback or observer panic,
             // leaves its last receipts with no call end. The run's evidence
             // check then reports the tap's own health, `ReactorGone` or
@@ -1673,10 +1674,12 @@ impl ActionSource for ReactorTap {
                 return Ok(());
             }
         };
-        // The step's claim breaks drain even when its evidence failed, and
-        // the failure waits behind them.
+        // The probe is read, and its claims found, even when the step's
+        // other evidence failed. Then the step's claim breaks drain, and the
+        // failure waits behind them.
+        let capacity = self.read_capacity(step);
         let drained = self.state.drain_claims(step);
-        match checked.and(drained) {
+        match checked.and(capacity).and(drained) {
             Ok(()) => Ok(()),
             Err(error) => self.state.fail_after_claims(step, error),
         }

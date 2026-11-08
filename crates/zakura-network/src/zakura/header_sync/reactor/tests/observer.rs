@@ -36,7 +36,7 @@ impl HeaderSyncObserver for Recorder {
 
 impl Recorder {
     /// The events recorded since the last call, without retained-header ownership,
-    /// reservations, capacity accounting, budget changes, credit, causes,
+    /// reservations, capacity accounting, the queue's slots, budget changes, credit, causes,
     /// session admissions, refusals and ends, readmission cooldowns, or the
     /// adopted state and its publications.
     fn take(&self) -> Vec<ReactorEvent> {
@@ -60,6 +60,7 @@ impl Recorder {
                         | ReactorEvent::CachedPassDeferred { .. }
                         | ReactorEvent::EventTaken { .. }
                         | ReactorEvent::WatchObserved { .. }
+                        | ReactorEvent::Slots { .. }
                         | ReactorEvent::SessionAdmitted { .. }
                         | ReactorEvent::SessionEnded { .. }
                         | ReactorEvent::SessionRefused { .. }

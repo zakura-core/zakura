@@ -274,6 +274,15 @@ pub enum ReactorEvent {
         /// complete release leaves at 0.
         queue_owned: usize,
     },
+    /// The work queue's slots changed: a slot was added, given a new target
+    /// or priority's target, started, moved into preparation, where a
+    /// bounded prefix also narrows its owner, or into apply, or removed.
+    /// Lists every slot the queue holds, ordered by peer. Reported after the
+    /// change, once per change of any listed field.
+    Slots {
+        /// Every slot, ordered by peer.
+        slots: Vec<WorkSlot>,
+    },
     /// The header chunk budget changed: a reservation charged it, a page's
     /// staging moved reserved headers into a lease, or a reservation or a
     /// lease returned headers. The budget reports every change itself,
@@ -510,6 +519,28 @@ impl ReactorEvent {
             reason,
         }
     }
+}
+
+/// One peer's slot in the work queue, as [`ReactorEvent::Slots`] lists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkSlot {
+    /// The slot's peer.
+    pub peer: ZakuraPeerId,
+    /// The session the slot's work belongs to: the awaiting target's, or
+    /// the round owner's.
+    pub session_id: u64,
+    /// The advertised target the slot pursues.
+    pub target_tip_hash: block::Hash,
+    /// The round's phase, or `None` while the slot awaits its locator.
+    pub phase: Option<HeaderTargetPhase>,
+    /// The round the queue assigned at start, or 0 while the slot awaits
+    /// its locator.
+    pub incarnation: u64,
+    /// Whether the round is a body repair's.
+    pub repair: bool,
+    /// The header authority the slot holds now: the awaiting target's
+    /// scope, or the round owner's, which a bounded prefix narrows.
+    pub authority: HeaderWorkAuthority,
 }
 
 /// What a dispatched port call asks storage for.

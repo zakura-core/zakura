@@ -41,7 +41,7 @@ pub use probe::{HeaderResourceProbe, HeaderResources};
 #[cfg(any(test, zakura_sim))]
 use super::super::observe::{
     BudgetOwner, HeaderSyncObserver, ObserverSlot, PageArrival, ReactorEvent, RequestRef,
-    ReservationEnd, ReservationPurpose,
+    ReservationEnd, ReservationPurpose, WorkSlot,
 };
 use super::super::{events::HeaderPortOperation, v9::Cursor, HeaderEntry, ZakuraPeerId};
 use crate::zakura::transport::sim_arg;
@@ -543,6 +543,8 @@ struct QueueObservation {
     /// The reservation that page spent to the end, whose own end reports
     /// after the page's staging.
     exhausted: Option<HeaderCountReservation>,
+    /// The slots last reported, empty before any report.
+    slots: Vec<WorkSlot>,
     /// The observer itself. This struct is the queue's last field, so this
     /// drops after the queue's reservations and leases, and an observer
     /// that reads the reactor's lifetime from its handles sees their ends
@@ -648,7 +650,10 @@ impl PeerWorkQueue {
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
         let decision = self.policy.stage(peer, target, priority);
-        self.apply_stage(decision)
+        let result = self.apply_stage(decision);
+        #[cfg(any(test, zakura_sim))]
+        self.report_slots();
+        result
     }
 
     /// Stage one ordinary branch target only when no other peer already owns it.
@@ -661,7 +666,10 @@ impl PeerWorkQueue {
         priority: PeerWorkPriority,
     ) -> QueueWorkResult {
         let decision = self.policy.stage_distinct_target(peer, target, priority);
-        self.apply_stage(decision)
+        let result = self.apply_stage(decision);
+        #[cfg(any(test, zakura_sim))]
+        self.report_slots();
+        result
     }
 
     pub(in crate::zakura::header_sync) fn start(&mut self, request: ActiveHeaderRequest) -> bool {
@@ -672,6 +680,7 @@ impl PeerWorkQueue {
         #[cfg(any(test, zakura_sim))]
         if started {
             self.report_bound(&peer);
+            self.report_slots();
         }
         started
     }
@@ -713,7 +722,10 @@ impl PeerWorkQueue {
         self.release_capacity(peer);
         #[cfg(any(test, zakura_sim))]
         self.report_released(peer);
-        self.policy.remove(peer)
+        let removed = self.policy.remove(peer);
+        #[cfg(any(test, zakura_sim))]
+        self.report_slots();
+        removed
     }
 
     pub(in crate::zakura::header_sync) fn remove_owner(
@@ -727,6 +739,8 @@ impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn remove_unstarted(&mut self, peer: &ZakuraPeerId) {
         if self.policy.remove_unstarted(peer) {
             self.release_capacity(peer);
+            #[cfg(any(test, zakura_sim))]
+            self.report_slots();
         }
     }
 
@@ -784,6 +798,8 @@ impl PeerWorkQueue {
     ) -> Option<HeaderPortOperation> {
         let operation = self.policy.begin_prepare(peer, bounded_prefix);
         self.publish_phase_metrics();
+        #[cfg(any(test, zakura_sim))]
+        self.report_slots();
         operation
     }
 
@@ -791,6 +807,8 @@ impl PeerWorkQueue {
     pub(in crate::zakura::header_sync) fn begin_apply(&mut self, peer: &ZakuraPeerId) -> bool {
         let began = self.policy.begin_apply(peer);
         self.publish_phase_metrics();
+        #[cfg(any(test, zakura_sim))]
+        self.report_slots();
         began
     }
 
@@ -1074,6 +1092,19 @@ impl PeerWorkQueue {
             });
         }
         self.observing.exhausted = None;
+    }
+
+    /// Report the queue's slots if any listed field changed since the last
+    /// report ([`ReactorEvent::Slots`]).
+    fn report_slots(&mut self) {
+        let Some(observer) = self.observing.observer.0.clone() else {
+            return;
+        };
+        let slots = self.policy.slots();
+        if slots != self.observing.slots {
+            self.observing.slots = slots.clone();
+            observer.observe(ReactorEvent::Slots { slots });
+        }
     }
 
     /// Report reservations, staged pages, lease returns, round releases and
@@ -1740,8 +1771,28 @@ mod tests {
     }
 
     impl Recorded {
-        /// The events recorded since the last call.
+        /// The events recorded since the last call, without the queue's
+        /// slots.
         fn take(&self) -> Vec<ReactorEvent> {
+            self.take_all()
+                .into_iter()
+                .filter(|event| !matches!(event, ReactorEvent::Slots { .. }))
+                .collect()
+        }
+
+        /// The slot lists reported since the last call, in order.
+        fn take_slots(&self) -> Vec<Vec<WorkSlot>> {
+            self.take_all()
+                .into_iter()
+                .filter_map(|event| match event {
+                    ReactorEvent::Slots { slots } => Some(slots),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Every event recorded since the last call.
+        fn take_all(&self) -> Vec<ReactorEvent> {
             std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
         }
     }
@@ -1800,6 +1851,66 @@ mod tests {
                 frame: Some(frame),
             },
         )
+    }
+
+    /// The queue reports its slots after each change of a field it lists,
+    /// and only then. A staged target awaits its locator under its scope, a
+    /// start names the round, a staged page changes nothing listed, a
+    /// bounded prepare narrows the owner to the staged tip, an apply moves
+    /// the phase, and the removal leaves no slot.
+    #[test]
+    fn the_queue_reports_its_slots_as_they_change() {
+        let (mut queue, recorder, _observer) = observed_queue();
+        let awaiting = WorkSlot {
+            peer: peer(1),
+            session_id: 7,
+            target_tip_hash: hash(1),
+            phase: None,
+            incarnation: 0,
+            repair: false,
+            authority: advertisement(1).scope,
+        };
+        assert_eq!(recorder.take_slots(), [vec![awaiting.clone()]]);
+        assert_eq!(
+            queue.stage(peer(1), advertisement(1), PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert_eq!(recorder.take_slots(), Vec::<Vec<WorkSlot>>::new());
+
+        assert!(queue.reserve_request(&peer(1), 3));
+        assert!(queue.start(active_request(1, advertisement(1), &snapshot(), Vec::new())));
+        let receiving = WorkSlot {
+            phase: Some(HeaderTargetPhase::Receiving),
+            incarnation: 1,
+            authority: HeaderWorkAuthority::for_target(&snapshot(), hash(1)),
+            ..awaiting
+        };
+        assert_eq!(recorder.take_slots(), [vec![receiving.clone()]]);
+
+        let entry = versioned_entry(11);
+        let tip = entry.header.hash();
+        assert!(stage_arrival(&mut queue, vec![entry], 9));
+        assert_eq!(recorder.take_slots(), Vec::<Vec<WorkSlot>>::new());
+
+        assert!(queue.begin_prepare(&peer(1), true).is_some());
+        let mut narrowed = receiving.authority;
+        narrowed.branch.target_tip_hash = tip;
+        let preparing = WorkSlot {
+            phase: Some(HeaderTargetPhase::Preparing),
+            authority: narrowed,
+            ..receiving
+        };
+        assert_eq!(recorder.take_slots(), [vec![preparing.clone()]]);
+
+        assert!(queue.begin_apply(&peer(1)));
+        let applying = WorkSlot {
+            phase: Some(HeaderTargetPhase::Applying),
+            ..preparing
+        };
+        assert_eq!(recorder.take_slots(), [vec![applying]]);
+
+        assert!(queue.remove(&peer(1)).is_some());
+        assert_eq!(recorder.take_slots(), [Vec::new()]);
     }
 
     /// An observed round reports its reservation's opening, binding and end,

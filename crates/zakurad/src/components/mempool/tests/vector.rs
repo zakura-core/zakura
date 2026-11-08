@@ -366,7 +366,8 @@ fn upgrade_dependent_failures_ban_only_v5_and_later() {
 #[test]
 fn tip_dependent_failures_never_ban() {
     for error in [
-        TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
+        // A v5 transaction before NU5 can come from a peer whose tip is ahead.
+        TransactionError::UnsupportedByNetworkUpgrade(5, NetworkUpgrade::Canopy),
         expired_transaction(block::Height(99), block::Height(101)),
         TransactionError::WrongConsensusBranchId,
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
@@ -382,6 +383,36 @@ fn tip_dependent_failures_never_ban() {
             assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
         }
     }
+}
+
+/// ZIP 2003 disallows v4 transactions from NU7 onward, so a peer that relays one
+/// after NU7 is banned, whatever its tip or this node's upgrade grace period.
+#[test]
+fn post_nu7_v4_transactions_ban() {
+    let failure = relayed_transaction_failure(
+        TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Nu7),
+        4,
+    );
+    assert_eq!(transaction_ban_peer(&failure), Some(test_peer()));
+    for grace in [None, Some(NetworkUpgrade::Nu6_3)] {
+        assert_eq!(
+            transaction_cooldown_peer(
+                &failure,
+                Some(block::Height(100)),
+                NetworkUpgrade::Nu7,
+                grace
+            ),
+            None,
+            "a ban replaces the cooldown"
+        );
+    }
+
+    // Before NU7, the same failure can come from a peer whose tip is ahead of this node's.
+    let pre_nu7 = relayed_transaction_failure(
+        TransactionError::UnsupportedByNetworkUpgrade(4, NetworkUpgrade::Overwinter),
+        4,
+    );
+    assert_eq!(transaction_ban_peer(&pre_nu7), None);
 }
 
 #[test]

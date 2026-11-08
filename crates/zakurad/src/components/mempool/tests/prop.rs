@@ -356,6 +356,9 @@ fn is_unscored_but_bans(error: &TransactionError) -> bool {
             | DuplicateOrchardNullifier(_)
             | DuplicateIronwoodNullifier(_)
             | MaximumExpiryHeight { .. }
+    ) || matches!(
+        error,
+        UnsupportedByNetworkUpgrade(4, upgrade) if *upgrade >= NetworkUpgrade::Nu7
     )
 }
 

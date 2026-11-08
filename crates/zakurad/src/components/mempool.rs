@@ -386,6 +386,11 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // cooldown because an honest peer can still be before activation.
         DisabledAddToSproutPool => Cooldown,
 
+        // ZIP 2003 disallows v4 transactions from NU7 onward, and the verifier
+        // only reports this failure for a height at or after NU7. NU7 has been
+        // active long enough that no honest peer still relays v4 transactions.
+        UnsupportedByNetworkUpgrade(4, upgrade) if *upgrade >= NetworkUpgrade::Nu7 => Ban,
+
         // These failures already received no mempool penalty. Preserve that
         // policy when peers disagree about the tip or network upgrade.
         WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | ExpiredTransaction { .. } => {

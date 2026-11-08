@@ -521,14 +521,16 @@ pub(crate) struct Decider {
 /// make them all new together, and every tie would then go to the same
 /// task.
 ///
-/// **Bound.** Say action `a` is enabled at pick `s` and at every pick after
-/// it until it's picked. An action picked before `a` has an older stamp
-/// than `a`'s, and its pick gives it a stamp newer than every stamp so far,
-/// so it's never older than `a` again. An action first enabled after `s` is
-/// newer than `a` too. So `a` is picked within one more pick than the
-/// number of actions older than it at `s`, which is at most the number of
-/// actions the policy has stamped by then. The policy bounds picks, not
-/// virtual time.
+/// **Bound.** Order actions by stamp, then identity. Say action `a` is
+/// enabled at pick `s` and at every pick after it until it's picked. An
+/// action picked before `a` comes before `a` in that order, and its pick
+/// gives it a stamp newer than every stamp so far, so it comes after `a`
+/// from then on. An action first enabled after `s` gets a stamp newer than
+/// `a`'s. So `a` is picked within one more pick than the number of actions
+/// before it at `s`, which is at most the number of actions stamped by
+/// then. Three actions first enabled together share a stamp, so the third
+/// in identity order waits two picks. The policy bounds picks, not virtual
+/// time.
 #[derive(Debug, Default)]
 struct Recovery {
     /// Picks made under the policy so far.
@@ -1340,6 +1342,8 @@ mod tests {
             .iter()
             .all(|p| p.by == By::Recovery && p.offset.is_none()));
         let indices: Vec<_> = picks.iter().map(|p| p.index).collect();
+        // All three start with one stamp, so t002 waits for the two that
+        // sort before it, as the bound counts.
         assert_eq!(indices, [0, 1, 2, 0, 1, 2]);
         // Only the pick before recovery read a byte.
         assert_eq!(d.resolved().choices.len(), 1);
@@ -1475,7 +1479,9 @@ mod tests {
             sets in proptest::collection::vec(proptest::collection::btree_set(0usize..8, 1..8), 1..64),
         ) {
             // An action enabled at pick s and still enabled is picked within
-            // as many picks as actions were enabled at some pick up to s.
+            // one more pick than the actions before it at s, by stamp, then
+            // index. A stamp is the pick after the action's last pick, or
+            // the pick it was first enabled at.
             let all = tasks(8);
             let mut d = bytes(&prefix);
             for _ in 0..prefix.len() {
@@ -1487,10 +1493,26 @@ mod tests {
                 .iter()
                 .map(|set| set[d.pick(&some(&all, set)).unwrap().index])
                 .collect();
+            // The bound at each pick, from stamps kept apart from the policy's.
+            let mut stamps: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut bounds = Vec::new();
             for (s, set) in sets.iter().enumerate() {
-                let stamped = sets[..=s].iter().flatten().collect::<std::collections::BTreeSet<_>>().len();
-                for &a in set {
-                    let window = s..(s + stamped).min(sets.len());
+                for &b in set {
+                    stamps.entry(b).or_insert(s);
+                }
+                bounds.push(
+                    set.iter()
+                        .map(|&a| {
+                            let before = stamps.iter().filter(|(&b, &t)| (t, b) < (stamps[&a], a)).count();
+                            (a, before + 1)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                stamps.insert(picks[s], s + 1);
+            }
+            for (s, bound) in bounds.iter().enumerate() {
+                for &(a, within) in bound {
+                    let window = s..(s + within).min(sets.len());
                     let mut stayed = true;
                     let mut picked = false;
                     for t in window.clone() {
@@ -1504,7 +1526,7 @@ mod tests {
                         }
                     }
                     // A window cut short by the end of the run can't decide.
-                    let decided = window.end - window.start == stamped;
+                    let decided = window.end - window.start == within;
                     prop_assert!(picked || !stayed || !decided, "{a} at pick {s}: {picks:?}");
                 }
             }

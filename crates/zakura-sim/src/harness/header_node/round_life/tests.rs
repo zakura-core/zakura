@@ -384,6 +384,28 @@ fn a_start_from_an_unreported_read_is_missing_evidence() {
         .starts_with("RoundLifeJoin"));
 }
 
+/// A break found alongside missing evidence is still taken, so the tap
+/// reports it ahead of the failure.
+#[test]
+fn a_break_survives_missing_evidence() {
+    let mut check = RoundLife::new(RoundLifeEvidence::default(), 1);
+    check.storage(&[reset(1)], 1);
+    for event in [
+        adopted(1),
+        locator(1, 1),
+        cause(ReactorCause::Completion { call: 1 }),
+        started(1, 1),
+    ] {
+        check.observe(&event, true);
+    }
+    assert!(check.drain(1).is_err(), "the read is missing");
+    let found = check.take_breaks();
+    assert!(
+        matches!(&found[..], [only] if only.contains("left the header generation at 1")),
+        "{found:?}"
+    );
+}
+
 /// A reset that leaves the generation where the engine had it breaks the
 /// generation rule, and one that advances it doesn't. Either applies.
 #[test]

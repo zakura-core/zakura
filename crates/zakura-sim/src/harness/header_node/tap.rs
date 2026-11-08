@@ -315,7 +315,7 @@ impl TapState {
         {
             Some(rounds) => rounds.drain(step).unwrap_or_else(|error| {
                 broken.get_or_insert(error);
-                Vec::new()
+                rounds.take_breaks()
             }),
             None => Vec::new(),
         };
@@ -334,7 +334,7 @@ impl TapState {
         {
             Some(chain) => chain.drain(step).unwrap_or_else(|error| {
                 broken.get_or_insert(error);
-                Vec::new()
+                chain.take_breaks()
             }),
             None => Vec::new(),
         };

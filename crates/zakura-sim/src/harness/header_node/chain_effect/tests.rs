@@ -130,6 +130,21 @@ fn an_apply_must_change_the_engine_under_its_own_authority() {
     }
 }
 
+/// A break found alongside missing evidence is still taken, so the tap
+/// reports it ahead of the failure.
+#[test]
+fn a_break_survives_missing_evidence() {
+    let mut check = ChainEffect::new(ChainEffectEvidence::default(), engine(2, "s0"));
+    check.storage(&[apply(1, 1, "a")], engine(2, "s0"));
+    check.storage(&[completed(1, "s1"), committed(4, "s2")], engine(3, "s2"));
+    assert!(check.drain(1).is_err(), "the submission is missing");
+    let found = check.take_breaks();
+    assert!(
+        matches!(&found[..], [only] if only.starts_with("StaleChainEffect: apply operation 1")),
+        "{found:?}"
+    );
+}
+
 /// A stale apply that changes nothing, as an engine refusal does, is
 /// neither judged nor makes the check apply.
 #[test]

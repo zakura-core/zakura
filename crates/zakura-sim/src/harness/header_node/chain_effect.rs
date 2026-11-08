@@ -194,6 +194,13 @@ impl ChainEffect {
         Ok(std::mem::take(&mut self.breaks))
     }
 
+    /// The breaks found since the last call, taken even when
+    /// [`drain`](Self::drain) failed with missing evidence, so the tap can
+    /// report them ahead of that failure.
+    pub(super) fn take_breaks(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.breaks)
+    }
+
     /// Notes that a fact made the check applicable.
     fn applies(&self) {
         self.evidence.with(|store| store.pending = true);

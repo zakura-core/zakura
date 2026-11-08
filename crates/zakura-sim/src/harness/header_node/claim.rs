@@ -255,6 +255,15 @@ impl ClaimEvidence {
             .map(|(record, _)| record.clone())
     }
 
+    /// Whether step `step`'s drain found a break.
+    pub(super) fn found_at(&self, step: u64) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(record, _)| record.step == step)
+    }
+
     /// Every break so far, in order.
     pub fn records(&self) -> Vec<ClaimRecord> {
         self.0

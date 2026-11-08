@@ -403,6 +403,12 @@ impl ActionSource for PolicySource {
             }
             None => Ok(()),
         };
+        // A claim break the tap found at this step reports before the
+        // storage source's failure.
+        let stored = match (stored, &self.tap) {
+            (Err(error), Some(tap)) => tap.fail_after_claims(log.step(), error),
+            (stored, _) => stored,
+        };
         stored?;
         tapped?;
         let mut predicates = self.predicates.borrow_mut();

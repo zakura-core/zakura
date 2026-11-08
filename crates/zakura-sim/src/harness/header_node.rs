@@ -26,6 +26,7 @@ pub mod reservation;
 pub mod session;
 pub mod stale;
 pub mod tap;
+pub mod wake;
 
 use std::{
     cell::{Cell, RefCell},

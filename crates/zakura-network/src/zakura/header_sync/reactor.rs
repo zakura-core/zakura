@@ -41,6 +41,8 @@ use crate::zakura::{
 mod state;
 
 pub use super::scheduler::peer_work::StorageCallKind;
+#[cfg(any(test, zakura_sim))]
+pub(super) use state::CACHED_PASS_REFILL;
 
 #[cfg(any(test, zakura_sim))]
 use super::observe::{self, ReactorCause, ReactorEvent};

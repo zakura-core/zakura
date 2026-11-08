@@ -37,6 +37,10 @@ pub use ledger::{ClaimBreak, ClaimRule, HeaderWorkLedger};
 pub const HEADER_CHUNK_BUDGET_CAPACITY: usize =
     super::scheduler::peer_work::HEADER_CHUNK_BUDGET_CAPACITY_V1;
 
+/// The interval that refills one cached-offer pass, so a model can pin its
+/// own constant to it.
+pub const HEADER_CACHED_PASS_REFILL: std::time::Duration = super::reactor::CACHED_PASS_REFILL;
+
 /// Receives reactor events as they happen.
 ///
 /// Called synchronously on the reactor task, never while the reactor holds a

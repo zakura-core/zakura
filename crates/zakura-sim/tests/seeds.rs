@@ -14,7 +14,7 @@ use zakura_sim::{
         block_sync::BlockScenario,
         discovery,
         fixtures::{PickScenario, Variant, Which},
-        header_sync::StorageScenario,
+        header_sync::{StorageScenario, WakeScenario},
         wire_plans::SavedPlan,
     },
     seed::{self, SeedError, SeedKind, SeedReport},
@@ -141,6 +141,8 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-triggers" | "header-storage-stale-prepare" => {
             value(StorageScenario::triggers())
         }
+        "header-release-wake" => value(WakeScenario::Release),
+        "header-release-wake-deferred" => value(WakeScenario::Deferred),
         _ => None,
     }
 }

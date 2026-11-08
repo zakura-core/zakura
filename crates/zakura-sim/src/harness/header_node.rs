@@ -22,6 +22,7 @@ pub mod claim;
 pub mod fault;
 mod pair;
 pub mod policy;
+pub mod recovery;
 pub mod reservation;
 pub mod session;
 pub mod stale;
@@ -67,6 +68,7 @@ use zakura_storage::header::{
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
+    recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RECOVERY_BOUND, RELINK},
     session::SessionEvidence,
     tap::{ReactorTap, TapShutdown},
 };
@@ -278,6 +280,8 @@ pub struct PolicySource {
     reset: usize,
     /// How many releases are recorded.
     released: usize,
+    /// The run's recovery, which retires every hold once it starts.
+    recovery: RecoveryEvidence,
 }
 
 impl PolicySource {
@@ -299,7 +303,17 @@ impl PolicySource {
             grown: 0,
             reset: 0,
             released: 0,
+            recovery: RecoveryEvidence::default(),
         }
+    }
+
+    /// This source, retiring every hold once `recovery` starts: from then
+    /// on each operation is offered only `engine`, or `rejected` where
+    /// that's the only legal outcome, each held reply is delivered, and each
+    /// must be done within [`RECOVERY_BOUND`] of the later of its
+    /// submission, or its commit, and the `Recover` pick.
+    pub fn with_recovery(self, recovery: RecoveryEvidence) -> Self {
+        PolicySource { recovery, ..self }
     }
 
     /// This source, draining `tap` at each observation, after storage, so
@@ -328,24 +342,42 @@ impl ActionSource for PolicySource {
         let pending = self.port.pending();
         let committed = self.port.committed();
         let predicates = self.predicates.borrow();
+        let recovering = self.recovery.started().is_some();
         let mut offered = Vec::new();
         self.storage.enabled(now, &mut offered);
         out.extend(offered.into_iter().filter(|(_, local)| {
             match crate::storage::decode(*local) {
-                StorageAction::Complete(id, outcome) => pending
-                    .iter()
-                    .find(|op| op.id == id)
-                    .is_some_and(|op| predicates.offers(self.base, op, outcome)),
+                StorageAction::Complete(id, outcome) => {
+                    pending.iter().find(|op| op.id == id).is_some_and(|op| {
+                        if recovering {
+                            Base::SuccessOnly.offers(&op.enabled, outcome)
+                        } else {
+                            predicates.offers(self.base, op, outcome)
+                        }
+                    })
+                }
                 StorageAction::Deliver(id) => committed
                     .iter()
                     .find(|op| op.id == id)
-                    .is_some_and(|op| predicates.delivers(op)),
+                    .is_some_and(|op| recovering || predicates.delivers(op)),
             }
         }));
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
         self.storage.boundaries(now, out);
+        if let Some(started) = self.recovery.started() {
+            // Each operation's deadline is the bound after the later of its
+            // own start and recovery's.
+            let since = now.saturating_duration_since(started);
+            let by = |own: Duration| {
+                let left = RECOVERY_BOUND.saturating_sub(own.min(since));
+                Boundary::Deadline(crate::harness::policy::after(now, left))
+            };
+            out.extend(self.port.pending().iter().map(|op| by(op.since_submit)));
+            out.extend(self.port.committed().iter().map(|op| by(op.since_commit)));
+            return;
+        }
         let predicates = self.predicates.borrow();
         for op in self.port.pending() {
             predicates.boundaries(self.bound, &op, now, out);
@@ -358,7 +390,8 @@ impl ActionSource for PolicySource {
     fn execute(&mut self, local: u64, log: &mut ObservationLog) {
         match crate::storage::decode(local) {
             StorageAction::Complete(id, Outcome::Engine)
-                if self.predicates.borrow().holds_reply(id) =>
+                if self.recovery.started().is_none()
+                    && self.predicates.borrow().holds_reply(id) =>
             {
                 self.port
                     .commit(id)
@@ -1082,6 +1115,13 @@ pub enum ControlAction {
     /// scheduling step until the node's shutdown, so lifecycle events stay
     /// queued.
     Churn,
+    /// End the hostile prefix and recover, with the named mirror as the
+    /// source. At its pick the scenario's controls stop, every invalidation
+    /// it made is reconsidered, every hold retires, and from the next pick
+    /// the run's scheduling is fair. Offered once the task has carried out
+    /// every earlier step, and never after a `Shutdown`. See the
+    /// [`recovery`] module.
+    Recover,
 }
 
 /// What a [`ControlAction::Reset`] does, judged at its pick, since only
@@ -1116,6 +1156,7 @@ impl ControlAction {
             ControlAction::Commit { .. } => "commit",
             ControlAction::Flood => "flood",
             ControlAction::Churn => "churn",
+            ControlAction::Recover => "recover",
         }
     }
 
@@ -1129,6 +1170,7 @@ impl ControlAction {
                 | ControlAction::Release { .. }
                 | ControlAction::StopStorage
                 | ControlAction::Commit { .. }
+                | ControlAction::Recover
         )
     }
 }
@@ -1178,6 +1220,8 @@ pub struct Control {
     fixture: HeaderFixture,
     /// The node under test's adoption evidence, which records each commit.
     adoption: Option<AdoptionEvidence>,
+    /// What a `Recover` step drives.
+    recovery: Option<Driver>,
 }
 
 impl Control {
@@ -1238,7 +1282,8 @@ impl Control {
                     ControlAction::Reset(_)
                     | ControlAction::Release { .. }
                     | ControlAction::StopStorage
-                    | ControlAction::Commit { .. } => {
+                    | ControlAction::Commit { .. }
+                    | ControlAction::Recover => {
                         unreachable!("the step loop carries out run-only steps")
                     }
                 }
@@ -1256,7 +1301,25 @@ impl Control {
             port: None,
             fixture,
             adoption: None,
+            recovery: None,
         }
+    }
+
+    /// This source, recovering from `inputs` at a `Recover` step and
+    /// keeping its progress in `evidence`. Without it, a `Recover` step
+    /// fails the run.
+    pub fn with_recovery(self, inputs: RecoveryInputs, evidence: RecoveryEvidence) -> Self {
+        Control {
+            recovery: Some(Driver { inputs, evidence }),
+            ..self
+        }
+    }
+
+    /// Whether a `Recover` step was picked.
+    fn recovering(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|driver| driver.evidence.started().is_some())
     }
 
     /// This source, resetting, committing to and stopping `port`, the node
@@ -1279,13 +1342,15 @@ impl Control {
     }
 
     /// Whether `step` may be offered now, apart from its trigger: a
-    /// run-only step once the task carried out every earlier step, and a
-    /// storage stop once the node's stop is done too.
+    /// run-only step once the task carried out every earlier step, a
+    /// storage stop once the node's stop is done too, and a recovery only
+    /// before any shutdown.
     fn ready(&self, step: &ControlStep) -> bool {
         match step.action {
             ControlAction::StopStorage => {
                 self.queued.get() == 0 && self.shut_down && self.topology.reactor_stopped()
             }
+            ControlAction::Recover => self.queued.get() == 0 && !self.shut_down,
             action if action.run_only() => self.queued.get() == 0,
             _ => true,
         }
@@ -1319,8 +1384,32 @@ impl Control {
             ControlAction::Release { hold } => self.topology.release(hold),
             ControlAction::StopStorage => port()?.shut_down(),
             ControlAction::Commit { len } => self.commit(&*port()?, len)?,
+            ControlAction::Recover => self.recover(&*port()?, &step.peer)?,
             _ => unreachable!("only run-only steps run at their pick"),
         }
+        Ok(())
+    }
+
+    /// Starts recovery from `source` at the `Recover` pick: reconsiders
+    /// every invalidation still in force on `port`, newest first, and
+    /// records the start, which stops the script, retires the holds and
+    /// turns on fair scheduling.
+    fn recover(&self, port: &ControlledPort, source: &str) -> Result<(), String> {
+        let driver = self
+            .recovery
+            .as_ref()
+            .ok_or_else(|| "a recovery needs the harness's recovery inputs".to_owned())?;
+        if !driver.inputs.mirrors.iter().any(|(name, _)| name == source) {
+            return Err(format!("a recover names a mirror, not {source}"));
+        }
+        while port
+            .reset(ResetRequest::Reconsider)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {}
+        let now = zakura_scheduler::hooks::now()
+            .ok_or_else(|| "a recovery starts inside a run".to_owned())?;
+        driver.evidence.start(source.to_owned(), now);
         Ok(())
     }
 }
@@ -1355,6 +1444,9 @@ impl Control {
 
 impl ActionSource for Control {
     fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if self.recovering() {
+            return;
+        }
         let Some(step) = self.script.get(self.next) else {
             return;
         };
@@ -1373,6 +1465,10 @@ impl ActionSource for Control {
     }
 
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        if let Some(driver) = self.recovery.as_ref().filter(|_| self.recovering()) {
+            driver.boundaries(now, out);
+            return;
+        }
         if let Some(when) = self
             .script
             .get(self.next)
@@ -1382,16 +1478,57 @@ impl ActionSource for Control {
         }
     }
 
+    /// Recovery's `recovered` or relink pick, once the task carried out
+    /// every step.
+    fn quiet(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if let Some(driver) = &self.recovery {
+            if self.queued.get() == 0 {
+                driver.quiet(now, out);
+            }
+        }
+    }
+
+    /// True from the `Recover` pick on.
+    fn recovering(&self) -> bool {
+        Control::recovering(self)
+    }
+
     /// Checks the next step and queues it for the control task, or carries
     /// out a run-only one. A shutdown, reset, release or storage stop that
     /// doesn't name the node under test, a second shutdown, and a relink,
     /// reset or release after one fail the run here instead. A shutdown
     /// counts as begun from its pick, before the task takes it.
-    fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+    fn execute(&mut self, local: u64, _: &mut ObservationLog) {
+        if let Some(driver) = &self.recovery {
+            match local {
+                RECOVERED => {
+                    if let Err(why) = driver.recovered() {
+                        self.topology.fail(why);
+                    }
+                    return;
+                }
+                RELINK => {
+                    let step = ControlStep {
+                        peer: driver.relinked(),
+                        action: ControlAction::Relink,
+                        when: None,
+                    };
+                    self.queued.set(self.queued.get() + 1);
+                    self.to_task
+                        .try_send(step)
+                        .expect("recovery relinks only once the task took every step");
+                    return;
+                }
+                _ => {}
+            }
+        }
         let step = self.script[self.next].clone();
         self.next += 1;
         let node = &self.topology.nodes[0].name;
         let invalid = match step.action {
+            ControlAction::Recover if step.peer == *node => {
+                Some("a recover names a mirror, not the node under test".to_owned())
+            }
             ControlAction::Shutdown
             | ControlAction::Reset(_)
             | ControlAction::Release { .. }

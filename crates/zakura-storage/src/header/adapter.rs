@@ -203,6 +203,11 @@ impl EnginePort {
         self.engine().snapshot()
     }
 
+    /// The selected chain, from the finalized anchor to the selected tip.
+    pub fn selected_path(&self) -> Vec<zakura_header_chain::Frontier> {
+        self.engine().selected_projection().to_vec()
+    }
+
     /// Locks the engine. A panic while it was held can't leave it half
     /// changed, since installing a transition is its only mutation and
     /// leaves the engine unchanged on error.

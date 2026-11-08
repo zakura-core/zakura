@@ -12,6 +12,9 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
+mod tests;
+
 use zakura_chain::block;
 use zakura_header_chain::{
     AuxDelivery, AuxiliaryRequirementEpisode, BodyWorkAuthority, BodyWorkOwner, EngineLimits,

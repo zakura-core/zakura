@@ -201,10 +201,11 @@ pub fn fork_stale_apply() -> StorageScenario {
 }
 
 /// The node and `mirror-0` both at A3, so each sends the other one
-/// `Status` at the link. An invalidation of the node's tip lands 200 ms in,
-/// inside the 1 s publication floor of the status the node just queued.
-/// The reactor adopts the reset at once, and queues the next `Status` only
-/// once the floor passes. A reconsider follows.
+/// `Status` at the link. An invalidation of the node's tip is offered once
+/// the node admits the mirror's session, inside the 1 s publication floor
+/// of the status it queued then. The reactor adopts the reset at once, and
+/// queues the next `Status` only once the floor passes. A reconsider
+/// follows the invalidation.
 pub fn reset_inside_status_floor() -> StorageScenario {
     StorageScenario {
         node: Chain::main(3),
@@ -213,11 +214,11 @@ pub fn reset_inside_status_floor() -> StorageScenario {
         controls: vec![
             node_step(
                 ControlAction::Reset(Reset::Invalidate { depth: 0 }),
-                Some(Trigger::VirtualTime(200)),
+                Some(Trigger::SessionAdmitted("mirror-0".to_owned())),
             ),
             node_step(
                 ControlAction::Reset(Reset::Reconsider),
-                Some(Trigger::VirtualTime(3_000)),
+                Some(Trigger::Reset("node".to_owned())),
             ),
         ],
         weights: Default::default(),
@@ -346,8 +347,8 @@ fn every_witness_holds_and_applies() {
 /// and its round retires obsolete before the reactor handles that reply. The apply held across a reset, and the one held
 /// while the other fork commits, are each refused stale after the
 /// generation moved. In the status-floor witness, the reactor adopts the
-/// reset's generation before its next `Status`, which comes a second or
-/// more after the one before, with no deferral.
+/// reset inside the 1 s floor of the `Status` it queued last, and its next
+/// `Status` waits until the floor passes, with no deferral.
 #[test]
 fn each_witness_takes_the_path_it_names() {
     for input in inputs(8, 256) {
@@ -412,13 +413,28 @@ fn each_witness_takes_the_path_it_names() {
         assert!(other < held);
         assert_eq!(result, refused());
 
-        let (_, view) = run(&reset_inside_status_floor(), input);
+        let (report, view) = run(&reset_inside_status_floor(), input);
+        let reset_generation = storage(&report)
+            .into_iter()
+            .find_map(|(_, fact)| match fact {
+                StorageFact::Reset { generation, .. } => Some(generation),
+                _ => None,
+            })
+            .expect("the node resets");
         let facts = view.adoption.facts();
+        // The reactor's first adoption at or past the reset's generation.
+        // The watch holds only the newest snapshot, so the reactor may
+        // adopt the reconsider's straight away.
         let reset_at = facts
             .iter()
-            .filter(|stamped| matches!(stamped.fact, AdoptionFact::Adopted(_)))
-            .nth(1)
-            .map(|stamped| stamped.at)
+            .find_map(|stamped| match &stamped.fact {
+                AdoptionFact::Adopted(adoption)
+                    if adoption.header_generation.get() >= reset_generation =>
+                {
+                    Some(stamped.at)
+                }
+                _ => None,
+            })
             .expect("the reactor adopts the reset");
         let statuses: Vec<_> = facts
             .iter()
@@ -430,10 +446,12 @@ fn each_witness_takes_the_path_it_names() {
         let (Some(before), Some(after)) = (before, after) else {
             panic!("a status before and after the reset's adoption: {statuses:?}");
         };
+        let floor = *before + std::time::Duration::from_secs(1);
         assert!(
-            *after >= *before + std::time::Duration::from_secs(1),
-            "{before:?} {after:?}"
+            reset_at < floor,
+            "the reset is adopted inside the floor: {before:?} {reset_at:?}"
         );
+        assert!(*after >= floor, "{before:?} {after:?}");
         assert!(!facts
             .iter()
             .any(|stamped| matches!(stamped.fact, AdoptionFact::StatusDeferred { .. })));

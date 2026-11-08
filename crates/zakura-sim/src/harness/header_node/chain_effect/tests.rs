@@ -165,7 +165,7 @@ fn adoption_never_moves_back() {
 fn an_unsubmitted_apply_is_missing_evidence() {
     for fact in [committed(4, "s1"), completed(4, "s1")] {
         let mut check = ChainEffect::new(ChainEffectEvidence::default(), engine(2, "s0"));
-        check.storage(&[fact.clone()], engine(3, "s1"));
+        check.storage(std::slice::from_ref(&fact), engine(3, "s1"));
         assert!(
             check
                 .drain(1)

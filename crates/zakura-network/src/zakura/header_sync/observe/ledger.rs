@@ -63,9 +63,6 @@ struct Held {
     incarnation: u64,
     headers: usize,
     ended: bool,
-    /// The other rounds whose leases the call holds, which a
-    /// `ForeignLease` claim reported.
-    foreign: Vec<u64>,
 }
 
 /// What the ledger knows about one dispatched call.
@@ -172,6 +169,9 @@ pub struct HeaderWorkLedger {
     claims: Vec<ClaimBreak>,
     /// Every round the queue has released, by incarnation.
     released: BTreeSet<u64>,
+    /// The rounds a claimed `ForeignLease` involved, whose lease settlement
+    /// the ledger no longer judges.
+    tainted: BTreeSet<u64>,
 }
 
 /// One live reservation.
@@ -243,8 +243,6 @@ struct Handoff {
     apply: u64,
     incarnation: u64,
     headers: usize,
-    /// The other rounds whose leases pass with the headers.
-    foreign: Vec<u64>,
 }
 
 impl HeaderWorkLedger {
@@ -432,14 +430,17 @@ impl HeaderWorkLedger {
                          longer owns any or isn't its peer's"
                     ));
                 };
-                if held || round.returned + headers > round.staged {
+                if !self.tainted.contains(incarnation)
+                    && (held || round.returned + headers > round.staged)
+                {
                     return Err(format!(
                         "LeaseReturnedEarly: round {incarnation} returned {headers} headers with \
                          {} of its {} staged returned, while a call holds it: {held}",
                         round.returned, round.staged
                     ));
                 }
-                round.returned += headers;
+                // A tainted round may report more returned than it staged.
+                round.returned = (round.returned + headers).min(round.staged);
                 self.prune(*incarnation);
             }
             ReactorEvent::RoundReleased {
@@ -502,7 +503,13 @@ impl HeaderWorkLedger {
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                if let Some(foreign) = foreign.first() {
+                if let Some(first) = foreign.first() {
+                    // The claim reports the defect. These rounds' leases no
+                    // longer settle as the ledger tracks them, so their
+                    // settlement isn't judged after it.
+                    self.tainted.insert(*incarnation);
+                    self.tainted.extend(foreign.iter().copied());
+                    let foreign = first;
                     found.push(ClaimBreak {
                         rule: ClaimRule::ForeignLease,
                         detail: format!(
@@ -522,7 +529,6 @@ impl HeaderWorkLedger {
                     incarnation: *incarnation,
                     headers: *headers,
                     ended: false,
-                    foreign,
                 });
                 let (expected_kind, call_peer, owner, payload) = match &record.op {
                     PortCall::Prepare {
@@ -614,10 +620,9 @@ impl HeaderWorkLedger {
                             ),
                         }
                     });
-                let foreign = held.foreign.clone();
                 self.claims.extend(wrong);
                 if let HeaderWorkEnd::HandedToApply { apply } = end {
-                    self.check_handoff(*call, *apply, *incarnation, *headers, foreign)?;
+                    self.check_handoff(*call, *apply, *incarnation, *headers)?;
                 }
             }
             _ => {}
@@ -634,7 +639,6 @@ impl HeaderWorkLedger {
         apply: u64,
         incarnation: u64,
         headers: usize,
-        foreign: Vec<u64>,
     ) -> Result<(), String> {
         let prepare = self.calls.get(&call).map(|record| &record.op);
         let applied = self.calls.get(&apply);
@@ -680,7 +684,6 @@ impl HeaderWorkLedger {
                     apply,
                     incarnation,
                     headers,
-                    foreign,
                 });
                 Ok(())
             }
@@ -1052,6 +1055,9 @@ impl HeaderWorkLedger {
     /// The `LeakedLease` break if the queue released `incarnation` and, with
     /// no call holding it, it kept a lease at `when`.
     fn unreturned(&self, incarnation: u64, when: &str) -> Option<String> {
+        if self.tainted.contains(&incarnation) {
+            return None;
+        }
         let held = self.held_by_round().contains_key(&incarnation);
         let round = self.started.get(&incarnation)?;
         (round.released && !held && round.returned != round.staged).then(|| {
@@ -1120,7 +1126,8 @@ impl HeaderWorkLedger {
         self.released
             .iter()
             .filter(|incarnation| {
-                self.unsettled(**incarnation)
+                !self.tainted.contains(incarnation)
+                    && self.unsettled(**incarnation)
                     && !self.calls.values().any(|call| {
                         call.end.is_none()
                             && call
@@ -1156,9 +1163,7 @@ impl HeaderWorkLedger {
     }
 
     /// How many headers calls hold now, by round. A handoff's headers count
-    /// for their round until its apply takes them. A round whose lease a
-    /// call holds for another round, a claimed `ForeignLease`, counts as
-    /// held with no headers.
+    /// for their round until its apply takes them.
     pub fn held_by_round(&self) -> BTreeMap<u64, usize> {
         let mut held = BTreeMap::new();
         let calls = self
@@ -1166,16 +1171,13 @@ impl HeaderWorkLedger {
             .values()
             .filter_map(|record| record.held.as_ref())
             .filter(|held| !held.ended)
-            .map(|held| (held.incarnation, held.headers, &held.foreign));
+            .map(|held| (held.incarnation, held.headers));
         let handoff = self
             .handoff
             .iter()
-            .map(|handoff| (handoff.incarnation, handoff.headers, &handoff.foreign));
-        for (incarnation, headers, foreign) in calls.chain(handoff) {
+            .map(|handoff| (handoff.incarnation, handoff.headers));
+        for (incarnation, headers) in calls.chain(handoff) {
             *held.entry(incarnation).or_insert(0) += headers;
-            for round in foreign {
-                held.entry(*round).or_insert(0);
-            }
         }
         held
     }
@@ -2402,8 +2404,8 @@ mod tests {
             },
         ]);
         claimed_as(foreign, ClaimRule::ForeignLease);
-        // The foreign lease's round counts as held through the call, so its
-        // release while the call holds it is no leak.
+        // A claimed foreign lease leaves both rounds' settlement unjudged,
+        // so neither a release, an early return nor a leak follows it.
         let mut ledger = fold(after(
             &[(1, 1), (2, 2)],
             vec![
@@ -2430,6 +2432,51 @@ mod tests {
             .map(|claim| claim.rule)
             .collect();
         assert_eq!(rules, [ClaimRule::ForeignLease]);
+        for after_hold in [
+            // Round 1's call holds only round 2's lease, and round 1's own
+            // lease returns while the call is pending.
+            vec![ReactorEvent::LeaseReturned {
+                peer: peer(1),
+                incarnation: 1,
+                headers: 5,
+            }],
+            // Round 2 releases and returns its lease while round 1's call
+            // still holds one of round 2's.
+            vec![
+                ReactorEvent::RoundReleased {
+                    peer: peer(2),
+                    incarnation: 2,
+                    queue_owned: 0,
+                },
+                ReactorEvent::LeaseReturned {
+                    peer: peer(2),
+                    incarnation: 2,
+                    headers: 5,
+                },
+            ],
+        ] {
+            let mut events = vec![
+                dispatched(1, prepare(1)),
+                ReactorEvent::HeadersHeld {
+                    call: 1,
+                    kind: StorageCallKind::Prepare,
+                    peer: peer(1),
+                    incarnation: 1,
+                    headers: 5,
+                    leases: vec![2],
+                },
+            ];
+            events.extend(after_hold);
+            let mut ledger = fold(after(&[(1, 1), (2, 2)], events))
+                .expect("a claimed foreign lease doesn't refuse the history");
+            let rules: Vec<_> = ledger
+                .take_claims()
+                .iter()
+                .map(|claim| claim.rule)
+                .collect();
+            assert_eq!(rules, [ClaimRule::ForeignLease]);
+            assert_eq!(ledger.stuck_rounds(), 0);
+        }
     }
 
     /// A prepare or apply that ends without holding its round's headers

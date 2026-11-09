@@ -23,11 +23,16 @@
 //! settled run ends means the reactor lost it, and breaks the rule.
 //!
 //! A dropped call forgives a reply that already reached the reactor only
-//! when the drop came after the harness began its `Shutdown`, as the node's
-//! [`EndEvidence`] shows. A reactor that returns by itself drops its calls
-//! too, but nobody stopped it, so a reply it lost before any stop began is
-//! still untaken, even if the harness begins one partway through that
-//! teardown.
+//! when the harness's `Shutdown` tore the reactor down, as the node's
+//! [`EndEvidence`] shows: the drop came after the harness began its stop,
+//! and no drop came before it. Only the reactor's teardown drops calls, so
+//! a drop before any stop began shows the reactor started its own teardown,
+//! and every drop after it belongs to that teardown too, even once the
+//! harness picks a `Shutdown` partway through. A reactor that returns by
+//! itself drops its calls, but nobody stopped it, so the replies it lost are
+//! still untaken. A teardown the reactor began on its own that drops nothing
+//! before the harness's pick can't be told from the harness's stop, and
+//! counts as it.
 
 use std::{
     cell::RefCell,
@@ -193,6 +198,10 @@ struct Judge {
     /// drop numbered after it forgives a reply that already reached the
     /// reactor.
     stop_after: Option<u64>,
+    /// Set at the first drop numbered at or before [`Judge::stop_after`],
+    /// or with no stop begun: the reactor began its own teardown, so no
+    /// drop after it forgives anything either (see the module docs).
+    own_teardown: bool,
     /// Every penalty owed so far, in the order the replies were taken.
     owed: Vec<OwedPenalty>,
     /// The penalties in [`Judge::owed`] whose call's handling hasn't ended,
@@ -417,11 +426,12 @@ impl Judge {
     fn reactor(&mut self, seq: u64, event: &ReactorFact) {
         match event {
             // A dropped call is never handled, and never takes its reply.
-            // Only a drop after the harness began its stop forgives a reply
-            // already waiting.
+            // Only the harness's stop forgives a reply already waiting.
             ReactorFact::CallEnded { call, end, .. } if end == "dropped" => {
                 self.dropped.insert(*call);
-                if self.stop_after.is_some_and(|after| seq > after) {
+                let stopped = self.stop_after.is_some_and(|after| seq > after);
+                self.own_teardown |= !stopped;
+                if !self.own_teardown {
                     self.failed
                         .retain(|_, (request, _)| request.call != Some(*call));
                 }
@@ -619,8 +629,8 @@ fn owes(
 /// never began one. Each reactor event takes the next number, and the
 /// harness records its `Shutdown` at the step's pick, before the teardown it
 /// starts drops anything, so a drop numbered after this came once the stop
-/// had begun. A drop numbered at or before it, such as one from a teardown
-/// the reactor began by itself, came first.
+/// had begun. A drop numbered at or before it came first, from a teardown
+/// the reactor began by itself.
 fn stop_began(ends: &EndEvidence) -> Option<u64> {
     ends.facts().into_iter().find_map(|(_, fact)| match fact {
         EndFact::Environment {
@@ -1346,11 +1356,13 @@ mod tests {
     }
 
     /// The check reads the end evidence as it grows, and agrees with the
-    /// end. A drop read before any stop began keeps its reply untaken, and
-    /// a `Shutdown` the harness begins after it forgives nothing. A drop of
-    /// another call once the stop has begun forgives that call's reply.
+    /// end. The reactor begins its own teardown and drops call 1 as event
+    /// 5, before any stop, so its reply stays untaken. The harness then
+    /// picks `Shutdown`, and the same teardown drops call 2 as event 6. That
+    /// drop is numbered after the stop began, but it's still the reactor's
+    /// own teardown, so call 2's reply stays untaken too.
     #[test]
-    fn a_stop_begun_after_a_drop_forgives_only_later_drops() {
+    fn a_stop_picked_during_the_reactors_own_teardown_forgives_nothing() {
         let ends = EndEvidence::default();
         let attributed = evidence(&[(1, blame("aa")), (2, blame("aa"))]).with_ends(ends.clone());
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
@@ -1371,12 +1383,25 @@ mod tests {
         ));
         assert_eq!(
             untaken(&log, attributed.attributions(), &ends).unwrap(),
-            vec![1]
+            vec![1, 2]
         );
-        assert!(matches!(
-            attributed.penalized(&log).violated.as_slice(),
-            [why] if why.starts_with("UntakenFault: operation 1 ")
-        ));
+        let end = attributed.penalized(&log);
+        assert!(
+            matches!(end.violated.as_slice(), [first, second]
+                if first.starts_with("UntakenFault: operation 1 ")
+                    && second.starts_with("UntakenFault: operation 2 ")),
+            "{end:?}"
+        );
+
+        // The same two drops, both after the harness began its stop, are
+        // its teardown, and forgive both replies.
+        let mut stopped = log[..log.len() - 2].to_vec();
+        stopped.push(dropped_at(1, 6));
+        stopped.push(dropped_at(2, 7));
+        let attributed =
+            evidence(&[(1, blame("aa")), (2, blame("aa"))]).with_ends(ends_of(vec![shutdown(5)]));
+        assert_eq!(attributed.check(&stopped), FaultCheck::Nothing);
+        assert_eq!(attributed.penalized(&stopped), FaultEnd::default());
     }
 
     /// A settled run's end reports every open finding, not just the

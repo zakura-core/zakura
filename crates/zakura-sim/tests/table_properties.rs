@@ -20,7 +20,7 @@ use zakura_sim::{
     observe::StreamId,
     property::{Property, Source},
     table::{rule_row, table_properties, GeneratedId, Template},
-    Observation, Outcome, PropertyOutcome, RunReport,
+    Observation, Outcome, PropertyOutcome, RunReport, Violation,
 };
 
 /// The `feed` stream: a subscription with its page and terminal outcome.
@@ -477,17 +477,154 @@ fn every_unjustified_punishment_is_a_violation() {
         closed("header_peer_fault"),
         on(2, closed("header_peer_fault")),
     ]]);
-    let property = report
+    let id = "feed/s64v1/conformant-never-closes";
+    let close = "a close with cause header_peer_fault";
+    assert_eq!(
+        violations(&report, id),
+        [
+            violation(
+                id,
+                (1, &[1]),
+                "connection 1's judged frames are all conformant, so no punishment",
+                close
+            ),
+            violation(
+                id,
+                (1, &[1]),
+                "connection 2's judged frames are all conformant, so no punishment",
+                close
+            ),
+        ]
+    );
+}
+
+/// The frame `seq` the peer sent on `connection` and `stream`, labelled
+/// `label` under `row`, charged to an empty cadence bucket if `exhausted`,
+/// then the node's judgement of it.
+fn judged_on(
+    connection: u64,
+    stream: Stream,
+    seq: u64,
+    (row, label, exhausted): (Option<&str>, Label, bool),
+) -> [Observation; 2] {
+    [
+        Observation::PeerFrame {
+            connection,
+            stream: id(stream),
+            quic_stream: None,
+            seq,
+            row: row.map(str::to_owned),
+            rule_stream: id(stream),
+            label,
+            exhausted,
+            exchange: None,
+            payload: 0,
+        },
+        Observation::FrameJudged {
+            connection,
+            stream: id(stream),
+            quic_stream: None,
+            seq,
+        },
+    ]
+}
+
+/// Each violation the report of `id` in `report` keeps.
+fn violations<'r>(report: &'r RunReport, id: &str) -> &'r [Violation] {
+    &report
         .properties
         .iter()
-        .find(|p| p.property == "feed/s64v1/conformant-never-closes")
-        .expect("the property reports");
-    let connections: Vec<&str> = property
+        .find(|p| p.property == id)
+        .unwrap_or_else(|| panic!("{id} is registered"))
         .violations
-        .iter()
-        .map(|v| v.expected.split('\'').next().unwrap_or_default())
-        .collect();
-    assert_eq!(connections, ["connection 1", "connection 2"]);
+}
+
+/// A violation of `property` at `step`, with `witness`, `expected` and
+/// `actual`.
+fn violation(
+    property: &str,
+    (step, witness): (u64, &[u64]),
+    expected: &str,
+    actual: &str,
+) -> Violation {
+    Violation {
+        property: property.to_owned(),
+        step,
+        witness: witness.to_vec(),
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
+}
+
+/// C21: two faults on two connections that nothing punishes are two
+/// `<label>-closes` violations, which expire together at quiescence, and
+/// the report keeps both, each naming its own connection.
+#[test]
+fn every_unpunished_fault_at_a_boundary_is_reported() {
+    let mut first = judged_on(1, FEED_STREAM, 0, (None, Label::UndeclaredType, false)).to_vec();
+    first.extend(judged_on(
+        2,
+        FEED_STREAM,
+        0,
+        (None, Label::UndeclaredType, false),
+    ));
+    let report = run_script(vec![first, vec![]]);
+    // Step 1 judges both frames, step 2 is the empty batch, and the run
+    // goes quiescent after step 3, when the node's task exits.
+    let id = "feed/s64v1/undeclared-type-closes";
+    let open = "the scheduler is Quiescent after step 3 with the obligation from step 1 open";
+    assert_eq!(
+        violations(&report, id),
+        [
+            violation(
+                id,
+                (3, &[1, 3]),
+                "Session(\"1\") discharged before quiescence",
+                open
+            ),
+            violation(
+                id,
+                (3, &[1, 3]),
+                "Session(\"2\") discharged before quiescence",
+                open
+            ),
+        ]
+    );
+}
+
+/// C21: two conformant cadence-exhausting frames on two connections, each
+/// punished at one boundary, are two `cadence-never-closes` violations, and
+/// the report keeps both.
+#[test]
+fn every_cadence_punishment_at_a_boundary_is_reported() {
+    let exhausting = (Some("status"), Label::Conformant, true);
+    let mut frames = judged_on(1, TEST_STREAM, 0, exhausting).to_vec();
+    frames.extend(judged_on(2, TEST_STREAM, 0, exhausting));
+    let report = run_script(vec![
+        frames,
+        vec![
+            closed("request_protocol_reject"),
+            Observation::Misbehavior { connection: 2 },
+        ],
+    ]);
+    let id = "test/s65v2/status/cadence-never-closes";
+    assert_eq!(
+        violations(&report, id),
+        [
+            violation(
+                id,
+                (2, &[2]),
+                "connection 1's judged frames are all conformant, so no punishment",
+                "a close with cause request_protocol_reject"
+            ),
+            violation(
+                id,
+                (2, &[2]),
+                "connection 2's judged frames are all conformant, so no punishment",
+                "a Misbehavior"
+            ),
+        ]
+    );
 }
 
 /// Review (#1752): a punishment before the node judged anything on the

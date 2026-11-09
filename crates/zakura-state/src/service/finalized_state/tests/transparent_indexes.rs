@@ -453,6 +453,68 @@ fn skipped_and_indexed_databases_keep_identical_validation_state() {
     assert!(indexed.db.utxo(&chain.unspent_output).is_none());
 }
 
+/// Committing contextually verified blocks with the spent UTXOs that validation resolved
+/// writes the same transparent state as committing the same blocks as checkpoint-verified,
+/// which reads the spent UTXOs from the database.
+#[test]
+fn contextual_commit_with_resolved_spends_matches_checkpoint_commit() {
+    let _init_guard = zakura_test::init();
+    let chain = test_chain();
+    let network = chain.network.clone();
+
+    // Height 4 spends an output created at height 3, which is committed contextually, then
+    // spends its own new output in the same block.
+    let tip = chain.blocks.last().expect("the chain has blocks");
+    let spend4 = spend_tx(chain.unspent_output, amount(15_000), &chain.address);
+    let spend5 = spend_tx(outpoint(&spend4, 0), amount(10_000), &chain.other);
+    let block4 = child_block(
+        tip,
+        vec![
+            coinbase_tx(Height(4), amount(4_000), &chain.other),
+            spend4,
+            spend5,
+        ],
+    );
+
+    let checkpoint_dir = TempDir::new().expect("temp dir");
+    let contextual_dir = TempDir::new().expect("temp dir");
+    let mut checkpoint = open(
+        &config_at(checkpoint_dir.path(), NodeConfig::Archive),
+        &network,
+    );
+    let mut contextual = open(
+        &config_at(contextual_dir.path(), NodeConfig::Archive),
+        &network,
+    );
+
+    let mut all_blocks = chain.blocks.clone();
+    all_blocks.push(block4.clone());
+    commit_checkpoint(&mut checkpoint, &all_blocks);
+
+    // Height 3 spends an output created at height 2, which is committed as checkpoint-verified.
+    let (below_contextual, contextual_blocks) = chain.blocks.split_at(3);
+    commit_checkpoint(&mut contextual, below_contextual);
+    for block in contextual_blocks.iter().cloned().chain([block4]) {
+        commit_contextual(&mut contextual, block);
+    }
+
+    assert_eq!(contextual.db.finalized_tip_height(), Some(Height(4)));
+    for cf in ["utxo_by_out_loc", "tx_loc_by_hash", "hash_by_tx_loc"]
+        .into_iter()
+        .chain(TRANSPARENT_INDEX_COLUMN_FAMILIES)
+    {
+        assert_eq!(
+            contextual.db.raw_column_family_entries_for_test(cf),
+            checkpoint.db.raw_column_family_entries_for_test(cf),
+            "{cf} is the same for contextual and checkpoint commits"
+        );
+    }
+    assert!(
+        transparent_index_entry_count(&contextual.db) > 0,
+        "the databases built transparent indexes"
+    );
+}
+
 /// The marker is written with the first skipped block, before raw transaction pruning starts.
 #[test]
 fn transparent_index_marker_precedes_raw_transaction_pruning() {

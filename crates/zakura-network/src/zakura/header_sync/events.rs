@@ -49,6 +49,10 @@ pub struct HeaderSyncStartup {
     pub config: ZakuraHeaderSyncConfig,
     /// Application frame cap for header-sync messages.
     pub max_frame_bytes: u32,
+    /// The most connections the node admits at once, which caps how many
+    /// header-sync peers it can hold. Defaults to
+    /// [`DEFAULT_ZAKURA_MAX_CONNECTIONS`](crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS).
+    pub max_connections: usize,
     /// Per-request timeout.
     pub request_timeout: Duration,
     /// Status refresh interval.
@@ -92,6 +96,7 @@ impl HeaderSyncStartup {
             port_dispatch: PortDispatch::External,
             config,
             max_frame_bytes,
+            max_connections: crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
             request_timeout: Duration::from_secs(30),
             status_refresh_interval,
             trace: ZakuraTrace::noop(),

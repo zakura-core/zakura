@@ -167,6 +167,12 @@ test = "regenerate_release_wake_seeds"
 run = false
 reason = "a tool, not a test: it rewrites the committed inputs"
 
+[[ignored]]
+file = "crates/zakura-sim/tests/header_repair.rs"
+test = "regenerate_repair_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed inputs"
+
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
 # `zakura_sim release` and `zakura_sim asan` jobs make. The ASan lane needs
@@ -328,6 +334,11 @@ reason = "no target: the harness has two fixed scenarios, the flood fixtures, an
 harness = "header-sync/release-wake"
 owner = "E5a"
 reason = "no target: the harness has two fixed scenarios, the wake fixtures, and no plan maps it to a target"
+
+[[missing-target]]
+harness = "header-sync/repair"
+owner = "E5a"
+reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
 
 [[missing-target]]
 harness = "block-sync/storage"

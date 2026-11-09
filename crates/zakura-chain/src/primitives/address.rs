@@ -115,6 +115,15 @@ impl zcash_address::TryFromAddress for Address {
                 unified::Receiver::P2sh(data) => {
                     transparent = Some(transparent::Address::from_script_hash(network, data));
                 }
+                unified::Receiver::PqTransparent { .. } => {
+                    // A post-quantum receiver is a valid part of an address, so the address
+                    // is not rejected for carrying one. The node keeps no destination for
+                    // it: it has nowhere to put a 32-byte commitment (every variant of the
+                    // transparent address type is a 20-byte hash), it pays nobody, and the
+                    // one thing it would do with a destination — mine to it — must not
+                    // happen, because creating such an output before the rules activate
+                    // leaves it spendable by anyone.
+                }
                 unified::Receiver::Unknown { .. } => {
                     return Err(BoxError::from("Unsupported receiver in a Unified Address.").into());
                 }

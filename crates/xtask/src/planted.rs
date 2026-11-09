@@ -1390,6 +1390,22 @@ fn git(dir: &Path) -> Command {
     command
 }
 
+/// Runs `script` until it starts. A child that another test's thread forks
+/// while a script is open for writing holds it open until that child execs,
+/// and running the script meanwhile fails with ETXTBSY. Once it starts, no
+/// process holds it open for writing.
+#[cfg(all(test, unix))]
+fn wait_until_executable(script: &Path) {
+    while let Err(error) = Command::new(script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2169,6 +2185,7 @@ mod tests {
             let path = dir.path().join(name);
             let script = format!(
                 "#!/bin/sh\n\
+                 [ $# -gt 0 ] || exit 0\n\
                  if [ \"$1\" = replay ]; then\n\
                  case \"$2\" in */case/patched) exit {code} ;; *) exit 9 ;; esac\n\
                  fi\n\
@@ -2180,6 +2197,7 @@ mod tests {
             );
             fs::write(&path, script).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_executable(&path);
             path
         };
         let matches = fake("matches", 0);
@@ -2238,6 +2256,7 @@ mod tests {
             let path = dir.path().join(name);
             fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            wait_until_executable(&path);
             path
         };
         let matched = fake("matched", "test \"$1\" = replay || exit 2");

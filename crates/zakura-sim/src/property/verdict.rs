@@ -64,12 +64,44 @@ pub struct FactDischarge<V> {
     pub answer: fn(&ObligationKey, &V, u64) -> FactAnswer,
 }
 
+/// Who ended something an obligation waits on, or an assumption rests on.
+///
+/// Only the environment may discharge an obligation by ending what it
+/// waits on, or break an assumption. The environment's ends are the
+/// harness closing or relinking a link, a scripted peer closing its own
+/// connection (its `PeerClosed`), and the harness starting to stop the
+/// node. Anything the node under test ends is the node's: a session its
+/// reactor ends, refuses or retires, or a run loop that stops taking work.
+/// A node-side end answers nothing, so its obligation runs to its deadline
+/// or to the run's settled end and is violated there. Otherwise a node that
+/// drops the peer it owes, or wedges, would read as inconclusive, and
+/// that's the denial of service these properties exist to catch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndedBy {
+    /// One of the environment's ends listed above.
+    Environment,
+    /// The node under test.
+    Node,
+}
+
+impl EndedBy {
+    /// What this end means for an obligation that waits on what ended:
+    /// the environment's discharges it, and the node's is unrelated.
+    pub fn answer(self) -> FactAnswer {
+        match self {
+            EndedBy::Environment => FactAnswer::Discharges,
+            EndedBy::Node => FactAnswer::Unrelated,
+        }
+    }
+}
+
 /// What one view-side fact means for an obligation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FactAnswer {
     /// Nothing.
     Unrelated,
     /// It discharges the obligation, under the obligation's [`Cardinality`].
+    /// An end discharges only as [`EndedBy`] allows.
     Discharges,
     /// It moves a `BeforeQuiescence` obligation's deadline to this instant.
     /// From then on, the obligation no longer expires at quiescence, but at

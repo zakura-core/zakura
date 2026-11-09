@@ -41,6 +41,7 @@ async fn rpc_server_spawn() {
         cookie_dir: Default::default(),
         cookie_file_name: ".cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin: false,
         max_response_body_size: Default::default(),
         tls: None,
     };
@@ -116,6 +117,7 @@ async fn rpc_spawn_unallocated_port(do_shutdown: bool) {
         cookie_dir: Default::default(),
         cookie_file_name: ".cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin: false,
         max_response_body_size: Default::default(),
         tls: None,
     };
@@ -180,6 +182,7 @@ async fn rpc_server_spawn_port_conflict() {
         cookie_dir: Default::default(),
         cookie_file_name: ".cookie".to_string(),
         enable_cookie_auth: false,
+        allow_unauthenticated_admin: false,
         max_response_body_size: Default::default(),
         tls: None,
     };

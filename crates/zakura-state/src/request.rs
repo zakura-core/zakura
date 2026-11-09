@@ -627,12 +627,18 @@ pub struct FinalizedBlock {
     pub(super) treestate: Treestate,
     /// This block's deferred pool value balance change.
     pub(super) deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    /// The UTXOs spent by this block, if contextual validation already resolved them.
+    ///
+    /// When present, this contains the UTXO spent by every transparent input in the block, so
+    /// the finalized state doesn't read them from the database again. Checkpoint-verified
+    /// blocks don't have them, so their spent UTXOs are read from the database.
+    pub(super) spent_outputs: Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>>,
 }
 
 impl FinalizedBlock {
     /// Constructs [`FinalizedBlock`] from [`CheckpointVerifiedBlock`] and its [`Treestate`].
     pub fn from_checkpoint_verified(block: CheckpointVerifiedBlock, treestate: Treestate) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate)
+        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate, None)
     }
 
     /// Constructs [`FinalizedBlock`] from [`ContextuallyVerifiedBlock`] and its [`Treestate`].
@@ -640,11 +646,22 @@ impl FinalizedBlock {
         block: ContextuallyVerifiedBlock,
         treestate: Treestate,
     ) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate)
+        let spent_outputs = Arc::clone(&block.spent_outputs);
+
+        Self::from_semantically_verified(
+            SemanticallyVerifiedBlock::from(block),
+            treestate,
+            Some(spent_outputs),
+        )
     }
 
-    /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`] and its [`Treestate`].
-    fn from_semantically_verified(block: SemanticallyVerifiedBlock, treestate: Treestate) -> Self {
+    /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`], its [`Treestate`], and
+    /// the UTXOs it spends, if contextual validation already resolved them.
+    fn from_semantically_verified(
+        block: SemanticallyVerifiedBlock,
+        treestate: Treestate,
+        spent_outputs: Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>>,
+    ) -> Self {
         Self {
             block: block.block,
             hash: block.hash,
@@ -653,6 +670,7 @@ impl FinalizedBlock {
             transaction_hashes: block.transaction_hashes,
             treestate,
             deferred_pool_balance_change: block.deferred_pool_balance_change,
+            spent_outputs,
         }
     }
 }
@@ -1940,6 +1958,18 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BlockAndSize(None)`](ReadResponse::BlockAndSize) otherwise.
     BlockAndSize(HashOrHeight),
 
+    /// Looks up the Zcash consensus serialization of a block by hash or height
+    /// in the current best chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::RawBlock(Some(OwnedRawBlock))`](ReadResponse::RawBlock) if the block is in the best chain;
+    /// * [`ReadResponse::RawBlock(None)`](ReadResponse::RawBlock) otherwise.
+    ///
+    /// Finalized blocks are read from their stored bytes without decoding them.
+    /// Like [`ReadRequest::Block`], a block whose body was pruned is not found.
+    RawBlock(HashOrHeight),
+
     /// Looks up a block header by hash or height in the current best chain.
     ///
     /// Returns
@@ -1962,11 +1992,26 @@ pub enum ReadRequest {
     ///
     /// Returns
     ///
-    /// * [`ReadResponse::AnyChainTransaction(Some(AnyTx))`](ReadResponse::AnyChainTransaction)
+    /// * [`ReadResponse::AnyChainTransaction(Some((AnyTx, OwnedRawTransaction)))`](ReadResponse::AnyChainTransaction)
     ///   if the transaction is in any chain;
     /// * [`ReadResponse::AnyChainTransaction(None)`](ReadResponse::AnyChainTransaction)
     ///   otherwise.
+    ///
+    /// The response carries the transaction's Zcash consensus serialization, so
+    /// callers that need it do not serialize the transaction again. Finalized
+    /// transactions return their stored bytes.
     AnyChainTransaction(transaction::Hash),
+
+    /// Looks up the Zcash consensus serialization of a transaction by hash in any chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::RawTransaction(Some(OwnedRawTransaction))`](ReadResponse::RawTransaction)
+    ///   if the transaction is in any chain;
+    /// * [`ReadResponse::RawTransaction(None)`](ReadResponse::RawTransaction) otherwise.
+    ///
+    /// Finalized transactions are read from their stored bytes without decoding them.
+    AnyChainRawTransaction(transaction::Hash),
 
     /// Looks up the transaction IDs for a block, using a block hash or height.
     ///
@@ -1993,6 +2038,15 @@ pub enum ReadRequest {
     ///
     /// Returned txids are in the order they appear in the block.
     AnyChainTransactionIdsForBlock(HashOrHeight),
+
+    /// Looks up which of the given transaction IDs are mined in the current best chain.
+    ///
+    /// Returns [`ReadResponse::MinedTransactionIds`] with the subset of the
+    /// requested IDs that are in the best chain.
+    ///
+    /// Only the transaction indexes are read, so the transactions are not read
+    /// or decoded. The cost is one index lookup per requested ID.
+    MinedTransactionIds(HashSet<transaction::Hash>),
 
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
@@ -2423,11 +2477,14 @@ impl ReadRequest {
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
             ReadRequest::BlockAndSize(_) => "block_and_size",
+            ReadRequest::RawBlock(_) => "raw_block",
             ReadRequest::BlockHeader(_) => "block_header",
             ReadRequest::Transaction(_) => "transaction",
             ReadRequest::AnyChainTransaction(_) => "any_chain_transaction",
+            ReadRequest::AnyChainRawTransaction(_) => "any_chain_raw_transaction",
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
+            ReadRequest::MinedTransactionIds(_) => "mined_transaction_ids",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             ReadRequest::CheckParentInputs { .. } => "check_parent_inputs",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",

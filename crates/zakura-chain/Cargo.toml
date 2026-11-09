@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "13.0.1"
+version = "14.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -98,7 +98,6 @@ rayon = { workspace = true }
 ref-cast = { workspace = true }
 
 # ZF deps
-ed25519-zebra = { workspace = true }
 redjubjub = { workspace = true }
 reddsa = { workspace = true }
 

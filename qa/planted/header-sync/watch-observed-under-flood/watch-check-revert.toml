@@ -1,0 +1,13 @@
+# #1566 reverted: a turn no longer checks the committed watch before it
+# takes its events. Under the wire flood the `select!`'s events arm always
+# wins over its watch arm, so the input's commit is never read from the
+# watch, and the reactor takes a third wire event first. The commit comes
+# as the held locator completes, and that completion refreshes the
+# snapshot within two wire events, so the state is adopted in time.
+input = "crates/zakura-sim/tests/fixtures/header-flood-wire.bin"
+# Besides reactor.rs, which the patch changes, the session receiver and the
+# queues decide how fast wire events arrive and when the commit lands.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The revert starves the watch under either queue, so a campaign input
+# whose other queue reaches its third event first breaks that rule instead.
+also_violates = ["header-sync/watch-observed-under-lifecycle-flood"]

@@ -103,7 +103,7 @@ use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture}
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     authority::{Authority, AuthorityEvidence},
-    capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
+    capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     chain_effect::{ChainEffect, ChainEffectEvidence, EngineAt},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
@@ -970,6 +970,7 @@ impl ReactorTap {
             let cooldowns = cooldowns.clone();
             move || cooldowns.freeze()
         });
+        let wake_sessions = sessions.clone();
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -997,7 +998,7 @@ impl ReactorTap {
                 teardown_claims: Mutex::default(),
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
-                wake: Mutex::new(WakeCheck::new(WakeEvidence::default())),
+                wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
                 round_life: Mutex::default(),
                 chain_effect: Mutex::default(),
                 authority: Mutex::default(),
@@ -1137,7 +1138,8 @@ impl ReactorTap {
             .state
             .wake
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
+            .unwrap_or_else(PoisonError::into_inner) =
+            WakeCheck::new(wake, self.state.sessions.clone());
     }
 
     /// Checks from now on that this reactor's work follows the resets it
@@ -1329,31 +1331,27 @@ impl ReactorTap {
             compared: matches!(expected, Expected::Live { accounted: Some(_) }),
             teardown: gone,
         });
-        match capacity::check(&probe, read, expected) {
-            Ok(()) => Ok(()),
-            Err(Broken::Claim(claim, detail)) => {
-                // Every teardown read is checked, since storage can still
-                // hold a permit when the reactor goes and return it later,
-                // but each teardown claim is reported once.
-                let mut seen = self
-                    .state
-                    .teardown_claims
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if !gone || !seen.contains(&claim) {
-                    if gone {
-                        seen.push(claim);
-                    }
-                    self.state.claims.record(ClaimRecord {
-                        step,
-                        claim,
-                        detail,
-                    });
+        // Every teardown read is checked, since storage can still hold a
+        // permit when the reactor goes and return it later, but each
+        // teardown claim is reported once.
+        let mut seen = self
+            .state
+            .teardown_claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (claim, detail) in capacity::check(Limits::of(&probe), read, expected)? {
+            if !gone || !seen.contains(&claim) {
+                if gone {
+                    seen.push(claim);
                 }
-                Ok(())
+                self.state.claims.record(ClaimRecord {
+                    step,
+                    claim,
+                    detail,
+                });
             }
-            Err(Broken::Integrity(detail)) => Err(detail),
         }
+        Ok(())
     }
 
     /// Takes the reservations and admissions recorded since the last call,

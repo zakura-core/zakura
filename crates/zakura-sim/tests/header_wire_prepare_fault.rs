@@ -19,7 +19,7 @@ use support::{
 };
 use zakura_sim::{
     harness::{
-        header_node::adoption::Acceptance,
+        header_node::fault::FaultEnd,
         header_sync::{StorageView, WirePorts, WireScenario, HEADER_FAULT_PENALIZED},
         run_prepared, HarnessError, Subsystem,
     },
@@ -169,7 +169,7 @@ fn assert_penalized(label: &str, report: &RunReport, view: &StorageView) -> Shap
     );
     assert_eq!(
         view.faults.penalized(report.log.entries()),
-        Acceptance::Holds,
+        FaultEnd::default(),
         "{label}"
     );
     let shape = shape(report);

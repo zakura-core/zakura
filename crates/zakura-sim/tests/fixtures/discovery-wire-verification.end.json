@@ -1,0 +1,1 @@
+{"end":{"outcome":"budget","steps":30007,"drain":{"steps":7,"exhausted":false},"cleanup":{"cancelled":5,"panicked":0,"unwound":0,"unwind_failures":0,"leaked":0,"timers_left":3},"properties":[{"property":"sim/no-task-panic","outcome":{"held":{"applicable":30007}}},{"property":"sim/no-livelock","outcome":"not-applicable"}]}}

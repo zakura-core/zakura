@@ -10,13 +10,13 @@
 //!   state exactly as it was. One that only raises a resource-stall alarm
 //!   inserts nothing.
 //! - **Success.** After any other apply, and after every reset, each held
-//!   header is eligible exactly when neither it nor an ancestor stands
-//!   invalidated by the port's `Reset` facts and not reconsidered. The
-//!   stored selected projection is the ancestry from the finalized anchor
-//!   to its own tip, each entry the parent of the next by its header, and
-//!   the verified projection is unchanged, since header applies and resets
-//!   never verify bodies. Which tip is selected is
-//!   `expected-chain-selected`'s.
+//!   node's stored header hashes to its key, and each held header is
+//!   eligible exactly when neither it nor an ancestor stands invalidated by
+//!   the port's `Reset` facts and not reconsidered. The stored selected
+//!   projection is the ancestry from the finalized anchor to its own tip,
+//!   each entry the parent of the next by its header, and the verified
+//!   projection is unchanged, since header applies and resets never verify
+//!   bodies. Which tip is selected is `expected-chain-selected`'s.
 
 use std::collections::{HashMap, HashSet};
 
@@ -152,6 +152,17 @@ impl Contents {
     /// the verified projection.
     fn judge_state(&self, before: &DurableState, after: &DurableState, found: &mut Vec<String>) {
         let nodes = &after.graph.nodes;
+        let mut misfiled: Vec<String> = nodes
+            .iter()
+            .filter(|(key, node)| node.hash != **key || node.header.hash() != **key)
+            .map(|(key, _)| hash(*key))
+            .collect();
+        misfiled.sort_unstable();
+        if !misfiled.is_empty() {
+            found.push(format!(
+                "left {misfiled:?} holding a header that doesn't hash to its own key"
+            ));
+        }
         let invalidated: HashSet<&str> = self.invalidated.iter().map(String::as_str).collect();
         let mut wrong: Vec<String> = nodes
             .values()

@@ -24,6 +24,7 @@ pub mod chain_effect;
 pub mod claim;
 pub mod ends;
 pub mod fault;
+pub mod fork_choice;
 pub mod hold_wake;
 pub mod outstanding;
 mod pair;

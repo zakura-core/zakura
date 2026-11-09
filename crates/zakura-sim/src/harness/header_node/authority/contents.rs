@@ -87,8 +87,9 @@ impl Contents {
         }
     }
 
-    /// Judges one engine `run`.
-    pub(super) fn run(&mut self, run: &EngineRun) {
+    /// Judges one engine `run`, returning whether it found the run left the
+    /// engine's durable state other than its rules allow.
+    pub(super) fn run(&mut self, run: &EngineRun) -> bool {
         let EngineRun {
             kind,
             clock,
@@ -110,8 +111,9 @@ impl Contents {
                          state",
                         id.0
                     ));
+                    return true;
                 }
-                return;
+                return false;
             }
         };
         let mut found = Vec::new();
@@ -220,10 +222,12 @@ impl Contents {
         if success {
             self.judge_state(*clock, before, after, reset.as_ref(), &mut found);
         }
+        let broke = !found.is_empty();
         for detail in found {
             self.breaks
                 .push(format!("CommitOnlyAuthorized: {what} {detail}"));
         }
+        broke
     }
 
     /// Judges the durable state `after` a successful run, field by field:

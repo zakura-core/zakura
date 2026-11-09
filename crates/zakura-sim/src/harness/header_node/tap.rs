@@ -108,6 +108,7 @@ use super::{
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
+    fork_choice::{ForkChoice, ForkChoiceEvidence},
     outstanding::{HeldHeaders, Outstanding, OutstandingEvidence},
     pair::{PairError, Pairer},
     policy::LinkEffect,
@@ -217,6 +218,9 @@ struct TapState {
     /// Checks the reactor's growable containers. None until
     /// [`ReactorTap::watch_outstanding`].
     outstanding: Mutex<Option<Outstanding>>,
+    /// Checks that the engine selects a max-work eligible tip of what it
+    /// holds. None until [`ReactorTap::watch_fork_choice`].
+    fork_choice: Mutex<Option<ForkChoice>>,
     /// Checks rounds' owner binding and pages' paths. None until
     /// [`ReactorTap::watch_authority`].
     authority: Mutex<Option<Authority>>,
@@ -444,6 +448,25 @@ impl TapState {
             self.claims.record(ClaimRecord {
                 step,
                 claim: Claim::PeerRetirementProgress,
+                detail,
+            });
+        }
+        let selected = match self
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            Some(selection) => selection.drain(step).unwrap_or_else(|error| {
+                broken.get_or_insert(error);
+                selection.take_breaks()
+            }),
+            None => Vec::new(),
+        };
+        for detail in selected {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::ExpectedChainSelected,
                 detail,
             });
         }
@@ -1185,6 +1208,7 @@ impl ReactorTap {
                 round_life: Mutex::default(),
                 chain_effect: Mutex::default(),
                 outstanding: Mutex::default(),
+                fork_choice: Mutex::default(),
                 authority: Mutex::default(),
                 retirement: Mutex::default(),
             }))
@@ -1236,20 +1260,32 @@ impl ReactorTap {
         (observer, tap)
     }
 
-    /// Hands the authority check each apply's, reset's and harness commit's
-    /// engine run that the header storage source just logged.
+    /// Hands the authority and fork-choice checks each apply's, reset's and
+    /// harness commit's engine run that the header storage source just
+    /// logged, in order. A run the authority check's commit-contents rules
+    /// find corrupt taints fork choice from then on
+    /// ([`super::fork_choice`]).
     pub(crate) fn engine_runs(
         &self,
         runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
     ) {
-        if let Some(authority) = self
+        let mut authority = self
             .state
             .authority
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-        {
-            authority.engine_runs(runs.iter().map(|(_, run)| run.as_ref()));
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut selection = self
+            .state
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (_, run) in runs {
+            let corrupt = authority
+                .as_mut()
+                .is_some_and(|authority| authority.engine_run(run));
+            if let Some(selection) = selection.as_mut() {
+                selection.run(run, corrupt);
+            }
         }
     }
 
@@ -1336,6 +1372,17 @@ impl ReactorTap {
             .as_mut()
         {
             authority.storage(facts.iter().map(|(_, fact)| *fact));
+        }
+        if let Some(selection) = self
+            .state
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (_, fact) in &facts {
+                selection.storage(fact);
+            }
         }
         self.pairer.facts(facts);
     }
@@ -1427,6 +1474,42 @@ impl ReactorTap {
             .chain_effect
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(ChainEffect::new(evidence, engine));
+    }
+
+    /// Checks from now on that the node's engine selects a max-work eligible
+    /// tip of the headers it holds, placed among `fixture`'s headers on
+    /// `branches`, as [`super::fork_choice`] describes, keeping when the
+    /// check applied in `evidence`. It first judges the engine as it is
+    /// now, before the reactor starts, with the headers it holds admitted
+    /// at `preloaded_at`, the clock they were committed at. Call it before
+    /// the run starts. A harness that calls it must hand the tap the node's
+    /// storage facts and engine runs.
+    pub fn watch_fork_choice(
+        &self,
+        evidence: ForkChoiceEvidence,
+        fixture: HeaderFixture,
+        branches: impl IntoIterator<Item = u8>,
+        preloaded_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let port = self
+            .state
+            .port
+            .upgrade()
+            .expect("the tap's port outlives its harness's setup");
+        let engine = port.engine();
+        let check = ForkChoice::new(
+            evidence,
+            fixture,
+            branches,
+            &engine.durable_state(),
+            &engine.snapshot(),
+            preloaded_at,
+        );
+        *self
+            .state
+            .fork_choice
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(check);
     }
 
     /// Checks from now on that each round's owner is bound to its `Open`

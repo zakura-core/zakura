@@ -1201,6 +1201,51 @@ fn prepared_target_follows_the_scenario_clock() {
     }
 }
 
+/// A node preloaded with all 150 headers before the run, under a scenario
+/// clock that would defer its last 100: the preload ran on the host clock,
+/// before any run, so every header was admitted valid and the engine keeps
+/// its tip at 150. `header-sync/expected-chain-selected` judges the seed's
+/// admissions at the preload's clock, not the run's, so it holds.
+#[test]
+fn a_preloaded_chain_keeps_its_admission_clock() {
+    let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
+    let scenario = Probed {
+        storage: StorageScenario {
+            node: Chain::main(CLOCK_HEADERS),
+            mirrors: vec![mirror(Chain::main(CLOCK_HEADERS), Dialer::Mirror)],
+            ..StorageScenario::default()
+        },
+        probe: Probe::Idle,
+        utc_origin: Some(origin_deferring(&fixture, 100)),
+        budget: None,
+    };
+    for input in inputs(4, 256) {
+        let ready = Probing::prepare(&scenario);
+        let port = ready.ports.node.clone();
+        let report =
+            run_prepared::<Probing>(&scenario, ready, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert_eq!(
+            port.engine().snapshot().frontiers.header_best.height.0,
+            CLOCK_HEADERS
+        );
+        let selected = report
+            .properties
+            .iter()
+            .find(|reported| reported.property == "header-sync/expected-chain-selected")
+            .expect("the property reports");
+        assert!(
+            matches!(
+                selected.outcome,
+                zakura_sim::check::PropertyOutcome::Held { applicable } if applicable > 0
+            ),
+            "{:?}",
+            selected.outcome
+        );
+    }
+}
+
 /// The node syncs 150 headers from `mirror-0` with the scenario clock set so
 /// the last ones are more than 2 h ahead. Its first apply is held until 20 s
 /// into the run, so admission sees a later clock than preparation did and

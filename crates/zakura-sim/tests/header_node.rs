@@ -311,6 +311,7 @@ impl HasView for Planted {
             authority: Default::default(),
             outstanding: Default::default(),
             recovery: Default::default(),
+            fork_choice: Default::default(),
         }
     }
 }

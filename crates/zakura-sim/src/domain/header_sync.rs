@@ -14,6 +14,7 @@ use crate::{
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
         ends::{EndEvidence, EndFact, EnvironmentAction},
+        fork_choice::ForkChoiceEvidence,
         hold_wake::{HoldWakeEvidence, HoldWakeFact},
         outstanding::OutstandingEvidence,
         retirement::{HandoffFact, RetirementEvidence},
@@ -543,6 +544,85 @@ where
 /// [`STALE_CHAIN_EFFECT_INERT`]'s trigger history: the check applied.
 fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
     view.chain_effect().any()
+}
+
+/// The node's engine selects a max-work eligible tip of the headers it
+/// holds, and scores it with its work above the anchor.
+pub const EXPECTED_CHAIN_SELECTED: &str = "header-sync/expected-chain-selected";
+
+/// What the fork-choice check reads: one reactor's claim breaks and when
+/// the check first applied.
+pub trait ForkView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the node's fork-choice check first applied.
+    fn fork_choice(&self) -> &ForkChoiceEvidence;
+}
+
+/// [`EXPECTED_CHAIN_SELECTED`], as a harness whose view is a [`ForkView`]
+/// registers it.
+pub fn expected_chain_selected<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: ForkView,
+{
+    Property {
+        id: PropertyId::new(EXPECTED_CHAIN_SELECTED),
+        claim: "at every engine snapshot record, the node's engine selects a max-work eligible \
+                tip of the headers it holds, by the fixture's work and the resets in force, \
+                with any max-work tip allowed on a tie, and scores it with that tip's work \
+                above the anchor",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_expected_chain_selected::<S>,
+        witness: Some(TriggerHistory::View(fork_choice_applied::<S::View>)),
+    }
+}
+
+/// Checks [`EXPECTED_CHAIN_SELECTED`] at the boundary after a step.
+///
+/// The tap's fork-choice check
+/// ([`crate::harness::header_node::fork_choice`]) judges the engine before
+/// the run and the record each apply's, reset's and harness commit's engine
+/// run left. A break the step's drain found violates at once. It applies
+/// once a drain judged a record, until a drain found a run corrupt.
+fn check_expected_chain_selected<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: ForkView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the engine selects a max-work eligible tip, scored with its work";
+    let mut breaks = view
+        .claims()
+        .at(step, &[Claim::ExpectedChainSelected])
+        .into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    // A corrupt engine state is `commit-only-authorized`'s, and nothing
+    // after it is judged here, so no later step counts as passed.
+    if view.fork_choice().tainted_by(step) {
+        return Verdict::NotApplicable;
+    }
+    if view.fork_choice().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`EXPECTED_CHAIN_SELECTED`]'s trigger history: the check judged a
+/// record.
+fn fork_choice_applied<V: ForkView>(view: &V, _: &ObservationLog) -> bool {
+    view.fork_choice().any()
 }
 
 /// The node stages, prepares and commits only headers it asked for, and

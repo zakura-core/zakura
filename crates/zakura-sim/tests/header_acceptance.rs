@@ -1290,6 +1290,24 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
         ),
         (
             STORAGE,
+            "tests/header_chain_selected.rs",
+            "every_witness_holds_and_applies",
+            Some("header-sync/expected-chain-selected"),
+            [
+                "stronger-first ",
+                "stronger-last ",
+                "three-forks ",
+                "equal-work ",
+                "heavier-offered-to-longer ",
+                "invalidated-then-reconsidered ",
+                "harness-commit ",
+            ]
+            .iter()
+            .flat_map(|name| plans(name, "inputs(8, 256)", 8))
+            .collect(),
+        ),
+        (
+            STORAGE,
             "tests/header_outstanding.rs",
             "the_committed_witnesses_hold_outstanding_work_bounded",
             Some("header-sync/outstanding-work-bounded"),

@@ -47,6 +47,7 @@ use super::{
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
+        fork_choice::ForkChoiceEvidence,
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
@@ -71,12 +72,13 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, commit_only_authorized, outstanding_end_violations,
-            outstanding_work_bounded, peer_retirement_progress, reset_invalidates_work,
-            retirement_end_violations, stale_chain_effect_inert, stale_completion_inert,
-            teardown_end_violations, teardown_returns_baseline, AdoptionView, AuthorityView,
-            BudgetView, ChainView, HoldWakeView, OutstandingView, ResetView, RetirementView,
-            StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
+            chunk_budget_bound, commit_only_authorized, expected_chain_selected,
+            outstanding_end_violations, outstanding_work_bounded, peer_retirement_progress,
+            reset_invalidates_work, retirement_end_violations, stale_chain_effect_inert,
+            stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
+            AdoptionView, AuthorityView, BudgetView, ChainView, ForkView, HoldWakeView,
+            OutstandingView, ResetView, RetirementView, StaleView, TeardownView, WakeView,
+            OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -559,6 +561,9 @@ pub struct Ports {
     pub fixture: HeaderFixture,
     /// The node's controlled port.
     pub node: Arc<ControlledPort>,
+    /// The clock the node's chain was preloaded at, before the run, which
+    /// its headers' admission read: the host's, since no run had started.
+    pub preloaded_at: chrono::DateTime<chrono::Utc>,
     /// Each mirror's engine port, in scenario order.
     pub mirrors: Vec<Arc<EnginePort>>,
     /// The node's session view, which its tap and links fill during the run.
@@ -607,6 +612,9 @@ pub struct Ports {
     /// The mirror whose first page on each link the harness holds back.
     /// `None` unless whoever prepared the ports set one.
     pub delayed_page: Option<DelayedPage>,
+    /// When the node's fork-choice check first applied, which its tap finds
+    /// during the run.
+    pub fork_choice: ForkChoiceEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -643,6 +651,8 @@ pub struct Storage {
     authority: AuthorityEvidence,
     /// The reactor's container peaks, from its tap.
     outstanding: OutstandingEvidence,
+    /// When the node's fork-choice check first applied, from its tap.
+    fork_choice: ForkChoiceEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -704,6 +714,21 @@ pub struct StorageView {
     /// Each of the reactor's container peaks, and when the outstanding-work
     /// rule first applied.
     pub outstanding: OutstandingEvidence,
+    /// When the node's fork-choice check first applied. A harness that
+    /// doesn't run the check leaves it never applied.
+    pub fork_choice: ForkChoiceEvidence,
+}
+
+impl ForkView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::fork_choice`].
+    fn fork_choice(&self) -> &ForkChoiceEvidence {
+        &self.fork_choice
+    }
 }
 
 impl AuthorityView for StorageView {
@@ -867,6 +892,7 @@ impl HasView for Storage {
             authority: self.authority.clone(),
             outstanding: self.outstanding.clone(),
             recovery: self.recovery.clone(),
+            fork_choice: self.fork_choice.clone(),
         }
     }
 
@@ -984,6 +1010,9 @@ impl Subsystem for Storage {
         }
         let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
+        // Read just before, so a header the preload defers is deferred at
+        // this clock too, short of a deadline inside the preload itself.
+        let preloaded_at = zakura_rt::time::utc_now().into();
         preload(node.engine(), &fixture, &scenario.node);
         let mirrors = scenario
             .mirrors
@@ -997,6 +1026,7 @@ impl Subsystem for Storage {
         Ports {
             fixture,
             node,
+            preloaded_at,
             mirrors,
             sessions: SessionEvidence::default(),
             reservations: ReservationEvidence::default(),
@@ -1013,6 +1043,7 @@ impl Subsystem for Storage {
             outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
             delayed_page: None,
+            fork_choice: ForkChoiceEvidence::default(),
         }
     }
 
@@ -1051,13 +1082,25 @@ impl Subsystem for Storage {
         tap.watch_rounds(ports.round_life.clone());
         tap.watch_retirement(ports.retirement.clone());
         tap.watch_chain(ports.chain_effect.clone());
-        let branches = scenario
+        let branches: Vec<u8> = scenario
             .mirrors
             .iter()
             .flat_map(|mirror| mirror.chain.branches())
-            .chain(scenario.node.branches());
-        tap.watch_authority(ports.authority.clone(), ports.fixture.clone(), branches, []);
+            .chain(scenario.node.branches())
+            .collect();
+        tap.watch_authority(
+            ports.authority.clone(),
+            ports.fixture.clone(),
+            branches.clone(),
+            [],
+        );
         tap.watch_outstanding(ports.outstanding.clone(), storage_peer_limit());
+        tap.watch_fork_choice(
+            ports.fork_choice.clone(),
+            ports.fixture.clone(),
+            branches,
+            ports.preloaded_at,
+        );
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1154,6 +1197,7 @@ impl Subsystem for Storage {
             chain_effect: ports.chain_effect,
             authority: ports.authority,
             outstanding: ports.outstanding,
+            fork_choice: ports.fork_choice,
             ends,
             stamps,
             faults,
@@ -1408,6 +1452,8 @@ impl HasView for HeaderWire {
             // The wire harness doesn't register outstanding-work-bounded.
             outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
+            // The wire harness doesn't judge fork choice.
+            fork_choice: ForkChoiceEvidence::default(),
         }
     }
 
@@ -1909,8 +1955,9 @@ pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
 /// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
 /// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`],
-/// [`COMMIT_ONLY_AUTHORIZED`] and [`PEER_RETIREMENT_PROGRESS`], all active. A test harness that wraps [`Storage`] with its view registers
-/// them too.
+/// [`COMMIT_ONLY_AUTHORIZED`], [`PEER_RETIREMENT_PROGRESS`] and
+/// [`EXPECTED_CHAIN_SELECTED`], all active. A test harness that wraps
+/// [`Storage`] with its view registers them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
 /// [`TEARDOWN_RETURNS_BASELINE`]: crate::domain::header_sync::TEARDOWN_RETURNS_BASELINE
@@ -1919,6 +1966,7 @@ pub fn recovery_assumptions(source: &str) -> Vec<AssumeRecord> {
 /// [`STALE_CHAIN_EFFECT_INERT`]: crate::domain::header_sync::STALE_CHAIN_EFFECT_INERT
 /// [`COMMIT_ONLY_AUTHORIZED`]: crate::domain::header_sync::COMMIT_ONLY_AUTHORIZED
 /// [`PEER_RETIREMENT_PROGRESS`]: crate::domain::header_sync::PEER_RETIREMENT_PROGRESS
+/// [`EXPECTED_CHAIN_SELECTED`]: crate::domain::header_sync::EXPECTED_CHAIN_SELECTED
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1950,6 +1998,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         commit_only_authorized(),
         outstanding_work_bounded(),
         peer_retirement_progress(),
+        expected_chain_selected(),
     ]
 }
 
@@ -2383,6 +2432,7 @@ mod tests {
                 authority: AuthorityEvidence::default(),
                 outstanding: OutstandingEvidence::default(),
                 recovery: RecoveryEvidence::default(),
+                fork_choice: ForkChoiceEvidence::default(),
             }
         }
     }

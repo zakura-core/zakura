@@ -285,6 +285,21 @@ pub static NA_REASONS: &[NaProducer] = &[
     },
     NaProducer {
         file: "src/domain/header_sync.rs",
+        function: "check_expected_chain_selected",
+        fingerprint: "fa57cd17d676c4e1",
+        constructions: &[
+            step(
+                "a corrupt engine state, which commit-only-authorized owns, tainted the fork-choice evidence by this step",
+                RETURN,
+            ),
+            step(
+                "no fork-choice step had applied by this step",
+                TAIL,
+            ),
+        ],
+    },
+    NaProducer {
+        file: "src/domain/header_sync.rs",
         function: "check_outstanding_work_bounded",
         fingerprint: "4722d816dec8d8c8",
         constructions: &[step(

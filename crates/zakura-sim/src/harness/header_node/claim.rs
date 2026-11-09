@@ -60,6 +60,9 @@ pub enum Claim {
     /// An apply changed the engine under an older generation or anchor, or
     /// the reactor's adoption moved back ([`super::chain_effect`]).
     StaleChainEffect,
+    /// The engine selected other than a max-work eligible tip of what it
+    /// holds, or scored its tip wrongly ([`super::fork_choice`]).
+    ExpectedChainSelected,
     /// A round's owner isn't bound to its `Open`, a staged page isn't on
     /// its requested path ([`super::authority`]), or the node admitted a
     /// session under another identity than its link's.

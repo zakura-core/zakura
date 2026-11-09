@@ -204,6 +204,12 @@ run = false
 reason = "a tool, not a test: it rewrites the planted cases' scenarios"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_chain_selected.rs"
+test = "regenerate_selection_witnesses"
+run = false
+reason = "a tool, not a test: it rewrites the committed selection witnesses from their builders"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_storage_seeds.rs"
 test = "regenerate_storage_seeds"
 run = false
@@ -458,12 +464,6 @@ id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/expected-chain-selected"
-kind = "property"
-owner = "H4"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
 id = "header-sync/state-publication-consistent"

@@ -389,7 +389,8 @@ fn a_start_from_an_unreported_read_is_missing_evidence() {
 /// reports it ahead of the failure.
 #[test]
 fn a_break_survives_missing_evidence() {
-    let mut check = RoundLife::new(RoundLifeEvidence::default(), 1);
+    let evidence = RoundLifeEvidence::default();
+    let mut check = RoundLife::new(evidence.clone(), 1);
     check.storage(&[reset(1)], 1);
     for event in [
         adopted(1),
@@ -404,6 +405,10 @@ fn a_break_survives_missing_evidence() {
     assert!(
         matches!(&found[..], [only] if only.contains("left the header generation at 1")),
         "{found:?}"
+    );
+    assert!(
+        evidence.applicable_by(1),
+        "the break keeps its trigger history"
     );
 }
 

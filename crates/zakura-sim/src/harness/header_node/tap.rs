@@ -101,7 +101,7 @@ use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
-    capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
+    capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
@@ -1116,31 +1116,27 @@ impl ReactorTap {
             compared: matches!(expected, Expected::Live { accounted: Some(_) }),
             teardown: gone,
         });
-        match capacity::check(&probe, read, expected) {
-            Ok(()) => Ok(()),
-            Err(Broken::Claim(claim, detail)) => {
-                // Every teardown read is checked, since storage can still
-                // hold a permit when the reactor goes and return it later,
-                // but each teardown claim is reported once.
-                let mut seen = self
-                    .state
-                    .teardown_claims
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if !gone || !seen.contains(&claim) {
-                    if gone {
-                        seen.push(claim);
-                    }
-                    self.state.claims.record(ClaimRecord {
-                        step,
-                        claim,
-                        detail,
-                    });
+        // Every teardown read is checked, since storage can still hold a
+        // permit when the reactor goes and return it later, but each
+        // teardown claim is reported once.
+        let mut seen = self
+            .state
+            .teardown_claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (claim, detail) in capacity::check(Limits::of(&probe), read, expected)? {
+            if !gone || !seen.contains(&claim) {
+                if gone {
+                    seen.push(claim);
                 }
-                Ok(())
+                self.state.claims.record(ClaimRecord {
+                    step,
+                    claim,
+                    detail,
+                });
             }
-            Err(Broken::Integrity(detail)) => Err(detail),
         }
+        Ok(())
     }
 
     /// Takes the reservations and admissions recorded since the last call,

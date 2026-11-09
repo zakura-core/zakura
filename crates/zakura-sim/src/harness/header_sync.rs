@@ -5,11 +5,14 @@
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1), checked by header sync's generated table properties
 //! and `session/honest-never-punished` (P3d). `header-sync/release-wake`
-//! runs `header-sync/storage` on the wake fixture alone.
+//! runs `header-sync/storage` on the wake fixtures alone, and
+//! `header-sync/flood` on the flood fixtures.
 
+mod flood;
 pub mod grammar;
 mod release_wake;
 
+pub use flood::{Flood, FloodScenario, FLOODERS};
 pub use release_wake::{ReleaseWake, WakeScenario};
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
@@ -57,8 +60,8 @@ use crate::{
     domain::{
         header_sync::{
             chunk_budget_bound, reset_invalidates_work, stale_completion_inert,
-            teardown_end_violations, teardown_returns_baseline, BudgetView, ResetView, StaleView,
-            TeardownView, WakeView,
+            teardown_end_violations, teardown_returns_baseline, AdoptionView, BudgetView,
+            ResetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -683,6 +686,13 @@ impl StaleView for StorageView {
     /// [`StorageView::stale_calls`].
     fn stale_calls(&self) -> &StaleEvidence {
         &self.stale_calls
+    }
+}
+
+impl AdoptionView for StorageView {
+    /// [`StorageView::adoption`].
+    fn adoption(&self) -> &AdoptionEvidence {
+        &self.adoption
     }
 }
 
@@ -1625,7 +1635,7 @@ fn check_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 /// IDs and completes each at most once, after its submission, at each step
 /// that logs a submission or completion there. A check keeps no state
 /// between steps, so it replays the node's facts from the run's start, and
-/// reports the first finding among this step's.
+/// reports every finding among this step's, in log order.
 pub(crate) fn check_service_operation_ids<S: HasView>(
     service: &str,
     cx: &mut CheckCtx<'_, S>,
@@ -1637,17 +1647,25 @@ pub(crate) fn check_service_operation_ids<S: HasView>(
         return Verdict::NotApplicable;
     }
     let mut ids = OperationIds::default();
+    let mut findings = Vec::new();
     for entry in cx.log.entries() {
         let Some(fact) = operation_fact(service, &entry.obs) else {
             continue;
         };
-        if let Some((expected, actual)) = ids.check(fact) {
+        if let Some(finding) = ids.check(fact) {
             if entry.step == cx.step {
-                return cx.violated(expected, actual);
+                findings.push(finding);
             }
         }
     }
-    Verdict::Holds
+    let mut findings = findings.into_iter();
+    let Some((expected, actual)) = findings.next() else {
+        return Verdict::Holds;
+    };
+    for (expected, actual) in findings {
+        cx.record_violation(expected, actual);
+    }
+    cx.violated(expected, actual)
 }
 
 /// Checks [`DIRECT_DISPATCH`]: violated once the dispatch guard's flag is
@@ -1807,6 +1825,120 @@ mod tests {
     /// The finding `check` reports.
     fn finding(expected: &str, actual: &str) -> Option<(String, String)> {
         Some((expected.to_owned(), actual.to_owned()))
+    }
+
+    /// A harness with no view, for checks that read only the log.
+    struct Logged;
+
+    impl HasView for Logged {
+        type View = ();
+
+        /// Nothing.
+        fn view(&self) {}
+    }
+
+    /// Logs each step's scripted storage facts on the node's header
+    /// storage, from step 1, since the run also observes after setup.
+    struct Facts {
+        /// Each step's facts, in order.
+        steps: std::collections::VecDeque<Vec<StorageFact>>,
+        /// The last fact's sequence number.
+        seq: u64,
+    }
+
+    impl crate::ActionSource for Facts {
+        fn enabled(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<(crate::Identity, u64)>) {}
+
+        fn boundaries(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<crate::Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the script offers no actions");
+        }
+
+        /// Logs the next step's facts, numbered after the last ones.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            if log.step() == 0 {
+                return Ok(());
+            }
+            for fact in self.steps.pop_front().unwrap_or_default() {
+                self.seq += 1;
+                log.push(Observation::Storage {
+                    service: HEADER_SERVICE.to_owned(),
+                    instance: 0,
+                    seq: self.seq,
+                    txn: self.seq,
+                    fact,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// Runs [`OPERATION_IDS`] through the registry over one task that
+    /// yields once per step of `steps`, each step logging its facts.
+    fn run_operation_ids(steps: Vec<Vec<StorageFact>>) -> crate::RunReport {
+        let mut sim = crate::Sim::new(RunConfig::default(), crate::PlanInput::Bytes(Vec::new()));
+        let count = steps.len();
+        sim.add_source(Box::new(Facts {
+            steps: steps.into_iter().collect(),
+            seq: 0,
+        }));
+        sim.scheduler().spawn_root("reactor", async move {
+            for _ in 1..count {
+                zakura_rt::task::yield_now().await;
+            }
+        });
+        let property = Property {
+            id: PropertyId::new(OPERATION_IDS),
+            claim: "operation IDs",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Storage],
+            status: Status::Active,
+            check: check_operation_ids::<Logged>,
+            witness: None,
+        };
+        let registry = crate::property::Registry::new(vec![property]).expect("one property");
+        let mut checker = crate::property::RegistryChecker::new(
+            registry,
+            Rc::new(Logged),
+            crate::property::Assumptions::none(),
+            &Sources::observed(&[Source::Schedule, Source::Storage]),
+        );
+        sim.run(&mut checker, &mut crate::MemorySink::default())
+    }
+
+    /// Every finding at one step survives into the run's report, not just
+    /// the first: at step 2, operation 1 completes again and operation 3
+    /// completes before its submission, and step 1's facts break nothing.
+    #[test]
+    fn every_operation_id_finding_at_a_step_is_reported() {
+        let report = run_operation_ids(vec![
+            vec![submitted(1), completed(1), submitted(2)],
+            vec![completed(1), completed(3), completed(2)],
+        ]);
+        let property = &report.properties[0];
+        assert_eq!(
+            property.outcome,
+            crate::PropertyOutcome::Violated { witness: vec![2] }
+        );
+        let found = |expected: &str, actual: &str| crate::Violation {
+            property: OPERATION_IDS.to_owned(),
+            step: 2,
+            witness: vec![2],
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        };
+        assert_eq!(
+            property.violations,
+            [
+                found("operation 1 completes once", "operation 1 completed again"),
+                found(
+                    "a completion of a submitted operation, at most 2",
+                    "operation 3 completed before its submission"
+                ),
+            ]
+        );
     }
 
     /// No M4 run trips [`OPERATION_IDS`], so each of its branches gets a

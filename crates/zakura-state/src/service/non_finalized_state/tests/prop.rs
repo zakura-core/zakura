@@ -682,7 +682,6 @@ fn different_blocks_different_chains() -> Result<()> {
                 chain1.tx_loc_by_hash.clone_from(&chain2.tx_loc_by_hash);
 
                 // transparent UTXOs
-                chain1.created_utxos.clone_from(&chain2.created_utxos);
                 chain1.spent_utxos.clone_from(&chain2.spent_utxos);
 
                 // note commitment trees

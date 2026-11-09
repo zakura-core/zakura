@@ -1318,9 +1318,9 @@ async fn rpc_getblock_missing_error() {
 
     // Make the mock service respond with no block
     let response_handler = read_state
-        .expect_request(zakura_state::ReadRequest::Block(Height(0).into()))
+        .expect_request(zakura_state::ReadRequest::RawBlock(Height(0).into()))
         .await;
-    response_handler.respond(zakura_state::ReadResponse::Block(None));
+    response_handler.respond(zakura_state::ReadResponse::RawBlock(None));
 
     let block_response = block_future.await.expect("block future should not panic");
     let block_response =

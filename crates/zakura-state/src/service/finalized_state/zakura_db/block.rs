@@ -18,8 +18,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, ReadMemoryExhausted,
-    TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, OwnedRawTransaction,
+    ReadMemoryExhausted, TransactionHandle,
 };
 
 use zakura_chain::{
@@ -561,23 +561,82 @@ impl ZakuraDb {
     /// The read reserves an upper bound on the decoded transaction before decoding it,
     /// and the result keeps its charge through its final clone. Capacity refusal
     /// returns an error.
-    #[allow(clippy::unwrap_in_result)]
     pub fn transaction(
         &self,
         hash: transaction::Hash,
     ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, ReadMemoryExhausted> {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        let Some(location) = self.transaction_location(hash) else {
+        let Some((raw, height, time)) = self.raw_transaction_with_context(hash) else {
             return Ok(None);
         };
-        let Some(header) = self.block_header(location.height.into()) else {
+        let transaction = self.decode_transaction(&raw)?;
+        Ok(Some((transaction, height, time)))
+    }
+
+    /// Returns the [`Transaction`] with [`transaction::Hash`] like [`Self::transaction`],
+    /// along with its stored Zcash consensus serialization.
+    ///
+    /// The decoded transaction and its bytes each keep their read-memory charge
+    /// through their final clones. Capacity refusal returns an error.
+    #[allow(clippy::type_complexity)]
+    pub fn transaction_and_raw(
+        &self,
+        hash: transaction::Hash,
+    ) -> Result<
+        Option<(
+            TransactionHandle,
+            OwnedRawTransaction,
+            Height,
+            DateTime<Utc>,
+        )>,
+        ReadMemoryExhausted,
+    > {
+        let Some((raw, height, time)) = self.raw_transaction_with_context(hash) else {
+            return Ok(None);
+        };
+        let transaction = self.decode_transaction(&raw)?;
+        let raw = self.retain_serialized_bytes(raw.into_raw_bytes())?;
+        Ok(Some((transaction, raw, height, time)))
+    }
+
+    /// Reads the stored bytes of the transaction with `hash`, with its block
+    /// height and time, without read admission or decoding.
+    #[allow(clippy::unwrap_in_result)]
+    fn raw_transaction_with_context(
+        &self,
+        hash: transaction::Hash,
+    ) -> Option<(RawBytes, Height, DateTime<Utc>)> {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let location = self.transaction_location(hash)?;
+        let header = self.block_header(location.height.into())?;
+        let raw = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location)?;
+        Some((raw, location.height, header.time))
+    }
+
+    /// Returns the Zcash consensus serialization of the [`Transaction`] with
+    /// [`transaction::Hash`], if it exists in the finalized chain and its raw
+    /// data is available.
+    ///
+    /// The stored bytes are returned without decoding them. The result keeps its
+    /// read-memory charge through its final clone. Missing or pruned transactions
+    /// return `Ok(None)`; capacity refusal returns an error.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn raw_transaction_result(
+        &self,
+        hash: transaction::Hash,
+    ) -> Result<Option<OwnedRawTransaction>, ReadMemoryExhausted> {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let Some(location) = self.transaction_location(hash) else {
             return Ok(None);
         };
         let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
             return Ok(None);
         };
-        let transaction = self.decode_transaction(&raw)?;
-        Ok(Some((transaction, location.height, header.time)))
+        let bytes = raw.into_raw_bytes();
+        let reservation = self
+            .read_capacity
+            .memory
+            .try_reserve(byte_count(bytes.capacity()))?;
+        reservation.retain(bytes).map(Some)
     }
 
     /// Returns the [`Transaction`] with [`transaction::Hash`] like [`Self::transaction`],
@@ -1020,7 +1079,9 @@ impl ZakuraDb {
             })
             .collect();
 
-        // Get a list of the spent UTXOs, before we delete any from the database.
+        // Get the spent UTXOs before deleting any from the database. Contextual validation
+        // already resolved them for contextually verified blocks; checkpoint-verified blocks
+        // read them here.
         let outpoints: Vec<transparent::OutPoint> = finalized
             .block
             .view()
@@ -1041,7 +1102,12 @@ impl ZakuraDb {
             Option<Vec<RawBytes>>,
         ) = rayon::join(
             || {
-                if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                if let Some(spent_outputs) = &finalized.spent_outputs {
+                    outpoints
+                        .into_iter()
+                        .map(|outpoint| resolved_spent_utxo(outpoint, spent_outputs))
+                        .collect()
+                } else if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
                     use rayon::prelude::*;
                     outpoints
                         .into_par_iter()
@@ -1278,6 +1344,29 @@ fn read_spent_utxo(
         .expect("already checked UTXO was in state or block");
 
     (outpoint, out_loc, utxo)
+}
+
+/// Returns a spent transparent UTXO and its output location from the UTXOs that contextual
+/// validation resolved, without reading the database.
+///
+/// The output location comes from the height and transaction index recorded in the
+/// [`transparent::OrderedUtxo`], so this works for UTXOs created in earlier blocks and in this
+/// block.
+fn resolved_spent_utxo(
+    outpoint: transparent::OutPoint,
+    spent_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) -> (transparent::OutPoint, OutputLocation, transparent::Utxo) {
+    let ordered_utxo = spent_outputs.get(&outpoint).expect(
+        "contextual validation resolves the UTXO spent by every transparent input in the block",
+    );
+    let tx_loc =
+        TransactionLocation::from_usize(ordered_utxo.utxo.height, ordered_utxo.tx_index_in_block);
+
+    (
+        outpoint,
+        OutputLocation::from_outpoint(tx_loc, &outpoint),
+        ordered_utxo.utxo.clone(),
+    )
 }
 
 /// Lookup the output location for an outpoint.

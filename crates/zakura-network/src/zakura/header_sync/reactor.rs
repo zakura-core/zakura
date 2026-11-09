@@ -7,7 +7,7 @@ use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
     sync::{mpsc, watch, Semaphore},
-    task::JoinHandle,
+    task::{coop, JoinHandle},
     time::{self, Instant},
 };
 
@@ -107,6 +107,11 @@ use trace::{header_direction_label, ordered_send_error_label};
 const INTERNAL_VCT_REPAIR_SESSION_ID: u64 = u64::MAX;
 
 const VCT_REPAIR_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The fewest peer identities whose state outlives a session that the reactor
+/// keeps, so a node with very few connection slots still remembers its last
+/// few offenders.
+const MIN_PEER_IDENTITY_STATE: usize = 8;
 
 /// Minimum interval between unchanged header-snapshot refresh trace rows.
 ///
@@ -510,8 +515,10 @@ impl HeaderSyncReactor {
             }
             // Retire already-ready state operations before any event can enforce
             // their hard deadlines. Bound this pass to the current operation set.
+            // A spent coop budget mustn't hide one. See `a_spent_budget_hides_no_ready_completion`.
             for _ in 0..self.pending_port_operations.len() {
-                let Some(Some(completion)) = self.pending_port_operations.next().now_or_never()
+                let Some(Some(completion)) =
+                    coop::unconstrained(self.pending_port_operations.next()).now_or_never()
                 else {
                     break;
                 };
@@ -519,8 +526,9 @@ impl HeaderSyncReactor {
             }
             // Inspect watches on every turn, even when peer queues never become empty.
             // `changed` delivers a final unseen value before reporting channel closure.
+            // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
             if let Some(snapshots) = committed_snapshots.as_mut() {
-                match snapshots.changed().now_or_never() {
+                match coop::unconstrained(snapshots.changed()).now_or_never() {
                     Some(Ok(())) => {
                         let snapshot = snapshots.borrow_and_update().clone();
                         if let Some(snapshot) = snapshot {
@@ -542,7 +550,7 @@ impl HeaderSyncReactor {
                 }
             }
             if let Some(repairs) = vct_root_repairs.as_mut() {
-                match repairs.changed().now_or_never() {
+                match coop::unconstrained(repairs.changed()).now_or_never() {
                     Some(Ok(())) => {
                         let status = *repairs.borrow_and_update();
                         caused!(
@@ -1057,14 +1065,11 @@ impl HeaderSyncReactor {
                 reason,
             }
         );
-        let limits = self.startup.config.peer_limits;
         self.state.remove_session(
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
-            limits
-                .max_inbound_peers
-                .saturating_add(limits.max_outbound_peers),
+            self.admitted_peer_limit(),
         );
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
@@ -2814,6 +2819,17 @@ impl HeaderSyncReactor {
             .count()
     }
 
+    /// How many header-sync peers this node can hold at once: the inbound
+    /// plus outbound `peer_limits`, clamped to the node's admitted
+    /// connections, and at least [`MIN_PEER_IDENTITY_STATE`]. It bounds the
+    /// per-identity state that outlives a session.
+    fn admitted_peer_limit(&self) -> usize {
+        self.startup
+            .config
+            .serving_sessions(self.startup.max_connections)
+            .max(MIN_PEER_IDENTITY_STATE)
+    }
+
     fn publish_peer_state(&self) {
         let snapshot = ServicePeerSnapshot::new(
             self.admitted_count(ServicePeerDirection::Inbound),
@@ -2989,6 +3005,7 @@ impl HeaderSyncReactor {
             peer,
             Instant::now(),
             self.startup.config.unproductive_peer_cooldown,
+            self.admitted_peer_limit(),
         );
         metrics::counter!("sync.header.peer.dropped.total", "reason" => reason).increment(1);
         let _ = self.dispatch_action(HeaderPortOperation::DropPeer {
@@ -3265,6 +3282,7 @@ impl HeaderSyncReactor {
                 &peer,
                 now,
                 self.startup.config.unproductive_peer_cooldown,
+                self.admitted_peer_limit(),
             );
             #[cfg(any(test, zakura_sim))]
             if let Some(owner) = owner.filter(|_| self.state.cooldowns_installed != installed) {

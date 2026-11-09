@@ -568,6 +568,7 @@ impl HeaderWorkLedger {
                 let current = self.rounds.get(peer).copied();
                 let record = self.record_mut(*call)?;
                 if record.held.is_some() {
+                    self.claims.extend(found);
                     return Err(format!("HeldTwice: call {call} took headers again"));
                 }
                 // The call holds the headers whatever a claim below finds, as
@@ -637,6 +638,9 @@ impl HeaderWorkLedger {
                         || handoff.incarnation != *incarnation
                         || handoff.headers != *headers
                     {
+                        // The claims this hold already found are kept, so
+                        // the tap reports them ahead of the failure.
+                        self.claims.extend(found);
                         return Err(format!(
                             "BadHandoff: call {} handed call {} round {} with {} headers, and \
                              call {call} took round {incarnation} with {headers} next",
@@ -1775,6 +1779,27 @@ mod tests {
             leases: Vec::new(),
         });
         refused_as(wrong_count, "BadHandoff");
+
+        // A hold that breaks the handoff keeps the claims it found first, so
+        // the tap reports them ahead of the failure.
+        let mut foreign_and_wrong = base.clone();
+        foreign_and_wrong.push(ended(1, 1, HeaderWorkEnd::HandedToApply { apply: 2 }));
+        foreign_and_wrong.push(ReactorEvent::HeadersHeld {
+            call: 2,
+            kind: StorageCallKind::Apply,
+            peer: peer(1),
+            incarnation: 1,
+            headers: 4,
+            leases: vec![9],
+        });
+        let mut ledger = HeaderWorkLedger::default();
+        let error = foreign_and_wrong
+            .iter()
+            .find_map(|event| ledger.observe(event).err())
+            .expect("the ledger refuses the handoff");
+        assert!(error.starts_with("BadHandoff"), "{error}");
+        let rules: Vec<_> = ledger.take_claims().iter().map(|c| c.rule).collect();
+        assert_eq!(rules, [ClaimRule::ForeignLease]);
 
         let mut other_call = base.clone();
         other_call.push(dispatched(3, apply(1)));

@@ -128,6 +128,10 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
                 let response = MethodResponse::too_large_request(MAX_REQUEST_BODY_SIZE);
                 return json_response(StatusCode::PAYLOAD_TOO_LARGE, response);
             }
+            Err(ReadBodyError::Malformed) => {
+                let response = MethodResponse::error(Id::Null, ErrorCode::ParseError.into());
+                return json_response(StatusCode::BAD_REQUEST, response);
+            }
             Err(ReadBodyError::Stream(error)) => {
                 tracing::warn!("Internal error reading request body: {error}");
                 let response =
@@ -200,11 +204,16 @@ fn is_json(content_type: Option<&header::HeaderValue>) -> bool {
 pub(super) enum ReadBodyError {
     /// The body is longer than the limit.
     TooLarge,
+    /// The body's first non-whitespace byte is neither `{` nor `[`.
+    Malformed,
     /// The body couldn't be received.
     Stream(BoxError),
 }
 
 /// Reads a request body of up to `max_body_size` bytes.
+///
+/// Rejects the body as soon as its first non-whitespace byte shows it isn't a JSON object or
+/// array, before copying the rest. The server rejects any such body, in every JSON-RPC version.
 pub(super) async fn read_body<B>(
     headers: &header::HeaderMap,
     body: B,
@@ -227,14 +236,27 @@ where
     let max_body_size = max_body_size as usize;
     let mut body = std::pin::pin!(Limited::new(body, max_body_size));
     let mut received = Vec::with_capacity((content_length as usize).min(16 * 1024));
+    let mut found_first_byte = false;
 
     while let Some(frame) = body.frame().await {
         // Like `jsonrpsee`, a body that exceeds the limit without a `content-length` header that
         // says so is an internal error.
         let frame = frame.map_err(ReadBodyError::Stream)?;
-        if let Some(data) = frame.data_ref() {
-            received.extend_from_slice(data.chunk());
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        let data = data.chunk();
+
+        if !found_first_byte {
+            if let Some(first) = data.iter().find(|byte| !byte.is_ascii_whitespace()) {
+                if !matches!(first, b'{' | b'[') {
+                    return Err(ReadBodyError::Malformed);
+                }
+                found_first_byte = true;
+            }
         }
+
+        received.extend_from_slice(data);
     }
 
     Ok(received)

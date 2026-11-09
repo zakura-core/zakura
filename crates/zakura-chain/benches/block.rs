@@ -46,6 +46,13 @@ fn block_serialization(c: &mut Criterion) {
             &block_bytes,
             |b, bytes| b.iter(|| Block::zcash_deserialize(Cursor::new(bytes)).unwrap()),
         );
+        c.bench_with_input(
+            BenchmarkId::new("zcash_deserialize_from_slice", name),
+            &block_bytes,
+            |b, bytes| {
+                b.iter(|| Block::zcash_deserialize_from_slice(&mut bytes.as_slice()).unwrap())
+            },
+        );
     }
 }
 

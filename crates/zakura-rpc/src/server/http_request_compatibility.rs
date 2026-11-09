@@ -48,6 +48,11 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 ///
 /// This enables compatibility with `zcash-cli`.
 ///
+/// ### Reject browser requests
+///
+/// If the listener rejects browser requests, refuse any request with an `Origin` header.
+/// See [`HttpRequestMiddlewareLayer::reject_browser_requests`].
+///
 /// ## Security
 ///
 /// Any user-specified data in RPC requests is hex or base58check encoded.
@@ -58,6 +63,7 @@ pub struct HttpRequestMiddleware<S> {
     service: S,
     cookie: Option<Cookie>,
     max_request_body_size: usize,
+    reject_browser_requests: bool,
 }
 
 impl<S> HttpRequestMiddleware<S> {
@@ -67,7 +73,16 @@ impl<S> HttpRequestMiddleware<S> {
             service,
             cookie,
             max_request_body_size,
+            reject_browser_requests: false,
         }
+    }
+
+    /// Returns whether a web browser sent the request.
+    ///
+    /// Browsers add `Origin` to every `POST`, including same-origin ones, and page scripts
+    /// can't remove it. Command-line tools and RPC client libraries don't send it.
+    fn is_browser_request(headers: &header::HeaderMap) -> bool {
+        headers.contains_key(header::ORIGIN)
     }
 
     /// Check if the request is authenticated.
@@ -193,6 +208,7 @@ impl<S> HttpRequestMiddleware<S> {
 pub struct HttpRequestMiddlewareLayer {
     cookie: Option<Cookie>,
     max_request_body_size: usize,
+    reject_browser_requests: bool,
 }
 
 impl HttpRequestMiddlewareLayer {
@@ -201,7 +217,22 @@ impl HttpRequestMiddlewareLayer {
         Self {
             cookie,
             max_request_body_size,
+            reject_browser_requests: false,
         }
+    }
+
+    /// Rejects every request that has an `Origin` header with `403 Forbidden`.
+    ///
+    /// # Security
+    ///
+    /// A listener without credentials trusts whoever can reach it. A web browser on a trusted
+    /// machine can reach it on behalf of any page the user opens: a cross-site `text/plain`
+    /// `POST` needs no CORS preflight, and DNS rebinding makes the listener look same-origin,
+    /// so the page can also read responses. Browsers always send `Origin` on `POST`, so
+    /// rejecting it stops both attacks without affecting non-browser clients.
+    pub fn reject_browser_requests(mut self) -> Self {
+        self.reject_browser_requests = true;
+        self
     }
 }
 
@@ -209,7 +240,10 @@ impl<S> tower::Layer<S> for HttpRequestMiddlewareLayer {
     type Service = HttpRequestMiddleware<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        HttpRequestMiddleware::new(service, self.cookie.clone(), self.max_request_body_size)
+        HttpRequestMiddleware {
+            reject_browser_requests: self.reject_browser_requests,
+            ..HttpRequestMiddleware::new(service, self.cookie.clone(), self.max_request_body_size)
+        }
     }
 }
 
@@ -234,6 +268,14 @@ where
     }
 
     fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
+        if self.reject_browser_requests && Self::is_browser_request(request.headers()) {
+            let mut response = HttpResponse::new(HttpBody::from(
+                "browser requests are not accepted on this RPC listener",
+            ));
+            *response.status_mut() = hyper::StatusCode::FORBIDDEN;
+            return future::ok(response).boxed();
+        }
+
         // Check if the request is authenticated
         if !self.check_credentials(request.headers_mut()) {
             let error = ErrorObject::new(401, "unauthenticated method");

@@ -3,6 +3,8 @@
 //! in its place.
 
 use super::*;
+#[cfg(unix)]
+use crate::planted::wait_until_executable;
 use crate::planted::{end_of, Run};
 
 const ID: &str = "block/reactor-policy";
@@ -1102,11 +1104,7 @@ fn a_witness_run_that_dies_mid_trace_is_classified() {
         .expect("the script is written");
         fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
             .expect("the script is executable");
-        // Another test's fork can briefly hold the script open for writing.
-        while let Err(error) = Command::new(&sim).status() {
-            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until_executable(&sim);
         let recorded = witness_run(
             &sim,
             dir.path(),
@@ -1257,11 +1255,7 @@ fn a_witness_run_that_times_out_or_is_killed_is_not_scored() {
         .expect("the script is written");
         fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
             .expect("the script is executable");
-        // Another test's fork can briefly hold the script open for writing.
-        while let Err(error) = Command::new(&sim).status() {
-            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until_executable(&sim);
         let recorded = witness_run(
             &sim,
             dir.path(),
@@ -1531,11 +1525,7 @@ fn a_campaign_build_is_rejected_only_for_a_compile_error() {
         .expect("the script is written");
         fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
             .expect("the script is executable");
-        // Another test's fork can briefly hold the script open for writing.
-        while let Err(error) = Command::new(&sim).status() {
-            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until_executable(&sim);
         let lane = campaign_lane(
             &sim,
             &dir.path().join(format!("{name}-lane")),
@@ -1613,11 +1603,7 @@ fn a_campaign_that_a_signal_killed_is_not_read() {
         .expect("the script is written");
         fs::set_permissions(&sim, fs::Permissions::from_mode(0o755))
             .expect("the script is executable");
-        // Another test's fork can briefly hold the script open for writing.
-        while let Err(error) = Command::new(&sim).status() {
-            assert_eq!(error.raw_os_error(), Some(libc::ETXTBSY), "{error}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_until_executable(&sim);
         let lane = campaign_lane(
             &sim,
             &dir.path().join(format!("{name}-lane")),

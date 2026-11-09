@@ -55,6 +55,7 @@ async fn verifier_returns_error_for_out_of_range_input_index() {
         .oneshot(Request {
             cached_ffi_transaction: cached,
             input_index: out_of_range,
+            limit_verification_work: false,
         })
         .await;
 
@@ -94,7 +95,7 @@ async fn cancelled_script_caller_keeps_block_charge_until_worker_finishes() {
         .iter()
         .map(|_| transparent::Output {
             value: 0.try_into().unwrap(),
-            lock_script: transparent::Script::new(&[]),
+            lock_script: transparent::Script::new(&[0xac]),
         })
         .collect();
     let cached = CachedFfiTransaction::new(
@@ -108,6 +109,7 @@ async fn cancelled_script_caller_keeps_block_charge_until_worker_finishes() {
     let mut future = Verifier.call(Request {
         cached_ffi_transaction: cached,
         input_index: 0,
+        limit_verification_work: true,
     });
 
     // The only worker polls the caller, so its queued verification cannot start yet.
@@ -122,6 +124,11 @@ async fn cancelled_script_caller_keeps_block_charge_until_worker_finishes() {
             .is_pending());
         drop(owned);
         drop(future);
+        assert!(
+            super::mempool_work_budget().available_permits()
+                < usize::try_from(super::MEMPOOL_VERIFICATION_WORK).unwrap(),
+            "cancelling the caller must retain the queued CPU work reservation"
+        );
         assert!(
             actual.upgrade().is_some(),
             "the queued worker still retains the transaction"

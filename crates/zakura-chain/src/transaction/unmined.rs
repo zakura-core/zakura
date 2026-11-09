@@ -370,6 +370,9 @@ pub struct VerifiedUnminedTx {
     /// matching zcashd's consensus behavior.
     pub p2sh_sigop_count: u32,
 
+    /// Authenticated transparent verification work, or zero before PQ activation.
+    pub verification_work: u32,
+
     /// The number of conventional actions for `transaction`, as defined by [ZIP-317].
     ///
     /// The number of actions is limited by [`MAX_BLOCK_BYTES`](crate::block::MAX_BLOCK_BYTES), so it fits in a u32.
@@ -436,9 +439,35 @@ impl VerifiedUnminedTx {
         p2sh_sigop_count: u32,
         spent_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<Self, zip317::Error> {
-        let fee_weight_ratio = zip317::conventional_fee_weight_ratio(&transaction, miner_fee);
-        let conventional_actions = zip317::conventional_actions(&transaction.transaction);
-        let unpaid_actions = zip317::unpaid_actions(&transaction, miner_fee);
+        Self::new_with_verification_work(
+            transaction,
+            miner_fee,
+            legacy_sigop_count,
+            p2sh_sigop_count,
+            spent_outputs,
+            0,
+        )
+    }
+
+    /// Creates a verified transaction with the work authenticated by its verifier.
+    /// Supply zero before PQ activation; the verifier must enforce the block work cap.
+    pub fn new_with_verification_work(
+        transaction: UnminedTx,
+        miner_fee: Amount<NonNegative>,
+        legacy_sigop_count: u32,
+        p2sh_sigop_count: u32,
+        spent_outputs: Arc<Vec<transparent::Output>>,
+        verification_work: u32,
+    ) -> Result<Self, zip317::Error> {
+        let fee_weight_ratio = zip317::conventional_fee_weight_ratio_with_work(
+            &transaction,
+            miner_fee,
+            verification_work,
+        );
+        let conventional_actions =
+            zip317::conventional_actions_with_work(&transaction.transaction, verification_work);
+        let unpaid_actions =
+            zip317::unpaid_actions_with_work(&transaction, miner_fee, verification_work);
 
         zip317::mempool_checks(unpaid_actions, miner_fee, transaction.size)?;
 
@@ -447,6 +476,7 @@ impl VerifiedUnminedTx {
             miner_fee,
             legacy_sigop_count,
             p2sh_sigop_count,
+            verification_work,
             fee_weight_ratio,
             conventional_actions,
             unpaid_actions,
@@ -470,7 +500,11 @@ impl VerifiedUnminedTx {
     ///
     /// [ZIP-317]: https://zips.z.cash/zip-0317#mempool-size-limiting
     pub fn pays_conventional_fee(&self) -> bool {
-        self.miner_fee >= self.transaction.conventional_fee
+        self.miner_fee
+            >= zip317::conventional_fee_with_work(
+                &self.transaction.transaction,
+                self.verification_work,
+            )
     }
 
     /// The cost in bytes of the transaction, as defined in [ZIP-401].

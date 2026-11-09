@@ -868,6 +868,7 @@ impl Arbitrary for VerifiedUnminedTx {
                         miner_fee,
                         legacy_sigop_count: sigops,
                         p2sh_sigop_count: p2sh_sigops,
+                        verification_work: 0,
                         conventional_actions,
                         unpaid_actions,
                         fee_weight_ratio,

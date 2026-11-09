@@ -721,6 +721,7 @@ where
                     primitives::flush::BlockFlush::register(&known_outpoint_hashes, shielded.len())
                 });
 
+                let verification_budget = tx::VerificationBudget::default();
                 for (transaction_id, transaction) in shielded.into_iter().chain(transparent) {
                     let rsp = transaction_verifier
                         .ready()
@@ -732,6 +733,7 @@ where
                             known_outpoint_hashes: known_outpoint_hashes.clone(),
                             known_utxos: known_utxos.clone(),
                             parent_utxos: parent_utxos.clone(),
+                            verification_budget: verification_budget.clone(),
                             height,
                             time: block.header().time,
                         });

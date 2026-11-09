@@ -1,4 +1,9 @@
-use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    ops::Deref,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
 
 use tracing::Instrument;
 
@@ -33,6 +38,20 @@ pub struct Request<T = Arc<Transaction>> {
     ///
     /// Coinbase inputs are rejected by the script verifier, because they do not spend a UTXO.
     pub input_index: usize,
+    /// Reserve mempool work before dispatch; blocks use their cumulative budget instead.
+    pub limit_verification_work: bool,
+}
+
+/// Keep the queued mempool signature work below one tenth of a PQ block budget.
+const MEMPOOL_VERIFICATION_WORK: u32 = 15_000;
+
+fn mempool_work_budget() -> &'static Arc<tokio::sync::Semaphore> {
+    static BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            usize::try_from(MEMPOOL_VERIFICATION_WORK).expect("work budget fits supported targets"),
+        ))
+    })
 }
 
 impl<T: Deref<Target = Transaction> + Send + Sync + 'static> tower::Service<Request<T>>
@@ -56,6 +75,7 @@ impl<T: Deref<Target = Transaction> + Send + Sync + 'static> tower::Service<Requ
         let Request {
             cached_ffi_transaction,
             input_index,
+            limit_verification_work,
         } = req;
 
         let span = tracing::trace_span!("script");
@@ -71,9 +91,28 @@ impl<T: Deref<Target = Transaction> + Send + Sync + 'static> tower::Service<Requ
                 transparent::Input::PrevOut { outpoint, .. } => {
                     let outpoint = *outpoint;
 
-                    // Script verification is CPU-bound so run in Rayon thread
-                    spawn_fifo_and_convert(move || cached_ffi_transaction.is_valid(input_index))
-                        .await?;
+                    let permit = if limit_verification_work {
+                        let work = cached_ffi_transaction.input_verification_work(input_index)?;
+                        if work > MEMPOOL_VERIFICATION_WORK {
+                            return Err("input exceeds mempool verification work capacity".into());
+                        }
+                        Some(
+                            mempool_work_budget()
+                                .clone()
+                                .acquire_many_owned(work)
+                                .await?,
+                        )
+                    } else {
+                        None
+                    };
+
+                    // The worker owns its permit: cancelling this future must not
+                    // release capacity while its Rayon closure still consumes CPU.
+                    spawn_fifo_and_convert(move || {
+                        let _permit = permit;
+                        cached_ffi_transaction.is_valid(input_index)
+                    })
+                    .await?;
                     tracing::trace!(?outpoint, "script verification succeeded");
 
                     Ok(())

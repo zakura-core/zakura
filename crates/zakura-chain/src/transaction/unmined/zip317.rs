@@ -24,6 +24,15 @@ mod tests;
 // TODO: allow Amount<NonNegative> in constants
 pub const MARGINAL_FEE: u64 = 400;
 
+/// Maximum transparent verification work in a block once PQ outputs are active.
+pub const MAX_BLOCK_VERIFICATION_WORK: u32 = 150_000;
+
+/// Work charged for each potential SHA2-128f signature comparison.
+pub const SHA2_128F_VERIFICATION_WORK: u32 = 60;
+
+/// Work charged for each potential SHA2-192s signature comparison.
+pub const SHA2_192S_VERIFICATION_WORK: u32 = 30;
+
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
 const GRACE_ACTIONS: u32 = 2;
 
@@ -65,12 +74,17 @@ pub const MEMPOOL_TX_FEE_REQUIREMENT_CAP: usize = 800;
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
 pub fn conventional_fee(transaction: &Transaction) -> Amount<NonNegative> {
+    conventional_fee_with_work(transaction, 0)
+}
+
+/// Conventional fee including authenticated transparent verification work.
+pub fn conventional_fee_with_work(transaction: &Transaction, work: u32) -> Amount<NonNegative> {
     // The action count follows ZIP-317; Zakura's marginal fee is lower.
 
     let marginal_fee: Amount<NonNegative> = MARGINAL_FEE.try_into().expect("fits in amount");
 
     // marginal_fee * max(logical_actions, GRACE_ACTIONS)
-    let conventional_fee = marginal_fee * conventional_actions(transaction).into();
+    let conventional_fee = marginal_fee * conventional_actions_with_work(transaction, work).into();
 
     conventional_fee.expect("conventional fee is positive and limited by serialized size limit")
 }
@@ -79,8 +93,17 @@ pub fn conventional_fee(transaction: &Transaction) -> Amount<NonNegative> {
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
 pub fn unpaid_actions(transaction: &UnminedTx, miner_fee: Amount<NonNegative>) -> u32 {
+    unpaid_actions_with_work(transaction, miner_fee, 0)
+}
+
+/// Unpaid actions after charging authenticated transparent verification work.
+pub fn unpaid_actions_with_work(
+    transaction: &UnminedTx,
+    miner_fee: Amount<NonNegative>,
+    work: u32,
+) -> u32 {
     // max(logical_actions, GRACE_ACTIONS)
-    let conventional_actions = conventional_actions(&transaction.transaction);
+    let conventional_actions = conventional_actions_with_work(&transaction.transaction, work);
 
     // floor(tx.fee / marginal_fee)
     let marginal_fee_weight_ratio = miner_fee / MARGINAL_FEE;
@@ -105,6 +128,15 @@ pub fn conventional_fee_weight_ratio(
     transaction: &UnminedTx,
     miner_fee: Amount<NonNegative>,
 ) -> f32 {
+    conventional_fee_weight_ratio_with_work(transaction, miner_fee, 0)
+}
+
+/// Template fee weight using the same work-adjusted fee as admission.
+pub fn conventional_fee_weight_ratio_with_work(
+    transaction: &UnminedTx,
+    miner_fee: Amount<NonNegative>,
+    work: u32,
+) -> f32 {
     // Check that this function will always return a positive, non-zero value.
     //
     // The maximum number of logical actions in a block is actually
@@ -117,7 +149,9 @@ pub fn conventional_fee_weight_ratio(
 
     let miner_fee = max(miner_fee.into(), MIN_BLOCK_PRODUCTION_SUBSTITUTE_FEE) as f32;
 
-    let conventional_fee = i64::from(transaction.conventional_fee) as f32;
+    // Policy scoring permits rounding; every bounded monetary amount fits a finite f32.
+    let conventional_fee =
+        i64::from(conventional_fee_with_work(&transaction.transaction, work)) as f32;
 
     let uncapped_weight = miner_fee / conventional_fee;
 
@@ -129,6 +163,14 @@ pub fn conventional_fee_weight_ratio(
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#fee-calculation
 pub fn conventional_actions(transaction: &Transaction) -> u32 {
+    conventional_actions_with_work(transaction, 0)
+}
+
+/// Conventional actions including authenticated transparent verification work.
+///
+/// Callers supply zero before PQ activation. After activation, the work is derived
+/// from the spent outputs and their authenticated scripts, never a sender's claim.
+pub fn conventional_actions_with_work(transaction: &Transaction, verification_work: u32) -> u32 {
     let tx_in_total_size: usize = transaction
         .inputs()
         .iter()
@@ -150,14 +192,16 @@ pub fn conventional_actions(transaction: &Transaction) -> u32 {
     let tx_in_logical_actions = tx_in_total_size.div_ceil(P2PKH_STANDARD_INPUT_SIZE);
     let tx_out_logical_actions = tx_out_total_size.div_ceil(P2PKH_STANDARD_OUTPUT_SIZE);
 
-    let logical_actions = max(tx_in_logical_actions, tx_out_logical_actions)
+    let work =
+        usize::try_from(verification_work).expect("supported targets have at least 32-bit usize");
+    let logical_actions = max(max(tx_in_logical_actions, tx_out_logical_actions), work)
         + 2 * n_join_split
         + max(n_spends_sapling, n_outputs_sapling)
         + n_actions_orchard
         + n_actions_ironwood;
-    let logical_actions: u32 = logical_actions
-        .try_into()
-        .expect("transaction items are limited by serialized size limit");
+    // Saturating overcharges an out-of-range supplied work value rather than
+    // wrapping to a cheap fee. Consensus caps authenticated work much earlier.
+    let logical_actions: u32 = logical_actions.try_into().unwrap_or(u32::MAX);
 
     max(GRACE_ACTIONS, logical_actions)
 }

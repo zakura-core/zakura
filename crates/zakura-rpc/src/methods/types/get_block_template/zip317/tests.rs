@@ -539,6 +539,7 @@ mod zip218_template_limits {
         BlockTemplateLimits {
             remaining_bytes: usize::MAX,
             remaining_sigops: u32::MAX,
+            remaining_verification_work: u32::MAX,
             remaining_unpaid_actions: u32::MAX,
             remaining_orchard_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             remaining_ironwood_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
@@ -546,6 +547,23 @@ mod zip218_template_limits {
             remaining_sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
             remaining_shielded_cost: GLOBAL_SHIELDED_BUDGET,
         }
+    }
+
+    #[test]
+    fn template_reserves_verification_work_without_spending_capacity_on_rejection() {
+        let mut limits = nu7_template_limits();
+        limits.remaining_verification_work = 60;
+        let mut tx = verified_unmined_tx(fake_v5_with_orchard_actions(1));
+        tx.verification_work = 61;
+        let bytes = limits.remaining_bytes;
+        assert!(!limits.try_add(&tx));
+        assert_eq!(limits.remaining_bytes, bytes);
+        assert_eq!(limits.remaining_verification_work, 60);
+        tx.verification_work = 60;
+        assert!(limits.try_add(&tx));
+        assert_eq!(limits.remaining_verification_work, 0);
+        tx.verification_work = 1;
+        assert!(!limits.try_add(&tx));
     }
 
     fn nu7_activation_testnet(nu7_activation_height: u32) -> Network {

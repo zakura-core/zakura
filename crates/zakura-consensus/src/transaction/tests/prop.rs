@@ -522,6 +522,7 @@ fn validate(
                 transaction: Arc::new(transaction).into(),
                 known_utxos: Arc::new(known_utxos),
                 parent_utxos: Arc::new(HashMap::new()),
+                verification_budget: Default::default(),
                 known_outpoint_hashes: Arc::new(HashSet::new()),
                 height,
                 time: block_time,

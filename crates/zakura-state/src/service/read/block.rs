@@ -111,6 +111,7 @@ where
 /// and non-finalized blocks are serialized from memory. Either result keeps its
 /// read-memory charge through its final clone. Missing or pruned bodies return
 /// `Ok(None)`, like [`block`].
+#[allow(clippy::unwrap_in_result)]
 pub fn raw_block<C>(
     chain: Option<C>,
     db: &ZakuraDb,
@@ -282,6 +283,7 @@ pub fn any_transaction<'a>(
 /// Finalized transactions are returned from their stored bytes without decoding
 /// them, and non-finalized transactions are serialized from memory. Either result
 /// keeps its read-memory charge through its final clone.
+#[allow(clippy::unwrap_in_result)]
 pub fn any_raw_transaction<'a>(
     mut chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,

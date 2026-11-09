@@ -171,6 +171,11 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
         network: &Network,
         height: Height,
     ) -> Result<Self, Error> {
+        // The previous outputs decide which rules each input is verified under, so a list
+        // that does not line up with the inputs is refused here rather than per input.
+        if !transaction.is_coinbase() && all_previous_outputs.len() != transaction.inputs().len() {
+            return Err(Error::TxIndex);
+        }
         let cached = Self::new(
             transaction,
             all_previous_outputs,

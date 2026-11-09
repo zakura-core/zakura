@@ -435,9 +435,10 @@ pub const LATE_RESPONSE_ADMITTED: &str = "discovery/late-response-admitted";
 /// session is `discovery/late-response-delivered`'s.
 ///
 /// It reads the transport tap's sessions and header reads, the peers'
-/// frames and labels, and the node's closes. A `Draft`: every bypass also
-/// violates `discovery/s4v2/conformant-never-closes`, so no committed input
-/// can violate this ID alone, as the planted runner requires.
+/// frames and labels, and the node's closes. A late answer is conformant,
+/// so a bypass that punishes it also violates
+/// `discovery/s4v2/conformant-never-closes`. Its planted case lists that
+/// ID in `also_violates`, an expected co-violation.
 pub fn late_response_admitted<S: HasView>() -> Property<S> {
     Property {
         id: PropertyId::new(LATE_RESPONSE_ADMITTED),
@@ -446,7 +447,7 @@ pub fn late_response_admitted<S: HasView>() -> Property<S> {
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::Frames, Source::Closes],
-        status: Status::Draft,
+        status: Status::Active,
         check: check_late_response_admitted::<S>,
         witness: Some(TriggerHistory::Log(|log| {
             let entries = log.entries();

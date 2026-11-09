@@ -625,7 +625,7 @@ fn sensitivity_case(
                     &INTERRUPTED,
                 )?;
                 if matches!(
-                    planted_verdict(&case.property, &recorded.run),
+                    planted_verdict(&case.property, &[], &recorded.run),
                     Verdict::Caught(_)
                 ) {
                     run.confirmation = Some(confirm_and_replay(

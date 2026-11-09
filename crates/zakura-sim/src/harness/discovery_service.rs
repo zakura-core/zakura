@@ -510,8 +510,8 @@ pub const STREAMS: [Stream; 1] = [Stream {
 /// `discovery/wire`'s properties: discovery's generated receiver
 /// properties, 31 IDs, then its sender properties, 7 IDs, each a `Draft`
 /// until its planted case lands (disc-3.2, disc-3.3), then
-/// `discovery/late-response-admitted` (disc-3.4), a `Draft` for the reason
-/// [`late_response_admitted`] gives.
+/// `discovery/late-response-admitted` (disc-3.4), `Active` with its planted
+/// case.
 ///
 /// A `bad-content-closes` ID's generated check accepts a fault close or a
 /// `Misbehavior`, and discovery's node answers bad content with a fault

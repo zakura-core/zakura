@@ -9,7 +9,6 @@ input = "crates/zakura-sim/tests/fixtures/discovery-wire-late-response.bin"
 # late window.
 checks = ["crates/zakura-network/src/zakura"]
 # The late Peers is conformant, so its fault close also breaks
-# `conformant-never-closes`. The runner counts this only for campaign
-# inputs: the committed input violates both IDs, so it can't violate this
-# one alone, and the property stays a `Draft`.
+# `conformant-never-closes`. The runner expects that co-violation on the
+# committed input and on campaign inputs.
 also_violates = ["discovery/s4v2/conformant-never-closes"]

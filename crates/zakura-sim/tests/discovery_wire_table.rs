@@ -33,10 +33,10 @@ fn the_registered_stream_is_the_services() {
 }
 
 /// The harness registers discovery's 31 generated receiver IDs, then its
-/// 7 sender IDs, then `discovery/late-response-admitted`, and no other
-/// property, each a `Draft`. A receiver ID and the late-response one read
-/// only the peers' frames and the node's closes, and a sender ID only the
-/// frames. No downstream template is registered.
+/// 7 sender IDs, each a `Draft`, then `discovery/late-response-admitted`,
+/// an `Active`, and no other property. A receiver ID and the late-response
+/// one read only the peers' frames and the node's closes, and a sender ID
+/// only the frames. No downstream template is registered.
 #[test]
 fn the_harness_registers_the_generated_discovery_ids() {
     let receiver: Vec<String> = table_properties::<DiscoveryWire>(FAMILY, &STREAMS)
@@ -67,7 +67,12 @@ fn the_harness_registers_the_generated_discovery_ids() {
         .collect();
     assert_eq!(ids, expected);
     for property in &registered {
-        assert_eq!(property.status, Status::Draft, "{}", property.id);
+        let status = if property.id.to_string() == late {
+            Status::Active
+        } else {
+            Status::Draft
+        };
+        assert_eq!(property.status, status, "{}", property.id);
         let needs: &[Source] = if sender.contains(&property.id.to_string()) {
             &[Source::Frames]
         } else {

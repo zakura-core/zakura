@@ -34,6 +34,7 @@ pub mod evaluate;
 pub mod reasons;
 pub mod required;
 pub mod rows;
+pub mod tool;
 
 use serde::{Deserialize, Serialize};
 

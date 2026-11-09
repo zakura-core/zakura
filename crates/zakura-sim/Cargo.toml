@@ -10,6 +10,8 @@ keywords.workspace = true
 categories = ["development-tools::testing"]
 # Only tests and the `zakura-sim` binary use it, and no published crate does.
 publish = false
+# `cargo run -p zakura-sim` runs the simulator, beside `header-acceptance`.
+default-run = "zakura-sim"
 
 # The crate is empty outside the simulator build, `RUSTFLAGS="--cfg zakura_sim"`.
 [target.'cfg(zakura_sim)'.dependencies]

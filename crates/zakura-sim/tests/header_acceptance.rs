@@ -2622,7 +2622,6 @@ const OPEN_PRS: &[&str] = &[
     "hdr-14.4",
     "hdr-14.5",
     "hdr-14.6",
-    "hdr-14.7a",
     "hdr-14.7b",
     "hdr-14.8",
     "hf-1",

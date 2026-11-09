@@ -198,7 +198,14 @@ pub static NOT_HEADER: &[NotHeader] = &[
         why: "the acceptance evaluator's own report type, not a check",
         basis: Basis::NamesNoVerdict,
     },
+    NotHeader {
+        file: "src/harness/header_acceptance/tool.rs",
+        module: "tool",
+        why: "the acceptance tool reading a trace's report into the evaluator's type, not a check",
+        basis: Basis::NamesNoVerdict,
+    },
 ];
+
 /// A [`NaKind::Step`] construction on `line`, meaning `meaning`.
 const fn step(meaning: &'static str, line: &'static str) -> NaConstruction {
     NaConstruction {

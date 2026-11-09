@@ -4485,6 +4485,33 @@ fn retired_seed_ids_never_stop_startup() -> Result<()> {
         &[warning.as_str(), "Starting zakurad"],
     )?;
     assert_eq!(fs::read(&config_path)?, before, "the file is left alone");
+    Ok(())
+}
 
+/// Local PQ spends pass RPC admission and template selection alongside legacy ECDSA.
+#[cfg(feature = "pq")]
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_pq_mempool_and_template() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(300), common::regtest::pq_mempool_test()).await??;
+    Ok(())
+}
+
+/// PQ single-signer and multisig spends propagate between nodes and survive block/RPC transport.
+#[cfg(feature = "pq")]
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_pq_p2p_relay_and_block_acceptance() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(300), common::regtest::pq_p2p_test()).await??;
+    Ok(())
+}
+
+/// Rollback below PQ activation removes eligibility; an alternate chain restores it.
+#[cfg(feature = "pq")]
+#[tokio::test(flavor = "multi_thread")]
+async fn regtest_pq_activation_crossing_reorg() -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(300),
+        common::regtest::pq_activation_reorg_test(),
+    )
+    .await??;
     Ok(())
 }

@@ -29,7 +29,7 @@ fn verification_work_sets_fee_without_adding_to_byte_charge() {
     assert_eq!(conventional_actions_with_work(&tx, u32::MAX), u32::MAX);
     assert_eq!(
         conventional_fee_with_work(&tx, 600),
-        Amount::try_from(240_000).unwrap()
+        Amount::<NonNegative>::try_from(240_000).unwrap()
     );
     let unmined = UnminedTx::from(tx);
     assert_eq!(

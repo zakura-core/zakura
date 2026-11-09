@@ -99,16 +99,10 @@ pub const DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES: u64 = 102_400;
 /// This will be used as `Config.advert_window_full_size_bytes` if it is not configured.
 pub const DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES: u64 = 1_572_864;
 
-/// The default delay before announcing a small block to peers outside the initial group.
+/// The default delay before announcing a block to peers outside the initial group.
 ///
-/// This will be used as `Config.advert_delay_min` if it is not configured.
-pub const DEFAULT_ADVERT_DELAY_MIN: Duration = Duration::from_millis(500);
-
-/// The default delay before announcing a full-sized or unknown-sized block to peers outside the
-/// initial group.
-///
-/// This will be used as `Config.advert_delay_max` if it is not configured.
-pub const DEFAULT_ADVERT_DELAY_MAX: Duration = Duration::from_millis(500);
+/// This will be used as `Config.advert_delay` if it is not configured.
+pub const DEFAULT_ADVERT_DELAY: Duration = Duration::from_millis(500);
 
 /// The default peerset target size.
 ///

@@ -379,6 +379,28 @@ fn the_encoder_refuses_what_the_grammar_cannot_express() {
             },
             "a growth",
         ),
+        (
+            StorageScenario {
+                controls: vec![step(
+                    "node",
+                    ControlAction::RepairStatus {
+                        unavailable: Some(2),
+                        generation: 0,
+                    },
+                    None,
+                )],
+                ..StorageScenario::default()
+            },
+            "RepairStatus",
+        ),
+        (
+            with_holds(vec![hold(
+                Trigger::SessionEnded("mirror-0".to_owned()),
+                vec![],
+                None,
+            )]),
+            "SessionEnded",
+        ),
     ];
     for (scenario, reason) in unencodable {
         let error = grammar::encode(&scenario).expect_err(reason).to_string();

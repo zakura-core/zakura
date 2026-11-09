@@ -654,9 +654,12 @@ impl HeaderSyncReactor {
     /// Handles the storage completions that are ready now, then reads both
     /// watches, so a deadline checked afterward can't win over a ready result.
     ///
-    /// The drain is bounded by the operation count. The VCT local operation,
-    /// whose deadline is fatal, is polled directly, so its result never waits
-    /// on the shared ready queue. See [`PortOperations`].
+    /// The VCT local operation, whose deadline is fatal, is polled directly,
+    /// so its result never waits on the shared ready queue. See
+    /// [`PortOperations`]. It's polled before each other completion and once
+    /// at the end, since a handler can start its successor. Only the other
+    /// calls count toward the drain's bound, so that successor can't take an
+    /// older completion's turn.
     fn settle_ready_inputs(
         &mut self,
         committed_snapshots: &mut Option<
@@ -664,10 +667,16 @@ impl HeaderSyncReactor {
         >,
         vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
     ) {
-        for _ in 0..self.pending_port_operations.len() {
-            let Some(Some(completion)) = self.pending_port_operations.next().now_or_never() else {
+        for _ in 0..self.pending_port_operations.others_len() {
+            if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+                self.handle_port_completion(completion);
+            }
+            let Some(completion) = self.pending_port_operations.ready_other() else {
                 break;
             };
+            self.handle_port_completion(completion);
+        }
+        if let Some(completion) = self.pending_port_operations.ready_vct_local() {
             self.handle_port_completion(completion);
         }
         // `changed` delivers a final unseen value before reporting channel closure.

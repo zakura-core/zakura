@@ -54,6 +54,7 @@ impl PortOperations {
     }
 
     /// The number of calls still running.
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.others.len() + usize::from(self.vct_local.is_some())
     }
@@ -61,6 +62,23 @@ impl PortOperations {
     /// Whether no call is running.
     pub(super) fn is_empty(&self) -> bool {
         self.vct_local.is_none() && self.others.is_empty()
+    }
+
+    /// The number of running calls other than the VCT local operation's.
+    pub(super) fn others_len(&self) -> usize {
+        self.others.len()
+    }
+
+    /// The VCT local operation's outcome, if it's ready now.
+    pub(super) fn ready_vct_local(&mut self) -> Option<StorageOutcome> {
+        let outcome = self.vct_local.as_mut()?.as_mut().now_or_never()?;
+        self.vct_local = None;
+        Some(outcome)
+    }
+
+    /// Another call's outcome, if the shared ready queue shows one now.
+    pub(super) fn ready_other(&mut self) -> Option<StorageOutcome> {
+        self.others.next().now_or_never().flatten()
     }
 }
 

@@ -29,6 +29,8 @@ struct PendingVctLocalPort {
     /// When set, the apply finishes once this time passes, without waking
     /// its waker, like a result the shared ready queue hasn't shown yet.
     apply_silent_until: Option<Instant>,
+    /// When set, the prepare succeeds at once with this target.
+    prepared: std::sync::Mutex<Option<port::PreparedHeaderTarget>>,
     apply_succeeds: bool,
 }
 
@@ -42,6 +44,7 @@ impl PendingVctLocalPort {
             prepare_delay: None,
             apply_delay: None,
             apply_silent_until: None,
+            prepared: std::sync::Mutex::new(None),
             apply_succeeds,
         }
     }
@@ -115,8 +118,16 @@ impl port::Port for PendingVctLocalPort {
         let calls = self.prepare_calls.clone();
         let release = self.prepare_release.clone();
         let delay = self.prepare_delay;
+        let prepared = self
+            .prepared
+            .lock()
+            .expect("no test panics while holding it")
+            .take();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(prepared) = prepared {
+                return Ok(prepared);
+            }
             match delay {
                 Some(delay) => time::sleep(delay).await,
                 None => release.notified().await,
@@ -1008,6 +1019,48 @@ async fn inputs_ready_every_turn_cannot_starve_the_fatal_deadline() {
     );
     shutdown.cancel();
     reactor.await.unwrap();
+}
+
+/// A VCT prepare's handler can start an apply that finishes on its first
+/// poll. That apply can't take the drain turn of an older ready completion,
+/// which would leave the older one for a due deadline to charge.
+#[tokio::test(start_paused = true)]
+async fn a_vct_successor_cannot_take_an_older_completions_drain_turn() {
+    let port = PendingVctLocalPort::with_silent_apply(Instant::now());
+    let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Preparing);
+    *port.prepared.lock().unwrap() = Some(prepared_vct_target(
+        &fixture.reactor,
+        &fixture.snapshot,
+        &fixture.peer,
+        fixture.source,
+        fixture.owner,
+        &fixture.context,
+    ));
+    fixture.dispatch();
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+
+    fixture.reactor.settle_ready_inputs(&mut None, &mut None);
+
+    assert_eq!(
+        port.apply_calls.load(Ordering::SeqCst),
+        1,
+        "the prepare's handler started the apply"
+    );
+    assert!(
+        fixture.reactor.pending_port_operations.is_empty(),
+        "the prepare, its apply and the older locator read are all handled"
+    );
 }
 
 #[test]

@@ -62,6 +62,9 @@ fn the_harness_registers_the_generated_discovery_ids() {
     let planted = ids.iter().filter(|id| has_planted_case(id)).count();
     // One per stream, `undeclared-type-closes`, then three per row.
     assert_eq!(planted, 16, "{ids:?}");
+    // Another family's ID with the same template and row has no case here.
+    assert!(!has_planted_case("header-sync/s5v9/undeclared-type-closes"));
+    assert!(!has_planted_case("discovery/s5v9/undeclared-type-closes"));
     for property in &registered {
         let status = if has_planted_case(property.id.as_str()) {
             Status::Active

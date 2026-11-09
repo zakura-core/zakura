@@ -544,6 +544,9 @@ type Trigger = fn(&ObservationLog) -> bool;
 /// node judging a frame with the ID's label on its row ([`judged_fault`]).
 fn planted_trigger(id: &str) -> Option<Trigger> {
     let id = GeneratedId::parse(id)?;
+    if id.family != FAMILY || id.stream != stream_id() {
+        return None;
+    }
     let Template::Closes(label) = id.template else {
         return None;
     };
@@ -555,6 +558,15 @@ fn planted_trigger(id: &str) -> Option<Trigger> {
                 .position(|rule| Some(rule.name) == id.row)?;
             Some(ROW_TRIGGERS[at - 1][row])
         }
+    }
+}
+
+/// The kind and version of discovery's one stream ([`STREAMS`]).
+fn stream_id() -> StreamId {
+    let [stream] = STREAMS;
+    StreamId {
+        kind: stream.kind,
+        version: stream.version,
     }
 }
 
@@ -601,11 +613,7 @@ fn judged_fault<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> b
     let label = STATELESS[LABEL];
     let row = (label != Label::UndeclaredType)
         .then(|| <DiscoveryMessage as WireMessage>::RULES[ROW].name);
-    let [stream] = STREAMS;
-    let stream = StreamId {
-        kind: stream.kind,
-        version: stream.version,
-    };
+    let stream = stream_id();
     let entries = log.entries();
     entries.iter().enumerate().any(|(at, entry)| {
         let Observation::FrameJudged {

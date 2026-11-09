@@ -214,6 +214,43 @@ fn unsolicited_responses_fail_by_row() {
     assert!(not_applicable(&second_ending, ANSWERS));
 }
 
+/// Two requests past the limit at one step are two violations, each
+/// naming its own frame, and the report keeps both.
+#[test]
+fn every_sender_violation_at_a_step_is_reported() {
+    let report = run_script(vec![vec![
+        sent(TEST_STREAM, 0, "get", Label::OverMargin),
+        sent(TEST_STREAM, 1, "get", Label::OverMargin),
+    ]]);
+    assert_eq!(stopped_by(&report), Some(LIMIT));
+    let limit = report
+        .properties
+        .iter()
+        .find(|r| r.property == LIMIT)
+        .expect("registered");
+    let found: Vec<(u64, &str)> = limit
+        .violations
+        .iter()
+        .map(|v| (v.step, v.expected.as_str()))
+        .collect();
+    let step = limit.violations[0].step;
+    assert_eq!(
+        found,
+        [
+            (
+                step,
+                "connection 1's s65v2/get frame 0 from the node is conformant under \
+                 sender-within-limit"
+            ),
+            (
+                step,
+                "connection 1's s65v2/get frame 1 from the node is conformant under \
+                 sender-within-limit"
+            ),
+        ]
+    );
+}
+
 /// An `Open` past `max_live` breaks `sender-within-live`, and a page past
 /// the granted credit breaks the subscription row's
 /// `sender-within-credit`, not the page row's `sender-answers-open`.

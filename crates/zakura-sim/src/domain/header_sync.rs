@@ -476,13 +476,15 @@ mod tests {
     };
 
     use super::{
-        chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
-        EndViolation, TeardownView, CACHED_PASS_REFILL, CHUNK_BUDGET_CAPACITY,
+        chunk_budget_bound, stale_completion_inert, teardown_end_violations,
+        teardown_returns_baseline, BudgetView, EndViolation, StaleView, TeardownView,
+        CACHED_PASS_REFILL, CHUNK_BUDGET_CAPACITY,
     };
     use crate::{
         harness::header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
+            stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
@@ -503,6 +505,17 @@ mod tests {
         capacity: CapacityEvidence,
         claims: ClaimEvidence,
         rounds: SettlementEvidence,
+        stale_calls: StaleEvidence,
+    }
+
+    impl StaleView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn stale_calls(&self) -> &StaleEvidence {
+            &self.stale_calls
+        }
     }
 
     impl TeardownView for Probe {
@@ -560,6 +573,7 @@ mod tests {
             settled: bool,
         },
         Broke(Claim),
+        Breaks(&'static [Claim]),
     }
 
     /// Records the next scripted evidence at each boundary, as a tap would.
@@ -628,6 +642,15 @@ mod tests {
                         shutdown: false,
                         settled: false,
                     });
+                }
+                Some(Scripted::Breaks(claims)) => {
+                    for (at, &claim) in claims.iter().enumerate() {
+                        self.probe.claims.record(ClaimRecord {
+                            step,
+                            claim,
+                            detail: format!("{claim:?} #{at}"),
+                        });
+                    }
                 }
                 None => {}
             }
@@ -901,6 +924,51 @@ mod tests {
             let violations = &report.properties[0].violations;
             assert_eq!(violations.len(), 1, "{claim:?}: {violations:?}");
             assert_eq!(violations[0].step, 2, "{claim:?}");
+        }
+    }
+
+    /// Every claim break one boundary's drain found survives into the
+    /// report, not just the first, for each check that reads claim breaks:
+    /// two at step 1, in the order the tap found them.
+    #[test]
+    fn every_claim_break_at_a_boundary_is_reported() {
+        let cases: [(Property<Probe>, &'static [Claim]); 3] = [
+            (
+                chunk_budget_bound(),
+                &[Claim::BudgetOverCapacity, Claim::OverBudget],
+            ),
+            (
+                teardown_returns_baseline(),
+                &[Claim::LeakedReservation, Claim::LeakedLease],
+            ),
+            (
+                stale_completion_inert(),
+                &[Claim::StaleCompletionEffect, Claim::StaleCompletionEffect],
+            ),
+        ];
+        for (property, claims) in cases {
+            let id = property.id.to_string();
+            let report = run_property(property, &[Scripted::Breaks(claims)]);
+            let found: Vec<(u64, &str)> = report.properties[0]
+                .violations
+                .iter()
+                .map(|v| (v.step, v.actual.as_str()))
+                .collect();
+            let expected: Vec<String> = claims
+                .iter()
+                .enumerate()
+                .map(|(at, claim)| format!("{claim:?} #{at}"))
+                .collect();
+            assert_eq!(
+                found,
+                [(1, expected[0].as_str()), (1, expected[1].as_str())],
+                "{id}"
+            );
+            assert_eq!(
+                report.properties[0].outcome,
+                PropertyOutcome::Violated { witness: vec![1] },
+                "{id}"
+            );
         }
     }
 }

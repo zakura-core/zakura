@@ -765,6 +765,58 @@ fn closed(cause: &str) -> Observation {
     }
 }
 
+/// Two punishments of an honest peer at one step, a fault close of its
+/// connection 1 and a `Misbehavior` against its connection 2, are two
+/// violations, and the report keeps both.
+#[test]
+fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
+    let second = Observation::Transport {
+        instance: 0,
+        seq: 2,
+        node: "node".to_owned(),
+        connection: Some(2),
+        remote: peer_addr(0, 1).to_string(),
+        event: TransportFact::Registered,
+    };
+    let report = run_marked(
+        true,
+        false,
+        vec![
+            vec![registered(), second],
+            vec![
+                closed("ordered_read_rejected"),
+                Observation::Misbehavior { connection: 2 },
+            ],
+        ],
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let honest = report
+        .properties
+        .iter()
+        .find(|property| property.property == HONEST_NEVER_PUNISHED)
+        .expect("registered");
+    let found: Vec<(u64, &str, &str)> = honest
+        .violations
+        .iter()
+        .map(|v| (v.step, v.expected.as_str(), v.actual.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                2,
+                "honest peer-0's connection 1 is never punished",
+                "a close with cause ordered_read_rejected"
+            ),
+            (
+                2,
+                "honest peer-0's connection 2 is never punished",
+                "a Misbehavior"
+            ),
+        ]
+    );
+}
+
 /// Scripted punishments of an honest peer violate
 /// `session/honest-never-punished`, even where a label excuses them: a
 /// fault close after a frame its models label `short-payload`, which

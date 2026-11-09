@@ -477,17 +477,24 @@ fn every_unjustified_punishment_is_a_violation() {
         closed("header_peer_fault"),
         on(2, closed("header_peer_fault")),
     ]]);
-    let property = report
-        .properties
-        .iter()
-        .find(|p| p.property == "feed/s64v1/conformant-never-closes")
-        .expect("the property reports");
-    let connections: Vec<&str> = property
-        .violations
-        .iter()
-        .map(|v| v.expected.split('\'').next().unwrap_or_default())
-        .collect();
-    assert_eq!(connections, ["connection 1", "connection 2"]);
+    let close = "a close with cause header_peer_fault";
+    assert_eq!(
+        findings(&report, "feed/s64v1/conformant-never-closes"),
+        [
+            (
+                1,
+                &[1][..],
+                "connection 1's judged frames are all conformant, so no punishment",
+                close
+            ),
+            (
+                1,
+                &[1][..],
+                "connection 2's judged frames are all conformant, so no punishment",
+                close
+            ),
+        ]
+    );
 }
 
 /// The frame `seq` the peer sent on `connection` and `stream`, labelled

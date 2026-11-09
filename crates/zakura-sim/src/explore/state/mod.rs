@@ -9,7 +9,7 @@
 //!
 //! # Index layout
 //!
-//! [`FEEDBACK_VERSION`] 2 fixes this layout. Each [`Family`] owns 4,096
+//! [`FEEDBACK_VERSION`] 3 fixes this layout. Each [`Family`] owns 4,096
 //! indices from `family × 4096`, in [`Family::ALL`]'s order. A family splits
 //! its span into blocks, one per [`StateFeature`] variant. A block's index is
 //! mixed-radix over the variant's fields, in field order, each field by its
@@ -28,11 +28,13 @@
 //! | `budget` | 16384 | +0 | `BlockBudget`: change × level before × level after |
 //! | | | +512 | `HeaderCapacity`: event × class |
 //! | | | +1024 | `CadenceEmptied`: row × direction |
+//! | | | +1536 | `HeaderLease`: class × level |
 //! | `regulation` | 20480 | +0 | `Frame`: row × direction × label × stage |
 //! | | | +2048 | `Transition`: transition |
-//! | `hold` | 24576 | | none yet |
+//! | `hold` | 24576 | +0 | `Hold`: operation × part × stage |
 //! | `reorg-stage` | 28672 | +0 | `ReorgStage`: stage |
 //! | `recovery` | 32768 | +0 | `Obligation`: namespace × point |
+//! | | | +512 | `ConditionsEstablished` |
 //! | `teardown` | 36864 | +0 | `Retired`: what |
 //! | | | +16 | `Acknowledged`: service × how × dropped |
 //! | | | +32 | `Baseline`: baseline |
@@ -464,6 +466,39 @@ vocabulary! {
         HeaderReorgApplied = "header-reorg-applied",
         /// Block storage reset the verified chain onto another branch.
         VerifiedReset = "verified-reset",
+        /// Header storage prepared a target with more work than an earlier
+        /// target from the same common ancestor whose first header differs.
+        /// A retry of an earlier prepare counts for none of the three.
+        StrongerWork = "stronger-work",
+        /// The same with less work.
+        WeakerWork = "weaker-work",
+        /// The same with equal work.
+        EqualWork = "equal-work",
+    }
+}
+
+vocabulary! {
+    /// What a storage hold kept back: an operation's completion, or a
+    /// committed apply's reply.
+    HeldPart {
+        /// The completion.
+        Completion = "completion",
+        /// The reply of a committed apply.
+        Reply = "reply",
+    }
+}
+
+vocabulary! {
+    /// A held storage operation's stage.
+    HoldStage {
+        /// At the start of a live step after its submission, or its commit
+        /// for a reply, it was pending and none of its storage actions was
+        /// enabled.
+        Blocked = "blocked",
+        /// A later step's enabled set held one of its storage actions.
+        Released = "released",
+        /// It completed, or its reply was delivered.
+        Resumed = "resumed",
     }
 }
 
@@ -900,6 +935,15 @@ pub enum StateFeature {
         /// The counter's level after it.
         after: Level,
     },
+    /// A header storage lease for `class` took the class's live leases to
+    /// `level` against its limit. The peer class's limit is one lease per
+    /// peer.
+    HeaderLease {
+        /// The capacity class.
+        class: CapacityClass,
+        /// The live leases' level then.
+        level: Level,
+    },
     /// Header storage capacity `event` for `class`.
     HeaderCapacity {
         /// What happened.
@@ -931,6 +975,16 @@ pub enum StateFeature {
     /// After block sync's body-work epoch first advanced, its newest-epoch
     /// work reached `stage`.
     ReorgStage(ReorgStage),
+    /// A held storage operation of kind `op` reached `stage`, with `part`
+    /// held.
+    Hold {
+        /// The operation's kind.
+        op: Operation,
+        /// What was held.
+        part: HeldPart,
+        /// The stage.
+        stage: HoldStage,
+    },
     /// An obligation of a property in `namespace` reached `point`.
     Obligation {
         /// The property ID's first segment.
@@ -938,6 +992,9 @@ pub enum StateFeature {
         /// The point.
         point: ObligationPoint,
     },
+    /// A recovery reached its conditions point: the `peer:node:recovered`
+    /// pick.
+    ConditionsEstablished,
     /// A service retired.
     Retired(Retirement),
     /// `service` acknowledged its caller's retirement by `how`.
@@ -989,10 +1046,14 @@ impl StateFeature {
             StateFeature::Replacement { .. } => Family::Replacement,
             StateFeature::BlockBudget { .. }
             | StateFeature::HeaderCapacity { .. }
-            | StateFeature::CadenceEmptied { .. } => Family::Budget,
+            | StateFeature::CadenceEmptied { .. }
+            | StateFeature::HeaderLease { .. } => Family::Budget,
             StateFeature::Frame { .. } | StateFeature::Transition(_) => Family::Regulation,
+            StateFeature::Hold { .. } => Family::Hold,
             StateFeature::ReorgStage(_) => Family::ReorgStage,
-            StateFeature::Obligation { .. } => Family::Recovery,
+            StateFeature::Obligation { .. } | StateFeature::ConditionsEstablished => {
+                Family::Recovery
+            }
             StateFeature::Retired(_)
             | StateFeature::Acknowledged { .. }
             | StateFeature::Baseline(_)
@@ -1010,6 +1071,7 @@ impl StateFeature {
             | StateFeature::BlockBudget { .. }
             | StateFeature::Frame { .. }
             | StateFeature::ReorgStage(_)
+            | StateFeature::Hold { .. }
             | StateFeature::Obligation { .. }
             | StateFeature::Retired(_) => 0,
             StateFeature::Acknowledged { .. } => 16,
@@ -1017,7 +1079,9 @@ impl StateFeature {
             StateFeature::IncompleteDrain => 48,
             StateFeature::BlockRequestStep { .. }
             | StateFeature::Disposition { .. }
-            | StateFeature::HeaderCapacity { .. } => 512,
+            | StateFeature::HeaderCapacity { .. }
+            | StateFeature::ConditionsEstablished => 512,
+            StateFeature::HeaderLease { .. } => 1536,
             StateFeature::BlockOpCompleted { .. }
             | StateFeature::CallEnded { .. }
             | StateFeature::CadenceEmptied { .. } => 1024,
@@ -1088,6 +1152,15 @@ impl StateFeature {
             StateFeature::HeaderCapacity { event, class } => {
                 mix(&[digit!(event, CapacityEvent), digit!(class, CapacityClass)])
             }
+            StateFeature::HeaderLease { class, level } => {
+                mix(&[digit!(class, CapacityClass), digit!(level, Level)])
+            }
+            StateFeature::Hold { op, part, stage } => mix(&[
+                digit!(op, Operation),
+                digit!(part, HeldPart),
+                digit!(stage, HoldStage),
+            ]),
+            StateFeature::ConditionsEstablished => 0,
             StateFeature::CadenceEmptied { row, direction } => {
                 mix(&[digit!(row, Row), digit!(direction, Direction)])
             }
@@ -1204,6 +1277,18 @@ impl StateFeature {
                 all.push(StateFeature::HeaderCapacity { event, class });
             }
         }
+        for &class in CapacityClass::ALL {
+            for &level in Level::ALL {
+                all.push(StateFeature::HeaderLease { class, level });
+            }
+        }
+        for &op in Operation::ALL {
+            for &part in HeldPart::ALL {
+                for &stage in HoldStage::ALL {
+                    all.push(StateFeature::Hold { op, part, stage });
+                }
+            }
+        }
         for &row in Row::ALL {
             for &direction in Direction::ALL {
                 all.push(StateFeature::CadenceEmptied { row, direction });
@@ -1236,6 +1321,7 @@ impl StateFeature {
                 all.push(StateFeature::Obligation { namespace, point });
             }
         }
+        all.push(StateFeature::ConditionsEstablished);
         all.extend(Retirement::ALL.iter().copied().map(StateFeature::Retired));
         for &service in Service::ALL {
             for &how in Acknowledgement::ALL {
@@ -1423,8 +1509,10 @@ pub const REQUIRED: &[RequiredState] = &[
     waiting(
         Family::CompletionCancellation,
         "completion after cancellation acknowledgement",
-        "M6a and G2a",
-        "no storage port acknowledges a cancellation on main",
+        "fuzz-14",
+        "neither storage contract acknowledges a cancellation: header storage never stops \
+         accepted work, and only shutdown removes a pending operation, so no witness can \
+         reach it and fuzz-14's acceptance must list it as an exclusion",
     ),
     collected(
         Family::CompletionCancellation,
@@ -1462,14 +1550,17 @@ pub const REQUIRED: &[RequiredState] = &[
         true,
         |f| *f == StateFeature::Fork(Fork::SharedAncestorPrepared),
     ),
-    waiting(
+    collected(
         Family::CompetingForks,
         "stronger, weaker or equal work",
-        "O2 and G2a",
-        "no observation carries chain work, and every fixture header has the Regtest genesis \
-         difficulty, so competing branches differ only in length; an observation must report \
-         each prepared target's suffix work, and G2a's controls must offer branches of more, \
-         less and equal work",
+        &[HEADER_STORAGE],
+        true,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Fork(Fork::StrongerWork | Fork::WeakerWork | Fork::EqualWork)
+            )
+        },
     ),
     collected(
         Family::CompetingForks,
@@ -1538,12 +1629,20 @@ pub const REQUIRED: &[RequiredState] = &[
             }
         )
     }),
-    waiting(
+    collected(
         Family::Budget,
         "exactly limit",
-        "fuzz-12.6",
-        "the `header-storage-w-peer-lease-denied` seed holds a peer lease at the peer \
-         class's limit of one, but the collector has no header lease level feature yet",
+        &[HEADER_STORAGE],
+        true,
+        |f| {
+            matches!(
+                f,
+                StateFeature::HeaderLease {
+                    level: Level::AtLimit,
+                    ..
+                }
+            )
+        },
     ),
     collected(Family::Budget, "released", &[BLOCK], true, |f| {
         matches!(
@@ -1576,13 +1675,17 @@ pub const REQUIRED: &[RequiredState] = &[
         false,
         |f| matches!(f, StateFeature::CadenceEmptied { .. }),
     ),
-    waiting(
+    collected(
         Family::Budget,
         "attempted over-limit and denied",
-        "fuzz-12.6",
-        "the `header-storage-w-peer-lease-denied` seed's second acquire for the same peer \
-         is refused `CapacityBusy` for the peer class, but the collector has no header \
-         lease level feature yet",
+        &[HEADER_STORAGE],
+        true,
+        |f| {
+            *f == StateFeature::HeaderCapacity {
+                event: CapacityEvent::Denied,
+                class: CapacityClass::Peer,
+            }
+        },
     ),
     collected(
         Family::Regulation,
@@ -1630,11 +1733,12 @@ pub const REQUIRED: &[RequiredState] = &[
         "G2b",
         "no peer script crosses an update with an outcome; G2b's protocol actions add it",
     ),
-    waiting(
+    collected(
         Family::Hold,
         "operation kind × blocked × release × resumed operation",
-        "G2a",
-        "the run logs no hold or release; G2a's storage controls add them",
+        &[HEADER_STORAGE],
+        true,
+        |f| matches!(f, StateFeature::Hold { .. }),
     ),
     collected(Family::ReorgStage, "query", &[BLOCK], true, |f| {
         *f == StateFeature::ReorgStage(ReorgStage::Query)
@@ -1667,11 +1771,12 @@ pub const REQUIRED: &[RequiredState] = &[
         "P8",
         "no harness runs header and block sync together",
     ),
-    waiting(
+    collected(
         Family::Recovery,
         "conditions established",
-        "G2a",
-        "no harness has a recovery phase; G2a's recovery contract adds its boundary",
+        &[HEADER_STORAGE],
+        true,
+        |f| *f == StateFeature::ConditionsEstablished,
     ),
     collected(
         Family::Recovery,
@@ -1706,15 +1811,17 @@ pub const REQUIRED: &[RequiredState] = &[
     waiting(
         Family::Recovery,
         "deadline expired",
-        "G2a",
-        "no witness on main expires an obligation without a planted bug; G2a's recovery \
-         witnesses reach it",
+        "a planted witness",
+        "without a bug, an expired obligation is a violation, so only a planted case, such \
+         as hdr-7's `capacity-release-wakes` bypass, can reach it",
     ),
     waiting(
         Family::Recovery,
         "assumption lost",
-        "G2a",
-        "the registry emits no event when a property's assumptions stop holding",
+        "hdr-13",
+        "the registry tracks a loss only for a property that lists an assumption, and emits \
+         no event for it; hdr-13's recovery property lists the storage harness's \
+         assumptions, and the event comes with it",
     ),
     collected(
         Family::Teardown,
@@ -1723,12 +1830,20 @@ pub const REQUIRED: &[RequiredState] = &[
         true,
         |f| matches!(f, StateFeature::Retired(_)),
     ),
-    waiting(
+    collected(
         Family::Teardown,
         "external acknowledgement",
-        "G2a",
-        "no witness on main leaves a storage call pending at teardown, so no driver \
-         exits or shuts down with one; G2a's storage holds keep the call pending",
+        &[HEADER_STORAGE],
+        true,
+        |f| {
+            matches!(
+                f,
+                StateFeature::Acknowledged {
+                    dropped: Dropped::Some,
+                    ..
+                }
+            )
+        },
     ),
     collected(Family::Teardown, "settled baseline", &[BLOCK], false, |f| {
         *f == StateFeature::Baseline(Baseline::Settled)
@@ -1736,7 +1851,8 @@ pub const REQUIRED: &[RequiredState] = &[
     waiting(
         Family::Teardown,
         "incomplete drain",
-        "G2a",
-        "no witness on main stops its drain at the bound",
+        "a drain bound knob",
+        "the drain stops at its bound only with tasks still ready, and no harness's controls \
+         keep tasks ready for its 1,000 steps; reaching it needs a lower drain bound",
     ),
 ];

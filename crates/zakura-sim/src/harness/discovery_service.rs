@@ -35,8 +35,8 @@ use super::{
 };
 use crate::{
     peer::{
-        discovery::discovery_stream, key_index, peer_addr, PeerControl, PeerFailure, PeerRecords,
-        PeerSpec, PeerTask, NODE_ADDR,
+        discovery::discovery_stream, key_index, peer_addr, PeerCloses, PeerControl, PeerFailure,
+        PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     Sim,
 };
@@ -180,6 +180,7 @@ pub fn spawn(sim: &mut Sim, net: &NetScenario, spec: &NodeSpec, peers: &[PeerSpe
             listening,
             chain: None,
             records: records.clone(),
+            closed: PeerCloses::default(),
             taken: 0,
         };
         sim.scheduler()

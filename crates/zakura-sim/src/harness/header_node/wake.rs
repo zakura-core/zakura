@@ -18,10 +18,11 @@
 //! If they all hold, the release opens the waiting peer's wake
 //! ([`WakeFact::Opened`]). Otherwise it opens nothing, so a broken fixture
 //! reads as not applicable, never as a missed wake. The waiting peer's
-//! locator reaching storage ([`WakeFact::Submitted`]) or its session ending
-//! ([`WakeFact::Ended`]) answers the wake, and a deferred cached pass
-//! ([`WakeFact::Deferred`]) moves its deadline to the pass's refill, but
-//! never past one refill interval after the wake opened.
+//! locator reaching storage ([`WakeFact::Submitted`]) answers the wake, and
+//! so does its session ending ([`WakeFact::Ended`]) when the environment
+//! ended it ([`EndedBy`]). A deferred cached pass ([`WakeFact::Deferred`])
+//! moves its deadline to the pass's refill, but never past one refill
+//! interval after the wake opened.
 //!
 //! Each fact takes the node's next stamp ([`super::stamp`]), which the
 //! storage view hands the registry as its view-side facts.
@@ -39,8 +40,11 @@ use zakura_network::zakura::{
 };
 use zakura_scheduler::SimInstant;
 
-use super::stamp::Stamps;
-use crate::observe::{StorageFact, StorageRequest};
+use super::{session::SessionEvidence, stamp::Stamps};
+use crate::{
+    observe::{StorageFact, StorageRequest},
+    property::EndedBy,
+};
 
 /// The wake fixture a harness declares. It fixes one waiting mirror whose
 /// only `Status` arrives once filling mirrors' held rounds use the room,
@@ -76,6 +80,8 @@ pub enum WakeFact {
         peer: ZakuraPeerId,
         /// The ended session.
         session_id: u64,
+        /// Who ended it, when the reactor reported the end.
+        by: EndedBy,
     },
     /// The reactor's cached pass waits for its budget's refill at `until`.
     Deferred {
@@ -183,6 +189,8 @@ struct Wait {
 /// locator calls, the adopted tip, the budget and the probe.
 pub(super) struct WakeCheck {
     evidence: WakeEvidence,
+    /// The node's session view, which says who ended a session.
+    sessions: SessionEvidence,
     /// The offer waiting for room, if any.
     waiting: Option<Wait>,
     /// Each peer's live session.
@@ -203,10 +211,12 @@ pub(super) struct WakeCheck {
 }
 
 impl WakeCheck {
-    /// A check that keeps its facts in `evidence`.
-    pub(super) fn new(evidence: WakeEvidence) -> WakeCheck {
+    /// A check that keeps its facts in `evidence`, and reads who ended a
+    /// session from `sessions`.
+    pub(super) fn new(evidence: WakeEvidence, sessions: SessionEvidence) -> WakeCheck {
         WakeCheck {
             evidence,
+            sessions,
             waiting: None,
             live: HashMap::new(),
             started: HashSet::new(),
@@ -339,8 +349,8 @@ impl WakeCheck {
         }
     }
 
-    /// Notes that `peer`'s session `session_id` ended, which ends its wait
-    /// and answers its wake.
+    /// Notes that `peer`'s session `session_id` ended, which ends its wait,
+    /// and keeps who ended it, which decides whether that answers its wake.
     fn ended(&mut self, peer: &ZakuraPeerId, session_id: u64) {
         if self
             .waiting
@@ -352,6 +362,7 @@ impl WakeCheck {
         self.evidence.push(WakeFact::Ended {
             peer: peer.clone(),
             session_id,
+            by: self.sessions.ended_by(session_id),
         });
     }
 }

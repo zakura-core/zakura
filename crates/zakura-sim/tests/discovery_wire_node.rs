@@ -53,6 +53,7 @@ fn run() -> RunReport {
         &NodeSpec {
             verification_slots: 1,
             static_candidates: vec![1],
+            peer_sample_limit: None,
         },
         &[PeerSpec {
             capabilities: ZAKURA_CAP_DISCOVERY,
@@ -127,6 +128,7 @@ fn run_peers(static_candidates: Vec<usize>, peers: &[PeerSpec]) -> RunReport {
         &NodeSpec {
             verification_slots: 1,
             static_candidates,
+            peer_sample_limit: None,
         },
         peers,
     );

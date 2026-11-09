@@ -18,8 +18,11 @@
 //!
 //! `discovery/wire` (disc-2.3) is the [`Subsystem`] that runs the node and
 //! its peers. A committed input's two-byte prefix picks one of its
-//! [`SavedPlan`]s, as `header-sync/wire`'s does. It registers only the
-//! registry's own checks, and disc-3 adds discovery's properties.
+//! [`SavedPlan`]s, as `header-sync/wire`'s does. It registers discovery's
+//! generated receiver properties ([`wire_properties`], disc-3.1), each a
+//! `Draft` until its planted case lands. A peer's
+//! [`PeerAction::Discover`](crate::peer::PeerAction::Discover) acts reach
+//! them ([`act_scenario`]).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -30,8 +33,11 @@ use zakura_network::zakura::{
         build_discovery_handle, insert_static_bootstrap_candidates, spawn_native_bootstrap_dialer,
         spawn_native_discovery_dialer,
     },
-    DiscoveryService, Service, TransportObserver, ZakuraDiscoveryHandle, ZakuraHandshakeConfig,
-    ZakuraServiceId, ZAKURA_CAP_DISCOVERY,
+    wire_codec::WireMessage,
+    DiscoveryMessage, DiscoveryService, Service, Stream, TransportObserver, ZakuraDiscoveryConfig,
+    ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraServiceId,
+    DEFAULT_DISCOVERY_CONNECTION_HEADROOM, ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION,
+    ZAKURA_STREAM_DISCOVERY,
 };
 use zakura_quic::sim::{SeededInputs, SimNet};
 
@@ -42,11 +48,14 @@ use super::{
 };
 use crate::{
     peer::{
-        discovery::{discovery_stream, Answer, DiscoveryScript, Hold},
-        key_index, peer_addr, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
+        discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
+        key_index,
+        limit::ADVERSARY_RATE,
+        peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
         PeerTask, NODE_ADDR,
     },
-    property::{HasView, Source, Sources},
+    property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status},
+    table::table_properties,
     RunConfig, Sim,
 };
 
@@ -60,6 +69,11 @@ pub struct NodeSpec {
     /// bootstrap candidates and keeps dialing. An index no peer takes names
     /// an address nobody listens on.
     pub static_candidates: Vec<usize>,
+    /// The peer limit of its `GetPeers`, in place of production's 32. Left
+    /// out of a serialized scenario when unset, so saved ones keep their
+    /// form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_sample_limit: Option<usize>,
 }
 
 /// The discovery node's handle, which the node's root task sets once it
@@ -85,7 +99,8 @@ impl NodeHandle {
 
 /// Binds the discovery node to [`NODE_ADDR`] on `net` as
 /// [`WireEndpoint::spawn`] does, with discovery alone at production defaults
-/// on `network`, and `spec`'s verification slots and static candidates. It
+/// on `network`, and `spec`'s verification slots, static candidates and
+/// peer limit. It
 /// reports to `observer`, with failed dials to `dials`, and keeps a clone of
 /// its handle in `node`.
 #[allow(clippy::too_many_arguments)]
@@ -101,6 +116,7 @@ pub fn spawn_node(
 ) {
     let bootstrap_peers = bootstrap_peers(seed, &spec.static_candidates);
     let slots = spec.verification_slots;
+    let peer_sample_limit = spec.peer_sample_limit;
     let handshake = ZakuraHandshakeConfig::for_network(network);
     WireEndpoint::spawn(
         sim,
@@ -112,18 +128,41 @@ pub fn spawn_node(
         {
             let bootstrap_count = bootstrap_peers.len();
             move |supervisor, limits| {
-                let handle = build_discovery_handle(
-                    SeededInputs::node_key(seed, 0),
-                    // As production passes its listen address. The
-                    // address is private, so the node's record drops it.
-                    vec![NODE_ADDR],
-                    // The node serves discovery alone.
-                    vec![ZakuraServiceId::discovery()],
-                    &handshake,
-                    limits.max_connections,
-                    bootstrap_count,
-                    supervisor.subscribe(),
-                )
+                let handle = match peer_sample_limit {
+                    None => build_discovery_handle(
+                        SeededInputs::node_key(seed, 0),
+                        // As production passes its listen address. The
+                        // address is private, so the node's record drops it.
+                        vec![NODE_ADDR],
+                        // The node serves discovery alone.
+                        vec![ZakuraServiceId::discovery()],
+                        &handshake,
+                        limits.max_connections,
+                        bootstrap_count,
+                        supervisor.subscribe(),
+                    ),
+                    // Production's builder, with the peer limit changed.
+                    Some(peer_sample_limit) => ZakuraDiscoveryHandle::new(
+                        ZakuraDiscoveryLocalConfig {
+                            secret_key: SeededInputs::node_key(seed, 0),
+                            direct_addrs: vec![NODE_ADDR],
+                            services: vec![ZakuraServiceId::discovery()],
+                            zakura_protocol_min: handshake.zakura_protocol_min,
+                            zakura_protocol_max: handshake.zakura_protocol_max,
+                            network_id: handshake.network_id,
+                            chain_id: handshake.chain_id,
+                            last_authored_sequence: None,
+                        },
+                        ZakuraDiscoveryConfig {
+                            max_zakura_connections: limits.max_connections,
+                            discovery_connection_headroom: DEFAULT_DISCOVERY_CONNECTION_HEADROOM
+                                .max(bootstrap_count),
+                            peer_sample_limit,
+                            ..ZakuraDiscoveryConfig::default()
+                        },
+                        supervisor.subscribe(),
+                    ),
+                }
                 .expect("production's config on the fixture network is valid")
                 .with_verification_slots(slots);
                 node.set(&handle);
@@ -206,8 +245,11 @@ fn spawn_with(
             peer.honest.is_none(),
             "a discovery scenario's peers hold no header chain"
         );
-        let (readiness, commands) =
-            control.add(&name, peer.script.clone(), peer.adversary.is_some());
+        let (readiness, commands) = control.add(
+            &name,
+            peer.script.clone(),
+            peer.adversary.is_some() || peer.discovers_adversarially(),
+        );
         let (listening, _) = zakura_rt::sync::watch::channel(false);
         let task = PeerTask {
             name,
@@ -256,6 +298,7 @@ impl Default for WireScenario {
             node: NodeSpec {
                 verification_slots: 1,
                 static_candidates: Vec::new(),
+                peer_sample_limit: None,
             },
             peers: vec![discovering(PeerSpec::dialing(), DiscoveryScript::default())],
         }
@@ -377,8 +420,98 @@ fn dialed(script: DiscoveryScript) -> WireScenario {
     }
 }
 
+/// When an act scenario's held answers go, in milliseconds past the run's
+/// start: before the node's 2 s initial exchange wait ends, so the
+/// exchange stays open for the act.
+pub const ACT_HOLD_MS: u64 = 1_500;
+
+/// The scenario where `act` reaches its label: the default node, dialed by
+/// one peer whose script is `act` alone, on links of 1 to 5 ms, so the
+/// act and the node's answers fit the node's initial exchange wait, and
+/// each round trip moves the clock. The
+/// peer relays one record. It holds its `Services`, so the node's exchange
+/// stays open, and also the answer `act` takes. An unsolicited `Services`
+/// needs the node's `GetServices` answered, so that act's peer holds its
+/// `Peers` instead. An over-owed `Peers` needs a node limit under 32, so
+/// that act's node asks for one record.
+pub fn act_scenario(act: DiscoveryAct) -> WireScenario {
+    let hold = |answer| Hold {
+        answer,
+        until_ms: ACT_HOLD_MS,
+    };
+    let mut held = vec![Answer::Services];
+    if act
+        == (DiscoveryAct::Unsolicited {
+            row: DiscoveryRow::Services,
+        })
+    {
+        held = vec![Answer::Peers];
+    } else if let Some(answer) = act.takes().filter(|answer| *answer != Answer::Services) {
+        held.push(answer);
+    }
+    let script = DiscoveryScript {
+        relays: 1,
+        holds: held.into_iter().map(hold).collect(),
+    };
+    let base = WireScenario::default();
+    let mut net = base.net.clone();
+    net.default_link.min_delay_ms = 1;
+    net.default_link.max_delay_ms = 5;
+    WireScenario {
+        net,
+        node: NodeSpec {
+            peer_sample_limit: (act
+                == DiscoveryAct::OverOwed {
+                    row: DiscoveryRow::Peers,
+                })
+            .then_some(1),
+            ..base.node
+        },
+        peers: vec![PeerSpec {
+            script: vec![PeerAction::Discover { act }],
+            ..discovering(PeerSpec::dialing(), script)
+        }],
+    }
+}
+
+/// The family discovery's generated property IDs name.
+pub const FAMILY: &str = "discovery";
+
+/// Discovery's one stream as its generated properties name it: its kind,
+/// version and table. A test pins them to [`DiscoveryService::streams`],
+/// which needs a handle, and building one draws from the run.
+pub const STREAMS: [Stream; 1] = [Stream {
+    kind: ZAKURA_STREAM_DISCOVERY,
+    version: ZAKURA_DISCOVERY_STREAM_VERSION,
+    messages: Some(<DiscoveryMessage as WireMessage>::RULES),
+    ..Stream::PERSISTENT
+}];
+
+/// `discovery/wire`'s properties: discovery's generated receiver
+/// properties, 31 IDs, each a `Draft` until its planted case lands
+/// (disc-3.2, disc-3.3).
+///
+/// A `bad-content-closes` ID's generated check accepts a fault close or a
+/// `Misbehavior`, and discovery's node answers bad content with a fault
+/// close. Neither comes from storage, which the discovery node doesn't
+/// have, so its IDs need only the frames and closes.
+///
+/// Not registered: the downstream templates. Discovery's harness observes
+/// none of the node's serving, work or output, so they would claim coverage
+/// that doesn't exist. They follow disc-1's full-service observations.
+pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
+    table_properties(FAMILY, &STREAMS)
+        .into_iter()
+        .map(|property| Property {
+            status: Status::Draft,
+            needs: &[Source::Frames, Source::Closes],
+            ..property
+        })
+        .collect()
+}
+
 /// The discovery node behind its real transport on simulated QUIC, named
-/// `node`, with scripted peers. It registers only the registry's checks.
+/// `node`, with scripted peers.
 pub struct DiscoveryWire;
 
 impl HasView for DiscoveryWire {
@@ -398,6 +531,28 @@ impl Subsystem for DiscoveryWire {
     /// [`wire_config`].
     fn config(_: &WireScenario) -> RunConfig {
         wire_config()
+    }
+
+    /// [`wire_properties`].
+    fn properties() -> Vec<Property<Self>> {
+        wire_properties()
+    }
+
+    /// For a scenario where a peer takes a discovery act, `BoundedAdversary`
+    /// at [`ADVERSARY_RATE`] actions per virtual second, the budget
+    /// [`PeerControl`] holds an adversary to.
+    fn assumptions(scenario: &WireScenario) -> Assumptions<Self> {
+        if !scenario
+            .peers
+            .iter()
+            .any(|peer| peer.adversary.is_some() || peer.discovers_adversarially())
+        {
+            return Assumptions::none();
+        }
+        Assumptions::declare(vec![AssumeRecord {
+            assume: Assume::BoundedAdversary,
+            params: serde_json::json!({ "actions_per_second": ADVERSARY_RATE }),
+        }])
     }
 
     /// An empty slot for the node's handle.

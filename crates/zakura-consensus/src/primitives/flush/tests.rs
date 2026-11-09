@@ -76,7 +76,7 @@ fn flush_waits_for_late_transactions_and_unqueued_requests() {
         );
 
         // The first request reaches its queue before the other transaction is dispatched.
-        first_request.enqueued(Verifier::Ed25519);
+        first_request.enqueued(Verifier::Sapling);
         assert_eq!(outstanding(&pending), 1, "second transaction");
 
         // A request still waiting for queue capacity holds the flush back.
@@ -91,11 +91,11 @@ fn flush_waits_for_late_transactions_and_unqueued_requests() {
                 .lock()
                 .expect("test progress mutex is never poisoned")
                 .queued,
-            Verifier::Ed25519.bit()
+            Verifier::Sapling.bit()
         );
 
-        // Releasing it flushes the real Ed25519 worker, on the runtime its global verifier uses.
-        waiting.enqueued(Verifier::Ed25519);
+        // Releasing it flushes the real Sapling worker, on the runtime its global verifier uses.
+        waiting.enqueued(Verifier::Sapling);
         assert_eq!(outstanding(&pending), 0);
     });
 }

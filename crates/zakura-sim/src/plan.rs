@@ -8,8 +8,18 @@
 //! Once bytes run out, picks fall back to round-robin over the enabled set and
 //! draws to a fair default, so an empty or truncated input is still a valid,
 //! bounded run (M1.4).
+//!
+//! Once a source starts recovery ([`ActionSource::recovering`]), the input
+//! is no longer read. Picks go least recently picked first and draws rotate
+//! per call site, both recorded [`By::Recovery`] (see `Recovery` for the
+//! policy and its bound).
+//!
+//! [`ActionSource::recovering`]: crate::ActionSource::recovering
 
-use std::{collections::VecDeque, fmt};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -251,6 +261,8 @@ pub enum By {
     Default,
     /// The only option.
     Forced,
+    /// The recovery policy, after a source started recovery.
+    Recovery,
 }
 
 /// A scripted plan or trace that the run couldn't follow.
@@ -490,6 +502,79 @@ pub(crate) struct Decider {
     /// [`PlanChoice::Default`] entries only if a later choice isn't a
     /// default, so an exhausted input's defaults take no room.
     pending_defaults: usize,
+    /// The recovery policy's state, once [`recover`](Self::recover) is
+    /// called.
+    recovery: Option<Recovery>,
+}
+
+/// The recovery policy: least recently picked first.
+///
+/// Each action gets a stamp: the pick after its last one, or the pick at
+/// which it was first enabled if it hasn't been picked since recovery
+/// started. The policy picks the enabled action with the oldest stamp, ties
+/// going to the first in identity order. Identities compare without their
+/// `at`, so a task stays one action while it moves from point to point.
+///
+/// A stamp survives picks at which its action isn't enabled. With one
+/// worker, a task that stops mid-poll at a `select!` is the only enabled
+/// task until it resumes. Restarting every other task's age there would
+/// make them all new together, and every tie would then go to the same
+/// task.
+///
+/// **Bound.** Order actions by stamp, then identity. Say action `a` is
+/// enabled at pick `s` and at every pick after it until it's picked. An
+/// action picked before `a` comes before `a` in that order, and its pick
+/// gives it a stamp newer than every stamp so far, so it comes after `a`
+/// from then on. An action first enabled after `s` gets a stamp newer than
+/// `a`'s. So `a` is picked within one more pick than the number of actions
+/// before it at `s`, which is at most the number of actions stamped by
+/// then. Three actions first enabled together share a stamp, so the third
+/// in identity order waits two picks. The policy bounds picks, not virtual
+/// time.
+#[derive(Debug, Default)]
+struct Recovery {
+    /// Picks made under the policy so far.
+    picks: u64,
+    /// Each action enabled at some pick under the policy, and its stamp.
+    stamps: BTreeMap<(Category, String), u64>,
+}
+
+impl Recovery {
+    /// The index of the option with the oldest stamp.
+    fn oldest(&self, options: &[Identity]) -> usize {
+        let mut oldest = (0, u64::MAX);
+        for (index, option) in options.iter().enumerate() {
+            let stamp = self.stamp(option);
+            if stamp < oldest.1 {
+                oldest = (index, stamp);
+            }
+        }
+        oldest.0
+    }
+
+    /// `option`'s stamp, or the current pick for an action not enabled
+    /// before.
+    fn stamp(&self, option: &Identity) -> u64 {
+        self.stamps
+            .get(&(option.category, option.key.clone()))
+            .copied()
+            .unwrap_or(self.picks)
+    }
+
+    /// Notes that `options[index]` was picked from `options`: an option
+    /// enabled for the first time is stamped now, and the picked one is
+    /// stamped after every stamp so far.
+    fn picked(&mut self, options: &[Identity], index: usize) {
+        for option in options {
+            self.stamps
+                .entry((option.category, option.key.clone()))
+                .or_insert(self.picks);
+        }
+        self.picks = self.picks.saturating_add(1);
+        let picked = &options[index];
+        self.stamps
+            .insert((picked.category, picked.key.clone()), self.picks);
+    }
 }
 
 impl Decider {
@@ -510,7 +595,34 @@ impl Decider {
             cursor: None,
             resolved: Vec::new(),
             pending_defaults: 0,
+            recovery: None,
         }
+    }
+
+    /// Starts the recovery policy from the next pick and draw on. The input
+    /// is no longer read, except that a trace input still answers from its
+    /// record. Calling it again does nothing.
+    pub(crate) fn recover(&mut self) {
+        self.recovery.get_or_insert_with(Recovery::default);
+    }
+
+    /// True once [`recover`](Self::recover) was called.
+    pub(crate) fn recovering(&self) -> bool {
+        self.recovery.is_some()
+    }
+
+    /// The recovery policy's pick among `options`, if recovery started.
+    fn recovery_pick(&self, options: &[Identity]) -> Option<Decision> {
+        let recovery = self.recovery.as_ref()?;
+        Some(Decision {
+            index: recovery.oldest(options),
+            by: if options.len() == 1 {
+                By::Forced
+            } else {
+                By::Recovery
+            },
+            offset: None,
+        })
     }
 
     /// Picks one of `options`, which must be non-empty, sorted and free of
@@ -520,6 +632,8 @@ impl Decider {
     /// `value % n`, a script entry chooses by identity, and an exhausted input
     /// takes the first option whose key sorts after the previous pick,
     /// wrapping to the start. A skip script follows [`SkipScript`]'s rule.
+    /// Once recovery starts, the recovery policy picks, and only a trace
+    /// input is still read.
     pub(crate) fn pick(&mut self, options: &[Identity]) -> Result<Decision, PlanError> {
         assert!(!options.is_empty(), "a pick needs an enabled action");
         debug_assert!(
@@ -527,7 +641,13 @@ impl Decider {
             "the enabled set is sorted and has no duplicates"
         );
         let n = options.len();
-        let decision = if let Input::Trace { .. } = self.input {
+        let recovery = match self.input {
+            Input::Trace { .. } => None,
+            _ => self.recovery_pick(options),
+        };
+        let decision = if let Some(decision) = recovery {
+            decision
+        } else if let Input::Trace { .. } = self.input {
             let (recorded, by, offset) = self.next_recorded_pick(options)?;
             Decision {
                 index: options
@@ -585,6 +705,9 @@ impl Decider {
         let picked = &options[decision.index];
         self.resolve(decision.by, || PlanChoice::Pick(picked.to_string()));
         self.cursor = Some((picked.category, picked.key.clone()));
+        if let Some(recovery) = &mut self.recovery {
+            recovery.picked(options, decision.index);
+        }
         Ok(decision)
     }
 
@@ -610,7 +733,7 @@ impl Decider {
                         .iter()
                         .position(|o| o.to_string() == step.pick)
                         .unwrap_or(fallback),
-                    By::Default | By::Forced => fallback,
+                    By::Default | By::Forced | By::Recovery => fallback,
                 }
             }
             Some(Candidate::Default) | None => {
@@ -632,8 +755,9 @@ impl Decider {
     }
 
     /// Notes a choice made `by`, for [`resolved`](Self::resolved): `choice`
-    /// for a bytes choice, a pending default for a default one, and nothing
-    /// for a forced one.
+    /// for a bytes choice, a pending default for a default or recovery one,
+    /// and nothing for a forced one. No bytes choice follows a recovery one,
+    /// so the pending defaults then take no room.
     fn resolve(&mut self, by: By, choice: impl FnOnce() -> PlanChoice) {
         match by {
             By::Bytes => {
@@ -642,20 +766,22 @@ impl Decider {
                     .extend(std::iter::repeat_n(PlanChoice::Default, defaults));
                 self.resolved.push(choice());
             }
-            By::Default => self.pending_defaults += 1,
+            By::Default | By::Recovery => self.pending_defaults += 1,
             By::Forced => {}
         }
     }
 
     /// Picks one of `options` by round-robin alone, ignoring the input, as
-    /// the drain after a budget does. The same preconditions as
-    /// [`pick`](Self::pick) apply.
+    /// the drain after a budget does, or by the recovery policy once
+    /// recovery started. The same preconditions as [`pick`](Self::pick)
+    /// apply.
     ///
     /// A trace input still checks the pick against its record, so a drain
     /// that leaves the trace stops before the step runs.
     pub(crate) fn pick_round_robin(&mut self, options: &[Identity]) -> Result<Decision, PlanError> {
         assert!(!options.is_empty(), "a pick needs an enabled action");
-        let decision = Decision {
+        let recovery = self.recovery_pick(options);
+        let decision = recovery.unwrap_or_else(|| Decision {
             index: self.round_robin(options),
             by: if options.len() == 1 {
                 By::Forced
@@ -663,15 +789,15 @@ impl Decider {
                 By::Default
             },
             offset: None,
-        };
-        if let Input::Skip { .. } = self.input {
+        });
+        if let (Input::Skip { .. }, None) = (&self.input, recovery) {
             // The drain takes the round-robin pick whatever the candidate
             // says, but the candidate's draws still answer the step's.
             self.skip_pick(options);
         }
         if let Input::Trace { .. } = self.input {
-            // Round-robin makes the same `by` the recording did, so only the
-            // pick needs checking.
+            // Round-robin and the recovery policy make the same `by` the
+            // recording did, so only the pick needs checking.
             let (recorded, _, _) = self.next_recorded_pick(options)?;
             let found = options[decision.index].to_string();
             if found != recorded {
@@ -684,6 +810,9 @@ impl Decider {
         }
         let picked = &options[decision.index];
         self.cursor = Some((picked.category, picked.key.clone()));
+        if let Some(recovery) = &mut self.recovery {
+            recovery.picked(options, decision.index);
+        }
         Ok(decision)
     }
 
@@ -691,10 +820,13 @@ impl Decider {
     /// 0.
     ///
     /// `ordinal` counts this draw among its task's draws of the same kind,
-    /// from 1. An exhausted input answers [`default_draw`] for it. A trace
-    /// input answers the recorded value, after checking the identity and
-    /// bound, bound-1 draws included. A skip script follows
-    /// [`SkipScript`]'s rule.
+    /// from 1, or once recovery started, among its task's draws of that
+    /// kind at the same call site since recovery started. An exhausted
+    /// input, and the recovery policy, answer [`default_draw`] for it, so
+    /// after recovery a `select!` site polled `n` times with `k` branches
+    /// starts at each branch once in every `k` polls. A trace input answers
+    /// the recorded value, after checking the identity and bound, bound-1
+    /// draws included. A skip script follows [`SkipScript`]'s rule.
     pub(crate) fn draw(
         &mut self,
         identity: &str,
@@ -703,6 +835,11 @@ impl Decider {
     ) -> Result<Answer, PlanError> {
         let answer = match self.input {
             Input::Trace { .. } => self.next_recorded_draw(identity, bound)?,
+            _ if self.recovering() => Answer {
+                value: default_draw(bound, ordinal),
+                by: if bound == 1 { By::Forced } else { By::Recovery },
+                offset: None,
+            },
             Input::Skip { .. } => self.skip_draw(identity, bound, ordinal),
             Input::Bytes { .. } | Input::Script(_) => self.input_draw(bound, ordinal)?,
         };
@@ -1188,6 +1325,107 @@ mod tests {
         assert!(serde_json::from_str::<Plan>(r#"{"choices":[],"extra":1}"#).is_err());
     }
 
+    /// The tasks of [`tasks`] at these indices.
+    fn some(all: &[Identity], indices: &[usize]) -> Vec<Identity> {
+        indices.iter().map(|&i| all[i].clone()).collect()
+    }
+
+    #[test]
+    fn recovery_picks_the_oldest_enabled_and_ignores_the_input() {
+        let options = tasks(3);
+        // Bytes that would pick t000 every time.
+        let mut d = bytes(&[0; 64]);
+        assert_eq!(d.pick(&options).unwrap().index, 0);
+        d.recover();
+        let picks: Vec<_> = (0..6).map(|_| d.pick(&options).unwrap()).collect();
+        assert!(picks
+            .iter()
+            .all(|p| p.by == By::Recovery && p.offset.is_none()));
+        let indices: Vec<_> = picks.iter().map(|p| p.index).collect();
+        // All three start with one stamp, so t002 waits for the two that
+        // sort before it, as the bound counts.
+        assert_eq!(indices, [0, 1, 2, 0, 1, 2]);
+        // Only the pick before recovery read a byte.
+        assert_eq!(d.resolved().choices.len(), 1);
+        assert_eq!(d.pick(&tasks(1)).unwrap().by, By::Forced);
+    }
+
+    #[test]
+    fn recovery_reaches_a_key_round_robin_puts_off() {
+        // round_robin's doc case: with {a, z}, then {b, z}, then {c, z}, an
+        // exhausted input keeps landing on the new key, and z waits.
+        let all = tasks(4);
+        let sets = [
+            some(&all, &[0, 3]),
+            some(&all, &[1, 3]),
+            some(&all, &[2, 3]),
+        ];
+        let mut d = bytes(&[]);
+        let defaults: Vec<_> = sets
+            .iter()
+            .map(|set| set[d.pick(set).unwrap().index].clone())
+            .collect();
+        assert!(!defaults.contains(&all[3]), "{defaults:?}");
+        let mut d = bytes(&[]);
+        d.recover();
+        let recovered: Vec<_> = sets
+            .iter()
+            .map(|set| set[d.pick(set).unwrap().index].clone())
+            .collect();
+        assert_eq!(recovered, [all[0].clone(), all[3].clone(), all[2].clone()]);
+    }
+
+    #[test]
+    fn a_pick_where_others_wait_keeps_their_age() {
+        // As when one worker's task stops mid-poll: t000 alone, then all
+        // four. Each round must reach the others, not hand t000 every tie.
+        let all = tasks(4);
+        let mut d = bytes(&[]);
+        d.recover();
+        let mut ran = Vec::new();
+        for _ in 0..8 {
+            for set in [some(&all, &[0, 1, 2, 3]), some(&all, &[0])] {
+                ran.push(set[d.pick(&set).unwrap().index].key.clone());
+            }
+        }
+        for task in &all {
+            assert!(
+                ran.iter().filter(|key| **key == task.key).count() >= 2,
+                "{ran:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_draws_rotate_by_the_given_ordinal() {
+        let mut d = bytes(&[1; 64]);
+        d.recover();
+        let values: Vec<_> = (1..=4)
+            .map(|n| d.draw("t:select#9", 2, n).unwrap())
+            .collect();
+        assert!(values
+            .iter()
+            .all(|a| a.by == By::Recovery && a.offset.is_none()));
+        assert_eq!(
+            values.iter().map(|a| a.value).collect::<Vec<_>>(),
+            [0, 1, 0, 1]
+        );
+        assert_eq!(d.draw("t:select#9", 1, 1).unwrap().by, By::Forced);
+        assert!(d.resolved().choices.is_empty());
+    }
+
+    #[test]
+    fn the_drain_follows_the_recovery_policy() {
+        let all = tasks(3);
+        let mut d = bytes(&[]);
+        d.recover();
+        let one = d.pick(&all).unwrap();
+        assert_eq!((one.index, one.by), (0, By::Recovery));
+        // t001 and t002 have waited since the first pick, t000 is new again.
+        let drained = d.pick_round_robin(&some(&all, &[0, 2])).unwrap();
+        assert_eq!((drained.index, drained.by), (1, By::Recovery));
+    }
+
     /// One choice a test run asks for: a pick among this many tasks, or a
     /// draw with this bound.
     #[derive(Clone, Debug)]
@@ -1232,6 +1470,65 @@ mod tests {
                 seen.sort_unstable();
                 seen.dedup();
                 prop_assert_eq!(seen.len(), k);
+            }
+        }
+
+        #[test]
+        fn recovery_picks_each_waiting_action_within_the_bound(
+            prefix in proptest::collection::vec(any::<u8>(), 0..16),
+            sets in proptest::collection::vec(proptest::collection::btree_set(0usize..8, 1..8), 1..64),
+        ) {
+            // An action enabled at pick s and still enabled is picked within
+            // one more pick than the actions before it at s, by stamp, then
+            // index. A stamp is the pick after the action's last pick, or
+            // the pick it was first enabled at.
+            let all = tasks(8);
+            let mut d = bytes(&prefix);
+            for _ in 0..prefix.len() {
+                d.pick(&all).unwrap();
+            }
+            d.recover();
+            let sets: Vec<Vec<usize>> = sets.into_iter().map(|set| set.into_iter().collect()).collect();
+            let picks: Vec<usize> = sets
+                .iter()
+                .map(|set| set[d.pick(&some(&all, set)).unwrap().index])
+                .collect();
+            // The bound at each pick, from stamps kept apart from the policy's.
+            let mut stamps: BTreeMap<usize, usize> = BTreeMap::new();
+            let mut bounds = Vec::new();
+            for (s, set) in sets.iter().enumerate() {
+                for &b in set {
+                    stamps.entry(b).or_insert(s);
+                }
+                bounds.push(
+                    set.iter()
+                        .map(|&a| {
+                            let before = stamps.iter().filter(|(&b, &t)| (t, b) < (stamps[&a], a)).count();
+                            (a, before + 1)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                stamps.insert(picks[s], s + 1);
+            }
+            for (s, bound) in bounds.iter().enumerate() {
+                for &(a, within) in bound {
+                    let window = s..(s + within).min(sets.len());
+                    let mut stayed = true;
+                    let mut picked = false;
+                    for t in window.clone() {
+                        if !sets[t].contains(&a) {
+                            stayed = false;
+                            break;
+                        }
+                        if picks[t] == a {
+                            picked = true;
+                            break;
+                        }
+                    }
+                    // A window cut short by the end of the run can't decide.
+                    let decided = window.end - window.start == within;
+                    prop_assert!(picked || !stayed || !decided, "{a} at pick {s}: {picks:?}");
+                }
             }
         }
 

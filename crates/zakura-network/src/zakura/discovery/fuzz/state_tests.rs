@@ -68,7 +68,7 @@ fn controlled_disclosure_replays_signed_samples_across_insertion_orders() {
                         .into_iter()
                         .map(|record| {
                             let mut bytes = record.body.encode_for_signature().unwrap();
-                            bytes.extend_from_slice(&record.signature.to_bytes());
+                            bytes.extend_from_slice(&record.signature);
                             bytes
                         })
                         .collect(),

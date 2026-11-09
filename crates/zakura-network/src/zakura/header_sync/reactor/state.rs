@@ -601,9 +601,12 @@ impl ReactorState {
             .get_mut(&peer)
             .and_then(|schedule| schedule.replaced_request_budget.take())
             .filter(|carried| *carried < timeout);
-        self.arm_request_deadline(peer.clone(), now, carried.unwrap_or(timeout));
-        if carried.is_some() {
-            self.carried_request_deadlines.insert(peer);
+        match carried {
+            None => self.arm_request_deadline(peer, now, timeout),
+            Some(carried) => {
+                self.arm_request_deadline(peer.clone(), now, carried);
+                self.carried_request_deadlines.insert(peer);
+            }
         }
     }
 

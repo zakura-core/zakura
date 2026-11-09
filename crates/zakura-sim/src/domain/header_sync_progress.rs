@@ -46,7 +46,7 @@ pub fn honest_progress<S: HasView<View = StorageView>>() -> Property<S> {
         claim: "once the node reads an honest peer's first Status advertising the one header \
                 past its own tip, it applies that header and adopts it as its selected tip \
                 within 30 virtual seconds, while delivery and storage stay bounded and the \
-                peer's session is the only membership",
+                peer is the node's only membership until it closes its own connection",
         kind: Kind::Liveness {
             bound: LivenessBound::VirtualTime(PROGRESS_BOUND),
         },

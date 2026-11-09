@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 
-use super::adoption::{settled, Acceptance};
+use super::adoption::settled;
 use crate::{
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
@@ -453,23 +453,53 @@ impl Judge {
 
     /// Why the rule can't judge everything it read yet, if it can't: a
     /// penalty whose call's handling hasn't ended, or a failure whose reply
-    /// reached the reactor, which hasn't taken it.
+    /// reached the reactor, which hasn't taken it. The first of
+    /// [`Judge::open_at_end`]'s findings.
     fn open(&self) -> Option<String> {
-        if let Some(index) = self.pending.first() {
-            let penalty = &self.owed[*index];
-            return Some(format!(
-                "{} operation {} failed with a header-peer fault of {} in session {}, and the \
-                 reactor hasn't finished handling call {:?}",
-                penalty.stage, penalty.op, penalty.source, penalty.session_id, penalty.call
-            ));
+        match self.pending.first() {
+            Some(&index) => Some(unhandled(&self.owed[index])),
+            None => self.untaken_findings().into_iter().next(),
         }
-        self.failed.keys().next().map(|op| {
-            format!(
-                "UntakenFault: operation {op} failed with a header-peer fault whose reply \
-                 reached the reactor, which never took it"
-            )
-        })
     }
+
+    /// Every finding still open when the run ends, each once: each penalty
+    /// whose call's handling never ended, in the order its reply was taken,
+    /// then each failure whose reply reached the reactor and was never
+    /// taken, by operation.
+    fn open_at_end(&self) -> Vec<String> {
+        let mut findings: Vec<String> = self
+            .pending
+            .iter()
+            .map(|&index| unhandled(&self.owed[index]))
+            .collect();
+        findings.extend(self.untaken_findings());
+        findings
+    }
+
+    /// An `UntakenFault` finding for each failure in [`Judge::untaken`].
+    fn untaken_findings(&self) -> Vec<String> {
+        self.untaken()
+            .into_iter()
+            .map(|op| {
+                format!(
+                    "UntakenFault: operation {op} failed with a header-peer fault whose reply \
+                     reached the reactor, which never took it"
+                )
+            })
+            .collect()
+    }
+}
+
+/// The finding for `penalty`, whose call took its failed reply and hasn't
+/// finished handling it, so whether it penalized the fault can't be judged
+/// yet. The call may already have reported the `Misbehavior`, which counts
+/// only once its handling ends.
+fn unhandled(penalty: &OwedPenalty) -> String {
+    format!(
+        "UnhandledFault: {} operation {} failed with a header-peer fault of {} in session {}, \
+         and the reactor never finished handling call {:?}, which took its reply",
+        penalty.stage, penalty.op, penalty.source, penalty.session_id, penalty.call
+    )
 }
 
 /// Checks that `window`, the handling of `penalty`'s call, reported a
@@ -719,45 +749,63 @@ impl FaultEvidence {
     }
 
     /// The same rule as [`FaultEvidence::check`] over a finished run's
-    /// `entries`. What's still open when a settled run ends is a break: a
-    /// penalty whose call's handling never ended, or a failure whose reply
-    /// reached the reactor and was never taken ([`untaken`]). Open at any
-    /// other end, or before the run has ended, it's inconclusive.
-    pub fn penalized(&self, entries: &[Entry]) -> Acceptance {
+    /// `entries`, with every distinct finding. A break of the rule is
+    /// violated at any end. What's still open is a break once a settled run
+    /// ends, one finding each: every penalty whose call's handling never
+    /// ended, and every failure whose reply reached the reactor and was
+    /// never taken ([`untaken`]). Open at any other end, or before the run
+    /// has ended, each is inconclusive. After an evidence error or a break,
+    /// the judge reads nothing more, so what it left open isn't reported.
+    pub fn penalized(&self, entries: &[Entry]) -> FaultEnd {
         let mode = Mode::Judge {
             cooldown: self.cooldown,
         };
         let judge = Judge::over(mode, &self.cooldowns.facts(), entries, &self.attributions);
         if let Some(why) = judge.failure() {
-            return Acceptance::Violated(why);
+            return FaultEnd {
+                violated: vec![why],
+                inconclusive: Vec::new(),
+            };
         }
-        let what = match judge.pending.first() {
-            Some(&index) => {
-                let penalty = &judge.owed[index];
-                format!(
-                    "UnpenalizedFault: {} operation {} failed with a header-peer fault of {} in \
-                     session {}, and the reactor reported no {} Misbehavior from that session \
-                     while it handled call {:?}",
-                    penalty.stage,
-                    penalty.op,
-                    penalty.source,
-                    penalty.session_id,
-                    penalty.reason,
-                    penalty.call
-                )
-            }
-            None => match judge.open() {
-                Some(why) => why,
-                None => return Acceptance::Holds,
-            },
-        };
+        let open = judge.open_at_end();
         match self.settled.get() {
-            Some(true) => Acceptance::Violated(what),
-            Some(false) => Acceptance::Inconclusive(format!(
-                "the run stopped while a task could be partway through handling it: {what}"
-            )),
-            None => Acceptance::Inconclusive(format!("the run hasn't ended: {what}")),
+            Some(true) => FaultEnd {
+                violated: open,
+                inconclusive: Vec::new(),
+            },
+            settled => FaultEnd {
+                violated: Vec::new(),
+                inconclusive: open
+                    .into_iter()
+                    .map(|what| match settled {
+                        Some(_) => format!(
+                            "the run stopped while a task could be partway through handling \
+                             it: {what}"
+                        ),
+                        None => format!("the run hasn't ended: {what}"),
+                    })
+                    .collect(),
+            },
         }
+    }
+}
+
+/// What [`FaultEvidence::penalized`] found over a finished run, each
+/// finding once, in the order the judge found it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FaultEnd {
+    /// Each break of the rule.
+    pub violated: Vec<String>,
+    /// Each finding that only a settled end makes a break, when the run
+    /// didn't settle or hasn't ended.
+    pub inconclusive: Vec<String>,
+}
+
+impl FaultEnd {
+    /// Whether the rule held over the whole run: nothing violated or
+    /// inconclusive.
+    pub fn holds(&self) -> bool {
+        self.violated.is_empty() && self.inconclusive.is_empty()
     }
 }
 
@@ -765,6 +813,24 @@ impl FaultEvidence {
 mod tests {
     use super::*;
     use crate::observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope};
+
+    /// The one violation in `end`, if it holds exactly one and nothing
+    /// inconclusive.
+    fn violated(end: FaultEnd) -> Option<String> {
+        match (end.violated.as_slice(), end.inconclusive.as_slice()) {
+            ([why], []) => Some(why.clone()),
+            _ => None,
+        }
+    }
+
+    /// The one inconclusive finding in `end`, if it holds exactly one and
+    /// nothing violated.
+    fn inconclusive(end: FaultEnd) -> Option<String> {
+        match (end.violated.as_slice(), end.inconclusive.as_slice()) {
+            ([], [why]) => Some(why.clone()),
+            _ => None,
+        }
+    }
 
     /// A header-peer fault of `source`.
     fn blame(source: &str) -> Blame {
@@ -951,7 +1017,7 @@ mod tests {
         let log = failed_prepare(1, "aa", 3, "invalid_header");
         assert_eq!(
             evidence(&[(1, blame("bb"))]).penalized(&log),
-            Acceptance::Holds
+            FaultEnd::default()
         );
         let owed = owed(&log, evidence(&[(1, blame("aa"))]).attributions()).unwrap();
         assert_eq!(
@@ -972,10 +1038,7 @@ mod tests {
     #[test]
     fn the_penalty_comes_while_the_failing_call_is_handled() {
         let attributed = evidence(&[(1, blame("aa"))]);
-        let broken = |log: &[Entry]| {
-            matches!(attributed.penalized(log),
-                Acceptance::Violated(why) if why.starts_with("UnpenalizedFault"))
-        };
+        let broken = |log: &[Entry]| matches!(violated(attributed.penalized(log)), Some(why) if why.starts_with("UnpenalizedFault"));
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         // Another session's or peer's penalty during the handling.
         log.extend(handled(1, vec![misbehavior("aa", 4), misbehavior("bb", 3)]));
@@ -991,7 +1054,7 @@ mod tests {
         assert!(broken(&early));
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.extend(handled(1, vec![misbehavior("aa", 3)]));
-        assert_eq!(attributed.penalized(&log), Acceptance::Holds);
+        assert_eq!(attributed.penalized(&log), FaultEnd::default());
     }
 
     /// Each failure needs its own call's penalty.
@@ -1002,10 +1065,10 @@ mod tests {
         log.extend(failed_prepare(2, "aa", 3, "invalid_header"));
         log.extend(handled(1, vec![misbehavior("aa", 3)]));
         log.extend(handled(2, Vec::new()));
-        assert!(matches!(
-            attributed.penalized(&log),
-            Acceptance::Violated(why) if why.contains("operation 2")
-        ));
+        assert!(
+            matches!(violated(attributed.penalized(&log)), Some(why) if why.contains("operation 2")
+            )
+        );
     }
 
     #[test]
@@ -1013,15 +1076,9 @@ mod tests {
         let attributed = evidence(&[(1, blame("aa"))]);
         let log = failed_prepare(1, "aa", 3, "invalid_header");
         attributed.settled.set(None);
-        assert!(matches!(
-            attributed.penalized(&log),
-            Acceptance::Inconclusive(_)
-        ));
+        assert!(inconclusive(attributed.penalized(&log)).is_some());
         attributed.settled.set(Some(false));
-        assert!(matches!(
-            attributed.penalized(&log),
-            Acceptance::Inconclusive(_)
-        ));
+        assert!(inconclusive(attributed.penalized(&log)).is_some());
     }
 
     /// A fault whose reply reached the reactor but was never taken owes no
@@ -1034,16 +1091,16 @@ mod tests {
         log.pop();
         assert_eq!(owed(&log, attributed.attributions()).unwrap(), Vec::new());
         assert_eq!(untaken(&log, attributed.attributions()).unwrap(), vec![1]);
-        assert!(matches!(
-            attributed.penalized(&log),
-            Acceptance::Violated(why) if why.starts_with("UntakenFault")
-        ));
+        assert!(
+            matches!(violated(attributed.penalized(&log)), Some(why) if why.starts_with("UntakenFault")
+            )
+        );
         for settled in [Some(false), None] {
             attributed.settled.set(settled);
-            assert!(matches!(
-                attributed.penalized(&log),
-                Acceptance::Inconclusive(why) if why.contains("UntakenFault")
-            ));
+            assert!(
+                matches!(inconclusive(attributed.penalized(&log)), Some(why) if why.contains("UntakenFault")
+                )
+            );
         }
         // A failure that owes nothing isn't listed.
         let unblamed = evidence(&[(1, blame("bb"))]);
@@ -1051,7 +1108,7 @@ mod tests {
             untaken(&log, unblamed.attributions()).unwrap(),
             Vec::<u64>::new()
         );
-        assert_eq!(unblamed.penalized(&log), Acceptance::Holds);
+        assert_eq!(unblamed.penalized(&log), FaultEnd::default());
     }
 
     /// A fault whose reply never reached the reactor owes nothing, even in a
@@ -1087,18 +1144,83 @@ mod tests {
                 untaken(&log, attributed.attributions()).unwrap(),
                 Vec::<u64>::new()
             );
-            assert_eq!(attributed.penalized(&log), Acceptance::Holds, "{log:?}");
+            assert_eq!(attributed.penalized(&log), FaultEnd::default(), "{log:?}");
             assert_eq!(cooled(Vec::new()).check(&log), FaultCheck::Nothing);
+        }
+    }
+
+    /// A settled run's end reports every open finding, not just the
+    /// first: two replies that reached the reactor and were never taken,
+    /// and two penalties whose calls' handling never ended, one finding
+    /// each, which stay inconclusive at an unsettled end.
+    #[test]
+    fn the_end_reports_every_open_fault() {
+        let attributed = evidence(&[(1, blame("aa")), (2, blame("aa")), (3, blame("aa"))]);
+        let mut untaken = failed_prepare(1, "aa", 3, "invalid_header");
+        untaken.pop();
+        let mut second = failed_prepare(2, "aa", 4, "invalid_header");
+        second.pop();
+        untaken.extend(second);
+        assert_eq!(
+            attributed.penalized(&untaken).violated,
+            [1, 2].map(|op| format!(
+                "UntakenFault: operation {op} failed with a header-peer fault whose reply \
+                 reached the reactor, which never took it"
+            ))
+        );
+
+        // Operations 1 and 2 taken by calls whose handling never ended,
+        // and operation 3 never taken.
+        let mut mixed = failed_prepare(1, "aa", 3, "invalid_header");
+        mixed.extend(failed_prepare(2, "aa", 4, "invalid_header"));
+        let mut third = failed_prepare(3, "aa", 5, "invalid_header");
+        third.pop();
+        mixed.extend(third);
+        let end = attributed.penalized(&mixed);
+        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert_eq!(
+            end.violated,
+            [
+                "UnhandledFault: prepare operation 1 failed with a header-peer fault of aa in \
+                 session 3, and the reactor never finished handling call Some(1), which took \
+                 its reply",
+                "UnhandledFault: prepare operation 2 failed with a header-peer fault of aa in \
+                 session 4, and the reactor never finished handling call Some(2), which took \
+                 its reply",
+                "UntakenFault: operation 3 failed with a header-peer fault whose reply reached \
+                 the reactor, which never took it",
+            ]
+        );
+        // Call 2 already reported its matching penalty, but its handling
+        // never ended, so the finding stays unhandled, not unpenalized.
+        let mut partial = mixed.clone();
+        partial.push(reactor(ReactorFact::CallEnded {
+            call: 2,
+            end: "replied".to_owned(),
+            op: Some(2),
+        }));
+        partial.push(misbehavior("aa", 4));
+        let end = attributed.penalized(&partial);
+        assert_eq!(end.violated.len(), 3, "{end:?}");
+        assert!(
+            end.violated[1].starts_with("UnhandledFault: prepare operation 2 "),
+            "{end:?}"
+        );
+        for settled in [Some(false), None] {
+            attributed.settled.set(settled);
+            let end = attributed.penalized(&mixed);
+            assert!(end.violated.is_empty(), "{end:?}");
+            assert_eq!(end.inconclusive.len(), 3, "{end:?}");
         }
     }
 
     #[test]
     fn a_failure_with_no_attribution_is_a_break() {
         let log = failed_prepare(1, "aa", 3, "invalid_header");
-        assert!(matches!(
-            evidence(&[]).penalized(&log),
-            Acceptance::Violated(why) if why.starts_with("MissingAttribution")
-        ));
+        assert!(
+            matches!(violated(evidence(&[]).penalized(&log)), Some(why) if why.starts_with("MissingAttribution")
+            )
+        );
     }
 
     /// The reactor's `Misbehavior` against `peer` from session `origin`, as
@@ -1154,7 +1276,10 @@ mod tests {
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.extend(handled(1, vec![misbehavior_at(7, "aa", 3)]));
         let judged = |facts| cooled(facts).penalized(&log);
-        assert_eq!(judged(vec![started("aa", 3, 60, 2, 7)]), Acceptance::Holds);
+        assert_eq!(
+            judged(vec![started("aa", 3, 60, 2, 7)]),
+            FaultEnd::default()
+        );
         for facts in [
             Vec::new(),
             vec![started("bb", 3, 60, 2, 7)],
@@ -1163,8 +1288,8 @@ mod tests {
             vec![started("aa", 3, 60, 2, 6)],
         ] {
             assert!(
-                matches!(judged(facts.clone()),
-                    Acceptance::Violated(why) if why.starts_with("UncooledFault")),
+                matches!(violated(judged(facts.clone())),
+                    Some(why) if why.starts_with("UncooledFault")),
                 "{facts:?}"
             );
         }
@@ -1174,7 +1299,7 @@ mod tests {
             cooldown: Duration::ZERO,
             ..unconfigured
         };
-        assert_eq!(unconfigured.penalized(&log), Acceptance::Holds);
+        assert_eq!(unconfigured.penalized(&log), FaultEnd::default());
     }
 
     /// No session from a cooled peer is admitted until its cooldown ends.
@@ -1192,8 +1317,7 @@ mod tests {
         ] {
             let evidence = cooled(facts.clone());
             assert_eq!(
-                matches!(evidence.penalized(&[]),
-                    Acceptance::Violated(why) if why.starts_with("ReadmittedInCooldown")),
+                matches!(violated(evidence.penalized(&[])), Some(why) if why.starts_with("ReadmittedInCooldown")),
                 broken,
                 "{facts:?}"
             );
@@ -1256,10 +1380,10 @@ mod tests {
         log.extend(third);
         let evidence =
             FaultEvidence::new(attributions, CooldownEvidence::default(), Duration::ZERO);
-        assert!(matches!(
-            evidence.penalized(&log),
-            Acceptance::Violated(why) if why.contains("operation 1")
-        ));
+        assert!(
+            matches!(violated(evidence.penalized(&log)), Some(why) if why.contains("operation 1")
+            )
+        );
         let owed: Vec<u64> = owed(&log, evidence.attributions())
             .unwrap()
             .iter()

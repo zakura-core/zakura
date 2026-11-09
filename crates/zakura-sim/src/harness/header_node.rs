@@ -605,6 +605,9 @@ impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.harness_closed(self.conn_id);
+        }
         self.record_closed();
         for token in &self.tokens {
             token.cancel();
@@ -695,10 +698,15 @@ async fn flood(far: FarEnd) {
     }
 }
 
+/// How often one `Churn` step relinks its mirror. A bound lets a run
+/// settle once churn stops, so a node that stops taking work under churn
+/// is told apart from one still being churned.
+pub const CHURN_RELINKS: u32 = 8;
+
 /// Relinks the mirror whose index `start` delivers to the node under test
-/// as its dialer, once per scheduling step, until the node's shutdown. Each
-/// relink replaces the mirror's session, so the node's lifecycle queue
-/// takes a disconnect and a connect every time.
+/// as its dialer, once per scheduling step, [`CHURN_RELINKS`] times or until
+/// the node's shutdown. Each relink replaces the mirror's session, so the
+/// node's lifecycle queue takes a disconnect and a connect every time.
 ///
 /// Opening a link has scheduling points, so a `Shutdown` can be picked and
 /// sweep the node's links while one is half open. The sweep then misses
@@ -710,7 +718,7 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
         return;
     };
     drop(start);
-    loop {
+    for _ in 0..CHURN_RELINKS {
         if topology.stopping() {
             return;
         }
@@ -1019,6 +1027,13 @@ impl Topology {
         self.stopping.get() || self.nodes[0].shutdown.is_cancelled()
     }
 
+    /// Whether the harness picked a `Shutdown` step, which begins the node
+    /// under test's stop. Only the harness does, so this is an environment
+    /// end ([`EndedBy`](crate::property::EndedBy)).
+    pub(crate) fn shutdown_picked(&self) -> bool {
+        self.stopping.get()
+    }
+
     /// Each link's session and how long it lasted, in link order. A session
     /// ends when [`Effects::ended`] records it, or when a later link to the
     /// same peer replaces it, whichever comes first. The node refuses a
@@ -1122,8 +1137,8 @@ pub enum ControlAction {
     /// reads whatever the node sends.
     Flood,
     /// Start relinking the named mirror to the node under test, once per
-    /// scheduling step until the node's shutdown, so lifecycle events stay
-    /// queued.
+    /// scheduling step, [`CHURN_RELINKS`] times or until the node's
+    /// shutdown, so lifecycle events stay queued.
     Churn,
 }
 

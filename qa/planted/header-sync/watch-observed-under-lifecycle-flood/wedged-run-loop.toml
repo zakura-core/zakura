@@ -1,0 +1,12 @@
+# The run loop stops for good once the committed watch holds the fixture's
+# commit, before it reads it. It then takes no event and reads nothing, so
+# once the bounded churn stops the run settles with the publication unread
+# and no shutdown begun. A correct loop always has its watch arm ready
+# then, so the settled end breaks the rule.
+input = "crates/zakura-sim/tests/fixtures/header-flood-lifecycle.bin"
+# Besides reactor.rs, which the patch changes, the session receiver and the
+# queues decide how fast lifecycle events arrive and when the commit lands.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+# The wedge leaves a publication unread under either fixture, so a campaign
+# input on the wire fixture breaks that fixture's rule instead.
+also_violates = ["header-sync/watch-observed-under-flood"]

@@ -131,6 +131,24 @@ fn linked(links: &[u64]) -> SessionEvidence {
     view
 }
 
+/// Only the harness's own close or a later link to the same peer makes a
+/// session's end the environment's. A close the view hears of only through
+/// a cancelled token, such as the node tearing its own side down, stays the
+/// node's, and so does a session no link carries.
+#[test]
+fn only_the_harness_ends_a_session_for_the_environment() {
+    let view = linked(&[1, 2]);
+    view.link_closed(2);
+    assert_eq!(view.ended_by(2), EndedBy::Node);
+    view.harness_closed(2);
+    assert_eq!(view.ended_by(2), EndedBy::Environment);
+    assert_eq!(view.ended_by(1), EndedBy::Environment, "link 2 relinked it");
+    assert_eq!(view.ended_by(3), EndedBy::Node, "no link carries it");
+    let alone = linked(&[1]);
+    alone.link_closed(1);
+    assert_eq!(alone.ended_by(1), EndedBy::Node);
+}
+
 /// The rule `events` break on `view`, if any.
 fn broken(view: &SessionEvidence, events: &[ReactorEvent]) -> Option<String> {
     for event in events {

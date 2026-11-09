@@ -24,7 +24,7 @@ use zakura_script::{CachedFfiTransaction, Error as ScriptError};
 use zcash_protocol::consensus::NetworkType;
 use zcash_script::{pq as script_pq, script::Code};
 use zcash_transparent::{
-    pq::{output, template},
+    pq::{output, single_key},
     util::hash160,
 };
 
@@ -85,7 +85,7 @@ fn push(bytes: &[u8]) -> Vec<u8> {
 
 /// The canonical body for one signer, which is what a wallet writes.
 fn single_signer() -> Code {
-    template::single_key_body(PARAMETERS, &KEY.public_key()).unwrap()
+    single_key::body(PARAMETERS, &KEY.public_key()).unwrap()
 }
 
 fn multisig(required: u8, keys: &[[u8; crypto::PUBLIC_KEY_BYTES]], verify: bool) -> Code {
@@ -411,7 +411,7 @@ async fn creating_an_output_no_rules_define_is_rejected_at_creation() {
 
     // A defined format and scheme is an ordinary payment.
     let defined = paying_to(
-        &template::single_key_output_script(PARAMETERS, &KEY.public_key())
+        &single_key::output_script(PARAMETERS, &KEY.public_key())
             .unwrap()
             .0,
     );

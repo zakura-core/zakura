@@ -31,22 +31,22 @@ url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audi
 [policy.zakura]
 audit-as-crates-io = false
 
-[policy."zakura-address:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-address:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-bellman:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-bellman:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-bento-core:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-bento-core:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-bento-macros:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-bento-macros:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-bento:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-bento:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-bls12-381:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-bls12-381:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-chain]
@@ -55,16 +55,16 @@ audit-as-crates-io = false
 [policy.zakura-consensus]
 audit-as-crates-io = false
 
-[policy."zakura-equihash:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-equihash:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-halo2-gadgets:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-halo2-gadgets:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-halo2-poseidon:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-halo2-poseidon:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-halo2-proofs:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-halo2-proofs:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-header-chain]
@@ -73,7 +73,7 @@ audit-as-crates-io = false
 [policy.zakura-jsonl-trace]
 audit-as-crates-io = false
 
-[policy."zakura-jubjub:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-jubjub:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-mmr-tree]
@@ -85,34 +85,34 @@ audit-as-crates-io = false
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
-[policy."zakura-note-encryption:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-note-encryption:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-orchard-legacy:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-orchard-legacy:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-orchard:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-orchard:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-pairing:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-pairing:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-pasta-curves:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-pasta-curves:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-primitives:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-primitives:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-protocol:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-protocol:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-quic]
 audit-as-crates-io = false
 
-[policy."zakura-reddsa:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-reddsa:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-redjubjub:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-redjubjub:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-rpc]
@@ -121,7 +121,7 @@ audit-as-crates-io = false
 [policy.zakura-rt]
 audit-as-crates-io = false
 
-[policy."zakura-sapling-crypto:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-sapling-crypto:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-scheduler]
@@ -130,22 +130,22 @@ criteria = "safe-to-run"
 [policy.zakura-script]
 audit-as-crates-io = false
 
-[policy."zakura-sensei-artifacts:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-sensei-artifacts:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-sensei-macros:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-sensei-macros:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-sensei-shared:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-sensei-shared:0.1.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-sensei:0.1.1@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-sensei:0.1.1@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-sim]
 criteria = "safe-to-run"
 
-[policy."zakura-sinsemilla:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-sinsemilla:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-state]
@@ -154,16 +154,16 @@ audit-as-crates-io = false
 [policy.zakura-test]
 audit-as-crates-io = false
 
-[policy."zakura-transparent:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-transparent:5.3.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
-[policy."zakura-udon:0.2.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-udon:0.2.0@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [policy.zakura-utils]
 audit-as-crates-io = false
 
-[policy."zakura-zcash-script:0.0.1@git:26d222cdde82f522d74e363666c887140e048a62"]
+[policy."zakura-zcash-script:0.0.1@git:be9570590963dfc331bc08a5c9ecfdf9f7fcdcbe"]
 audit-as-crates-io = false
 
 [[exemptions.addr2line]]

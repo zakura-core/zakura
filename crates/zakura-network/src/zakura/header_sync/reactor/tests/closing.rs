@@ -237,6 +237,102 @@ async fn lifecycle_admission_reserves_disconnect_capacity() {
     assert!(receiver.try_recv().is_err());
 }
 
+/// Counts the counters a block registers, by name.
+#[derive(Default)]
+struct CounterNames(std::sync::Mutex<Vec<String>>);
+
+impl metrics::Recorder for CounterNames {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        self.0
+            .lock()
+            .expect("the test recorder is never poisoned")
+            .push(key.name().to_owned());
+        metrics::Counter::noop()
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// A session refused because the lifecycle queue is full is counted, so a
+/// reactor that falls behind shows up. One refused after the reactor shut
+/// down is not, since every shutdown closes the queue.
+#[test]
+fn a_full_lifecycle_queue_counts_its_refusals() {
+    const REFUSED: &str = "sync.header.peer.lifecycle_refused.total";
+    let (sender, receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
+    let (send, _outbound) = framed_channel(8);
+    let session = |session_id| {
+        PeerSession::from_parts_with_session_id(
+            peer(),
+            session_id,
+            send.clone(),
+            CancellationToken::new(),
+        )
+    };
+    let recorder = CounterNames::default();
+    let refused = |recorder: &CounterNames| {
+        recorder
+            .0
+            .lock()
+            .expect("the test recorder is never poisoned")
+            .iter()
+            .filter(|name| *name == REFUSED)
+            .count()
+    };
+
+    metrics::with_local_recorder(&recorder, || {
+        let _first = sender.send(Event::PeerConnected(session(7))).unwrap();
+        let _replacement = sender.send(Event::PeerConnected(session(8))).unwrap();
+        assert_eq!(refused(&recorder), 0);
+        assert!(sender.send(Event::PeerConnected(session(9))).is_err());
+    });
+    assert_eq!(refused(&recorder), 1);
+
+    drop(receiver);
+    let after_shutdown = session(10);
+    metrics::with_local_recorder(&recorder, || {
+        assert!(sender
+            .send(Event::PeerConnected(after_shutdown.clone()))
+            .is_err());
+    });
+    assert!(after_shutdown.cancel_token().is_cancelled());
+    assert_eq!(refused(&recorder), 1);
+}
+
 /// With one admissible peer, an ended session's teardown can still be queued
 /// when the peer reconnects, or a replacement can arrive while the session it
 /// replaces is live. Either new session is admitted.

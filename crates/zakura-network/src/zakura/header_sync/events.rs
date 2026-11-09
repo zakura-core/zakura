@@ -205,6 +205,9 @@ impl LifecycleSender {
     }
 
     /// Reserve cleanup before queueing a connection; duplicate/stale teardown is harmless.
+    ///
+    /// A connection that finds the queue full is refused, its session is
+    /// cancelled, and `sync.header.peer.lifecycle_refused.total` counts it.
     pub(super) fn send(
         &self,
         event: Event,
@@ -217,13 +220,22 @@ impl LifecycleSender {
         match &event {
             Event::PeerConnected(session) => {
                 let key = (session.peer_id().clone(), session.session_id());
-                let Ok(connect) = self.sender.clone().try_reserve_owned() else {
-                    session.cancel_token().cancel();
-                    return Err(mpsc::error::SendError(event));
-                };
-                let Ok(disconnect) = self.sender.clone().try_reserve_owned() else {
-                    session.cancel_token().cancel();
-                    return Err(mpsc::error::SendError(event));
+                let reserved =
+                    self.sender.clone().try_reserve_owned().and_then(|connect| {
+                        Ok((connect, self.sender.clone().try_reserve_owned()?))
+                    });
+                let (connect, disconnect) = match reserved {
+                    Ok(permits) => permits,
+                    Err(refused) => {
+                        // A full queue means the reactor is behind, the overload
+                        // `LIFECYCLE_SLOTS_PER_PEER` bounds. A closed one is shutdown.
+                        if matches!(refused, mpsc::error::TrySendError::Full(_)) {
+                            metrics::counter!("sync.header.peer.lifecycle_refused.total")
+                                .increment(1);
+                        }
+                        session.cancel_token().cancel();
+                        return Err(mpsc::error::SendError(event));
+                    }
                 };
                 disconnects.insert(key, disconnect);
                 connect.send(LifecycleEvent { event, applied });

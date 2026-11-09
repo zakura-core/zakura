@@ -153,6 +153,16 @@ impl WakeEvidence {
         self.with(|store| store.facts.clone())
     }
 
+    /// When the last wake a release opened opened, if any did.
+    pub fn last_opened(&self) -> Option<SimInstant> {
+        self.with(|store| {
+            store.facts.iter().rev().find_map(|(_, fact)| match fact {
+                WakeFact::Opened { at, .. } => Some(*at),
+                _ => None,
+            })
+        })
+    }
+
     /// Whether any release opened a wake.
     pub fn any_opened(&self) -> bool {
         self.with(|store| {

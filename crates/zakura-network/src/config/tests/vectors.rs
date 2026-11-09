@@ -1974,7 +1974,7 @@ fn invalid_advert_fanout_config_is_rejected() {
 }
 
 #[test]
-fn pq_activation_config_is_regtest_only_and_requires_support() {
+fn pq_activation_config_requires_an_isolated_network_and_support() {
     let default: Config = toml::from_str("network = 'Regtest'").unwrap();
     assert_eq!(default.network.pq_activation_height(), None);
 
@@ -2002,5 +2002,106 @@ fn pq_activation_config_is_regtest_only_and_requires_support() {
     }
 
     let error = toml::from_str::<Config>("network = { pq_activation_height = 0 }").unwrap_err();
-    assert!(error.to_string().contains("only supported on Regtest"));
+    assert!(error.to_string().contains(if cfg!(feature = "pq") {
+        "explicit network_name"
+    } else {
+        "pq feature"
+    }));
+}
+
+#[test]
+fn only_an_isolated_custom_testnet_can_spend_a_coinbase_to_a_transparent_address() {
+    let source = r#"
+initial_testnet_peers = ["127.0.0.1:18333"]
+network = { network_name = "PqFork", checkpoints = true, network_magic = [80, 81, 84, 49], allow_unshielded_coinbase_spends = true }
+"#;
+    let config = toml::from_str::<Config>(source)
+        .expect("a configured Testnet with an identity of its own is isolated");
+    assert!(config.network.should_allow_unshielded_coinbase_spends());
+    // The setting survives being written back out and read again, so a node that rewrites
+    // its own configuration keeps the chain it was running.
+    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.network, config.network);
+
+    // A chain that is not its own may not drop a rule the public networks keep.
+    for (name, invalid) in [
+        (
+            "the public magic",
+            source.replace("[80, 81, 84, 49]", "[250, 26, 249, 191]"),
+        ),
+        ("the public name", source.replace("PqFork", "Testnet")),
+        (
+            "the public peers",
+            source.replace("initial_testnet_peers = [\"127.0.0.1:18333\"]", ""),
+        ),
+    ] {
+        assert!(
+            toml::from_str::<Config>(&invalid).is_err(),
+            "{name} must be rejected"
+        );
+    }
+
+    // Asking for it off is the default, and asking at all on Regtest is a mistake worth
+    // naming: Regtest allows these spends whatever the configuration says.
+    let off: Config = toml::from_str(&source.replace(
+        "allow_unshielded_coinbase_spends = true",
+        "allow_unshielded_coinbase_spends = false",
+    ))
+    .unwrap();
+    assert!(!off.network.should_allow_unshielded_coinbase_spends());
+    let default: Config = toml::from_str("network = 'Testnet'").unwrap();
+    assert!(!default.network.should_allow_unshielded_coinbase_spends());
+    let regtest = toml::from_str::<Config>(
+        "network = 'Regtest'\n[testnet_parameters]\nallow_unshielded_coinbase_spends = true",
+    )
+    .unwrap_err();
+    assert!(
+        regtest
+            .to_string()
+            .contains("only applies to configured Testnets"),
+        "{regtest}"
+    );
+    assert!(Network::new_regtest(Default::default()).should_allow_unshielded_coinbase_spends());
+}
+
+#[test]
+fn an_isolated_custom_testnet_can_ask_for_the_post_quantum_rules() {
+    let source = r#"
+initial_testnet_peers = ["127.0.0.1:18333"]
+network = { network_name = "PqFork", checkpoints = true, network_magic = [80, 81, 84, 49], pq_activation_height = 4420649 }
+"#;
+    let parsed = toml::from_str::<Config>(source);
+    if !cfg!(feature = "pq") {
+        assert!(parsed.unwrap_err().to_string().contains("pq feature"));
+        return;
+    }
+
+    let config = parsed.expect("a configured Testnet with an identity of its own is isolated");
+    assert_eq!(
+        config.network.pq_activation_height(),
+        Some(Height(4_420_649))
+    );
+    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.network, config.network);
+
+    // Each of these would make the chain something other than its own: a fork point at the
+    // genesis block, the public Testnet's magic, the public Testnet's name, or the public
+    // Testnet's peers.
+    for (name, invalid) in [
+        ("height zero", source.replace("4420649", "0")),
+        (
+            "the public magic",
+            source.replace("[80, 81, 84, 49]", "[250, 26, 249, 191]"),
+        ),
+        ("the public name", source.replace("PqFork", "Testnet")),
+        (
+            "the public peers",
+            source.replace("initial_testnet_peers = [\"127.0.0.1:18333\"]", ""),
+        ),
+    ] {
+        assert!(
+            toml::from_str::<Config>(&invalid).is_err(),
+            "{name} must be rejected"
+        );
+    }
 }

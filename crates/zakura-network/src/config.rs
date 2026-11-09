@@ -24,6 +24,7 @@ use zakura_chain::{
     amount::Amount,
     common::atomic_write,
     parameters::{
+        constants::magics,
         testnet::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
             ConfiguredLockboxDisbursement, RegtestParameters,
@@ -1092,7 +1093,8 @@ where
 #[serde(deny_unknown_fields)]
 struct DTestnetParameters {
     /// Height at which this chain starts applying the post-quantum transparent output
-    /// rules. Regtest only, and only on a node built with the `pq` feature.
+    /// rules. Only on a node built with the `pq` feature, and only for Regtest or a
+    /// configured Testnet with an identity and peers of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pq_activation_height: Option<u32>,
     network_name: Option<String>,
@@ -1100,6 +1102,12 @@ struct DTestnetParameters {
     slow_start_interval: Option<u32>,
     target_difficulty_limit: Option<String>,
     disable_pow: Option<bool>,
+    /// If `true`, a transaction may spend a coinbase output and still pay a transparent
+    /// address. Only a configured Testnet with an identity and peers of its own accepts it,
+    /// because it drops a rule the public networks keep. Regtest allows these spends
+    /// already.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_unshielded_coinbase_spends: Option<bool>,
     /// Height at which the MTP-plus-90-minutes rule activates.
     max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
@@ -1310,6 +1318,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             slow_start_interval: Some(params.slow_start_interval().0),
             target_difficulty_limit: Some(params.target_difficulty_limit().to_string()),
             disable_pow: Some(params.disable_pow()),
+            // Regtest allows these spends whatever the configuration says, and its
+            // deserializer rejects the setting, so only a configured Testnet writes it out.
+            allow_unshielded_coinbase_spends: (!params.is_regtest()
+                && params.should_allow_unshielded_coinbase_spends())
+            .then_some(true),
             max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
@@ -1720,6 +1733,7 @@ where
         slow_start_interval,
         target_difficulty_limit,
         disable_pow,
+        allow_unshielded_coinbase_spends,
         max_block_time_start_height,
         genesis_hash,
         activation_heights,
@@ -1738,10 +1752,35 @@ where
         regtest: _,
     } = params;
 
-    if pq_activation_height.is_some() {
-        return Err(de::Error::custom(
-            "pq_activation_height is only supported on Regtest",
-        ));
+    if let Some(height) = pq_activation_height {
+        if !cfg!(feature = "pq") {
+            return Err(de::Error::custom(
+                "pq_activation_height requires a node built with the pq feature",
+            ));
+        }
+        // These rules belong to a chain that is nobody else's. A configured Testnet asking
+        // for them must say who it is, with a name and a magic of its own, and must not
+        // carry the public Testnet's magic, which would make every peer treat it as that
+        // chain. The height must be a real one, so the fork point is stated rather than
+        // inherited from the genesis block.
+        if height == 0
+            || network_name.is_none()
+            || network_magic.is_none()
+            || network_magic == Some(magics::TESTNET.0)
+        {
+            return Err(de::Error::custom(
+                "post-quantum activation on a configured Testnet requires a positive height \
+                 and an explicit network_name and network_magic of its own",
+            ));
+        }
+        // And it must not reach the public network's peers, which is what the default peer
+        // list would do.
+        if contains_default_initial_peers(initial_testnet_peers) {
+            return Err(de::Error::custom(
+                "post-quantum activation on a configured Testnet requires explicit, \
+                 isolated initial peers",
+            ));
+        }
     }
 
     let mut params_builder = testnet::Parameters::build();
@@ -1781,6 +1820,32 @@ where
 
     if let Some(disable_pow) = disable_pow {
         params_builder = params_builder.with_disable_pow(disable_pow);
+    }
+
+    if allow_unshielded_coinbase_spends == Some(true) {
+        // Letting a mining reward pay a transparent address is a rule the public networks
+        // keep, so only a chain that is nobody else's may drop it: it must say who it is,
+        // with a name and a magic of its own that is not the public Testnet's, and it must
+        // not reach the public network's peers.
+        if network_name.is_none()
+            || network_magic.is_none()
+            || network_magic == Some(magics::TESTNET.0)
+        {
+            return Err(de::Error::custom(
+                "unshielded coinbase spends on a configured Testnet require an explicit \
+                 network_name and network_magic of its own",
+            ));
+        }
+        if contains_default_initial_peers(initial_testnet_peers) {
+            return Err(de::Error::custom(
+                "unshielded coinbase spends on a configured Testnet require explicit, \
+                 isolated initial peers",
+            ));
+        }
+    }
+
+    if let Some(allow) = allow_unshielded_coinbase_spends {
+        params_builder = params_builder.with_unshielded_coinbase_spends(allow);
     }
 
     if let Some(height) = max_block_time_start_height {
@@ -1851,6 +1916,11 @@ where
         params_builder = params_builder.with_initial_nsm_value_balance(balance);
     }
 
+    if let Some(height) = pq_activation_height {
+        params_builder =
+            params_builder.with_pq_activation_height(zakura_chain::block::Height(height));
+    }
+
     // An omitted seed and otherwise default parameters select public Testnet.
     // An explicit zero seed must remain zero on the configured network.
     if network_name.is_none()
@@ -1889,6 +1959,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
+        allow_unshielded_coinbase_spends,
         initial_nsm_value_balance,
         ..
     } = params;
@@ -1903,6 +1974,13 @@ where
         return Err(de::Error::custom(
             "inherit_activation_heights only applies to configured Testnets; \
              Regtest activation heights have their own defaults",
+        ));
+    }
+
+    if allow_unshielded_coinbase_spends.is_some() {
+        return Err(de::Error::custom(
+            "allow_unshielded_coinbase_spends only applies to configured Testnets; \
+             Regtest already lets a coinbase output be spent to a transparent address",
         ));
     }
 

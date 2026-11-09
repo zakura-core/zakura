@@ -1054,6 +1054,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         // TODO: Use default field values when optional features are enabled in tests #8183
         internal_miner: true,
         optimistic_block_inventory: true,
+        internal_miner_threads: std::num::NonZeroUsize::MIN,
     };
 
     // nu5 block height

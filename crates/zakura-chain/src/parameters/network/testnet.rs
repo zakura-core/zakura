@@ -739,6 +739,9 @@ impl From<bool> for ConfiguredCheckpoints {
 /// Builder for the [`Parameters`] struct.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParametersBuilder {
+    /// The height the post-quantum transparent output rules start at, absent unless this
+    /// chain is an isolated one that asked for them.
+    pq_activation_height: Option<Height>,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -789,6 +792,7 @@ impl Default for ParametersBuilder {
     /// Creates a [`ParametersBuilder`] with all of the default Testnet parameters except `network_name`.
     fn default() -> Self {
         Self {
+            pq_activation_height: None,
             network_name: "UnknownTestnet".to_string(),
             network_magic: magics::TESTNET,
             // # Correctness
@@ -1084,13 +1088,23 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height the post-quantum transparent output rules start at.
+    ///
+    /// Whether a chain may ask for this is decided where its configuration is read: a
+    /// Regtest chain, or a configured Testnet whose identity is explicitly its own.
+    pub fn with_pq_activation_height(mut self, height: Height) -> Self {
+        self.pq_activation_height = Some(height);
+        self
+    }
+
     /// Sets the local activation height for the MTP-plus-90-minutes rule.
     pub fn with_max_block_time_start_height(mut self, height: Height) -> Self {
         self.max_block_time_start_height = Some(height);
         self
     }
 
-    /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
+    /// Sets whether a transaction may spend a coinbase output and still pay a transparent
+    /// address, in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
         should_allow_unshielded_coinbase_spends: bool,
@@ -1218,6 +1232,7 @@ impl ParametersBuilder {
             .max_block_time_start_height
             .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
+            pq_activation_height,
             network_name,
             network_magic,
             genesis_hash,
@@ -1241,7 +1256,7 @@ impl ParametersBuilder {
         } = self;
         let mut parameters = Parameters {
             network_name,
-            pq_activation_height: None,
+            pq_activation_height,
             network_magic,
             genesis_hash,
             activation_heights,
@@ -1323,6 +1338,7 @@ impl ParametersBuilder {
             .max_block_time_start_height
             .unwrap_or(TESTNET_MAX_TIME_START_HEIGHT);
         let Self {
+            pq_activation_height: _,
             network_name: _,
             network_magic,
             genesis_hash,
@@ -1348,7 +1364,10 @@ impl ParametersBuilder {
 
         // Compare the height ranges after NU7 moves the inherited ones, so an explicit copy
         // of the built-in ranges is compatible exactly when it matches them.
-        self.activation_heights == activation_heights
+        // A chain that has asked for the post-quantum rules is not the public Testnet,
+        // whatever else it copies from it.
+        self.pq_activation_height.is_none()
+            && self.activation_heights == activation_heights
             && self.network_magic == network_magic
             && self.genesis_hash == genesis_hash
             && self.slow_start_interval == slow_start_interval
@@ -1386,7 +1405,9 @@ pub struct RegtestParameters {
     /// deployed on any public network, so a height here is a local test decision rather
     /// than a network upgrade. The node reads it from
     /// `network.params.pq_activation_height` in its configuration file, and refuses it
-    /// unless the binary was built with the `pq` feature.
+    /// unless the binary was built with the `pq` feature. A configured Testnet whose
+    /// identity is its own can ask for these rules too, through
+    /// [`ParametersBuilder::with_pq_activation_height`].
     pub pq_activation_height: Option<Height>,
     /// The configured network upgrade activation heights to use on Regtest
     pub activation_heights: ConfiguredActivationHeights,
@@ -1422,8 +1443,9 @@ impl From<ConfiguredActivationHeights> for RegtestParameters {
 /// Network consensus parameters for test networks such as Regtest and the default Testnet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Parameters {
-    /// Height at which the post-quantum transparent output rules start applying, set only
-    /// through the Regtest constructor. See [`RegtestParameters::pq_activation_height`].
+    /// Height at which the post-quantum transparent output rules start applying. See
+    /// [`RegtestParameters::pq_activation_height`] and
+    /// [`ParametersBuilder::with_pq_activation_height`].
     pq_activation_height: Option<Height>,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
@@ -1776,13 +1798,23 @@ impl Network {
     /// The height at which this chain starts applying the post-quantum transparent output
     /// rules, if it ever does.
     ///
-    /// Only a Regtest chain can answer with a height: the public networks and ordinary
-    /// configured Testnets return `None`, because the format is not deployed on any of
-    /// them. Activating it on a public network will be a network upgrade with its own
-    /// height, not this setting.
+    /// Only an isolated chain can answer with a height: Regtest, or a configured Testnet
+    /// whose network magic is its own rather than a public network's. The public networks
+    /// return `None`, because the format is not deployed on any of them, and activating it
+    /// on one will be a network upgrade with its own height rather than this setting.
     pub fn pq_activation_height(&self) -> Option<Height> {
         match self {
-            Self::Testnet(parameters) if parameters.is_regtest() => parameters.pq_activation_height,
+            // Regtest, or a configured Testnet with an identity of its own. The magic
+            // decides the second: a chain carrying a public network's magic is that
+            // network's chain as far as every peer is concerned, and these rules are no
+            // part of it.
+            Self::Testnet(parameters)
+                if parameters.is_regtest()
+                    || (parameters.network_magic != magics::TESTNET
+                        && parameters.network_magic != magics::MAINNET) =>
+            {
+                parameters.pq_activation_height
+            }
             _ => None,
         }
     }

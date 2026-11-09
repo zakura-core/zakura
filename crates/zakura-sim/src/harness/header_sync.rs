@@ -43,6 +43,7 @@ use super::{
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
+        recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
         session::SessionEvidence,
         stale::StaleEvidence,
@@ -562,6 +563,8 @@ pub struct Ports {
     /// unless whoever prepared the ports declared a wake fixture
     /// ([`WakeEvidence::new`]).
     pub wake: WakeEvidence,
+    /// The run's recovery, which a `Recover` step starts.
+    pub recovery: RecoveryEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -586,6 +589,10 @@ pub struct Storage {
     /// The nodes and links. They live until the run ends, so no reactor sees
     /// its inputs close.
     topology: Rc<Topology>,
+    /// The node's session view.
+    sessions: SessionEvidence,
+    /// The run's recovery, once a `Recover` step is picked.
+    recovery: RecoveryEvidence,
 }
 
 /// What [`Storage`]'s checks read between steps.
@@ -619,6 +626,9 @@ pub struct StorageView {
     pub stale_calls: StaleEvidence,
     /// The node's wake facts, which its tap finds during the run.
     pub wake: WakeEvidence,
+    /// The run's recovery: its source, where it is, and once the conditions
+    /// held, their record. Only `header-sync/storage` recovers.
+    pub recovery: RecoveryEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -696,6 +706,7 @@ impl HasView for Storage {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            recovery: self.recovery.clone(),
         }
     }
 
@@ -737,7 +748,9 @@ impl Subsystem for Storage {
     /// # Panics
     ///
     /// If a hold or control step waits for a trigger the node never records
-    /// ([`policy::undriven`]).
+    /// ([`policy::undriven`]), or a `Recover` step is out of place: it must
+    /// be the last step, follow no `Shutdown`, and follow no churn or flood,
+    /// whose tasks keep acting after their step.
     fn prepare(scenario: &StorageScenario) -> Ports {
         let triggers = scenario
             .policy
@@ -786,6 +799,23 @@ impl Subsystem for Storage {
         {
             panic!("{step:?} releases a hold the policy's {holds} holds don't have");
         }
+        if let Some(at) = scenario
+            .controls
+            .iter()
+            .position(|step| step.action == ControlAction::Recover)
+        {
+            if let Some(after) = scenario.controls.get(at + 1) {
+                panic!("no control step follows a recover, but {after:?} does");
+            }
+            if let Some(before) = scenario.controls[..at].iter().find(|step| {
+                matches!(
+                    step.action,
+                    ControlAction::Shutdown | ControlAction::Churn | ControlAction::Flood
+                )
+            }) {
+                panic!("a recover can't follow {before:?}");
+            }
+        }
         let fixture = scenario.weights.fixture();
         let node = Arc::new(ControlledPort::new(&fixture));
         preload(node.engine(), &fixture, &scenario.node);
@@ -808,6 +838,7 @@ impl Subsystem for Storage {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            recovery: RecoveryEvidence::default(),
         }
     }
 
@@ -819,12 +850,14 @@ impl Subsystem for Storage {
     fn build(sim: &mut Sim, scenario: &StorageScenario, ports: Ports) -> Self {
         let dispatch = DispatchFlag::default();
         let effects = Effects::default();
+        let recovery = ports.recovery.clone();
         let storage = PolicySource::new(
             sim,
             ports.node.clone(),
             scenario.policy.clone(),
             effects.clone(),
-        );
+        )
+        .with_recovery(recovery.clone());
         let (observer, tap) = ReactorTap::with_evidence(
             sim,
             &ports.node,
@@ -873,15 +906,16 @@ impl Subsystem for Storage {
                 None,
             ));
         }
-        let faults = FaultEvidence::new(
-            attributions,
-            cooldowns,
-            nodes[0].startup.config.unproductive_peer_cooldown,
-        );
+        let cooldown = nodes[0].startup.config.unproductive_peer_cooldown;
+        let faults = FaultEvidence::new(attributions, cooldowns.clone(), cooldown);
+        let names: Vec<_> = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.name.clone()))
+            .collect();
         let topology = Rc::new(
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
-                .with_sessions(ports.sessions),
+                .with_sessions(ports.sessions.clone()),
         );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
@@ -897,7 +931,21 @@ impl Subsystem for Storage {
             predicates,
         )
         .with_port(ports.node.clone())
-        .with_adoption(adoption.clone());
+        .with_adoption(adoption.clone())
+        .with_recovery(
+            RecoveryInputs {
+                node: ports.node.clone(),
+                mirrors: (0..)
+                    .zip(&ports.mirrors)
+                    .map(|(index, port)| (format!("mirror-{index}"), port.clone()))
+                    .collect(),
+                sessions: ports.sessions.clone(),
+                cooldowns,
+                cooldown,
+                names,
+            },
+            recovery.clone(),
+        );
         sim.add_source(Box::new(control));
         Storage {
             port: ports.node,
@@ -910,6 +958,8 @@ impl Subsystem for Storage {
             wake: ports.wake,
             faults,
             topology,
+            sessions: ports.sessions,
+            recovery,
         }
     }
 
@@ -921,6 +971,47 @@ impl Subsystem for Storage {
     /// [`storage_sources`].
     fn sources() -> Sources {
         storage_sources()
+    }
+
+    /// A scenario with a `Recover` step declares hdr-13's five assumptions,
+    /// none of which holds before the `recovered` pick
+    /// ([`RecoveryEvidence::holds`]). Others declare none.
+    fn assumptions(scenario: &StorageScenario) -> Assumptions<Self> {
+        let Some(source) = scenario
+            .controls
+            .iter()
+            .find(|step| step.action == ControlAction::Recover)
+            .map(|step| step.peer.clone())
+        else {
+            return Assumptions::none();
+        };
+        Assumptions::declare(vec![
+            AssumeRecord {
+                assume: Assume::StableMembership,
+                params: serde_json::json!({ "membership": "recorded" }),
+            },
+            AssumeRecord {
+                assume: Assume::HonestPeer,
+                params: serde_json::json!({ "peers": [source] }),
+            },
+            AssumeRecord {
+                assume: Assume::BoundedStorage,
+                params: serde_json::json!({ "max_ms": RECOVERY_BOUND.as_millis() }),
+            },
+            AssumeRecord {
+                assume: Assume::BoundedDelivery,
+                params: serde_json::json!({
+                    "link": "in-memory",
+                    "added_delay_ms": 0,
+                    "loss": "none",
+                }),
+            },
+            AssumeRecord {
+                assume: Assume::FairScheduling,
+                params: serde_json::json!({ "contract": crate::record::CONTRACT_VERSION }),
+            },
+        ])
+        .holds_when(|storage, assume| storage.recovery.holds(&storage.sessions, assume))
     }
 
     /// The scenario [`grammar::decode`] reads from `prefix`. A prefix
@@ -1088,6 +1179,7 @@ impl HasView for HeaderWire {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            recovery: RecoveryEvidence::default(),
         }
     }
 
@@ -1953,6 +2045,7 @@ mod tests {
                 rounds: SettlementEvidence::default(),
                 stale_calls: StaleEvidence::default(),
                 wake: WakeEvidence::default(),
+                recovery: RecoveryEvidence::default(),
             }
         }
     }

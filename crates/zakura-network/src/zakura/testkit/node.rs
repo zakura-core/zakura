@@ -494,9 +494,12 @@ impl ZakuraTestNodeBuilder {
                 anchor,
                 frontiers,
                 best_header_tip,
-                self.header_sync_config.clone(),
+                self.header_sync_config
+                    .clone()
+                    .for_node_connections(self.limits.max_connections),
                 self.limits.max_frame_bytes,
             );
+            startup.max_connections = self.limits.max_connections;
             if let Some(request_timeout) = self.header_sync_request_timeout {
                 startup.request_timeout = request_timeout;
             }

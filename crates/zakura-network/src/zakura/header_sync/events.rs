@@ -158,6 +158,17 @@ pub(crate) enum PortDispatch {
     External,
 }
 
+/// Lifecycle queue slots per admissible header-sync peer.
+///
+/// A session holds two until the reactor reads its admission, one for that
+/// admission and one reserved for its teardown, then one until the reactor
+/// reads its teardown. Generations of one peer overlap: a replacement is
+/// admitted while the session it replaces is live, and a reconnect can arrive
+/// while the ended session's teardown is still queued. So each peer gets room
+/// for its session and one more overlapping generation. Past that the reactor
+/// is behind, and a new session is refused until it catches up.
+pub(super) const LIFECYCLE_SLOTS_PER_PEER: usize = 4;
+
 /// A bounded lifecycle queue whose admitted sessions retain their cleanup capacity.
 #[derive(Clone, Debug)]
 pub(super) struct LifecycleSender {
@@ -173,11 +184,11 @@ pub(super) struct LifecycleEvent {
 }
 
 impl LifecycleSender {
-    /// Allocate two slots for each of `peers`, the header-sync peers the node
-    /// can admit at once: one for a session's pending admission and one
-    /// reserved for its teardown.
+    /// Allocate [`LIFECYCLE_SLOTS_PER_PEER`] slots for each of `peers`, the
+    /// header-sync peers the node can admit at once.
     pub(super) fn channel(peers: usize) -> (Self, mpsc::Receiver<LifecycleEvent>) {
-        let (sender, receiver) = mpsc::channel(peers.max(1).saturating_mul(2));
+        let (sender, receiver) =
+            mpsc::channel(peers.max(1).saturating_mul(LIFECYCLE_SLOTS_PER_PEER));
         (
             Self {
                 sender,

@@ -201,11 +201,19 @@ fn a_close_refused_by_a_full_queue_waits_to_start_its_deadline() {
 async fn lifecycle_admission_reserves_disconnect_capacity() {
     let (sender, mut receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
     let (send, _outbound) = framed_channel(8);
-    let first =
-        PeerSession::from_parts_with_session_id(peer(), 7, send.clone(), CancellationToken::new());
-    let rejected =
-        PeerSession::from_parts_with_session_id(peer(), 8, send, CancellationToken::new());
+    let session = |session_id| {
+        PeerSession::from_parts_with_session_id(
+            peer(),
+            session_id,
+            send.clone(),
+            CancellationToken::new(),
+        )
+    };
+    let first = session(7);
+    let replacement = session(8);
+    let rejected = session(9);
     let first_ack = sender.send(Event::PeerConnected(first.clone())).unwrap();
+    let _replacement_ack = sender.send(Event::PeerConnected(replacement)).unwrap();
     assert!(sender.send(Event::PeerConnected(rejected.clone())).is_err());
     assert!(rejected.cancel_token().is_cancelled());
     sender
@@ -219,12 +227,68 @@ async fn lifecycle_admission_reserves_disconnect_capacity() {
     assert!(matches!(connected.event, Event::PeerConnected(_)));
     connected.applied.send(()).unwrap();
     first_ack.await.unwrap();
+    let replaced = receiver.recv().await.unwrap();
+    assert!(matches!(replaced.event, Event::PeerConnected(_)));
     let disconnected = receiver.recv().await.unwrap();
     assert!(matches!(
         disconnected.event,
         Event::PeerDisconnected { session_id: 7, .. }
     ));
     assert!(receiver.try_recv().is_err());
+}
+
+/// With one admissible peer, an ended session's teardown can still be queued
+/// when the peer reconnects, or a replacement can arrive while the session it
+/// replaces is live. Either new session is admitted.
+#[tokio::test]
+async fn one_overlapping_generation_fits_the_lifecycle_queue() {
+    let (sender, mut receiver) = crate::zakura::header_sync::events::LifecycleSender::channel(1);
+    let (send, _outbound) = framed_channel(8);
+    let session = |session_id| {
+        PeerSession::from_parts_with_session_id(
+            peer(),
+            session_id,
+            send.clone(),
+            CancellationToken::new(),
+        )
+    };
+    let first = session(7);
+    sender.send(Event::PeerConnected(first)).unwrap();
+    let connected = receiver.recv().await.unwrap();
+    assert!(matches!(connected.event, Event::PeerConnected(_)));
+
+    let replacement = session(8);
+    sender
+        .send(Event::PeerConnected(replacement.clone()))
+        .expect("a replacement fits while the session it replaces is live");
+    assert!(!replacement.cancel_token().is_cancelled());
+    let connected = receiver.recv().await.unwrap();
+    assert!(matches!(connected.event, Event::PeerConnected(_)));
+    sender
+        .send(Event::PeerDisconnected {
+            peer: peer(),
+            session_id: 7,
+            reason: "replaced",
+        })
+        .unwrap();
+    sender
+        .send(Event::PeerDisconnected {
+            peer: peer(),
+            session_id: 8,
+            reason: "test",
+        })
+        .unwrap();
+    let ended = receiver.recv().await.unwrap();
+    assert!(matches!(
+        ended.event,
+        Event::PeerDisconnected { session_id: 7, .. }
+    ));
+
+    let reconnect = session(9);
+    sender
+        .send(Event::PeerConnected(reconnect.clone()))
+        .expect("a reconnect fits while the ended session's teardown is queued");
+    assert!(!reconnect.cancel_token().is_cancelled());
 }
 
 /// Actual service replacement and pre-acknowledgement cancellation reclaim lifecycle slots.

@@ -69,9 +69,9 @@ optimistic_block_inventory = true
 # Zero delays announce to all peers immediately, regardless of block size.
 advert_delay_min = "0s"
 advert_delay_max = "0s"
+advert_window_full_block = 32
 advert_window_full_size_bytes = 1572864
-advert_window_max = 64
-advert_window_min = 32
+advert_window_small_block = 64
 advert_window_small_size_bytes = 102400
 cache_dir = true
 crawl_new_peer_interval = "1m 1s"
@@ -143,6 +143,10 @@ send_window_bytes = 33554432
 stream_receive_window_bytes = 16777216
 
 [rpc]
+# Takes effect when enable_cookie_auth = false. The administrator is expected
+# to have correctly configured firewall rules restricting access to trusted clients.
+# Requests from web browsers (with an Origin header) are rejected.
+allow_unauthenticated_admin = false
 cookie_dir = "@RPC_COOKIE_DIR@"
 cookie_file_name = ".cookie"
 debug_force_finished_sync = false

@@ -94,7 +94,7 @@ use zakura_storage::header::controlled::ControlledPort;
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
-    capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected},
+    capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     fault::{CooldownEvidence, CooldownFact},
     pair::{PairError, Pairer},
@@ -102,6 +102,7 @@ use super::{
     reservation::ReservationEvidence,
     session::SessionEvidence,
     stale::{StaleCheck, StaleEvidence},
+    wake::{WakeCheck, WakeEvidence},
 };
 use crate::{
     draws::Failure,
@@ -179,6 +180,9 @@ struct TapState {
     /// Checks each stale call's handler as its facts arrive, keeping the
     /// stale calls it finds for the view.
     stale: Mutex<StaleCheck>,
+    /// Checks for offers a budget return should wake, keeping its facts for
+    /// the view. Inert until [`ReactorTap::watch_wakes`].
+    wake: Mutex<WakeCheck>,
 }
 
 /// The resource probe a tap was handed.
@@ -520,9 +524,17 @@ impl TapState {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .observe(&event, on_reactor);
+            if on_reactor {
+                let now = zakura_scheduler::hooks::now().unwrap_or_default();
+                state
+                    .wake
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .observe(&event, now);
+            }
         }
-        // Budget changes, credit, causes, headroom waits and deferred passes
-        // stay out of the log, whose format pinned Plans fix, and a
+        // Budget changes, credit, causes, headroom waits, deferred passes,
+        // taken events and watch reads stay out of the log, whose format pinned Plans fix, and a
         // teardown's returns after the run are expected.
         if matches!(
             event,
@@ -531,7 +543,24 @@ impl TapState {
                 | ReactorEvent::CauseSet { .. }
                 | ReactorEvent::HeadroomWait { .. }
                 | ReactorEvent::CachedPassDeferred { .. }
+                | ReactorEvent::EventTaken { .. }
+                | ReactorEvent::WatchObserved { .. }
         ) {
+            if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
+                state
+                    .buffer()
+                    .effects
+                    .push((LinkEffect::HeadroomWait, peer.clone()));
+            }
+            // The events it takes and its turns, kept in order with what it
+            // adopts. The run's own shutdown takes events and sets causes
+            // too, so only the run's are kept.
+            if let (Some(now), Some(fact)) = (
+                zakura_scheduler::hooks::now().filter(|_| in_run),
+                AdoptionFact::of_turn(&event),
+            ) {
+                state.adoption.record(now.since_start(), fact);
+            }
             return;
         }
         let at = zakura_scheduler::hooks::now()
@@ -749,6 +778,7 @@ impl ReactorTap {
             let cooldowns = cooldowns.clone();
             move || cooldowns.freeze()
         });
+        let wake_sessions = sessions.clone();
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -772,6 +802,7 @@ impl ReactorTap {
                 teardown_claims: Mutex::default(),
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
+                wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
             }))
         });
         let state = observer.0.clone();
@@ -823,7 +854,28 @@ impl ReactorTap {
         &mut self,
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
     ) {
+        let facts: Vec<_> = facts.into_iter().collect();
+        let mut wake = self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (_, fact) in &facts {
+            wake.storage(fact);
+        }
+        drop(wake);
         self.pairer.facts(facts);
+    }
+
+    /// Checks this reactor's wakes against `wake`'s fixture from now on,
+    /// keeping the facts in `wake`. Call it before the run starts.
+    pub fn watch_wakes(&self, wake: WakeEvidence) {
+        *self
+            .state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            WakeCheck::new(wake, self.state.sessions.clone());
     }
 
     /// The reactor's adoption facts, which the tap fills as they happen.
@@ -936,6 +988,11 @@ impl ReactorTap {
                 accounted: (!mid_poll).then(|| self.state.accounted()),
             }
         };
+        self.state
+            .wake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .permits(read.locator_permits);
         evidence.record(CapacityReading {
             step,
             reserved: read.reserved,
@@ -944,31 +1001,27 @@ impl ReactorTap {
             compared: matches!(expected, Expected::Live { accounted: Some(_) }),
             teardown: gone,
         });
-        match capacity::check(&probe, read, expected) {
-            Ok(()) => Ok(()),
-            Err(Broken::Claim(claim, detail)) => {
-                // Every teardown read is checked, since storage can still
-                // hold a permit when the reactor goes and return it later,
-                // but each teardown claim is reported once.
-                let mut seen = self
-                    .state
-                    .teardown_claims
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if !gone || !seen.contains(&claim) {
-                    if gone {
-                        seen.push(claim);
-                    }
-                    self.state.claims.record(ClaimRecord {
-                        step,
-                        claim,
-                        detail,
-                    });
+        // Every teardown read is checked, since storage can still hold a
+        // permit when the reactor goes and return it later, but each
+        // teardown claim is reported once.
+        let mut seen = self
+            .state
+            .teardown_claims
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (claim, detail) in capacity::check(Limits::of(&probe), read, expected)? {
+            if !gone || !seen.contains(&claim) {
+                if gone {
+                    seen.push(claim);
                 }
-                Ok(())
+                self.state.claims.record(ClaimRecord {
+                    step,
+                    claim,
+                    detail,
+                });
             }
-            Err(Broken::Integrity(detail)) => Err(detail),
         }
+        Ok(())
     }
 
     /// Takes the reservations and admissions recorded since the last call,

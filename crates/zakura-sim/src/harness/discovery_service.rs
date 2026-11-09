@@ -43,7 +43,8 @@ use super::{
 use crate::{
     peer::{
         discovery::{discovery_stream, Answer, DiscoveryScript, Hold},
-        key_index, peer_addr, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
+        key_index, peer_addr, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
+        PeerTask, NODE_ADDR,
     },
     property::{HasView, Source, Sources},
     RunConfig, Sim,
@@ -224,6 +225,7 @@ fn spawn_with(
             listening,
             chain: None,
             records: records.clone(),
+            closed: PeerCloses::default(),
             taken: 0,
         };
         sim.scheduler()

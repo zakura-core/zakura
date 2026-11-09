@@ -23,7 +23,7 @@ mod tests;
 
 pub use auth_digest::AuthDigest;
 pub use hash::{Hash, WtxId};
-pub use joinsplit::JoinSplitData;
+pub use joinsplit::{JoinSplitData, JoinSplitPubKey, JoinSplitSig};
 pub use lock_time::LockTime;
 pub use memo::Memo;
 use redjubjub::{Binding, Signature};
@@ -48,7 +48,7 @@ use crate::{
         Network, NetworkUpgrade, OVERWINTER_VERSION_GROUP_ID, SAPLING_VERSION_GROUP_ID,
         TX_V5_VERSION_GROUP_ID,
     },
-    primitives::{ed25519, Bctv14Proof, Groth16Proof},
+    primitives::{Bctv14Proof, Groth16Proof},
     sapling,
     serialization::ZcashSerialize,
     sprout,
@@ -943,7 +943,7 @@ impl Transaction {
 
     /// Access the JoinSplit public validating key in this transaction,
     /// regardless of version, if any.
-    pub fn sprout_joinsplit_pub_key(&self) -> Option<ed25519::VerificationKeyBytes> {
+    pub fn sprout_joinsplit_pub_key(&self) -> Option<JoinSplitPubKey> {
         match self {
             // JoinSplits with Bctv14 Proofs
             Transaction::V2 {
@@ -1726,7 +1726,7 @@ impl Transaction {
     ///
     /// ## Note
     /// JoinSplits are deprecated in favor of Sapling and Orchard
-    pub fn joinsplit_pub_key(&self) -> Option<ed25519::VerificationKeyBytes> {
+    pub fn joinsplit_pub_key(&self) -> Option<JoinSplitPubKey> {
         match self {
             Transaction::V2 {
                 joinsplit_data: Some(joinsplit_data),
@@ -1751,7 +1751,7 @@ impl Transaction {
     ///
     /// ## Note
     /// JoinSplits are deprecated in favor of Sapling and Orchard
-    pub fn joinsplit_sig(&self) -> Option<ed25519::Signature> {
+    pub fn joinsplit_sig(&self) -> Option<JoinSplitSig> {
         match self {
             Transaction::V2 {
                 joinsplit_data: Some(joinsplit_data),

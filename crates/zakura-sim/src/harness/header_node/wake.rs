@@ -348,3 +348,137 @@ impl WakeCheck {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use zakura_network::zakura::ZakuraPeerId;
+    use zakura_scheduler::SimInstant;
+
+    use super::{WakeEvidence, WakeFact};
+    use crate::{
+        domain::header_sync::{capacity_release_wakes, WakeView},
+        peer::peer_id,
+        property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
+        storage::hex,
+        ActionSource, Boundary, Identity, MemorySink, ObservationLog, PlanInput, Sim,
+    };
+
+    /// Wake evidence with no tap behind it.
+    #[derive(Clone, Default)]
+    struct Wakes(WakeEvidence);
+
+    impl WakeView for Wakes {
+        fn wake(&self) -> &WakeEvidence {
+            &self.0
+        }
+    }
+
+    impl HasView for Wakes {
+        type View = Wakes;
+
+        /// A copy sharing the store.
+        fn view(&self) -> Wakes {
+            self.clone()
+        }
+
+        /// The store's stamps.
+        fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+            Some(self.0.stamps_after(after))
+        }
+    }
+
+    /// Opens each wake in `opened` at the boundary after step 1, as a tap
+    /// would.
+    struct Opens {
+        wakes: WakeEvidence,
+        opened: Vec<WakeFact>,
+    }
+
+    impl ActionSource for Opens {
+        fn enabled(&self, _: SimInstant, _: &mut Vec<(Identity, u64)>) {}
+
+        fn boundaries(&self, _: SimInstant, _: &mut Vec<Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the script offers no actions");
+        }
+
+        /// Pushes every wake in `opened` after step 1.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            if log.step() == 1 {
+                for fact in self.opened.drain(..) {
+                    self.wakes.push(fact);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A wake for `peer`'s session `session_id`.
+    fn opened(peer: &ZakuraPeerId, session_id: u64) -> WakeFact {
+        WakeFact::Opened {
+            peer: peer.clone(),
+            session_id,
+            at: SimInstant::ZERO,
+        }
+    }
+
+    /// What `capacity-release-wakes` expects of the wake for `peer`'s
+    /// session `session_id`.
+    fn discharged(peer: &ZakuraPeerId, session_id: u64) -> String {
+        format!(
+            "Session(\"{}#{session_id}\") discharged before quiescence",
+            hex(&peer.digest())
+        )
+    }
+
+    /// C21: two wakes one boundary opened, for two peers' sessions, that
+    /// nothing answers are two violations of `capacity-release-wakes`,
+    /// which expire together at quiescence, and the report keeps both,
+    /// each naming its own session.
+    #[test]
+    fn every_unanswered_wake_at_a_boundary_is_reported() {
+        let (first, second) = (peer_id([7; 32], 0), peer_id([7; 32], 1));
+        let wakes = Wakes::default();
+        let mut sim = Sim::new(crate::RunConfig::default(), PlanInput::Bytes(Vec::new()));
+        sim.add_source(Box::new(Opens {
+            wakes: wakes.0.clone(),
+            opened: vec![opened(&first, 3), opened(&second, 4)],
+        }));
+        sim.scheduler().spawn_root("reactor", async {
+            zakura_rt::task::yield_now().await;
+        });
+        let registry =
+            Registry::new(vec![capacity_release_wakes::<Wakes>()]).expect("one property");
+        let mut checker = RegistryChecker::new(
+            registry,
+            Rc::new(wakes),
+            Assumptions::none(),
+            &Sources::observed(&[Source::Schedule, Source::View]),
+        );
+        let report = sim.run(&mut checker, &mut MemorySink::default());
+        let found: Vec<(u64, &[u64], &str, &str)> = report.properties[0]
+            .violations
+            .iter()
+            .map(|v| {
+                (
+                    v.step,
+                    v.witness.as_slice(),
+                    v.expected.as_str(),
+                    v.actual.as_str(),
+                )
+            })
+            .collect();
+        let (first, second) = (discharged(&first, 3), discharged(&second, 4));
+        let open = "the scheduler is Quiescent after step 2 with the obligation from step 1 open";
+        assert_eq!(
+            found,
+            [
+                (2, &[1, 2][..], first.as_str(), open),
+                (2, &[1, 2][..], second.as_str(), open),
+            ]
+        );
+    }
+}

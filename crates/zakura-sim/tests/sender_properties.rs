@@ -228,24 +228,35 @@ fn every_sender_violation_at_a_step_is_reported() {
         .iter()
         .find(|r| r.property == LIMIT)
         .expect("registered");
-    let found: Vec<(u64, &str)> = limit
+    let found: Vec<(u64, &[u64], &str, &str)> = limit
         .violations
         .iter()
-        .map(|v| (v.step, v.expected.as_str()))
+        .map(|v| {
+            (
+                v.step,
+                v.witness.as_slice(),
+                v.expected.as_str(),
+                v.actual.as_str(),
+            )
+        })
         .collect();
-    let step = limit.violations[0].step;
+    let labelled = "the peer's models labelled it OverMargin";
     assert_eq!(
         found,
         [
             (
-                step,
+                1,
+                &[1][..],
                 "connection 1's s65v2/get frame 0 from the node is conformant under \
-                 sender-within-limit"
+                 sender-within-limit",
+                labelled
             ),
             (
-                step,
+                1,
+                &[1][..],
                 "connection 1's s65v2/get frame 1 from the node is conformant under \
-                 sender-within-limit"
+                 sender-within-limit",
+                labelled
             ),
         ]
     );

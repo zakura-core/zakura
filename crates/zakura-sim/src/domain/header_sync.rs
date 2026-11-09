@@ -929,39 +929,76 @@ mod tests {
 
     /// Every claim break one boundary's drain found survives into the
     /// report, not just the first, for each check that reads claim breaks:
-    /// two at step 1, in the order the tap found them.
+    /// the first and third of three at step 1, in the order the tap found
+    /// them. The second is another rule's, which the check doesn't report.
     #[test]
     fn every_claim_break_at_a_boundary_is_reported() {
-        let cases: [(Property<Probe>, &'static [Claim]); 3] = [
+        let budget = format!("at most {CHUNK_BUDGET_CAPACITY} headers reserved and owned");
+        let teardown = "a released round, and a stopped node, keeps no reservation, lease or \
+                        held headers once settled, and no locator permit a pending storage \
+                        read doesn't hold";
+        let stale = "a stale completion's handler returns only its own round's budget";
+        /// A property, the claims the boundary broke, what the property
+        /// expects, and the two findings it reports.
+        type Case<'e> = (
+            Property<Probe>,
+            &'static [Claim],
+            &'e str,
+            [&'static str; 2],
+        );
+        let cases: [Case<'_>; 3] = [
             (
                 chunk_budget_bound(),
-                &[Claim::BudgetOverCapacity, Claim::OverBudget],
+                &[
+                    Claim::BudgetOverCapacity,
+                    Claim::LeakedLease,
+                    Claim::OverBudget,
+                ],
+                &budget,
+                ["BudgetOverCapacity #0", "OverBudget #2"],
             ),
             (
                 teardown_returns_baseline(),
-                &[Claim::LeakedReservation, Claim::LeakedLease],
+                &[
+                    Claim::LeakedReservation,
+                    Claim::OverBudget,
+                    Claim::LeakedLease,
+                ],
+                teardown,
+                ["LeakedReservation #0", "LeakedLease #2"],
             ),
             (
                 stale_completion_inert(),
-                &[Claim::StaleCompletionEffect, Claim::StaleCompletionEffect],
+                &[
+                    Claim::StaleCompletionEffect,
+                    Claim::LeakedLease,
+                    Claim::StaleCompletionEffect,
+                ],
+                stale,
+                ["StaleCompletionEffect #0", "StaleCompletionEffect #2"],
             ),
         ];
-        for (property, claims) in cases {
+        for (property, claims, expected, [first, second]) in cases {
             let id = property.id.to_string();
             let report = run_property(property, &[Scripted::Breaks(claims)]);
-            let found: Vec<(u64, &str)> = report.properties[0]
+            let found: Vec<(u64, &[u64], &str, &str)> = report.properties[0]
                 .violations
                 .iter()
-                .map(|v| (v.step, v.actual.as_str()))
-                .collect();
-            let expected: Vec<String> = claims
-                .iter()
-                .enumerate()
-                .map(|(at, claim)| format!("{claim:?} #{at}"))
+                .map(|v| {
+                    (
+                        v.step,
+                        v.witness.as_slice(),
+                        v.expected.as_str(),
+                        v.actual.as_str(),
+                    )
+                })
                 .collect();
             assert_eq!(
                 found,
-                [(1, expected[0].as_str()), (1, expected[1].as_str())],
+                [
+                    (1, &[1][..], expected, first),
+                    (1, &[1][..], expected, second)
+                ],
                 "{id}"
             );
             assert_eq!(

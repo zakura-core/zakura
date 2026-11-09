@@ -1837,21 +1837,30 @@ mod tests {
             property.outcome,
             crate::PropertyOutcome::Violated { witness: vec![2] }
         );
-        let findings: Vec<(u64, &str, &str)> = property
+        let findings: Vec<(u64, &[u64], &str, &str)> = property
             .violations
             .iter()
-            .map(|v| (v.step, v.expected.as_str(), v.actual.as_str()))
+            .map(|v| {
+                (
+                    v.step,
+                    v.witness.as_slice(),
+                    v.expected.as_str(),
+                    v.actual.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             findings,
             [
                 (
                     2,
+                    &[2][..],
                     "operation 1 completes once",
                     "operation 1 completed again"
                 ),
                 (
                     2,
+                    &[2][..],
                     "a completion of a submitted operation, at most 2",
                     "operation 3 completed before its submission"
                 ),

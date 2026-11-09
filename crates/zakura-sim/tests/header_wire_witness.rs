@@ -795,21 +795,30 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         .iter()
         .find(|property| property.property == HONEST_NEVER_PUNISHED)
         .expect("registered");
-    let found: Vec<(u64, &str, &str)> = honest
+    let found: Vec<(u64, &[u64], &str, &str)> = honest
         .violations
         .iter()
-        .map(|v| (v.step, v.expected.as_str(), v.actual.as_str()))
+        .map(|v| {
+            (
+                v.step,
+                v.witness.as_slice(),
+                v.expected.as_str(),
+                v.actual.as_str(),
+            )
+        })
         .collect();
     assert_eq!(
         found,
         [
             (
                 2,
+                &[2][..],
                 "honest peer-0's connection 1 is never punished",
                 "a close with cause ordered_read_rejected"
             ),
             (
                 2,
+                &[2][..],
                 "honest peer-0's connection 2 is never punished",
                 "a Misbehavior"
             ),

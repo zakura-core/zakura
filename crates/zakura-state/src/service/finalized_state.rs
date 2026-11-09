@@ -328,6 +328,19 @@ pub struct FinalizedState {
     vct: VctCommitState,
 }
 
+/// Durably writes a prepared block's batch, given the block's VCT authentication proof.
+///
+/// The block commit code is large, so it takes this boxed callback rather than a generic one,
+/// which would compile a copy of that code for each caller.
+type CommitBatch<'a> = Box<
+    dyn FnOnce(
+            &mut ZakuraDb,
+            DiskWriteBatch,
+            VctAuthenticationProof,
+        ) -> Result<(), CommitCheckpointVerifiedError>
+        + 'a,
+>;
+
 impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
@@ -720,7 +733,7 @@ impl FinalizedState {
             vct_successor_witness,
             vct_auxiliary_window,
             "commit checkpoint-verified request",
-            commit,
+            Box::new(commit),
         );
 
         if result.is_ok() {
@@ -797,12 +810,12 @@ impl FinalizedState {
             vct_successor_witness,
             Some(vct_auxiliary_window),
             source,
-            |db, batch, _proof| {
+            Box::new(|db, batch, _proof| {
                 db.header_chain_disk_db()
                     .write(batch)
                     .expect("unexpected rocksdb error while writing block");
                 Ok(())
-            },
+            }),
         )
     }
 
@@ -828,27 +841,20 @@ impl FinalizedState {
             vct_successor_witness,
             None,
             source,
-            commit,
+            Box::new(commit),
         )
     }
 
     /// Prepare a finalized block with exact auxiliary provenance and delegate its durable batch.
-    fn commit_finalized_direct_with_aux<C>(
+    fn commit_finalized_direct_with_aux(
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
         vct_auxiliary_window: Option<VctAuxiliaryWindow>,
         source: &str,
-        commit: C,
-    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError>
-    where
-        C: FnOnce(
-            &mut ZakuraDb,
-            DiskWriteBatch,
-            VctAuthenticationProof,
-        ) -> Result<(), CommitCheckpointVerifiedError>,
-    {
+        commit: CommitBatch<'_>,
+    ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let mut vct_authentication = VctAuthenticationProof::NotAuthenticated;
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
             match finalizable_block {

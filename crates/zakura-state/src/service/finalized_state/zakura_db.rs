@@ -352,6 +352,22 @@ impl ZakuraDb {
         self.read_capacity.control_workers.clone()
     }
 
+    /// Charge `bytes` serialized from a non-finalized block to the read memory
+    /// budget, so they share its limit with serialized disk results.
+    ///
+    /// The bytes already exist, like a read worker's transient parser memory, so
+    /// a refusal drops them and returns an error.
+    pub(crate) fn retain_serialized_bytes(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<
+        zakura_node_services::block_memory::OwnedPayload<Vec<u8>>,
+        zakura_node_services::block_memory::ReadMemoryExhausted,
+    > {
+        let charge = u64::try_from(bytes.capacity()).unwrap_or(u64::MAX);
+        self.read_capacity.memory.try_reserve(charge)?.retain(bytes)
+    }
+
     /// Returns config for this database.
     pub fn config(&self) -> &Config {
         &self.config

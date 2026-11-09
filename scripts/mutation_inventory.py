@@ -16,9 +16,41 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def typed_binding(root, patch, case):
+    """Check a typed case's committed scenario and Plan bytes. No fuzz target runs one."""
+    typed = case["typed"]
+    errors = []
+    files = {}
+    for name in ("scenario", "plan"):
+        path = root / typed[name]
+        if path.is_file():
+            files[name] = sha256(path)
+        else:
+            errors.append(f"missing typed {name}: {typed[name]}")
+    for check in case.get("checks", []):
+        if not (root / check).exists():
+            errors.append(f"missing dependency path: {check}")
+    return {
+        "property": patch.parent.relative_to(root / "qa/planted").as_posix(),
+        "input": None,
+        "scenario": typed["scenario"],
+        "scenario_sha256": files.get("scenario"),
+        "plan": typed["plan"],
+        "plan_sha256": files.get("plan"),
+        "harness": typed["harness"],
+        "fuzz_targets": [],
+        "discovery_target": "not applicable: a typed case has no fuzz input",
+        "errors": errors,
+    }
+
+
 def planted_binding(root, patch):
     """Check the case, committed input, witness declaration, and fuzz target mapping."""
     case = tomllib.loads(patch.with_suffix(".toml").read_text())
+    if ("input" in case) == ("typed" in case):
+        raise ValueError("a case names either `input` or `[typed]`")
+    if "typed" in case:
+        return typed_binding(root, patch, case)
     source = root / case["input"]
     sidecar = tomllib.loads(source.with_suffix(".toml").read_text())
     property_id = patch.parent.relative_to(root / "qa/planted").as_posix()

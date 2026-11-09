@@ -527,6 +527,11 @@ impl Sim {
                 Action::RunTask(_) => executed,
                 _ => executed.and_then(|()| self.observe_sources(st)),
             };
+            if let Action::Source { source, .. } = chosen.action {
+                if self.sources[source.0].recovering() {
+                    self.choices.borrow_mut().decider.recover();
+                }
+            }
 
             let next = self.ready(st);
             if record_steps {

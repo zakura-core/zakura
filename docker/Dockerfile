@@ -133,6 +133,15 @@ ENV FEATURES=${FEATURES}
 # Compress debug sections with zlib, roughly 275 MB -> 110 MB on disk.
 # Not zstd: std's backtrace symbolizer only reads zlib, and file:line would be lost.
 ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib"
+# On x86-64, rustc links with LLD, so the release build below also folds
+# identical functions (`--icf=all`). Generic code is instantiated once per
+# codegen unit and crate, leaving byte-identical copies that this merges,
+# shrinking zakurad's .text by about 2.7%. Rust does not guarantee distinct
+# addresses for distinct functions (rustc marks them `unnamed_addr`), so folding
+# them is sound; a backtrace through a folded function can name a twin.
+# `--icf=safe` folds nothing because rustc emits no address-significance
+# tables. aarch64 links with the system's GNU ld, which has no `--icf`.
+ARG ICF_RUSTFLAGS="-C link-arg=-Wl,--icf=all"
 
 # Set the working directory for the build.
 ARG HOME
@@ -166,6 +175,7 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
+    if [ "$(uname -m)" = "x86_64" ]; then export RUSTFLAGS="${RUSTFLAGS} ${ICF_RUSTFLAGS}"; fi; \
     cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
     cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin
 

@@ -174,8 +174,9 @@ impl std::error::Error for ResetError {}
 pub enum RunKind {
     /// An apply operation, with what it returned.
     Apply(OpId, ResultIdentity),
-    /// A selected-path locator read.
-    Locator(OpId),
+    /// A selected-path locator read, with every entry of the locator the
+    /// engine returned, or `None` if it returned none.
+    Locator(OpId, Option<Vec<zakura_header_chain::Frontier>>),
     /// An operator reset.
     Reset,
 }
@@ -1021,7 +1022,15 @@ impl ControlledPort {
             std::sync::Arc::new(EngineRun {
                 kind: match op {
                     HeaderOp::ApplyHeaderTarget => RunKind::Apply(id, result.clone()),
-                    _ => RunKind::Locator(id),
+                    _ => RunKind::Locator(
+                        id,
+                        match &reply {
+                            HeaderReply::ContinuationLocator(Ok(Some(locator))) => {
+                                Some(locator.entries().to_vec())
+                            }
+                            _ => None,
+                        },
+                    ),
                 },
                 clock,
                 before,

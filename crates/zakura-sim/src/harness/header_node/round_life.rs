@@ -413,22 +413,16 @@ impl RoundLife {
 
     /// Judges a locator read in `fact` against the selected path of the
     /// durable state its `run` recorded just before it read, which
-    /// `commit-only-authorized` requires the read to leave unchanged.
+    /// `commit-only-authorized` requires the read to leave unchanged. The
+    /// selected projection always holds the finalized anchor, so the engine
+    /// must return a locator, and every entry, height and hash, must be the
+    /// one LC-WIRE-03's offsets take from that projection. The reported
+    /// result must give the same tip, hashes and anchor.
     fn locator_result(&mut self, fact: &StorageFact, run: Option<&EngineRun>) {
         let (
-            StorageFact::Completed {
-                id,
-                result:
-                    StorageResult::Locator {
-                        tip,
-                        hashes,
-                        finalized,
-                        ..
-                    },
-                ..
-            },
+            StorageFact::Completed { id, result, .. },
             Some(EngineRun {
-                kind: RunKind::Locator(_),
+                kind: RunKind::Locator(_, engine_entries),
                 before: durable,
                 ..
             }),
@@ -442,8 +436,27 @@ impl RoundLife {
         let projection = &durable.selected_projection;
         let anchor = point(durable.graph.finalized_frontier);
         let expected = selected_locator(projection);
+        if engine_entries.as_ref() != Some(&expected) {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: locator read {id}'s engine returned {engine_entries:?}, \
+                 but the engine's selected path gives {expected:?}"
+            ));
+        }
         let expected_tip = expected.first().map(|entry| point(*entry));
         let expected_hashes: Vec<String> = expected.iter().map(|entry| hash(entry.hash)).collect();
+        let StorageResult::Locator {
+            tip,
+            hashes,
+            finalized,
+            ..
+        } = result
+        else {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: locator read {id} reported {result:?}, but the engine's \
+                 selected path gives {expected_hashes:?} at anchor {anchor:?}"
+            ));
+            return;
+        };
         if expected_tip.as_ref() != Some(tip) || *finalized != anchor || *hashes != expected_hashes
         {
             self.breaks.push(format!(

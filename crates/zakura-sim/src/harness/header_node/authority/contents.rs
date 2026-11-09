@@ -93,7 +93,7 @@ impl Contents {
         let what = match kind {
             RunKind::Apply(id, _) => format!("apply operation {}", id.0),
             RunKind::Reset => "a reset".to_owned(),
-            RunKind::Locator(id) => {
+            RunKind::Locator(id, _) => {
                 // Its result is `reset-invalidates-work`'s locator-result
                 // rule's, judged against `before`.
                 if before != after {

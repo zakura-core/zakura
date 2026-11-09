@@ -36,7 +36,7 @@ use crate::{
             CheckpointVerifiedBlock, FinalizedState, ZakuraDb, PRUNING_METADATA,
             STATE_COLUMN_FAMILIES_IN_CODE,
         },
-        non_finalized_state::{CreatedUtxos, SharedMap},
+        non_finalized_state::SharedMap,
     },
     ContextuallyVerifiedBlock, ReadRequest, ReadResponse, RollbackFinalizedStateError,
     RollbackFinalizedStateOptions, SemanticallyVerifiedBlock, StateInitError,
@@ -189,7 +189,7 @@ fn commit_contextual(state: &mut FinalizedState, block: Arc<Block>) {
     let semantically_verified = SemanticallyVerifiedBlock::from(block);
     let spent_utxos = check::utxo::transparent_spend(
         &semantically_verified,
-        &CreatedUtxos::default(),
+        |_| None,
         &SharedMap::default(),
         &state.db,
     )
@@ -240,7 +240,7 @@ fn check_spends(
     all_transactions.extend(transactions);
     let block = SemanticallyVerifiedBlock::from(child_block(parent, all_transactions));
 
-    check::utxo::transparent_spend(&block, &CreatedUtxos::default(), &SharedMap::default(), db)
+    check::utxo::transparent_spend(&block, |_| None, &SharedMap::default(), db)
         .map(|spent| spent.into_keys().collect())
 }
 

@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.8.5"
+version = "1.8.6"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -63,7 +63,10 @@ default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc
 
 
 # Standard builds enable Pasta assembly; `portable` is the explicit override.
-default = ["default-release-binaries"]
+#
+# `sprout` stays on until the checkpoints cover NU7 activation on every network,
+# because until then a pre-NU7 block with JoinSplits can still need full verification.
+default = ["default-release-binaries", "sprout"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin", "indicatif", "zakura-consensus/progress-bar", "zakura-state/progress-bar", "zakura-network/progress-bar"]
@@ -79,6 +82,11 @@ portable = ["dep:orchard", "orchard/portable"]
 x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
+
+# Sprout JoinSplit proof and signature verification, only needed to fully verify
+# pre-NU7 blocks above the last checkpoint. On by default for now. See the `sprout` feature in
+# `zakura-consensus`.
+sprout = ["zakura-consensus/sprout"]
 
 # The indexer gRPC server, started when `rpc.indexer_listen_addr` is configured
 indexer-rpc = ["zakura-rpc/indexer-rpc"]
@@ -141,8 +149,8 @@ zakura-checkpoints = [
 ]
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain", version = "13.0.1" }
-zakura-consensus = { path = "../zakura-consensus", version = "16.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "14.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "17.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "15.0.0" }
@@ -222,8 +230,8 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "ne
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "13.0.1", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "16.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "14.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "17.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "5.0.2", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "15.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "15.0.0", features = ["proptest-impl"] }

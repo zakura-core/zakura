@@ -41,7 +41,7 @@ use crate::{
 use crate::request::Spend;
 
 use self::{counted_set::CountedSet, height_map::HeightMap, index::TransparentTransfers};
-use super::{AddressTransfers, CreatedUtxos, SharedMap};
+use super::{AddressTransfers, SharedMap};
 
 #[cfg(test)]
 mod chunked_height_map_tests;
@@ -105,16 +105,6 @@ pub struct ChainInner {
 
     // Transparent outputs and spends
     //
-    /// The [`transparent::Utxo`]s created by `blocks`.
-    ///
-    /// Note that these UTXOs may not be unspent.
-    /// Outputs can be spent by later transactions or blocks in the chain.
-    ///
-    /// Share output index partitions and immutable payloads when cloning snapshots.
-    /// Membership and spend indexes remain independent for each chain.
-    //
-    // TODO: replace OutPoint with OutputLocation?
-    pub(crate) created_utxos: CreatedUtxos,
     /// The spending transaction ids by [`transparent::OutPoint`]s spent by `blocks`,
     /// including spent outputs created by earlier transactions or blocks in the chain.
     ///
@@ -282,7 +272,6 @@ impl Chain {
             blocks: Default::default(),
             height_by_hash: Default::default(),
             tx_loc_by_hash: Default::default(),
-            created_utxos: Default::default(),
             spent_utxos: Default::default(),
             sprout_anchors: CountedSet::new(),
             sprout_anchors_by_height: Default::default(),
@@ -412,7 +401,6 @@ impl Chain {
             block_info_by_height: _,
 
             tx_loc_by_hash: _,
-            created_utxos: _,
             spent_utxos: _,
             sprout_trees_by_anchor: _,
             sprout_trees_by_height: _,
@@ -1639,10 +1627,11 @@ impl Chain {
     /// and removed from the relevant chain(s).
     #[cfg(test)]
     pub fn unspent_utxos(&self) -> HashMap<transparent::OutPoint, transparent::OrderedUtxo> {
-        self.created_utxos
-            .iter()
+        self.blocks
+            .values()
+            .flat_map(|block| block.new_outputs.iter())
             .filter(|(outpoint, _)| !self.spent_utxos.contains_key(outpoint))
-            .map(|(outpoint, utxo)| (*outpoint, utxo.as_ref().clone()))
+            .map(|(outpoint, utxo)| (*outpoint, utxo.clone()))
             .collect()
     }
 
@@ -1651,9 +1640,25 @@ impl Chain {
     ///
     /// UTXOs are returned regardless of whether they have been spent.
     pub fn created_utxo(&self, outpoint: &transparent::OutPoint) -> Option<transparent::Utxo> {
-        self.created_utxos
-            .get(outpoint)
+        self.created_ordered_utxo(outpoint)
             .map(|utxo| utxo.utxo.clone())
+    }
+
+    /// Looks up an output in its retained block, including outputs already spent in this chain.
+    ///
+    /// Snapshots share the block's immutable output map. The transaction index locates
+    /// that map without maintaining another copy of every output in the chain.
+    #[allow(clippy::unwrap_in_result)] // A dangling transaction location is an internal invariant violation.
+    pub(crate) fn created_ordered_utxo(
+        &self,
+        outpoint: &transparent::OutPoint,
+    ) -> Option<&transparent::OrderedUtxo> {
+        let location = self.tx_loc_by_hash.get(&outpoint.hash)?;
+        self.blocks
+            .get(&location.height)
+            .expect("transaction locations refer to retained blocks")
+            .new_outputs
+            .get(outpoint)
     }
 
     /// Returns the [`Hash`](transaction::Hash) of the transaction that spent an output at
@@ -1999,8 +2004,8 @@ impl Chain {
             // (same hash → same nullifiers) is rejected with a clean
             // `Duplicate{Sprout|Sapling|Orchard|Ironwood}Nullifier` error by
             // the nullifier insertion helpers before reaching the
-            // defense-in-depth assertions on `tx_loc_by_hash`,
-            // `created_utxos`, and `spent_utxos` below.
+            // defense-in-depth assertions on `tx_loc_by_hash` and
+            // `spent_utxos` below.
             {
                 #[cfg(not(feature = "indexer"))]
                 let transaction_hash = ();
@@ -2286,15 +2291,6 @@ impl
                 .get(&outpoint)
                 .expect("new_outputs contains all created UTXOs");
 
-            // Update the chain's created UTXOs
-            let previous_entry = self
-                .created_utxos
-                .insert(outpoint, Arc::new(created_utxo.clone()));
-            assert_eq!(
-                previous_entry, None,
-                "unexpected created output: duplicate update or duplicate UTXO",
-            );
-
             // Update the address index with this UTXO
             if let Some(receiving_address) = self.indexed_address(&created_utxo.utxo.output) {
                 self.partial_transparent_transfers
@@ -2323,13 +2319,6 @@ impl
             let created_utxo = block_created_outputs
                 .get(&outpoint)
                 .expect("new_outputs contains all created UTXOs");
-
-            // Revert the chain's created UTXOs
-            let removed_entry = self.created_utxos.remove(&outpoint);
-            assert!(
-                removed_entry.is_some(),
-                "unexpected revert of created output: duplicate revert or duplicate UTXO",
-            );
 
             // Revert the address index for this UTXO
             if let Some(receiving_address) = self.indexed_address(&created_utxo.utxo.output) {

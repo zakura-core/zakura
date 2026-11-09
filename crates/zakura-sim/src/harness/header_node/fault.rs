@@ -181,11 +181,19 @@ struct Judge {
     /// The call whose handling is running: its `CallEnded` came, and its
     /// `Handled` hasn't.
     handling: Option<u64>,
-    /// Why the evidence can't be read, such as a failure with no
-    /// attribution.
+    /// Why the log's evidence can't be read, such as a failure with no
+    /// attribution. The judge reads no more of the log after one, since
+    /// what it would judge there can't be trusted. The cooldown facts are a
+    /// separate store the error says nothing about, so it still judges
+    /// those.
     error: Option<String>,
-    /// The first break of the rule.
-    broken: Option<String>,
+    /// Every break of the rule, in the order it read them. A break doesn't
+    /// stop it, so a later one in the same step is kept too.
+    broken: Vec<String>,
+    /// How many of [`Judge::broken`] the property's check has reported.
+    reported: usize,
+    /// Whether the property's check has reported [`Judge::error`].
+    error_reported: bool,
 }
 
 impl Judge {
@@ -245,13 +253,11 @@ impl Judge {
                     if let Some((from, until)) =
                         self.cooled.get(peer).filter(|(_, until)| at < until)
                     {
-                        self.broken.get_or_insert_with(|| {
-                            format!(
-                                "ReadmittedInCooldown: the reactor admitted session {session_id} \
-                                 from {peer} at {at:?}, inside the readmission cooldown it started \
-                                 at {from:?} until {until:?}"
-                            )
-                        });
+                        self.broken.push(format!(
+                            "ReadmittedInCooldown: the reactor admitted session {session_id} \
+                             from {peer} at {at:?}, inside the readmission cooldown it started \
+                             at {from:?} until {until:?}"
+                        ));
                     }
                 }
                 CooldownFact::Refused { .. } => {}
@@ -260,18 +266,18 @@ impl Judge {
     }
 
     /// Reads the entries after the ones it already read, judging each owed
-    /// penalty once its call's handling ends. Stops at the first break.
+    /// penalty once its call's handling ends. A break doesn't stop it. An
+    /// evidence error stops it for good (see [`Judge::error`]).
     fn read(&mut self, entries: &[Entry], attributions: &FaultAttributions) {
+        if self.error.is_some() {
+            return;
+        }
         let Some(new) = entries.get(self.read..) else {
-            self.error
-                .get_or_insert_with(|| "the log the penalty rule reads got shorter".to_owned());
+            self.error = Some("the log the penalty rule reads got shorter".to_owned());
             return;
         };
         self.read = entries.len();
         for entry in new {
-            if self.failure().is_some() {
-                return;
-            }
             if let Err(why) = self.entry(entry, attributions) {
                 self.error = Some(why);
                 return;
@@ -280,9 +286,22 @@ impl Judge {
         }
     }
 
-    /// The evidence error or rule break that stopped it, if one did.
-    fn failure(&self) -> Option<String> {
-        self.error.clone().or_else(|| self.broken.clone())
+    /// Every break, in the order read, then the evidence error that stopped
+    /// the log, if one did.
+    fn failures(&self) -> Vec<String> {
+        self.broken.iter().chain(&self.error).cloned().collect()
+    }
+
+    /// The breaks, then the evidence error, the property's check hasn't
+    /// reported yet, now marked reported.
+    fn unreported(&mut self) -> Vec<String> {
+        let mut new = self.broken[self.reported..].to_vec();
+        self.reported = self.broken.len();
+        if let Some(why) = self.error.as_ref().filter(|_| !self.error_reported) {
+            new.push(why.clone());
+            self.error_reported = true;
+        }
+        new
     }
 
     /// Reads one log entry.
@@ -424,21 +443,18 @@ impl Judge {
         pending.retain(|index| {
             let penalty = &self.owed[*index];
             let Some(call) = penalty.call else {
-                self.broken.get_or_insert_with(|| {
-                    format!(
-                        "UnpenalizedFault: {} operation {} failed with a header-peer fault of {} \
-                         in session {}, and no reactor call submitted it, so no handling can \
-                         penalize it",
-                        penalty.stage, penalty.op, penalty.source, penalty.session_id
-                    )
-                });
+                self.broken.push(format!(
+                    "UnpenalizedFault: {} operation {} failed with a header-peer fault of {} in \
+                     session {}, and no reactor call submitted it, so no handling can penalize it",
+                    penalty.stage, penalty.op, penalty.source, penalty.session_id
+                ));
                 return false;
             };
             let Some(window) = self.windows.get(&call).filter(|window| window.handled) else {
                 return true;
             };
             if let Err(why) = matched(penalty, window, cooldown, &self.started) {
-                self.broken.get_or_insert(why);
+                self.broken.push(why);
             }
             false
         });
@@ -679,8 +695,15 @@ pub enum FaultCheck {
     Holds,
     /// Everything judged so far holds, but this is still open.
     Open(String),
-    /// The rule broke.
-    Broken(String),
+    /// The rule broke since the last check: each break it found, in the
+    /// order read, then the evidence error that stopped its reading of the
+    /// log, if one just did. Each is reported at one check only.
+    Broken {
+        /// The new breaks, never empty.
+        breaks: Vec<String>,
+        /// What's still open beside them, as [`FaultCheck::Open`] says.
+        open: Option<String>,
+    },
 }
 
 impl FaultEvidence {
@@ -725,6 +748,13 @@ impl FaultEvidence {
     /// `Misbehavior` is followed by a `CooldownStarted` for the same peer and
     /// session that installs the configured cooldown. No session from a
     /// peer is admitted while a cooldown started for it lasts.
+    ///
+    /// A break doesn't stop the check from reading on, so every break in
+    /// the new entries and cooldown facts is reported, each at the first
+    /// check that finds it. An evidence error, such as a failure with no
+    /// attribution, is reported once after them, and the check reads no
+    /// more of the log. It still judges new cooldown facts, which the error
+    /// doesn't touch.
     pub fn check(&self, entries: &[Entry]) -> FaultCheck {
         let mut judge = self.judge.borrow_mut();
         let judge = judge.get_or_insert_with(|| Judge {
@@ -735,10 +765,12 @@ impl FaultEvidence {
         });
         judge.cooldowns(&self.cooldowns.facts_after(judge.facts_read));
         judge.read(entries, &self.attributions);
-        if let Some(why) = judge.failure() {
-            return FaultCheck::Broken(why);
+        let open = judge.open();
+        let breaks = judge.unreported();
+        if !breaks.is_empty() {
+            return FaultCheck::Broken { breaks, open };
         }
-        if let Some(why) = judge.open() {
+        if let Some(why) = open {
             return FaultCheck::Open(why);
         }
         if judge.owed.is_empty() && judge.started.is_empty() {
@@ -754,27 +786,34 @@ impl FaultEvidence {
     /// ends, one finding each: every penalty whose call's handling never
     /// ended, and every failure whose reply reached the reactor and was
     /// never taken ([`untaken`]). Open at any other end, or before the run
-    /// has ended, each is inconclusive. After an evidence error or a break,
-    /// the judge reads nothing more, so what it left open isn't reported.
+    /// has ended, each is inconclusive. Every break comes first, in the
+    /// order the judge read them (every cooldown fact, then the log), then
+    /// the evidence error that stopped its reading of the log, if one did.
+    /// After an error it reads no more of the log, so what the log left
+    /// open isn't reported.
     pub fn penalized(&self, entries: &[Entry]) -> FaultEnd {
         let mode = Mode::Judge {
             cooldown: self.cooldown,
         };
         let judge = Judge::over(mode, &self.cooldowns.facts(), entries, &self.attributions);
-        if let Some(why) = judge.failure() {
+        let mut violated = judge.failures();
+        if judge.error.is_some() {
             return FaultEnd {
-                violated: vec![why],
+                violated,
                 inconclusive: Vec::new(),
             };
         }
         let open = judge.open_at_end();
         match self.settled.get() {
-            Some(true) => FaultEnd {
-                violated: open,
-                inconclusive: Vec::new(),
-            },
+            Some(true) => {
+                violated.extend(open);
+                FaultEnd {
+                    violated,
+                    inconclusive: Vec::new(),
+                }
+            }
             settled => FaultEnd {
-                violated: Vec::new(),
+                violated,
                 inconclusive: open
                     .into_iter()
                     .map(|what| match settled {
@@ -1213,6 +1252,142 @@ mod tests {
         }
     }
 
+    /// The judge reads on past a break: two penalties broken while the
+    /// same step's calls were handled, and a readmission inside a cooldown,
+    /// are each reported, in the order read, at the first check and at a
+    /// settled end. A later check reports none of them again.
+    #[test]
+    fn every_break_is_reported_once() {
+        let attributions = FaultAttributions::default();
+        for id in 1..=2 {
+            attributions.insert(NODE, id, blame("aa"));
+        }
+        let cooldowns = CooldownEvidence::default();
+        cooldowns.record(started("aa", 9, 60, 2, 99));
+        cooldowns.record(admitted("aa", 4, 30));
+        let evidence = FaultEvidence::new(attributions, cooldowns, Duration::from_secs(60));
+        evidence.settled.set(Some(true));
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(failed_prepare(2, "aa", 3, "invalid_header"));
+        log.extend(handled(1, Vec::new()));
+        log.extend(handled(2, vec![misbehavior_at(7, "aa", 3)]));
+        let kinds = |breaks: &[String]| -> Vec<String> {
+            breaks
+                .iter()
+                .map(|why| {
+                    let kind = why.split(':').next().unwrap_or_default();
+                    match why.split("operation ").nth(1) {
+                        Some(rest) => format!("{kind} {}", rest.split(' ').next().unwrap_or("")),
+                        None => kind.to_owned(),
+                    }
+                })
+                .collect()
+        };
+        let expected = [
+            "ReadmittedInCooldown",
+            "UnpenalizedFault 1",
+            "UncooledFault 2",
+        ];
+        let readmitted = "ReadmittedInCooldown: the reactor admitted session 4 from aa at 30s, \
+                          inside the readmission cooldown it started at 2s until 62s";
+        let FaultCheck::Broken { breaks, open: None } = evidence.check(&log) else {
+            panic!("{:?}", evidence.check(&log));
+        };
+        assert_eq!(kinds(&breaks), expected);
+        assert_eq!(breaks[0], readmitted);
+        assert!(breaks[1].starts_with("UnpenalizedFault: prepare operation 1 failed with a header-peer fault of aa in session 3,"));
+        assert!(breaks[2].starts_with("UncooledFault: prepare operation 2 failed with a header-peer fault of aa in session 3,"));
+        assert_eq!(evidence.check(&log), FaultCheck::Holds);
+        let end = evidence.penalized(&log);
+        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert_eq!(kinds(&end.violated), expected);
+    }
+
+    /// A break beside an open fault: the check reports the break and what's
+    /// still open, and a settled end reports both.
+    #[test]
+    fn a_break_beside_an_open_fault_reports_both() {
+        let attributed = evidence(&[(1, blame("aa")), (2, blame("aa"))]);
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, Vec::new()));
+        let mut untaken = failed_prepare(2, "aa", 3, "invalid_header");
+        untaken.pop();
+        log.extend(untaken);
+        assert!(matches!(
+            attributed.check(&log),
+            FaultCheck::Broken { breaks, open: Some(open) }
+                if matches!(breaks.as_slice(), [why] if why.contains("operation 1"))
+                    && open.starts_with("UntakenFault: operation 2 ")
+        ));
+        let end = attributed.penalized(&log);
+        assert!(end.inconclusive.is_empty(), "{end:?}");
+        assert!(
+            matches!(end.violated.as_slice(), [first, second]
+                if first.starts_with("UnpenalizedFault: prepare operation 1 ")
+                    && second.starts_with("UntakenFault: operation 2 ")),
+            "{end:?}"
+        );
+    }
+
+    /// An evidence error stops the judge's reading of the log for good, and
+    /// is kept apart from the breaks: reported once after the breaks read
+    /// before it, with nothing in the log after it read. Cooldown facts,
+    /// which the error doesn't touch, are still judged, and a readmission
+    /// recorded after the error is reported once.
+    #[test]
+    fn an_evidence_error_stops_the_judge_after_the_breaks_before_it() {
+        // Operation 2 has no attribution. Operation 3's unpenalized fault
+        // comes after it, so it's never read.
+        let attributions = FaultAttributions::default();
+        for id in [1, 3, 4] {
+            attributions.insert(NODE, id, blame("aa"));
+        }
+        let cooldowns = CooldownEvidence::default();
+        let attributed =
+            FaultEvidence::new(attributions, cooldowns.clone(), Duration::from_secs(60));
+        attributed.settled.set(Some(true));
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.extend(handled(1, Vec::new()));
+        log.extend(failed_prepare(2, "aa", 3, "invalid_header"));
+        log.extend(failed_prepare(3, "aa", 3, "invalid_header"));
+        log.extend(handled(3, Vec::new()));
+        let missing = "MissingAttribution: failed operation 2 has no attribution";
+        let FaultCheck::Broken { breaks, .. } = attributed.check(&log) else {
+            panic!("{:?}", attributed.check(&log));
+        };
+        assert!(
+            matches!(breaks.as_slice(), [first, second]
+                if first.starts_with("UnpenalizedFault: prepare operation 1 ") && second == missing),
+            "{breaks:?}"
+        );
+        assert!(!matches!(attributed.check(&log), FaultCheck::Broken { .. }));
+
+        // Later, the log grows with another unpenalized fault, which isn't
+        // read, and the reactor readmits a cooled peer, which is.
+        log.extend(failed_prepare(4, "aa", 5, "invalid_header"));
+        log.extend(handled(4, Vec::new()));
+        cooldowns.record(started("bb", 6, 60, 2, 99));
+        cooldowns.record(admitted("bb", 7, 30));
+        let readmitted = "ReadmittedInCooldown: the reactor admitted session 7 from bb at 30s, \
+                          inside the readmission cooldown it started at 2s until 62s";
+        assert_eq!(
+            attributed.check(&log),
+            FaultCheck::Broken {
+                breaks: vec![readmitted.to_owned()],
+                open: None,
+            }
+        );
+        assert!(!matches!(attributed.check(&log), FaultCheck::Broken { .. }));
+
+        // The end replay reads every cooldown fact before the log.
+        let end = attributed.penalized(&log);
+        assert_eq!(
+            end.violated,
+            [readmitted, breaks[0].as_str(), missing].map(str::to_owned)
+        );
+        assert!(end.inconclusive.is_empty(), "{end:?}");
+    }
+
     #[test]
     fn a_failure_with_no_attribution_is_a_break() {
         let log = failed_prepare(1, "aa", 3, "invalid_header");
@@ -1321,7 +1496,7 @@ mod tests {
                 "{facts:?}"
             );
             assert_eq!(
-                matches!(evidence.check(&[]), FaultCheck::Broken(_)),
+                matches!(evidence.check(&[]), FaultCheck::Broken { .. }),
                 broken,
                 "{facts:?}"
             );
@@ -1350,7 +1525,8 @@ mod tests {
         ));
         assert!(matches!(
             evidence.check(&log),
-            FaultCheck::Broken(why) if why.starts_with("UncooledFault")
+            FaultCheck::Broken { breaks, open: None }
+                if matches!(breaks.as_slice(), [why] if why.starts_with("UncooledFault"))
         ));
 
         // A fault whose reply the reactor hasn't taken stays open.
@@ -1379,10 +1555,12 @@ mod tests {
         log.extend(third);
         let evidence =
             FaultEvidence::new(attributions, CooldownEvidence::default(), Duration::ZERO);
+        let end = evidence.penalized(&log);
         assert!(
-            matches!(violated(evidence.penalized(&log)), Some(why) if why.contains("operation 1")
-            )
+            matches!(end.violated.as_slice(), [why] if why.contains("operation 1")),
+            "{end:?}"
         );
+        assert_eq!(end.inconclusive.len(), 2, "{end:?}");
         let owed: Vec<u64> = owed(&log, evidence.attributions())
             .unwrap()
             .iter()
@@ -1410,7 +1588,8 @@ mod tests {
         evidence.cooldowns().record(admitted("aa", 4, 30));
         assert!(matches!(
             evidence.check(&log),
-            FaultCheck::Broken(why) if why.starts_with("ReadmittedInCooldown")
+            FaultCheck::Broken { breaks, open: None }
+                if matches!(breaks.as_slice(), [why] if why.starts_with("ReadmittedInCooldown"))
         ));
     }
 }

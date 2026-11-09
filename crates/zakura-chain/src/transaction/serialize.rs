@@ -608,8 +608,20 @@ impl<T: reddsa::SigType> ZcashDeserialize for reddsa::Signature<T> {
 impl ZcashSerialize for Transaction {
     crate::serialization::compile_serialize_entry_points_here!();
 
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, mut writer: &mut W) -> Result<(), io::Error> {
+        self.zcash_serialize_erased(&mut writer)
+    }
+}
+
+impl Transaction {
+    /// Writes this transaction to `writer`, as [`ZcashSerialize::zcash_serialize`] does.
+    ///
+    /// The writer's type is erased, so the transaction encoder and every encoder nested in it
+    /// are compiled once, rather than once for each writer type: `Vec`s, size counting, hashing,
+    /// and network buffers.
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+    #[inline(never)]
+    fn zcash_serialize_erased(&self, writer: &mut dyn io::Write) -> Result<(), io::Error> {
         // Post-Sapling, transaction size is limited to MAX_BLOCK_BYTES.
         // (Strictly, the maximum transaction size is about 1.5 kB less,
         // because blocks also include a block header.)

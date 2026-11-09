@@ -555,4 +555,33 @@ mod tests {
 
         assert_eq!(result, Err(zip317::Error::UnpaidActions));
     }
+
+    #[test]
+    fn authenticated_work_reaches_every_verified_fee_metric() {
+        let tx = UnminedTx::from(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        });
+        let construct = |fee: u64| {
+            VerifiedUnminedTx::new_with_verification_work(
+                tx.clone(),
+                fee.try_into().unwrap(),
+                0,
+                10,
+                Arc::new(Vec::new()),
+                600,
+            )
+        };
+        assert_eq!(construct(239_999), Err(zip317::Error::UnpaidActions));
+        let verified = construct(240_000).unwrap();
+        assert_eq!(verified.conventional_actions, 600);
+        assert_eq!(verified.unpaid_actions, 0);
+        assert_eq!(verified.fee_weight_ratio, 1.0);
+        assert!(verified.pays_conventional_fee());
+    }
 }

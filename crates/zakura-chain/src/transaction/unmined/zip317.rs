@@ -195,10 +195,10 @@ pub fn conventional_actions_with_work(transaction: &Transaction, verification_wo
     let work =
         usize::try_from(verification_work).expect("supported targets have at least 32-bit usize");
     let logical_actions = max(max(tx_in_logical_actions, tx_out_logical_actions), work)
-        + 2 * n_join_split
-        + max(n_spends_sapling, n_outputs_sapling)
-        + n_actions_orchard
-        + n_actions_ironwood;
+        .saturating_add(2 * n_join_split)
+        .saturating_add(max(n_spends_sapling, n_outputs_sapling))
+        .saturating_add(n_actions_orchard)
+        .saturating_add(n_actions_ironwood);
     // Saturating overcharges an out-of-range supplied work value rather than
     // wrapping to a cheap fee. Consensus caps authenticated work much earlier.
     let logical_actions: u32 = logical_actions.try_into().unwrap_or(u32::MAX);

@@ -1,0 +1,11 @@
+# Discovery admits a `GetServices` past twice its row's `max_in_flight` instead
+# of closing. The scenario's peer writes `GetServices` at once until one is past
+# the margin, and the node counts it there before it releases a commitment.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/get-services/over-margin-closes/admit-past-margin.scenario.json"
+plan = "qa/planted/discovery/s4v2/get-services/over-margin-closes/admit-past-margin.plan.bin"

@@ -707,7 +707,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-peers/bad-content-closes",
         GET_PEERS_ACTS,
-        Bypass::Planted("accept-zero-limit"),
+        Bypass::Planted("drop-refused-get-peers"),
     ),
     discovery(
         "discovery/s4v2/get-peers/cadence-never-closes",
@@ -767,7 +767,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-services/bad-content-closes",
         GET_SERVICES_ACTS,
-        Bypass::Planted("accept-repeated-wanted"),
+        Bypass::Planted("drop-refused-get-services"),
     ),
     discovery(
         "discovery/s4v2/get-services/cadence-never-closes",

@@ -12,9 +12,9 @@ use tempfile::TempDir;
 use zakura_sim::{
     harness::{
         block_sync::BlockScenario,
-        discovery,
+        discovery, discovery_service,
         fixtures::{PickScenario, Variant, Which},
-        header_sync::{FloodScenario, StorageScenario, WakeScenario},
+        header_sync::{FloodScenario, RepairScenario, StorageScenario, WakeScenario},
         wire_plans::SavedPlan,
     },
     seed::{self, SeedError, SeedKind, SeedReport},
@@ -66,6 +66,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
     if let Some(plan) = SavedPlan::ALL
         .into_iter()
         .find(|plan| stem == format!("header-wire-{}", plan.name()))
+    {
+        return value(plan.scenario());
+    }
+    if let Some(plan) = discovery_service::SavedPlan::ALL
+        .into_iter()
+        .find(|plan| stem == format!("discovery-wire-{}", plan.name()))
     {
         return value(plan.scenario());
     }
@@ -145,6 +151,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-release-wake-deferred" => value(WakeScenario::Deferred),
         "header-flood-wire" => value(FloodScenario::Wire),
         "header-flood-lifecycle" => value(FloodScenario::Lifecycle),
+        "header-repair-applied" => value(RepairScenario::Applied),
+        "header-repair-prepare-departs" => value(RepairScenario::PrepareDeparts),
+        "header-repair-apply-departs" => value(RepairScenario::ApplyDeparts),
         _ => None,
     }
 }

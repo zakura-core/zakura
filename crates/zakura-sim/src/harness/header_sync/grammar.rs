@@ -619,7 +619,8 @@ pub fn encode(scenario: &StorageScenario) -> Result<Vec<u8>, Unencodable> {
             }
             action @ (ControlAction::Commit { .. }
             | ControlAction::Flood
-            | ControlAction::Churn) => {
+            | ControlAction::Churn
+            | ControlAction::RepairStatus { .. }) => {
                 return Err(Unencodable(format!(
                     "the grammar has no {action:?} control step"
                 )))

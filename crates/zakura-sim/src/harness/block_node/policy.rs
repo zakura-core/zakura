@@ -189,6 +189,7 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         | policy::Trigger::Released
         | policy::Trigger::ReservationOpened(_)
         | policy::Trigger::SessionAdmitted(_)
+        | policy::Trigger::SessionEnded(_)
         | policy::Trigger::HeadroomWait(_)
         | policy::Trigger::StorageStopped(_) => true,
         policy::Trigger::ReplyTaken(select) => {
@@ -215,9 +216,10 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         ),
         policy::Trigger::ReservationOpened(_)
         | policy::Trigger::SessionAdmitted(_)
+        | policy::Trigger::SessionEnded(_)
         | policy::Trigger::HeadroomWait(_) => format!(
             "a block scenario can't wait for {found:?}: only a header reactor's tap reports \
-             reservations, admissions and headroom waits"
+             reservations, admissions, session ends and headroom waits"
         ),
         _ => format!(
             "a block scenario can't wait for {found:?}: only a range read's caller takes its \

@@ -184,6 +184,12 @@ pub enum Trigger<K> {
     /// peer, as its tap reports: once per admission, the setup link's
     /// included, so a replacement is the second. Never holds without a tap.
     SessionAdmitted(String),
+    /// The header node under test's reactor handled the end of a session
+    /// from this peer, as its tap reports: once per session that ends.
+    /// Unlike [`Trigger::Closed`], which counts the connection closing, it
+    /// holds only once the reactor has acted on the departure. Never holds
+    /// without a tap.
+    SessionEnded(String),
     /// The header node under test's reactor kept this peer's offer waiting
     /// for header room, as its tap reports: once per refusal. Never holds
     /// without a tap.
@@ -276,7 +282,7 @@ pub(crate) enum Event {
 /// [`Trigger::Closed`], [`Trigger::Linked`], [`Trigger::Grown`],
 /// [`Trigger::Reset`], [`Trigger::Prepared`],
 /// [`Trigger::ReservationOpened`], [`Trigger::SessionAdmitted`],
-/// [`Trigger::HeadroomWait`] and [`Trigger::StorageStopped`] count it.
+/// [`Trigger::SessionEnded`], [`Trigger::HeadroomWait`] and [`Trigger::StorageStopped`] count it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkEffect {
     /// A link was made.
@@ -293,6 +299,8 @@ pub enum LinkEffect {
     ReservationOpened,
     /// The node under test's reactor admitted a session from a peer.
     SessionAdmitted,
+    /// The node under test's reactor handled a peer's session ending.
+    SessionEnded,
     /// The node under test's reactor kept a peer's offer waiting for room.
     HeadroomWait,
     /// An actor's storage shut down.
@@ -557,6 +565,7 @@ impl<F: Family> Predicates<F> {
             Trigger::Prepared(peer) => links(LinkEffect::Prepared, peer),
             Trigger::ReservationOpened(peer) => links(LinkEffect::ReservationOpened, peer),
             Trigger::SessionAdmitted(peer) => links(LinkEffect::SessionAdmitted, peer),
+            Trigger::SessionEnded(peer) => links(LinkEffect::SessionEnded, peer),
             Trigger::HeadroomWait(peer) => links(LinkEffect::HeadroomWait, peer),
             Trigger::StorageStopped(peer) => links(LinkEffect::StorageStopped, peer),
             Trigger::Released | Trigger::VirtualTime(_) | Trigger::Count(..) | Trigger::All(_) => {

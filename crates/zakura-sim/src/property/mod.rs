@@ -19,8 +19,8 @@ pub use cx::{Capture, CheckCtx, EndViolation, HasView};
 pub use id::{BadId, PropertyId};
 pub use registry::{CheckEvent, Lifecycle, Registry, RegistryChecker, RegistryError, Sources, Tee};
 pub use verdict::{
-    Cardinality, FactAnswer, FactDischarge, Inconclusive, LivenessBound, Obligation, ObligationKey,
-    Subject, Verdict,
+    Cardinality, EndedBy, FactAnswer, FactDischarge, Inconclusive, LivenessBound, Obligation,
+    ObligationKey, Subject, Verdict,
 };
 
 use crate::ObservationLog;

@@ -6,10 +6,7 @@ use zakura_node_services::task::spawn_erased_named;
 use zakura_quic::NodeId;
 use zakura_rt::{
     collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, watch, Semaphore,
-    },
+    sync::{mpsc, watch, Semaphore},
     task::JoinHandle,
     time::{self, Instant},
 };
@@ -493,40 +490,11 @@ pub(super) fn selected_port_aux_delivery(
         .min_by_key(|delivery| (!delivery.is_authenticated(), delivery.delivery_id))
 }
 
-/// A waker that records whether a poll asked to be polled again.
-///
-/// `settle_ready_inputs` polls with it to tell a drained queue from one that
-/// asked to be polled again.
-struct Repoll {
-    flag: std::sync::Arc<RepollFlag>,
-    waker: std::task::Waker,
-}
-
-impl Repoll {
-    /// Creates a waker whose wakes only raise its flag.
-    fn new() -> Self {
-        let flag = std::sync::Arc::new(RepollFlag(AtomicBool::new(false)));
-        let waker = futures::task::waker(flag.clone());
-        Self { flag, waker }
-    }
-}
-
-/// The flag behind [`Repoll`]'s waker.
-struct RepollFlag(AtomicBool);
-
-impl futures::task::ArcWake for RepollFlag {
-    /// Records the request to poll again.
-    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
-        arc_self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 impl HeaderSyncReactor {
     async fn run(mut self) {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
-        let repoll = Repoll::new();
         let terminal_outcome = loop {
             if self
                 .state
@@ -541,7 +509,7 @@ impl HeaderSyncReactor {
                 break HeaderRequestTerminal::Shutdown;
             }
             // Inspect watches on every turn, even when peer queues never become empty.
-            self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs, &repoll);
+            self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
             // One item from each queue per turn prevents either queue monopolizing the loop.
             // Session readers wait for connection acknowledgement before publishing peer events.
             let mut handled_event = false;
@@ -594,7 +562,7 @@ impl HeaderSyncReactor {
                 },
                 _ = capacity_releases.changed() => {},
                 _ = time::sleep_until(maintenance) => {
-                    self.maintenance_due(&mut committed_snapshots, &mut vct_root_repairs, &repoll);
+                    self.maintenance_due(&mut committed_snapshots, &mut vct_root_repairs);
                 },
                 event = self.lifecycle.recv() => match event {
                     Some(event) => {
@@ -682,32 +650,24 @@ impl HeaderSyncReactor {
         );
     }
 
-    /// Handles every storage completion that is ready now, then reads both
+    /// Handles the storage completions that are ready now, then reads both
     /// watches, so a deadline checked afterward can't win over a ready result.
     ///
-    /// `FuturesUnordered` returns `Pending` and asks to be polled again after
-    /// futures yield, or while another thread is mid-wake on its ready queue.
-    /// The drain retries such a poll within its bound, one more than the
-    /// operation count. The VCT local operation, whose deadline is fatal, is
-    /// polled directly, so its result never waits on that queue. See
-    /// [`PortOperations`].
+    /// The drain is bounded by the operation count. The VCT local operation,
+    /// whose deadline is fatal, is polled directly, so its result never waits
+    /// on the shared ready queue. See [`PortOperations`].
     fn settle_ready_inputs(
         &mut self,
         committed_snapshots: &mut Option<
             watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
         >,
         vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
-        repoll: &Repoll,
     ) {
-        let mut cx = std::task::Context::from_waker(&repoll.waker);
-        for _ in 0..=self.pending_port_operations.len() {
-            repoll.flag.0.store(false, Ordering::Relaxed);
-            match self.pending_port_operations.poll_next_unpin(&mut cx) {
-                std::task::Poll::Ready(Some(completion)) => self.handle_port_completion(completion),
-                std::task::Poll::Ready(None) => break,
-                std::task::Poll::Pending if !repoll.flag.0.load(Ordering::Relaxed) => break,
-                std::task::Poll::Pending => {}
-            }
+        for _ in 0..self.pending_port_operations.len() {
+            let Some(Some(completion)) = self.pending_port_operations.next().now_or_never() else {
+                break;
+            };
+            self.handle_port_completion(completion);
         }
         // `changed` delivers a final unseen value before reporting channel closure.
         if let Some(snapshots) = committed_snapshots.as_mut() {
@@ -2724,9 +2684,8 @@ impl HeaderSyncReactor {
             watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
         >,
         vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
-        repoll: &Repoll,
     ) {
-        self.settle_ready_inputs(committed_snapshots, vct_root_repairs, repoll);
+        self.settle_ready_inputs(committed_snapshots, vct_root_repairs);
         caused!(self, ReactorCause::Maintenance, self.run_maintenance());
     }
 

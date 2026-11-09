@@ -887,64 +887,6 @@ async fn an_earlier_completion_cannot_fire_the_fatal_for_a_finished_vct_apply() 
     task.await.unwrap();
 }
 
-/// A port future that asks to be polled again on every poll and never ends.
-struct Yielding;
-
-impl std::future::Future for Yielding {
-    type Output = StorageOutcome;
-
-    /// Wakes itself and stays pending.
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<StorageOutcome> {
-        cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    }
-}
-
-/// Settling keeps polling past a queue that asks to be polled again, so two
-/// yielding futures ahead of a finished call can't hide it.
-#[tokio::test(start_paused = true)]
-async fn settling_finds_a_finished_call_behind_yielding_futures() {
-    let mut fixture = VctLocalFixture::new(
-        PendingVctLocalPort::pending(true),
-        HeaderTargetPhase::Applying,
-    );
-    // `FuturesUnordered` returns `Pending` once two futures yield in one poll.
-    fixture
-        .reactor
-        .pending_port_operations
-        .push(Box::pin(Yielding), false);
-    fixture
-        .reactor
-        .pending_port_operations
-        .push(Box::pin(Yielding), false);
-    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
-    assert!(matches!(
-        fixture
-            .reactor
-            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
-                peer: other,
-                session_id: 8,
-                target_tip_hash: fixture.context.target.hash,
-                scope: fixture.owner.header_authority(),
-            }),
-        StorageDispatch::Started(_)
-    ));
-    assert_eq!(fixture.reactor.pending_port_operations.len(), 3);
-
-    fixture
-        .reactor
-        .settle_ready_inputs(&mut None, &mut None, &Repoll::new());
-
-    assert_eq!(
-        fixture.reactor.pending_port_operations.len(),
-        2,
-        "the finished locator read is handled"
-    );
-}
-
 /// Due maintenance polls the VCT local operation directly, so a finished
 /// apply whose wake the shared ready queue hasn't shown can't fire the fatal.
 #[tokio::test(start_paused = true)]
@@ -956,9 +898,7 @@ async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
     poll_pending_operation(&mut fixture.reactor);
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
 
-    fixture
-        .reactor
-        .maintenance_due(&mut None, &mut None, &Repoll::new());
+    fixture.reactor.maintenance_due(&mut None, &mut None);
 
     let fatal = fixture.fatal_events.try_recv();
     assert!(
@@ -995,9 +935,7 @@ async fn due_maintenance_reads_a_ready_repair_status_first() {
         .expect("the test holds the receiver");
     time::advance(fixture.reactor.startup.request_timeout).await;
 
-    fixture
-        .reactor
-        .maintenance_due(&mut None, &mut repairs, &Repoll::new());
+    fixture.reactor.maintenance_due(&mut None, &mut repairs);
 
     assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
     assert!(

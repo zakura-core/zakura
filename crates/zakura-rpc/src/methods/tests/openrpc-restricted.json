@@ -73,6 +73,20 @@
       }
     },
     {
+      "name": "getnetworkparameters",
+      "summary": "Returns the running node's local activation settings for operator verification.",
+      "description": "Returns the running node's local activation settings for operator verification.",
+      "params": [],
+      "result": {
+        "name": "getnetworkparameters_result",
+        "summary": "An OpenRPC document.",
+        "description": "An OpenRPC document.",
+        "schema": {
+          "$ref": "#/components/schemas/OpenRPC%20Schema"
+        }
+      }
+    },
+    {
       "name": "getmempoolinfo",
       "summary": "Returns details on the active state of the TX memory pool.",
       "description": "Returns details on the active state of the TX memory pool.\n\nzcash reference: [`getmempoolinfo`](https://zcash.github.io/rpc/getmempoolinfo.html)",

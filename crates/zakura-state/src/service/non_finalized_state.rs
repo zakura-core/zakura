@@ -32,7 +32,6 @@ use crate::{
 mod address_transfers;
 mod backup;
 mod chain;
-mod created_utxos;
 mod proposal_results;
 mod shared_map;
 
@@ -47,7 +46,6 @@ pub(crate) use backup::write_semantically_verified_backup_block;
 #[cfg(feature = "internal-bench")]
 pub use chain::{benchmark_height_map, HeightMapBenchmarkSample};
 pub(crate) use chain::{Chain, SpendingTransactionId};
-pub(crate) use created_utxos::CreatedUtxos;
 use proposal_results::{NotPrepared, PreparedProposal, ProposalResults};
 pub(crate) use shared_map::SharedMap;
 
@@ -889,7 +887,7 @@ impl NonFinalizedState {
             Some(spent_utxos) => Ok(spent_utxos),
             None => check::utxo::transparent_spend(
                 &prepared,
-                &new_chain.created_utxos,
+                |outpoint| new_chain.created_ordered_utxo(outpoint),
                 &new_chain.spent_utxos,
                 finalized_state,
             )

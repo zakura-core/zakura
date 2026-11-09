@@ -1,6 +1,6 @@
 # Spec: `zakura-quic` transport
 
-Status: draft for review, 2026-11-05. Version 0.16.
+Status: draft for review, 2026-11-08. Version 0.17.
 This document is authoritative for the `zakura-quic` crate, its configuration,
 its wire behavior and its `quinn-proto` dependency policy.
 [Decision 0003](../decisions/zakura/0003-zakura-quic-transport.md) records the
@@ -33,7 +33,8 @@ come from the runtime a simulation controls; §17k explains it. Version 0.14
 adds the §16 row for byte-identical replay; §17l explains it. Version 0.15
 adds API-10, credit holds, and lets CTRL-6 sit below CTRL-5; §17m lists each
 change. Version 0.16 adds `SendStream::stopped` to API-5 and DRV-9; §17n
-explains it.
+explains it. Version 0.17 moves Ed25519 signing and the ID-6 equation from
+`ed25519-zebra` to `ring`; §17o explains it.
 
 ## 0. Conventions
 
@@ -84,9 +85,9 @@ Terms:
   `ed25519-dalek`, `nix` or `memoffset`. CI enforces the list with
   `cargo tree -e normal -i <pkg>` and fails on any hit.
 - **DEP-2.** `zakura-quic` MAY depend directly on these packages and no others:
-  `bytes`, `curve25519-dalek`, `ed25519-zebra`, `futures`, `hex`, `libc`,
-  `metrics`, `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`,
-  `socket2`, `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
+  `bytes`, `curve25519-dalek`, `futures`, `hex`, `libc`, `metrics`,
+  `quinn-proto`, `ring`, `rustls`, `rustls-pki-types`, `serde`, `socket2`,
+  `thiserror`, `tokio`, `tracing`, `zakura-rt` and `zeroize`.
   - `data-encoding` MAY be added only if step 3 of PLAN §6 finds a deployed base32 key.
   - Any other dependency needs a spec change.
 - **DEP-3.** `zakura-quic` MUST enable the `quinn-proto` feature `rustls-ring`
@@ -129,6 +130,8 @@ Terms:
   existing `id@addr` bootstrap entries keep parsing.
 - **ID-3.** `NodeSecretKey` holds a 32-byte Ed25519 seed. It MUST zeroize on
   drop. Its `Debug`, `Display` and `Serialize` output MUST NOT contain the seed.
+  Signing expands the seed into a `ring` key pair for each signature, and
+  `ring` does not zeroize that expanded key when it drops.
 - **ID-4.** The public key MUST derive from the seed per RFC 8032, so every
   existing key file yields the same `NodeId` as on the Iroh backend.
 - **ID-5.** The identity file stays `<network>.zakura-iroh-secret-key` under
@@ -138,7 +141,7 @@ Terms:
   1. refuse a key `A` or a signature `R` that fails any ID-1 point check or
      has a torsion component, using `curve25519-dalek`;
   2. refuse a non-canonical `S`;
-  3. verify the equation with `ed25519-zebra`.
+  3. verify the cofactorless equation with `ring`.
 
   With A and R in the prime-order subgroup, ZIP 215's cofactored equation and
   the cofactorless one agree. The accepted set is therefore a subset of
@@ -1376,3 +1379,21 @@ Changed:
   worker on the connection, up to 1,024 of them. The task's writes and
   accepts read its own copy of the code, so they take no lock.
 - **§16.** Adds the `stopped` test.
+
+## 17o. Changes in version 0.17
+
+`ring` already sits in the production graph for QUIC and TLS, and it signs
+and verifies Ed25519. `ed25519-zebra` was a second Ed25519 implementation
+used only here and for Sprout transactions, so `zakura-quic` drops it. Key
+derivation and signing follow RFC 8032 in both, so every key file yields the
+same `NodeId` and every signature is byte-identical.
+
+Changed:
+
+- **DEP-2.** Drops `ed25519-zebra`.
+- **ID-3.** Records that `ring` does not zeroize the expanded key it builds
+  for each signature. The stored seed still zeroizes on drop.
+- **ID-6.** Step 3 verifies the cofactorless equation with `ring`. After the
+  step 1 point checks, it accepts exactly the signatures the cofactored
+  equation accepted, so the accepted set is unchanged. A differential test
+  checks this against `ed25519-zebra`.

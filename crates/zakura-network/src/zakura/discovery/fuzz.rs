@@ -655,7 +655,7 @@ fn signed_bytes(record: &ZakuraNodeRecord) -> Vec<u8> {
         .body
         .encode_for_signature()
         .expect("a stored record encodes");
-    bytes.extend_from_slice(&record.signature.to_bytes());
+    bytes.extend_from_slice(&record.signature);
     bytes
 }
 

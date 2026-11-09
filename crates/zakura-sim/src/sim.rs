@@ -428,7 +428,11 @@ impl Sim {
             }
             let now = self.sched().now();
             let offers: Vec<Offer> = match phase {
-                Phase::Live => self.sources.iter().map(|s| offer(&**s, now)).collect(),
+                Phase::Live => self
+                    .sources
+                    .iter()
+                    .map(|s| offer(&**s, now, ready.is_empty()))
+                    .collect(),
                 Phase::Drain => Vec::new(),
             };
             // A source that drew while offering, here or in the idle check
@@ -624,7 +628,11 @@ impl Sim {
     /// instant took.
     fn nothing_enabled(&self, ready: &[(Identity, TaskId)]) -> bool {
         let now = self.sched().now();
-        let offers: Vec<Offer> = self.sources.iter().map(|s| offer(&**s, now)).collect();
+        let offers: Vec<Offer> = self
+            .sources
+            .iter()
+            .map(|s| offer(&**s, now, ready.is_empty()))
+            .collect();
         enabled_set(&EnabledInputs {
             phase: Phase::Live,
             now,
@@ -887,10 +895,14 @@ fn after_harness_failure(reports: Vec<PropertyReport>) -> Vec<PropertyReport> {
         .collect()
 }
 
-/// What `source` offers at `now`.
-fn offer(source: &dyn ActionSource, now: SimInstant) -> Offer {
+/// What `source` offers at `now`, with its quiet actions when `quiet`,
+/// which the run sets when no task is ready.
+fn offer(source: &dyn ActionSource, now: SimInstant, quiet: bool) -> Offer {
     let mut offer = Offer::default();
     source.enabled(now, &mut offer.actions);
+    if quiet {
+        source.quiet(now, &mut offer.actions);
+    }
     source.boundaries(now, &mut offer.boundaries);
     offer
 }

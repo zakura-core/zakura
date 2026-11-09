@@ -1,0 +1,45 @@
+diff --git a/crates/zakura-storage/src/header/adapter.rs b/crates/zakura-storage/src/header/adapter.rs
+index 0b178bb334..c706b83333 100644
+--- a/crates/zakura-storage/src/header/adapter.rs
++++ b/crates/zakura-storage/src/header/adapter.rs
+@@ -83,6 +83,13 @@ pub struct EnginePort {
+     /// sending and subscribing are scheduling points in a simulator run, so
+     /// they use a clone after the lock is released.
+     selected: StdMutex<Option<watch::Sender<Option<EngineSnapshot>>>>,
++    cached_locator: StdMutex<
++        Option<(
++            zakura_header_chain::HeaderLocator,
++            zakura_header_chain::HeaderGeneration,
++            zakura_header_chain::Frontier,
++        )>,
++    >,
+     /// Full state's committed blocks. A std lock, taken only under the engine
+     /// lock and never held across a scheduling point, so full state and the
+     /// engine change together.
+@@ -159,6 +166,7 @@ impl EnginePort {
+             engine: Mutex::new(engine),
+             leases: Mutex::new(Registry::default()),
+             selected: StdMutex::new(Some(selected)),
++            cached_locator: StdMutex::new(None),
+             full_state: StdMutex::new(VerifiedChain::new(fixture.genesis_block())),
+             views: StdMutex::new(views),
+             block_service: AtomicBool::new(false),
+@@ -923,7 +931,17 @@ impl EnginePort {
+         let (mut effects, mut locator_read, mut refusal) = (Effects::default(), None, None);
+         let reply = match request {
+             HeaderRequest::ContinuationLocator => HeaderReply::ContinuationLocator(
+-                self.locator().map(|(locator, generation, finalized)| {
++                self.locator().map(|read| {
++                    // Mutation: storage answers every locator read with the
++                    // first one's hashes, but with the generation and anchor
++                    // it reads now.
++                    let (generation, finalized) = (read.1, read.2);
++                    let (locator, _, _) = self
++                        .cached_locator
++                        .lock()
++                        .unwrap_or_else(std::sync::PoisonError::into_inner)
++                        .get_or_insert(read)
++                        .clone();
+                     locator_read = Some((generation, finalized));
+                     Some(locator)
+                 }),

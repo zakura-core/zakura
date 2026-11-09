@@ -1067,12 +1067,29 @@ impl ReactorTap {
         }
     }
 
+    /// Hands the round-life check the engine's durable state at the run's
+    /// setup.
+    pub(crate) fn engine_baseline(&self, state: zakura_header_chain::DurableState) {
+        if let Some(rounds) = self
+            .state
+            .round_life
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            rounds.baseline(state);
+        }
+    }
+
     /// Reads the node's storage facts that this step's drain logged, as
     /// `(seq, fact)` in order, so the next [`observe`](ActionSource::observe)
-    /// can pair calls with them.
+    /// can pair calls with them, with the engine `runs` the header storage
+    /// source logged with them, by the sequence number of the fact that
+    /// carried each.
     pub(crate) fn storage_facts<'f>(
         &mut self,
         facts: impl IntoIterator<Item = (u64, &'f StorageFact)>,
+        runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
     ) {
         let facts: Vec<_> = facts.into_iter().collect();
         let mut wake = self
@@ -1091,8 +1108,14 @@ impl ReactorTap {
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
-            rounds.storage(
-                facts.iter().map(|(_, fact)| *fact),
+            rounds.storage_runs(
+                facts.iter().map(|(seq, fact)| {
+                    let run = runs
+                        .iter()
+                        .find(|(carried, _)| carried == seq)
+                        .map(|(_, run)| run.as_ref());
+                    (*fact, run)
+                }),
                 self.state.engine_generation(),
             );
         }

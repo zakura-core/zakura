@@ -390,15 +390,22 @@ impl ActionSource for PolicySource {
             Some(tap) => {
                 // The storage source appends only its own port's facts, but
                 // a run may hold other services' storage too.
-                tap.storage_facts(log.entries()[before..].iter().filter_map(
-                    |entry| match &entry.obs {
-                        Observation::Storage {
-                            service, seq, fact, ..
-                        } if service == HEADER_SERVICE => Some((*seq, fact)),
-                        _ => None,
-                    },
-                ));
-                tap.engine_runs(&self.storage.take_runs());
+                let runs = self.storage.take_runs();
+                if let Some(state) = self.storage.take_baseline() {
+                    tap.engine_baseline(state);
+                }
+                tap.storage_facts(
+                    log.entries()[before..]
+                        .iter()
+                        .filter_map(|entry| match &entry.obs {
+                            Observation::Storage {
+                                service, seq, fact, ..
+                            } if service == HEADER_SERVICE => Some((*seq, fact)),
+                            _ => None,
+                        }),
+                    &runs,
+                );
+                tap.engine_runs(&runs);
                 tapped_effects = tap.take_effects();
                 tap.observe(log)
             }

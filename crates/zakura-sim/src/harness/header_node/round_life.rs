@@ -25,7 +25,16 @@
 //! - **Changes advance the generation.** Every acted `Reset` names a header
 //!   generation above the engine's before the step that reset it. The
 //!   engine changes only in steps, one action each, so its generation read
-//!   at the end of the previous step's observation is the one before.
+//!   at the end of the previous step's observation is the one before. Every
+//!   apply execution that inserted a header leaves the engine's header
+//!   generation above where its run found it, from the durable state the
+//!   port recorded around the run. One that inserts nothing, such as an
+//!   all-duplicate apply or an alarm-only commit, is exempt.
+//! - **Locator results.** Each locator storage read gives the engine's
+//!   selected path as its durable state then holds it: its tip is the
+//!   selected projection's tip, its anchor the finalized anchor, and every
+//!   entry a header of the selected projection. The read's generation
+//!   doesn't vouch for its hashes.
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
 //!   and the read storage answered it with has a generation and anchor no
@@ -39,8 +48,8 @@
 //!   subscription the subscriber never opened is another property's.
 //!
 //! The check applies once an adoption changes the generation while a
-//! current-started round is live, an ordinary round starts, or a reset is
-//! acted. A broken rule is a claim break, which the tap hands
+//! current-started round is live, an ordinary round starts, a reset is
+//! acted, or an apply execution inserts headers. A broken rule is a claim break, which the tap hands
 //! [`Claim::ResetInvalidatesWork`](super::claim::Claim) at its drain. A
 //! locator `Started` whose read storage never reported is missing evidence,
 //! which fails the run.
@@ -56,9 +65,11 @@ use zakura_network::zakura::{
     HeaderTargetPurpose, ZakuraPeerId,
 };
 
+use zakura_storage::header::controlled::EngineRun;
+
 use crate::{
     observe::{StorageFact, StorageResult},
-    storage::hash,
+    storage::{hash, point},
 };
 
 /// A header generation and the finality anchor's hash, as authority names
@@ -145,6 +156,9 @@ pub(super) struct RoundLife {
     accepted: HashMap<Subscription, block::Hash>,
     /// The engine's header generation before the current step.
     engine: u64,
+    /// The engine's durable state as of the last engine run, or the run's
+    /// setup before any.
+    durable: Option<zakura_header_chain::DurableState>,
     /// The breaks already found, so a slot kept across units breaks once.
     reported: BTreeSet<String>,
     breaks: Vec<String>,
@@ -169,6 +183,7 @@ impl RoundLife {
             started: HashSet::new(),
             accepted: HashMap::new(),
             engine,
+            durable: None,
             reported: BTreeSet::new(),
             breaks: Vec::new(),
             missing: None,
@@ -277,12 +292,30 @@ impl RoundLife {
     /// Notes the node's storage facts one step's drain logged, in order,
     /// then that the engine's header generation is `engine` once the step
     /// is done.
+    #[cfg(test)]
     pub(super) fn storage<'f>(
         &mut self,
         facts: impl IntoIterator<Item = &'f StorageFact>,
         engine: u64,
     ) {
-        for fact in facts {
+        self.storage_runs(facts.into_iter().map(|fact| (fact, None)), engine);
+    }
+
+    /// Notes the engine's durable state at the run's setup, which locator
+    /// reads before any engine run are judged against.
+    pub(super) fn baseline(&mut self, state: zakura_header_chain::DurableState) {
+        self.durable.get_or_insert(state);
+    }
+
+    /// [`storage`](Self::storage), with each fact's engine run, if it
+    /// carried one, judged right after it.
+    pub(super) fn storage_runs<'f>(
+        &mut self,
+        facts: impl IntoIterator<Item = (&'f StorageFact, Option<&'f EngineRun>)>,
+        engine: u64,
+    ) {
+        for (fact, run) in facts {
+            self.locator_result(fact);
             match fact {
                 StorageFact::Submitted {
                     id,
@@ -325,8 +358,75 @@ impl RoundLife {
                 }
                 _ => {}
             }
+            if let Some(run) = run {
+                self.run(run);
+            }
         }
         self.engine = engine;
+    }
+
+    /// Judges an apply's engine `run`, which must advance the header
+    /// generation if it inserted a header, then keeps its durable state.
+    fn run(&mut self, run: &EngineRun) {
+        if let Some((id, _)) = &run.apply {
+            let inserted = run
+                .after
+                .graph
+                .nodes
+                .keys()
+                .filter(|hash| !run.before.graph.nodes.contains_key(hash))
+                .count();
+            if inserted > 0 {
+                self.applies();
+                let before = run.before.metadata.header_generation.get();
+                let after = run.after.metadata.header_generation.get();
+                if after <= before {
+                    self.breaks.push(format!(
+                        "ResetInvalidatesWork: apply operation {} inserted {inserted} headers \
+                         and left the header generation at {after}, from {before}",
+                        id.0
+                    ));
+                }
+            }
+        }
+        self.durable = Some(run.after.clone());
+    }
+
+    /// Judges a locator read in `fact` against the durable state's selected
+    /// path.
+    fn locator_result(&mut self, fact: &StorageFact) {
+        let (
+            StorageFact::Completed {
+                id,
+                result:
+                    StorageResult::Locator {
+                        tip,
+                        hashes,
+                        finalized,
+                        ..
+                    },
+                ..
+            },
+            Some(durable),
+        ) = (fact, &self.durable)
+        else {
+            return;
+        };
+        let projection = &durable.selected_projection;
+        let selected: HashSet<String> = projection.iter().map(|entry| hash(entry.hash)).collect();
+        let expected_tip = projection.last().map(|entry| point(*entry));
+        let anchor = point(durable.graph.finalized_frontier);
+        let off_path: Vec<&String> = hashes
+            .iter()
+            .filter(|entry| !selected.contains(*entry))
+            .collect();
+        if expected_tip.as_ref() != Some(tip) || *finalized != anchor || !off_path.is_empty() {
+            self.breaks.push(format!(
+                "ResetInvalidatesWork: locator read {id} gave tip {tip:?} at anchor {finalized:?} \
+                 with {off_path:?} off the selected path, but the engine held tip \
+                 {expected_tip:?} at anchor {anchor:?}"
+            ));
+        }
     }
 
     /// The breaks found since the last call, or the first missing evidence.

@@ -1,0 +1,12 @@
+# The subscription primitive drains the cursors the reactor accepted but
+# keeps its previous accepted cursor, so what it stored isn't what it was
+# asked to accept. A run that ends before the next update sees it only at
+# the acceptance. The reactor, the subscriber, the subscription primitive
+# and the queue decide how the witness's rounds start, stage and are
+# credited, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-network/src/zakura/regulation/subscription"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-multi-page-sync.plan"

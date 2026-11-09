@@ -6,19 +6,24 @@
 //! hold on frames the node must not punish.
 #![cfg(zakura_sim)]
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    future::Future,
+    pin::pin,
+    task::{Context, Poll, Waker},
+};
 
 use zakura_network::zakura::{
     wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::{
     harness::{
-        discovery_service::{act_scenario, DiscoveryWire, WireScenario, FAMILY},
+        discovery_service::{act_scenario, DiscoveryWire, NodeHandle, WireScenario, FAMILY},
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
-    peer::discovery::{DiscoveryAct, DiscoveryRow, DiscoveryRule},
+    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule},
     table::GeneratedId,
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
@@ -146,18 +151,36 @@ fn reached(act: DiscoveryAct) -> String {
 /// Runs `scenario` under the default Plan, and returns the report even of
 /// a run that ended in a harness failure.
 fn run(scenario: &WireScenario) -> RunReport {
+    run_node(scenario).0
+}
+
+/// Runs `scenario` as [`run`] does, and also returns the node's handle.
+fn run_node(scenario: &WireScenario) -> (RunReport, NodeHandle) {
     let node = DiscoveryWire::prepare(scenario);
     let ran = run_prepared::<DiscoveryWire>(
         scenario,
-        node,
+        node.clone(),
         Plan::from_fuzz(&[]),
         &mut MemorySink::default(),
         None,
     );
-    match ran {
+    let report = match ran {
         Ok(report) => report,
         Err(HarnessError::Run { report, .. }) => *report,
         Err(error) => panic!("{error}"),
+    };
+    (report, node)
+}
+
+/// Whether the node's book holds a record for the author of the peer's
+/// relayed record, read once the run has ended. Every task has stopped by
+/// then, so the book's lock is free and the read finishes in one poll.
+fn book_holds_relayed(node: &NodeHandle) -> bool {
+    let handle = node.get().expect("the run built the node");
+    let read = pin!(handle.record_for(relayed_node(0)));
+    match read.poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(record) => record.is_some(),
+        Poll::Pending => panic!("the book's lock is free after the run"),
     }
 }
 
@@ -384,10 +407,13 @@ fn services_acts_apply_in_their_witnesses() {
 /// last request finding the bucket empty. Each act's frames are
 /// `Conformant`, the node judges them, and it records no fault close.
 /// `conformant-never-closes` applies and holds, and so does the run's
-/// `cadence-never-closes`.
+/// `cadence-never-closes`. Each expired record expired past the node's
+/// clock skew tolerance, so the node's expiry check refuses it. The node
+/// drops the expired relayed record: its book doesn't hold it.
 ///
 /// This fails if the node punishes a frame that local policy, not the
-/// specification, refuses, or a request that finds the bucket empty.
+/// specification, refuses, or a request that finds the bucket empty, or if
+/// it stores an expired relayed record.
 #[test]
 fn conformant_controls_hold_conformant_never_closes() {
     for control in [
@@ -398,7 +424,13 @@ fn conformant_controls_hold_conformant_never_closes() {
         },
     ] {
         assert_eq!(control.label(), Label::Conformant, "{control:?}");
-        let report = run(&act_scenario(control));
+        let (report, node) = run_node(&act_scenario(control));
+        if control == DiscoveryAct::ExpiredRelay {
+            assert!(
+                !book_holds_relayed(&node),
+                "the node stored an expired record"
+            );
+        }
         let ids = match control {
             DiscoveryAct::RequestRun { .. } => vec![reached(control)],
             _ => Vec::new(),

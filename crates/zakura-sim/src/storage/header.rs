@@ -103,8 +103,8 @@ pub struct HeaderStorage {
     label: String,
     /// What each failed prepare and apply blamed.
     attributions: FaultAttributions,
-    /// Each apply's and reset's engine run since the last
-    /// [`take_runs`](Self::take_runs), with the fact that carried it.
+    /// Each engine run the last observation logged, with the fact that
+    /// carried it, until [`take_runs`](Self::take_runs) takes them.
     runs: Vec<(u64, Arc<EngineRun>)>,
 }
 
@@ -717,6 +717,9 @@ impl ActionSource for HeaderStorage {
             }
         };
         let facts = self.port.take_facts();
+        // Only this observation's runs are kept, so a run no tap takes is
+        // dropped at the next one.
+        self.runs.clear();
         let actual = self.port.owner_state();
         // A model failure is returned only once the facts are logged and the
         // checkpoint names this step, so the run's evidence check passes and

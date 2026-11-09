@@ -14,9 +14,17 @@ keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["cryptography::cryptocurrencies"]
 
+[features]
+default = []
+# Post-quantum transparent output validation, off unless a chain configures an
+# activation height for it.
+pq = ["dep:zcash_transparent", "dep:zcash_protocol", "zcash_transparent/pq"]
+
 [dependencies]
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
+zcash_transparent = { workspace = true, optional = true }
+zcash_protocol = { workspace = true, optional = true }
 zakura-chain = { path = "../zakura-chain", version = "14.0.0" }
 
 thiserror = { workspace = true }

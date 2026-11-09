@@ -15,7 +15,8 @@ use std::{ops::Deref, sync::Arc};
 use thiserror::Error;
 
 use zakura_chain::{
-    parameters::NetworkUpgrade,
+    block::Height,
+    parameters::{Network, NetworkUpgrade},
     transaction::{HashType, SigHasher},
     transparent,
 };
@@ -25,6 +26,19 @@ use zcash_script::{
     script::{self, Evaluable as _},
     Opcode,
 };
+
+/// Whether the chain applies the post-quantum transparent output rules at this height.
+///
+/// This reads the network's configuration and the block height being validated, never the
+/// transaction's own bytes, and it answers for every transaction in the block alike: once
+/// the rules apply, every input is verified under them. A binary built without the `pq`
+/// feature always says no, so those outputs keep whatever the legacy rules make of them.
+pub fn pq_outputs_active(network: &Network, height: Height) -> bool {
+    cfg!(feature = "pq")
+        && network
+            .pq_activation_height()
+            .is_some_and(|activation| height >= activation)
+}
 
 /// Errors from transaction preparation and script verification.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -46,6 +60,10 @@ pub enum Error {
     },
     /// transaction is invalid according to zakura_chain (not a zcash_script error)
     TxInvalid(#[from] zakura_chain::Error),
+    /// The post-quantum rules rejected this input, or the output it spends is one they
+    /// define no way to spend.
+    #[cfg(feature = "pq")]
+    Pq(#[from] zcash_transparent::pq::output::Error),
 }
 
 impl fmt::Display for Error {
@@ -60,6 +78,8 @@ impl fmt::Display for Error {
                 format!("{component:?} script failed: {error}")
             }
             Error::TxInvalid(e) => format!("tx is invalid: {e}"),
+            #[cfg(feature = "pq")]
+            Error::Pq(e) => format!("post-quantum input failed: {e}"),
         })
     }
 }
@@ -69,7 +89,12 @@ impl Error {
     ///
     /// Returns false for transaction preparation failures that prevent verification.
     pub fn is_script_failure(&self) -> bool {
-        matches!(self, Error::ScriptInvalid | Error::Interpreter { .. })
+        match self {
+            Error::ScriptInvalid | Error::Interpreter { .. } => true,
+            #[cfg(feature = "pq")]
+            Error::Pq(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -101,6 +126,15 @@ pub struct CachedFfiTransaction<T = Arc<zakura_chain::transaction::Transaction>>
 
     /// The sighasher context to use to compute sighashes.
     sighasher: SigHasher,
+
+    /// The network whose post-quantum signing context a spend must have been signed under,
+    /// or `None` when those rules do not apply to this transaction.
+    ///
+    /// This is decided from the network's configuration and the validation height, never
+    /// from the transaction's own bytes, and the network matters: a post-quantum signature
+    /// is made for one network and will not verify on another.
+    #[cfg(feature = "pq")]
+    pq_outputs: Option<zcash_protocol::consensus::NetworkType>,
 }
 
 impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransaction<T> {
@@ -117,7 +151,52 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
             transaction,
             all_previous_outputs,
             sighasher,
+            #[cfg(feature = "pq")]
+            pq_outputs: None,
         })
+    }
+
+    /// Prepares input verification under the rules in force at this network and height.
+    ///
+    /// The caller must resolve every input's previous output from trusted state, in input
+    /// order: those outputs decide which rules each input is verified under, and they feed
+    /// the transaction digest as well.
+    ///
+    /// Use this wherever the validation height is known. [`Self::new`] keeps the legacy
+    /// rules whatever the chain is configured to do, which is right only for callers that
+    /// have no height to judge by.
+    pub fn new_for_network(
+        transaction: T,
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+        network: &Network,
+        height: Height,
+    ) -> Result<Self, Error> {
+        let cached = Self::new(
+            transaction,
+            all_previous_outputs,
+            NetworkUpgrade::current(network, height),
+        )?;
+        #[cfg(feature = "pq")]
+        let cached = Self {
+            pq_outputs: pq_outputs_active(network, height)
+                .then(|| zcash_protocol::consensus::Parameters::network_type(network)),
+            ..cached
+        };
+        Ok(cached)
+    }
+
+    /// The script rule that refuses to run a post-quantum output under the legacy
+    /// interpreter, set for every input of every transaction once those rules apply.
+    ///
+    /// Setting it for some inputs and not others would make the same output spendable or
+    /// not depending on which verifier looked at it, so it is derived here from the
+    /// transaction's rules rather than from anything per-input.
+    fn pq_flags(&self) -> Flags {
+        #[cfg(feature = "pq")]
+        if self.pq_outputs.is_some() {
+            return Flags::PqOutputs;
+        }
+        Flags::empty()
     }
 
     /// Returns the transparent inputs for this transaction.
@@ -149,6 +228,16 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
     ///
     /// [`GetP2SHSigOpCount()`]: https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L840-L852
     pub fn p2sh_sigops(&self) -> u32 {
+        #[cfg(feature = "pq")]
+        if self.pq_outputs.is_some() && !self.transaction.is_coinbase() {
+            return self
+                .transaction
+                .inputs()
+                .iter()
+                .zip(self.all_previous_outputs.iter())
+                .map(|(input, output)| pq_input_sigop_count(input, output))
+                .sum();
+        }
         p2sh_sigop_count(&self.transaction, &self.all_previous_outputs)
     }
 
@@ -168,7 +257,7 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
         } = previous_output;
         let script_pub_key: &[u8] = lock_script.as_raw_bytes();
 
-        let flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY;
+        let flags = Flags::P2SH | Flags::CHECKLOCKTIMEVERIFY | self.pq_flags();
 
         let lock_time = self.transaction.raw_lock_time();
         let is_final = self.transaction.inputs()[input_index].sequence() == u32::MAX;
@@ -227,11 +316,61 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
             lock_time: i64::from(lock_time),
             is_final,
         };
+        // Which rules an input is verified under is decided by the output it spends, so a
+        // transaction can spend a legacy output and a post-quantum one side by side and
+        // each is judged by its own rules.
+        //
+        // Only a v5 or later transaction can spend a post-quantum output: a post-quantum
+        // signature is made over the v5 digest, which commits to the output being spent and
+        // so to the commitment in it. The v4 digest does not, and an earlier transaction
+        // spending such an output is instead refused by the namespace rule in `flags`.
+        #[cfg(feature = "pq")]
+        if let Some(network) = self.pq_outputs.filter(|_| self.transaction.version() >= 5) {
+            let lock_code = script::Code(script_pub_key.to_vec());
+            match zcash_transparent::pq::output::parse_output(&lock_code) {
+                Ok(Some(output)) => {
+                    return match output.verify_spend(network, signature_script, &checker) {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Err(Error::ScriptInvalid),
+                        Err(error) => Err(Error::Pq(error)),
+                    };
+                }
+                // Not a post-quantum output, so the legacy rules below apply to it as before.
+                Ok(None) => {}
+                // An output inside the namespace that nothing defines a way to spend. The
+                // namespace rule in `flags` would refuse it too; failing here says why.
+                Err(error) => return Err(Error::Pq(error)),
+            }
+        }
+
         match script.eval(flags, &checker) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Error::ScriptInvalid),
             Err((component, error)) => Err(Error::Interpreter { component, error }),
         }
+    }
+}
+
+/// Counts the signature operations in the script a post-quantum output commits to, rather
+/// than in the input that reveals it.
+///
+/// The input's signature pushes are far larger than the legacy counter's push bound, where
+/// that counter stops and would report almost none of the checks the script performs. This
+/// is accounting only: the input is still authenticated and executed independently.
+#[cfg(feature = "pq")]
+fn pq_input_sigop_count(input: &transparent::Input, output: &transparent::Output) -> u32 {
+    let legacy_count = p2sh_input_sigop_count(input, output);
+    let transparent::Input::PrevOut { unlock_script, .. } = input else {
+        return legacy_count;
+    };
+    let lock_code = script::Code(output.lock_script.as_raw_bytes().to_vec());
+    match zcash_transparent::pq::output::parse_output(&lock_code) {
+        Ok(Some(pq_output)) => pq_output
+            .authenticate_spend(unlock_script.as_raw_bytes())
+            .map_or(legacy_count, |spend| spend.sig_op_count(true)),
+        // Either a legacy output, or one no spend can satisfy; verification rejects the
+        // latter, and counting it as the legacy rules do charges nothing extra for it.
+        _ => legacy_count,
     }
 }
 

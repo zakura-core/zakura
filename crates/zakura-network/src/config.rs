@@ -1091,6 +1091,10 @@ where
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DTestnetParameters {
+    /// Height at which this chain starts applying the post-quantum transparent output
+    /// rules. Regtest only, and only on a node built with the `pq` feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pq_activation_height: Option<u32>,
     network_name: Option<String>,
     network_magic: Option<[u8; 4]>,
     slow_start_interval: Option<u32>,
@@ -1298,6 +1302,9 @@ impl Default for DConfig {
 impl From<Arc<testnet::Parameters>> for DTestnetParameters {
     fn from(params: Arc<testnet::Parameters>) -> Self {
         Self {
+            pq_activation_height: Network::new_configured_testnet((*params).clone())
+                .pq_activation_height()
+                .map(|height| height.0),
             network_name: Some(params.network_name().to_string()),
             network_magic: Some(params.network_magic().0),
             slow_start_interval: Some(params.slow_start_interval().0),
@@ -1707,6 +1714,7 @@ where
     D: Deserializer<'de>,
 {
     let DTestnetParameters {
+        pq_activation_height,
         network_name,
         network_magic,
         slow_start_interval,
@@ -1729,6 +1737,12 @@ where
         params: _,
         regtest: _,
     } = params;
+
+    if pq_activation_height.is_some() {
+        return Err(de::Error::custom(
+            "pq_activation_height is only supported on Regtest",
+        ));
+    }
 
     let mut params_builder = testnet::Parameters::build();
 
@@ -1865,6 +1879,7 @@ where
     D: Deserializer<'de>,
 {
     let DTestnetParameters {
+        pq_activation_height,
         activation_heights,
         inherit_activation_heights,
         pre_nu6_funding_streams,
@@ -1877,6 +1892,12 @@ where
         initial_nsm_value_balance,
         ..
     } = params;
+
+    if pq_activation_height.is_some() && !cfg!(feature = "pq") {
+        return Err(de::Error::custom(
+            "pq_activation_height requires a node built with the pq feature",
+        ));
+    }
 
     if inherit_activation_heights.is_some() {
         return Err(de::Error::custom(
@@ -1909,6 +1930,7 @@ where
         reason = "test-only fields depend on feature unification"
     )]
     let params = RegtestParameters {
+        pq_activation_height: pq_activation_height.map(zakura_chain::block::Height),
         activation_heights: activation_heights.unwrap_or_default(),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,

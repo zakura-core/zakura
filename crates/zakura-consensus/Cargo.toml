@@ -20,6 +20,7 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
 [features]
 default = []
+pq = ["zakura-script/pq", "zcash_transparent/pq"]
 
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin", "zakura-state/progress-bar"]

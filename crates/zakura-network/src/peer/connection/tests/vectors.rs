@@ -421,7 +421,10 @@ async fn cancelled_mempool_reply_does_not_complete_find_blocks() {
             .unwrap()
             .unwrap()
             .unwrap(),
-        Response::BlockHashes(hashes),
+        Response::BlockHashes {
+            hashes: hashes,
+            feedback: None,
+        },
     );
 
     assert!(error_slot.try_get_error().is_none());
@@ -2204,7 +2207,10 @@ async fn block_advert_while_awaiting_response() {
             async {
                 assert_eq!(
                     request_rx.await.unwrap().unwrap(),
-                    Response::BlockHashes(vec![next_hash])
+                    Response::BlockHashes {
+                        hashes: vec![next_hash],
+                        feedback: None,
+                    }
                 );
             }
         );
@@ -2300,7 +2306,10 @@ async fn getblocks_response_precedes_ready_block_advert() {
                         stop: None,
                     })
                     .await
-                    .respond(Response::BlockHashes(vec![response_hash]));
+                    .respond(Response::BlockHashes {
+                        hashes: vec![response_hash],
+                        feedback: None,
+                    });
             },
             async {
                 assert_eq!(
@@ -2550,7 +2559,10 @@ async fn single_block_inv_during_getblocks_is_also_gossiped() {
         // The reply is delivered before the advert reaches the inbound service.
         assert_eq!(
             request_rx.await.unwrap().unwrap(),
-            Response::BlockHashes(vec![announced_hash])
+            Response::BlockHashes {
+                hashes: vec![announced_hash],
+                feedback: None,
+            }
         );
         inbound_service
             .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
@@ -2587,7 +2599,10 @@ async fn single_block_inv_during_getblocks_survives_inbound_overload() {
 
         assert_eq!(
             request_rx.await.unwrap().unwrap(),
-            Response::BlockHashes(vec![announced_hash])
+            Response::BlockHashes {
+                hashes: vec![announced_hash],
+                feedback: None,
+            }
         );
         inbound_service
             .expect_request(Request::AdvertiseBlock(announced_hash.into(), None))
@@ -2629,7 +2644,10 @@ async fn multi_block_inv_during_getblocks_is_only_the_reply() {
 
         assert_eq!(
             request_rx.await.unwrap().unwrap(),
-            Response::BlockHashes(hashes)
+            Response::BlockHashes {
+                hashes: hashes,
+                feedback: None,
+            }
         );
         inbound_service.expect_no_requests().await;
         assert!(shared_error_slot.try_get_error().is_none());
@@ -2676,7 +2694,10 @@ async fn single_block_inv_during_getblocks_survives_inbound_error() {
             async {
                 assert_eq!(
                     request_rx.await.unwrap().unwrap(),
-                    Response::BlockHashes(vec![announced_hash])
+                    Response::BlockHashes {
+                        hashes: vec![announced_hash],
+                        feedback: None,
+                    }
                 );
             }
         );
@@ -2692,7 +2713,10 @@ async fn single_block_inv_during_getblocks_survives_inbound_error() {
             .unwrap();
         assert_eq!(
             request_rx.await.unwrap().unwrap(),
-            Response::BlockHashes(hashes)
+            Response::BlockHashes {
+                hashes: hashes,
+                feedback: None,
+            }
         );
         assert!(shared_error_slot.try_get_error().is_none());
 
@@ -2795,7 +2819,10 @@ async fn transaction_reply_precedes_unsolicited_transaction_inbound_error() {
                 .unwrap();
             assert_eq!(
                 request_rx.await.unwrap().unwrap(),
-                Response::BlockHashes(hashes)
+                Response::BlockHashes {
+                    hashes: hashes,
+                    feedback: None,
+                }
             );
             assert!(shared_error_slot.try_get_error().is_none());
 

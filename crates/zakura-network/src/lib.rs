@@ -207,3 +207,5 @@ pub mod types {
     #[cfg(any(test, feature = "proptest-impl"))]
     pub use crate::protocol::external::InventoryHash;
 }
+
+pub use peer_set::DiscoveryFeedback;

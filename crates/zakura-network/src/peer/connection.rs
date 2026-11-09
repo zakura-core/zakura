@@ -430,7 +430,10 @@ impl Handler {
                         .iter()
                         .all(|item| matches!(item, InventoryHash::Block(_))) =>
             {
-                let response = Response::BlockHashes(block_hashes(&items[..]).collect());
+                let response = Response::BlockHashes {
+                    hashes: block_hashes(&items[..]).collect(),
+                    feedback: None,
+                };
                 if let [InventoryHash::Block(_)] = items[..] {
                     ignored_msg = Some(Message::Inv(items));
                 }
@@ -1922,7 +1925,7 @@ where
                     }
                 }
             }
-            Response::BlockHashes(hashes) => {
+            Response::BlockHashes { hashes, .. } => {
                 if let Err(e) = self
                     .peer_tx
                     .send(Message::Inv(hashes.into_iter().map(Into::into).collect()))

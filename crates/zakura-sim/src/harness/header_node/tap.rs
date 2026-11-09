@@ -778,6 +778,7 @@ impl ReactorTap {
             let cooldowns = cooldowns.clone();
             move || cooldowns.freeze()
         });
+        let wake_sessions = sessions.clone();
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -801,7 +802,7 @@ impl ReactorTap {
                 teardown_claims: Mutex::default(),
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
-                wake: Mutex::new(WakeCheck::new(WakeEvidence::default())),
+                wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
             }))
         });
         let state = observer.0.clone();
@@ -873,7 +874,8 @@ impl ReactorTap {
             .state
             .wake
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
+            .unwrap_or_else(PoisonError::into_inner) =
+            WakeCheck::new(wake, self.state.sessions.clone());
     }
 
     /// The reactor's adoption facts, which the tap fills as they happen.

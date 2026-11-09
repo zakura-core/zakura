@@ -338,9 +338,9 @@ mod tests {
         assert_eq!(
             details,
             [
-                "TeardownReserved: the stopped reactor is gone with 1 headers still reserved",
-                "TeardownOwned: the stopped reactor is gone with 2 headers still owned",
-                "TeardownLocatorPermits: the stopped reactor is gone with 2 of 4 locator \
+                "TeardownReserved: the reactor is gone with 1 headers still reserved",
+                "TeardownOwned: the reactor is gone with 2 headers still owned",
+                "TeardownLocatorPermits: the reactor is gone with 2 of 4 locator \
                  permits free, and storage holds 1",
             ]
         );

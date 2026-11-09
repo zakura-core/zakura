@@ -1,6 +1,6 @@
 //! Mining config
 
-use std::{collections::HashMap, ops::Deref, sync::LazyLock};
+use std::{collections::HashMap, num::NonZeroUsize, ops::Deref, sync::LazyLock};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -57,12 +57,17 @@ pub struct Config {
     /// Mine blocks using Zakura's internal miner, without an external mining pool or equihash solver.
     ///
     /// Requires a `zakurad` built with the experimental `internal-miner` feature, which solves
-    /// Equihash with one low-priority thread. Miners that share a `miner_address` should set
+    /// Equihash with low-priority threads. Miners that share a `miner_address` should set
     /// distinct `extra_coinbase_data`, so they do not search identical work.
     ///
     /// The internal miner is off by default.
     #[serde(default)]
     pub internal_miner: bool,
+
+    /// Number of low-priority internal mining solvers to start when mining is enabled.
+    /// Defaults to one and must be positive. The node caps the count at the available
+    /// CPUs and 256 distinct nonce ranges. Each solver uses about 144 MB of memory.
+    pub internal_miner_threads: NonZeroUsize,
 
     /// Advertise prepared mined block hashes after expected-work validation and state admission,
     /// but before contextual commit completes.
@@ -104,6 +109,7 @@ impl Default for Config {
             extra_coinbase_data: None,
             miner_memo: None,
             internal_miner: false,
+            internal_miner_threads: NonZeroUsize::MIN,
             optimistic_block_inventory: true,
         }
     }
@@ -246,5 +252,25 @@ mod tests {
         }
         assert!(toml::from_str::<Config>("miner_address = 'invalid'").is_err());
         assert!(toml::from_str::<Config>("miner_address = 42").is_err());
+    }
+
+    #[test]
+    fn internal_miner_thread_configuration_is_positive_and_defaults_to_one() {
+        let defaults: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.internal_miner_threads.get(), 1);
+        let configured: Config = serde_json::from_str(r#"{"internal_miner_threads":6}"#).unwrap();
+        assert_eq!(configured.internal_miner_threads.get(), 6);
+        assert_eq!(
+            toml::from_str::<Config>("internal_miner_threads = 6")
+                .unwrap()
+                .internal_miner_threads
+                .get(),
+            6
+        );
+        assert!(toml::from_str::<Config>("internal_miner_threads = 0").is_err());
+        let restored: Config =
+            serde_json::from_str(&serde_json::to_string(&configured).unwrap()).unwrap();
+        assert_eq!(restored, configured);
+        assert!(serde_json::from_str::<Config>(r#"{"internal_miner_threads":0}"#).is_err());
     }
 }

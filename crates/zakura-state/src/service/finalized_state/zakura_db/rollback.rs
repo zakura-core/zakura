@@ -1,7 +1,7 @@
 //! Offline rollback support for the finalized state database.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
 };
@@ -1068,7 +1068,7 @@ fn prune_tree_indexes(
 ) {
     let retained_shielded_roots = retained_shielded_roots(db, target_height);
 
-    let sapling_trees: BTreeMap<_, _> = db
+    let sapling_trees: Vec<_> = db
         .sapling_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
             std::ops::Bound::Unbounded,
@@ -1082,7 +1082,7 @@ fn prune_tree_indexes(
         }
     }
 
-    let orchard_trees: BTreeMap<_, _> = db
+    let orchard_trees: Vec<_> = db
         .orchard_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
             std::ops::Bound::Unbounded,
@@ -1096,7 +1096,7 @@ fn prune_tree_indexes(
         }
     }
 
-    let ironwood_trees: BTreeMap<_, _> = db
+    let ironwood_trees: Vec<_> = db
         .ironwood_tree_by_height_range((
             std::ops::Bound::Excluded(target_height),
             std::ops::Bound::Unbounded,

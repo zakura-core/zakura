@@ -32,6 +32,7 @@ use zakura_chain::{
     work::difficulty::PartialCumulativeWork,
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     request::Treestate, service::check, ContextuallyVerifiedBlock, HashOrHeight, OutputLocation,
     TransactionLocation, ValidateContextError,
@@ -936,10 +937,11 @@ impl Chain {
         &self,
         range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
     ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<sapling_crypto::Node>> {
-        self.sapling_subtrees
-            .range(range)
-            .map(|(index, subtree)| (*index, *subtree))
-            .collect()
+        collect_ordered_map(
+            self.sapling_subtrees
+                .range(range)
+                .map(|(index, subtree)| (*index, *subtree)),
+        )
     }
 
     /// Returns the Sapling [`NoteCommitmentSubtree`] if it was completed at the tip height.
@@ -1135,10 +1137,11 @@ impl Chain {
         &self,
         range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
     ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<orchard::tree::Node>> {
-        self.orchard_subtrees
-            .range(range)
-            .map(|(index, subtree)| (*index, *subtree))
-            .collect()
+        collect_ordered_map(
+            self.orchard_subtrees
+                .range(range)
+                .map(|(index, subtree)| (*index, *subtree)),
+        )
     }
 
     /// Returns the Orchard [`NoteCommitmentSubtree`] if it was completed at the tip height.
@@ -1206,10 +1209,11 @@ impl Chain {
         &self,
         range: impl std::ops::RangeBounds<NoteCommitmentSubtreeIndex>,
     ) -> BTreeMap<NoteCommitmentSubtreeIndex, NoteCommitmentSubtreeData<ironwood::tree::Node>> {
-        self.ironwood_subtrees
-            .range(range)
-            .map(|(index, subtree)| (*index, *subtree))
-            .collect()
+        collect_ordered_map(
+            self.ironwood_subtrees
+                .range(range)
+                .map(|(index, subtree)| (*index, *subtree)),
+        )
     }
 
     /// Returns the Ironwood [`NoteCommitmentSubtree`] if it was completed at the tip height.
@@ -1750,11 +1754,11 @@ impl Chain {
         BTreeMap<OutputLocation, transparent::Output>,
         BTreeSet<OutputLocation>,
     ) {
-        let created_utxos = self
-            .partial_transparent_indexes(addresses)
-            .flat_map(|transfers| transfers.created_utxos())
-            .map(|(out_loc, output)| (*out_loc, output.clone()))
-            .collect();
+        let created_utxos = collect_ordered_map(
+            self.partial_transparent_indexes(addresses)
+                .flat_map(|transfers| transfers.created_utxos())
+                .map(|(out_loc, output)| (*out_loc, output.clone())),
+        );
 
         let spent_utxos = self
             .partial_transparent_indexes(addresses)
@@ -1789,11 +1793,12 @@ impl Chain {
         addresses: &HashSet<transparent::Address>,
         query_height_range: RangeInclusive<Height>,
     ) -> BTreeMap<TransactionLocation, transaction::Hash> {
-        self.partial_transparent_indexes(addresses)
-            .flat_map(|transfers| {
-                transfers.tx_ids(&self.tx_loc_by_hash, query_height_range.clone())
-            })
-            .collect()
+        collect_ordered_map(
+            self.partial_transparent_indexes(addresses)
+                .flat_map(|transfers| {
+                    transfers.tx_ids(&self.tx_loc_by_hash, query_height_range.clone())
+                }),
+        )
     }
 
     /// Update the chain tip with the `contextually_valid` block,

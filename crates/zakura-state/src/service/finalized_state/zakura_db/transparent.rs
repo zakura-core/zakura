@@ -26,6 +26,7 @@ use zakura_chain::{
     transparent::{self, Input},
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     error::TransparentIndexesUnavailable,
     request::FinalizedBlock,
@@ -290,17 +291,16 @@ impl ZakuraDb {
         let output_locations = self.address_utxo_locations(address_location);
 
         // Ignore any outputs spent by blocks committed during this query
-        Ok(output_locations
-            .iter()
-            .filter_map(|&addr_out_loc| {
+        Ok(collect_ordered_map(output_locations.iter().filter_map(
+            |&addr_out_loc| {
                 Some((
                     addr_out_loc.unspent_output_location(),
                     self.utxo_by_location(addr_out_loc.unspent_output_location())?
                         .utxo
                         .output,
                 ))
-            })
-            .collect())
+            },
+        )))
     }
 
     /// Returns the unspent transparent output locations for a [`transparent::Address`],
@@ -389,16 +389,15 @@ impl ZakuraDb {
         let transaction_locations =
             self.address_transaction_locations(address_location, query_height_range);
 
-        Ok(transaction_locations
-            .iter()
-            .map(|&tx_loc| {
+        Ok(collect_ordered_map(transaction_locations.iter().map(
+            |&tx_loc| {
                 (
                     tx_loc.transaction_location(),
                     self.tx_id_by_location(tx_loc.transaction_location())
                         .expect("transactions whose locations are stored must exist"),
                 )
-            })
-            .collect())
+            },
+        )))
     }
 
     /// Returns the locations of any transactions that sent or received from a [`transparent::Address`],

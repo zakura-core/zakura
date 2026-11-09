@@ -23,6 +23,7 @@ use zakura_chain::{
     transaction, transparent,
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     service::{
         finalized_state::ZakuraDb, non_finalized_state::Chain, read::FINALIZED_STATE_QUERY_RETRIES,
@@ -416,11 +417,12 @@ fn apply_utxo_changes(
 ) -> BTreeMap<OutputLocation, transparent::Output> {
     // Correctness: combine the created UTXOs, then remove spent UTXOs,
     // to compensate for overlapping finalized and non-finalized blocks.
-    finalized_utxos
-        .into_iter()
-        .chain(created_chain_utxos)
-        .filter(|(utxo_location, _output)| !spent_chain_utxos.contains(utxo_location))
-        .collect()
+    collect_ordered_map(
+        finalized_utxos
+            .into_iter()
+            .chain(created_chain_utxos)
+            .filter(|(utxo_location, _output)| !spent_chain_utxos.contains(utxo_location)),
+    )
 }
 
 /// Returns the [`transaction::Hash`]es containing the supplied UTXOs,
@@ -454,16 +456,13 @@ where
         .unwrap_or_default();
 
     // First try the in-memory chain, then the disk database
-    transaction_locations
-        .iter()
-        .map(|tx_loc| {
-            (
-                *tx_loc,
-                chain_tx_ids.get(tx_loc).cloned().unwrap_or_else(|| {
-                    db.transaction_hash(*tx_loc)
-                        .expect("unexpected inconsistent UTXO indexes")
-                }),
-            )
-        })
-        .collect()
+    collect_ordered_map(transaction_locations.iter().map(|tx_loc| {
+        (
+            *tx_loc,
+            chain_tx_ids.get(tx_loc).cloned().unwrap_or_else(|| {
+                db.transaction_hash(*tx_loc)
+                    .expect("unexpected inconsistent UTXO indexes")
+            }),
+        )
+    }))
 }

@@ -30,6 +30,7 @@ use zakura_chain::{
     block::Height, parameters::Network, primitives::byte_array::increment_big_endian,
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     database_format_version_on_disk,
     service::finalized_state::disk_format::{FromDisk, IntoDisk},
@@ -606,7 +607,7 @@ impl ReadDisk for DiskDb {
         V: FromDisk,
         R: RangeBounds<K>,
     {
-        self.zs_forward_range_iter(cf, range).collect()
+        collect_ordered_map(self.zs_forward_range_iter(cf, range))
     }
 
     fn zs_items_in_range_unordered<C, K, V, R>(&self, cf: &C, range: R) -> HashMap<K, V>

@@ -12,6 +12,7 @@ use zakura_chain::{
     transaction, transparent,
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{OutputLocation, TransactionLocation, ValidateContextError};
 
 use super::{counted_set::CountedSet, RevertPosition, SharedMap, UpdateWith};
@@ -362,20 +363,17 @@ impl TransparentTransfers {
         chain_tx_loc_by_hash: &SharedMap<transaction::Hash, TransactionLocation>,
         query_height_range: RangeInclusive<Height>,
     ) -> BTreeMap<TransactionLocation, transaction::Hash> {
-        self.tx_ids
-            .distinct_values()
-            .filter_map(|tx_hash| {
-                let tx_loc = *chain_tx_loc_by_hash
-                    .get(tx_hash)
-                    .expect("all hashes are indexed");
+        collect_ordered_map(self.tx_ids.distinct_values().filter_map(|tx_hash| {
+            let tx_loc = *chain_tx_loc_by_hash
+                .get(tx_hash)
+                .expect("all hashes are indexed");
 
-                if query_height_range.contains(&tx_loc.height) {
-                    Some((tx_loc, *tx_hash))
-                } else {
-                    None
-                }
-            })
-            .collect()
+            if query_height_range.contains(&tx_loc.height) {
+                Some((tx_loc, *tx_hash))
+            } else {
+                None
+            }
+        }))
     }
 
     /// Returns the new transparent outputs sent to this address,

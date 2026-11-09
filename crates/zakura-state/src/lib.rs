@@ -26,6 +26,7 @@ pub mod config;
 // Most constants are exported by default
 pub mod constants;
 mod header_chain;
+mod ordered_map;
 
 // Allow use in external tests
 #[cfg(any(test, feature = "proptest-impl"))]

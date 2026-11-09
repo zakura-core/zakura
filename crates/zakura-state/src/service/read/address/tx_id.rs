@@ -18,6 +18,7 @@ use std::{
 
 use zakura_chain::{block::Height, transaction, transparent};
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     service::{
         finalized_state::ZakuraDb, non_finalized_state::Chain, read::FINALIZED_STATE_QUERY_RETRIES,
@@ -287,5 +288,5 @@ fn apply_tx_id_changes(
 ) -> BTreeMap<TransactionLocation, transaction::Hash> {
     // Correctness: compensate for inconsistent tx IDs finalized blocks across multiple addresses,
     // by combining them with overlapping non-finalized block tx IDs.
-    finalized_tx_ids.into_iter().chain(chain_tx_ids).collect()
+    collect_ordered_map(finalized_tx_ids.into_iter().chain(chain_tx_ids))
 }

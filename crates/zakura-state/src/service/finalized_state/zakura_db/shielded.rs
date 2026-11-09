@@ -26,6 +26,7 @@ use zakura_chain::{
     transaction::Transaction,
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
@@ -381,9 +382,7 @@ impl ZakuraDb {
             .cf_handle("sapling_note_commitment_subtree")
             .unwrap();
 
-        self.db
-            .zs_forward_range_iter(&sapling_subtrees, range)
-            .collect()
+        collect_ordered_map(self.db.zs_forward_range_iter(&sapling_subtrees, range))
     }
 
     /// Get the sapling note commitment subtress for the finalized tip.
@@ -524,9 +523,7 @@ impl ZakuraDb {
             .cf_handle("orchard_note_commitment_subtree")
             .unwrap();
 
-        self.db
-            .zs_forward_range_iter(&orchard_subtrees, range)
-            .collect()
+        collect_ordered_map(self.db.zs_forward_range_iter(&orchard_subtrees, range))
     }
 
     /// Get the orchard note commitment subtress for the finalized tip.
@@ -644,9 +641,7 @@ impl ZakuraDb {
             .cf_handle("ironwood_note_commitment_subtree")
             .unwrap();
 
-        self.db
-            .zs_forward_range_iter(&ironwood_subtrees, range)
-            .collect()
+        collect_ordered_map(self.db.zs_forward_range_iter(&ironwood_subtrees, range))
     }
 
     /// Get the Ironwood note commitment subtree for the finalized tip.

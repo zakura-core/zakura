@@ -35,6 +35,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
+use crate::ordered_map::collect_ordered_map;
 use crate::{
     config::MAX_DECODED_BYTES_PER_WIRE_BYTE,
     constants::MAX_PRUNE_HEIGHTS_PER_COMMIT,
@@ -1068,16 +1069,18 @@ impl ZakuraDb {
         // TODO: index new_outputs by TransactionLocation,
         //       simplify the spent_utxos location lookup code,
         //       and remove the extra new_outputs_by_out_loc argument
-        let new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = finalized
-            .new_outputs
-            .iter()
-            .map(|(outpoint, ordered_utxo)| {
-                (
-                    lookup_out_loc(finalized.height, outpoint, &tx_hash_indexes),
-                    ordered_utxo.utxo.clone(),
-                )
-            })
-            .collect();
+        let new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> =
+            collect_ordered_map(
+                finalized
+                    .new_outputs
+                    .iter()
+                    .map(|(outpoint, ordered_utxo)| {
+                        (
+                            lookup_out_loc(finalized.height, outpoint, &tx_hash_indexes),
+                            ordered_utxo.utxo.clone(),
+                        )
+                    }),
+            );
 
         // Get the spent UTXOs before deleting any from the database. Contextual validation
         // already resolved them for contextually verified blocks; checkpoint-verified blocks
@@ -1165,10 +1168,12 @@ impl ZakuraDb {
             .iter()
             .map(|(outpoint, out_loc, _utxo)| (*outpoint, *out_loc))
             .collect();
-        let spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> = spent_utxos
-            .into_iter()
-            .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo))
-            .collect();
+        let spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo> =
+            collect_ordered_map(
+                spent_utxos
+                    .into_iter()
+                    .map(|(_outpoint, out_loc, utxo)| (out_loc, utxo)),
+            );
 
         // Pruned checkpoint sync stops optional index writes in place. A durable marker
         // keeps them disabled after configuration changes or rollback.

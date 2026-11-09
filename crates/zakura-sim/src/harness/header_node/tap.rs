@@ -619,22 +619,17 @@ impl TapState {
             ReactorEvent::SessionAdmitted { peer, .. } => {
                 Some((LinkEffect::SessionAdmitted, peer.clone()))
             }
+            ReactorEvent::SessionEnded { peer, .. } => {
+                Some((LinkEffect::SessionEnded, peer.clone()))
+            }
             _ => None,
         };
         if let Some(effect) = effect {
-            // Only a live reactor reserves or admits, so neither happens in
-            // the run's own shutdown.
+            // Only a live reactor reserves, admits or handles a disconnect,
+            // so none happens in the run's own shutdown.
             if in_run {
                 state.buffer().effects.push(effect);
             } else {
-                state.refused.store(true, Ordering::Relaxed);
-            }
-            return;
-        }
-        // Only a live reactor handles a disconnect, so this doesn't happen
-        // in the run's own shutdown either.
-        if matches!(event, ReactorEvent::SessionEnded { .. }) {
-            if !in_run {
                 state.refused.store(true, Ordering::Relaxed);
             }
             return;
@@ -778,6 +773,7 @@ impl ReactorTap {
             let cooldowns = cooldowns.clone();
             move || cooldowns.freeze()
         });
+        let wake_sessions = sessions.clone();
         let observer = Arc::new_cyclic(|observer| {
             TapObserver(Arc::new(TapState {
                 run,
@@ -801,7 +797,7 @@ impl ReactorTap {
                 teardown_claims: Mutex::default(),
                 rounds,
                 stale: Mutex::new(StaleCheck::new(stale_calls)),
-                wake: Mutex::new(WakeCheck::new(WakeEvidence::default())),
+                wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
             }))
         });
         let state = observer.0.clone();
@@ -873,7 +869,8 @@ impl ReactorTap {
             .state
             .wake
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = WakeCheck::new(wake);
+            .unwrap_or_else(PoisonError::into_inner) =
+            WakeCheck::new(wake, self.state.sessions.clone());
     }
 
     /// The reactor's adoption facts, which the tap fills as they happen.

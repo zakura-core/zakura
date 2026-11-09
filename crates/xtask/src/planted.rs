@@ -114,7 +114,7 @@ mod pilot;
 
 #[allow(dead_code)]
 #[path = "../../zakura-sim/build/provenance.rs"]
-mod provenance;
+pub(super) mod provenance;
 
 pub(super) use pilot::run as pilot;
 
@@ -140,7 +140,7 @@ const SHARED: &[&str] = &[
 /// The cargo profile every case builds with: optimized, with the dev
 /// profile's debug assertions and overflow checks (the workspace's
 /// `Cargo.toml`).
-const PROFILE: &str = "planted";
+pub(super) const PROFILE: &str = "planted";
 
 /// Fuzz inputs the short campaign records after the committed input.
 const CAMPAIGN_INPUTS: usize = 32;
@@ -572,6 +572,17 @@ pub(super) fn run(
         return Err(format!("{failed} of {} planted cases failed", cases.len()).into());
     }
     Ok(())
+}
+
+/// The index [`run`] gives case `name` of `property` when it runs that
+/// property without `--targets`: its position among the property's cases
+/// in path order, which names its `case-<index>` directory.
+pub(super) fn case_index(repo_root: &Path, property: &str, name: &str) -> Result<usize, BoxError> {
+    cases(repo_root)?
+        .into_iter()
+        .filter(|case| case.property == property)
+        .position(|case| case.patch.file_stem().and_then(|stem| stem.to_str()) == Some(name))
+        .ok_or_else(|| format!("{property}/{name} has no planted case").into())
 }
 
 /// Every case under `repo_root`'s [`PLANTED_DIR`], in path order.
@@ -1011,7 +1022,7 @@ fn through_target(
 /// digest as `zakura-sim`'s build script computes it, so it was built from
 /// that source and not reused from an earlier one. A digest git couldn't
 /// compute names no source.
-fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
+pub(super) fn names_source(binary: &[u8], source: &str) -> Result<(), String> {
     if source == provenance::UNKNOWN {
         return Err("git couldn't compute the patched checkout's source digest".to_owned());
     }
@@ -1142,7 +1153,7 @@ fn apply(worktree: &Path, patch: &Path) -> Result<(), String> {
 /// A bypass patch can leave the code it bypasses unused, so the build
 /// reports warnings but doesn't fail on them, even where the environment
 /// denies them, as CI's Rust setup does with `CARGO_BUILD_WARNINGS=deny`.
-fn cargo_sim(worktree: &Path, target: &Path) -> Command {
+pub(super) fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command
@@ -1384,7 +1395,7 @@ fn classify(property: &str, patched: &Run) -> Verdict {
 }
 
 /// `git` in `dir`.
-fn git(dir: &Path) -> Command {
+pub(super) fn git(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(dir);
     command

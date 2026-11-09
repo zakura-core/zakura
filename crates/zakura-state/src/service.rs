@@ -3112,6 +3112,11 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
+            // Used by the RPC retry queue.
+            ReadRequest::MinedTransactionIds(hashes) => Ok(ReadResponse::MinedTransactionIds(
+                read::mined_transaction_ids(state.latest_best_chain(), &state.db, &hashes),
+            )),
+
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
                 read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend)?,

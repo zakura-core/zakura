@@ -30,7 +30,7 @@ use zakura_node_services::{
     BoxError,
 };
 
-use zakura_state::{MinedTx, ReadRequest, ReadResponse};
+use zakura_state::{ReadRequest, ReadResponse};
 
 #[cfg(test)]
 mod tests;
@@ -274,7 +274,10 @@ impl Runner {
 
     /// Check the state for given transactions.
     ///
-    /// Returns transactions that are in the state.
+    /// Returns the queued transactions whose transaction ID is mined in the
+    /// best chain. A queued transaction whose effects were mined with
+    /// different authorizing data can never be mined itself, so it is
+    /// returned too.
     async fn check_state<State>(
         state: State,
         transactions: HashSet<UnminedTxId>,
@@ -286,19 +289,19 @@ impl Runner {
             + Sync
             + 'static,
     {
-        let mut response = HashSet::new();
+        let request = ReadRequest::MinedTransactionIds(
+            transactions.iter().map(UnminedTxId::mined_id).collect(),
+        );
 
-        for t in transactions {
-            let request = ReadRequest::Transaction(t.mined_id());
+        // ignore any error coming from the state
+        let Ok(ReadResponse::MinedTransactionIds(mined)) = state.oneshot(request).await else {
+            return HashSet::new();
+        };
 
-            // ignore any error coming from the state
-            let state_response = state.clone().oneshot(request).await;
-            if let Ok(ReadResponse::Transaction(Some(MinedTx { tx, .. }))) = state_response {
-                response.insert(tx.unmined_id());
-            }
-        }
-
-        response
+        transactions
+            .into_iter()
+            .filter(|t| mined.contains(&t.mined_id()))
+            .collect()
     }
 
     /// Retry sending given transactions to mempool.

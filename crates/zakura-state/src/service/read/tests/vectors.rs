@@ -1,6 +1,6 @@
 //! Fixed test vectors for the ReadStateService.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use zakura_node_services::block_memory::TransactionHandle;
 
 use tower::ServiceExt;
@@ -90,6 +90,21 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
 
     let empty_cases = Transcript::from(empty_state_test_cases());
     empty_cases.check(read_state.clone()).await?;
+
+    // Every indexed transaction is mined, and an unknown ID is not.
+    // Spec: transactions in the genesis block are ignored.
+    let mined: HashSet<transaction::Hash> = blocks
+        .iter()
+        .skip(1)
+        .flat_map(|block| block.transactions.iter().map(|tx| tx.hash()))
+        .collect();
+    let mut requested = mined.clone();
+    requested.insert(transaction::Hash([0xff; 32]));
+    let transcript = Transcript::from(vec![(
+        ReadRequest::MinedTransactionIds(requested),
+        Ok(ReadResponse::MinedTransactionIds(mined)),
+    )]);
+    transcript.check(read_state.clone()).await?;
 
     for block in blocks {
         let block_cases = vec![
@@ -778,6 +793,39 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         "block should find best chain block by hash"
     );
     assert_eq!(found.unwrap().hash(), best_hash);
+
+    // Mined transaction IDs come from the best chain's index only.
+    use crate::service::read::block::mined_transaction_ids;
+
+    let best_txid = best_chain_block.transactions[0].hash();
+    let unknown_txid = transaction::Hash([0xff; 32]);
+    let mined = mined_transaction_ids(
+        non_finalized_state.best_chain(),
+        &finalized_state.db,
+        &[best_txid, unknown_txid].into(),
+    );
+    assert_eq!(mined, [best_txid].into());
+
+    let side_only: HashSet<_> = side_chain_block
+        .transactions
+        .iter()
+        .map(|tx| tx.hash())
+        .filter(|hash| {
+            !non_finalized_state
+                .best_chain()
+                .unwrap()
+                .contains_transaction(hash)
+        })
+        .collect();
+    assert!(
+        mined_transaction_ids(
+            non_finalized_state.best_chain(),
+            &finalized_state.db,
+            &side_only,
+        )
+        .is_empty(),
+        "side chain transactions are not mined in the best chain"
+    );
 
     // Raw reads serialize non-finalized blocks and transactions from memory.
     use crate::service::read::block::{any_raw_transaction, raw_block};

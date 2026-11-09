@@ -15,7 +15,7 @@ use zakura_sim::{
     observe::StreamId,
     property::Property,
     table::{sender_properties, table_properties, GeneratedId, Template},
-    Observation, PropertyOutcome, RunReport,
+    Observation, PropertyOutcome, RunReport, Violation,
 };
 
 /// The `feed` stream: the `watch` subscription, its `item` pages and its
@@ -212,6 +212,33 @@ fn unsolicited_responses_fail_by_row() {
     ]);
     assert_eq!(stopped_by(&second_ending), Some(ENDS));
     assert!(not_applicable(&second_ending, ANSWERS));
+}
+
+/// Two requests past the limit at one step are two violations, each
+/// naming its own frame, and the report keeps both.
+#[test]
+fn every_sender_violation_at_a_step_is_reported() {
+    let report = run_script(vec![vec![
+        sent(TEST_STREAM, 0, "get", Label::OverMargin),
+        sent(TEST_STREAM, 1, "get", Label::OverMargin),
+    ]]);
+    assert_eq!(stopped_by(&report), Some(LIMIT));
+    let limit = report
+        .properties
+        .iter()
+        .find(|r| r.property == LIMIT)
+        .expect("registered");
+    let found = |seq: u64| Violation {
+        property: LIMIT.to_owned(),
+        step: 1,
+        witness: vec![1],
+        expected: format!(
+            "connection 1's s65v2/get frame {seq} from the node is conformant under \
+             sender-within-limit"
+        ),
+        actual: "the peer's models labelled it OverMargin".to_owned(),
+    };
+    assert_eq!(limit.violations, [found(0), found(1)]);
 }
 
 /// An `Open` past `max_live` breaks `sender-within-live`, and a page past

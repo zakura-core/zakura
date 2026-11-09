@@ -11,6 +11,10 @@
 //! `ZakuraEndpoint`. All of it runs in the node's root task, so every
 //! discovery task is a scheduler task. The handle's verification slot count
 //! is fixed, in place of the host's.
+//!
+//! A peer with a discovery script runs it on its discovery stream
+//! (disc-2.2), with the stream `DiscoveryService::streams()` declares, and
+//! the peers' evidence logs its frames there.
 
 use std::sync::Arc;
 
@@ -31,8 +35,8 @@ use super::{
 };
 use crate::{
     peer::{
-        key_index, peer_addr, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
-        PeerTask, NODE_ADDR,
+        discovery::discovery_stream, key_index, peer_addr, PeerCloses, PeerControl, PeerFailure,
+        PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
     },
     Sim,
 };
@@ -130,6 +134,7 @@ fn bootstrap_peers(seed: [u8; 32], indexes: &[usize]) -> Vec<String> {
 /// `spec` on Regtest behind it, then spawns each of sim-5's scripted
 /// `peers`, named `peer-<i>`, and adds their action source. The node
 /// dials a listening peer only if `spec` holds it as a static candidate.
+/// A peer with a discovery script runs it on discovery's stream.
 ///
 /// # Panics
 ///
@@ -146,9 +151,11 @@ pub fn spawn(sim: &mut Sim, net: &NetScenario, spec: &NodeSpec, peers: &[PeerSpe
     let dials = tap.dials();
     sim.add_source(Box::new(tap));
     spawn_node(sim, spec, &network, net.sim(), seed, observer, dials);
+    // Read before any task runs, since building it draws from the run.
+    let stream = discovery_stream();
     let failure = PeerFailure::default();
     let records = PeerRecords::default();
-    let mut control = PeerControl::new(failure.clone(), records.clone());
+    let mut control = PeerControl::new(failure.clone(), records.clone()).with_discovery(&stream);
     for ((index, peer), name) in peers.iter().enumerate().zip(names) {
         assert!(
             peer.honest.is_none(),
@@ -176,7 +183,8 @@ pub fn spawn(sim: &mut Sim, net: &NetScenario, spec: &NodeSpec, peers: &[PeerSpe
             closed: PeerCloses::default(),
             taken: 0,
         };
-        sim.scheduler().spawn_root("peer", task.run());
+        sim.scheduler()
+            .spawn_root("peer", task.run_with(Some(stream)));
     }
     sim.add_source(Box::new(control));
 }

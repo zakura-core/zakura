@@ -6,7 +6,7 @@ use crate::{
     amount::{self, Amount, NegativeAllowed},
     fmt::HexDebug,
     memory::{vec_capacity_bytes, AttributedMemorySize},
-    primitives::{ed25519, ZkSnarkProof},
+    primitives::ZkSnarkProof,
     sprout::{self, JoinSplit, Nullifier},
 };
 
@@ -45,9 +45,127 @@ pub struct JoinSplitData<P: ZkSnarkProof> {
     ))]
     pub rest: Vec<JoinSplit<P>>,
     /// The public key for the JoinSplit signature, denoted as `joinSplitPubKey` in the spec.
-    pub pub_key: ed25519::VerificationKeyBytes,
+    pub pub_key: JoinSplitPubKey,
     /// The JoinSplit signature, denoted as `joinSplitSig` in the spec.
-    pub sig: ed25519::Signature,
+    pub sig: JoinSplitSig,
+}
+
+/// A transaction's `joinSplitPubKey`: the encoded Ed25519 validating key that its
+/// `joinSplitSig` is checked against.
+///
+/// These are the bytes as the transaction encodes them. Nothing checks that they are a
+/// valid key: `zakura-consensus` does that when it verifies the signature.
+///
+/// Serializes like `ed25519_zebra::VerificationKeyBytes`, the type this replaces.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename = "VerificationKeyBytes")]
+pub struct JoinSplitPubKey(pub [u8; 32]);
+
+impl fmt::Debug for JoinSplitPubKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("JoinSplitPubKey")
+            .field(&HexDebug(&self.0))
+            .finish()
+    }
+}
+
+impl From<[u8; 32]> for JoinSplitPubKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<JoinSplitPubKey> for [u8; 32] {
+    fn from(key: JoinSplitPubKey) -> Self {
+        key.0
+    }
+}
+
+impl AsRef<[u8]> for JoinSplitPubKey {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// A transaction's `joinSplitSig`: the encoded Ed25519 signature over its JoinSplit data.
+///
+/// These are the bytes as the transaction encodes them. Nothing checks them:
+/// `zakura-consensus` verifies the signature.
+///
+/// Serializes like `ed25519::Signature`, the type this replaces: a tuple of 64 bytes.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct JoinSplitSig(pub [u8; 64]);
+
+impl JoinSplitSig {
+    /// The length of an encoded signature.
+    pub const BYTE_SIZE: usize = 64;
+}
+
+impl fmt::Debug for JoinSplitSig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("JoinSplitSig")
+            .field(&HexDebug(&self.0))
+            .finish()
+    }
+}
+
+impl From<[u8; 64]> for JoinSplitSig {
+    fn from(bytes: [u8; 64]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<JoinSplitSig> for [u8; 64] {
+    fn from(sig: JoinSplitSig) -> Self {
+        sig.0
+    }
+}
+
+impl AsRef<[u8]> for JoinSplitSig {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for JoinSplitSig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple as _;
+
+        let mut tuple = serializer.serialize_tuple(Self::BYTE_SIZE)?;
+        for byte in &self.0 {
+            tuple.serialize_element(byte)?;
+        }
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for JoinSplitSig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+            type Value = JoinSplitSig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a tuple of 64 bytes")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<JoinSplitSig, A::Error> {
+                let mut bytes = [0u8; JoinSplitSig::BYTE_SIZE];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                }
+                Ok(JoinSplitSig(bytes))
+            }
+        }
+
+        deserializer.deserialize_tuple(Self::BYTE_SIZE, BytesVisitor)
+    }
 }
 
 impl<P: ZkSnarkProof> AttributedMemorySize for JoinSplitData<P> {
@@ -62,7 +180,7 @@ impl<P: ZkSnarkProof> fmt::Debug for JoinSplitData<P> {
             .field("first", &self.first)
             .field("rest", &self.rest)
             .field("pub_key", &self.pub_key)
-            .field("sig", &HexDebug(&self.sig.to_bytes()))
+            .field("sig", &self.sig)
             .finish()
     }
 }

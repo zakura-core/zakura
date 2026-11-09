@@ -12,10 +12,7 @@ use std::{
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use rand_10::seq::SliceRandom;
 use thiserror::Error;
-use zakura_chain::{
-    block,
-    primitives::ed25519::{Signature, SigningKey},
-};
+use zakura_chain::block;
 use zakura_quic::{NodeAddr, NodeId, NodeSecretKey};
 use zakura_rt::{
     collections::{hash_map, HashMap, HashSet},
@@ -298,8 +295,9 @@ impl ZakuraNodeRecordBody {
 pub struct ZakuraNodeRecord {
     /// Signed record body.
     pub body: ZakuraNodeRecordBody,
-    /// Ed25519 signature over [`ZakuraNodeRecordBody::encode_for_signature`].
-    pub signature: Signature,
+    /// Ed25519 signature over [`ZakuraNodeRecordBody::encode_for_signature`], by the key
+    /// behind [`ZakuraNodeRecordBody::node_id`].
+    pub signature: [u8; 64],
 }
 
 impl ZakuraNodeRecord {
@@ -311,8 +309,7 @@ impl ZakuraNodeRecord {
         if body.node_id != secret_key.public() {
             return Err(DiscoveryWireError::SigningKeyMismatch);
         }
-        let signing_key = SigningKey::from(secret_key.to_bytes());
-        let signature = signing_key.sign(&body.encode_for_signature()?);
+        let signature = secret_key.sign(&body.encode_for_signature()?);
         Ok(Self { body, signature })
     }
 
@@ -345,7 +342,7 @@ impl ZakuraNodeRecord {
         // never authenticate a dial, so its record is useless to the book.
         self.body
             .node_id
-            .verify_strict(&body_bytes, &self.signature.to_bytes())
+            .verify_strict(&body_bytes, &self.signature)
             .map_err(|_| DiscoveryRecordError::InvalidSignature)?;
         validate_record_context(&self.body, context)
     }
@@ -4213,8 +4210,7 @@ mod tests {
             .expect("test record format version writes");
         write_record_body(&body, &mut bytes);
 
-        let signing_key = SigningKey::from(secret_key.to_bytes());
-        let signature = signing_key.sign(&bytes);
+        let signature = secret_key.sign(&bytes);
         ZakuraNodeRecord { body, signature }
     }
 
@@ -4897,10 +4893,10 @@ mod tests {
     #[test]
     fn record_from_mixed_order_node_id_is_rejected() {
         use curve25519_dalek::{
-            constants::ED25519_BASEPOINT_POINT, edwards::CompressedEdwardsY, Scalar,
+            constants::ED25519_BASEPOINT_POINT, edwards::CompressedEdwardsY,
+            traits::IsIdentity as _, Scalar,
         };
         use sha2::{Digest as _, Sha512};
-        use zakura_chain::primitives::ed25519::VerificationKey;
 
         /// A point of order 8.
         const ORDER_8: [u8; 32] = [
@@ -4923,9 +4919,8 @@ mod tests {
         let torsion = CompressedEdwardsY(ORDER_8)
             .decompress()
             .expect("the order-8 constant is a curve point");
-        let mixed_bytes = (a * ED25519_BASEPOINT_POINT + torsion)
-            .compress()
-            .to_bytes();
+        let mixed_point = a * ED25519_BASEPOINT_POINT + torsion;
+        let mixed_bytes = mixed_point.compress().to_bytes();
         let mixed = NodeId::from_bytes(&mixed_bytes).expect("a mixed-order key parses");
 
         let honest =
@@ -4946,16 +4941,19 @@ mod tests {
             .chain_update(&message)
             .finalize()
             .into();
-        let s = r + Scalar::from_bytes_mod_order_wide(&challenge) * a;
-        let mut signature_bytes = [0u8; 64];
-        signature_bytes[..32].copy_from_slice(&r_point);
-        signature_bytes[32..].copy_from_slice(s.as_bytes());
-        let signature = Signature::from_bytes(&signature_bytes);
+        let k = Scalar::from_bytes_mod_order_wide(&challenge);
+        let s = r + k * a;
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&r_point);
+        signature[32..].copy_from_slice(s.as_bytes());
 
-        VerificationKey::try_from(mixed_bytes)
-            .expect("a mixed-order key is a valid cofactored verification key")
-            .verify(&signature, &message)
-            .expect("the cofactored equation accepts the mixed-order signature");
+        // The cofactored equation [8](sB - R - kA') = 0 accepts it.
+        assert!(
+            (s * ED25519_BASEPOINT_POINT - r * ED25519_BASEPOINT_POINT - k * mixed_point)
+                .mul_by_cofactor()
+                .is_identity(),
+            "the cofactored equation accepts the mixed-order signature"
+        );
 
         let record = ZakuraNodeRecord { body, signature };
         assert!(matches!(
@@ -5451,7 +5449,7 @@ mod tests {
                 )
                 .unwrap();
             encoded.write_all(&body_bytes).unwrap();
-            encoded.write_all(&record.signature.to_bytes()).unwrap();
+            encoded.write_all(&record.signature).unwrap();
             encoded
         }
 
@@ -5616,7 +5614,7 @@ mod tests {
             out.write_u32::<LittleEndian>(u32::try_from(body.len()).unwrap())
                 .unwrap();
             out.write_all(&body).unwrap();
-            out.write_all(&record.signature.to_bytes()).unwrap();
+            out.write_all(&record.signature).unwrap();
         }
 
         let first = signed_record_with(1, service(1), test_addr(1));
@@ -5645,9 +5643,7 @@ mod tests {
             .write_u32::<LittleEndian>(u32::try_from(unknown_body.len()).unwrap())
             .unwrap();
         encoded.write_all(&unknown_body).unwrap();
-        encoded
-            .write_all(&unknown_family.signature.to_bytes())
-            .unwrap();
+        encoded.write_all(&unknown_family.signature).unwrap();
         assert!(matches!(
             DiscoveryMessage::decode(&encoded),
             Err(WireError::OutOfRange("address family"))

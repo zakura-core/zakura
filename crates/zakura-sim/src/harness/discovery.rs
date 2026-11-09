@@ -1,14 +1,14 @@
 //! S4.7: discovery's `wait_complete` wakes once the initial exchange
 //! completes. A scripted peer answers the node's Hello, GetPeers and
-//! GetServices over an in-memory stream, on 2 workers.
+//! GetServices over an in-memory stream, on 2 workers, with the fixture
+//! records and answers sim-5's peers send ([`crate::peer::discovery`]).
 
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, UNIX_EPOCH},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,22 +16,21 @@ use zakura_chain::parameters::Network;
 use zakura_network::zakura::{
     framed_channel,
     wire_codec::{decode_frame, encode_frame},
-    DiscoveryMessage, DiscoveryService, DiscoveryServiceSummary, Peer, Service, ServicePeerLimits,
-    ServiceSummaryEnvelope, Services, ZakuraDiscoveryConfig, ZakuraDiscoveryHandle,
-    ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraNodeRecord, ZakuraNodeRecordBody,
-    ZakuraPeerId, ZakuraServiceId, ZAKURA_CAP_DISCOVERY, ZAKURA_STREAM_DISCOVERY,
+    DiscoveryMessage, DiscoveryService, Peer, Service, ServicePeerLimits, ZakuraDiscoveryConfig,
+    ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraPeerId,
+    ZakuraServiceId, ZAKURA_CAP_DISCOVERY, ZAKURA_STREAM_DISCOVERY,
 };
 use zakura_quic::{NodeId, NodeSecretKey};
 use zakura_rt::{
     collections::HashMap,
     sync::{watch, CancellationToken},
-    time::utc_now,
 };
 use zakura_scheduler::SchedulerConfig;
 
 use super::Subsystem;
 use crate::{
     domain::discovery::{verification_capacity, wait_complete_wakes, VerificationView},
+    peer::discovery::{self as fixture, record, unix_now, FIXTURE_ADDR},
     property::{HasView, Property, Source, Sources},
     RunConfig, Sim,
 };
@@ -83,27 +82,6 @@ impl Subsystem for WaitComplete {
     fn draw(_: &[u8]) -> Scenario {
         Scenario {}
     }
-}
-
-/// A signed record for `secret`, valid for ten minutes of the run's UTC, which
-/// is the clock discovery validates it against.
-fn record(secret: &NodeSecretKey, handshake: &ZakuraHandshakeConfig, now: u64) -> ZakuraNodeRecord {
-    let body = ZakuraNodeRecordBody {
-        node_id: secret.public(),
-        direct_addrs: vec![SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(45, 33, 30, 45)),
-            8233,
-        )],
-        services: vec![ZakuraServiceId::discovery()],
-        zakura_protocol_min: handshake.zakura_protocol_min,
-        zakura_protocol_max: handshake.zakura_protocol_max,
-        network_id: handshake.network_id,
-        chain_id: handshake.chain_id,
-        sequence: 1,
-        expires_at_unix_secs: now.saturating_add(600),
-        extensions: Vec::new(),
-    };
-    ZakuraNodeRecord::sign(body, secret).expect("a fixture record signs")
 }
 
 /// What a test can read after a run of [`spawn`]'s scenario.
@@ -177,28 +155,14 @@ pub fn spawn(sim: &mut Sim) -> Spawned {
                 DiscoveryMessage::Peers { .. } | DiscoveryMessage::Services(_) => {}
             }
         }
-        let summary = DiscoveryServiceSummary {
-            peer_exchange_slots_free: 1,
-            max_records_per_response: 1,
-            expected_disconnect_after_exchange: true,
-        };
-        let now = utc_now()
-            .duration_since(UNIX_EPOCH)
-            .expect("the run clock is after the epoch")
-            .as_secs();
         let answers = [
             DiscoveryMessage::Hello {
-                record: record(&peer_secret, &handshake, now),
+                record: record(&peer_secret, &handshake, unix_now(), vec![FIXTURE_ADDR]),
             },
             DiscoveryMessage::Peers {
                 records: Vec::new(),
             },
-            DiscoveryMessage::Services(Services {
-                node_id: peer_secret.public(),
-                expires_at_unix_secs: u64::MAX,
-                summaries: vec![ServiceSummaryEnvelope::discovery(&summary)
-                    .expect("the fixture summary encodes")],
-            }),
+            DiscoveryMessage::Services(fixture::services(peer_secret.public())),
         ];
         for answer in answers {
             let frame = encode_frame(&answer).expect("the fixture answers encode");
@@ -334,13 +298,10 @@ fn spawn_capacity(sim: &mut Sim, evidence: &Arc<CapacityEvidence>) -> ZakuraDisc
         let evidence = Arc::clone(evidence);
         let author = 33 + u8::try_from(reader).expect("the fixture has few readers");
         sim.scheduler().spawn_root(name, async move {
-            let now = utc_now()
-                .duration_since(UNIX_EPOCH)
-                .expect("the run clock is after the epoch")
-                .as_secs();
             let secret = NodeSecretKey::from_bytes(&[author; 32]);
+            let record = record(&secret, &handshake, unix_now(), vec![FIXTURE_ADDR]);
             let outcome = handle
-                .import_peer_records([record(&secret, &handshake, now)], Some(relay))
+                .import_peer_records([record], Some(relay))
                 .await
                 .expect("the fixture record is authentic");
             assert_eq!(outcome.added, 1, "the fixture record is new");

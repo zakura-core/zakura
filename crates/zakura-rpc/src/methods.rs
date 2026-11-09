@@ -5441,7 +5441,7 @@ impl SendRawTransactionResponse {
 #[serde(untagged)]
 pub enum GetBlockResponse {
     /// The request block, hex-encoded.
-    Raw(#[serde(with = "hex")] SerializedBlock),
+    Raw(#[serde(with = "hex_data")] SerializedBlock),
     /// The block object.
     Object(Box<BlockObject>),
 }
@@ -5806,7 +5806,7 @@ impl Default for GetBlockHashResponse {
 #[serde(untagged)]
 pub enum GetRawTransactionResponse {
     /// The raw transaction, encoded as hex bytes.
-    Raw(#[serde(with = "hex")] SerializedTransaction),
+    Raw(#[serde(with = "hex_data")] SerializedTransaction),
     /// The transaction object.
     Object(Box<TransactionObject>),
 }

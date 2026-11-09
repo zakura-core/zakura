@@ -32,6 +32,8 @@ const MAX_EXPIRY_HEIGHT: block::Height = block::Height::MAX_EXPIRY_HEIGHT;
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 #[allow(missing_docs)]
 pub enum TransactionError {
+    #[error("transparent verification work exceeds the block budget")]
+    VerificationWorkLimit,
     #[error("first transaction must be coinbase")]
     CoinbasePosition,
 
@@ -473,6 +475,7 @@ impl TransactionError {
             Self::NoOutputs => consensus("transaction.no_outputs"),
             Self::BadBalance => consensus("transaction.bad_balance"),
             Self::Script(_) => consensus("transaction.script"),
+            Self::VerificationWorkLimit => consensus("transaction.verification_work_limit"),
             Self::SaplingVerificationFailed => consensus("transaction.sapling_verification"),
             Self::Halo2VerificationFailed => consensus("transaction.halo2_verification"),
             Self::SmallOrder => consensus("transaction.small_order"),
@@ -587,6 +590,7 @@ impl TransactionError {
             | NoOutputs
             | BadBalance
             | Script(_)
+            | VerificationWorkLimit
             | SaplingVerificationFailed
             | Halo2VerificationFailed
             | SmallOrder

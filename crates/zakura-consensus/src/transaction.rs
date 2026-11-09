@@ -42,6 +42,8 @@ use zakura_state as zs;
 use crate::{error::TransactionError, primitives, script, BoxError};
 
 pub mod check;
+mod work;
+pub use work::VerificationBudget;
 #[cfg(test)]
 mod tests;
 
@@ -219,6 +221,8 @@ pub enum Request {
         /// Inputs found here skip the state lookup. Outputs created in the same block stay in
         /// `known_utxos`, which is checked first. See `zakura_state::ParentInputs::Unspent`.
         parent_utxos: Arc<HashMap<transparent::OutPoint, transparent::Utxo>>,
+        /// Cumulative work admitted for this block attempt, shared by all its transactions.
+        verification_budget: VerificationBudget,
         /// The height of the block containing this transaction.
         height: block::Height,
         /// The time that the block was mined.
@@ -650,6 +654,21 @@ where
                 )?;
             }
 
+            let nu = req.upgrade(&network);
+            let cached_ffi_transaction =
+                Arc::new(CachedFfiTransaction::new_for_network(tx.clone(), Arc::new(spent_outputs), &network, req.height()).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
+            let verification_work = if zakura_script::pq_outputs_active(&network, req.height()) {
+                let work = cached_ffi_transaction.verification_work()?;
+                match &req {
+                    Request::Block { verification_budget, .. } => verification_budget.reserve(work)?,
+                    Request::Mempool { .. } if work > transaction::zip317::MAX_BLOCK_VERIFICATION_WORK => {
+                        return Err(TransactionError::VerificationWorkLimit);
+                    }
+                    Request::Mempool { .. } => {}
+                }
+                work
+            } else { 0 };
+
             let mempool_transaction = req.mempool_transaction();
             let mut miner_fee = None;
             if let Some(unmined_tx) = mempool_transaction.as_ref() {
@@ -657,7 +676,7 @@ where
                 // VerifiedUnminedTx::new() repeats this check to preserve its constructor
                 // invariant.
                 let fee = Self::miner_fee(tx.as_ref(), &spent_utxos)?;
-                let unpaid_actions = transaction::zip317::unpaid_actions(unmined_tx, fee);
+                let unpaid_actions = transaction::zip317::unpaid_actions_with_work(unmined_tx, fee, verification_work);
 
                 transaction::zip317::mempool_checks(unpaid_actions, fee, unmined_tx.size())?;
                 miner_fee = Some(fee);
@@ -675,10 +694,6 @@ where
                     "unexpected response to CheckBestChainTipNullifiersAndAnchors request"
                 );
             }
-
-            let nu = req.upgrade(&network);
-            let cached_ffi_transaction =
-                Arc::new(CachedFfiTransaction::new_for_network(tx.clone(), Arc::new(spent_outputs), &network, req.height()).map_err(|_| TransactionError::UnsupportedByNetworkUpgrade(tx.version(), nu))?);
 
             tracing::trace!(?tx_id, "got state UTXOs");
 
@@ -750,18 +765,14 @@ where
                     sigops: sigops.saturating_add(cached_ffi_transaction.p2sh_sigops()),
                 },
                 Request::Mempool { transaction: tx, .. } => {
-                    // TODO: `spent_outputs` may not align with `tx.inputs()` when a transaction
-                    // spends both chain and mempool UTXOs (mempool outputs are appended last by
-                    // `spent_utxos()`), causing policy checks to pair the wrong input with
-                    // the wrong spent output.
-                    // https://github.com/ZcashFoundation/zebra/issues/10346
                     let spent_outputs = cached_ffi_transaction.all_previous_outputs().clone();
-                    let transaction = VerifiedUnminedTx::new(
+                    let transaction = VerifiedUnminedTx::new_with_verification_work(
                         tx,
                         miner_fee.expect("fee should have been checked earlier"),
                         sigops,
                         cached_ffi_transaction.p2sh_sigops(),
                         spent_outputs.into(),
+                        verification_work,
                     )?;
 
                     Response::Mempool { transaction, spent_mempool_outpoints }
@@ -1063,6 +1074,7 @@ where
             // transaction never needs it; its inputs compute their own sighashes.
             return Self::verify_transparent_inputs_and_outputs(
                 request,
+                network,
                 script_verifier,
                 cached_ffi_transaction,
             );
@@ -1074,6 +1086,7 @@ where
 
         Ok(Self::verify_transparent_inputs_and_outputs(
             request,
+            network,
             script_verifier,
             cached_ffi_transaction,
         )?
@@ -1186,6 +1199,7 @@ where
             // transaction-wide sighash.
             return Self::verify_transparent_inputs_and_outputs(
                 request,
+                network,
                 script_verifier,
                 cached_ffi_transaction,
             );
@@ -1197,6 +1211,7 @@ where
 
         Ok(Self::verify_transparent_inputs_and_outputs(
             request,
+            network,
             script_verifier,
             cached_ffi_transaction,
         )?
@@ -1276,6 +1291,7 @@ where
             // transaction-wide sighash.
             return Self::verify_transparent_inputs_and_outputs(
                 request,
+                network,
                 script_verifier,
                 cached_ffi_transaction,
             );
@@ -1287,6 +1303,7 @@ where
 
         Ok(Self::verify_transparent_inputs_and_outputs(
             request,
+            network,
             script_verifier,
             cached_ffi_transaction,
         )?
@@ -1330,6 +1347,7 @@ where
     /// Returns script verification responses via the `utxo_sender`.
     fn verify_transparent_inputs_and_outputs(
         request: &Request,
+        network: &Network,
         script_verifier: script::Verifier,
         cached_ffi_transaction: Arc<CachedFfiTransaction<TransactionHandle>>,
     ) -> Result<AsyncChecks, TransactionError> {
@@ -1348,6 +1366,8 @@ where
                     let request = script::Request {
                         cached_ffi_transaction: cached_ffi_transaction.clone(),
                         input_index,
+                        limit_verification_work: request.is_mempool()
+                            && zakura_script::pq_outputs_active(network, request.height()),
                     };
 
                     script_verifier.oneshot(request)

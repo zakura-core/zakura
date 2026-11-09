@@ -294,6 +294,15 @@ async fn verify_block(
     network: &Network,
     height: Height,
 ) -> Result<Response, TransactionError> {
+    verify_block_with_budget(spend, network, height, Default::default()).await
+}
+
+async fn verify_block_with_budget(
+    spend: &Spend,
+    network: &Network,
+    height: Height,
+    verification_budget: crate::transaction::VerificationBudget,
+) -> Result<Response, TransactionError> {
     let utxos: HashMap<_, _> = spend
         .transaction
         .inputs()
@@ -334,10 +343,26 @@ async fn verify_block(
             known_utxos: Arc::new(HashMap::new()),
             known_outpoint_hashes: Arc::default(),
             parent_utxos: Arc::new(HashMap::new()),
+            verification_budget,
             height,
             time: DateTime::<Utc>::MAX_UTC,
         })
         .await
+}
+
+#[tokio::test]
+async fn block_work_is_reserved_before_an_invalid_signature_runs() {
+    use zakura_chain::transaction::zip317::MAX_BLOCK_VERIFICATION_WORK;
+    let budget = crate::transaction::VerificationBudget::default();
+    budget.reserve(MAX_BLOCK_VERIFICATION_WORK).unwrap();
+    let mut spend = SPEND.clone();
+    let mut signature = spend.signature(&KEY, HashType::ALL, context());
+    signature[0] ^= 1;
+    spend.install_arguments(&[signature]);
+    assert_eq!(
+        verify_block_with_budget(&spend, &network(Some(ACTIVATION)), ACTIVATION, budget).await,
+        Err(TransactionError::VerificationWorkLimit)
+    );
 }
 
 #[tokio::test]
@@ -361,6 +386,32 @@ async fn serialized_pq_spend_reaches_transaction_validation_and_accounting() {
         "the ordinary legacy input beside it still executes"
     );
     assert_eq!(cached.p2sh_sigops(), 1);
+    let expected_work = match PARAMETERS {
+        zcash_transparent::pq::ParameterSet::Sha2_128f => 60,
+        zcash_transparent::pq::ParameterSet::Sha2_192s => 30,
+    };
+    assert_eq!(cached.verification_work().unwrap(), expected_work);
+    assert_eq!(SPEND.cached(&network(None), ACTIVATION).unwrap().verification_work().unwrap(), 0);
+}
+
+#[test]
+fn repeated_signature_charges_every_comparison_and_authenticates_body() {
+    let mut body = Vec::new();
+    for _ in 0..9 {
+        body.push(0x76);
+        body.extend(push(&KEY.public_key()));
+        body.push(0xad);
+    }
+    body.extend(single_signer().0);
+    let spend = Spend::signed(Code(body), HashType::ALL, context(), 1);
+    let net = network(Some(ACTIVATION));
+    let cached = spend.cached(&net, ACTIVATION).unwrap();
+    let weight = SPEND.cached(&net, ACTIVATION).unwrap().verification_work().unwrap();
+    assert_eq!(cached.verification_work().unwrap(), 10 * weight);
+    assert!(cached.is_valid(PQ_INPUT).is_ok());
+    let mut invalid = spend.clone();
+    invalid.previous_outputs[PQ_INPUT].lock_script = Script::new(&output::output_script(PARAMETERS, &Code(vec![0x51])).unwrap().0);
+    assert!(invalid.cached(&net, ACTIVATION).unwrap().verification_work().is_err());
 }
 
 #[tokio::test]

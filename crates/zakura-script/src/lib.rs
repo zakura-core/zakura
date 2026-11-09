@@ -246,6 +246,59 @@ impl<T: Deref<Target = zakura_chain::transaction::Transaction>> CachedFfiTransac
         p2sh_sigop_count(&self.transaction, &self.all_previous_outputs)
     }
 
+    /// Conservative transparent verification work, including every potential PQ
+    /// comparison even when execution can succeed early or reuse a signature.
+    ///
+    /// The spent output selects the scheme. Body authentication happens before
+    /// counting, so an invalid commitment cannot select a cheaper work charge.
+    pub fn verification_work(&self) -> Result<u32, Error> {
+        if self.transaction.is_coinbase() {
+            return Ok(0);
+        }
+        (0..self.transaction.inputs().len()).try_fold(0u32, |total, index| {
+            total
+                .checked_add(self.input_verification_work(index)?)
+                .ok_or(Error::ScriptInvalid)
+        })
+    }
+
+    /// Conservative work for one input, derived from the output it spends.
+    pub fn input_verification_work(&self, index: usize) -> Result<u32, Error> {
+        if self.all_previous_outputs.len() != self.transaction.inputs().len() {
+            return Err(Error::TxIndex);
+        }
+        let input = self.transaction.inputs().get(index).ok_or(Error::TxIndex)?;
+        let output = self.all_previous_outputs.get(index).ok_or(Error::TxIndex)?;
+        let transparent::Input::PrevOut { unlock_script, .. } = input else {
+            return Ok(0);
+        };
+        #[cfg(feature = "pq")]
+        if self.pq_outputs.is_some() {
+            use zakura_chain::transaction::zip317::{
+                SHA2_128F_VERIFICATION_WORK, SHA2_192S_VERIFICATION_WORK,
+            };
+            use zcash_transparent::pq::{output::parse_output, ParameterSet};
+
+            if let Some(pq) =
+                parse_output(&script::Code(output.lock_script.as_raw_bytes().to_vec()))?
+            {
+                let spend = pq.authenticate_spend(unlock_script.as_raw_bytes())?;
+                let weight = match spend.parameters() {
+                    ParameterSet::Sha2_128f => SHA2_128F_VERIFICATION_WORK,
+                    ParameterSet::Sha2_192s => SHA2_192S_VERIFICATION_WORK,
+                };
+                return spend
+                    .sig_op_count(true)
+                    .checked_mul(weight)
+                    .ok_or(Error::ScriptInvalid);
+            }
+        }
+        legacy_sigop_count(unlock_script.as_raw_bytes())
+            .checked_add(legacy_sigop_count(output.lock_script.as_raw_bytes()))
+            .and_then(|count| count.checked_add(p2sh_input_sigop_count(input, output)))
+            .ok_or(Error::ScriptInvalid)
+    }
+
     /// Verify if the script in the input at `input_index` of a transaction correctly spends the
     /// matching [`transparent::Output`] it refers to.
     pub fn is_valid(&self, input_index: usize) -> Result<(), Error> {

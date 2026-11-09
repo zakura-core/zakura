@@ -287,6 +287,7 @@ fn checked_add_transaction(
 struct BlockTemplateLimits {
     remaining_bytes: usize,
     remaining_sigops: u32,
+    remaining_verification_work: u32,
     remaining_unpaid_actions: u32,
     remaining_orchard_actions: u32,
     remaining_ironwood_actions: u32,
@@ -316,6 +317,11 @@ impl BlockTemplateLimits {
                 .checked_sub(coinbase.sigops)
                 .expect("coinbase sigops fit within the block limit"),
             remaining_unpaid_actions: BLOCK_UNPAID_ACTION_LIMIT,
+            remaining_verification_work: if zakura_script::pq_outputs_active(network, height) {
+                transaction::zip317::MAX_BLOCK_VERIFICATION_WORK
+            } else {
+                u32::MAX
+            },
             remaining_orchard_actions: shielded_limits.orchard_actions,
             remaining_ironwood_actions: shielded_limits.ironwood_actions,
             remaining_sapling_ios: shielded_limits.sapling_ios,
@@ -383,6 +389,7 @@ impl BlockTemplateLimits {
 
         if tx.transaction.size() > self.remaining_bytes
             || tx_block_sigops > self.remaining_sigops
+            || tx.verification_work > self.remaining_verification_work
             || tx.unpaid_actions > self.remaining_unpaid_actions
             || counts.orchard_actions > self.remaining_orchard_actions
             || counts.ironwood_actions > self.remaining_ironwood_actions
@@ -395,6 +402,7 @@ impl BlockTemplateLimits {
 
         self.remaining_bytes -= tx.transaction.size();
         self.remaining_sigops -= tx_block_sigops;
+        self.remaining_verification_work -= tx.verification_work;
         self.remaining_unpaid_actions -= tx.unpaid_actions;
         self.remaining_orchard_actions -= counts.orchard_actions;
         self.remaining_ironwood_actions -= counts.ironwood_actions;

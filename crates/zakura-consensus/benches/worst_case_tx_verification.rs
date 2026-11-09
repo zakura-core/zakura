@@ -475,6 +475,7 @@ fn build_workload(case: &BenchmarkCase, candidates: &[CandidateTx]) -> Option<Wo
                 known_outpoint_hashes: known_outpoint_hashes.clone(),
                 known_utxos: known_utxos.clone(),
                 parent_utxos: Arc::new(HashMap::new()),
+                verification_budget: Default::default(),
                 height: candidate.height,
                 time: candidate.time,
             }

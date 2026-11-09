@@ -13,6 +13,28 @@ use zakura_test::prelude::*;
 
 use crate::{legacy_sigop_count, p2sh_sigop_count, Sigops};
 
+#[test]
+fn verification_work_counts_spent_bare_multisig_instead_of_created_outputs() {
+    let transaction = SCRIPT_TX
+        .zcash_deserialize_into::<Arc<Transaction>>()
+        .unwrap();
+    // A bare multisig operation conservatively charges twenty comparisons, even
+    // inside an unexecuted branch. Newly created outputs are not executed here.
+    let output = Output {
+        value: 1u64.try_into().unwrap(),
+        lock_script: transparent::Script::new(&[0, 0x63, 0xae, 0x68, 0x51]),
+    };
+    let cached = super::CachedFfiTransaction::new(
+        transaction.clone(),
+        Arc::new(vec![output]),
+        NetworkUpgrade::Blossom,
+    )
+    .unwrap();
+    assert_eq!(transaction.sigops(), 1);
+    assert_eq!(cached.verification_work().unwrap(), 20);
+    assert_eq!(cached.input_verification_work(0).unwrap(), 20);
+}
+
 pub static SCRIPT_PUBKEY: LazyLock<Vec<u8>> = LazyLock::new(|| {
     <Vec<u8>>::from_hex("76a914f47cac1e6fec195c055994e8064ffccce0044dd788ac").unwrap()
 });

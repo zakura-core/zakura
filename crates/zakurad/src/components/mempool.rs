@@ -392,6 +392,10 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // faith.
         RestrictedPqOutput { .. } => Cooldown,
 
+        // PQ work limits also start at a chain-configured height. A peer
+        // before that height can still relay the transaction in good faith.
+        VerificationWorkLimit => Cooldown,
+
         // These failures already received no mempool penalty. Preserve that
         // policy when peers disagree about the tip or network upgrade.
         WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | ExpiredTransaction { .. } => {

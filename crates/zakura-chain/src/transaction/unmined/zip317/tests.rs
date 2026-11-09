@@ -1,5 +1,47 @@
 //! ZIP-317 tests.
 
+#[test]
+fn verification_work_sets_fee_without_adding_to_byte_charge() {
+    use super::{
+        conventional_actions_with_work, conventional_fee_with_work, unpaid_actions_with_work,
+    };
+    use crate::transparent::{Input, OutPoint, Script};
+    let tx = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(1),
+        inputs: vec![Input::PrevOut {
+            outpoint: OutPoint {
+                hash: crate::transaction::Hash([0; 32]),
+                index: 0,
+            },
+            unlock_script: Script::new(&vec![0; 17_000]),
+            sequence: 0,
+        }],
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let byte_actions = conventional_actions(&tx);
+    assert!(byte_actions > 60);
+    assert_eq!(conventional_actions_with_work(&tx, 60), byte_actions);
+    assert_eq!(conventional_actions_with_work(&tx, 600), 600);
+    assert_eq!(conventional_actions_with_work(&tx, u32::MAX), u32::MAX);
+    assert_eq!(
+        conventional_fee_with_work(&tx, 600),
+        Amount::<NonNegative>::try_from(240_000).unwrap()
+    );
+    let unmined = UnminedTx::from(tx);
+    assert_eq!(
+        unpaid_actions_with_work(&unmined, Amount::try_from(239_999).unwrap(), 600),
+        1
+    );
+    assert_eq!(
+        unpaid_actions_with_work(&unmined, Amount::try_from(240_000).unwrap(), 600),
+        0
+    );
+}
+
 use super::{
     conventional_actions, conventional_fee, conventional_fee_weight_ratio, mempool_checks,
     unpaid_actions, Amount, Error,

@@ -2039,6 +2039,15 @@ pub enum ReadRequest {
     /// Returned txids are in the order they appear in the block.
     AnyChainTransactionIdsForBlock(HashOrHeight),
 
+    /// Looks up which of the given transaction IDs are mined in the current best chain.
+    ///
+    /// Returns [`ReadResponse::MinedTransactionIds`] with the subset of the
+    /// requested IDs that are in the best chain.
+    ///
+    /// Only the transaction indexes are read, so the transactions are not read
+    /// or decoded. The cost is one index lookup per requested ID.
+    MinedTransactionIds(HashSet<transaction::Hash>),
+
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
     ///
@@ -2475,6 +2484,7 @@ impl ReadRequest {
             ReadRequest::AnyChainRawTransaction(_) => "any_chain_raw_transaction",
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
+            ReadRequest::MinedTransactionIds(_) => "mined_transaction_ids",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             ReadRequest::CheckParentInputs { .. } => "check_parent_inputs",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",

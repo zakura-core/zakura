@@ -559,6 +559,10 @@ pub enum ReadResponse {
     /// in the best chain, or `None` if the block was not found.
     AnyChainTransactionIdsForBlock(Option<(Arc<[transaction::Hash]>, bool)>),
 
+    /// Response to [`ReadRequest::MinedTransactionIds`], with the requested
+    /// transaction IDs that are mined in the best chain.
+    MinedTransactionIds(HashSet<transaction::Hash>),
+
     /// Response to [`ReadRequest::SpendingTransactionId`],
     /// with an list of transaction hashes in block order,
     /// or `None` if the block was not found.
@@ -826,6 +830,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
+            | ReadResponse::MinedTransactionIds(_)
             | ReadResponse::SaplingTree(_)
             | ReadResponse::OrchardTree(_)
             | ReadResponse::IronwoodTree(_)

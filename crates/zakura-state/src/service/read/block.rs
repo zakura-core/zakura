@@ -229,6 +229,34 @@ where
     Ok(tip_height(chain, db).map(|tip| MinedTx::new(tx, height, 1 + tip.0 - height.0, time)))
 }
 
+/// Returns the transaction IDs in `hashes` that are mined in the non-finalized
+/// best `chain` or the finalized `db`.
+///
+/// Only the transaction indexes are read, so the transactions are not read or decoded.
+pub fn mined_transaction_ids<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hashes: &HashSet<transaction::Hash>,
+) -> HashSet<transaction::Hash>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // Finalized state updates can only add overlapping blocks, so a transaction
+    // that moves from the chain to the database while this runs is found in one of them.
+    hashes
+        .iter()
+        .filter(|hash| {
+            chain
+                .as_ref()
+                .is_some_and(|chain| chain.as_ref().contains_transaction(hash))
+                || db.transaction_location(**hash).is_some()
+        })
+        .copied()
+        .collect()
+}
+
 /// Returns a [`AnyTx`] for a [`Transaction`] with [`transaction::Hash`], and the
 /// transaction's Zcash consensus serialization, if one exists in any chain in
 /// `chains` or finalized `db`.

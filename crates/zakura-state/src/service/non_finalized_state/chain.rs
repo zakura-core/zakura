@@ -622,6 +622,13 @@ impl Chain {
         self.blocks.get(&height).map(Arc::as_ref)
     }
 
+    /// Returns `true` if the transaction with `hash` is in this chain.
+    ///
+    /// Only reads the transaction index, so the transaction is not retained.
+    pub fn contains_transaction(&self, hash: &transaction::Hash) -> bool {
+        self.tx_loc_by_hash.contains_key(hash)
+    }
+
     /// Returns the [`Transaction`] with [`transaction::Hash`], if it exists in this chain.
     pub fn transaction(
         &self,

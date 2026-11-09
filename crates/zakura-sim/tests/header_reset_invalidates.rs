@@ -432,11 +432,12 @@ fn a_round_started_before_adopting_a_reset_retires_obsolete() {
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-reset-<name>.json` with its Plan bytes beside
 /// it in `header-reset-<name>.plan`.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
+fn committed_witnesses() -> [(&'static str, StorageScenario); 5] {
     [
         ("held-locator", held_locator()),
         ("held-prepare", held_prepare()),
         ("held-apply", held_apply()),
+        ("held-reply", held_reply()),
         ("quiet-reset", quiet_reset()),
     ]
 }

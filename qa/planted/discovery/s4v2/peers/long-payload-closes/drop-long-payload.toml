@@ -1,8 +1,9 @@
 # Discovery's reader skips the maximum of its `peers` row, its precheck and
 # the frame cap, and discovery drops a `peers` frame over that maximum
-# instead of closing. Skipping the reader's checks alone would leave
-# discovery's codec to close. The scenario's peer sends its held `Peers` one
-# byte over the row's maximum, and the node never closes for it.
+# instead of closing. Skipping the reader's checks alone already leaves the
+# node quiet: the run goes quiescent before the payload's read completes, so
+# the input never reaches the drop. The scenario's peer sends its held
+# `Peers` one byte over the row's maximum, and the node never closes for it.
 # Besides the files the patch changes, the reader's read path and the rest
 # of discovery decide whether the frame reaches the drop.
 checks = [

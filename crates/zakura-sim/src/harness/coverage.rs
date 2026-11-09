@@ -224,8 +224,8 @@ const RELEASE_FACT: Bypass = Bypass::Pending(
 /// The planted cases of the discovery IDs whose guard is the shared frame
 /// reader's (disc-3.3). Each patch makes the reader skip one check for one
 /// row of discovery's table, and discovery drop that frame instead of
-/// closing. Skipping the reader's check alone would leave discovery's codec
-/// to close the connection.
+/// closing. For most of the 16 inputs, skipping the reader's check alone
+/// would leave discovery's codec to close the connection.
 const DROP_UNDECLARED_TYPE: Bypass = Bypass::Planted("drop-undeclared-type");
 /// See [`DROP_UNDECLARED_TYPE`].
 const DROP_RESERVED_FLAGS: Bypass = Bypass::Planted("drop-reserved-flags");

@@ -1,0 +1,12 @@
+# Each apply and operator reset, once committed, points every header that
+# inherits ineligibility at the finalized anchor instead of its ineligible
+# parent, so the header stays ineligible with the wrong source. The
+# witness invalidates one below the tip, so the tip inherits. The queue,
+# the reactor and the planner decide when its resets run, so a change
+# there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset-deep.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset-deep.plan"

@@ -239,8 +239,16 @@ pub fn quiet_reset() -> StorageScenario {
     }
 }
 
+/// [`quiet_reset`] with the invalidation one below the tip, so the tip
+/// inherits its parent's ineligibility until the reconsider.
+pub fn quiet_reset_deep() -> StorageScenario {
+    let mut scenario = quiet_reset();
+    scenario.controls[0].action = ControlAction::Reset(Reset::Invalidate { depth: 1 });
+    scenario
+}
+
 /// Every witness, by name.
-fn witnesses() -> [(&'static str, StorageScenario); 9] {
+fn witnesses() -> [(&'static str, StorageScenario); 10] {
     [
         ("held-locator", held_locator()),
         ("held-prepare", held_prepare()),
@@ -251,6 +259,7 @@ fn witnesses() -> [(&'static str, StorageScenario); 9] {
         ("tip-reuse", tip_reuse()),
         ("completion-before-adoption", completion_before_adoption()),
         ("quiet-reset", quiet_reset()),
+        ("quiet-reset-deep", quiet_reset_deep()),
     ]
 }
 
@@ -432,13 +441,14 @@ fn a_round_started_before_adopting_a_reset_retires_obsolete() {
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-reset-<name>.json` with its Plan bytes beside
 /// it in `header-reset-<name>.plan`.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 5] {
+fn committed_witnesses() -> [(&'static str, StorageScenario); 6] {
     [
         ("held-locator", held_locator()),
         ("held-prepare", held_prepare()),
         ("held-apply", held_apply()),
         ("held-reply", held_reply()),
         ("quiet-reset", quiet_reset()),
+        ("quiet-reset-deep", quiet_reset_deep()),
     ]
 }
 

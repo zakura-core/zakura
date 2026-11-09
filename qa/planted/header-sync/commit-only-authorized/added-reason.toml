@@ -1,0 +1,11 @@
+# Each operator reset, once committed, also gives every header with a
+# direct reason a permanent checkpoint conflict, so the invalidated target
+# stays excluded after its reconsideration although it's still ineligible
+# either way. The queue, the reactor and the planner decide when the
+# witness's resets run, so a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.json"
+plan = "crates/zakura-sim/tests/fixtures/header-reset-quiet-reset.plan"

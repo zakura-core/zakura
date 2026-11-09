@@ -372,6 +372,14 @@ impl AdoptionEvidence {
         self.store().settled = Some(settled(end));
     }
 
+    /// Whether the run [`settled`] with a publication still waiting for its
+    /// watch read under `queue` ([`WatchRead::Open`]). False before the run
+    /// has ended ([`AdoptionEvidence::end`]).
+    pub fn unread_at_settled_end(&self, queue: EventQueue) -> bool {
+        let open = self.watch_read(queue) == WatchRead::Open;
+        open && self.store().settled == Some(true)
+    }
+
     /// Every fact so far, in the order the reactor reported them.
     pub fn facts(&self) -> Vec<Stamped> {
         self.store().facts.clone()
@@ -461,9 +469,12 @@ impl AdoptionEvidence {
 
     /// Whether some published state had `queue` compete with its watch
     /// read: the run loop took an event from `queue` after the publication
-    /// and before any read of it. That's [`AdoptionEvidence::watch_read`]'s
-    /// trigger history: every break of the rule takes such an event first,
-    /// and a quiet run, whose watch read comes first, never does.
+    /// and before any read of it. With
+    /// [`AdoptionEvidence::unread_at_settled_end`], that's
+    /// [`AdoptionEvidence::watch_read`]'s trigger history: a break of the
+    /// rule either takes such an event first or settles with the
+    /// publication unread, and a quiet run, whose watch read comes first,
+    /// does neither.
     pub fn published_into_flood(&self, queue: EventQueue) -> bool {
         let store = self.store();
         store.facts.iter().enumerate().any(|(index, published)| {
@@ -719,7 +730,10 @@ fn unsent(session: u64, due: Duration) -> Acceptance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::end::Drain;
+    use crate::{
+        domain::header_sync::{watch_end_violations, WATCH_OBSERVED_UNDER_FLOOD},
+        end::Drain,
+    };
 
     /// An adoption at generation `generation` whose tip is at `height`.
     fn adoption(generation: u64, height: u32) -> Adoption {
@@ -826,6 +840,51 @@ mod tests {
         AdoptionFact::WatchObserved {
             state_version: StateVersion::new(version),
         }
+    }
+
+    /// A loop that stops right after a publication, taking no event and
+    /// reading nothing, leaves no competing event, so only the settled end
+    /// shows it. That end is the trigger history and the break, unless the
+    /// harness had begun a shutdown. A run that hasn't ended, or ended
+    /// unsettled, shows neither, and nor does a read.
+    #[test]
+    fn a_publication_unread_at_a_settled_end_breaks_the_watch_rule() {
+        let settled = RunEnd {
+            outcome: Outcome::Budget,
+            steps: 100,
+            violation: None,
+            drain: Some(Drain {
+                steps: 10,
+                exhausted: false,
+            }),
+            harness: None,
+        };
+        let cut = RunEnd {
+            drain: Some(Drain {
+                steps: 10,
+                exhausted: true,
+            }),
+            ..settled.clone()
+        };
+        let wedged = evidence(vec![(0, commit(2))], 0);
+        assert!(!wedged.unread_at_settled_end(EventQueue::Wire));
+        wedged.end(&settled);
+        assert!(!wedged.published_into_flood(EventQueue::Wire));
+        assert!(wedged.unread_at_settled_end(EventQueue::Wire));
+        let found = watch_end_violations(&wedged, EventQueue::Wire, false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].property.to_string(), WATCH_OBSERVED_UNDER_FLOOD);
+        assert!(watch_end_violations(&wedged, EventQueue::Wire, true).is_empty());
+
+        let unsettled = evidence(vec![(0, commit(2))], 0);
+        unsettled.end(&cut);
+        assert!(!unsettled.unread_at_settled_end(EventQueue::Wire));
+        assert!(watch_end_violations(&unsettled, EventQueue::Wire, false).is_empty());
+
+        let read = evidence(vec![(0, commit(2)), (0, self::read(2))], 0);
+        read.end(&settled);
+        assert!(!read.unread_at_settled_end(EventQueue::Wire));
+        assert!(watch_end_violations(&read, EventQueue::Wire, false).is_empty());
     }
 
     /// The watch rule over `facts`, all at time 0.

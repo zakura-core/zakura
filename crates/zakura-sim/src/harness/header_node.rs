@@ -42,7 +42,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use zakura_chain::block;
-use zakura_header_chain::{Frontier, VctRootRepairStatus};
+use zakura_header_chain::{Frontier, VctRootRepairState, VctRootRepairStatus};
 use zakura_network::zakura::{
     framed_channel,
     observe::HeaderSyncObserver,
@@ -54,7 +54,7 @@ use zakura_network::zakura::{
     ZakuraPeerId, LOCAL_MAX_MESSAGE_BYTES, ZAKURA_CAP_HEADER_SYNC,
     ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_HEADER_SYNC,
 };
-use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port};
+use zakura_node_services::header_chain::{ApplyHeaderTargetOutcome, Port, PrepareHeaderTarget};
 use zakura_quic::NodeSecretKey;
 use zakura_rt::sync::{mpsc, watch, CancellationToken};
 use zakura_scheduler::SimInstant;
@@ -158,9 +158,30 @@ fn ready<F: Future>(future: F) -> F::Output {
 /// controlled port pristine, and fixture headers validate the same against
 /// any clock only outside a run.
 pub fn preload(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
+    preload_requests(port, fixture, chain, |request| request);
+}
+
+/// [`preload`], with every header carrying the fixture's tree record
+/// ([`HeaderFixture::with_tree_aux`]), as a node that holds the chain's
+/// tree roots does. Its publisher serves them to a repair.
+pub fn preload_with_tree_aux(port: &EnginePort, fixture: &HeaderFixture, chain: &Chain) {
+    preload_requests(port, fixture, chain, |request| {
+        fixture.with_tree_aux(request)
+    });
+}
+
+/// Commits `chain` to `port`, one segment at a time, each segment's
+/// request passed through `request` first.
+fn preload_requests(
+    port: &EnginePort,
+    fixture: &HeaderFixture,
+    chain: &Chain,
+    request: impl Fn(PrepareHeaderTarget) -> PrepareHeaderTarget,
+) {
     for (request_id, (parent, headers)) in (1..).zip(chain.segments(fixture)) {
-        let request = fixture.target_request(&port.snapshot(), parent, &headers, request_id);
-        let prepared = ready(port.prepare_header_target(request)).expect("fixture headers prepare");
+        let target =
+            request(fixture.target_request(&port.snapshot(), parent, &headers, request_id));
+        let prepared = ready(port.prepare_header_target(target)).expect("fixture headers prepare");
         ready(port.apply_header_target(prepared)).expect("fixture headers apply");
     }
 }
@@ -614,6 +635,9 @@ impl Link {
     /// Closes the connection on both sides, as a transport does when either
     /// end goes away.
     pub fn close(&self) {
+        if let Some(sessions) = &self.sessions {
+            sessions.harness_closed(self.conn_id);
+        }
         self.record_closed();
         for token in &self.tokens {
             token.cancel();
@@ -704,10 +728,15 @@ async fn flood(far: FarEnd) {
     }
 }
 
+/// How often one `Churn` step relinks its mirror. A bound lets a run
+/// settle once churn stops, so a node that stops taking work under churn
+/// is told apart from one still being churned.
+pub const CHURN_RELINKS: u32 = 8;
+
 /// Relinks the mirror whose index `start` delivers to the node under test
-/// as its dialer, once per scheduling step, until the node's shutdown. Each
-/// relink replaces the mirror's session, so the node's lifecycle queue
-/// takes a disconnect and a connect every time.
+/// as its dialer, once per scheduling step, [`CHURN_RELINKS`] times or until
+/// the node's shutdown. Each relink replaces the mirror's session, so the
+/// node's lifecycle queue takes a disconnect and a connect every time.
 ///
 /// Opening a link has scheduling points, so a `Shutdown` can be picked and
 /// sweep the node's links while one is half open. The sweep then misses
@@ -719,7 +748,7 @@ async fn churn(topology: Rc<Topology>, mut start: mpsc::Receiver<usize>) {
         return;
     };
     drop(start);
-    loop {
+    for _ in 0..CHURN_RELINKS {
         if topology.stopping() {
             return;
         }
@@ -1003,6 +1032,13 @@ impl Topology {
         self.stopping.get() || self.nodes[0].shutdown.is_cancelled()
     }
 
+    /// Whether the harness picked a `Shutdown` step, which begins the node
+    /// under test's stop. Only the harness does, so this is an environment
+    /// end ([`EndedBy`](crate::property::EndedBy)).
+    pub(crate) fn shutdown_picked(&self) -> bool {
+        self.stopping.get()
+    }
+
     /// Each link's session and how long it lasted, in link order. A session
     /// ends when [`Effects::ended`] records it, or when a later link to the
     /// same peer replaces it, whichever comes first. The node refuses a
@@ -1106,8 +1142,8 @@ pub enum ControlAction {
     /// reads whatever the node sends.
     Flood,
     /// Start relinking the named mirror to the node under test, once per
-    /// scheduling step until the node's shutdown, so lifecycle events stay
-    /// queued.
+    /// scheduling step, [`CHURN_RELINKS`] times or until the node's
+    /// shutdown, so lifecycle events stay queued.
     Churn,
     /// End the hostile prefix and recover, with the named mirror as the
     /// source. At its pick the scenario's controls stop, every invalidation
@@ -1116,6 +1152,17 @@ pub enum ControlAction {
     /// every earlier step, and never after a `Shutdown`. See the
     /// [`recovery`] module.
     Recover,
+    /// Publish a VCT root repair status on the node under test's repair
+    /// watch, which the step must name, as zakura-state publishes one when
+    /// it finds tree data missing. The node's storage resolves the repair
+    /// only up to its checkpoint ceiling, which is 0 unless the harness
+    /// raised it.
+    RepairStatus {
+        /// The height whose tree data is missing, or `None` for `Idle`.
+        unavailable: Option<u32>,
+        /// The status's generation.
+        generation: u64,
+    },
 }
 
 /// What a [`ControlAction::Reset`] does, judged at its pick, since only
@@ -1151,6 +1198,7 @@ impl ControlAction {
             ControlAction::Flood => "flood",
             ControlAction::Churn => "churn",
             ControlAction::Recover => "recover",
+            ControlAction::RepairStatus { .. } => "repair-status",
         }
     }
 
@@ -1165,6 +1213,7 @@ impl ControlAction {
                 | ControlAction::StopStorage
                 | ControlAction::Commit { .. }
                 | ControlAction::Recover
+                | ControlAction::RepairStatus { .. }
         )
     }
 }
@@ -1277,7 +1326,8 @@ impl Control {
                     | ControlAction::Release { .. }
                     | ControlAction::StopStorage
                     | ControlAction::Commit { .. }
-                    | ControlAction::Recover => {
+                    | ControlAction::Recover
+                    | ControlAction::RepairStatus { .. } => {
                         unreachable!("the step loop carries out run-only steps")
                     }
                 }
@@ -1379,6 +1429,21 @@ impl Control {
             ControlAction::StopStorage => port()?.shut_down(),
             ControlAction::Commit { len } => self.commit(&*port()?, len)?,
             ControlAction::Recover => self.recover(&*port()?, &step.peer)?,
+            ControlAction::RepairStatus {
+                unavailable,
+                generation,
+            } => {
+                let state = match unavailable {
+                    Some(height) => VctRootRepairState::Unavailable {
+                        height: zakura_chain::block::Height(height),
+                    },
+                    None => VctRootRepairState::Idle,
+                };
+                self.topology.nodes[0]
+                    .vct_repairs
+                    .send(VctRootRepairStatus { state, generation })
+                    .map_err(|_| "the node's reactor no longer follows its repairs".to_owned())?;
+            }
             _ => unreachable!("only run-only steps run at their pick"),
         }
         Ok(())
@@ -1532,6 +1597,7 @@ impl ActionSource for Control {
             | ControlAction::Release { .. }
             | ControlAction::StopStorage
             | ControlAction::Commit { .. }
+            | ControlAction::RepairStatus { .. }
                 if step.peer != *node =>
             {
                 Some(format!(
@@ -1558,6 +1624,7 @@ impl ActionSource for Control {
             ControlAction::Reset(_)
             | ControlAction::Release { .. }
             | ControlAction::Commit { .. }
+            | ControlAction::RepairStatus { .. }
                 if self.shut_down =>
             {
                 Some(format!(

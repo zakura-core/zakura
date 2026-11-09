@@ -328,8 +328,8 @@ where
         id: PropertyId::new(CAPACITY_RELEASE_WAKES),
         claim: "in the wake fixture, a header budget return that leaves room for an offer \
                 waiting for it gets that offer's locator read to storage before quiescence, \
-                or within one cached-pass refill when the pass is deferred, unless its \
-                session ends",
+                or within one cached-pass refill when the pass is deferred, unless the \
+                environment ends its session",
         kind: Kind::Liveness {
             bound: LivenessBound::BeforeQuiescence,
         },
@@ -345,7 +345,8 @@ where
 ///
 /// Each wake the step's facts opened ([`WakeFact::Opened`]) obliges the
 /// waiting peer's locator read to reach storage before quiescence. The
-/// read's submission or the waiting session's end answers it, and a
+/// read's submission answers it, and so does the waiting session's end when
+/// the environment ended it ([`EndedBy`](crate::property::EndedBy)). A
 /// deferred cached pass moves its deadline to the pass's refill, but never
 /// past [`CACHED_PASS_REFILL`] after the wake opened. Otherwise a budget that
 /// never refills would keep deferring it. It applies once a release opened
@@ -392,11 +393,11 @@ fn wake_answer<V: WakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAn
         {
             FactAnswer::Discharges
         }
-        Some(WakeFact::Ended { peer, session_id })
-            if *subject == wake_subject(&peer, session_id) =>
-        {
-            FactAnswer::Discharges
-        }
+        Some(WakeFact::Ended {
+            peer,
+            session_id,
+            by,
+        }) if *subject == wake_subject(&peer, session_id) => by.answer(),
         Some(WakeFact::Deferred { until }) => {
             let cap = opened_at(view.wake(), subject, stamp)
                 .and_then(|opened| opened.checked_add(CACHED_PASS_REFILL));
@@ -517,7 +518,8 @@ where
 /// Checks the watch rule for `queue` over the view's adoption evidence
 /// ([`AdoptionEvidence::watch_read`]). It applies once a state is
 /// published. A publication still waiting for its read or its third event
-/// leaves the run inconclusive if it ends there.
+/// leaves the run inconclusive if it ends there, unless
+/// [`watch_end_violations`] breaks it at a settled end.
 fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
 where
     S: HasView,
@@ -538,17 +540,57 @@ where
     }
 }
 
+/// The watch property for the flooded `queue`'s violation at the run's end:
+/// a publication still unread when the run settled
+/// ([`AdoptionEvidence::unread_at_settled_end`]), unless the harness had started to
+/// stop the node (`stopping`). A correct loop with an unread publication
+/// always has its watch arm ready, so it can't settle with one. Only a
+/// shutdown, which wins the loop's biased `select!`, may leave one unread
+/// ([`EndedBy`](crate::property::EndedBy)). A harness whose view is an
+/// [`AdoptionView`] reports these from [`HasView::end_violations`], after it
+/// handed the run's end to [`AdoptionEvidence::end`].
+pub fn watch_end_violations(
+    adoption: &AdoptionEvidence,
+    queue: EventQueue,
+    stopping: bool,
+) -> Vec<EndViolation> {
+    if stopping || !adoption.unread_at_settled_end(queue) {
+        return Vec::new();
+    }
+    let property = match queue {
+        EventQueue::Wire => WATCH_OBSERVED_UNDER_FLOOD,
+        EventQueue::Lifecycle => WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+    };
+    vec![EndViolation {
+        property: PropertyId::new(property),
+        expected: "each published state is read from the committed watch before the run \
+                   settles"
+            .to_owned(),
+        actual: format!(
+            "the run settled with a published state unread and fewer than {} {queue:?} \
+             events taken since, with no shutdown begun",
+            crate::harness::header_node::adoption::WATCH_READ_EVENTS + 1
+        ),
+    }]
+}
+
 /// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state
 /// whose wire queue competed with its watch read
-/// ([`AdoptionEvidence::published_into_flood`]).
+/// ([`AdoptionEvidence::published_into_flood`]), or that the run settled
+/// with unread ([`AdoptionEvidence::unread_at_settled_end`]).
 fn published_under_wire_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
-    view.adoption().published_into_flood(EventQueue::Wire)
+    let adoption = view.adoption();
+    adoption.published_into_flood(EventQueue::Wire)
+        || adoption.unread_at_settled_end(EventQueue::Wire)
 }
 
 /// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
-/// state whose lifecycle queue competed with its watch read.
+/// state whose lifecycle queue competed with its watch read, or that the
+/// run settled with unread.
 fn published_under_lifecycle_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
-    view.adoption().published_into_flood(EventQueue::Lifecycle)
+    let adoption = view.adoption();
+    adoption.published_into_flood(EventQueue::Lifecycle)
+        || adoption.unread_at_settled_end(EventQueue::Lifecycle)
 }
 
 /// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended

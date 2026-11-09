@@ -184,8 +184,10 @@ fn ready_turns(facts: &[AdoptionFact], queue: EventQueue) -> Vec<bool> {
 }
 
 /// How loaded a queue was over a run: the turn it first was ready in,
-/// how many turns from then on it was ready in, out of how many, and its
-/// longest run of ready turns.
+/// how many turns from then until the last turn it was ready in it was
+/// ready in, out of how many, and its longest run of ready turns. Churn
+/// stops after a bounded number of relinks, so the turns after its last
+/// event don't count.
 #[derive(Debug)]
 struct Load {
     filled: usize,
@@ -198,7 +200,11 @@ struct Load {
 fn load(facts: &[AdoptionFact], queue: EventQueue) -> Load {
     let turns = ready_turns(facts, queue);
     let filled = turns.iter().position(|&ready| ready).unwrap_or(turns.len());
-    let after = &turns[filled..];
+    let last = turns
+        .iter()
+        .rposition(|&ready| ready)
+        .map_or(filled, |at| at + 1);
+    let after = &turns[filled..last];
     let (mut streak, mut current) = (0, 0);
     for &ready in after {
         current = if ready { current + 1 } else { 0 };

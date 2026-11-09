@@ -1,8 +1,8 @@
 diff --git a/crates/zakura-header-chain/src/transition/invariants/checks/generations.rs b/crates/zakura-header-chain/src/transition/invariants/checks/generations.rs
-index d57db88bf1..0785bad251 100644
+index d57db88bf1..0474bd7e26 100644
 --- a/crates/zakura-header-chain/src/transition/invariants/checks/generations.rs
 +++ b/crates/zakura-header-chain/src/transition/invariants/checks/generations.rs
-@@ -55,13 +55,15 @@ pub(crate) fn verify_generations(
+@@ -55,13 +55,20 @@ pub(crate) fn verify_generations(
              .header_node(node.hash)
              .is_some_and(|old| old.is_eligible() != node.is_eligible())
      });
@@ -15,7 +15,12 @@ index d57db88bf1..0785bad251 100644
 -        || plan.change_set.finality_append.is_some();
 +    // Mutation: the self-check expects an insertion to keep the
 +    // generation too.
-+    let header_effect = plan.change_set.index_changes.inserted.is_empty()
++    let inserted = plan
++        .change_set
++        .put_nodes
++        .iter()
++        .any(|node| engine_before_commit.graph().header_node(node.hash).is_none());
++    let header_effect = !inserted
 +        && (selected_changed
 +            || !plan.change_set.delete_nodes.is_empty()
 +            || header_validation_changed
@@ -26,20 +31,31 @@ index d57db88bf1..0785bad251 100644
          plan.snapshot_before_commit
              .header_generation
 diff --git a/crates/zakura-header-chain/src/transition/planner/write_set.rs b/crates/zakura-header-chain/src/transition/planner/write_set.rs
-index 2b3c090075..755dd187de 100644
+index 2b3c090075..e012a47421 100644
 --- a/crates/zakura-header-chain/src/transition/planner/write_set.rs
 +++ b/crates/zakura-header-chain/src/transition/planner/write_set.rs
-@@ -127,7 +127,12 @@ pub(super) fn derive_plan(
+@@ -127,12 +127,18 @@ pub(super) fn derive_plan(
          || alarm_changed;
      if changed {
          metadata.state_version = metadata.state_version.checked_next()?;
 -        if selected_changed
+-            || header_topology_changed
+-            || header_validation_changed
+-            || header_eligibility_changed
+-            || !eligibility_changes.is_empty()
+-            || finality_append.is_some()
 +        // Mutation: a commit that inserts a header keeps the header
 +        // generation.
 +        let inserted = put_nodes
 +            .iter()
 +            .any(|node| base_graph.header_node(node.hash).is_none());
-+        if !inserted && selected_changed
-             || header_topology_changed
-             || header_validation_changed
-             || header_eligibility_changed
++        if !inserted
++            && (selected_changed
++                || header_topology_changed
++                || header_validation_changed
++                || header_eligibility_changed
++                || !eligibility_changes.is_empty()
++                || finality_append.is_some())
+         {
+             metadata.header_generation = metadata.header_generation.checked_next()?;
+         }

@@ -170,7 +170,10 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+#
+# The post-quantum transparent output work is unreleased in Common, so there is no
+# published version to depend on yet. Drop this entry once the pin moves to one.
+allow-git = ["https://github.com/zakura-core/common"]
 
 [sources.allow-org]
 github = [

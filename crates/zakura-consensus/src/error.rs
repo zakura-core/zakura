@@ -615,7 +615,10 @@ impl TransactionError {
             | SproutJoinSplitsExceedBlockLimit { .. }
             | ShieldedCostExceedsBlockBudget { .. }
             | LockedUntilAfterBlockHeight(_)
-            | LockedUntilAfterBlockTime(_) => 100,
+            | LockedUntilAfterBlockTime(_)
+            // No honest wallet pays to an output nothing can spend, and a node
+            // applying these rules will not relay or mine one.
+            | RestrictedPqOutput { .. } => 100,
 
             // NU6.2 mempool transactions are invalid under NU6.3 rules, but
             // honest peers can relay them briefly while their chain tips converge.

@@ -325,6 +325,7 @@ fn is_scored_but_never_bans(error: &TransactionError) -> bool {
         WrongConsensusBranchId
             | MissingConsensusBranchId
             | DisabledAddToSproutPool
+            | RestrictedPqOutput { .. }
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_)
             | ImmatureTransparentCoinbaseSpend { .. }

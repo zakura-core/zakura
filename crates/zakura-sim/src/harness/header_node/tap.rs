@@ -103,7 +103,7 @@ use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture}
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
     authority::{Authority, AuthorityEvidence},
-    capacity::{self, BoundaryRead, Broken, CapacityEvidence, CapacityReading, Expected, Limits},
+    capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     chain_effect::{ChainEffect, ChainEffectEvidence, EngineAt},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},

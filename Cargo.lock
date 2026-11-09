@@ -3442,6 +3442,7 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "libc",
+ "proc-macro2",
  "proptest",
  "rand 0.10.2",
  "rayon",

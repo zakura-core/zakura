@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod discovery_machine;
 pub mod discovery_service;
 pub mod fixtures;
+pub mod header_acceptance;
 pub mod header_node;
 pub mod header_sync;
 pub mod header_work;

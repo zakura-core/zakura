@@ -48,6 +48,9 @@ rayon = { workspace = true }
 # to check that equal records still write equal bytes.
 serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
+# The header-acceptance checks read test items from source tokens, with
+# line numbers.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 # A runtime for the serving tool in the model agreement tests.
 tokio = { workspace = true, features = ["rt", "time"] }
 tokio-stream = { workspace = true }

@@ -125,6 +125,15 @@ impl HasView for Handle {
     }
 }
 
+/// Every source `machine`'s property needs, for hdr-14's missing-source
+/// keys.
+pub(crate) fn needs(machine: &Machine) -> Vec<Source> {
+    properties(machine)
+        .iter()
+        .flat_map(|property| property.needs.iter().copied())
+        .collect()
+}
+
 fn properties(machine: &Machine) -> Vec<Property<Handle>> {
     vec![Property {
         id: PropertyId::new(machine.name),

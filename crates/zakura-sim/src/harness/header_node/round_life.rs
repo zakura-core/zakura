@@ -31,10 +31,10 @@
 //!   port recorded around the run. One that inserts nothing, such as an
 //!   all-duplicate apply or an alarm-only commit, is exempt.
 //! - **Locator results.** Each locator storage read gives the engine's
-//!   selected path as its durable state then holds it: its tip is the
-//!   selected projection's tip, its anchor the finalized anchor, and every
-//!   entry a header of the selected projection. The read's generation
-//!   doesn't vouch for its hashes.
+//!   selected path as the durable state the port recorded at the read
+//!   holds it: its tip is the selected projection's tip, its anchor the
+//!   finalized anchor, and every entry a header of the selected projection.
+//!   The read's generation doesn't vouch for its hashes.
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
 //!   and the read storage answered it with has a generation and anchor no
@@ -65,7 +65,7 @@ use zakura_network::zakura::{
     HeaderTargetPurpose, ZakuraPeerId,
 };
 
-use zakura_storage::header::controlled::EngineRun;
+use zakura_storage::header::controlled::{EngineRun, RunKind};
 
 use crate::{
     observe::{StorageFact, StorageResult},
@@ -156,9 +156,6 @@ pub(super) struct RoundLife {
     accepted: HashMap<Subscription, block::Hash>,
     /// The engine's header generation before the current step.
     engine: u64,
-    /// The engine's durable state as of the last engine run, or the run's
-    /// setup before any.
-    durable: Option<zakura_header_chain::DurableState>,
     /// The breaks already found, so a slot kept across units breaks once.
     reported: BTreeSet<String>,
     breaks: Vec<String>,
@@ -183,7 +180,6 @@ impl RoundLife {
             started: HashSet::new(),
             accepted: HashMap::new(),
             engine,
-            durable: None,
             reported: BTreeSet::new(),
             breaks: Vec::new(),
             missing: None,
@@ -301,12 +297,6 @@ impl RoundLife {
         self.storage_runs(facts.into_iter().map(|fact| (fact, None)), engine);
     }
 
-    /// Notes the engine's durable state at the run's setup, which locator
-    /// reads before any engine run are judged against.
-    pub(super) fn baseline(&mut self, state: zakura_header_chain::DurableState) {
-        self.durable.get_or_insert(state);
-    }
-
     /// [`storage`](Self::storage), with each fact's engine run, if it
     /// carried one, judged right after it.
     pub(super) fn storage_runs<'f>(
@@ -315,7 +305,7 @@ impl RoundLife {
         engine: u64,
     ) {
         for (fact, run) in facts {
-            self.locator_result(fact);
+            self.locator_result(fact, run);
             match fact {
                 StorageFact::Submitted {
                     id,
@@ -366,9 +356,9 @@ impl RoundLife {
     }
 
     /// Judges an apply's engine `run`, which must advance the header
-    /// generation if it inserted a header, then keeps its durable state.
+    /// generation if it inserted a header.
     fn run(&mut self, run: &EngineRun) {
-        if let Some((id, _)) = &run.apply {
+        if let RunKind::Apply(id, _) = &run.kind {
             let inserted = run
                 .after
                 .graph
@@ -389,12 +379,11 @@ impl RoundLife {
                 }
             }
         }
-        self.durable = Some(run.after.clone());
     }
 
-    /// Judges a locator read in `fact` against the durable state's selected
-    /// path.
-    fn locator_result(&mut self, fact: &StorageFact) {
+    /// Judges a locator read in `fact` against the selected path of the
+    /// durable state its `run` recorded as it read.
+    fn locator_result(&mut self, fact: &StorageFact, run: Option<&EngineRun>) {
         let (
             StorageFact::Completed {
                 id,
@@ -407,8 +396,12 @@ impl RoundLife {
                     },
                 ..
             },
-            Some(durable),
-        ) = (fact, &self.durable)
+            Some(EngineRun {
+                kind: RunKind::Locator(_),
+                after: durable,
+                ..
+            }),
+        ) = (fact, run)
         else {
             return;
         };

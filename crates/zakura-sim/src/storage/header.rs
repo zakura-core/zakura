@@ -106,9 +106,6 @@ pub struct HeaderStorage {
     /// Each apply's and reset's engine run since the last
     /// [`take_runs`](Self::take_runs), with the fact that carried it.
     runs: Vec<(u64, Arc<EngineRun>)>,
-    /// The engine's durable state when the run bound the port, until
-    /// [`take_baseline`](Self::take_baseline) takes it.
-    baseline: Option<zakura_header_chain::DurableState>,
 }
 
 /// Whom a failed prepare or apply blamed, with each source as the hex of its
@@ -238,7 +235,6 @@ impl HeaderStorage {
             id,
             attributions: FaultAttributions::default(),
             runs: Vec::new(),
-            baseline: None,
         }
     }
 
@@ -717,7 +713,6 @@ impl ActionSource for HeaderStorage {
                 self.port
                     .bind_to_run()
                     .map_err(|error| format!("activity before binding: {error}"))?;
-                self.baseline = Some(self.port.engine().durable_state());
                 0
             }
         };
@@ -772,11 +767,6 @@ impl HeaderStorage {
     /// call logged, with the sequence number of the fact that carried it.
     pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
         std::mem::take(&mut self.runs)
-    }
-
-    /// The engine's durable state when the run bound the port, once.
-    pub(crate) fn take_baseline(&mut self) -> Option<zakura_header_chain::DurableState> {
-        self.baseline.take()
     }
 }
 

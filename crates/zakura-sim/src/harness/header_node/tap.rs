@@ -1067,20 +1067,6 @@ impl ReactorTap {
         }
     }
 
-    /// Hands the round-life check the engine's durable state at the run's
-    /// setup.
-    pub(crate) fn engine_baseline(&self, state: zakura_header_chain::DurableState) {
-        if let Some(rounds) = self
-            .state
-            .round_life
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-        {
-            rounds.baseline(state);
-        }
-    }
-
     /// Reads the node's storage facts that this step's drain logged, as
     /// `(seq, fact)` in order, so the next [`observe`](ActionSource::observe)
     /// can pair calls with them, with the engine `runs` the header storage

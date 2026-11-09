@@ -168,14 +168,25 @@ impl fmt::Display for ResetError {
 
 impl std::error::Error for ResetError {}
 
+/// What an [`EngineRun`] ran.
+#[cfg(zakura_sim)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunKind {
+    /// An apply operation, with what it returned.
+    Apply(OpId, ResultIdentity),
+    /// A selected-path locator read.
+    Locator(OpId),
+    /// An operator reset.
+    Reset,
+}
+
 /// An engine run's durable state just before and just after it, for the
-/// simulator's commit-contents and durable-state checks.
+/// simulator's commit-contents, durable-state and locator-result checks.
 #[cfg(zakura_sim)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineRun {
-    /// The apply's operation and what it returned, or `None` for an
-    /// operator reset.
-    pub apply: Option<(OpId, ResultIdentity)>,
+    /// What ran.
+    pub kind: RunKind,
     /// Before the run.
     pub before: zakura_header_chain::DurableState,
     /// After the run.
@@ -963,8 +974,12 @@ impl ControlledPort {
         // the apply installed one.
         let before = hold.then(|| self.engine.snapshot());
         #[cfg(zakura_sim)]
-        let durable_before = (early.is_none() && op == HeaderOp::ApplyHeaderTarget)
-            .then(|| self.engine.durable_state());
+        let durable_before = (early.is_none()
+            && matches!(
+                op,
+                HeaderOp::ApplyHeaderTarget | HeaderOp::ContinuationLocator
+            ))
+        .then(|| self.engine.durable_state());
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
         let (reply, effects, result) = match early {
@@ -996,7 +1011,10 @@ impl ControlledPort {
         #[cfg(zakura_sim)]
         let executed = durable_before.map(|before| {
             std::sync::Arc::new(EngineRun {
-                apply: Some((id, result.clone())),
+                kind: match op {
+                    HeaderOp::ApplyHeaderTarget => RunKind::Apply(id, result.clone()),
+                    _ => RunKind::Locator(id),
+                },
                 before,
                 after: self.engine.durable_state(),
             })
@@ -1006,8 +1024,7 @@ impl ControlledPort {
                 id,
                 now,
                 txn,
-                reply,
-                result,
+                (reply, result),
                 kinds,
                 #[cfg(zakura_sim)]
                 executed.expect("a commit runs an apply's engine"),
@@ -1089,8 +1106,7 @@ impl ControlledPort {
         id: OpId,
         now: Instant,
         txn: u64,
-        reply: HeaderReply,
-        result: ResultIdentity,
+        (reply, result): (HeaderReply, ResultIdentity),
         mut kinds: Vec<FactKind>,
         #[cfg(zakura_sim)] executed: std::sync::Arc<EngineRun>,
     ) -> Commit {
@@ -1207,7 +1223,7 @@ impl ControlledPort {
             generation: self.engine.snapshot().header_generation,
             #[cfg(zakura_sim)]
             executed: std::sync::Arc::new(EngineRun {
-                apply: None,
+                kind: RunKind::Reset,
                 before: durable_before,
                 after: self.engine.durable_state(),
             }),

@@ -22,7 +22,10 @@ use std::collections::{HashMap, HashSet};
 
 use zakura_chain::block;
 use zakura_header_chain::{DurableState, HeaderNode};
-use zakura_storage::header::{controlled::EngineRun, evidence::ResultIdentity};
+use zakura_storage::header::{
+    controlled::{EngineRun, RunKind},
+    evidence::ResultIdentity,
+};
 
 use crate::{
     observe::{StorageFact, StorageRequest},
@@ -65,13 +68,15 @@ impl Contents {
     /// Judges one engine `run`.
     pub(super) fn run(&mut self, run: &EngineRun) {
         let EngineRun {
-            apply,
+            kind,
             before,
             after,
         } = run;
-        let what = match apply {
-            Some((id, _)) => format!("apply operation {}", id.0),
-            None => "a reset".to_owned(),
+        let what = match kind {
+            RunKind::Apply(id, _) => format!("apply operation {}", id.0),
+            RunKind::Reset => "a reset".to_owned(),
+            // A read is `reset-invalidates-work`'s locator-result rule's.
+            RunKind::Locator(_) => return,
         };
         let mut found = Vec::new();
         let mut dropped: Vec<String> = before
@@ -93,8 +98,8 @@ impl Contents {
             .map(|new| hash(*new))
             .collect();
         inserted.sort_unstable();
-        let success = match apply {
-            Some((id, result)) => {
+        let success = match kind {
+            RunKind::Apply(id, result) => {
                 let payload = self.payloads.get(&id.0).cloned().flatten();
                 let stray: Vec<&String> = inserted
                     .iter()
@@ -126,7 +131,7 @@ impl Contents {
                     }
                 }
             }
-            None => {
+            _ => {
                 if !inserted.is_empty() {
                     found.push(format!("inserted {inserted:?}"));
                 }

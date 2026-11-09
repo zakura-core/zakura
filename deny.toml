@@ -85,6 +85,10 @@ skip = [
     # still resolves Rand 0.9. Remove these when the workspace converges.
     { name = "rand", version = "=0.9.4" },
     { name = "rand_chacha", version = "=0.9.0" },
+
+    # The post-quantum signature crate uses the signature 3.0 traits, while the
+    # ECDSA and Ed25519 crates still resolve 2.2. Remove when the ecosystem converges.
+    { name = "signature", version = "=2.2.0" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate

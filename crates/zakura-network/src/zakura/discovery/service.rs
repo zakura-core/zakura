@@ -583,6 +583,9 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
+    // Before the queries attach their precheck, which lets the reader read.
+    #[cfg(any(test, zakura_sim))]
+    serving.observe(&recv);
     let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,

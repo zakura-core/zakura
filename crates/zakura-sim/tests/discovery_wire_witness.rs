@@ -6,6 +6,8 @@
 //! hold on frames the node must not punish.
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     collections::BTreeSet,
     future::Future,
@@ -13,18 +15,22 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+use support::script::{run_under, OBSERVED};
 use zakura_network::zakura::{
     wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::{
     harness::{
-        discovery_service::{act_scenario, DiscoveryWire, NodeHandle, WireScenario, FAMILY},
+        discovery_service::{
+            act_scenario, wire_properties, DiscoveryWire, NodeHandle, WireScenario, FAMILY,
+            SCRIPTED,
+        },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
     peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule},
-    table::GeneratedId,
+    table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
 };
@@ -232,9 +238,8 @@ fn generated() -> Vec<String> {
 
 /// Requires `ids` to apply and hold in `report`, the run of `witness`, as
 /// `applicable` witness tests judge them, and so does the stream's
-/// `conformant-never-closes`. Every registered property is a `Draft`,
-/// whose violation doesn't stop the run, so this also requires that no
-/// property is violated. The [`UNREACHED`] ID stays `NotApplicable`.
+/// `conformant-never-closes`. A `Draft` property's violation doesn't stop
+/// the run, so this also requires that no property is violated. The [`UNREACHED`] ID stays `NotApplicable`.
 fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) {
     assert_eq!(report.end.harness, None, "{witness:?}: {:?}", report.end);
     assert_eq!(report.end.violation, None, "{witness:?}: {:?}", report.end);
@@ -476,5 +481,56 @@ fn conformant_controls_hold_conformant_never_closes() {
             })
             .collect();
         assert_eq!(labels, BTreeSet::from(["conformant"]), "{control:?}");
+    }
+}
+
+/// The scripted history that violates `id` on connection 1, one batch per
+/// step: a fault the node never punishes, or the punishment of a peer whose
+/// row's bucket it emptied.
+fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
+    let peer = |label: Label, exhausted: bool| Observation::PeerFrame {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+        row: id.row.map(str::to_owned),
+        rule_stream: STREAM,
+        label,
+        exhausted,
+        exchange: None,
+        payload: 9,
+    };
+    let judged = Observation::FrameJudged {
+        connection: 1,
+        stream: STREAM,
+        quic_stream: Some(4),
+        seq: 0,
+    };
+    let fault_close = Observation::ConnectionClosed {
+        connection: 1,
+        cause: "service_protocol_reject".to_owned(),
+    };
+    match id.template {
+        Template::Closes(label) => vec![vec![peer(label, false)], vec![judged]],
+        Template::CadenceNeverCloses => vec![
+            vec![peer(Label::Conformant, true)],
+            vec![judged, fault_close],
+        ],
+        template => panic!("no scripted bypass covers {template:?}"),
+    }
+}
+
+/// Each [`SCRIPTED`] ID fails on a scripted history that bypasses its
+/// rule.
+#[test]
+fn scripted_bypasses_violate_the_unplanted_discovery_ids() {
+    for name in SCRIPTED {
+        let parsed = GeneratedId::parse(name).expect("a generated ID parses back");
+        let report = run_under(wire_properties(), OBSERVED, bypass(&parsed));
+        assert!(
+            matches!(outcome(&report, name), PropertyOutcome::Violated { .. }),
+            "{name}: {:?}",
+            report.properties
+        );
     }
 }

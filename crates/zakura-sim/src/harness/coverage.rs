@@ -211,23 +211,19 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// The file of `discovery/wire`'s witness tests (disc-3.1).
 const DISCOVERY_WITNESSES: &str = "tests/discovery_wire_witness.rs";
 
-/// Why a discovery ID whose guard is discovery's own has no bypass yet.
-const DISCOVERY_GUARD: Bypass = Bypass::Pending("disc-3.2 adds its planted case");
-
-/// Why a discovery `over-margin-closes` ID has no bypass yet. Without a
-/// fact for the node's commitment releases, the evidence judges a request
-/// past the margin only before a fault close (`peer/evidence.rs`).
-const RELEASE_FACT: Bypass = Bypass::Pending(
-    "no fact shows the node releasing a commitment; disc-3.2 adds one with its planted case",
-);
+/// The scripted bypass that violates each discovery ID no planted case can
+/// violate alone, `discovery_service::SCRIPTED`.
+const DISCOVERY_BYPASS: Bypass = Bypass::Test(sim_test(
+    DISCOVERY_WITNESSES,
+    "scripted_bypasses_violate_the_unplanted_discovery_ids",
+));
 
 /// Why a discovery ID whose guard is the shared reader's has no bypass
 /// yet.
 const READER_GUARD: Bypass = Bypass::Pending("disc-3.3 adds its planted case");
 
 /// A discovery generated property's row: its witness test in
-/// [`DISCOVERY_WITNESSES`], and the disc-3 PR that adds its planted case.
-/// Each is a `Draft` until then.
+/// [`DISCOVERY_WITNESSES`], and its bypass.
 const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass) -> Coverage {
     Coverage {
         property,
@@ -237,9 +233,8 @@ const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass
 }
 
 /// A row for a generated discovery ID that no witness can reach, for
-/// `reason`. `witness` shows the act's other IDs apply. No planted case
-/// reaches it on this node yet; disc-3.2 adds a scripted bypass, as header
-/// sync's unreachable IDs have.
+/// `reason`. `witness` shows the act's other IDs apply, and
+/// [`DISCOVERY_BYPASS`] violates it.
 const fn discovery_unreachable(
     property: &'static str,
     reason: &'static str,
@@ -251,10 +246,7 @@ const fn discovery_unreachable(
             reason,
             witness: sim_test(DISCOVERY_WITNESSES, witness),
         },
-        bypass: Bypass::Pending(
-            "no planted case reaches it on this node; disc-3.2 adds a scripted bypass, as \
-             header sync's unreachable IDs have",
-        ),
+        bypass: DISCOVERY_BYPASS,
     }
 }
 
@@ -660,7 +652,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/conformant-never-closes",
         DISCOVERY_EVERY,
-        DISCOVERY_GUARD,
+        Bypass::Planted("close-on-expired-hello"),
     ),
     discovery(
         "discovery/s4v2/undeclared-type-closes",
@@ -685,12 +677,12 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/hello/bad-content-closes",
         HELLO_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("drop-forged-hello"),
     ),
     discovery(
         "discovery/s4v2/hello/cadence-never-closes",
         HELLO_ACTS,
-        DISCOVERY_GUARD,
+        DISCOVERY_BYPASS,
     ),
     discovery(
         "discovery/s4v2/get-peers/reserved-flags-closes",
@@ -710,17 +702,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-peers/over-margin-closes",
         GET_PEERS_ACTS,
-        RELEASE_FACT,
+        Bypass::Planted("admit-past-margin"),
     ),
     discovery(
         "discovery/s4v2/get-peers/bad-content-closes",
         GET_PEERS_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("accept-zero-limit"),
     ),
     discovery(
         "discovery/s4v2/get-peers/cadence-never-closes",
         GET_PEERS_ACTS,
-        DISCOVERY_GUARD,
+        DISCOVERY_BYPASS,
     ),
     discovery(
         "discovery/s4v2/peers/reserved-flags-closes",
@@ -740,17 +732,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/peers/unsolicited-closes",
         PEERS_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("admit-unreserved-peers"),
     ),
     discovery(
         "discovery/s4v2/peers/over-owed-closes",
         PEERS_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("reserve-largest-peers"),
     ),
     discovery(
         "discovery/s4v2/peers/bad-content-closes",
         PEERS_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("drop-forged-relay"),
     ),
     discovery(
         "discovery/s4v2/get-services/reserved-flags-closes",
@@ -770,17 +762,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-services/over-margin-closes",
         GET_SERVICES_ACTS,
-        RELEASE_FACT,
+        Bypass::Planted("admit-past-margin"),
     ),
     discovery(
         "discovery/s4v2/get-services/bad-content-closes",
         GET_SERVICES_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("accept-repeated-wanted"),
     ),
     discovery(
         "discovery/s4v2/get-services/cadence-never-closes",
         GET_SERVICES_ACTS,
-        DISCOVERY_GUARD,
+        DISCOVERY_BYPASS,
     ),
     discovery(
         "discovery/s4v2/services/reserved-flags-closes",
@@ -800,47 +792,47 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/services/unsolicited-closes",
         SERVICES_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("admit-unreserved-services"),
     ),
     discovery(
         "discovery/s4v2/services/bad-content-closes",
         SERVICES_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("skip-services-node-id"),
     ),
     discovery(
         "discovery/s4v2/hello/sender-cadence",
         DISCOVERY_EVERY,
-        DISCOVERY_GUARD,
+        Bypass::Planted("repeat-hello"),
     ),
     discovery(
         "discovery/s4v2/get-peers/sender-within-limit",
         DISCOVERY_EVERY,
-        DISCOVERY_GUARD,
+        Bypass::Planted("ask-peers-twice"),
     ),
     discovery(
         "discovery/s4v2/get-peers/sender-cadence",
         DISCOVERY_EVERY,
-        DISCOVERY_GUARD,
+        Bypass::Planted("re-ask-peers"),
     ),
     discovery(
         "discovery/s4v2/peers/sender-ends-once",
         GET_PEERS_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("answer-peers-twice"),
     ),
     discovery(
         "discovery/s4v2/get-services/sender-within-limit",
         DISCOVERY_EVERY,
-        DISCOVERY_GUARD,
+        Bypass::Planted("ask-services-twice"),
     ),
     discovery(
         "discovery/s4v2/get-services/sender-cadence",
         DISCOVERY_EVERY,
-        DISCOVERY_GUARD,
+        Bypass::Planted("re-ask-services"),
     ),
     discovery(
         "discovery/s4v2/services/sender-ends-once",
         GET_SERVICES_ACTS,
-        DISCOVERY_GUARD,
+        Bypass::Planted("answer-services-twice"),
     ),
     discovery_unreachable(
         "discovery/s4v2/services/over-owed-closes",

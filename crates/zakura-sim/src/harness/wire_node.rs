@@ -739,6 +739,12 @@ fn transition(transition: Transition) -> Result<TransitionFact, String> {
             objects,
             bytes,
         },
+        Transition::CommitmentCounted { seq, message_type } => {
+            TransitionFact::CommitmentCounted { seq, message_type }
+        }
+        Transition::CommitmentReleased { message_type } => {
+            TransitionFact::CommitmentReleased { message_type }
+        }
         unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
     })
 }

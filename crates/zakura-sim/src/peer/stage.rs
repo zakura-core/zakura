@@ -102,13 +102,16 @@ impl NodeView {
                 self.queued.objects = self.queued.objects.saturating_sub(1);
                 self.queued.bytes = self.queued.bytes.saturating_sub(bytes);
             }
-            // The checkpoint itself is read by the caller, and the rest are
-            // the peer's subscriptions on the node.
+            // The checkpoint itself is read by the caller, the next four are
+            // the peer's subscriptions on the node, and the last two are the
+            // node's serving.
             TransitionFact::HeaderChecked { .. }
             | TransitionFact::PublicationEnded { .. }
             | TransitionFact::OpenApplied { .. }
             | TransitionFact::CloseApplied { .. }
-            | TransitionFact::GrantApplied { .. } => {}
+            | TransitionFact::GrantApplied { .. }
+            | TransitionFact::CommitmentCounted { .. }
+            | TransitionFact::CommitmentReleased { .. } => {}
         }
         Ok(())
     }

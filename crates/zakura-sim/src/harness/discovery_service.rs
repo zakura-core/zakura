@@ -20,7 +20,7 @@
 //! its peers. A committed input's two-byte prefix picks one of its
 //! [`SavedPlan`]s, as `header-sync/wire`'s does. It registers discovery's
 //! generated receiver and sender properties ([`wire_properties`],
-//! disc-3.1), each a `Draft` until its planted case lands. A peer's
+//! disc-3.1), each `Active` once its planted case lands. A peer's
 //! [`PeerAction::Discover`](crate::peer::PeerAction::Discover) acts reach
 //! the receiver ones ([`act_scenario`]), and the node's own exchange
 //! reaches the sender ones.
@@ -48,6 +48,8 @@ use super::{
     NetScenario, Subsystem,
 };
 use crate::{
+    model::Label,
+    observe::StreamId,
     peer::{
         discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
         key_index,
@@ -55,9 +57,12 @@ use crate::{
         peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
         PeerTask, NODE_ADDR,
     },
-    property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status},
-    table::{sender_properties, table_properties},
-    RunConfig, Sim,
+    property::{
+        Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status,
+        TriggerHistory,
+    },
+    table::{sender_properties, table_properties, GeneratedId, Template},
+    Observation, ObservationLog, RunConfig, Sim,
 };
 
 /// The discovery node's own config.
@@ -489,8 +494,11 @@ pub const STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// `discovery/wire`'s properties: discovery's generated receiver
-/// properties, 31 IDs, then its sender properties, 7 IDs, each a `Draft`
-/// until its planted case lands (disc-3.2, disc-3.3).
+/// properties, 31 IDs, then its sender properties, 7 IDs. An ID is a
+/// `Draft` until its planted case lands. An ID with a planted case checks
+/// that case's trigger history ([`planted_trigger`]). An ID no planted case
+/// violates alone, one of [`SCRIPTED`], is `Active` with the scripted
+/// bypass in `tests/discovery_wire_witness.rs`, as header sync's are.
 ///
 /// A `bad-content-closes` ID's generated check accepts a fault close or a
 /// `Misbehavior`, and discovery's node answers bad content with a fault
@@ -509,11 +517,154 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         });
     receiver
         .chain(sender_properties(FAMILY, &STREAMS))
-        .map(|property| Property {
-            status: Status::Draft,
-            ..property
+        .map(|property| match planted_trigger(property.id.as_str()) {
+            Some(trigger) => Property {
+                witness: Some(TriggerHistory::Log(trigger)),
+                ..property
+            },
+            None if SCRIPTED.contains(&property.id.as_str()) => property,
+            None => Property {
+                status: Status::Draft,
+                ..property
+            },
         })
         .collect()
+}
+
+/// The generated IDs no planted case can violate alone, which a scripted
+/// bypass violates instead (disc-3.2). A bypass of a row's cadence punishes
+/// a conformant peer, so it violates `conformant-never-closes` too, and no
+/// scenario reaches `services/over-owed-closes`.
+pub const SCRIPTED: [&str; 4] = [
+    "discovery/s4v2/hello/cadence-never-closes",
+    "discovery/s4v2/get-peers/cadence-never-closes",
+    "discovery/s4v2/get-services/cadence-never-closes",
+    "discovery/s4v2/services/over-owed-closes",
+];
+
+/// True if the generated ID `id` has a planted case under `qa/planted/`,
+/// so it isn't a `Draft`.
+pub fn has_planted_case(id: &str) -> bool {
+    planted_trigger(id).is_some()
+}
+
+/// A trigger history over the run's observation log.
+type Trigger = fn(&ObservationLog) -> bool;
+
+/// The trigger history of the generated ID `id`'s planted case, if it has
+/// one. Each ID whose guard is discovery's own has one (disc-3.2): a
+/// `<label>-closes` ID's trigger is the node judging a frame with its label
+/// on its row ([`judged_label`]), `conformant-never-closes`'s is the node
+/// judging a conformant frame ([`judged_label`] on any row), and a sender
+/// ID's is the node sending a frame of its row ([`sent_row`]).
+fn planted_trigger(id: &str) -> Option<Trigger> {
+    let id = GeneratedId::parse(id)?;
+    let row = || {
+        <DiscoveryMessage as WireMessage>::RULES
+            .iter()
+            .position(|rule| Some(rule.name) == id.row)
+    };
+    match id.template {
+        Template::ConformantNeverCloses => Some(judged_label::<0, ANY_ROW>),
+        Template::Closes(label) => {
+            let label = GUARDED.iter().position(|guarded| *guarded == label)?;
+            match (label, row()?) {
+                (1, 1) => Some(judged_label::<1, 1>),
+                (1, 3) => Some(judged_label::<1, 3>),
+                (2, 2) => Some(judged_label::<2, 2>),
+                (2, 4) => Some(judged_label::<2, 4>),
+                (3, 2) => Some(judged_label::<3, 2>),
+                (4, 0) => Some(judged_label::<4, 0>),
+                (4, 1) => Some(judged_label::<4, 1>),
+                (4, 2) => Some(judged_label::<4, 2>),
+                (4, 3) => Some(judged_label::<4, 3>),
+                (4, 4) => Some(judged_label::<4, 4>),
+                _ => None,
+            }
+        }
+        Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
+            match row()? {
+                0 => Some(sent_row::<0>),
+                1 => Some(sent_row::<1>),
+                2 => Some(sent_row::<2>),
+                3 => Some(sent_row::<3>),
+                4 => Some(sent_row::<4>),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The labels of the judged frames that trigger discovery's own guards,
+/// as [`judged_label`] numbers them.
+const GUARDED: [Label; 5] = [
+    Label::Conformant,
+    Label::OverMargin,
+    Label::Unsolicited,
+    Label::OverOwed,
+    Label::BadContent,
+];
+
+/// [`judged_label`]'s `ROW` for a frame on any row.
+const ANY_ROW: usize = usize::MAX;
+
+/// Discovery's stream as the observations name it.
+fn discovery_stream_id() -> StreamId {
+    let [stream] = STREAMS;
+    StreamId {
+        kind: stream.kind,
+        version: stream.version,
+    }
+}
+
+/// True if `log` holds a frame the node judged on discovery's stream that
+/// the peer labelled `GUARDED[LABEL]`, on the row at `ROW` in discovery's
+/// table, or on any row for [`ANY_ROW`]. A trigger history is a plain
+/// function, so each ID takes its own instance.
+fn judged_label<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> bool {
+    let label = GUARDED[LABEL];
+    let row = <DiscoveryMessage as WireMessage>::RULES
+        .get(ROW)
+        .map(|rule| rule.name);
+    let stream = discovery_stream_id();
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream: judged,
+            quic_stream,
+            seq,
+        } = entry.obs
+        else {
+            return false;
+        };
+        judged == stream
+            && entries[..at].iter().any(|sent| {
+                matches!(&sent.obs, Observation::PeerFrame {
+                    connection: c,
+                    stream: s,
+                    quic_stream: q,
+                    seq: n,
+                    row: r,
+                    label: l,
+                    ..
+                } if (*c, *s, *q, *n) == (connection, judged, quic_stream, seq)
+                    && *l == label
+                    && (row.is_none() || r.as_deref() == row))
+            })
+    })
+}
+
+/// True if `log` holds a frame the node sent on discovery's stream on the
+/// row at `ROW` in discovery's table.
+fn sent_row<const ROW: usize>(log: &ObservationLog) -> bool {
+    let row = <DiscoveryMessage as WireMessage>::RULES[ROW].name;
+    let stream = discovery_stream_id();
+    log.entries().iter().any(|entry| {
+        matches!(&entry.obs, Observation::NodeFrame { stream: s, row: Some(r), .. }
+            if *s == stream && r == row)
+    })
 }
 
 /// The discovery node behind its real transport on simulated QUIC, named

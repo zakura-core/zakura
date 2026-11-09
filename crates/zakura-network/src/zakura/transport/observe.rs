@@ -278,6 +278,23 @@ pub enum Transition {
         /// Bytes the grant adds.
         bytes: u32,
     },
+    /// Serving counted the commitment of a request it admits, before it
+    /// checked the count against the margin. It's reported right after the
+    /// count changes, with no preemption point between.
+    CommitmentCounted {
+        /// The request's position among the stream's reads, or `None` if it
+        /// didn't come through a tagged reader.
+        seq: Option<u64>,
+        /// The request row's message type.
+        message_type: u16,
+    },
+    /// Serving released one commitment of a request row: the request's
+    /// ending entered the output, or the request was dropped. It's reported
+    /// right after the count changes, with no preemption point between.
+    CommitmentReleased {
+        /// The request row's message type.
+        message_type: u16,
+    },
 }
 
 /// The subscriber precheck's verdict on a response header.

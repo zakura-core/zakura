@@ -5,7 +5,7 @@
 use zakura_network::zakura::{wire_codec::WireMessage, DiscoveryMessage};
 use zakura_sim::{
     harness::{
-        discovery_service::{DiscoveryWire, FAMILY, STREAMS},
+        discovery_service::{has_planted_case, DiscoveryWire, FAMILY, SCRIPTED, STREAMS},
         Subsystem,
     },
     peer::discovery::discovery_stream,
@@ -31,9 +31,13 @@ fn the_registered_stream_is_the_services() {
 }
 
 /// The harness registers discovery's 31 generated receiver IDs, then its
-/// 7 sender IDs, and no other property, each a `Draft`. A receiver ID
-/// reads only the peers' frames and the node's closes, and a sender ID only
-/// the frames. No downstream template is registered.
+/// 7 sender IDs, and no other property. The 18 IDs whose guard is
+/// discovery's own and that a planted case violates alone have planted
+/// cases, are `Active` and check their cases' trigger histories. The 4
+/// [`SCRIPTED`] IDs are `Active` with a scripted bypass, and the rest are
+/// `Draft`s. A receiver ID reads only the peers' frames and the node's
+/// closes, and a sender ID only the frames. No downstream template is
+/// registered.
 #[test]
 fn the_harness_registers_the_generated_discovery_ids() {
     let receiver: Vec<String> = table_properties::<DiscoveryWire>(FAMILY, &STREAMS)
@@ -57,8 +61,25 @@ fn the_harness_registers_the_generated_discovery_ids() {
         .map(|property| property.id.to_string())
         .collect();
     assert_eq!(ids, expected);
+    let planted = ids.iter().filter(|id| has_planted_case(id)).count();
+    // Over-margin on 2 request rows, unsolicited on 2 response rows,
+    // over-owed on peers, bad content on 5 rows, conformant-never-closes,
+    // and the 7 sender IDs.
+    assert_eq!(planted, 18, "{ids:?}");
     for property in &registered {
-        assert_eq!(property.status, Status::Draft, "{}", property.id);
+        let planted = has_planted_case(property.id.as_str());
+        let status = if planted || SCRIPTED.contains(&property.id.as_str()) {
+            Status::Active
+        } else {
+            Status::Draft
+        };
+        assert_eq!(property.status, status, "{}", property.id);
+        assert_eq!(
+            property.witness.is_some(),
+            planted,
+            "{}: only a planted ID checks its case's trigger history",
+            property.id
+        );
         let needs: &[Source] = if sender.contains(&property.id.to_string()) {
             &[Source::Frames]
         } else {

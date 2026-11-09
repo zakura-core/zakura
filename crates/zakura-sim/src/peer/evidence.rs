@@ -33,19 +33,20 @@
 //!
 //! A discovery stream's frames are judged at the stage their label names
 //! ([`super::stage::discovery_stage`]), from the tap's `HeaderRead` and
-//! `FrameRead` (disc-3.1). The node may answer a request before it reads
-//! the next one, so a request the peer's models labelled `OverMargin`
-//! settles against the node's timing: its `PeerFrame` waits for its
-//! `FrameRead`. The node releases a request's commitment before it starts
-//! writing the answer, and it may admit a request well after its
-//! `FrameRead`, so the requests of its row the node had read by then, less
-//! the answers it had started writing, are never below the node's count.
-//! Within twice the row's `max_in_flight` the request settles `Conformant`.
-//! Past it the node may still admit the request, so its label stays
-//! `OverMargin` but its `FrameJudged` waits for the connection's close: a
-//! fault close is preceded by it, and any other close leaves it unjudged.
-//! A request the node never reads keeps the peer's label when its
-//! connection is torn down.
+//! `FrameRead` (disc-3.1). The node's reader may read requests well before
+//! its service admits them, and the service releases a commitment before it
+//! starts writing the answer, so a request the peer's models labelled
+//! `OverMargin` settles against the node's own count: its `PeerFrame` waits
+//! for the serving's `CommitmentCounted` that names it. The commitments of
+//! its row the serving had counted then, less those it had released, are
+//! the node's count. Past twice the row's `max_in_flight` the request is
+//! judged `OverMargin`, and within it the request is relabelled and judged
+//! `Conformant`. A fault close before the serving counts a request the node
+//! read settles it at the close, before the close: the requests of its row
+//! the node had read up to it, less the commitments released, are the count
+//! the serving would have reached. Any other close leaves it unjudged. A
+//! request the node never reads keeps the peer's label when its connection
+//! is torn down.
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
@@ -235,24 +236,35 @@ pub(crate) struct WireEvidence {
     /// Labels the node's frames on the discovery stream.
     discovery_sender: Option<DiscoverySender>,
     /// Each discovery request the peer's models labelled `OverMargin`, its
-    /// `PeerFrame` waiting to settle at its `FrameRead`.
-    unsettled: BTreeMap<FrameKey, Observation>,
-    /// Each discovery request the node read past the margin, its
-    /// `PeerFrame` waiting for its connection's close.
-    unproven: BTreeMap<FrameKey, Observation>,
-    /// Each discovery request row's requests the node read and answers it
-    /// started writing, by connection, QUIC stream and request type.
+    /// `PeerFrame` waiting for the serving to count it.
+    unsettled: BTreeMap<FrameKey, Unsettled>,
+    /// Each discovery request row's requests the node read and commitments
+    /// its serving counted and released, by connection, QUIC stream and
+    /// request type.
     margins: BTreeMap<(u64, u64, u16), Margin>,
 }
 
-/// One discovery request row's requests on one stream, as the node's
-/// reader and writer saw them.
+/// A discovery request the peer's models labelled `OverMargin`, waiting for
+/// the node's count to settle it.
+#[derive(Clone, Debug)]
+struct Unsettled {
+    /// Its `PeerFrame`.
+    frame: Observation,
+    /// Once the node read it, its request type and its position among that
+    /// row's requests the node read, from 1.
+    read: Option<(u16, u32)>,
+}
+
+/// One discovery request row's requests on one stream, as the node's reader
+/// and serving saw them.
 #[derive(Clone, Copy, Debug, Default)]
 struct Margin {
     /// Requests the node read.
     read: u32,
-    /// Answers the node started writing.
-    answered: u32,
+    /// Commitments the serving counted.
+    counted: u32,
+    /// Commitments the serving released.
+    released: u32,
 }
 
 impl WireEvidence {
@@ -482,7 +494,7 @@ impl WireEvidence {
                     payload,
                 };
                 if Some(stream) == self.discovery && label == Label::OverMargin {
-                    self.unsettled.insert(key, frame);
+                    self.unsettled.insert(key, Unsettled { frame, read: None });
                     return Some(Ok(Vec::new()));
                 }
                 frame
@@ -585,10 +597,10 @@ impl WireEvidence {
                         Some(Stage::Frame) if self.is_discovery(*connection, *quic_stream) => {
                             let waiting = self.waiting.remove(&key).expect("it waits, just read");
                             if self.discovery_read(key, waiting.row) {
-                                let judged = self.judged(key)?;
-                                self.late.extend(judged);
+                                self.judged(key)?
+                            } else {
+                                None
                             }
-                            None
                         }
                         Some(Stage::Frame) => {
                             self.waiting.remove(&key);
@@ -611,18 +623,34 @@ impl WireEvidence {
                         connection: *connection,
                         cause: cause.clone(),
                     };
-                    let unproven = take_connection(&mut self.unproven, *connection);
+                    let read: Vec<FrameKey> = self
+                        .unsettled
+                        .range((*connection, 0, 0)..=(*connection, u64::MAX, u64::MAX))
+                        .filter(|(_, unsettled)| unsettled.read.is_some())
+                        .map(|(key, _)| *key)
+                        .collect();
+                    let read: Vec<(FrameKey, Unsettled)> = read
+                        .into_iter()
+                        .map(|key| (key, self.unsettled.remove(&key).expect("just listed")))
+                        .collect();
                     if !is_fault_cause(cause) {
-                        self.late.extend(unproven.into_values());
+                        self.late
+                            .extend(read.into_iter().map(|(_, unsettled)| unsettled.frame));
                         return Ok(Some(closed));
                     }
-                    // A request the node may have admitted past the margin
-                    // justifies the fault close, and the close discharges
-                    // its `over-margin` obligation.
+                    // The node closed before its serving counted these
+                    // requests, which it would have counted in the order it
+                    // read them.
                     let mut judged = Vec::new();
-                    for (key, frame) in unproven {
-                        judged.push(frame);
-                        judged.push(self.frame_judged(key)?);
+                    for (key, unsettled) in read {
+                        let (message_type, position) =
+                            unsettled.read.expect("only read requests were listed");
+                        let released = self
+                            .margins
+                            .get(&(key.0, key.1, message_type))
+                            .map_or(0, |margin| margin.released);
+                        let open = position.saturating_sub(released);
+                        judged.extend(self.settle(key, unsettled.frame, message_type, open)?);
                     }
                     judged.push(closed);
                     let mut judged = judged.into_iter();
@@ -630,28 +658,12 @@ impl WireEvidence {
                     self.late.extend(judged);
                     first
                 }
-                TransportFact::FrameWriteStarted {
-                    quic_stream,
-                    message_type,
-                    ..
-                } if self.is_discovery(*connection, *quic_stream) => {
-                    let answers = discovery_row(*message_type).and_then(|row| match row.role {
-                        MessageRole::Response { request, .. } => Some(request),
-                        _ => None,
-                    });
-                    if let Some(request) = answers {
-                        self.margins
-                            .entry((*connection, *quic_stream, request))
-                            .or_default()
-                            .answered += 1;
-                    }
-                    None
-                }
                 TransportFact::TornDown => {
-                    for frames in [&mut self.unsettled, &mut self.unproven] {
-                        self.late
-                            .extend(take_connection(frames, *connection).into_values());
-                    }
+                    self.late.extend(
+                        take_connection(&mut self.unsettled, *connection)
+                            .into_values()
+                            .map(|unsettled| unsettled.frame),
+                    );
                     None
                 }
                 _ => None,
@@ -812,6 +824,19 @@ impl WireEvidence {
         quic_stream: u64,
         transition: &TransitionFact,
     ) -> Result<Option<Observation>, String> {
+        match *transition {
+            TransitionFact::CommitmentCounted { seq, message_type } => {
+                return self.counted(connection, quic_stream, seq, message_type);
+            }
+            TransitionFact::CommitmentReleased { message_type } => {
+                self.margins
+                    .entry((connection, quic_stream, message_type))
+                    .or_default()
+                    .released += 1;
+                return Ok(None);
+            }
+            _ => {}
+        }
         let view = self.views.entry((connection, quic_stream)).or_default();
         let TransitionFact::HeaderChecked { seq, .. } = transition else {
             view.apply(transition)?;
@@ -858,37 +883,95 @@ impl WireEvidence {
     }
 
     /// The node read discovery frame `key` of `row`. Counts a request, and
-    /// settles an `OverMargin` request against the requests of its row the
-    /// node has read and the answers it has started writing: within the
-    /// margin, its `PeerFrame` goes to the log relabelled `Conformant`.
-    /// Returns whether the frame is judged now, which a request past the
-    /// margin isn't.
+    /// returns whether the frame is judged now, which a request still
+    /// waiting for the serving's count isn't.
     fn discovery_read(&mut self, key: FrameKey, row: Option<&'static MessageRule>) -> bool {
         let Some(row) = row else {
             return true;
         };
-        let MessageRole::Request { max_in_flight, .. } = row.role else {
+        if !matches!(row.role, MessageRole::Request { .. }) {
             return true;
-        };
+        }
         let margin = self
             .margins
             .entry((key.0, key.1, row.message_type))
             .or_default();
         margin.read += 1;
-        let open = margin.read.saturating_sub(margin.answered);
-        let Some(mut frame) = self.unsettled.remove(&key) else {
+        let Some(unsettled) = self.unsettled.get_mut(&key) else {
             return true;
         };
-        if open > max_in_flight.saturating_mul(2) {
-            self.unproven.insert(key, frame);
-            return false;
+        unsettled.read = Some((row.message_type, margin.read));
+        false
+    }
+
+    /// The serving of `connection`'s `quic_stream` counted the commitment of
+    /// request `seq` of type `message_type`. Settles the request if it waits
+    /// for that count.
+    fn counted(
+        &mut self,
+        connection: u64,
+        quic_stream: u64,
+        seq: Option<u64>,
+        message_type: u16,
+    ) -> Result<Option<Observation>, String> {
+        let margin = self
+            .margins
+            .entry((connection, quic_stream, message_type))
+            .or_default();
+        margin.counted += 1;
+        let open = margin.counted.saturating_sub(margin.released);
+        let seq = seq.ok_or_else(|| {
+            format!(
+                "UntaggedCommitment: connection {connection} counted a commitment on stream \
+                 {quic_stream} for no frame it read"
+            )
+        })?;
+        let key = (connection, quic_stream, seq);
+        let Some(unsettled) = self.unsettled.remove(&key) else {
+            return Ok(None);
+        };
+        if unsettled.read.is_none() {
+            return Err(format!(
+                "CommitmentBeforeRead: connection {connection} counted request {seq} on \
+                 stream {quic_stream} before its frame-read"
+            ));
         }
-        if let Observation::PeerFrame { label, .. } = &mut frame {
-            *label = Label::Conformant;
+        let settled = self.settle(key, unsettled.frame, message_type, open)?;
+        let mut settled = settled.into_iter();
+        let first = settled.next();
+        self.late.extend(settled);
+        Ok(first)
+    }
+
+    /// The `PeerFrame` of request `key` of type `message_type`, `frame`, and
+    /// its `FrameJudged`, with `open` the node's commitments of its row,
+    /// its own included. Past twice the row's `max_in_flight` it keeps its
+    /// `OverMargin` label, and within it the request is `Conformant`.
+    fn settle(
+        &mut self,
+        key: FrameKey,
+        mut frame: Observation,
+        message_type: u16,
+        open: u32,
+    ) -> Result<Vec<Observation>, String> {
+        let max_in_flight = match discovery_row(message_type).map(|row| row.role) {
+            Some(MessageRole::Request { max_in_flight, .. }) => max_in_flight,
+            _ => {
+                return Err(format!(
+                    "UntabledCommitment: a commitment names {message_type}, no discovery \
+                     request row"
+                ))
+            }
+        };
+        if open <= max_in_flight.saturating_mul(2) {
+            if let Observation::PeerFrame { label, .. } = &mut frame {
+                *label = Label::Conformant;
+            }
+            self.labels.insert(key, Label::Conformant);
         }
-        self.labels.insert(key, Label::Conformant);
-        self.late.push(frame);
-        true
+        let mut settled = vec![frame];
+        settled.extend(self.judged(key)?);
+        Ok(settled)
     }
 
     /// The admitted stream of `connection`'s `quic_stream`.
@@ -930,10 +1013,10 @@ impl WireEvidence {
 }
 
 /// Removes and returns `connection`'s entries of `frames`.
-fn take_connection(
-    frames: &mut BTreeMap<FrameKey, Observation>,
+fn take_connection<T>(
+    frames: &mut BTreeMap<FrameKey, T>,
     connection: u64,
-) -> BTreeMap<FrameKey, Observation> {
+) -> BTreeMap<FrameKey, T> {
     let keys: Vec<FrameKey> = frames
         .range((connection, 0, 0)..=(connection, u64::MAX, u64::MAX))
         .map(|(key, _)| *key)
@@ -1450,146 +1533,319 @@ mod tests {
         assert_eq!(judged(&mut evidence), vec![(1, 8)]);
     }
 
-    /// A `GetPeers` the peer's models labelled `OverMargin` settles at its
-    /// `FrameRead`. With an answer the node had started writing, it's
-    /// within the margin and `Conformant`. With none, the node may still
-    /// have released a commitment it hadn't started writing, so it isn't
-    /// judged at its read: a fault close is preceded by its `FrameJudged`,
-    /// and any other close leaves it unjudged. A judgement at its read
-    /// would oblige `over-margin-closes` on a request the node admitted.
-    #[test]
-    fn an_over_margin_request_is_judged_only_when_it_settles() {
+    /// What the node does after it read three `GetPeers`, in a test of
+    /// [`over_margin_log`].
+    #[derive(Clone, Copy, Debug)]
+    enum Then {
+        /// The serving counts request `seq`.
+        Count(u64),
+        /// The serving releases one commitment.
+        Release,
+        /// The node closes the connection with this cause.
+        Close(&'static str),
+    }
+
+    /// The log a node leaves when a peer sends three `GetPeers` the node
+    /// reads before it counts any, and the node then does `then`. The peer's
+    /// models labelled the third `OverMargin`.
+    fn over_margin_log(then: &[Then]) -> ObservationLog {
         let stream = StreamId {
             kind: 4,
             version: 2,
         };
         let get_peers = discovery_row(u16::from(zakura_network::zakura::MSG_DISCOVERY_GET_PEERS))
             .expect("discovery has get-peers");
-        let peers = discovery_row(u16::from(zakura_network::zakura::MSG_DISCOVERY_PEERS))
-            .expect("discovery has peers");
-        // Each case: whether an answer's write started before the third
-        // request's read, the close's cause, and what follows that read: the
-        // third request's `PeerFrame` by its label, its `FrameJudged`, and the
-        // close.
-        let cases = [
-            (
-                true,
-                "discovery_exchange_complete",
-                ["conformant", "judged", "closed"].as_slice(),
-            ),
-            (
-                false,
-                "discovery_exchange_complete",
-                &["closed", "over-margin"],
-            ),
-            (
-                false,
-                "service_protocol_reject",
-                &["over-margin", "judged", "closed"],
-            ),
-        ];
-        for (answered, cause, expected) in cases {
-            let records = PeerRecords::default();
-            records.borrow_mut().extend((0..3).map(|seq| PeerRecord {
-                remote: Remote::first(peer_addr(0, 0)),
-                quic_stream: 4,
-                body: RecordBody::Frame {
-                    seq,
-                    row: Some("get-peers".to_owned()),
-                    rule_stream: stream,
-                    label: if seq == 2 {
-                        Label::OverMargin
-                    } else {
-                        Label::Conformant
-                    },
-                    exhausted: false,
-                    exchange: Some(seq),
-                    payload: 6,
-                    prepares: None,
+        let records = PeerRecords::default();
+        records.borrow_mut().extend((0..3).map(|seq| PeerRecord {
+            remote: Remote::first(peer_addr(0, 0)),
+            quic_stream: 4,
+            body: RecordBody::Frame {
+                seq,
+                row: Some("get-peers".to_owned()),
+                rule_stream: stream,
+                label: if seq == 2 {
+                    Label::OverMargin
+                } else {
+                    Label::Conformant
                 },
-            }));
-            let mut evidence = WireEvidence::with_discovery(stream);
-            let mut log = ObservationLog::default();
-            log.push(transport(1, Some(1), TransportFact::Registered));
-            log.push(Observation::Session {
-                connection: 1,
-                peer: "peer-0".to_owned(),
-                quic_stream: 4,
-                kind: 4,
-                version: 2,
-                session_id: 7,
-            });
-            let mut seq = 2;
-            let mut next = || {
-                seq += 1;
-                seq
-            };
-            for frame in 0..3 {
-                if frame == 2 && answered {
-                    log.push(transport(
-                        next(),
-                        Some(1),
-                        TransportFact::FrameWriteStarted {
-                            quic_stream: 4,
-                            seq: 0,
-                            message_type: peers.message_type,
-                        },
-                    ));
-                }
-                log.push(transport(
-                    next(),
-                    Some(1),
-                    TransportFact::HeaderRead {
-                        quic_stream: 4,
-                        seq: frame,
-                        message_type: get_peers.message_type,
-                        flags: 0,
-                        payload_len: 6,
-                    },
-                ));
-                log.push(transport(
-                    next(),
-                    Some(1),
-                    TransportFact::FrameRead {
-                        quic_stream: 4,
-                        seq: frame,
-                    },
-                ));
-            }
+                exhausted: false,
+                exchange: Some(seq),
+                payload: 6,
+                prepares: None,
+            },
+        }));
+        let mut evidence = WireEvidence::with_discovery(stream);
+        let mut log = ObservationLog::default();
+        log.push(transport(1, Some(1), TransportFact::Registered));
+        log.push(Observation::Session {
+            connection: 1,
+            peer: "peer-0".to_owned(),
+            quic_stream: 4,
+            kind: 4,
+            version: 2,
+            session_id: 7,
+        });
+        let mut seq = 2;
+        let mut next = || {
+            seq += 1;
+            seq
+        };
+        for frame in 0..3 {
             log.push(transport(
                 next(),
                 Some(1),
-                TransportFact::CloseDecided {
-                    cause: Some(cause.to_owned()),
+                TransportFact::HeaderRead {
+                    quic_stream: 4,
+                    seq: frame,
+                    message_type: get_peers.message_type,
+                    flags: 0,
+                    payload_len: 6,
                 },
             ));
-            log.push(transport(next(), Some(1), TransportFact::TornDown));
-            evidence
-                .observe(&records, &mut log)
-                .expect("every record is placed");
-            let read = log
-                .entries()
-                .iter()
-                .rposition(|entry| {
-                    matches!(
-                        entry.obs,
-                        Observation::Transport {
-                            event: TransportFact::FrameRead { seq: 2, .. },
-                            ..
-                        }
-                    )
-                })
-                .expect("the third request is read");
-            let after: Vec<&str> = log.entries()[read..]
-                .iter()
-                .filter_map(|entry| match &entry.obs {
-                    Observation::PeerFrame { seq: 2, label, .. } => Some(label.name()),
-                    Observation::FrameJudged { seq: 2, .. } => Some("judged"),
-                    Observation::ConnectionClosed { .. } => Some("closed"),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(after, expected, "answered {answered}, {cause}");
+            log.push(transport(
+                next(),
+                Some(1),
+                TransportFact::FrameRead {
+                    quic_stream: 4,
+                    seq: frame,
+                },
+            ));
         }
+        let regulated = |transition| TransportFact::Regulated {
+            quic_stream: 4,
+            transition,
+        };
+        for then in then {
+            let event = match *then {
+                Then::Count(frame) => regulated(TransitionFact::CommitmentCounted {
+                    seq: Some(frame),
+                    message_type: get_peers.message_type,
+                }),
+                Then::Release => regulated(TransitionFact::CommitmentReleased {
+                    message_type: get_peers.message_type,
+                }),
+                Then::Close(cause) => TransportFact::CloseDecided {
+                    cause: Some(cause.to_owned()),
+                },
+            };
+            log.push(transport(next(), Some(1), event));
+        }
+        log.push(transport(next(), Some(1), TransportFact::TornDown));
+        evidence
+            .observe(&records, &mut log)
+            .expect("every record is placed");
+        log
+    }
+
+    /// What `log` holds for the third request from its read on: its
+    /// `PeerFrame` by its label, its `FrameJudged`, and the close.
+    fn after_third_read(log: &ObservationLog) -> Vec<&'static str> {
+        let read = log
+            .entries()
+            .iter()
+            .rposition(|entry| {
+                matches!(
+                    entry.obs,
+                    Observation::Transport {
+                        event: TransportFact::FrameRead { seq: 2, .. },
+                        ..
+                    }
+                )
+            })
+            .expect("the third request is read");
+        log.entries()[read..]
+            .iter()
+            .filter_map(|entry| match &entry.obs {
+                Observation::PeerFrame { seq: 2, label, .. } => Some(label.name()),
+                Observation::FrameJudged { seq: 2, .. } => Some("judged"),
+                Observation::ConnectionClosed { .. } => Some("closed"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A harness with no view, for checks that read only the log.
+    struct Logged;
+
+    impl crate::property::HasView for Logged {
+        type View = ();
+
+        /// Nothing.
+        fn view(&self) {}
+    }
+
+    /// Logs a finished log's frames, judgements and closes at step 1, the
+    /// observations discovery's generated properties read.
+    struct Replayed(Option<ObservationLog>);
+
+    impl crate::ActionSource for Replayed {
+        fn enabled(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<(crate::Identity, u64)>) {}
+
+        fn boundaries(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<crate::Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the replay offers no actions");
+        }
+
+        /// Logs the finished log's observations once, at step 1.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            if log.step() == 0 {
+                return Ok(());
+            }
+            for entry in self
+                .0
+                .take()
+                .into_iter()
+                .flat_map(|done| done.entries().to_vec())
+            {
+                if matches!(
+                    entry.obs,
+                    Observation::PeerFrame { .. }
+                        | Observation::FrameJudged { .. }
+                        | Observation::ConnectionClosed { .. }
+                ) {
+                    log.push(entry.obs);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The outcome of each of `discovery/wire`'s properties over `log`, by
+    /// ID.
+    fn outcomes(log: ObservationLog) -> BTreeMap<String, crate::PropertyOutcome> {
+        use crate::{
+            harness::discovery_service::wire_properties,
+            property::{Assumptions, Registry, RegistryChecker, Source, Sources},
+        };
+        let registry =
+            Registry::new(wire_properties::<Logged>()).expect("generated IDs are unique");
+        let mut checker = RegistryChecker::new(
+            registry,
+            Rc::new(Logged),
+            Assumptions::none(),
+            &Sources::observed(&[Source::Schedule, Source::Frames, Source::Closes]),
+        );
+        let mut sim = crate::Sim::new(
+            crate::RunConfig::default(),
+            crate::PlanInput::Bytes(Vec::new()),
+        );
+        sim.add_source(Box::new(Replayed(Some(log))));
+        sim.scheduler().spawn_root("reactor", async {
+            zakura_rt::task::yield_now().await;
+        });
+        sim.run(&mut checker, &mut crate::MemorySink::default())
+            .properties
+            .into_iter()
+            .map(|property| (property.property, property.outcome))
+            .collect()
+    }
+
+    /// A `GetPeers` the peer's models labelled `OverMargin` settles at the
+    /// serving's count of it, or at a fault close before that count. The
+    /// node's count is the commitments of the row it counted, less those it
+    /// released, so a request within twice `max_in_flight` is
+    /// `Conformant`. A request the node read but never counted, under a close
+    /// that isn't a fault, stays unjudged.
+    #[test]
+    fn an_over_margin_request_settles_at_the_nodes_count() {
+        use Then::{Close, Count, Release};
+        const FAULT: &str = "service_protocol_reject";
+        const CLEAN: &str = "discovery_exchange_complete";
+        let cases: [(&[Then], &[&str]); 6] = [
+            // Released one: the third request is the node's second open.
+            (
+                &[Count(0), Release, Count(1), Count(2), Close(CLEAN)],
+                &["conformant", "judged", "closed"],
+            ),
+            // Released none: the third request is past the margin of 2.
+            (
+                &[Count(0), Count(1), Count(2), Close(FAULT)],
+                &["over-margin", "judged", "closed"],
+            ),
+            (
+                &[Count(0), Count(1), Count(2), Close(CLEAN)],
+                &["over-margin", "judged", "closed"],
+            ),
+            // A fault close before the count settles it as the third count.
+            (
+                &[Count(0), Count(1), Close(FAULT)],
+                &["over-margin", "judged", "closed"],
+            ),
+            (
+                &[Count(0), Release, Count(1), Close(FAULT)],
+                &["conformant", "judged", "closed"],
+            ),
+            // Any other close leaves it unjudged.
+            (
+                &[Count(0), Count(1), Close(CLEAN)],
+                &["closed", "over-margin"],
+            ),
+        ];
+        for (then, expected) in cases {
+            let log = over_margin_log(then);
+            assert_eq!(after_third_read(&log), expected, "{then:?}");
+        }
+    }
+
+    /// The #2122 case: with `max_in_flight` 1, the node reads three
+    /// `GetPeers` before it writes any answer, releases the first
+    /// commitment, and a bug closes the connection on the third. The third
+    /// was the node's second open request, within the margin, so the close
+    /// punished conformant frames.
+    #[test]
+    fn a_close_within_the_nodes_margin_violates_conformant_never_closes() {
+        use Then::{Close, Count, Release};
+        let log = over_margin_log(&[
+            Count(0),
+            Release,
+            Count(1),
+            Count(2),
+            Close("service_protocol_reject"),
+        ]);
+        let outcomes = outcomes(log);
+        assert!(
+            matches!(
+                outcomes["discovery/s4v2/conformant-never-closes"],
+                crate::PropertyOutcome::Violated { .. }
+            ),
+            "{outcomes:?}"
+        );
+        assert!(
+            !matches!(
+                outcomes["discovery/s4v2/get-peers/over-margin-closes"],
+                crate::PropertyOutcome::Violated { .. }
+            ),
+            "{outcomes:?}"
+        );
+    }
+
+    /// The node's count past the margin, then its fault close: the request
+    /// is `OverMargin` and the close discharges `over-margin-closes`, with no
+    /// conformant frame punished.
+    #[test]
+    fn a_close_past_the_nodes_margin_holds_over_margin_closes() {
+        use Then::{Close, Count};
+        let log = over_margin_log(&[
+            Count(0),
+            Count(1),
+            Count(2),
+            Close("service_protocol_reject"),
+        ]);
+        let outcomes = outcomes(log);
+        assert!(
+            matches!(
+                outcomes["discovery/s4v2/get-peers/over-margin-closes"],
+                crate::PropertyOutcome::Held { .. }
+            ),
+            "{outcomes:?}"
+        );
+        assert!(
+            !matches!(
+                outcomes["discovery/s4v2/conformant-never-closes"],
+                crate::PropertyOutcome::Violated { .. }
+            ),
+            "{outcomes:?}"
+        );
     }
 }

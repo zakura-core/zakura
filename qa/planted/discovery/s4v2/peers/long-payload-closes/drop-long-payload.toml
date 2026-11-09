@@ -1,0 +1,16 @@
+# Discovery's reader skips the maximum of its `peers` row and its precheck,
+# and discovery drops a `peers` frame over that maximum instead of closing.
+# Skipping the reader's check alone would leave discovery's codec to close.
+# The scenario's peer sends its held `Peers` one byte over the row's
+# maximum, and the node never closes for it.
+# Besides the files the patch changes, the reader's read path and the rest
+# of discovery decide whether the frame reaches the drop.
+checks = [
+    "crates/zakura-network/src/zakura/discovery",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/peers/long-payload-closes/drop-long-payload.scenario.json"
+plan = "qa/planted/discovery/s4v2/peers/long-payload-closes/drop-long-payload.plan.bin"

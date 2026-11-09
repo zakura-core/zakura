@@ -1,0 +1,37 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index c488b85bd5..5680e7ee51 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -729,6 +729,13 @@ async fn read_frame(
+     frame: Frame,
+     sink: &DiscoverySink,
+ ) -> Result<(), (ViolationStage, SinkReject)> {
++    // Planted bypass: discovery drops a `hello` frame over its row's maximum
++    // instead of closing.
++    if frame.message_type == super::wire::HELLO.message_type
++        && frame.payload.len() > super::wire::HELLO.payload.max()
++    {
++        return Ok(());
++    }
+     // An answer claims its query before its payload is decoded.
+     let answer = sink
+         .queries
+diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+index 3d5746878a..9e1863b2e2 100644
+--- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
++++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+@@ -186,6 +186,14 @@ impl<'a> FrameFilter<'a> {
+                 min: rule.payload.min(),
+             });
+         }
++        // Planted bypass: discovery's reader skips the maximum of its
++        // `hello` row, and a response's precheck, up to the frame cap.
++        if rules == crate::zakura::discovery::wire::RULES
++            && *rule == crate::zakura::discovery::wire::HELLO
++            && payload_len > rule.payload.max()
++        {
++            return Ok(frame_cap);
++        }
+         if let (MessageRole::Response { .. }, Some(precheck)) = (rule.role, self.precheck) {
+             precheck.check(message_type, payload_len)?;
+         }

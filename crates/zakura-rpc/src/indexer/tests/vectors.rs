@@ -243,10 +243,10 @@ async fn test_get_block(
         .await?
         .expect("get_block should succeed")
         .into_inner();
+    assert_eq!(response.data, block.zcash_serialize_to_vec()?);
     let (decoded_block, decoded_hash) = response.decode().expect("response should decode");
     assert_eq!(decoded_hash, expected_hash);
     assert_eq!(decoded_block.hash(), expected_hash);
-    assert_eq!(response.data, block.zcash_serialize_to_vec()?);
 
     // A block requested by hash returns the requested hash with the stored bytes.
     let mut request_client = client.clone();

@@ -515,7 +515,8 @@ where
                 and carry each subscription's state faithfully, and each prepare and apply hands \
                 on its round's staged work from its peer's source and reaches storage exactly as \
                 dispatched, and each apply or reset changes the engine's durable state only by \
-                its own submitted headers and the resets the port made",
+                its own submitted headers and the resets the port made, and each locator read \
+                leaves it unchanged",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],

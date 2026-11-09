@@ -14,7 +14,11 @@
 //!   height, block work and cumulative work, and the children, height and
 //!   eligible-tip indexes rebuilt from the nodes. A node held before and
 //!   after changes only in its eligibility (and its auxiliary delivery IDs,
-//!   which Rule 11 leaves aside). Each held header is
+//!   which Rule 11 leaves aside). Its direct reasons stay as they were,
+//!   except that a reset's invalidation adds its one operator reason to its
+//!   target and a reconsideration removes it, and a new node has none. Each
+//!   node inherits from its parent exactly when the parent is ineligible.
+//!   Each held header is
 //!   eligible exactly when neither it nor an ancestor stands invalidated by
 //!   the port's `Reset` facts and not reconsidered. The stored selected
 //!   projection is the ancestry from the finalized anchor to the engine's
@@ -22,14 +26,17 @@
 //!   and the verified projection is unchanged, since header applies and
 //!   resets never verify bodies. Which tip is selected is
 //!   `expected-chain-selected`'s.
+//! - **Read.** A locator read leaves the durable state exactly as it was.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 
+use sha2::{Digest, Sha256};
 use zakura_chain::block;
 use zakura_header_chain::{
-    BodyValidationState, DurableState, EngineMetadata, HeaderNode, HeaderValidationState,
+    BodyValidationState, DurableState, EligibilityReason, EngineMetadata, HeaderNode,
+    HeaderValidationState, OperatorInvalidationId,
 };
 use zakura_storage::header::{
     controlled::{EngineRun, RunKind},
@@ -47,14 +54,17 @@ pub(super) struct Contents {
     /// Each apply operation's submitted insertion, by its hashes in order,
     /// or `None` if the port couldn't open it.
     payloads: HashMap<u64, Option<Vec<String>>>,
-    /// The headers the port's `Reset` facts left invalidated, oldest first.
+    /// The headers the judged reset runs left invalidated, oldest first.
     invalidated: Vec<String>,
+    /// The drain's `Reset` facts not yet matched to their runs, oldest
+    /// first: whether each invalidated, and its target.
+    resets: VecDeque<(bool, String)>,
     breaks: Vec<String>,
 }
 
 impl Contents {
     /// Notes storage's `fact`: an apply's submitted insertion, or a reset's
-    /// invalidation or reconsideration.
+    /// invalidation or reconsideration, which its run then applies.
     pub(super) fn storage(&mut self, fact: &StorageFact) {
         match fact {
             StorageFact::Submitted {
@@ -64,11 +74,9 @@ impl Contents {
             } => {
                 self.payloads.insert(*id, hashes.clone());
             }
-            StorageFact::Reset { kind, target, .. } if kind == "invalidate" => {
-                self.invalidated.push(target.clone());
-            }
-            StorageFact::Reset { target, .. } => {
-                self.invalidated.retain(|held| held != target);
+            StorageFact::Reset { kind, target, .. } => {
+                self.resets
+                    .push_back((kind == "invalidate", target.clone()));
             }
             _ => {}
         }
@@ -85,10 +93,34 @@ impl Contents {
         let what = match kind {
             RunKind::Apply(id, _) => format!("apply operation {}", id.0),
             RunKind::Reset => "a reset".to_owned(),
-            // A read is `reset-invalidates-work`'s locator-result rule's.
-            RunKind::Locator(_) => return,
+            RunKind::Locator(id) => {
+                // Its result is `reset-invalidates-work`'s locator-result
+                // rule's, judged against `before`.
+                if before != after {
+                    self.breaks.push(format!(
+                        "CommitOnlyAuthorized: locator read {} changed the engine's durable \
+                         state",
+                        id.0
+                    ));
+                }
+                return;
+            }
         };
         let mut found = Vec::new();
+        // Each reset run is its oldest unmatched `Reset` fact's, so the
+        // invalidated set changes at the run that changed it.
+        let reset = match kind {
+            RunKind::Reset => {
+                let reset = self.resets.pop_front();
+                match &reset {
+                    Some((true, target)) => self.invalidated.push(target.clone()),
+                    Some((false, target)) => self.invalidated.retain(|held| held != target),
+                    None => found.push("ran with no Reset fact".to_owned()),
+                }
+                reset
+            }
+            _ => None,
+        };
         let mut dropped: Vec<String> = before
             .graph
             .nodes
@@ -167,7 +199,7 @@ impl Contents {
             }
         };
         if success {
-            self.judge_state(*clock, before, after, &mut found);
+            self.judge_state(*clock, before, after, reset.as_ref(), &mut found);
         }
         for detail in found {
             self.breaks
@@ -180,12 +212,14 @@ impl Contents {
     /// with no `..`, so a field added later fails to compile here until it's
     /// classified. Each is derived from the stored headers and the reset
     /// model, or must be unchanged from `before`, or is left to a named
-    /// owner.
+    /// owner. `reset` is the run's reset, if it's one: whether it
+    /// invalidated, and its target.
     fn judge_state(
         &self,
         clock: DateTime<Utc>,
         before: &DurableState,
         after: &DurableState,
+        reset: Option<&(bool, String)>,
         found: &mut Vec<String>,
     ) {
         let DurableState {
@@ -341,6 +375,28 @@ impl Contents {
         known.sort_unstable();
         if !known.is_empty() {
             found.push(format!("inserted {known:?} with body state no body gave"));
+        }
+        found.extend(reasons(before, nodes, reset));
+        // Each node inherits ineligibility from its parent exactly when the
+        // parent is ineligible. The finalized anchor inherits nothing.
+        let mut inherits: Vec<String> = nodes
+            .values()
+            .filter(|node| {
+                let parent = (node.hash != finalized_frontier.hash)
+                    .then(|| nodes.get(&node.parent_hash))
+                    .flatten();
+                node.eligibility.inherited_from
+                    != parent
+                        .filter(|parent| !parent.is_eligible())
+                        .map(|parent| parent.hash)
+            })
+            .map(|node| hash(node.hash))
+            .collect();
+        inherits.sort_unstable();
+        if !inherits.is_empty() {
+            found.push(format!(
+                "left {inherits:?} inheriting from other than an ineligible parent"
+            ));
         }
         // Eligible exactly when no held ancestor, itself included, stands
         // invalidated by a reset or waits on a deferred validation.
@@ -503,6 +559,79 @@ fn structure(graph: &zakura_header_chain::GraphState) -> Vec<String> {
         found.push("left an eligible-tip index its nodes don't give".to_owned());
     }
     found
+}
+
+/// The ways `nodes`' direct eligibility reasons differ from `before`'s
+/// after a run whose reset, if any, is `reset`. Each node keeps its reasons,
+/// and a new node has none, except the reset's target: an invalidation adds
+/// exactly one operator reason, with the ID and digest
+/// [`operator_identity`] gives the target, and a reconsideration removes
+/// exactly that reason. An operator reason's evidence names the full-state
+/// path, which the durable state doesn't hold, so it isn't judged.
+fn reasons(
+    before: &DurableState,
+    nodes: &HashMap<block::Hash, HeaderNode>,
+    reset: Option<&(bool, String)>,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for (key, node) in nodes {
+        let old = before
+            .graph
+            .nodes
+            .get(key)
+            .map(|old| old.eligibility.direct_reasons.clone())
+            .unwrap_or_default();
+        let new = &node.eligibility.direct_reasons;
+        let target = reset.filter(|(_, target)| *target == hash(*key));
+        let right = match target {
+            None => *new == old,
+            Some((invalidate, _)) => {
+                let (id, digest) = operator_identity(*key);
+                let operator = |reason: &EligibilityReason| {
+                    matches!(
+                        reason,
+                        EligibilityReason::OperatorInvalid { id: held, reason_digest, .. }
+                            if *held == id && *reason_digest == digest
+                    )
+                };
+                if *invalidate {
+                    let added: Vec<&EligibilityReason> = new.difference(&old).collect();
+                    old.is_subset(new) && added.len() == 1 && operator(added[0])
+                } else {
+                    let removed: Vec<&EligibilityReason> = old.difference(new).collect();
+                    new.is_subset(&old) && removed.len() == 1 && operator(removed[0])
+                }
+            }
+        };
+        if !right {
+            found.push(format!(
+                "left {} with direct reasons {new:?}, from {old:?}",
+                hash(*key)
+            ));
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// The operator invalidation ID and reason digest for `target`, derived on
+/// its own as zakura-state's `operator_identity` defines them.
+fn operator_identity(target: block::Hash) -> (OperatorInvalidationId, [u8; 32]) {
+    let id_digest: [u8; 32] = Sha256::new()
+        .chain_update(b"zakura-operator-invalidation-id-v1")
+        .chain_update(target.0)
+        .finalize()
+        .into();
+    let mut id = [0; 16];
+    id.copy_from_slice(&id_digest[..16]);
+    let id = OperatorInvalidationId::new(id);
+    let digest = Sha256::new()
+        .chain_update(b"zakura-operator-invalidation-v1")
+        .chain_update(target.0)
+        .chain_update(id.bytes())
+        .finalize()
+        .into();
+    (id, digest)
 }
 
 /// The validation header admission gives a header timed `time` at `clock`:

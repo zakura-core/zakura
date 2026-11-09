@@ -412,7 +412,8 @@ impl RoundLife {
     }
 
     /// Judges a locator read in `fact` against the selected path of the
-    /// durable state its `run` recorded as it read.
+    /// durable state its `run` recorded just before it read, which
+    /// `commit-only-authorized` requires the read to leave unchanged.
     fn locator_result(&mut self, fact: &StorageFact, run: Option<&EngineRun>) {
         let (
             StorageFact::Completed {
@@ -428,7 +429,7 @@ impl RoundLife {
             },
             Some(EngineRun {
                 kind: RunKind::Locator(_),
-                after: durable,
+                before: durable,
                 ..
             }),
         ) = (fact, run)

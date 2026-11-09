@@ -374,6 +374,15 @@ codegen-units = 1
 [profile.release.package.zakura-node-services]
 codegen-units = 1
 
+[profile.dist]
+# Distributed release binaries: the release profile with whole-program LTO. Merging every crate
+# into one module before code generation removes the duplicate copies of generic code that
+# separate crates and thin LTO each keep, and lets dead code elimination see the whole program.
+# It shrinks zakurad's .text by about 3.6%, but serializes optimization, so a clean build takes
+# longer and every relink repeats it. Day-to-day `--release` builds keep thin LTO.
+inherits = "release"
+lto = "fat"
+
 [profile.ci-tests]
 inherits = "release"
 # Unit tests need optimized execution, but do not need the production profile's

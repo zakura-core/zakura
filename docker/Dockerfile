@@ -166,8 +166,8 @@ RUN --mount=type=bind,source=crates/xtask,target=crates/xtask \
     --mount=type=cache,target=${CARGO_TARGET_DIR} \
     --mount=type=cache,target=${CARGO_HOME} \
     [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
-    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
-    cp ${CARGO_TARGET_DIR}/release/zakurad /usr/local/bin
+    cargo build --locked --profile dist --features "${FEATURES}" --package zakura --bin zakurad && \
+    cp ${CARGO_TARGET_DIR}/dist/zakurad /usr/local/bin
 
 # This stage starts from scratch using Debian and copies the built Zebra binaries
 # from the `release` stage along with other binaries and files.

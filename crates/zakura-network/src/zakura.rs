@@ -40,7 +40,7 @@ pub use discovery::*;
 pub use handler::*;
 pub use handshake::*;
 pub use header_sync::*;
-pub(crate) use ip::canonical_ip;
+pub(crate) use ip::{admission_host, canonical_ip};
 pub use legacy_gossip::*;
 pub use peer_memory::*;
 #[cfg(any(test, feature = "p2p-fuzz"))]

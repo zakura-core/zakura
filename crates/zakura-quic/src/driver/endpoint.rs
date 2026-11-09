@@ -472,11 +472,12 @@ impl<F: SocketFactory> EndpointTask<F> {
         };
         let raw_remote = incoming.remote_address();
         let remote = canonical_addr(raw_remote);
+        let pending_group = acceptor.pending_group(remote.ip());
         let info = IncomingInfo {
             remote,
             validated: incoming.remote_address_validated(),
             pending_total: self.shared.pending.total(),
-            pending_from_ip: self.shared.pending.for_ip(remote.ip()),
+            pending_from_ip: self.shared.pending.for_ip(pending_group),
         };
         let decision = decide(&self.shared.config, acceptor.as_ref(), &info);
         tracing::trace!(target: "zakura_quic", remote = %info.remote, ?decision, "incoming");
@@ -493,7 +494,7 @@ impl<F: SocketFactory> EndpointTask<F> {
                     return;
                 };
                 // ADM-7: count the handshake from Accept until it finishes.
-                let pending = self.shared.pending.enter(remote.ip());
+                let pending = self.shared.pending.enter(pending_group);
                 let probe = Arc::new(CongestionProbe::default());
                 let mut server = (*server).clone();
                 server.transport_config(self.shared.connection_transport(probe.clone(), io.gso()));

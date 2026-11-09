@@ -160,7 +160,12 @@ struct StalledHandshake {
 }
 
 fn stalled_handshake(server: &Server) -> StalledHandshake {
-    let target = server.endpoint.local_addrs()[0];
+    stalled_handshake_to(&server.endpoint)
+}
+
+/// Starts a [`StalledHandshake`] from 127.0.0.1 to `server`'s first address.
+fn stalled_handshake_to(server: &QuicEndpoint) -> StalledHandshake {
+    let target = server.local_addrs()[0];
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut endpoint = quinn_proto::Endpoint::new(
         Arc::new(quinn_proto::EndpointConfig::default()),
@@ -169,7 +174,7 @@ fn stalled_handshake(server: &Server) -> StalledHandshake {
         None,
     );
     let tls = crate::tls::TlsConfig::new(&NodeSecretKey::generate())
-        .client_config(server.endpoint.local_id(), &[ALPN])
+        .client_config(server.local_id(), &[ALPN])
         .unwrap();
     let now = std::time::Instant::now();
     let (_, mut conn) = endpoint
@@ -1962,6 +1967,80 @@ async fn handle_runs_before_the_pending_count_drops() {
         let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
         let _conn = client.connect(addr, &[ALPN]).await.unwrap();
         assert_eq!(pending_at_handle.recv().await, Some(1));
+    })
+    .await
+    .unwrap();
+}
+
+/// Counts every pending handshake under `group`, and records what `admit`
+/// sees and, when `handle` runs, the pending count under the group, under the
+/// raw source IP and in total.
+struct GroupProbe {
+    pending: crate::endpoint::PendingTable,
+    group: IpAddr,
+    admitted: Arc<Mutex<Vec<IncomingInfo>>>,
+    handled: mpsc::UnboundedSender<(usize, usize, usize)>,
+}
+
+impl Acceptor for GroupProbe {
+    fn admit(&self, incoming: &IncomingInfo) -> Admit {
+        self.admitted.lock().unwrap().push(*incoming);
+        Admit::Accept
+    }
+
+    fn alpns(&self) -> Vec<Vec<u8>> {
+        vec![ALPN.to_vec()]
+    }
+
+    fn handle(&self, conn: Conn) -> BoxFuture<'static, ()> {
+        let source = conn.admitted_ip();
+        let _ = self.handled.send((
+            self.pending.for_ip(self.group),
+            self.pending.for_ip(source),
+            self.pending.total(),
+        ));
+        Box::pin(async move {
+            conn.closed().await;
+        })
+    }
+
+    fn pending_group(&self, _ip: IpAddr) -> IpAddr {
+        self.group
+    }
+}
+
+/// ADM-7: the endpoint counts an attempt's pending handshake under the group
+/// `Acceptor::pending_group` returns, and reports that group's count to the
+/// next attempt's `admit` as `pending_from_ip`. Using the raw source IP for
+/// either the count or the lookup would report zero.
+#[tokio::test]
+async fn pending_handshakes_count_under_the_acceptor_group() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let server =
+            QuicEndpoint::bind(NodeSecretKey::generate(), &loopback(), &test_config()).unwrap();
+        let group = IpAddr::from([192, 0, 2, 1]);
+        let admitted = Arc::new(Mutex::new(Vec::new()));
+        let (handled, mut counts_at_handle) = mpsc::unbounded_channel();
+        server
+            .serve(GroupProbe {
+                pending: server.shared().pending.clone(),
+                group,
+                admitted: admitted.clone(),
+                handled,
+            })
+            .unwrap();
+        let _stalled = stalled_handshake_to(&server);
+        while admitted.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let client = client();
+        let addr = NodeAddr::with_addrs(server.local_id(), server.local_addrs());
+        let _conn = client.connect(addr, &[ALPN]).await.unwrap();
+        let seen = admitted.lock().unwrap().clone();
+        assert_eq!(seen[0].pending_from_ip, 0);
+        assert_eq!(seen[1].pending_from_ip, 1);
+        assert_eq!(counts_at_handle.recv().await, Some((2, 0, 2)));
     })
     .await
     .unwrap();

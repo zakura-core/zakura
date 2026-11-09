@@ -26,6 +26,8 @@ struct PendingVctLocalPort {
     apply_release: Arc<Notify>,
     prepare_delay: Option<std::time::Duration>,
     apply_delay: Option<std::time::Duration>,
+    /// When set, a continuation locator read finishes after this delay.
+    locator_delay: Option<std::time::Duration>,
     /// When set, the apply finishes once this time passes, without waking
     /// its waker, like a result the shared ready queue hasn't shown yet.
     apply_silent_until: Option<Instant>,
@@ -46,6 +48,7 @@ impl PendingVctLocalPort {
             apply_release: Arc::new(Notify::new()),
             prepare_delay: None,
             apply_delay: None,
+            locator_delay: None,
             apply_silent_until: None,
             apply_flag: None,
             prepared: std::sync::Mutex::new(None),
@@ -88,7 +91,13 @@ impl port::Port for PendingVctLocalPort {
         '_,
         Result<Option<zakura_header_chain::HeaderLocator>, port::PortError>,
     > {
-        Box::pin(async { Ok(None) })
+        let delay = self.locator_delay;
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                time::sleep(delay).await;
+            }
+            Ok(None)
+        })
     }
 
     fn vct_repair_context(
@@ -853,6 +862,41 @@ async fn ready_vct_completion_precedes_unseen_snapshot_at_deadline() {
 #[tokio::test(start_paused = true)]
 async fn a_spent_budget_hides_no_ready_completion() {
     ready_vct_completion_precedes_unseen_snapshot(true).await;
+}
+
+/// A spent cooperative budget doesn't hide a ready shared storage completion
+/// from a turn's settle either. The locator read waits on a Tokio timer, which
+/// a spent budget would otherwise report as pending.
+#[tokio::test(start_paused = true)]
+async fn a_spent_budget_hides_no_ready_shared_completion() {
+    let delay = std::time::Duration::from_secs(1);
+    let mut port = PendingVctLocalPort::new(true);
+    port.locator_delay = Some(delay);
+    let mut fixture = VctLocalFixture::new(Arc::new(port), HeaderTargetPhase::Applying);
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    assert!(matches!(
+        fixture
+            .reactor
+            .dispatch_action(HeaderPortOperation::QueryHeaderLocator {
+                peer: other,
+                session_id: 8,
+                target_tip_hash: fixture.context.target.hash,
+                scope: fixture.owner.header_authority(),
+            }),
+        StorageDispatch::Started(_)
+    ));
+    poll_pending_operation(&mut fixture.reactor);
+    time::advance(delay).await;
+
+    while zakura_rt::task::coop::has_budget_remaining() {
+        tokio::task::consume_budget().await;
+    }
+    fixture.reactor.settle_ready_inputs(&mut None, &mut None);
+
+    assert!(
+        fixture.reactor.pending_port_operations.is_empty(),
+        "the settle handles the ready locator read"
+    );
 }
 
 /// Counts the reactor's watch reads.

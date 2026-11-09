@@ -1,7 +1,7 @@
 use hex::FromHex;
 use proptest::prelude::*;
 
-use super::{decode, HexData};
+use super::{decode, encode, HexData};
 
 /// The `hex` crate's result, which `decode` must match exactly.
 fn reference(input: &[u8]) -> Result<Vec<u8>, hex::FromHexError> {
@@ -24,6 +24,12 @@ fn decode_matches_hex_crate_on_edge_cases() {
         "00é0".as_bytes(),
         b"\xff\xff",
         b"0123456789abcdefABCDEF",
+        b"0x",
+        b"0X",
+        b"0x0",
+        b"0x00",
+        b"0X00",
+        b"x0",
     ];
     for &case in cases {
         assert_eq!(decode(case), reference(case), "input {case:?}");
@@ -53,9 +59,26 @@ proptest! {
         prop_assert_eq!(decode(&input), reference(&input));
     }
 
+    /// Long inputs reach the SIMD chunks, so an invalid byte must be found in any chunk.
     #[test]
-    fn decode_inverts_encode(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
+    fn decode_matches_hex_crate_on_long_inputs(
+        bytes in prop::collection::vec(any::<u8>(), 0..300),
+        corruption in prop::option::of((any::<prop::sample::Index>(), prop::sample::select(b"gGxX \xff/:@`".to_vec()))),
+    ) {
+        let mut input = hex::encode(&bytes).into_bytes();
+        if let Some((index, byte)) = corruption {
+            if !input.is_empty() {
+                let index = index.index(input.len());
+                input[index] = byte;
+            }
+        }
+        prop_assert_eq!(decode(&input), reference(&input));
+    }
+
+    #[test]
+    fn decode_inverts_encode(bytes in prop::collection::vec(any::<u8>(), 0..300)) {
         prop_assert_eq!(decode(hex::encode(&bytes).as_bytes()), Ok(bytes.clone()));
-        prop_assert_eq!(decode(hex::encode_upper(&bytes).as_bytes()), Ok(bytes));
+        prop_assert_eq!(decode(hex::encode_upper(&bytes).as_bytes()), Ok(bytes.clone()));
+        prop_assert_eq!(encode(&bytes), hex::encode(&bytes));
     }
 }

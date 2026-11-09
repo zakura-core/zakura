@@ -538,7 +538,7 @@ impl HeaderSyncReactor {
                 caused!(self, ReactorCause::Event, self.handle_event(event));
                 handled_event = true;
             }
-            self.run_due_maintenance(maintenance);
+            self.run_due_maintenance(&mut vct_root_repairs, maintenance);
             maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
@@ -702,6 +702,14 @@ impl HeaderSyncReactor {
                 None => {}
             }
         }
+        self.probe_vct_root_repairs(vct_root_repairs);
+    }
+
+    /// Reads the VCT root repair watch if it changed.
+    fn probe_vct_root_repairs(
+        &mut self,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    ) {
         if let Some(repairs) = vct_root_repairs.as_mut() {
             match repairs.changed().now_or_never() {
                 Some(Ok(())) => {
@@ -2689,11 +2697,20 @@ impl HeaderSyncReactor {
     /// has passed.
     ///
     /// Each turn calls this after it settles the ready inputs and takes its
-    /// queued events, rather than from the maintenance `select!` arm. So a due
-    /// deadline can't win over a ready completion or repair status, and inputs
-    /// that keep winning the biased `select!` can't starve it.
-    fn run_due_maintenance(&mut self, maintenance: Instant) {
+    /// queued events, rather than from the maintenance `select!` arm, so
+    /// inputs that keep winning the biased `select!` can't starve it. The VCT
+    /// local operation and the repair watch can become ready while the turn
+    /// handles its events, so both are checked again first.
+    fn run_due_maintenance(
+        &mut self,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+        maintenance: Instant,
+    ) {
         if maintenance <= Instant::now() {
+            if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+                self.handle_port_completion(completion);
+            }
+            self.probe_vct_root_repairs(vct_root_repairs);
             caused!(self, ReactorCause::Maintenance, self.run_maintenance());
         }
     }

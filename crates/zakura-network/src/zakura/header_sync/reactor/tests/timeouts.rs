@@ -29,6 +29,9 @@ struct PendingVctLocalPort {
     /// When set, the apply finishes once this time passes, without waking
     /// its waker, like a result the shared ready queue hasn't shown yet.
     apply_silent_until: Option<Instant>,
+    /// When set, the apply finishes once this flag is raised, without waking
+    /// its waker.
+    apply_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// When set, the prepare succeeds at once with this target.
     prepared: std::sync::Mutex<Option<port::PreparedHeaderTarget>>,
     apply_succeeds: bool,
@@ -44,6 +47,7 @@ impl PendingVctLocalPort {
             prepare_delay: None,
             apply_delay: None,
             apply_silent_until: None,
+            apply_flag: None,
             prepared: std::sync::Mutex::new(None),
             apply_succeeds,
         }
@@ -62,6 +66,12 @@ impl PendingVctLocalPort {
     fn with_silent_apply(until: Instant) -> Arc<Self> {
         let mut port = Self::new(true);
         port.apply_silent_until = Some(until);
+        Arc::new(port)
+    }
+
+    fn with_flagged_apply(flag: Arc<std::sync::atomic::AtomicBool>) -> Arc<Self> {
+        let mut port = Self::new(true);
+        port.apply_flag = Some(flag);
         Arc::new(port)
     }
 
@@ -151,11 +161,24 @@ impl port::Port for PendingVctLocalPort {
         let release = self.apply_release.clone();
         let delay = self.apply_delay;
         let silent_until = self.apply_silent_until;
+        let flag = self.apply_flag.clone();
+        let self_flagged = flag.is_some();
         let succeeds = self.apply_succeeds;
         let owner = target.owner();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(flag) = flag {
+                std::future::poll_fn(|_| {
+                    if flag.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+            }
             match (silent_until, delay) {
+                _ if self_flagged => {}
                 (Some(until), _) => {
                     std::future::poll_fn(|_| {
                         if Instant::now() >= until {
@@ -911,7 +934,9 @@ async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
 
     fixture.reactor.settle_ready_inputs(&mut None, &mut None);
-    fixture.reactor.run_due_maintenance(Instant::now());
+    fixture
+        .reactor
+        .run_due_maintenance(&mut None, Instant::now());
 
     let fatal = fixture.fatal_events.try_recv();
     assert!(
@@ -949,8 +974,9 @@ async fn due_maintenance_reads_a_ready_repair_status_first() {
         .expect("the test holds the receiver");
     time::advance(fixture.reactor.startup.request_timeout).await;
 
-    fixture.reactor.settle_ready_inputs(&mut None, &mut repairs);
-    fixture.reactor.run_due_maintenance(Instant::now());
+    fixture
+        .reactor
+        .run_due_maintenance(&mut repairs, Instant::now());
 
     assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
     assert!(
@@ -1061,6 +1087,64 @@ async fn a_vct_successor_cannot_take_an_older_completions_drain_turn() {
         fixture.reactor.pending_port_operations.is_empty(),
         "the prepare, its apply and the older locator read are all handled"
     );
+}
+
+/// Finishes the flagged apply while the reactor takes a wire event at the
+/// start of a turn.
+#[derive(Debug)]
+struct FinishDuringEvents(Arc<std::sync::atomic::AtomicBool>);
+
+impl observe::HeaderSyncObserver for FinishDuringEvents {
+    /// Raises the flag when a turn takes a wire event.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(
+            event,
+            ReactorEvent::EventTaken {
+                queue: observe::EventQueue::Wire,
+                point: observe::TakePoint::TurnStart,
+                ..
+            }
+        ) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// A VCT apply that finishes while the turn handles its events, after the
+/// turn's first settle, still wins over its due fatal deadline.
+#[tokio::test(start_paused = true)]
+async fn an_apply_that_finishes_during_the_turns_events_cannot_fire_the_fatal() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let port = PendingVctLocalPort::with_flagged_apply(flag.clone());
+    let mut fixture = VctLocalFixture::new(port, HeaderTargetPhase::Applying);
+    fixture.dispatch();
+    poll_pending_operation(&mut fixture.reactor);
+    fixture.reactor.startup.observer =
+        observe::ObserverSlot(Some(Arc::new(FinishDuringEvents(flag))));
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    let other = ZakuraPeerId::new(vec![0x72; 32]).expect("the peer ID has the required length");
+    fixture
+        ._handle
+        .send(Event::PeerDisconnected {
+            peer: other,
+            session_id: 1,
+            reason: "test",
+        })
+        .await
+        .expect("the reactor holds the event queue");
+
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    let fatal = fatal_events.try_recv();
+    assert!(
+        matches!(fatal, Err(mpsc::error::TryRecvError::Empty)),
+        "a finished apply must not fire the fatal: {fatal:?}"
+    );
+    assert!(!task.is_finished());
+    shutdown.cancel();
+    task.await.unwrap();
 }
 
 #[test]

@@ -209,7 +209,8 @@ where
 /// `ShutdownIncomplete`. The node half of the claim is about a stopped
 /// node, so a run that never stops the node holds once its released rounds
 /// settle. Today no committed input can stop the node, so every planted
-/// round-level case relies on that.
+/// round-level case relies on that. A step with a released round a claim
+/// tainted isn't judged, so it never counts as holding.
 fn check_teardown<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -231,7 +232,8 @@ where
         }
         return cx.violated(expected, first.detail);
     }
-    if row.is_some_and(|row| row.released > 0 || row.settled) {
+    // A tainted round's settlement isn't judged, so the step doesn't pass.
+    if row.is_some_and(|row| row.tainted == 0 && (row.released > 0 || row.settled)) {
         Verdict::Holds
     } else {
         Verdict::NotApplicable
@@ -798,6 +800,8 @@ mod tests {
         Stop {
             settled: bool,
         },
+        /// A released round a claim tainted, unsettled.
+        Tainted,
         Broke(Claim),
     }
 
@@ -842,6 +846,7 @@ mod tests {
                     released,
                     unsettled,
                     stuck,
+                    tainted: 0,
                     shutdown: false,
                     settled: false,
                 }),
@@ -850,8 +855,18 @@ mod tests {
                     released: 0,
                     unsettled: 0,
                     stuck: 0,
+                    tainted: 0,
                     shutdown: true,
                     settled,
+                }),
+                Some(Scripted::Tainted) => self.probe.rounds.record(Settlement {
+                    step,
+                    released: 1,
+                    unsettled: 1,
+                    stuck: 0,
+                    tainted: 1,
+                    shutdown: false,
+                    settled: false,
                 }),
                 Some(Scripted::Broke(claim)) => {
                     self.probe.claims.record(ClaimRecord {
@@ -864,6 +879,7 @@ mod tests {
                         released: 1,
                         unsettled: 0,
                         stuck: 0,
+                        tainted: 0,
                         shutdown: false,
                         settled: false,
                     });
@@ -972,6 +988,27 @@ mod tests {
         assert_eq!(
             violation.actual,
             "the probe reads 4001 reserved and 0 owned"
+        );
+    }
+
+    /// A step whose released round a claim tainted doesn't count as a
+    /// passing evaluation: of these two steps only the settled one does.
+    #[test]
+    fn a_tainted_round_is_not_counted_as_held() {
+        let report = run_property(
+            teardown_returns_baseline(),
+            &[
+                Scripted::Tainted,
+                Scripted::Settlement {
+                    released: 1,
+                    unsettled: 0,
+                    stuck: 0,
+                },
+            ],
+        );
+        assert_eq!(
+            report.properties[0].outcome,
+            PropertyOutcome::Held { applicable: 1 }
         );
     }
 

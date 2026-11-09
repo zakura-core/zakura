@@ -99,6 +99,9 @@ pub struct Settlement {
     /// headers still unended, so storage has nothing left that could settle
     /// them.
     pub stuck: usize,
+    /// How many released rounds a claim tainted. Such a round never
+    /// settles, and its teardown isn't judged.
+    pub tainted: usize,
     /// Whether the harness began stopping the reactor.
     pub shutdown: bool,
     /// Whether the stopped reactor's teardown is done: the reactor is gone

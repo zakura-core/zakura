@@ -377,6 +377,7 @@ impl TapState {
             released: work.ledger.released_rounds(),
             unsettled: work.ledger.unsettled_rounds(),
             stuck: work.ledger.stuck_rounds(),
+            tainted: work.ledger.tainted_rounds(),
             shutdown: self.shutdown.load(Ordering::Relaxed),
             settled: self.settled.load(Ordering::Relaxed),
         });

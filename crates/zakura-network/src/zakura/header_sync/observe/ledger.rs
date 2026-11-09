@@ -1024,6 +1024,15 @@ impl HeaderWorkLedger {
             })
     }
 
+    /// How many released rounds a claim tainted, which never settle. See the
+    /// module doc.
+    pub fn tainted_rounds(&self) -> usize {
+        self.released
+            .iter()
+            .filter(|incarnation| self.tainted_rounds.contains(incarnation))
+            .count()
+    }
+
     /// How many released rounds haven't settled with no call that holds
     /// their headers still unended, so storage has nothing left to answer
     /// that could settle them. A tainted round isn't judged stuck.

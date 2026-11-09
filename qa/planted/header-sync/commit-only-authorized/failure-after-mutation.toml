@@ -1,7 +1,8 @@
-# The engine installs an apply's transition and then reports failure, so
+# A node round's apply installs its transition and then reports failure, so
 # the apply fails with the engine's durable state already changed. The
-# reactor, the queue, the storage adapter and the engine decide how the
-# witness's rounds apply, so a change there can move the witness off it.
+# fixture's own preload applies faithfully. The reactor, the queue, the
+# storage adapter and the engine decide how the witness's rounds apply, so a
+# change there can move the witness off it.
 checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition"]
 
 [typed]

@@ -1012,3 +1012,95 @@ fn an_open_starts_where_storage_put_its_first_locator() {
         );
     }
 }
+
+/// The model's V1 page sizes are encoded V1 pages' payloads, each entry
+/// carrying its auxiliary record, so a wrong auxiliary byte count fails
+/// here.
+#[test]
+fn v1_page_sizes_are_encoded_pages() {
+    use zakura_chain::{block::merkle::AuthDataRoot, ironwood, orchard, sapling};
+    use zakura_header_chain::TreeAuxRecordV1;
+
+    let fixture = HeaderFixture::regtest();
+    for count in [1, 3] {
+        let headers = fixture.extend(fixture.anchor(), count, 0);
+        let page = RegtestMessage::Headers(Headers {
+            subscription_id: 1,
+            initial_target_tip_hash: headers.last().expect("one at least").hash(),
+            common_ancestor_height: block::Height(0),
+            common_ancestor_hash: fixture.anchor().hash,
+            reaches_initial_target: true,
+            tree_aux_schema: AuxSchema::V1,
+            entries: (1..)
+                .zip(headers)
+                .map(|(height, header)| HeaderEntry {
+                    header,
+                    body_size: 0,
+                    tree_aux: Some(TreeAuxRecordV1 {
+                        height: block::Height(height),
+                        sapling_root: sapling::tree::Root::default(),
+                        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+                        sapling_tx_count: 0,
+                        orchard_tx_count: 0,
+                        ironwood_tx_count: 0,
+                        auth_data_root: AuthDataRoot::from([0; 32]),
+                    }),
+                })
+                .collect(),
+        });
+        let frame = encode_frame(&page).expect("a V1 page encodes");
+        assert_eq!(
+            credit::page_size(u64::from(count), AuxSchema::V1),
+            u64::try_from(frame.payload.len()).expect("small"),
+            "{count} headers"
+        );
+    }
+    assert!(credit::smallest_page(AuxSchema::V1) > credit::smallest_page(AuxSchema::None));
+}
+
+/// Under a V1 Open, a claimed page is charged its V1 size: one charged as
+/// a plain page breaks, with its cursor and totals agreeing.
+#[test]
+fn a_v1_page_is_charged_its_auxiliary_records() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let mut v1 = open(chain[3], &[genesis.hash]);
+    let granted = u32::try_from(credit::page_size(2, AuxSchema::V1)).expect("small");
+    if let ReactorEvent::CreditIssued {
+        objects,
+        bytes,
+        update,
+        ..
+    } = &mut v1
+    {
+        (*objects, *bytes) = (2, granted);
+        update.tree_aux_schema = AuxSchema::V1;
+        update.added_credit = Credit {
+            objects: 2,
+            bytes: granted,
+        };
+    }
+    let claim = |charged: u64| ReactorEvent::CursorClaimed {
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        through: chain[1],
+        headers: 2,
+        bytes: charged,
+        page_last: chain[1],
+        page_headers: 2,
+        page_bytes: charged,
+        totals: Default::default(),
+    };
+    let with = |charged| credit_breaks(&[reserved(1, 10), v1.clone(), claim(charged)]);
+    assert_eq!(
+        with(credit::page_size(2, AuxSchema::V1)),
+        Vec::<String>::new()
+    );
+    let found = with(credit::page_size(2, AuxSchema::None));
+    assert!(
+        found.iter().any(|found| found.contains("which takes")),
+        "{found:?}"
+    );
+}

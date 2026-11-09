@@ -890,9 +890,15 @@ pub(super) struct PeerSchedule {
     /// Without it, a peer could replace its session just before each timeout
     /// and never be charged. The next request's timeout is capped by this
     /// budget, counted from when the request is sent, so the node's own delay
-    /// before sending isn't charged to the peer. A peer that answers re-arms a
-    /// full timeout and pays nothing. A further replacement before any request
-    /// keeps the budget.
+    /// before sending isn't charged to the peer. A peer that answers within the
+    /// budget re-arms a full timeout and pays nothing. A further replacement
+    /// before any request keeps the budget.
+    ///
+    /// A replacement with very little time left can draw one strike before the
+    /// new request even reaches the peer. That's accepted: the peer had already
+    /// sat on the request for most of a timeout, a strike is one of the limit's
+    /// three by default, and its next usable answer clears it. A grace period
+    /// would need its own state so further replacements couldn't renew it.
     pub(super) replaced_request_budget: Option<Duration>,
 }
 

@@ -476,18 +476,21 @@ mod tests {
     };
 
     use super::{
-        chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
-        EndViolation, TeardownView, CACHED_PASS_REFILL, CHUNK_BUDGET_CAPACITY,
+        chunk_budget_bound, stale_completion_inert, teardown_end_violations,
+        teardown_returns_baseline, BudgetView, EndViolation, StaleView, TeardownView,
+        CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND, CHUNK_BUDGET_CAPACITY, STALE_COMPLETION_INERT,
+        TEARDOWN_RETURNS_BASELINE,
     };
     use crate::{
         harness::header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
+            stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim,
+        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
 
     /// The model's capacity and refill interval are production's.
@@ -503,6 +506,17 @@ mod tests {
         capacity: CapacityEvidence,
         claims: ClaimEvidence,
         rounds: SettlementEvidence,
+        stale_calls: StaleEvidence,
+    }
+
+    impl StaleView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn stale_calls(&self) -> &StaleEvidence {
+            &self.stale_calls
+        }
     }
 
     impl TeardownView for Probe {
@@ -560,6 +574,7 @@ mod tests {
             settled: bool,
         },
         Broke(Claim),
+        Breaks(&'static [Claim]),
     }
 
     /// Records the next scripted evidence at each boundary, as a tap would.
@@ -628,6 +643,15 @@ mod tests {
                         shutdown: false,
                         settled: false,
                     });
+                }
+                Some(Scripted::Breaks(claims)) => {
+                    for (at, &claim) in claims.iter().enumerate() {
+                        self.probe.claims.record(ClaimRecord {
+                            step,
+                            claim,
+                            detail: format!("{claim:?} #{at}"),
+                        });
+                    }
                 }
                 None => {}
             }
@@ -901,6 +925,83 @@ mod tests {
             let violations = &report.properties[0].violations;
             assert_eq!(violations.len(), 1, "{claim:?}: {violations:?}");
             assert_eq!(violations[0].step, 2, "{claim:?}");
+        }
+    }
+
+    /// Every claim break one boundary's drain found survives into the
+    /// report, not just the first, for each check that reads claim breaks:
+    /// the first and third of three at step 1, in the order the tap found
+    /// them. The second is another rule's, which the check doesn't report.
+    #[test]
+    fn every_claim_break_at_a_boundary_is_reported() {
+        let budget = format!("at most {CHUNK_BUDGET_CAPACITY} headers reserved and owned");
+        let teardown = "a released round, and a stopped node, keeps no reservation, lease or \
+                        held headers once settled, and no locator permit a pending storage \
+                        read doesn't hold";
+        let stale = "a stale completion's handler returns only its own round's budget";
+        /// A property, its ID, the claims the boundary broke, what the
+        /// property expects, and the two findings it reports.
+        type Case<'e> = (
+            Property<Probe>,
+            &'static str,
+            &'static [Claim],
+            &'e str,
+            [&'static str; 2],
+        );
+        let cases: [Case<'_>; 3] = [
+            (
+                chunk_budget_bound(),
+                CHUNK_BUDGET_BOUND,
+                &[
+                    Claim::BudgetOverCapacity,
+                    Claim::LeakedLease,
+                    Claim::OverBudget,
+                ],
+                &budget,
+                ["BudgetOverCapacity #0", "OverBudget #2"],
+            ),
+            (
+                teardown_returns_baseline(),
+                TEARDOWN_RETURNS_BASELINE,
+                &[
+                    Claim::LeakedReservation,
+                    Claim::OverBudget,
+                    Claim::LeakedLease,
+                ],
+                teardown,
+                ["LeakedReservation #0", "LeakedLease #2"],
+            ),
+            (
+                stale_completion_inert(),
+                STALE_COMPLETION_INERT,
+                &[
+                    Claim::StaleCompletionEffect,
+                    Claim::LeakedLease,
+                    Claim::StaleCompletionEffect,
+                ],
+                stale,
+                ["StaleCompletionEffect #0", "StaleCompletionEffect #2"],
+            ),
+        ];
+        for (property, id, claims, expected, [first, second]) in cases {
+            let report = run_property(property, &[Scripted::Breaks(claims)]);
+            let found = |actual: &str| Violation {
+                property: id.to_owned(),
+                step: 1,
+                witness: vec![1],
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            };
+            assert_eq!(
+                report.properties[0].violations,
+                [found(first), found(second)],
+                "{id}"
+            );
+            assert_eq!(
+                report.properties[0].outcome,
+                PropertyOutcome::Violated { witness: vec![1] },
+                "{id}"
+            );
         }
     }
 }

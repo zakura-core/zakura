@@ -31,7 +31,9 @@ howudoin = []
 # need it. Builds without this feature reject every JoinSplit as a retryable
 # local verifier failure (never as consensus-invalid), so they stall instead of
 # forking on a pre-NU7 block that is above the last checkpoint and has JoinSplits.
-sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd", "dep:ed25519-zebra", "dep:rand_core"]
+# It also makes `zakura-state` maintain the Sprout note commitment tree, which
+# only that verification reads.
+sprout = ["dep:bellman", "dep:bls12_381", "dep:blake2b_simd", "dep:ed25519-zebra", "dep:rand_core", "zakura-state/sprout"]
 
 # Test-only features
 internal-bench = []

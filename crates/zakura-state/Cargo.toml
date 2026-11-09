@@ -22,6 +22,16 @@ howudoin = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
+# Maintains the Sprout note commitment tree and its anchors.
+#
+# Only verifying pre-NU7 JoinSplits above the last checkpoint reads them, so a
+# build without `zakura-consensus`'s `sprout` feature, which refuses every
+# JoinSplit, leaves the tree unchanged. The first block whose Sprout note
+# commitments it skips durably marks the database, and a build with this
+# feature refuses to open a marked database until its tip is past NU7 and the
+# last checkpoint. See `ZakuraDb::sprout_tree_skipped_from`.
+sprout = []
+
 # Exposes narrow internal hooks used by benchmarks.
 internal-bench = []
 

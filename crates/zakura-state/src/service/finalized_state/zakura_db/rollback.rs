@@ -27,6 +27,7 @@ use zakura_chain::{
     value_balance::ValueBalance,
 };
 
+use super::shielded::update_note_commitment_trees;
 use crate::{
     config::state_database_format_version_on_disk,
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
@@ -724,7 +725,7 @@ fn rebuild_treestate_to_height(
             .stored_block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
-        note_commitment_trees.update_trees_parallel(&block)?;
+        update_note_commitment_trees(&mut note_commitment_trees, &block)?;
         retained_sprout_roots.insert(note_commitment_trees.sprout.root());
 
         let sapling_root = note_commitment_trees.sapling.root();

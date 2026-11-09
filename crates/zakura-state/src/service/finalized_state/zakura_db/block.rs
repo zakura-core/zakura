@@ -1277,6 +1277,15 @@ impl ZakuraDb {
             batch.prepare_transparent_indexes_skipped_marker_batch(self, finalized.height);
         }
 
+        // The first block whose Sprout note commitments this build left out of the Sprout tree
+        // durably marks the database, in the same atomic batch.
+        if !super::shielded::MAINTAINS_SPROUT_TREE
+            && self.sprout_tree_skipped_from().is_none()
+            && finalized.block.sprout_note_commitments().next().is_some()
+        {
+            batch.prepare_sprout_tree_skipped_marker_batch(self, finalized.height);
+        }
+
         // In pruned storage mode, delete raw transaction history that has fallen
         // outside the retention window, and/or advance the pruning marker. This
         // goes in the same atomic batch as the tip advance, so pruning and the

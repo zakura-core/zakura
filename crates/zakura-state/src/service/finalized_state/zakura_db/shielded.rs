@@ -30,9 +30,10 @@ use crate::{
     request::{FinalizedBlock, Treestate},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
-        disk_format::RawBytes,
+        disk_format::{IntoDisk, RawBytes},
         vct::VctWriteData,
         zakura_db::ZakuraDb,
+        PRUNING_METADATA,
     },
     MissingSproutTipTree, TransactionLocation, ValidateContextError,
 };
@@ -41,8 +42,81 @@ use crate::{
 #[allow(unused_imports)]
 use zakura_chain::subtree::NoteCommitmentSubtree;
 
+/// Whether this build maintains the Sprout note commitment tree and its anchors.
+///
+/// Only verifying pre-NU7 JoinSplits reads them. A build without the `sprout` feature refuses
+/// every JoinSplit, so it leaves the tree unchanged and marks the database instead. See
+/// [`ZakuraDb::sprout_tree_skipped_from`].
+pub(crate) const MAINTAINS_SPROUT_TREE: bool = cfg!(feature = "sprout");
+
+/// Updates `trees` with the note commitments in `block`, including Sprout only when this build
+/// maintains the Sprout tree.
+///
+/// See [`MAINTAINS_SPROUT_TREE`].
+pub(crate) fn update_note_commitment_trees(
+    trees: &mut NoteCommitmentTrees,
+    block: &zakura_chain::block::BlockRef,
+) -> Result<(), zakura_chain::parallel::tree::NoteCommitmentTreeError> {
+    if MAINTAINS_SPROUT_TREE {
+        trees.update_trees_parallel(block)
+    } else {
+        trees.update_trees_parallel_without_sprout(block)
+    }
+}
+
+/// The key, in the [`PRUNING_METADATA`] column family, of the first height a build without the
+/// `sprout` feature committed without adding its Sprout note commitments to the Sprout tree.
+///
+/// From that height on, the database's Sprout tree and anchors are incomplete. They stay
+/// incomplete for good, because nothing rebuilds them. Its bytes differ from every other key in
+/// the column family, so the entries never collide.
+#[derive(Debug)]
+struct SproutTreeSkippedFromKey;
+
+impl IntoDisk for SproutTreeSkippedFromKey {
+    type Bytes = &'static [u8];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        b"sprout_tree_skipped_from"
+    }
+}
+
 impl ZakuraDb {
     // Read shielded methods
+
+    /// Returns the first height committed without its Sprout note commitments, if any block has
+    /// been.
+    ///
+    /// A database with this marker has an incomplete Sprout tree and anchors. Pre-NU7 JoinSplits
+    /// cannot be checked against them, so a build with the `sprout` feature refuses to open the
+    /// database until its finalized tip is past NU7 and the last checkpoint, where nothing reads
+    /// the Sprout tree again. Final frontiers cannot be generated from it either.
+    ///
+    /// See [`SproutTreeSkippedFromKey`].
+    pub fn sprout_tree_skipped_from(&self) -> Option<Height> {
+        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA)?;
+        self.db.zs_get(&pruning_metadata, &SproutTreeSkippedFromKey)
+    }
+
+    /// Returns `true` if nothing will read this database's Sprout note commitment tree again.
+    ///
+    /// That holds once the finalized tip is at or past both NU7 activation and the last
+    /// checkpoint. From NU7 no block can contain a JoinSplit, so no Sprout anchor is checked.
+    /// Below the last checkpoint, fast sync still checks its embedded Sprout frontier at the
+    /// checkpoint. A network without NU7 never stops reading the Sprout tree.
+    pub fn sprout_tree_is_no_longer_read(
+        &self,
+        network: &zakura_chain::parameters::Network,
+    ) -> bool {
+        let Some(tip) = self.finalized_tip_height() else {
+            return false;
+        };
+        let Some(nu7) = zakura_chain::parameters::NetworkUpgrade::Nu7.activation_height(network)
+        else {
+            return false;
+        };
+        tip >= nu7 && tip >= network.checkpoint_list().max_height()
+    }
 
     /// Returns `true` if the finalized state contains `sprout_nullifier`.
     pub fn contains_sprout_nullifier(&self, sprout_nullifier: &sprout::Nullifier) -> bool {
@@ -951,6 +1025,19 @@ impl DiskWriteBatch {
     ) {
         self.insert_sprout_anchor(zakura_db, tree);
         self.update_sprout_tip(zakura_db, tree);
+    }
+
+    /// Adds the durable marker that this database committed `height` without its Sprout note
+    /// commitments.
+    ///
+    /// See [`ZakuraDb::sprout_tree_skipped_from`].
+    pub fn prepare_sprout_tree_skipped_marker_batch(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        height: Height,
+    ) {
+        let pruning_metadata = zakura_db.db.cf_handle(PRUNING_METADATA).unwrap();
+        self.zs_insert(&pruning_metadata, SproutTreeSkippedFromKey, height);
     }
 
     /// Inserts one historical Sprout frontier keyed by its anchor.

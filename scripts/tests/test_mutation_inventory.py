@@ -106,6 +106,25 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(row["errors"], ["sidecar has no holds witness for the intended property"])
         self.assertEqual(row["discovery_target"], "missing")
 
+    def test_typed_case_checks_its_files_and_has_no_target(self):
+        self.write("qa/planted/right/example.patch", "unused")
+        self.write("qa/planted/right/example.toml", '[typed]\nharness = "harness"\nscenario = "s.json"\nplan = "p.bin"\n')
+        self.write("s.json", "{}")
+        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        self.assertEqual(row["errors"], ["missing typed plan: p.bin"])
+        self.assertEqual(row["harness"], "harness")
+        self.assertEqual(row["fuzz_targets"], [])
+        self.assertEqual(row["scenario_sha256"], inventory.sha256(self.root / "s.json"))
+        self.write("p.bin", "plan")
+        row = inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+        self.assertEqual(row["errors"], [])
+
+    def test_case_with_both_forms_is_refused(self):
+        self.write("qa/planted/right/example.patch", "unused")
+        self.write("qa/planted/right/example.toml", 'input = "input.bin"\n[typed]\nharness = "h"\nscenario = "s"\nplan = "p"\n')
+        with self.assertRaises(ValueError):
+            inventory.planted_binding(self.root, self.root / "qa/planted/right/example.patch")
+
 
 if __name__ == "__main__":
     unittest.main()

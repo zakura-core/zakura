@@ -14,7 +14,7 @@ use zakura_sim::{
         block_sync::BlockScenario,
         discovery, discovery_service,
         fixtures::{PickScenario, Variant, Which},
-        header_sync::StorageScenario,
+        header_sync::{FloodScenario, StorageScenario, WakeScenario},
         wire_plans::SavedPlan,
     },
     seed::{self, SeedError, SeedKind, SeedReport},
@@ -147,6 +147,10 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-triggers" | "header-storage-stale-prepare" => {
             value(StorageScenario::triggers())
         }
+        "header-release-wake" => value(WakeScenario::Release),
+        "header-release-wake-deferred" => value(WakeScenario::Deferred),
+        "header-flood-wire" => value(FloodScenario::Wire),
+        "header-flood-lifecycle" => value(FloodScenario::Lifecycle),
         _ => None,
     }
 }
@@ -196,6 +200,14 @@ fn planted_inputs_carry_their_witnesses() {
                 );
                 let table: toml::Table = toml::from_str(&fs::read_to_string(&case).unwrap())
                     .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
+                // A typed case runs a committed scenario, not a seed.
+                if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
+                    for file in ["scenario", "plan"] {
+                        let path = typed[file].as_str().unwrap();
+                        assert!(root.join(path).is_file(), "{}: no {path}", case.display());
+                    }
+                    continue;
+                }
                 let input = root.join(table["input"].as_str().unwrap());
                 let seed = report
                     .admitted

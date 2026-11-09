@@ -16,8 +16,8 @@
 
 use serde::{Deserialize, Serialize};
 use zakura_network::zakura::{
-    wire_codec::WireMessage, DiscoveryMessage, MessageRole, MessageRule, ZakuraNodeRecord,
-    ZakuraServiceId,
+    wire_codec::WireMessage, DiscoveryMessage, MessageRole, MessageRule, ZakuraDiscoveryConfig,
+    ZakuraNodeRecord, ZakuraServiceId,
 };
 use zakura_quic::NodeSecretKey;
 
@@ -534,7 +534,9 @@ impl DiscoveryPeer {
         Ok((frame, exchange))
     }
 
-    /// `record` re-signed by `author` with an expiry already past.
+    /// `record` re-signed by `author` with an expiry past the node's clock
+    /// skew tolerance, production's default, so the node's expiry check
+    /// refuses it.
     fn expired(&self, record: ZakuraNodeRecord, author: &NodeSecretKey) -> ZakuraNodeRecord {
         let mut expired = body(
             author,
@@ -542,7 +544,8 @@ impl DiscoveryPeer {
             unix_now(),
             record.body.direct_addrs,
         );
-        expired.expires_at_unix_secs = unix_now().saturating_sub(1);
+        let tolerance = ZakuraDiscoveryConfig::default().clock_skew_tolerance;
+        expired.expires_at_unix_secs = unix_now().saturating_sub(tolerance.as_secs() + 1);
         ZakuraNodeRecord::sign(expired, author).expect("a fixture record signs")
     }
 }

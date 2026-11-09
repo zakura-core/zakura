@@ -55,6 +55,16 @@ impl BlockAndHash {
         }
     }
 
+    /// Creates a new [`BlockAndHash`] from a block's hash and its Zcash
+    /// consensus serialization, without decoding the block.
+    pub fn from_serialized(hash: block::Hash, data: Vec<u8>) -> Self {
+        BlockAndHash {
+            hash: hash.bytes_in_display_order().to_vec(),
+            data,
+            receipt_order: None,
+        }
+    }
+
     /// Try to convert a [`BlockAndHash`] into a tuple of a decoded block and hash.
     pub fn decode(self) -> Option<(block::Block, block::Hash)> {
         self.hash

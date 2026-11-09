@@ -4,9 +4,16 @@
 //! tapped. `header-sync/wire` runs the same node behind its real transport
 //! on simulated QUIC, with scripted peers (M5-C), honest ones (M5-D) and
 //! adversaries (M5-E1), checked by header sync's generated table properties
-//! and `session/honest-never-punished` (P3d).
+//! and `session/honest-never-punished` (P3d). `header-sync/release-wake`
+//! runs `header-sync/storage` on the wake fixtures alone, and
+//! `header-sync/flood` on the flood fixtures.
 
+mod flood;
 pub mod grammar;
+mod release_wake;
+
+pub use flood::{Flood, FloodScenario, FLOODERS};
+pub use release_wake::{ReleaseWake, WakeScenario};
 
 use std::{any::Any, cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
@@ -27,7 +34,7 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        adoption::{Acceptance, AdoptionEvidence, SessionLife},
+        adoption::{AdoptionEvidence, SessionLife},
         capacity::CapacityEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
         fault::{FaultCheck, FaultEvidence},
@@ -37,6 +44,7 @@ use super::{
         session::SessionEvidence,
         stale::StaleEvidence,
         tap::ReactorTap,
+        wake::WakeEvidence,
         Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
         Policy, PolicySource, Topology,
     },
@@ -49,14 +57,15 @@ use crate::{
     domain::{
         header_sync::{
             chunk_budget_bound, stale_completion_inert, teardown_end_violations,
-            teardown_returns_baseline, BudgetView, StaleView, TeardownView,
+            teardown_returns_baseline, AdoptionView, BudgetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
     observe::StorageFact,
     peer::{
         adversary::Act, honest::HonestChain, limit::ADVERSARY_RATE, peer_id, Dialer as PeerDialer,
-        PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask, NODE_ADDR,
+        PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
+        NODE_ADDR,
     },
     property::{
         Assume, AssumeRecord, Assumptions, CheckCtx, EndViolation, HasView, Inconclusive, Kind,
@@ -546,6 +555,10 @@ pub struct Ports {
     /// The node's stale prepare and apply calls, which its tap finds during
     /// the run.
     pub stale_calls: StaleEvidence,
+    /// The node's wake facts, which its tap finds during the run. Inert
+    /// unless whoever prepared the ports declared a wake fixture
+    /// ([`WakeEvidence::new`]).
+    pub wake: WakeEvidence,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -563,6 +576,8 @@ pub struct Storage {
     rounds: SettlementEvidence,
     /// The node's stale prepare and apply calls, from its tap.
     stale_calls: StaleEvidence,
+    /// The node's wake facts, from its tap.
+    wake: WakeEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -599,6 +614,8 @@ pub struct StorageView {
     pub rounds: SettlementEvidence,
     /// The node's stale prepare and apply calls.
     pub stale_calls: StaleEvidence,
+    /// The node's wake facts, which its tap finds during the run.
+    pub wake: WakeEvidence,
 }
 
 impl BudgetView for StorageView {
@@ -637,6 +654,20 @@ impl StaleView for StorageView {
     }
 }
 
+impl AdoptionView for StorageView {
+    /// [`StorageView::adoption`].
+    fn adoption(&self) -> &AdoptionEvidence {
+        &self.adoption
+    }
+}
+
+impl WakeView for StorageView {
+    /// [`StorageView::wake`].
+    fn wake(&self) -> &WakeEvidence {
+        &self.wake
+    }
+}
+
 impl HonestPeers for StorageView {
     /// True if `index` is in [`StorageView::honest_peers`].
     fn is_honest(&self, index: usize) -> bool {
@@ -661,6 +692,7 @@ impl HasView for Storage {
             claims: self.claims.clone(),
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
+            wake: self.wake.clone(),
         }
     }
 
@@ -677,6 +709,11 @@ impl HasView for Storage {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
         found
+    }
+
+    /// The node's wake facts' stamps ([`WakeEvidence::stamps_after`]).
+    fn stamps_after(&self, after: Option<u64>) -> Option<Vec<u64>> {
+        Some(self.wake.stamps_after(after))
     }
 }
 
@@ -767,6 +804,7 @@ impl Subsystem for Storage {
             capacity: CapacityEvidence::default(),
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
+            wake: WakeEvidence::default(),
         }
     }
 
@@ -794,6 +832,7 @@ impl Subsystem for Storage {
             ports.rounds.clone(),
             ports.stale_calls.clone(),
         );
+        tap.watch_wakes(ports.wake.clone());
         let adoption = tap.adoption();
         let claims = tap.claims();
 
@@ -854,7 +893,8 @@ impl Subsystem for Storage {
             scenario.controls.clone(),
             predicates,
         )
-        .with_port(ports.node.clone());
+        .with_port(ports.node.clone())
+        .with_adoption(adoption.clone());
         sim.add_source(Box::new(control));
         Storage {
             port: ports.node,
@@ -864,6 +904,7 @@ impl Subsystem for Storage {
             claims,
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
+            wake: ports.wake,
             faults,
             topology,
         }
@@ -959,6 +1000,8 @@ pub struct WirePorts {
     pub sessions: SessionEvidence,
     /// The peers' records the identity map hasn't placed yet.
     records: PeerRecords,
+    /// The peers that closed their own connection.
+    closed: PeerCloses,
     /// The node's header capacity accounting, which its tap fills during the
     /// run.
     pub reservations: ReservationEvidence,
@@ -971,6 +1014,8 @@ pub struct WirePorts {
     /// The node's stale prepare and apply calls, which its tap finds during
     /// the run.
     pub stale_calls: StaleEvidence,
+    /// The node's wake facts, which its tap finds during the run.
+    pub wake: WakeEvidence,
 }
 
 impl WirePorts {
@@ -1007,10 +1052,14 @@ pub struct HeaderWire {
     rounds: SettlementEvidence,
     /// The node's stale prepare and apply calls, from its tap.
     stale_calls: StaleEvidence,
+    /// The node's wake facts, from its tap.
+    wake: WakeEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
     sessions: SessionEvidence,
+    /// The peers that closed their own connection.
+    closed: PeerCloses,
     /// The node and the peers' state. They live until the run ends, so no
     /// task sees its inputs close.
     _keep: Box<dyn Any>,
@@ -1035,6 +1084,7 @@ impl HasView for HeaderWire {
             claims: self.claims.clone(),
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
+            wake: self.wake.clone(),
         }
     }
 
@@ -1135,10 +1185,12 @@ impl Subsystem for HeaderWire {
             adoption: Rc::default(),
             sessions: SessionEvidence::default(),
             records: PeerRecords::default(),
+            closed: PeerCloses::default(),
             reservations: ReservationEvidence::default(),
             capacity: CapacityEvidence::default(),
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
+            wake: WakeEvidence::default(),
         }
     }
 
@@ -1240,6 +1292,7 @@ impl Subsystem for HeaderWire {
                 listening,
                 chain: ports.chains[index].clone(),
                 records: ports.records.clone(),
+                closed: ports.closed.clone(),
                 taken: 0,
             };
             sim.scheduler().spawn_root("peer", task.run());
@@ -1257,8 +1310,10 @@ impl Subsystem for HeaderWire {
             claims,
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
+            wake: ports.wake,
             faults,
             sessions: ports.sessions,
+            closed: ports.closed,
             _keep: Box::new(node),
         }
     }
@@ -1387,12 +1442,17 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
 }
 
 /// Whether `assume` holds after a step of `wire`: `StableMembership` while
-/// `peer-0`'s header session is the node's only membership
-/// ([`SessionEvidence::stable_membership`]), and every other assumption
-/// always, since the scenario enforces what it declares.
+/// `peer-0` is the node's only membership
+/// ([`SessionEvidence::stable_membership`]) and hasn't closed its own
+/// connection, and every other assumption always, since the scenario
+/// enforces what it declares. Only the environment breaks it
+/// ([`EndedBy`](crate::property::EndedBy)): `peer-0`'s scripted close, or
+/// another peer. A node that drops `peer-0` leaves it holding.
 fn wire_holds(wire: &HeaderWire, assume: Assume) -> bool {
     match assume {
-        Assume::StableMembership => wire.sessions.stable_membership("peer-0"),
+        Assume::StableMembership => {
+            wire.sessions.stable_membership("peer-0") && !wire.closed.borrow().contains(&0)
+        }
         _ => true,
     }
 }
@@ -1513,7 +1573,7 @@ fn check_operation_ids<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
 /// IDs and completes each at most once, after its submission, at each step
 /// that logs a submission or completion there. A check keeps no state
 /// between steps, so it replays the node's facts from the run's start, and
-/// reports the first finding among this step's.
+/// reports every finding among this step's, in log order.
 pub(crate) fn check_service_operation_ids<S: HasView>(
     service: &str,
     cx: &mut CheckCtx<'_, S>,
@@ -1525,17 +1585,25 @@ pub(crate) fn check_service_operation_ids<S: HasView>(
         return Verdict::NotApplicable;
     }
     let mut ids = OperationIds::default();
+    let mut findings = Vec::new();
     for entry in cx.log.entries() {
         let Some(fact) = operation_fact(service, &entry.obs) else {
             continue;
         };
-        if let Some((expected, actual)) = ids.check(fact) {
+        if let Some(finding) = ids.check(fact) {
             if entry.step == cx.step {
-                return cx.violated(expected, actual);
+                findings.push(finding);
             }
         }
     }
-    Verdict::Holds
+    let mut findings = findings.into_iter();
+    let Some((expected, actual)) = findings.next() else {
+        return Verdict::Holds;
+    };
+    for (expected, actual) in findings {
+        cx.record_violation(expected, actual);
+    }
+    cx.violated(expected, actual)
 }
 
 /// Checks [`DIRECT_DISPATCH`]: violated once the dispatch guard's flag is
@@ -1592,18 +1660,20 @@ fn check_header_fault_penalized<S: HasView<View = StorageView>>(
     }
 }
 
-/// [`HEADER_FAULT_PENALIZED`]'s break at the run's end, from
-/// [`FaultEvidence::penalized`] over `log`, such as a failed reply the
+/// [`HEADER_FAULT_PENALIZED`]'s breaks at the run's end, one each, from
+/// [`FaultEvidence::penalized`] over `log`, such as two failed replies the
 /// reactor never took by the time a settled run ended.
 fn fault_end_violations(faults: &FaultEvidence, log: &ObservationLog) -> Vec<EndViolation> {
-    match faults.penalized(log.entries()) {
-        Acceptance::Violated(actual) => vec![EndViolation {
+    faults
+        .penalized(log.entries())
+        .violated
+        .into_iter()
+        .map(|actual| EndViolation {
             property: PropertyId::new(HEADER_FAULT_PENALIZED),
             expected: FAULT_PENALIZED_EXPECTED.to_owned(),
             actual,
-        }],
-        Acceptance::Holds | Acceptance::Inconclusive(_) => Vec::new(),
-    }
+        })
+        .collect()
 }
 
 /// The node's operation IDs so far, which [`check_operation_ids`] replays
@@ -1695,6 +1765,214 @@ mod tests {
     /// The finding `check` reports.
     fn finding(expected: &str, actual: &str) -> Option<(String, String)> {
         Some((expected.to_owned(), actual.to_owned()))
+    }
+
+    /// Two header-peer faults whose replies reached the reactor, which
+    /// never took either, are two breaks when a settled run ends, one
+    /// [`HEADER_FAULT_PENALIZED`] end violation each.
+    #[test]
+    fn every_untaken_fault_is_an_end_violation() {
+        use crate::{
+            observe::{StorageBranch, StoragePoint, WorkOwner, WorkScope},
+            storage::{Blame, FaultAttributions},
+            IdleStatus, Outcome,
+        };
+
+        let point = |height| StoragePoint {
+            height,
+            hash: String::new(),
+        };
+        let attributions = FaultAttributions::default();
+        let mut log = ObservationLog::default();
+        for id in [4, 7] {
+            attributions.insert(0, id, Blame::HeaderPeer("aa".to_owned()));
+            let owner = WorkOwner {
+                kind: "header".to_owned(),
+                scope: WorkScope {
+                    header_generation: 1,
+                    branch: StorageBranch {
+                        anchor: String::new(),
+                        target: String::new(),
+                    },
+                },
+                verified_generation: None,
+                body_work_epoch: None,
+                session_id: 3,
+                request_id: id,
+            };
+            let request = StorageRequest::PrepareHeaderTarget {
+                owner,
+                source: "aa".to_owned(),
+                common_ancestor: point(0),
+                target: point(1),
+                headers: 1,
+                work: None,
+                first: None,
+            };
+            let failed = StorageResult::PrepareFailed {
+                category: "invalid_header".to_owned(),
+            };
+            for fact in [
+                StorageFact::Submitted {
+                    id,
+                    request,
+                    digest: String::new(),
+                    call: Some(id),
+                },
+                StorageFact::Completed {
+                    id,
+                    outcome: "engine".to_owned(),
+                    result: failed,
+                    delivered: true,
+                    generation: 0,
+                    state: String::new(),
+                },
+            ] {
+                log.push(Observation::Storage {
+                    service: HEADER_SERVICE.to_owned(),
+                    instance: 0,
+                    seq: 0,
+                    txn: 0,
+                    fact,
+                });
+            }
+        }
+        let faults =
+            FaultEvidence::new(attributions, Default::default(), std::time::Duration::ZERO);
+        faults.end(&RunEnd {
+            outcome: Outcome::Idle {
+                status: IdleStatus::Quiescent,
+            },
+            steps: 1,
+            violation: None,
+            drain: None,
+            harness: None,
+        });
+        let found = fault_end_violations(&faults, &log);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for (violation, op) in found.iter().zip([4, 7]) {
+            assert_eq!(violation.property, PropertyId::new(HEADER_FAULT_PENALIZED));
+            assert!(
+                violation
+                    .actual
+                    .starts_with(&format!("UntakenFault: operation {op} ")),
+                "{violation:?}"
+            );
+        }
+    }
+
+    /// A harness with no view, for checks that read only the log.
+    struct Logged;
+
+    impl HasView for Logged {
+        type View = ();
+
+        /// Nothing.
+        fn view(&self) {}
+    }
+
+    /// Logs each step's scripted storage facts on the node's header
+    /// storage, from step 1, since the run also observes after setup.
+    struct Facts {
+        /// Each step's facts, in order.
+        steps: std::collections::VecDeque<Vec<StorageFact>>,
+        /// The last fact's sequence number.
+        seq: u64,
+    }
+
+    impl crate::ActionSource for Facts {
+        fn enabled(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<(crate::Identity, u64)>) {}
+
+        fn boundaries(&self, _: zakura_scheduler::SimInstant, _: &mut Vec<crate::Boundary>) {}
+
+        fn execute(&mut self, _: u64, _: &mut ObservationLog) {
+            unreachable!("the script offers no actions");
+        }
+
+        /// Logs the next step's facts, numbered after the last ones.
+        fn observe(&mut self, log: &mut ObservationLog) -> Result<(), String> {
+            if log.step() == 0 {
+                return Ok(());
+            }
+            for fact in self.steps.pop_front().unwrap_or_default() {
+                self.seq += 1;
+                log.push(Observation::Storage {
+                    service: HEADER_SERVICE.to_owned(),
+                    instance: 0,
+                    seq: self.seq,
+                    txn: self.seq,
+                    fact,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    /// Runs [`OPERATION_IDS`] through the registry over one task that
+    /// yields once per step of `steps`, each step logging its facts.
+    fn run_operation_ids(steps: Vec<Vec<StorageFact>>) -> crate::RunReport {
+        let mut sim = crate::Sim::new(RunConfig::default(), crate::PlanInput::Bytes(Vec::new()));
+        let count = steps.len();
+        sim.add_source(Box::new(Facts {
+            steps: steps.into_iter().collect(),
+            seq: 0,
+        }));
+        sim.scheduler().spawn_root("reactor", async move {
+            for _ in 1..count {
+                zakura_rt::task::yield_now().await;
+            }
+        });
+        let property = Property {
+            id: PropertyId::new(OPERATION_IDS),
+            claim: "operation IDs",
+            kind: Kind::Safety,
+            assumes: &[],
+            needs: &[Source::Storage],
+            status: Status::Active,
+            check: check_operation_ids::<Logged>,
+            witness: None,
+        };
+        let registry = crate::property::Registry::new(vec![property]).expect("one property");
+        let mut checker = crate::property::RegistryChecker::new(
+            registry,
+            Rc::new(Logged),
+            crate::property::Assumptions::none(),
+            &Sources::observed(&[Source::Schedule, Source::Storage]),
+        );
+        sim.run(&mut checker, &mut crate::MemorySink::default())
+    }
+
+    /// Every finding at one step survives into the run's report, not just
+    /// the first: at step 2, operation 1 completes again and operation 3
+    /// completes before its submission, and step 1's facts break nothing.
+    #[test]
+    fn every_operation_id_finding_at_a_step_is_reported() {
+        let report = run_operation_ids(vec![
+            vec![submitted(1), completed(1), submitted(2)],
+            vec![completed(1), completed(3), completed(2)],
+        ]);
+        let property = &report.properties[0];
+        assert_eq!(
+            property.outcome,
+            crate::PropertyOutcome::Violated { witness: vec![2] }
+        );
+        let found = |expected: &str, actual: &str| crate::Violation {
+            property: OPERATION_IDS.to_owned(),
+            step: 2,
+            witness: vec![2],
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        };
+        assert_eq!(
+            property.violations,
+            [
+                found("operation 1 completes once", "operation 1 completed again"),
+                found(
+                    "a completion of a submitted operation, at most 2",
+                    "operation 3 completed before its submission"
+                ),
+            ]
+        );
     }
 
     /// No M4 run trips [`OPERATION_IDS`], so each of its branches gets a

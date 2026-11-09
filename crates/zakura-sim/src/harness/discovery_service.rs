@@ -52,8 +52,8 @@ use crate::{
         discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
         key_index,
         limit::ADVERSARY_RATE,
-        peer_addr, PeerAction, PeerControl, PeerFailure, PeerRecords, PeerSpec, PeerTask,
-        NODE_ADDR,
+        peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
+        PeerTask, NODE_ADDR,
     },
     property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status},
     table::{sender_properties, table_properties},
@@ -268,6 +268,7 @@ fn spawn_with(
             listening,
             chain: None,
             records: records.clone(),
+            closed: PeerCloses::default(),
             taken: 0,
         };
         sim.scheduler()

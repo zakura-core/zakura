@@ -34,8 +34,7 @@ use support::{
 use zakura_sim::{
     harness::{
         header_node::{
-            adoption::Acceptance,
-            fault::CooldownFact,
+            fault::{CooldownFact, FaultEnd},
             session::{EndCheck, SessionEvidence, SessionFact},
         },
         header_sync::{StorageView, WireScenario, HEADER_FAULT_PENALIZED},
@@ -220,7 +219,7 @@ fn a_late_fault_cools_down_the_peer_and_refuses_its_redial() {
         );
         assert_eq!(
             view.faults.penalized(report.log.entries()),
-            Acceptance::Holds,
+            FaultEnd::default(),
             "plan {index}"
         );
 

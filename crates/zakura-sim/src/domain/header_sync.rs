@@ -4,18 +4,24 @@
 //! trait, so a shared property can take the check over later by
 //! registering it against another view.
 
+use zakura_network::zakura::observe::EventQueue;
+
 use crate::{
     harness::header_node::{
+        adoption::{AdoptionEvidence, WatchRead},
         capacity::{BoundaryRead, CapacityEvidence},
         claim::{Claim, ClaimEvidence, SettlementEvidence},
         stale::StaleEvidence,
+        wake::{WakeEvidence, WakeFact},
     },
     property::{
-        CheckCtx, EndViolation, HasView, Inconclusive, Kind, Property, PropertyId, Source, Status,
-        TriggerHistory, Unit, Verdict,
+        CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind, LivenessBound,
+        ObligationKey, Property, PropertyId, Source, Status, Subject, TriggerHistory, Unit,
+        Verdict,
     },
     ObservationLog,
 };
+use zakura_scheduler::SimInstant;
 
 /// The header chunk budget never holds more than its capacity, reserved
 /// and owned together.
@@ -24,6 +30,11 @@ pub const CHUNK_BUDGET_BOUND: &str = "header-sync/chunk-budget-bound";
 /// The model's header chunk budget capacity, from properties.md's
 /// Header-sync chunk budget. A unit test pins it to production's.
 pub const CHUNK_BUDGET_CAPACITY: usize = 4_000;
+
+/// The model's cached-pass refill interval: a deferred pass runs at most
+/// this long after a release's wake opens. A unit test pins it to
+/// production's.
+pub const CACHED_PASS_REFILL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// What the header budget checks read: one reactor's probe reads and the
 /// claim breaks its tap found.
@@ -294,6 +305,294 @@ where
     }
 }
 
+/// In the wake fixture, a budget return that leaves room for an offer
+/// waiting for header room gets that offer's locator read to storage
+/// before the reactor goes quiet.
+pub const CAPACITY_RELEASE_WAKES: &str = "header-sync/capacity-release-wakes";
+
+/// What the release-wake check reads: one reactor's wake facts.
+pub trait WakeView {
+    /// The reactor's wake facts.
+    fn wake(&self) -> &WakeEvidence;
+}
+
+/// [`CAPACITY_RELEASE_WAKES`], as a harness whose view is a [`WakeView`]
+/// registers it. It applies only where the harness declared the wake
+/// fixture ([`crate::harness::header_node::wake`]).
+pub fn capacity_release_wakes<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: WakeView,
+{
+    Property {
+        id: PropertyId::new(CAPACITY_RELEASE_WAKES),
+        claim: "in the wake fixture, a header budget return that leaves room for an offer \
+                waiting for it gets that offer's locator read to storage before quiescence, \
+                or within one cached-pass refill when the pass is deferred, unless the \
+                environment ends its session",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_release_wake::<S>,
+        witness: Some(TriggerHistory::View(wake_opened::<S::View>)),
+    }
+}
+
+/// Checks [`CAPACITY_RELEASE_WAKES`] at the boundary after a step.
+///
+/// Each wake the step's facts opened ([`WakeFact::Opened`]) obliges the
+/// waiting peer's locator read to reach storage before quiescence. The
+/// read's submission answers it, and so does the waiting session's end when
+/// the environment ended it ([`EndedBy`](crate::property::EndedBy)). A
+/// deferred cached pass moves its deadline to the pass's refill, but never
+/// past [`CACHED_PASS_REFILL`] after the wake opened. Otherwise a budget that
+/// never refills would keep deferring it. It applies once a release opened
+/// a wake.
+fn check_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: WakeView,
+{
+    let view = cx.view();
+    for stamp in cx.new_stamps().to_vec() {
+        if let Some(WakeFact::Opened {
+            peer, session_id, ..
+        }) = view.wake().fact(stamp)
+        {
+            let subject = Subject::Session(wake_subject(&peer, session_id));
+            let obligation = cx.fact_obligation(Some(stamp), subject, wake_answer::<S::View>);
+            cx.oblige(obligation);
+        }
+    }
+    if view.wake().any_opened() {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// The obligation subject of `peer`'s session `session_id`'s wake.
+fn wake_subject(peer: &zakura_network::zakura::ZakuraPeerId, session_id: u64) -> String {
+    format!("{}#{session_id}", crate::storage::hex(&peer.digest()))
+}
+
+/// What the wake fact with `stamp` means for the wake `key` names, as
+/// [`check_release_wake`] describes.
+fn wake_answer<V: WakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let Subject::Session(subject) = &key.subject else {
+        return FactAnswer::Unrelated;
+    };
+    match view.wake().fact(stamp) {
+        Some(WakeFact::Submitted { peer })
+            if subject
+                .strip_prefix(&crate::storage::hex(&peer.digest()))
+                .is_some_and(|rest| rest.starts_with('#')) =>
+        {
+            FactAnswer::Discharges
+        }
+        Some(WakeFact::Ended {
+            peer,
+            session_id,
+            by,
+        }) if *subject == wake_subject(&peer, session_id) => by.answer(),
+        Some(WakeFact::Deferred { until }) => {
+            let cap = opened_at(view.wake(), subject, stamp)
+                .and_then(|opened| opened.checked_add(CACHED_PASS_REFILL));
+            FactAnswer::DefersTo(cap.map_or(until, |cap| until.min(cap)))
+        }
+        _ => FactAnswer::Unrelated,
+    }
+}
+
+/// When the last wake for `subject` before `stamp` opened.
+fn opened_at(wake: &WakeEvidence, subject: &str, stamp: u64) -> Option<SimInstant> {
+    wake.facts()
+        .into_iter()
+        .rev()
+        .filter(|(at, _)| *at < stamp)
+        .find_map(|(_, fact)| match fact {
+            WakeFact::Opened {
+                peer,
+                session_id,
+                at,
+            } if wake_subject(&peer, session_id) == subject => Some(at),
+            _ => None,
+        })
+}
+
+/// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a release opened a wake.
+fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
+    view.wake().any_opened()
+}
+
+/// Under a wire flood, the run loop reads each externally published
+/// committed state from its watch before it takes a third wire event.
+pub const WATCH_OBSERVED_UNDER_FLOOD: &str = "header-sync/watch-observed-under-flood";
+
+/// Under lifecycle churn, the run loop reads each externally published
+/// committed state from its watch before it takes a third lifecycle event.
+pub const WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD: &str =
+    "header-sync/watch-observed-under-lifecycle-flood";
+
+/// What the flood checks read: one reactor's adoption evidence, which
+/// keeps publications, watch reads and taken events in order.
+pub trait AdoptionView {
+    /// The reactor's adoption evidence.
+    fn adoption(&self) -> &AdoptionEvidence;
+}
+
+/// [`WATCH_OBSERVED_UNDER_FLOOD`], as a harness whose view is an
+/// [`AdoptionView`] registers it.
+pub fn watch_observed_under_flood<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    watch_observed(
+        WATCH_OBSERVED_UNDER_FLOOD,
+        "the run loop reads each externally published committed state from its watch \
+         before it takes a third wire event",
+        check_watch_under_flood::<S>,
+        published_under_wire_flood::<S::View>,
+    )
+}
+
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`], as a harness whose view is an
+/// [`AdoptionView`] registers it.
+pub fn watch_observed_under_lifecycle_flood<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    watch_observed(
+        WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+        "the run loop reads each externally published committed state from its watch \
+         before it takes a third lifecycle event",
+        check_watch_under_lifecycle_flood::<S>,
+        published_under_lifecycle_flood::<S::View>,
+    )
+}
+
+/// One watch property: `id`, claiming `claim`, checked by `check`, with
+/// trigger history `triggered`. A view check that marks its own open
+/// obligations, since the registry's bounds can't count taken events.
+fn watch_observed<S: HasView>(
+    id: &'static str,
+    claim: &'static str,
+    check: fn(&mut CheckCtx<'_, S>) -> Verdict,
+    triggered: fn(&S::View, &ObservationLog) -> bool,
+) -> Property<S> {
+    Property {
+        id: PropertyId::new(id),
+        claim,
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check,
+        witness: Some(TriggerHistory::View(triggered)),
+    }
+}
+
+/// Checks [`WATCH_OBSERVED_UNDER_FLOOD`] after each step.
+fn check_watch_under_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    check_watch_read(cx, EventQueue::Wire)
+}
+
+/// Checks [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`] after each step.
+fn check_watch_under_lifecycle_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    check_watch_read(cx, EventQueue::Lifecycle)
+}
+
+/// Checks the watch rule for `queue` over the view's adoption evidence
+/// ([`AdoptionEvidence::watch_read`]). It applies once a state is
+/// published. A publication still waiting for its read or its third event
+/// leaves the run inconclusive if it ends there, unless
+/// [`watch_end_violations`] breaks it at a settled end.
+fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    match cx.view().adoption().watch_read(queue) {
+        WatchRead::Nothing => Verdict::NotApplicable,
+        WatchRead::Holds => Verdict::Holds,
+        WatchRead::Open => {
+            cx.unsettled(Inconclusive::ObligationOpen);
+            Verdict::Holds
+        }
+        WatchRead::Broken(why) => cx.violated(
+            "each published state is read from the committed watch before a third event \
+             from the flooded queue",
+            why,
+        ),
+    }
+}
+
+/// The watch property for the flooded `queue`'s violation at the run's end:
+/// a publication still unread when the run settled
+/// ([`AdoptionEvidence::unread_at_settled_end`]), unless the harness had started to
+/// stop the node (`stopping`). A correct loop with an unread publication
+/// always has its watch arm ready, so it can't settle with one. Only a
+/// shutdown, which wins the loop's biased `select!`, may leave one unread
+/// ([`EndedBy`](crate::property::EndedBy)). A harness whose view is an
+/// [`AdoptionView`] reports these from [`HasView::end_violations`], after it
+/// handed the run's end to [`AdoptionEvidence::end`].
+pub fn watch_end_violations(
+    adoption: &AdoptionEvidence,
+    queue: EventQueue,
+    stopping: bool,
+) -> Vec<EndViolation> {
+    if stopping || !adoption.unread_at_settled_end(queue) {
+        return Vec::new();
+    }
+    let property = match queue {
+        EventQueue::Wire => WATCH_OBSERVED_UNDER_FLOOD,
+        EventQueue::Lifecycle => WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+    };
+    vec![EndViolation {
+        property: PropertyId::new(property),
+        expected: "each published state is read from the committed watch before the run \
+                   settles"
+            .to_owned(),
+        actual: format!(
+            "the run settled with a published state unread and fewer than {} {queue:?} \
+             events taken since, with no shutdown begun",
+            crate::harness::header_node::adoption::WATCH_READ_EVENTS + 1
+        ),
+    }]
+}
+
+/// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state
+/// whose wire queue competed with its watch read
+/// ([`AdoptionEvidence::published_into_flood`]), or that the run settled
+/// with unread ([`AdoptionEvidence::unread_at_settled_end`]).
+fn published_under_wire_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
+    let adoption = view.adoption();
+    adoption.published_into_flood(EventQueue::Wire)
+        || adoption.unread_at_settled_end(EventQueue::Wire)
+}
+
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
+/// state whose lifecycle queue competed with its watch read, or that the
+/// run settled with unread.
+fn published_under_lifecycle_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
+    let adoption = view.adoption();
+    adoption.published_into_flood(EventQueue::Lifecycle)
+        || adoption.unread_at_settled_end(EventQueue::Lifecycle)
+}
+
 /// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended
 /// stale.
 fn stale_ended<V: StaleView>(view: &V, _: &ObservationLog) -> bool {
@@ -341,27 +640,33 @@ fn budget_claimed<V: BudgetView>(view: &V, _: &ObservationLog) -> bool {
 mod tests {
     use std::{collections::VecDeque, rc::Rc};
 
-    use zakura_network::zakura::observe::HEADER_CHUNK_BUDGET_CAPACITY;
+    use zakura_network::zakura::observe::{
+        HEADER_CACHED_PASS_REFILL, HEADER_CHUNK_BUDGET_CAPACITY,
+    };
 
     use super::{
-        chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
-        EndViolation, TeardownView, CHUNK_BUDGET_CAPACITY,
+        chunk_budget_bound, stale_completion_inert, teardown_end_violations,
+        teardown_returns_baseline, BudgetView, EndViolation, StaleView, TeardownView,
+        CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND, CHUNK_BUDGET_CAPACITY, STALE_COMPLETION_INERT,
+        TEARDOWN_RETURNS_BASELINE,
     };
     use crate::{
         harness::header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
+            stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim,
+        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
 
-    /// The model's capacity is production's.
+    /// The model's capacity and refill interval are production's.
     #[test]
     fn the_model_capacity_is_production_s() {
         assert_eq!(CHUNK_BUDGET_CAPACITY, HEADER_CHUNK_BUDGET_CAPACITY);
+        assert_eq!(CACHED_PASS_REFILL, HEADER_CACHED_PASS_REFILL);
     }
 
     /// A probe's and a ledger's evidence with no tap behind it.
@@ -370,6 +675,17 @@ mod tests {
         capacity: CapacityEvidence,
         claims: ClaimEvidence,
         rounds: SettlementEvidence,
+        stale_calls: StaleEvidence,
+    }
+
+    impl StaleView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn stale_calls(&self) -> &StaleEvidence {
+            &self.stale_calls
+        }
     }
 
     impl TeardownView for Probe {
@@ -427,6 +743,7 @@ mod tests {
             settled: bool,
         },
         Broke(Claim),
+        Breaks(&'static [Claim]),
     }
 
     /// Records the next scripted evidence at each boundary, as a tap would.
@@ -495,6 +812,15 @@ mod tests {
                         shutdown: false,
                         settled: false,
                     });
+                }
+                Some(Scripted::Breaks(claims)) => {
+                    for (at, &claim) in claims.iter().enumerate() {
+                        self.probe.claims.record(ClaimRecord {
+                            step,
+                            claim,
+                            detail: format!("{claim:?} #{at}"),
+                        });
+                    }
                 }
                 None => {}
             }
@@ -768,6 +1094,83 @@ mod tests {
             let violations = &report.properties[0].violations;
             assert_eq!(violations.len(), 1, "{claim:?}: {violations:?}");
             assert_eq!(violations[0].step, 2, "{claim:?}");
+        }
+    }
+
+    /// Every claim break one boundary's drain found survives into the
+    /// report, not just the first, for each check that reads claim breaks:
+    /// the first and third of three at step 1, in the order the tap found
+    /// them. The second is another rule's, which the check doesn't report.
+    #[test]
+    fn every_claim_break_at_a_boundary_is_reported() {
+        let budget = format!("at most {CHUNK_BUDGET_CAPACITY} headers reserved and owned");
+        let teardown = "a released round, and a stopped node, keeps no reservation, lease or \
+                        held headers once settled, and no locator permit a pending storage \
+                        read doesn't hold";
+        let stale = "a stale completion's handler returns only its own round's budget";
+        /// A property, its ID, the claims the boundary broke, what the
+        /// property expects, and the two findings it reports.
+        type Case<'e> = (
+            Property<Probe>,
+            &'static str,
+            &'static [Claim],
+            &'e str,
+            [&'static str; 2],
+        );
+        let cases: [Case<'_>; 3] = [
+            (
+                chunk_budget_bound(),
+                CHUNK_BUDGET_BOUND,
+                &[
+                    Claim::BudgetOverCapacity,
+                    Claim::LeakedLease,
+                    Claim::OverBudget,
+                ],
+                &budget,
+                ["BudgetOverCapacity #0", "OverBudget #2"],
+            ),
+            (
+                teardown_returns_baseline(),
+                TEARDOWN_RETURNS_BASELINE,
+                &[
+                    Claim::LeakedReservation,
+                    Claim::OverBudget,
+                    Claim::LeakedLease,
+                ],
+                teardown,
+                ["LeakedReservation #0", "LeakedLease #2"],
+            ),
+            (
+                stale_completion_inert(),
+                STALE_COMPLETION_INERT,
+                &[
+                    Claim::StaleCompletionEffect,
+                    Claim::LeakedLease,
+                    Claim::StaleCompletionEffect,
+                ],
+                stale,
+                ["StaleCompletionEffect #0", "StaleCompletionEffect #2"],
+            ),
+        ];
+        for (property, id, claims, expected, [first, second]) in cases {
+            let report = run_property(property, &[Scripted::Breaks(claims)]);
+            let found = |actual: &str| Violation {
+                property: id.to_owned(),
+                step: 1,
+                witness: vec![1],
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            };
+            assert_eq!(
+                report.properties[0].violations,
+                [found(first), found(second)],
+                "{id}"
+            );
+            assert_eq!(
+                report.properties[0].outcome,
+                PropertyOutcome::Violated { witness: vec![1] },
+                "{id}"
+            );
         }
     }
 }

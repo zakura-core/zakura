@@ -301,6 +301,7 @@ impl HasView for Planted {
             claims: Default::default(),
             rounds: Default::default(),
             stale_calls: Default::default(),
+            wake: Default::default(),
         }
     }
 }

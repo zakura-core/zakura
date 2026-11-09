@@ -188,7 +188,8 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
         | policy::Trigger::Committed(_)
         | policy::Trigger::Released
         | policy::Trigger::ReservationOpened(_)
-        | policy::Trigger::SessionAdmitted(_) => true,
+        | policy::Trigger::SessionAdmitted(_)
+        | policy::Trigger::HeadroomWait(_) => true,
         policy::Trigger::ReplyTaken(select) => {
             !matches!(select.kind, Some(BlockKind::Read | BlockKind::MirrorRead))
         }
@@ -207,9 +208,11 @@ pub fn undriven(trigger: &Trigger) -> Option<String> {
             "a block scenario can't wait for {found:?}: block storage commits and replies in \
              one completion"
         ),
-        policy::Trigger::ReservationOpened(_) | policy::Trigger::SessionAdmitted(_) => format!(
+        policy::Trigger::ReservationOpened(_)
+        | policy::Trigger::SessionAdmitted(_)
+        | policy::Trigger::HeadroomWait(_) => format!(
             "a block scenario can't wait for {found:?}: only a header reactor's tap reports \
-             reservations and admissions"
+             reservations, admissions and headroom waits"
         ),
         _ => format!(
             "a block scenario can't wait for {found:?}: only a range read's caller takes its \

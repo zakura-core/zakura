@@ -44,7 +44,7 @@ pub mod limit;
 mod stage;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{Ipv4Addr, SocketAddr},
@@ -525,10 +525,19 @@ pub(crate) struct PeerTask {
     pub(crate) chain: Option<Arc<HonestChain>>,
     /// Where it records its frames.
     pub(crate) records: PeerRecords,
+    /// The peers that closed their own connection, by index, which this one
+    /// joins when it takes a scripted close.
+    pub(crate) closed: PeerCloses,
     /// How many scripted actions it has taken, so its next is
     /// `spec.script[taken]`.
     pub(crate) taken: usize,
 }
+
+/// The peers that closed their own connection with a scripted
+/// [`PeerAction::Close`] or [`PeerAction::Disconnect`], by index. Shared by
+/// the peers' tasks and the harness, which reads it as the environment's
+/// end of a peer's membership.
+pub(crate) type PeerCloses = Rc<RefCell<BTreeSet<usize>>>;
 
 /// How a connection's service ended.
 enum Ended {
@@ -1602,6 +1611,7 @@ impl PeerTask {
                             settled = self.spec.dialer == Dialer::Peer;
                         }
                         PeerAction::Close | PeerAction::Disconnect => {
+                            self.closed.borrow_mut().insert(self.index);
                             conn.close(VarInt::from_u32(0), b"close");
                             if let Some(stream) = &header {
                                 self.record(remote, stream.id, RecordBody::Closed);

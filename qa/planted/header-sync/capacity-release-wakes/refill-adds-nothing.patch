@@ -1,0 +1,13 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+index 9d2c5184a1..f88711f8bc 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor/state.rs
+@@ -1106,7 +1106,7 @@ impl CachedPassBudget {
+             // At most the burst refills count, which fits u32.
+             let refills = u32::try_from(refills.min(u128::from(CACHED_PASS_BURST)))
+                 .expect("the burst fits u32");
+-            self.passes = self.passes.saturating_add(refills).min(CACHED_PASS_BURST);
++            // Mutation: a refill adds no pass.
+             self.refilled_at = if self.passes == CACHED_PASS_BURST {
+                 now
+             } else {

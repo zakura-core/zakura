@@ -14,10 +14,7 @@ use zakura_header_chain::{ErrorCategory, Frontier, SourceId};
 use zakura_node_services::header_chain::Port;
 use zakura_scheduler::SchedulerConfig;
 use zakura_sim::{
-    harness::header_node::{
-        adoption::Acceptance,
-        fault::{owed, CooldownEvidence, FaultEvidence, OwedPenalty},
-    },
+    harness::header_node::fault::{owed, CooldownEvidence, FaultEnd, FaultEvidence, OwedPenalty},
     observe::{StorageFact, StorageResult},
     storage::{Blame, HeaderStorage},
     NoChecks, Observation, Outcome, Plan, PlanInput, RunConfig, RunReport,
@@ -203,7 +200,7 @@ fn assert_one_attributed(
     // No reactor runs here, so nothing penalizes the supplier, and the
     // settled run shows it.
     assert!(
-        matches!(faults.penalized(report.log.entries()), Acceptance::Violated(why)
+        matches!(faults.penalized(report.log.entries()).violated.as_slice(), [why]
             if why.starts_with("UnpenalizedFault")),
         "{:?}",
         faults.penalized(report.log.entries())
@@ -275,6 +272,6 @@ fn an_unattributed_failure_owes_nothing() {
             owed(report.log.entries(), faults.attributions()).unwrap(),
             Vec::new()
         );
-        assert_eq!(faults.penalized(report.log.entries()), Acceptance::Holds);
+        assert_eq!(faults.penalized(report.log.entries()), FaultEnd::default());
     }
 }

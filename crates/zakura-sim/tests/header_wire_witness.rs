@@ -38,7 +38,7 @@ use zakura_sim::{
     property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source},
     table::{sender_properties, table_properties, GeneratedId, Template},
     witness::{judge_report, Expect},
-    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, Violation,
 };
 
 /// Header sync's stream at the version it tables.
@@ -763,6 +763,58 @@ fn closed(cause: &str) -> Observation {
         connection: 1,
         cause: cause.to_owned(),
     }
+}
+
+/// Two punishments of an honest peer at one step, a fault close of its
+/// connection 1 and a `Misbehavior` against its connection 2, are two
+/// violations, and the report keeps both.
+#[test]
+fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
+    let second = Observation::Transport {
+        instance: 0,
+        seq: 2,
+        node: "node".to_owned(),
+        connection: Some(2),
+        remote: peer_addr(0, 1).to_string(),
+        event: TransportFact::Registered,
+    };
+    let report = run_marked(
+        true,
+        false,
+        vec![
+            vec![registered(), second],
+            vec![
+                closed("ordered_read_rejected"),
+                Observation::Misbehavior { connection: 2 },
+            ],
+        ],
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let honest = report
+        .properties
+        .iter()
+        .find(|property| property.property == HONEST_NEVER_PUNISHED)
+        .expect("registered");
+    let found = |expected: &str, actual: &str| Violation {
+        property: "session/honest-never-punished".to_owned(),
+        step: 2,
+        witness: vec![2],
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    };
+    assert_eq!(
+        honest.violations,
+        [
+            found(
+                "honest peer-0's connection 1 is never punished",
+                "a close with cause ordered_read_rejected"
+            ),
+            found(
+                "honest peer-0's connection 2 is never punished",
+                "a Misbehavior"
+            ),
+        ]
+    );
 }
 
 /// Scripted punishments of an honest peer violate

@@ -38,7 +38,8 @@ pub struct AssumeRecord {
 /// A property that assumes something the scenario doesn't declare is
 /// `NotApplicable`. The harness enforces what it declares, so `holds` is
 /// false only while the scenario deliberately breaks an assumption, as
-/// during a fault.
+/// during a fault. Only the environment breaks one, never the node under
+/// test ([`EndedBy`](super::EndedBy)).
 pub struct Assumptions<S> {
     declared: Vec<AssumeRecord>,
     pub(crate) holds: fn(&S, Assume) -> bool,

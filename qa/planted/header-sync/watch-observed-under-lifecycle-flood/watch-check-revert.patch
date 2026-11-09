@@ -1,0 +1,52 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 7aa1720809..d8befcbf9c 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -515,45 +515,8 @@ impl HeaderSyncReactor {
+                 };
+                 self.handle_port_completion(completion);
+             }
+-            // Inspect watches on every turn, even when peer queues never become empty.
+-            // `changed` delivers a final unseen value before reporting channel closure.
+-            // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
+-            if let Some(snapshots) = committed_snapshots.as_mut() {
+-                match coop::unconstrained(snapshots.changed()).now_or_never() {
+-                    Some(Ok(())) => {
+-                        let snapshot = snapshots.borrow_and_update().clone();
+-                        if let Some(snapshot) = snapshot {
+-                            observe!(
+-                                self,
+-                                ReactorEvent::WatchObserved {
+-                                    state_version: snapshot.state_version,
+-                                }
+-                            );
+-                            caused!(
+-                                self,
+-                                ReactorCause::Watch,
+-                                self.observe_latest_committed_snapshot(snapshot)
+-                            );
+-                        }
+-                    }
+-                    Some(Err(_)) => committed_snapshots = None,
+-                    None => {}
+-                }
+-            }
+-            if let Some(repairs) = vct_root_repairs.as_mut() {
+-                match coop::unconstrained(repairs.changed()).now_or_never() {
+-                    Some(Ok(())) => {
+-                        let status = *repairs.borrow_and_update();
+-                        caused!(
+-                            self,
+-                            ReactorCause::Watch,
+-                            self.observe_vct_root_repair(status)
+-                        );
+-                    }
+-                    Some(Err(_)) => vct_root_repairs = None,
+-                    None => {}
+-                }
+-            }
++            // Mutation: #1566 reverted, so the turn checks no watch before its
++            // events.
+             // One item from each queue per turn prevents either queue monopolizing the loop.
+             // Session readers wait for connection acknowledgement before publishing peer events.
+             let mut handled_event = false;

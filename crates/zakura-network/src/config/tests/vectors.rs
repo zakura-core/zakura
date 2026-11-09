@@ -1820,20 +1820,20 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     let _init_guard = zakura_test::init();
 
     let config: Config = toml::from_str("").expect("empty config parses");
-    assert_eq!(config.advert_window_min, 32);
-    assert_eq!(config.advert_window_max, 64);
+    assert_eq!(config.advert_window_full_block, 32);
+    assert_eq!(config.advert_window_small_block, 64);
     assert_eq!(config.advert_window_small_size_bytes, 102_400);
     assert_eq!(config.advert_window_full_size_bytes, 1_572_864);
 
     let config: Config = toml::from_str(
-        "advert_window_min = 2\n\
-         advert_window_max = 16\n\
+        "advert_window_full_block = 2\n\
+         advert_window_small_block = 16\n\
          advert_window_small_size_bytes = 100\n\
          advert_window_full_size_bytes = 1000\n",
     )
     .expect("configured fan-out parses");
-    assert_eq!(config.advert_window_min, 2);
-    assert_eq!(config.advert_window_max, 16);
+    assert_eq!(config.advert_window_full_block, 2);
+    assert_eq!(config.advert_window_small_block, 16);
     assert_eq!(config.advert_window_small_size_bytes, 100);
     assert_eq!(config.advert_window_full_size_bytes, 1000);
 
@@ -1842,9 +1842,13 @@ fn advert_fanout_config_parses_with_defaults_and_roundtrips() {
     assert_eq!(roundtrip, config);
 
     // Equal bounds are a fixed window.
-    let config: Config = toml::from_str("advert_window_min = 50\nadvert_window_max = 50")
-        .expect("equal bounds parse");
-    assert_eq!(config.advert_window_min, config.advert_window_max);
+    let config: Config =
+        toml::from_str("advert_window_full_block = 50\nadvert_window_small_block = 50")
+            .expect("equal bounds parse");
+    assert_eq!(
+        config.advert_window_full_block,
+        config.advert_window_small_block
+    );
 
     let config: Config = toml::from_str("advert_window_small_size_bytes = 0")
         .expect("a zero small-size boundary parses");
@@ -1857,21 +1861,57 @@ fn advert_windows_preserve_explicit_values() {
     let _init_guard = zakura_test::init();
     for (text, expected) in [
         ("", (32, 64)),
-        ("advert_window_min = 32\nadvert_window_max = 64", (32, 64)),
         (
-            "advert_window_min = 1000\nadvert_window_max = 1000",
+            "advert_window_full_block = 32\nadvert_window_small_block = 64",
+            (32, 64),
+        ),
+        (
+            "advert_window_full_block = 1000\nadvert_window_small_block = 1000",
             (1000, 1000),
         ),
-        ("advert_window_min = 16\nadvert_window_max = 64", (16, 64)),
+        (
+            "advert_window_full_block = 16\nadvert_window_small_block = 64",
+            (16, 64),
+        ),
+        ("advert_window_small_block = 16", (16, 16)),
+        ("advert_window_full_block = 1001", (1001, 1001)),
+    ] {
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            (
+                config.advert_window_full_block,
+                config.advert_window_small_block
+            ),
+            expected
+        );
+    }
+}
+
+/// The previous names `advert_window_min` and `advert_window_max` still load, and resolve
+/// omitted windows the same way as the new names.
+#[test]
+fn previous_advert_window_names_still_load() {
+    let _init_guard = zakura_test::init();
+    for (text, expected) in [
+        ("advert_window_min = 16\nadvert_window_max = 48", (16, 48)),
+        ("advert_window_min = 32\nadvert_window_max = 64", (32, 64)),
         ("advert_window_max = 16", (16, 16)),
         ("advert_window_min = 1001", (1001, 1001)),
     ] {
         let config: Config = toml::from_str(text).unwrap();
         assert_eq!(
-            (config.advert_window_min, config.advert_window_max),
-            expected
+            (
+                config.advert_window_full_block,
+                config.advert_window_small_block
+            ),
+            expected,
+            "{text}"
         );
     }
+    assert!(
+        toml::from_str::<Config>("advert_window_min = 10\nadvert_window_max = 9").is_err(),
+        "the previous names keep the same validation"
+    );
 }
 
 #[test]
@@ -1900,10 +1940,10 @@ fn invalid_advert_fanout_config_is_rejected() {
     let _init_guard = zakura_test::init();
 
     for (config, field) in [
-        ("advert_window_min = 0", "advert_window_min"),
+        ("advert_window_full_block = 0", "advert_window_full_block"),
         (
-            "advert_window_min = 10\nadvert_window_max = 9",
-            "advert_window_min",
+            "advert_window_full_block = 10\nadvert_window_small_block = 9",
+            "advert_window_full_block",
         ),
         (
             "advert_window_full_size_bytes = 0",

@@ -9,8 +9,10 @@
 //! - **Failure.** An apply whose result is a failure leaves the durable
 //!   state exactly as it was. One that only raises a resource-stall alarm
 //!   inserts nothing.
-//! - **Success.** After any other apply, and after every reset, each held
-//!   node's stored header hashes to its key, and each held header is
+//! - **Success.** After any other apply, and after every reset, the graph
+//!   is what its stored headers alone give: each node's key, hash, parent,
+//!   height and block work, and the children, height and eligible-tip
+//!   indexes rebuilt from the nodes. Each held header is
 //!   eligible exactly when neither it nor an ancestor stands invalidated by
 //!   the port's `Reset` facts and not reconsidered. The stored selected
 //!   projection is the ancestry from the finalized anchor to the engine's
@@ -153,17 +155,7 @@ impl Contents {
     /// the verified projection.
     fn judge_state(&self, before: &DurableState, after: &DurableState, found: &mut Vec<String>) {
         let nodes = &after.graph.nodes;
-        let mut misfiled: Vec<String> = nodes
-            .iter()
-            .filter(|(key, node)| node.hash != **key || node.header.hash() != **key)
-            .map(|(key, _)| hash(*key))
-            .collect();
-        misfiled.sort_unstable();
-        if !misfiled.is_empty() {
-            found.push(format!(
-                "left {misfiled:?} holding a header that doesn't hash to its own key"
-            ));
-        }
+        found.extend(structure(&after.graph));
         let invalidated: HashSet<&str> = self.invalidated.iter().map(String::as_str).collect();
         let mut wrong: Vec<String> = nodes
             .values()
@@ -220,6 +212,82 @@ impl Contents {
     pub(super) fn take_breaks(&mut self) -> Vec<String> {
         std::mem::take(&mut self.breaks)
     }
+}
+
+/// The ways `graph`'s nodes and indexes disagree with what its stored
+/// headers alone give: each node's hash, parent, height and block work, and
+/// the children, height and eligible-tip indexes rebuilt from the nodes.
+fn structure(graph: &zakura_header_chain::GraphState) -> Vec<String> {
+    let nodes = &graph.nodes;
+    let mut wrong: Vec<String> = nodes
+        .iter()
+        .filter(|(key, node)| {
+            let height = match nodes.get(&node.header.previous_block_hash) {
+                Some(parent) => parent.height.next().ok(),
+                // Only the finalized anchor's parent isn't held.
+                None => (node.hash == graph.finalized_frontier.hash)
+                    .then_some(graph.finalized_frontier.height),
+            };
+            node.hash != **key
+                || node.header.hash() != **key
+                || node.parent_hash != node.header.previous_block_hash
+                || Some(node.height) != height
+                || Some(node.block_work) != node.header.difficulty_threshold.to_work()
+        })
+        .map(|(key, _)| hash(*key))
+        .collect();
+    wrong.sort_unstable();
+    let mut found = Vec::new();
+    if !wrong.is_empty() {
+        found.push(format!(
+            "left {wrong:?} with a hash, parent, height or block work its header doesn't give"
+        ));
+    }
+    let mut children: HashMap<block::Hash, HashSet<block::Hash>> = HashMap::new();
+    let mut heights: HashMap<block::Height, HashSet<block::Hash>> = HashMap::new();
+    for node in nodes.values() {
+        // The finalized anchor's parent isn't held, so it isn't indexed.
+        if nodes.contains_key(&node.parent_hash) {
+            children
+                .entry(node.parent_hash)
+                .or_default()
+                .insert(node.hash);
+        }
+        heights.entry(node.height).or_default().insert(node.hash);
+    }
+    let stored_children: HashMap<_, _> = graph
+        .children
+        .iter()
+        .filter(|(_, kids)| !kids.is_empty())
+        .map(|(parent, kids)| (*parent, kids.clone()))
+        .collect();
+    let stored_heights: HashMap<_, _> = graph
+        .heights
+        .iter()
+        .filter(|(_, at)| !at.is_empty())
+        .map(|(height, at)| (*height, at.clone()))
+        .collect();
+    if stored_children != children {
+        found.push("left a children index its nodes don't give".to_owned());
+    }
+    if stored_heights != heights {
+        found.push("left a height index its nodes don't give".to_owned());
+    }
+    let tips: HashSet<block::Hash> = nodes
+        .values()
+        .filter(|node| {
+            node.is_eligible()
+                && !children.get(&node.hash).is_some_and(|kids| {
+                    kids.iter()
+                        .any(|kid| nodes.get(kid).is_some_and(HeaderNode::is_eligible))
+                })
+        })
+        .map(|node| node.hash)
+        .collect();
+    if graph.eligible_header_tips != tips {
+        found.push("left an eligible-tip index its nodes don't give".to_owned());
+    }
+    found
 }
 
 /// Whether `node` or one of its held ancestors in `nodes` is in

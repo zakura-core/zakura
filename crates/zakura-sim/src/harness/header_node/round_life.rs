@@ -33,7 +33,8 @@
 //! - **Locator results.** Each locator storage read gives the engine's
 //!   selected path as the durable state the port recorded at the read
 //!   holds it: its tip is the selected projection's tip, its anchor the
-//!   finalized anchor, and every entry a header of the selected projection.
+//!   finalized anchor, the anchor is among its entries, and every entry is
+//!   a header of the selected projection.
 //!   The read's generation doesn't vouch for its hashes.
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
@@ -416,11 +417,19 @@ impl RoundLife {
             .iter()
             .filter(|entry| !selected.contains(*entry))
             .collect();
-        if expected_tip.as_ref() != Some(tip) || *finalized != anchor || !off_path.is_empty() {
+        // The anchor must be in the locator itself, not only in the
+        // separately recorded metadata, or a peer on another branch finds no
+        // common ancestor.
+        let anchored = hashes.contains(&anchor.hash);
+        if expected_tip.as_ref() != Some(tip)
+            || *finalized != anchor
+            || !off_path.is_empty()
+            || !anchored
+        {
             self.breaks.push(format!(
                 "ResetInvalidatesWork: locator read {id} gave tip {tip:?} at anchor {finalized:?} \
-                 with {off_path:?} off the selected path, but the engine held tip \
-                 {expected_tip:?} at anchor {anchor:?}"
+                 with {off_path:?} off the selected path and the anchor in it {anchored}, but \
+                 the engine held tip {expected_tip:?} at anchor {anchor:?}"
             ));
         }
     }

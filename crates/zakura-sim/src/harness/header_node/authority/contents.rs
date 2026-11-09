@@ -26,7 +26,9 @@
 use std::collections::{HashMap, HashSet};
 
 use zakura_chain::block;
-use zakura_header_chain::{DurableState, HeaderNode};
+use zakura_header_chain::{
+    BodyValidationState, DurableState, EngineMetadata, HeaderNode, HeaderValidationState,
+};
 use zakura_storage::header::{
     controlled::{EngineRun, RunKind},
     evidence::ResultIdentity,
@@ -152,24 +154,130 @@ impl Contents {
         }
     }
 
-    /// Judges the durable state `after` a successful run against the reset
-    /// model and the projection's own ancestry, and against `before` for
-    /// the verified projection.
+    /// Judges the durable state `after` a successful run, field by field:
+    /// every field of the engine, its graph and its metadata is destructured
+    /// with no `..`, so a field added later fails to compile here until it's
+    /// classified. Each is derived from the stored headers and the reset
+    /// model, or must be unchanged from `before`, or is left to a named
+    /// owner.
     fn judge_state(&self, before: &DurableState, after: &DurableState, found: &mut Vec<String>) {
-        let nodes = &after.graph.nodes;
-        found.extend(structure(&after.graph));
-        // A header apply or reset changes a held node only in its
-        // eligibility, which the reset model judges below. Its auxiliary
-        // delivery IDs are Rule 11's.
+        let DurableState {
+            graph,
+            metadata,
+            selected_projection,
+            verified_projection,
+            // Auxiliary delivery evidence is Rule 11's.
+            aux_delivery_index: _,
+        } = after;
+        let zakura_header_chain::GraphState {
+            // An in-memory change counter, like the engine's own revision.
+            graph_revision: _,
+            finalized_frontier,
+            preferred_header_tip,
+            nodes,
+            // Rebuilt from the nodes by `structure`.
+            children: _,
+            heights: _,
+            eligible_header_tips: _,
+            consensus_invalid_body_tombstones,
+        } = graph;
+        let EngineMetadata {
+            disk_format,
+            mode,
+            network_id,
+            network_policy_digest,
+            anchor_manifest_digest,
+            work_origin,
+            // Advances on every commit; its own rule is the planner's.
+            state_version: _,
+            // `reset-invalidates-work`'s insertion and reset rules.
+            header_generation: _,
+            verified_generation,
+            finality_epoch,
+            headers_only_migration_epoch,
+            frontiers,
+            header_best_score,
+            oldest_retained_height,
+            // A resource stall's alarm, the only change no fixture judges.
+            alarms: _,
+            // The committed transition's identity.
+            last_transition: _,
+        } = metadata;
+        let old = &before.metadata;
+        // No header apply or reset in these fixtures finalizes, verifies a
+        // body, migrates, prunes or changes the engine's identity.
+        let unchanged = [
+            ("the disk format", disk_format == &old.disk_format),
+            ("the mode", mode == &old.mode),
+            ("the network", network_id == &old.network_id),
+            (
+                "the network policy",
+                network_policy_digest == &old.network_policy_digest,
+            ),
+            (
+                "the anchor manifest",
+                anchor_manifest_digest == &old.anchor_manifest_digest,
+            ),
+            ("the work origin", work_origin == &old.work_origin),
+            (
+                "the verified generation",
+                verified_generation == &old.verified_generation,
+            ),
+            ("the finality epoch", finality_epoch == &old.finality_epoch),
+            (
+                "the migration epoch",
+                headers_only_migration_epoch == &old.headers_only_migration_epoch,
+            ),
+            (
+                "the finalized frontier",
+                frontiers.finalized == old.frontiers.finalized,
+            ),
+            (
+                "the verified frontier",
+                frontiers.verified_best == old.frontiers.verified_best,
+            ),
+            (
+                "the oldest retained height",
+                oldest_retained_height == &old.oldest_retained_height,
+            ),
+            (
+                "the graph's finalized frontier",
+                finalized_frontier == &before.graph.finalized_frontier,
+            ),
+            (
+                "the body tombstones",
+                consensus_invalid_body_tombstones
+                    == &before.graph.consensus_invalid_body_tombstones,
+            ),
+            (
+                "the verified projection",
+                verified_projection == &before.verified_projection,
+            ),
+        ];
+        for (field, same) in unchanged {
+            if !same {
+                found.push(format!("changed {field}"));
+            }
+        }
+        found.extend(structure(graph));
+        // A node held before and after changes only in its eligibility, which
+        // the model below judges, its validation from deferred to valid as
+        // the clock comes due, and its auxiliary delivery IDs, Rule 11's.
         let mut changed: Vec<String> = before
             .graph
             .nodes
             .iter()
             .filter(|(key, old)| {
                 nodes.get(key).is_some_and(|new| {
+                    let promoted =
+                        matches!(old.validation, HeaderValidationState::DeferredUntil(_))
+                            && new.validation == HeaderValidationState::Valid;
                     let mut new = new.clone();
                     new.eligibility = old.eligibility.clone();
                     new.aux_delivery_ids = old.aux_delivery_ids.clone();
+                    if promoted {
+                        new.validation = old.validation;
+                    }
                     new != **old
                 })
             })
@@ -178,40 +286,77 @@ impl Contents {
         changed.sort_unstable();
         if !changed.is_empty() {
             found.push(format!(
-                "changed held nodes {changed:?} in more than their eligibility"
+                "changed held nodes {changed:?} in more than their eligibility and a due \
+                 validation"
             ));
         }
+        // A header apply admits a header with no body knowledge.
+        let mut known: Vec<String> = nodes
+            .iter()
+            .filter(|(key, node)| {
+                !before.graph.nodes.contains_key(key)
+                    && node.body_validation_state != BodyValidationState::Unknown
+            })
+            .map(|(key, _)| hash(*key))
+            .collect();
+        known.sort_unstable();
+        if !known.is_empty() {
+            found.push(format!("inserted {known:?} with body state no body gave"));
+        }
+        // Eligible exactly when no held ancestor, itself included, stands
+        // invalidated by a reset or waits on a deferred validation.
         let invalidated: HashSet<&str> = self.invalidated.iter().map(String::as_str).collect();
         let mut wrong: Vec<String> = nodes
             .values()
-            .filter(|node| node.is_eligible() == stands_invalidated(node, nodes, &invalidated))
+            .filter(|node| node.is_eligible() == excluded(node, nodes, &invalidated))
             .map(|node| hash(node.hash))
             .collect();
         wrong.sort_unstable();
         if !wrong.is_empty() {
             found.push(format!(
-                "left {wrong:?} eligible while invalidated, or ineligible though nothing \
-                 invalidated them"
+                "left {wrong:?} eligible though excluded, or ineligible though nothing \
+                 excludes them"
             ));
         }
-        let projection = &after.selected_projection;
-        // Ending at the engine's own selected frontier is consistency, not
-        // fork choice, which is `expected-chain-selected`'s.
-        let selected = after.metadata.frontiers.header_best;
-        if projection.last() != Some(&selected) {
+        // Ending at the engine's own selected frontier, with its own score, is
+        // consistency, not fork choice, which is `expected-chain-selected`'s.
+        let selected = frontiers.header_best;
+        if selected_projection.last() != Some(&selected) {
             found.push(format!(
-                "left the selected projection ending at {:?}, not the selected frontier {selected:?}",
-                projection.last()
+                "left the selected projection ending at {:?}, not the selected frontier \
+                 {selected:?}",
+                selected_projection.last()
             ));
         }
-        if projection.first() != Some(&after.graph.finalized_frontier) {
+        if preferred_header_tip.is_some_and(|tip| tip != selected) {
             found.push(format!(
-                "left the selected projection starting at {:?}, not the finalized anchor {:?}",
-                projection.first(),
-                after.graph.finalized_frontier
+                "left the preferred tip {preferred_header_tip:?}, not the selected frontier"
             ));
         }
-        for pair in projection.windows(2) {
+        let score = nodes
+            .get(&selected.hash)
+            .zip(nodes.get(&finalized_frontier.hash))
+            .and_then(|(tip, anchor)| {
+                tip.work_coordinate()
+                    .cumulative_work()
+                    .checked_sub(anchor.work_coordinate().cumulative_work())
+            });
+        if header_best_score.tip_hash != selected.hash
+            || Some(header_best_score.suffix_work.as_u256()) != score
+        {
+            found.push(format!(
+                "left the selected score {header_best_score:?}, not the selected tip's work \
+                 above the anchor"
+            ));
+        }
+        if selected_projection.first() != Some(finalized_frontier) {
+            found.push(format!(
+                "left the selected projection starting at {:?}, not the finalized anchor \
+                 {finalized_frontier:?}",
+                selected_projection.first()
+            ));
+        }
+        for pair in selected_projection.windows(2) {
             let links = nodes.get(&pair[1].hash).is_some_and(|child| {
                 child.header.previous_block_hash == pair[0].hash
                     && child.header.hash() == pair[1].hash
@@ -224,12 +369,6 @@ impl Contents {
                     pair[1], pair[0]
                 ));
             }
-        }
-        if before.verified_projection != after.verified_projection {
-            found.push(format!(
-                "moved the verified projection from {:?} to {:?}",
-                before.verified_projection, after.verified_projection
-            ));
         }
     }
 
@@ -324,8 +463,9 @@ fn structure(graph: &zakura_header_chain::GraphState) -> Vec<String> {
 }
 
 /// Whether `node` or one of its held ancestors in `nodes` is in
-/// `invalidated`.
-fn stands_invalidated(
+/// `invalidated` or waits on a deferred validation, either of which makes it
+/// ineligible.
+fn excluded(
     node: &HeaderNode,
     nodes: &HashMap<block::Hash, HeaderNode>,
     invalidated: &HashSet<&str>,
@@ -333,7 +473,9 @@ fn stands_invalidated(
     let mut at = Some(node);
     // Each step moves to a strictly lower height, so the walk ends.
     while let Some(node) = at {
-        if invalidated.contains(hash(node.hash).as_str()) {
+        if invalidated.contains(hash(node.hash).as_str())
+            || node.validation != HeaderValidationState::Valid
+        {
             return true;
         }
         at = nodes

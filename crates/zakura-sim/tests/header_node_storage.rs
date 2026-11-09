@@ -1270,7 +1270,7 @@ fn selected_tip_follows_the_scenario_clock() {
                 }
                 None
             });
-            run_prepared::<Probing>(
+            let report = run_prepared::<Probing>(
                 &scenario,
                 ready.clone(),
                 input,
@@ -1279,6 +1279,9 @@ fn selected_tip_follows_the_scenario_clock() {
             )
             .unwrap_or_else(|error| panic!("{error}"));
             drop(watch);
+            // Deferred headers are ineligible for their clock, not a reset,
+            // and no property may read them as a defect.
+            assert_eq!(report.end.violation, None, "{:?}", report.end);
             let (now, tip) = first.get().expect("the node applied");
             let headers = fixture.extend(fixture.anchor(), CLOCK_HEADERS, 0);
             let eligible = headers

@@ -32,10 +32,9 @@
 //!   all-duplicate apply or an alarm-only commit, is exempt.
 //! - **Locator results.** Each locator storage read gives the engine's
 //!   selected path as the durable state the port recorded at the read
-//!   holds it: its tip is the selected projection's tip, its anchor the
-//!   finalized anchor, the anchor is among its entries, its entries are
-//!   distinct and at most the protocol's 13, and every entry is a header of
-//!   the selected projection.
+//!   holds it: its anchor is the finalized anchor, and its entries are
+//!   exactly the ones the spec's offsets (LC-WIRE-03) take from the
+//!   recorded selected projection, tip first, in order, then the anchor.
 //!   The read's generation doesn't vouch for its hashes.
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
@@ -73,6 +72,35 @@ use crate::{
     observe::{StorageFact, StorageResult},
     storage::{hash, point},
 };
+
+/// The distances below the tip a selected-path locator takes, as the
+/// header chain engine's spec sets them (LC-WIRE-03), restated so the check
+/// doesn't read the locator builder.
+const LOCATOR_OFFSETS: [u32; 12] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_000];
+
+/// The locator `projection`, a selected path from the finalized anchor to
+/// the tip, gives: the entry at each offset below the tip that the path
+/// reaches, then the anchor if no offset landed on it.
+fn selected_locator(
+    projection: &[zakura_header_chain::Frontier],
+) -> Vec<zakura_header_chain::Frontier> {
+    let (Some(anchor), Some(tip)) = (projection.first(), projection.last()) else {
+        return Vec::new();
+    };
+    let distance = tip.height.0.saturating_sub(anchor.height.0);
+    let mut entries: Vec<zakura_header_chain::Frontier> = LOCATOR_OFFSETS
+        .iter()
+        .filter(|offset| **offset <= distance)
+        .filter_map(|offset| {
+            // Widening u32 to usize is lossless on supported targets.
+            projection.get((distance - offset) as usize).copied()
+        })
+        .collect();
+    if entries.last() != Some(anchor) {
+        entries.push(*anchor);
+    }
+    entries
+}
 
 /// A header generation and the finality anchor's hash, as authority names
 /// them.
@@ -411,34 +439,16 @@ impl RoundLife {
         // keeps its trigger history.
         self.applies();
         let projection = &durable.selected_projection;
-        let selected: HashSet<String> = projection.iter().map(|entry| hash(entry.hash)).collect();
-        let expected_tip = projection.last().map(|entry| point(*entry));
         let anchor = point(durable.graph.finalized_frontier);
-        let off_path: Vec<&String> = hashes
-            .iter()
-            .filter(|entry| !selected.contains(*entry))
-            .collect();
-        // The anchor must be in the locator itself, not only in the
-        // separately recorded metadata, or a peer on another branch finds no
-        // common ancestor.
-        let anchored = hashes.contains(&anchor.hash);
-        // A locator names each header once and holds at most the protocol's
-        // entries, or the subscriber refuses to open from it.
-        let distinct: HashSet<&String> = hashes.iter().collect();
-        let well_formed = distinct.len() == hashes.len()
-            && hashes.len() <= zakura_header_chain::MAX_HEADER_LOCATOR_HASHES;
-        if expected_tip.as_ref() != Some(tip)
-            || *finalized != anchor
-            || !off_path.is_empty()
-            || !anchored
-            || !well_formed
+        let expected = selected_locator(projection);
+        let expected_tip = expected.first().map(|entry| point(*entry));
+        let expected_hashes: Vec<String> = expected.iter().map(|entry| hash(entry.hash)).collect();
+        if expected_tip.as_ref() != Some(tip) || *finalized != anchor || *hashes != expected_hashes
         {
             self.breaks.push(format!(
-                "ResetInvalidatesWork: locator read {id} gave tip {tip:?} at anchor {finalized:?} \
-                 with {off_path:?} off the selected path, the anchor in it {anchored} and \
-                 its {} entries distinct and within the limit {well_formed}, but the engine \
-                 held tip {expected_tip:?} at anchor {anchor:?}",
-                hashes.len()
+                "ResetInvalidatesWork: locator read {id} gave {hashes:?} from tip {tip:?} at \
+                 anchor {finalized:?}, but the engine's selected path gives {expected_hashes:?} \
+                 at anchor {anchor:?}"
             ));
         }
     }

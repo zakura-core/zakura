@@ -50,6 +50,8 @@ use super::{
 };
 use crate::{
     domain::discovery::late_response_admitted,
+    model::Label,
+    observe::StreamId,
     peer::{
         discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
         key_index,
@@ -57,9 +59,12 @@ use crate::{
         peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
         PeerTask, NODE_ADDR,
     },
-    property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status},
-    table::{sender_properties, table_properties},
-    RunConfig, Sim,
+    property::{
+        Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status,
+        TriggerHistory,
+    },
+    table::{sender_properties, table_properties, GeneratedId, Template},
+    Observation, ObservationLog, RunConfig, Sim,
 };
 
 /// The discovery node's own config.
@@ -508,10 +513,11 @@ pub const STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// `discovery/wire`'s properties: discovery's generated receiver
-/// properties, 31 IDs, then its sender properties, 7 IDs, each a `Draft`
-/// until its planted case lands (disc-3.2, disc-3.3), then
-/// `discovery/late-response-admitted` (disc-3.4), `Active` with its planted
-/// case.
+/// properties, 31 IDs, then its sender properties, 7 IDs. An ID is a
+/// `Draft` until its planted case lands. An ID with a planted case checks
+/// that case's trigger history ([`planted_trigger`]). Then comes
+/// `discovery/late-response-admitted` (disc-3.4), a hand-written `Active`
+/// property with its own planted case and trigger history.
 ///
 /// A `bad-content-closes` ID's generated check accepts a fault close or a
 /// `Misbehavior`, and discovery's node answers bad content with a fault
@@ -530,12 +536,132 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         });
     receiver
         .chain(sender_properties(FAMILY, &STREAMS))
-        .map(|property| Property {
-            status: Status::Draft,
-            ..property
+        .map(|property| match planted_trigger(property.id.as_str()) {
+            Some(trigger) => Property {
+                witness: Some(TriggerHistory::Log(trigger)),
+                ..property
+            },
+            None => Property {
+                status: Status::Draft,
+                ..property
+            },
         })
         .chain([late_response_admitted()])
         .collect()
+}
+
+/// True if the generated ID `id` has a planted case under `qa/planted/`,
+/// so it isn't a `Draft`.
+pub fn has_planted_case(id: &str) -> bool {
+    planted_trigger(id).is_some()
+}
+
+/// A trigger history over the run's observation log.
+type Trigger = fn(&ObservationLog) -> bool;
+
+/// The trigger history of the generated ID `id`'s planted case, if it has
+/// one. The stateless `<label>-closes` IDs have one each (disc-3.3): the
+/// shared frame reader skips the check for one row of discovery's table,
+/// and discovery drops that frame instead of closing. Their trigger is the
+/// node judging a frame with the ID's label on its row ([`judged_fault`]).
+fn planted_trigger(id: &str) -> Option<Trigger> {
+    let id = GeneratedId::parse(id)?;
+    if id.family != FAMILY || id.stream != stream_id() {
+        return None;
+    }
+    let Template::Closes(label) = id.template else {
+        return None;
+    };
+    match STATELESS.iter().position(|stateless| *stateless == label)? {
+        0 => Some(judged_fault::<0, 0>),
+        at => {
+            let row = <DiscoveryMessage as WireMessage>::RULES
+                .iter()
+                .position(|rule| Some(rule.name) == id.row)?;
+            Some(ROW_TRIGGERS[at - 1][row])
+        }
+    }
+}
+
+/// The kind and version of discovery's one stream ([`STREAMS`]).
+fn stream_id() -> StreamId {
+    let [stream] = STREAMS;
+    StreamId {
+        kind: stream.kind,
+        version: stream.version,
+    }
+}
+
+/// The labels the shared frame reader judges from a header alone, as
+/// [`judged_fault`] numbers them.
+const STATELESS: [Label; 4] = [
+    Label::UndeclaredType,
+    Label::ReservedFlags,
+    Label::ShortPayload,
+    Label::LongPayload,
+];
+
+/// [`judged_fault`] of each row-level label of [`STATELESS`], by label,
+/// then by row in table order.
+const ROW_TRIGGERS: [[Trigger; 5]; 3] = [
+    [
+        judged_fault::<1, 0>,
+        judged_fault::<1, 1>,
+        judged_fault::<1, 2>,
+        judged_fault::<1, 3>,
+        judged_fault::<1, 4>,
+    ],
+    [
+        judged_fault::<2, 0>,
+        judged_fault::<2, 1>,
+        judged_fault::<2, 2>,
+        judged_fault::<2, 3>,
+        judged_fault::<2, 4>,
+    ],
+    [
+        judged_fault::<3, 0>,
+        judged_fault::<3, 1>,
+        judged_fault::<3, 2>,
+        judged_fault::<3, 3>,
+        judged_fault::<3, 4>,
+    ],
+];
+
+/// True if `log` holds a frame the node judged on discovery's stream that
+/// the peer labelled `STATELESS[LABEL]`, on the row at `ROW` in
+/// discovery's table, or on any row for `UndeclaredType`. A trigger history
+/// is a plain function, so each ID takes its own instance.
+fn judged_fault<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> bool {
+    let label = STATELESS[LABEL];
+    let row = (label != Label::UndeclaredType)
+        .then(|| <DiscoveryMessage as WireMessage>::RULES[ROW].name);
+    let stream = stream_id();
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream: judged,
+            quic_stream,
+            seq,
+        } = entry.obs
+        else {
+            return false;
+        };
+        judged == stream
+            && entries[..at].iter().any(|sent| {
+                matches!(&sent.obs, Observation::PeerFrame {
+                    connection: c,
+                    stream: s,
+                    quic_stream: q,
+                    seq: n,
+                    row: r,
+                    label: l,
+                    ..
+                } if (*c, *s, *q, *n) == (connection, judged, quic_stream, seq)
+                    && *l == label
+                    && (row.is_none() || r.as_deref() == row))
+            })
+    })
 }
 
 /// The discovery node behind its real transport on simulated QUIC, named

@@ -1,0 +1,17 @@
+# Discovery's reader skips the maximum of its `services` row, its precheck
+# and the frame cap, and discovery drops a `services` frame over that
+# maximum instead of closing. Without the drop, discovery's claim would trip
+# its debug assertion that the precheck admitted the frame. The scenario's
+# peer sends its held `Services` one byte over the row's maximum, and the
+# node never closes for it.
+# Besides the files the patch changes, the reader's read path and the rest
+# of discovery decide whether the frame reaches the drop.
+checks = [
+    "crates/zakura-network/src/zakura/discovery",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/services/long-payload-closes/drop-long-payload.scenario.json"
+plan = "qa/planted/discovery/s4v2/services/long-payload-closes/drop-long-payload.plan.bin"

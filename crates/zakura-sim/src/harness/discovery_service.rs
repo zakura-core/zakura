@@ -20,7 +20,8 @@
 //! its peers. A committed input's two-byte prefix picks one of its
 //! [`SavedPlan`]s, as `header-sync/wire`'s does. It registers discovery's
 //! generated receiver and sender properties ([`wire_properties`],
-//! disc-3.1), each a `Draft` until its planted case lands. A peer's
+//! disc-3.1), each a `Draft` until its planted case lands, and
+//! `discovery/late-response-admitted` (disc-3.4). A peer's
 //! [`PeerAction::Discover`](crate::peer::PeerAction::Discover) acts reach
 //! the receiver ones ([`act_scenario`]), and the node's own exchange
 //! reaches the sender ones.
@@ -37,8 +38,8 @@ use zakura_network::zakura::{
     wire_codec::WireMessage,
     DiscoveryMessage, DiscoveryService, Service, Stream, TransportObserver, ZakuraDiscoveryConfig,
     ZakuraDiscoveryHandle, ZakuraDiscoveryLocalConfig, ZakuraHandshakeConfig, ZakuraServiceId,
-    DEFAULT_DISCOVERY_CONNECTION_HEADROOM, ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION,
-    ZAKURA_STREAM_DISCOVERY,
+    DEFAULT_DISCOVERY_CONNECTION_HEADROOM, DISCOVERY_INITIAL_EXCHANGE_TIMEOUT,
+    ZAKURA_CAP_DISCOVERY, ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
 };
 use zakura_quic::sim::{SeededInputs, SimNet};
 
@@ -48,6 +49,7 @@ use super::{
     NetScenario, Subsystem,
 };
 use crate::{
+    domain::discovery::late_response_admitted,
     peer::{
         discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
         key_index,
@@ -334,6 +336,11 @@ pub enum SavedPlan {
     Verification,
     /// The node dials a listening peer it holds as a static candidate.
     StaticDial,
+    /// A peer dials the node and holds its `Peers` until the node's initial
+    /// exchange wait times out. The Plan delivers the `Peers` after the
+    /// node's wait timed out and before its session ends, so the node reads
+    /// a late answer (`discovery/late-response-admitted`).
+    LateResponse,
 }
 
 /// The records [`SavedPlan::Verification`]'s peer relays.
@@ -341,11 +348,12 @@ pub const RELAYED: u8 = 3;
 
 impl SavedPlan {
     /// Every saved Plan.
-    pub const ALL: [SavedPlan; 4] = [
+    pub const ALL: [SavedPlan; 5] = [
         SavedPlan::Exchange,
         SavedPlan::TimedOut,
         SavedPlan::Verification,
         SavedPlan::StaticDial,
+        SavedPlan::LateResponse,
     ];
 
     /// The fixture's name, `discovery-wire-<name>.bin`.
@@ -355,6 +363,7 @@ impl SavedPlan {
             SavedPlan::TimedOut => "timed-out",
             SavedPlan::Verification => "verification",
             SavedPlan::StaticDial => "static-dial",
+            SavedPlan::LateResponse => "late-response",
         }
     }
 
@@ -409,6 +418,16 @@ impl SavedPlan {
                     ..base
                 }
             }
+            // The node admits the session at the run's start, so the
+            // `Peers` goes as its initial wait times out.
+            SavedPlan::LateResponse => dialed(DiscoveryScript {
+                relays: 1,
+                holds: vec![Hold {
+                    answer: Answer::Peers,
+                    // Two seconds fit a u64 of milliseconds.
+                    until_ms: DISCOVERY_INITIAL_EXCHANGE_TIMEOUT.as_millis() as u64,
+                }],
+            }),
         }
     }
 }
@@ -490,7 +509,9 @@ pub const STREAMS: [Stream; 1] = [Stream {
 
 /// `discovery/wire`'s properties: discovery's generated receiver
 /// properties, 31 IDs, then its sender properties, 7 IDs, each a `Draft`
-/// until its planted case lands (disc-3.2, disc-3.3).
+/// until its planted case lands (disc-3.2, disc-3.3), then
+/// `discovery/late-response-admitted` (disc-3.4), a `Draft` for the reason
+/// [`late_response_admitted`] gives.
 ///
 /// A `bad-content-closes` ID's generated check accepts a fault close or a
 /// `Misbehavior`, and discovery's node answers bad content with a fault
@@ -513,6 +534,7 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
             status: Status::Draft,
             ..property
         })
+        .chain([late_response_admitted()])
         .collect()
 }
 

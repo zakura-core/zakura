@@ -4,13 +4,17 @@ use std::{
     collections::BTreeMap,
     ops::RangeInclusive,
     sync::{atomic::Ordering, Arc, OnceLock},
+    time::Duration,
 };
 
+use zakura_network::zakura::{DISCOVERY_INITIAL_EXCHANGE_TIMEOUT, ZAKURA_STREAM_DISCOVERY};
 use zakura_scheduler::Status as SchedulerStatus;
 
 use crate::{
     harness::discovery::{CapacityEvidence, VERIFICATION_READERS, VERIFICATION_SLOTS},
-    observe::Entry,
+    model::{is_fault_cause, Label},
+    observe::{Entry, TransportFact},
+    peer::discovery::DiscoveryRow,
     property::{
         CheckCtx, HasView, Kind, Property, PropertyId, Source, Status, TriggerHistory, Verdict,
     },
@@ -418,6 +422,204 @@ impl Sites {
             None
         }
     }
+}
+
+/// A correlated answer that the node reads after its initial exchange timed
+/// out gets no punishment.
+pub const LATE_RESPONSE_ADMITTED: &str = "discovery/late-response-admitted";
+
+/// [`LATE_RESPONSE_ADMITTED`]: once the node's reader has the header of a
+/// late answer ([`late_answer`]), the node never closes that answer's
+/// connection with a fault cause and never reports a `Misbehavior` against
+/// it. The claim stops at no punishment: whether the answer reaches its
+/// session is `discovery/late-response-delivered`'s.
+///
+/// It reads the transport tap's sessions and header reads, the peers'
+/// frames and labels, and the node's closes. A `Draft`: every bypass also
+/// violates `discovery/s4v2/conformant-never-closes`, so no committed input
+/// can violate this ID alone, as the planted runner requires.
+pub fn late_response_admitted<S: HasView>() -> Property<S> {
+    Property {
+        id: PropertyId::new(LATE_RESPONSE_ADMITTED),
+        claim: "a correlated answer the node reads after its initial exchange timed out gets no \
+                fault close and no Misbehavior",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::Frames, Source::Closes],
+        status: Status::Draft,
+        check: check_late_response_admitted::<S>,
+        witness: Some(TriggerHistory::Log(|log| {
+            let entries = log.entries();
+            (0..entries.len()).any(|at| matches!(late_answer(entries, at), Ok(Some(_))))
+        })),
+    }
+}
+
+/// Checks [`LATE_RESPONSE_ADMITTED`] over the step's entries. It applies at
+/// each step where the reader has a late answer's header. Each fault close
+/// or `Misbehavior` at the step, on a connection where the reader had a late
+/// answer's header before it, is a violation of its own.
+fn check_late_response_admitted<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
+    let entries = cx.log.entries();
+    let start = entries.partition_point(|e| e.step < cx.step);
+    let mut verdict = Verdict::NotApplicable;
+    let mut punished = Vec::new();
+    for at in start..entries.len() {
+        let (connection, punishment) = match &entries[at].obs {
+            Observation::ConnectionClosed { connection, cause } if is_fault_cause(cause) => {
+                (*connection, format!("a close with cause {cause}"))
+            }
+            Observation::Misbehavior { connection } => (*connection, "a Misbehavior".to_owned()),
+            _ => {
+                match late_answer(entries, at) {
+                    Ok(Some(_)) => verdict = Verdict::Holds,
+                    Ok(None) => {}
+                    Err(missing) => {
+                        cx.missing_evidence(missing);
+                        return Verdict::NotApplicable;
+                    }
+                }
+                continue;
+            }
+        };
+        let late = (0..at).find_map(|read| match late_answer(entries, read) {
+            Ok(Some(late)) if late.connection == connection => Some(Ok(late)),
+            Ok(_) => None,
+            Err(missing) => Some(Err(missing)),
+        });
+        match late {
+            Some(Ok(late)) => punished.push((late, punishment)),
+            Some(Err(missing)) => {
+                cx.missing_evidence(missing);
+                return Verdict::NotApplicable;
+            }
+            None => {}
+        }
+    }
+    let expected = |late: &LateAnswer| {
+        format!(
+            "no punishment on connection {} after the node read its {} {:?} after the initial \
+             exchange timed out",
+            late.connection, late.row, late.after_admission
+        )
+    };
+    let mut punished = punished.into_iter();
+    let Some((late, punishment)) = punished.next() else {
+        return verdict;
+    };
+    for (late, punishment) in punished {
+        cx.record_violation(expected(&late), punishment);
+    }
+    cx.violated(expected(&late), punishment)
+}
+
+/// A late answer: a correlated answer whose header the node's reader has
+/// after its initial exchange timed out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LateAnswer {
+    /// The connection.
+    pub connection: u64,
+    /// The answer's row, `peers` or `services`.
+    pub row: String,
+    /// How long after the session's admission the reader had the header.
+    pub after_admission: Duration,
+}
+
+/// The late answer whose header read is `entries[at]`, if it is one.
+///
+/// The entry must be the reader's [`TransportFact::HeaderRead`] of a
+/// `Peers` or `Services` on a discovery session. Its peer frame
+/// must be `Conformant` and name the node's query, which makes it a
+/// correlated answer. The reader must have the header at or after the
+/// session's admission plus [`DISCOVERY_INITIAL_EXCHANGE_TIMEOUT`], so the
+/// initial wait's timeout had passed. It must be the session's first frame
+/// of its row: completing the exchange needs an answer of each row, so the
+/// exchange hadn't completed. The header read comes first, because a reader
+/// that refuses the answer never reads its payload.
+///
+/// An answer's header read on a discovery session with no peer frame is
+/// missing evidence.
+pub fn late_answer(entries: &[Entry], at: usize) -> Result<Option<LateAnswer>, String> {
+    let Observation::Transport {
+        connection: Some(connection),
+        event:
+            TransportFact::HeaderRead {
+                quic_stream,
+                seq,
+                message_type,
+                ..
+            },
+        ..
+    } = entries[at].obs
+    else {
+        return Ok(None);
+    };
+    let Some(answer) = [DiscoveryRow::Peers, DiscoveryRow::Services]
+        .into_iter()
+        .find(|row| row.rule().message_type == message_type)
+    else {
+        return Ok(None);
+    };
+    let before = &entries[..at];
+    let Some(admitted) = before.iter().rposition(|entry| {
+        matches!(entry.obs, Observation::Session { connection: c, quic_stream: q, kind, .. }
+            if (c, q, kind) == (connection, quic_stream, ZAKURA_STREAM_DISCOVERY))
+    }) else {
+        return Ok(None);
+    };
+    let frames = || {
+        before.iter().filter_map(|entry| match &entry.obs {
+            Observation::PeerFrame {
+                connection: c,
+                stream,
+                quic_stream: Some(q),
+                seq,
+                row,
+                label,
+                exchange,
+                ..
+            } if (*c, *q, stream.kind) == (connection, quic_stream, ZAKURA_STREAM_DISCOVERY) => {
+                Some((*seq, row.as_deref(), *label, *exchange))
+            }
+            _ => None,
+        })
+    };
+    // The peer's frames go to the log before the node reads them. Only a
+    // request past the margin waits for its read.
+    let Some((_, row, label, exchange)) = frames().find(|frame| frame.0 == seq) else {
+        return Err(format!(
+            "connection {connection}'s discovery reader read answer {seq}'s header on QUIC \
+             stream {quic_stream}, which no peer frame names"
+        ));
+    };
+    if row != Some(answer.name())
+        || label != Label::Conformant
+        || exchange.is_none()
+        || frames().any(|(earlier, other, ..)| earlier < seq && other == row)
+    {
+        return Ok(None);
+    }
+    let after_admission = time_at(entries, at).saturating_sub(time_at(entries, admitted));
+    Ok(
+        (after_admission >= DISCOVERY_INITIAL_EXCHANGE_TIMEOUT).then(|| LateAnswer {
+            connection,
+            row: answer.name().to_owned(),
+            after_admission,
+        }),
+    )
+}
+
+/// The run's virtual time at `entries[at]`: the last time it advanced to
+/// before then.
+fn time_at(entries: &[Entry], at: usize) -> Duration {
+    entries[..=at]
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } => Some(Duration::from_nanos(to_ns)),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

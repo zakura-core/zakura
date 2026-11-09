@@ -3,7 +3,8 @@
 //! in its witness, a run of the harness with one peer taking one
 //! [`DiscoveryAct`], and no other ID is violated there. Conformant controls
 //! show that `conformant-never-closes` and `cadence-never-closes` apply and
-//! hold on frames the node must not punish.
+//! hold on frames the node must not punish. `discovery/late-response-admitted`
+//! applies and holds in the `late-response` saved Plan (disc-3.4).
 #![cfg(zakura_sim)]
 
 use std::{
@@ -17,8 +18,11 @@ use zakura_network::zakura::{
     wire_codec::WireMessage, DiscoveryMessage, MAX_NODE_RECORD_BYTES, MSG_DISCOVERY_PEERS,
 };
 use zakura_sim::{
+    domain::discovery::LATE_RESPONSE_ADMITTED,
     harness::{
-        discovery_service::{act_scenario, DiscoveryWire, NodeHandle, WireScenario, FAMILY},
+        discovery_service::{
+            act_scenario, DiscoveryWire, NodeHandle, SavedPlan, WireScenario, FAMILY,
+        },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
@@ -183,11 +187,16 @@ fn run(scenario: &WireScenario) -> RunReport {
 
 /// Runs `scenario` as [`run`] does, and also returns the node's handle.
 fn run_node(scenario: &WireScenario) -> (RunReport, NodeHandle) {
+    run_plan(scenario, &[])
+}
+
+/// Runs `scenario` under the Plan `plan`, as [`run_node`] does.
+fn run_plan(scenario: &WireScenario, plan: &[u8]) -> (RunReport, NodeHandle) {
     let node = DiscoveryWire::prepare(scenario);
     let ran = run_prepared::<DiscoveryWire>(
         scenario,
         node.clone(),
-        Plan::from_fuzz(&[]),
+        Plan::from_fuzz(plan),
         &mut MemorySink::default(),
         None,
     );
@@ -477,4 +486,33 @@ fn conformant_controls_hold_conformant_never_closes() {
             .collect();
         assert_eq!(labels, BTreeSet::from(["conformant"]), "{control:?}");
     }
+}
+
+/// The `late-response` saved Plan's committed input: its tag, then its
+/// Plan.
+const LATE_RESPONSE: &[u8] = include_bytes!("fixtures/discovery-wire-late-response.bin");
+
+/// `discovery/late-response-admitted` applies and holds in the
+/// `late-response` saved Plan, where the node reads the held `Peers` after
+/// its initial wait timed out (`discovery_wire_lifecycle.rs` checks that
+/// history). No property is violated, and the honest exchange, whose
+/// answers come before the timeout, leaves it `NotApplicable`.
+///
+/// This fails if the node punishes a late answer, or if the Plan stops
+/// delivering the `Peers` after the timeout.
+#[test]
+fn late_response_admitted_applies_in_its_saved_plan() {
+    let (prefix, plan) = LATE_RESPONSE.split_at(DiscoveryWire::SCENARIO_BYTES);
+    assert_eq!(SavedPlan::from_tag(prefix), Some(SavedPlan::LateResponse));
+    let (report, _) = run_plan(&DiscoveryWire::draw(prefix), plan);
+    witnessed(
+        &report,
+        "late-response",
+        &[LATE_RESPONSE_ADMITTED.to_owned()],
+    );
+    assert_eq!(fault_closes(&report), Vec::<String>::new());
+    assert_eq!(
+        *outcome(&run(&WireScenario::default()), LATE_RESPONSE_ADMITTED),
+        PropertyOutcome::NotApplicable
+    );
 }

@@ -379,6 +379,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("lost-wakeup"),
     },
     Coverage {
+        property: crate::domain::discovery::LATE_RESPONSE_ADMITTED,
+        passing: passes(
+            DISCOVERY_WITNESSES,
+            "late_response_admitted_applies_in_its_saved_plan",
+        ),
+        bypass: Bypass::Planted("revoke-on-timeout"),
+    },
+    Coverage {
         property: super::header_sync::OPERATION_IDS,
         passing: passes(
             "tests/header_node.rs",

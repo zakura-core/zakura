@@ -4249,6 +4249,12 @@ where
                             .expect("using data already decoded as valid");
                     p2sh = Some(addr.payment_address().unwrap_or_default());
                 }
+                // This method answers with one address string per receiver, and a
+                // post-quantum receiver has no string form yet: the standalone encoding is
+                // specified but not built, and the commitment cannot be rendered as a
+                // transparent address. So it is left out of the answer rather than
+                // reported wrongly.
+                zcash_address::unified::Receiver::PqTransparent { .. } => (),
                 _ => (),
             }
         }

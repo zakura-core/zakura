@@ -186,7 +186,8 @@ pub enum RunKind {
 }
 
 /// An engine run's durable state just before and just after it, for the
-/// simulator's commit-contents, durable-state and locator-result checks.
+/// simulator's commit-contents, durable-state and locator-result checks,
+/// and the engine's own snapshot just after it, for its fork-choice check.
 #[cfg(zakura_sim)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineRun {
@@ -199,6 +200,10 @@ pub struct EngineRun {
     pub before: zakura_header_chain::DurableState,
     /// After the run.
     pub after: zakura_header_chain::DurableState,
+    /// The snapshot the engine itself gives after the run, read from it
+    /// whatever the run's result. It's the engine's own projection of
+    /// `after`'s metadata, the one a publication would carry.
+    pub snapshot: EngineSnapshot,
 }
 
 /// What [`ControlledPort::complete`] or [`ControlledPort::deliver`] did.
@@ -1042,6 +1047,7 @@ impl ControlledPort {
                 clock,
                 before,
                 after: self.engine.durable_state(),
+                snapshot: self.engine.snapshot(),
             })
         });
         if before.is_some_and(|before| before != self.engine.snapshot()) {
@@ -1255,6 +1261,7 @@ impl ControlledPort {
                 clock,
                 before: durable_before,
                 after: self.engine.durable_state(),
+                snapshot: self.engine.snapshot(),
             }),
         };
         let mut ops = self.ops();
@@ -1317,6 +1324,7 @@ impl ControlledPort {
             clock,
             before,
             after: self.engine.durable_state(),
+            snapshot: self.engine.snapshot(),
         };
         self.ops().harness_runs.push(std::sync::Arc::new(run));
         Ok(())

@@ -502,6 +502,7 @@ fn a_commit_of_a_read_is_unexpected() {
             clock: zakura_rt::time::utc_now().into(),
             before: port.engine().durable_state(),
             after: port.engine().durable_state(),
+            snapshot: port.engine().snapshot(),
         }),
     };
     assert_eq!(
@@ -570,6 +571,7 @@ fn a_reset_after_shutdown_is_unexpected() {
             clock: zakura_rt::time::utc_now().into(),
             before: port.engine().durable_state(),
             after: port.engine().durable_state(),
+            snapshot: port.engine().snapshot(),
         }),
     };
     assert_eq!(

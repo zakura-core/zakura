@@ -94,6 +94,8 @@ impl Contents {
             clock,
             before,
             after,
+            // The engine's own snapshot is `expected-chain-selected`'s.
+            snapshot: _,
         } = run;
         let what = match kind {
             RunKind::Apply(id, _) => format!("apply operation {}", id.0),

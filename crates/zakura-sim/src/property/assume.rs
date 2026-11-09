@@ -18,6 +18,10 @@ pub enum Assume {
     BoundedAdversary,
     /// No connects or disconnects after a start step.
     StableMembership,
+    /// From a start step on, the run's picks and draws follow the recovery
+    /// policy, which picks each action that stays enabled within a bounded
+    /// number of picks (see the `plan` module).
+    FairScheduling,
 }
 
 /// One assumption a scenario declares, with its parameters, as the trace's

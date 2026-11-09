@@ -17,8 +17,11 @@ use tokio::sync::Semaphore;
 use tower::{BoxError, Service};
 
 use super::{
-    jsonrpc::{ErrorCode, ErrorObject, Id, MethodResponse},
-    rpc_service::{handle_rpc_call, RpcServiceT},
+    http_request_compatibility::{
+        request_to_json_rpc_2, response_from_json_rpc_2, JsonRpc2Request,
+    },
+    jsonrpc::{Body, ErrorCode, ErrorObject, Id, MethodResponse},
+    rpc_service::{handle_parsed_body, RpcServiceT},
 };
 
 /// The body of HTTP requests passed to [`JsonRpcHttpService`], and of its responses.
@@ -119,7 +122,7 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
         }
 
         let (parts, body) = request.into_parts();
-        let (body, is_single) = match read_body(&parts.headers, body, MAX_REQUEST_BODY_SIZE).await {
+        let body = match read_body(&parts.headers, body, MAX_REQUEST_BODY_SIZE).await {
             Ok(body) => body,
             Err(ReadBodyError::TooLarge) => {
                 let response = MethodResponse::too_large_request(MAX_REQUEST_BODY_SIZE);
@@ -137,17 +140,46 @@ impl<S: RpcServiceT> JsonRpcHttpService<S> {
             }
         };
 
-        let response = handle_rpc_call(
+        answer_body(
             &body,
-            is_single,
             &self.rpc_service,
             self.max_batch_entries,
             self.max_response_body_size,
         )
-        .await;
-
-        json_response(StatusCode::OK, response)
+        .await
     }
+}
+
+/// Answers a request body from a client using any JSON-RPC version, in that client's version.
+///
+/// Batches can have up to `max_batch_entries` entries, and batch responses can be up to
+/// `max_response_body_size` bytes long.
+pub(super) async fn answer_body<S: RpcServiceT>(
+    body: &[u8],
+    rpc_service: &S,
+    max_batch_entries: usize,
+    max_response_body_size: usize,
+) -> HttpResponse {
+    let (version, body) = match request_to_json_rpc_2(body) {
+        JsonRpc2Request::Plain(call) => {
+            let response = handle_parsed_body(call, rpc_service, max_response_body_size).await;
+            return json_response(StatusCode::OK, response);
+        }
+        JsonRpc2Request::Converted { version, body } => (version, body),
+    };
+
+    let Some((body, is_single)) = strip_leading_whitespace(&body) else {
+        let response = MethodResponse::error(Id::Null, ErrorCode::ParseError.into());
+        return json_response(StatusCode::BAD_REQUEST, response);
+    };
+    let body = Body::parse(body, is_single, max_batch_entries);
+    let response = handle_parsed_body(body, rpc_service, max_response_body_size).await;
+
+    response_with_body(
+        StatusCode::OK,
+        response_from_json_rpc_2(version, response.into_json()),
+        JSON,
+    )
 }
 
 /// Whether `content_type` is one of the JSON content types the server accepts.
@@ -172,7 +204,7 @@ fn is_json(content_type: Option<&header::HeaderValue>) -> bool {
 pub(super) enum ReadBodyError {
     /// The body is longer than the limit.
     TooLarge,
-    /// The body doesn't start with `{` or `[`, or is empty.
+    /// The body's first non-whitespace byte is neither `{` nor `[`.
     Malformed,
     /// The body couldn't be received.
     Stream(BoxError),
@@ -180,14 +212,13 @@ pub(super) enum ReadBodyError {
 
 /// Reads a request body of up to `max_body_size` bytes.
 ///
-/// Returns the body without its leading whitespace, and whether it is a single request, which
-/// starts with `{`, rather than a batch, which starts with `[`. The first non-whitespace byte
-/// must be in the first 128 bytes of the first chunk of the body.
+/// Rejects the body as soon as its first non-whitespace byte shows it isn't a JSON object or
+/// array, before copying the rest. The server rejects any such body, in every JSON-RPC version.
 pub(super) async fn read_body<B>(
     headers: &header::HeaderMap,
     body: B,
     max_body_size: u32,
-) -> Result<(Vec<u8>, bool), ReadBodyError>
+) -> Result<Vec<u8>, ReadBodyError>
 where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
@@ -205,7 +236,7 @@ where
     let max_body_size = max_body_size as usize;
     let mut body = std::pin::pin!(Limited::new(body, max_body_size));
     let mut received = Vec::with_capacity((content_length as usize).min(16 * 1024));
-    let mut is_single = None;
+    let mut found_first_byte = false;
 
     while let Some(frame) = body.frame().await {
         // Like `jsonrpsee`, a body that exceeds the limit without a `content-length` header that
@@ -214,35 +245,40 @@ where
         let Some(data) = frame.data_ref() else {
             continue;
         };
+        let data = data.chunk();
 
-        if received.is_empty() {
-            let first_non_whitespace = data
-                .chunk()
-                .iter()
-                .enumerate()
-                .take(128)
-                .find(|(_, byte)| !byte.is_ascii_whitespace());
-            let start = match first_non_whitespace {
-                Some((index, b'{')) => {
-                    is_single = Some(true);
-                    index
+        if !found_first_byte {
+            if let Some(first) = data.iter().find(|byte| !byte.is_ascii_whitespace()) {
+                if !matches!(first, b'{' | b'[') {
+                    return Err(ReadBodyError::Malformed);
                 }
-                Some((index, b'[')) => {
-                    is_single = Some(false);
-                    index
-                }
-                _ => return Err(ReadBodyError::Malformed),
-            };
-            received.extend_from_slice(&data.chunk()[start..]);
-        } else {
-            received.extend_from_slice(data.chunk());
+                found_first_byte = true;
+            }
         }
+
+        received.extend_from_slice(data);
     }
 
-    match is_single {
-        Some(is_single) if !received.is_empty() => Ok((received, is_single)),
-        _ => Err(ReadBodyError::Malformed),
-    }
+    Ok(received)
+}
+
+/// Returns `body` without its leading whitespace, and whether it is a single request, which
+/// starts with `{`, rather than a batch, which starts with `[`.
+///
+/// Like `jsonrpsee`, the first non-whitespace byte must be in the first 128 bytes. Returns
+/// `None` for any other body.
+fn strip_leading_whitespace(body: &[u8]) -> Option<(&[u8], bool)> {
+    let (start, first) = body
+        .iter()
+        .enumerate()
+        .take(128)
+        .find(|(_, byte)| !byte.is_ascii_whitespace())?;
+    let is_single = match first {
+        b'{' => true,
+        b'[' => false,
+        _ => return None,
+    };
+    Some((&body[start..], is_single))
 }
 
 /// Returns a response with `status` and a JSON-RPC `response` body.

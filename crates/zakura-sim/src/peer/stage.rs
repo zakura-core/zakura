@@ -181,6 +181,23 @@ pub(crate) enum Stage {
     Frame,
 }
 
+/// The stage that judges a discovery frame the peer's models labelled
+/// `label` (disc-3.1). A stateless fault is decided by its header. So is
+/// an `Unsolicited` or `OverOwed` response, by its type and declared length
+/// against the exchanges open on the stream, where the node's response
+/// precheck and claim refuse it. Everything else is judged at `frame-read`.
+pub(crate) fn discovery_stage(label: Label) -> Stage {
+    match label {
+        Label::UndeclaredType
+        | Label::ReservedFlags
+        | Label::ShortPayload
+        | Label::LongPayload
+        | Label::Unsolicited
+        | Label::OverOwed => Stage::Header,
+        _ => Stage::Frame,
+    }
+}
+
 /// The stage a frame with `header` on a reader of `rules` waits for, and
 /// its row there, from the header alone.
 pub(crate) fn header_stage(

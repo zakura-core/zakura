@@ -86,6 +86,13 @@ macro_rules! machine_entry {
             run_bytes: |bytes, sink, extra| {
                 $crate::harness::machine::run_bytes(&$machine, bytes, sink, extra)
             },
+            accepts: |_| true,
+            migrate: |_, generator| {
+                Err(format!(
+                    "{} migrates no generator-{generator} input",
+                    $machine.name
+                ))
+            },
         }
     };
 }

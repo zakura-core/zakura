@@ -88,6 +88,11 @@ x86_64-asm = ["dep:orchard", "orchard/x86_64-asm"]
 # `zakura-consensus`.
 sprout = ["zakura-consensus/sprout"]
 
+# Subcommands for developers and release pipelines that node operators don't need, so release
+# binaries don't carry them. Currently `audit-historical-treestates` and
+# `verify-historical-treestates`, which check historical treestate serving and artifacts.
+debug-commands = []
+
 # The indexer gRPC server, started when `rpc.indexer_listen_addr` is configured
 indexer-rpc = ["zakura-rpc/indexer-rpc"]
 

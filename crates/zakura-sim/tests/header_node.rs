@@ -302,6 +302,7 @@ impl HasView for Planted {
             rounds: Default::default(),
             stale_calls: Default::default(),
             wake: Default::default(),
+            recovery: Default::default(),
         }
     }
 }

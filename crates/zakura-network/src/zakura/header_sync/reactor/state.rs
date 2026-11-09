@@ -86,8 +86,17 @@ pub(super) struct ReactorState {
     /// steady traffic cannot keep postponing the retry.
     pub(super) pending_closes: HashMap<ZakuraPeerId, (u64, Instant)>,
     /// What `HistoryPruned` taught the reactor about each peer. It outlives
-    /// the peer's sessions, so reconnecting cannot reset its backoff, and
-    /// maintenance drops entries once they no longer matter.
+    /// the peer's sessions, so reconnecting alone cannot reset its backoff,
+    /// and maintenance drops entries once they no longer matter.
+    ///
+    /// [`HeaderSyncReactor::admitted_peer_limit`](super::HeaderSyncReactor::admitted_peer_limit)
+    /// bounds the count, so identities that each answer `HistoryPruned` once
+    /// and leave cannot grow it. Past the limit the entry that stops mattering
+    /// first goes, a departed peer's before a connected one's. Eviction forgets
+    /// both waits and their doubled delays. So a peer that returns before they
+    /// would have ended can repeat a schema 1 round and a round without
+    /// records, each ending `HistoryPruned` without penalty, and then backs off
+    /// again from [`PRUNED_BACKOFF_MIN`].
     pub(super) pruned_peers: HashMap<ZakuraPeerId, PrunedPeer>,
     pub(super) completed_targets: CompletedHeaderTargets,
     /// State version of the latest ordinary admission refused by a committed resource stall.
@@ -498,6 +507,9 @@ impl ReactorState {
     /// after a backoff. After a round without records, ordinary discovery with
     /// the peer pauses instead, so another peer takes the target.
     ///
+    /// A new entry beyond `max_pruned_peers` evicts another, as
+    /// [`Self::pruned_peers`] describes.
+    ///
     /// Return whether the peer's rounds now fall back to no records.
     pub(super) fn note_history_pruned(
         &mut self,
@@ -505,12 +517,13 @@ impl ReactorState {
         schema: AuxSchema,
         tip: Option<zakura_header_chain::Frontier>,
         now: Instant,
+        max_pruned_peers: usize,
     ) -> bool {
         let Some(schedule) = self.peers.get_mut(peer) else {
             return false;
         };
         let pruned = self.pruned_peers.entry(peer.clone()).or_default();
-        match schema {
+        let falls_back = match schema {
             AuxSchema::V1 => {
                 pruned.aux_fallback = Some(PrunedBackoff::after(pruned.aux_fallback, now));
                 schedule.status_spent = false;
@@ -524,7 +537,25 @@ impl ReactorState {
                 }
                 false
             }
+        };
+        if self.pruned_peers.len() > max_pruned_peers {
+            self.prune_pruned_peers(now);
+            while self.pruned_peers.len() > max_pruned_peers {
+                let Some(evicted) = self
+                    .pruned_peers
+                    .iter()
+                    .filter(|(held, _)| *held != peer)
+                    .min_by_key(|(held, pruned)| {
+                        (self.peers.contains_key(*held), pruned.relevant_until())
+                    })
+                    .map(|(held, _)| held.clone())
+                else {
+                    break;
+                };
+                self.pruned_peers.remove(&evicted);
+            }
         }
+        falls_back
     }
 
     /// End `peer`'s `HistoryPruned` pause after an admitted ordinary round,
@@ -1290,15 +1321,20 @@ pub(super) struct PrunedPeer {
 }
 
 impl PrunedPeer {
-    /// Whether either wait still matters at `now`. An expired fallback stays
-    /// for one more maximum backoff, so a failed probe soon after still
-    /// doubles its delay.
+    /// Whether either wait still matters at `now`. See [`Self::relevant_until`].
     pub(super) fn relevant(&self, now: Instant) -> bool {
-        self.aux_fallback
-            .is_some_and(|fallback| fallback.until + PRUNED_BACKOFF_MAX > now)
-            || self
-                .pruned_pause
-                .is_some_and(|(pause, _)| pause.until > now)
+        self.relevant_until().is_some_and(|until| until > now)
+    }
+
+    /// When neither wait matters any more, or `None` when neither is set. An
+    /// expired fallback stays for one more maximum backoff, so a failed probe
+    /// soon after still doubles its delay.
+    fn relevant_until(&self) -> Option<Instant> {
+        let fallback = self
+            .aux_fallback
+            .map(|fallback| fallback.until + PRUNED_BACKOFF_MAX);
+        let pause = self.pruned_pause.map(|(pause, _)| pause.until);
+        fallback.max(pause)
     }
 }
 

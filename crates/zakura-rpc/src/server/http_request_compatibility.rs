@@ -1,6 +1,8 @@
 //! Compatibility fixes for JSON-RPC HTTP requests.
 //!
-//! These fixes are applied at the HTTP level, before the RPC request is parsed.
+//! [`HttpRequestMiddleware`] fixes HTTP headers and authenticates requests before the body is
+//! read. [`request_to_json_rpc_2`] and [`response_from_json_rpc_2`] map other JSON-RPC versions
+//! to and from the 2.0 that the server speaks, as the server parses each body.
 
 use std::{borrow::Cow, future::Future};
 
@@ -17,7 +19,7 @@ use tower::Service;
 use super::{
     cookie::Cookie,
     http::{HttpBody, HttpRequest, HttpResponse},
-    jsonrpc::ErrorObject,
+    jsonrpc::{Body, ErrorObject, Id, Notification, Request, TwoPointZero},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -26,12 +28,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 ///
 /// This middleware makes the following changes to HTTP requests:
 ///
-/// ### Remove `jsonrpc` field in JSON RPC 1.0
+/// ### Read the whole body
 ///
-/// Removes "jsonrpc: 1.0" fields from requests,
-/// because the "jsonrpc" field was only added in JSON-RPC 2.0.
-///
-/// <http://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0>
+/// Reads the body, up to the request size limit, before passing it on. A body that is too long
+/// or can't be received fails the request without a response.
 ///
 /// ### Add missing `content-type` HTTP header
 ///
@@ -139,68 +139,6 @@ impl<S> HttpRequestMiddleware<S> {
             );
         }
     }
-
-    /// Maps whatever JSON-RPC version the client is using to JSON-RPC 2.0.
-    async fn request_to_json_rpc_2<B>(
-        request: HttpRequest<B>,
-        max_request_body_size: usize,
-    ) -> Result<(JsonRpcVersion, HttpRequest<HttpBody>), BoxError>
-    where
-        B: hyper::body::Body<Data = hyper::body::Bytes> + Send + 'static,
-        B::Error: Into<BoxError>,
-    {
-        let (parts, body) = request.into_parts();
-        let bytes = Limited::new(body, max_request_body_size)
-            .collect()
-            .await?
-            .to_bytes();
-        if can_forward_json_rpc_2_call_unchanged(&bytes) {
-            return Ok((
-                JsonRpcVersion::TwoPointZero,
-                HttpRequest::from_parts(parts, HttpBody::from(bytes)),
-            ));
-        }
-        let (version, bytes) =
-            if let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(bytes.as_ref()) {
-                let version = request.version();
-                if matches!(version, JsonRpcVersion::Unknown) {
-                    (version, bytes)
-                } else {
-                    (
-                        version,
-                        serde_json::to_vec(&request.into_2()).expect("valid").into(),
-                    )
-                }
-            } else {
-                (JsonRpcVersion::Unknown, bytes)
-            };
-        Ok((
-            version,
-            HttpRequest::from_parts(parts, HttpBody::from(bytes)),
-        ))
-    }
-    /// Maps JSON-2.0 to whatever JSON-RPC version the client is using.
-    async fn response_from_json_rpc_2(
-        version: JsonRpcVersion,
-        response: HttpResponse<HttpBody>,
-    ) -> Result<HttpResponse<HttpBody>, BoxError> {
-        if matches!(version, JsonRpcVersion::TwoPointZero) {
-            // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
-            return Ok(response);
-        }
-
-        let (parts, body) = response.into_parts();
-        let bytes = body.collect().await?.to_bytes();
-        let bytes =
-            if let Ok(response) = serde_json::from_slice::<'_, JsonRpcResponse>(bytes.as_ref()) {
-                serde_json::to_vec(&response.into_version(version))
-                    .expect("valid")
-                    .into()
-            } else {
-                bytes
-            };
-        Ok(HttpResponse::from_parts(parts, HttpBody::from(bytes)))
-    }
 }
 
 /// Implement the Layer for HttpRequestMiddleware to allow injecting the cookie
@@ -290,17 +228,21 @@ where
         let max_request_body_size = self.max_request_body_size;
 
         async move {
-            let (version, request) =
-                Self::request_to_json_rpc_2(request, max_request_body_size).await?;
-            let response = service.call(request).await.map_err(Into::into)?;
-            Self::response_from_json_rpc_2(version, response).await
+            let (parts, body) = request.into_parts();
+            let body = Limited::new(body, max_request_body_size)
+                .collect()
+                .await?
+                .to_bytes();
+            let request = HttpRequest::from_parts(parts, HttpBody::from(body));
+            service.call(request).await.map_err(Into::into)
         }
         .boxed()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum JsonRpcVersion {
+/// The JSON-RPC version of a client, which its responses are mapped back to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JsonRpcVersion {
     /// bitcoind used a mishmash of 1.0, 1.1, and 2.0 for its JSON-RPC.
     Bitcoind,
     /// lightwalletd uses the above mishmash, but also breaks spec to include a
@@ -312,8 +254,68 @@ enum JsonRpcVersion {
     Unknown,
 }
 
-/// Returns whether `body` is a JSON-RPC 2.0 call that [`JsonRpcRequest::into_2`] would only
-/// re-encode, so the server can read it as sent.
+/// A request body mapped to JSON-RPC 2.0.
+pub(super) enum JsonRpc2Request<'a> {
+    /// A plain JSON-RPC 2.0 call, already parsed from the body as sent.
+    Plain(Body<'a>),
+    /// Any other body, re-encoded as JSON-RPC 2.0 if it is a call from a known version.
+    Converted {
+        /// The client's version, for [`response_from_json_rpc_2`].
+        version: JsonRpcVersion,
+        /// The body for the server to parse.
+        body: Cow<'a, [u8]>,
+    },
+}
+
+/// Maps a request body from whatever JSON-RPC version the client is using to JSON-RPC 2.0.
+///
+/// A plain JSON-RPC 2.0 call is parsed once, here, into the [`Body`] the server would parse
+/// from it, so a block's hex in `submitblock` is read once instead of twice. Any other body is
+/// re-encoded as JSON-RPC 2.0 for the server to parse, after removing a JSON-RPC 1.0 `jsonrpc`
+/// field. That field was only added in JSON-RPC 2.0:
+/// <http://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0>
+///
+/// A body that isn't a call from a known version is passed on unchanged.
+pub(super) fn request_to_json_rpc_2(body: &[u8]) -> JsonRpc2Request<'_> {
+    if let Some(call) = parse_plain_json_rpc_2_call(body) {
+        return JsonRpc2Request::Plain(call);
+    }
+
+    let Ok(request) = serde_json::from_slice::<'_, JsonRpcRequest>(body) else {
+        return JsonRpc2Request::Converted {
+            version: JsonRpcVersion::Unknown,
+            body: Cow::Borrowed(body),
+        };
+    };
+    let version = request.version();
+    let body = if version == JsonRpcVersion::Unknown {
+        Cow::Borrowed(body)
+    } else {
+        Cow::Owned(
+            serde_json::to_vec(&request.into_2())
+                .expect("values parsed from JSON serialize back to JSON"),
+        )
+    };
+    JsonRpc2Request::Converted { version, body }
+}
+
+/// Maps a JSON-RPC 2.0 response to the client's JSON-RPC `version`.
+pub(super) fn response_from_json_rpc_2(version: JsonRpcVersion, json: Box<RawValue>) -> String {
+    let json = String::from(Box::<str>::from(json));
+    if version == JsonRpcVersion::TwoPointZero {
+        // The server already answers in JSON-RPC 2.0, with a `result` or an `error`.
+        return json;
+    }
+
+    match serde_json::from_str::<'_, JsonRpcResponse>(&json) {
+        Ok(response) => serde_json::to_string(&response.into_version(version))
+            .expect("values parsed from JSON serialize back to JSON"),
+        Err(_) => json,
+    }
+}
+
+/// Parses `body` if it is a JSON-RPC 2.0 call that [`JsonRpcRequest::into_2`] would only
+/// re-encode, returning the [`Body`] that the server would parse from it.
 ///
 /// The server reads a few things differently from their re-encoded form: whitespace inside
 /// positional parameters, duplicate or reordered named parameters, leading whitespace, a `null`
@@ -321,25 +323,46 @@ enum JsonRpcVersion {
 /// only a body that starts with `{`, has no other fields, has a non-`null` ID or none, and has
 /// no parameters, an empty array, or one unescaped string argument. This avoids copying and
 /// re-encoding a block's hex in `submitblock` without inspecting each array element.
-fn can_forward_json_rpc_2_call_unchanged(body: &[u8]) -> bool {
+fn parse_plain_json_rpc_2_call(body: &[u8]) -> Option<Body<'_>> {
     if body.first() != Some(&b'{') {
-        return false;
+        return None;
     }
 
-    let Ok(call) = serde_json::from_slice::<'_, PlainJsonRpc2Call<'_>>(body) else {
-        return false;
+    let call = serde_json::from_slice::<'_, PlainJsonRpc2Call<'_>>(body).ok()?;
+
+    if call.jsonrpc != "2.0" || !call.params.is_none_or(params_can_pass_through_unchanged) {
+        return None;
+    }
+    let params = call.params.map(Cow::Borrowed);
+
+    let Some(id) = call.id else {
+        // Like the server, a call without an ID is a notification.
+        return Some(Body::Notification(Notification {
+            jsonrpc: TwoPointZero,
+            method: call.method,
+            params,
+        }));
     };
 
-    if call.jsonrpc != "2.0" {
-        return false;
+    // RawValue is valid JSON; the first byte distinguishes strings and numbers.
+    if !matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9')) {
+        return None;
     }
 
-    let id_is_absent_or_string_or_number = call.id.is_none_or(|id| {
-        // RawValue is valid JSON; the first byte distinguishes strings and numbers.
-        matches!(id.get().as_bytes().first(), Some(b'"' | b'-' | b'0'..=b'9'))
-    });
-
-    id_is_absent_or_string_or_number && call.params.is_none_or(params_can_pass_through_unchanged)
+    // Like the server, a call whose ID is a number that isn't a `u64` is a notification.
+    Some(match serde_json::from_str::<Id<'_>>(id.get()) {
+        Ok(id) => Body::Call(Request {
+            jsonrpc: TwoPointZero,
+            id,
+            method: call.method,
+            params,
+        }),
+        Err(_) => Body::Notification(Notification {
+            jsonrpc: TwoPointZero,
+            method: call.method,
+            params,
+        }),
+    })
 }
 
 /// Returns whether parameters are `[]` or one compact, unescaped string argument.
@@ -372,8 +395,8 @@ struct PlainJsonRpc2Call<'a> {
     #[serde(borrow)]
     jsonrpc: Cow<'a, str>,
     /// Required, so that a call without a method isn't treated as a plain call.
-    #[serde(borrow, rename = "method")]
-    _method: Cow<'a, str>,
+    #[serde(borrow)]
+    method: Cow<'a, str>,
     #[serde(borrow, default)]
     params: Option<&'a RawValue>,
     /// `Some` whenever the field is present, including `null`.

@@ -3,19 +3,20 @@
 //! campaign starts from inputs that use the whole action grammar instead
 //! of a unit that never reaches it.
 //!
-//! Every storage seed was built for generator 2 and migrated to generator
-//! 3 with its meaning kept. Each generator-2 source is kept in
-//! `tests/fixtures/sources/`, named by its digest, which the seed's
-//! sidecar names in `derived_from`. Generator 3 encodes each of their
-//! scenarios as generator 2 did, so a seed differs from its source only in
-//! the version byte.
+//! The three drawn witnesses `tests/explore_state.rs` reads were built for
+//! generator 3 and name no source. Every other storage seed here was built
+//! for generator 2 and migrated to generator 3 with its meaning kept. Each
+//! generator-2 source is kept in `tests/fixtures/sources/`, named by its
+//! digest, which the seed's sidecar names in `derived_from`. Generator 3
+//! encodes each of their scenarios as generator 2 did, so a seed differs
+//! from its source only in the version byte.
 #![cfg(zakura_sim)]
 
 mod support;
 
 use std::{fs, path::PathBuf};
 
-use support::byte_inputs;
+use support::{byte_inputs, storage_witnesses};
 use zakura_sim::{
     explore::{classify, ExploreOutcome},
     harness::{
@@ -81,7 +82,28 @@ const WITNESSES: [(&str, &str); 3] = [
     ),
 ];
 
-/// Every seed. `header-storage-stale-prepare` is the trigger scenario
+/// The witness scenarios `tests/explore_state.rs` draws from their seeds,
+/// so the fuzzer can reach the states they show. Generator 3 is their first
+/// generator, so they name no source.
+const DRAWN: [Seed; 3] = [
+    (
+        "header-storage-locator-dropped",
+        storage_witnesses::dropped_locator,
+        12,
+    ),
+    (
+        "header-storage-apply-at-close",
+        storage_witnesses::apply_at_close,
+        13,
+    ),
+    (
+        "header-storage-competing-mirrors",
+        storage_witnesses::competing_mirrors,
+        10,
+    ),
+];
+
+/// Every migrated seed. `header-storage-stale-prepare` is the trigger scenario
 /// under the slice whose run ends a prepare after its round retired, while
 /// the same peer's next round is active.
 const SEEDS: [Seed; 6] = [
@@ -122,7 +144,7 @@ fn input(index: usize, scenario: &StorageScenario) -> Vec<u8> {
 #[test]
 fn committed_seeds_are_their_scenarios_and_run_clean() {
     let entry = harness::find(Storage::NAME).unwrap();
-    for (stem, scenario, index) in SEEDS {
+    for (stem, scenario, index) in SEEDS.into_iter().chain(DRAWN) {
         let scenario = scenario();
         let committed = fs::read(fixtures().join(format!("{stem}.bin")))
             .unwrap_or_else(|error| panic!("{stem}: {error}"));
@@ -171,7 +193,8 @@ fn committed_seeds_are_their_scenarios_and_run_clean() {
 #[test]
 #[ignore = "rewrites the committed seeds"]
 fn regenerate_storage_seeds() {
-    for (stem, scenario, index) in SEEDS {
+    let migrated = SEEDS.into_iter().map(|seed| (seed, true));
+    for ((stem, scenario, index), migrated) in migrated.chain(DRAWN.map(|seed| (seed, false))) {
         let scenario = scenario();
         let input = input(index, &scenario);
         let base = fixtures().join(stem);
@@ -184,19 +207,20 @@ fn regenerate_storage_seeds() {
              generator = {generator}\n\
              sha256 = \"{digest}\"\n\
              scenario_sha256 = \"{scenario}\"\n\
-             source = \"crates/zakura-sim/tests/header_storage_seeds.rs\"\n\
-             \n\
-             [derived_from]\n\
-             sha256 = \"{source}\"\n\
-             generator = {SOURCE_GENERATOR}\n",
+             source = \"crates/zakura-sim/tests/header_storage_seeds.rs\"\n",
             harness = Storage::NAME,
             generator = Storage::GENERATOR,
             digest = seed::sha256(&input),
             scenario = seed::scenario_sha256(
                 &serde_json::to_value(&scenario).expect("scenarios serialize")
             ),
-            source = source_digest(&input),
         );
+        if migrated {
+            sidecar.push_str(&format!(
+                "\n[derived_from]\nsha256 = \"{}\"\ngenerator = {SOURCE_GENERATOR}\n",
+                source_digest(&input)
+            ));
+        }
         for (_, property) in WITNESSES.iter().filter(|(seed, _)| *seed == stem) {
             sidecar.push_str(&format!(
                 "\n[[witness]]\nproperty = \"{property}\"\nexpect = \"holds\"\n"
@@ -206,8 +230,9 @@ fn regenerate_storage_seeds() {
     }
 }
 
-/// Every committed storage seed is a generator-2 seed migrated with its
-/// meaning kept: its sidecar names a kept source by digest and generator,
+/// Every committed storage seed but the drawn witnesses is a generator-2
+/// seed migrated with its meaning kept: its sidecar names a kept source by
+/// digest and generator,
 /// generator 2 decodes the source to the scenario generator 3 decodes the
 /// seed to, migrating the source gives the seed back, Plan bytes and all,
 /// and the two differ only in the version byte.
@@ -226,10 +251,21 @@ fn committed_storage_seeds_are_migrated_generator_2_seeds() {
                 .into_owned()
         })
         .collect();
-    assert_eq!(stems.len(), SEEDS.len() + 1, "{stems:?}");
+    // `tests/header_storage_witness_seeds.rs` owns the item 7 witnesses.
+    let witness = |stem: &str| stem.starts_with("header-storage-w-");
+    let ours = stems.iter().filter(|stem| !witness(stem)).count();
+    assert_eq!(ours, SEEDS.len() + DRAWN.len() + 1, "{stems:?}");
     assert!(stems.contains(&"header-sync-storage-default".to_owned()));
-    for seed in &report.admitted {
+    for (seed, name) in report.admitted.iter().zip(&stems) {
         let stem = seed.path.display();
+        if witness(name)
+            || DRAWN
+                .iter()
+                .any(|(drawn, ..)| seed.path.ends_with(format!("{drawn}.bin")))
+        {
+            assert_eq!(seed.sidecar.derived_from, None, "{stem}");
+            continue;
+        }
         let from = seed
             .sidecar
             .derived_from

@@ -2,12 +2,15 @@
 //! generators (explorer implementation plan, E3a-1).
 #![cfg(zakura_sim)]
 
+mod support;
+
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
 use serde::Serialize;
+use support::storage_witnesses;
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -87,6 +90,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
             workers: 1,
         });
     }
+    if let Some((_, scenario)) = storage_witnesses::witness_seeds()
+        .into_iter()
+        .find(|(witness, _)| witness == stem)
+    {
+        return value(scenario);
+    }
     match stem {
         "header-sync-storage-default" => value(StorageScenario::default()),
         "block-reactor-identity" => value(zakura_sim::record::machine::MachineScenario {
@@ -147,6 +156,9 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         "header-storage-triggers" | "header-storage-stale-prepare" => {
             value(StorageScenario::triggers())
         }
+        "header-storage-locator-dropped" => value(storage_witnesses::dropped_locator()),
+        "header-storage-apply-at-close" => value(storage_witnesses::apply_at_close()),
+        "header-storage-competing-mirrors" => value(storage_witnesses::competing_mirrors()),
         "header-release-wake" => value(WakeScenario::Release),
         "header-release-wake-deferred" => value(WakeScenario::Deferred),
         "header-flood-wire" => value(FloodScenario::Wire),

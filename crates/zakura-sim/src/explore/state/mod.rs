@@ -1409,7 +1409,7 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompletionCancellation,
         "completion after cancellation request",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| {
             matches!(
                 f,
@@ -1430,7 +1430,7 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompletionCancellation,
         "completion after owner retirement",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| {
             matches!(
                 f,
@@ -1452,14 +1452,14 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompetingForks,
         "two distinct peer offers",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| *f == StateFeature::Fork(Fork::DistinctOffersActive),
     ),
     collected(
         Family::CompetingForks,
         "shared ancestor",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| *f == StateFeature::Fork(Fork::SharedAncestorPrepared),
     ),
     waiting(
@@ -1475,7 +1475,7 @@ pub const REQUIRED: &[RequiredState] = &[
         Family::CompetingForks,
         "selected winner",
         &[HEADER_STORAGE],
-        false,
+        true,
         |f| *f == StateFeature::Fork(Fork::WinnerApplied),
     ),
     collected(
@@ -1541,9 +1541,9 @@ pub const REQUIRED: &[RequiredState] = &[
     waiting(
         Family::Budget,
         "exactly limit",
-        "G2a",
-        "no witness on main reserves the budget to its limit exactly; G2a's boundary \
-         fixtures size the bodies to it",
+        "fuzz-12.6",
+        "the `header-storage-w-peer-lease-denied` seed holds a peer lease at the peer \
+         class's limit of one, but the collector has no header lease level feature yet",
     ),
     collected(Family::Budget, "released", &[BLOCK], true, |f| {
         matches!(
@@ -1579,9 +1579,10 @@ pub const REQUIRED: &[RequiredState] = &[
     waiting(
         Family::Budget,
         "attempted over-limit and denied",
-        "G2a",
-        "block sync's tap logs no refused reservation, and no header witness fills a \
-         capacity class; G2a's pressure fixtures reach them",
+        "fuzz-12.6",
+        "the `header-storage-w-peer-lease-denied` seed's second acquire for the same peer \
+         is refused `CapacityBusy` for the peer class, but the collector has no header \
+         lease level feature yet",
     ),
     collected(
         Family::Regulation,

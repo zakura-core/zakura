@@ -5,6 +5,8 @@
 
 mod support;
 
+use support::storage_witnesses::{competing_mirrors, header_apply};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     thread,
@@ -30,13 +32,10 @@ use zakura_sim::{
         },
         block_sync::{BlockScenario, Storage as BlockStorage},
         header_node::{
-            policy::{
-                Allow, Hold as HeaderHold, OpKind, Select as HeaderSelect, Trigger as HeaderTrigger,
-            },
-            Chain, ControlAction as HeaderAction, ControlStep as HeaderControl, Fork,
+            policy::{Allow, Hold as HeaderHold, Trigger as HeaderTrigger},
             Policy as HeaderPolicy,
         },
-        header_sync::{Dialer, HeaderWire, MirrorSpec, Storage as HeaderStorage, StorageScenario},
+        header_sync::{HeaderWire, Storage as HeaderStorage, StorageScenario},
         run_harness,
         wire_plans::act_scenario,
         HarnessError, Subsystem,
@@ -490,6 +489,15 @@ where
     }
 }
 
+/// The committed seed `stem`, a full fuzz input the harness draws its
+/// scenario from.
+fn seed(stem: &str) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(format!("{stem}.bin"));
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
 /// Plan bytes after a scenario prefix, the same on every call.
 fn plan() -> Vec<u8> {
     // Truncation to a byte is the point: a spread of byte values.
@@ -538,15 +546,20 @@ fn witnesses() -> Vec<Witness> {
             relink_while_applying(),
             plan(),
         ),
-        explicit::<HeaderStorage>(
+        drawn(
+            "header-sync/storage",
             "header storage locator dropped at its timeout",
-            dropped_locator(),
-            plan(),
+            seed("header-storage-locator-dropped"),
         ),
-        explicit::<HeaderStorage>(
+        drawn(
+            "header-sync/storage",
             "header storage apply pending at close",
-            apply_pending_at_close(),
-            plan(),
+            seed("header-storage-apply-at-close"),
+        ),
+        drawn(
+            "header-sync/storage",
+            "header storage competing mirrors",
+            seed("header-storage-competing-mirrors"),
         ),
         explicit::<HeaderWire>(
             "header wire status burst",
@@ -561,6 +574,7 @@ fn witnesses() -> Vec<Witness> {
             [&[0xFE, tag][..], &plan()].concat(),
         ));
     }
+    // Competing mirrors under more plans, which also reach a reorg.
     for (index, plan) in support::byte_inputs(6, 128).into_iter().enumerate() {
         all.push(explicit::<HeaderStorage>(
             &format!("header storage competing mirrors {index}"),
@@ -569,27 +583,6 @@ fn witnesses() -> Vec<Witness> {
         ));
     }
     all
-}
-
-/// The node at genesis, `mirror-0` at A5, and `mirror-1` on a heavier
-/// branch from A1.
-fn competing_mirrors() -> StorageScenario {
-    StorageScenario {
-        mirrors: vec![
-            MirrorSpec {
-                chain: Chain::main(5),
-                dialer: Dialer::Mirror,
-            },
-            MirrorSpec {
-                chain: Chain {
-                    main: 1,
-                    fork: Some(Fork { branch: 1, len: 6 }),
-                },
-                dialer: Dialer::Node,
-            },
-        ],
-        ..StorageScenario::default()
-    }
 }
 
 /// Eight blocks whose verdicts wait for the link to close, and a teardown
@@ -638,81 +631,6 @@ fn relink_while_applying() -> BlockScenario {
             })),
         }],
         ..BlockScenario::default()
-    }
-}
-
-/// The node's first locator, held until the reactor's request timeout drops
-/// its call, then completed.
-fn dropped_locator() -> StorageScenario {
-    StorageScenario {
-        policy: HeaderPolicy {
-            holds: vec![HeaderHold {
-                select: HeaderSelect::nth(OpKind::Locator, 1),
-                until: HeaderTrigger::CallerDropped(HeaderSelect::held()),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..HeaderPolicy::converging()
-        },
-        ..StorageScenario::default()
-    }
-}
-
-/// The node's header applies attributed to `session`.
-fn header_apply(session: u64) -> HeaderSelect {
-    HeaderSelect {
-        kind: Some(OpKind::Apply),
-        session: Some(session),
-        ..HeaderSelect::default()
-    }
-}
-
-/// The node's first apply for `mirror-0`, held until its link has closed
-/// and the relinked session's locator is submitted, then committed, as
-/// `tests/header_node_late.rs`'s `apply_pending_at_close_still_commits`
-/// runs. The close retires the applying request before its apply completes.
-fn apply_pending_at_close() -> StorageScenario {
-    let control = |action, when| HeaderControl {
-        peer: "mirror-0".to_owned(),
-        action,
-        when: Some(when),
-    };
-    StorageScenario {
-        policy: HeaderPolicy {
-            holds: vec![
-                HeaderHold {
-                    select: header_apply(1),
-                    until: HeaderTrigger::All(vec![
-                        HeaderTrigger::Closed("mirror-0".to_owned()),
-                        HeaderTrigger::Submitted(HeaderSelect::nth(OpKind::Locator, 2)),
-                    ]),
-                    then: vec![Allow::Engine],
-                    deadline_ms: Some(20_000),
-                },
-                HeaderHold {
-                    select: header_apply(2),
-                    until: HeaderTrigger::Completed(header_apply(1)),
-                    then: vec![Allow::Engine],
-                    deadline_ms: Some(25_000),
-                },
-            ],
-            ..HeaderPolicy::converging()
-        },
-        controls: vec![
-            control(
-                HeaderAction::Close,
-                HeaderTrigger::Submitted(header_apply(1)),
-            ),
-            control(
-                HeaderAction::Grow { len: 1 },
-                HeaderTrigger::Closed("mirror-0".to_owned()),
-            ),
-            control(
-                HeaderAction::Relink,
-                HeaderTrigger::Grown("mirror-0".to_owned()),
-            ),
-        ],
-        ..StorageScenario::default()
     }
 }
 
@@ -777,6 +695,42 @@ fn every_collected_state_has_a_witness() {
             )
         });
         assert_eq!(lost, None, "{}: no caller to lose", witness.name);
+    }
+    // Each drawn header storage seed shows the rows it's committed for on
+    // its own run, so another witness can't stand in for it.
+    let own = [
+        (
+            "header storage locator dropped at its timeout",
+            &["completion after cancellation request"][..],
+        ),
+        (
+            "header storage apply pending at close",
+            &["completion after owner retirement"][..],
+        ),
+        (
+            "header storage competing mirrors",
+            &[
+                "two distinct peer offers",
+                "shared ancestor",
+                "selected winner",
+            ][..],
+        ),
+    ];
+    for (name, rows) in own {
+        let (witness, states) = witnesses
+            .iter()
+            .zip(&reached)
+            .find(|(witness, _)| witness.name == name)
+            .unwrap_or_else(|| panic!("no witness {name}"));
+        assert!(witness.drawn, "{name}");
+        for state in rows {
+            let row = REQUIRED.iter().find(|row| row.state == *state).unwrap();
+            let Coverage::Collected { shows, drawn, .. } = row.coverage else {
+                panic!("{state} is collected");
+            };
+            assert!(drawn, "{state} is drawn");
+            assert!(states.iter().any(shows), "{name} doesn't show {state}");
+        }
     }
     for row in REQUIRED {
         let Coverage::Collected {

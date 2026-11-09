@@ -8,7 +8,7 @@ mod support;
 
 use std::process::{Command, Output};
 
-use support::inputs;
+use support::{inputs, storage_witnesses};
 use tempfile::TempDir;
 use zakura_sim::{
     harness::{
@@ -108,35 +108,9 @@ fn picked(report: &RunReport, action: &str) -> Vec<u64> {
         .collect()
 }
 
-/// The node at A3 syncing from `mirror-0` at A6. The first prepare is held
-/// until the node resets, and the reset invalidates the node's tip once
-/// that prepare is submitted. Once the prepare completes, a reconsider
-/// restores the tip, so the node can still take the mirror's chain.
+/// [`storage_witnesses::reset_held_prepare`].
 fn reset_held_prepare() -> StorageScenario {
-    StorageScenario {
-        node: Chain::main(3),
-        mirrors: vec![mirror(Chain::main(6), Dialer::Mirror)],
-        policy: Policy {
-            holds: vec![Hold {
-                select: Select::nth(OpKind::Prepare, 1),
-                until: Trigger::Reset("node".to_owned()),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..Policy::converging()
-        },
-        controls: vec![
-            node_step(
-                ControlAction::Reset(Reset::Invalidate { depth: 0 }),
-                Some(Trigger::Submitted(Select::nth(OpKind::Prepare, 1))),
-            ),
-            node_step(
-                ControlAction::Reset(Reset::Reconsider),
-                Some(Trigger::Completed(Select::nth(OpKind::Prepare, 1))),
-            ),
-        ],
-        weights: Default::default(),
-    }
+    storage_witnesses::reset_held_prepare()
 }
 
 /// A prepare held across an invalidation of the node's tip completes after
@@ -185,36 +159,9 @@ fn a_held_prepare_completes_in_the_reset_generation() {
     }
 }
 
-/// The node at A2 syncing from `mirror-0` at A6. The first apply is held
-/// until the node resets, and the reset invalidates the node's tip once
-/// that apply is submitted, so the held apply's headers extend an
-/// invalidated header. Once the apply completes, a reconsider restores
-/// the tip.
+/// [`storage_witnesses::reset_held_apply`].
 fn reset_held_apply() -> StorageScenario {
-    StorageScenario {
-        node: Chain::main(2),
-        mirrors: vec![mirror(Chain::main(6), Dialer::Mirror)],
-        policy: Policy {
-            holds: vec![Hold {
-                select: Select::nth(OpKind::Apply, 1),
-                until: Trigger::Reset("node".to_owned()),
-                then: vec![Allow::Engine],
-                deadline_ms: None,
-            }],
-            ..Policy::converging()
-        },
-        controls: vec![
-            node_step(
-                ControlAction::Reset(Reset::Invalidate { depth: 0 }),
-                Some(Trigger::Submitted(Select::nth(OpKind::Apply, 1))),
-            ),
-            node_step(
-                ControlAction::Reset(Reset::Reconsider),
-                Some(Trigger::Completed(Select::nth(OpKind::Apply, 1))),
-            ),
-        ],
-        weights: Default::default(),
-    }
+    storage_witnesses::reset_held_apply()
 }
 
 /// An apply held across an invalidation of its parent completes after the

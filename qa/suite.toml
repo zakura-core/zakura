@@ -150,6 +150,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed seeds"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"
+test = "regenerate_witness_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed witness seeds"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/block_semantic_properties.rs"
 test = "regenerate_reset_mid_flight_input"
 run = false

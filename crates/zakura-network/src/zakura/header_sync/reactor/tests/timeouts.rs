@@ -887,8 +887,9 @@ async fn an_earlier_completion_cannot_fire_the_fatal_for_a_finished_vct_apply() 
     task.await.unwrap();
 }
 
-/// Due maintenance polls the VCT local operation directly, so a finished
-/// apply whose wake the shared ready queue hasn't shown can't fire the fatal.
+/// A turn's settle polls the VCT local operation directly, so a finished
+/// apply whose wake the shared ready queue hasn't shown can't fire the fatal
+/// in the due maintenance after it.
 #[tokio::test(start_paused = true)]
 async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
     let port =
@@ -898,7 +899,8 @@ async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
     poll_pending_operation(&mut fixture.reactor);
     time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
 
-    fixture.reactor.maintenance_due(&mut None, &mut None);
+    fixture.reactor.settle_ready_inputs(&mut None, &mut None);
+    fixture.reactor.run_due_maintenance(Instant::now());
 
     let fatal = fixture.fatal_events.try_recv();
     assert!(
@@ -909,8 +911,9 @@ async fn an_unannounced_finished_apply_cannot_fire_the_fatal() {
     assert!(fixture.reactor.pending_port_operations.is_empty());
 }
 
-/// Due maintenance reads a ready repair status before it enforces the
-/// supplier's deadline, so a repair that ended charges its supplier nothing.
+/// A turn reads a ready repair status before its due maintenance enforces
+/// the supplier's deadline, so a repair that ended charges its supplier
+/// nothing.
 #[tokio::test(start_paused = true)]
 async fn due_maintenance_reads_a_ready_repair_status_first() {
     let mut fixture = ReadyVctRepairFixture::new();
@@ -935,13 +938,76 @@ async fn due_maintenance_reads_a_ready_repair_status_first() {
         .expect("the test holds the receiver");
     time::advance(fixture.reactor.startup.request_timeout).await;
 
-    fixture.reactor.maintenance_due(&mut None, &mut repairs);
+    fixture.reactor.settle_ready_inputs(&mut None, &mut repairs);
+    fixture.reactor.run_due_maintenance(Instant::now());
 
     assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
     assert!(
         !session.cancel_token().is_cancelled(),
         "the supplier of an ended repair is not charged"
     );
+}
+
+/// Wakes the reactor's capacity-release arm at the end of every turn, so
+/// that arm is ready whenever the reactor polls its `select!`.
+#[derive(Debug)]
+struct ReleaseEveryTurn(watch::Sender<u64>);
+
+impl observe::HeaderSyncObserver for ReleaseEveryTurn {
+    /// Bumps the release watch as each turn's closing pass starts.
+    fn observe(&self, event: ReactorEvent) {
+        if matches!(
+            event,
+            ReactorEvent::CauseSet {
+                cause: ReactorCause::Pass
+            }
+        ) {
+            self.0
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+}
+
+/// An input that wins the biased `select!` on every turn can't starve a due
+/// fatal deadline, since each turn runs due maintenance before its `select!`.
+#[tokio::test(start_paused = true)]
+async fn inputs_ready_every_turn_cannot_starve_the_fatal_deadline() {
+    let mut fixture = VctLocalFixture::new(
+        PendingVctLocalPort::pending(true),
+        HeaderTargetPhase::Applying,
+    );
+    fixture.dispatch();
+    let releases = fixture
+        .reactor
+        .peer_work_queue
+        .capacity_release_sender_for_test();
+    let first_release = releases.clone();
+    fixture.reactor.startup.observer =
+        observe::ObserverSlot(Some(Arc::new(ReleaseEveryTurn(releases))));
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let mut fatal_events = fixture.fatal_events;
+    let reactor = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    // One release starts the cycle: from then on each turn's closing pass
+    // makes the next `select!` take the release arm.
+    first_release.send_modify(|revision| *revision = revision.wrapping_add(1));
+
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER).await;
+    let mut fatal = None;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+        if let Ok(event) = fatal_events.try_recv() {
+            fatal = Some(event);
+            break;
+        }
+    }
+
+    assert!(
+        fatal.is_some(),
+        "the due fatal deadline runs despite a ready input"
+    );
+    shutdown.cancel();
+    reactor.await.unwrap();
 }
 
 #[test]

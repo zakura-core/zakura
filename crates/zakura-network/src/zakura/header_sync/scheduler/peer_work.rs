@@ -587,6 +587,15 @@ impl PeerWorkQueue {
         self.budget.0.released.subscribe()
     }
 
+    /// The sender behind [`Self::capacity_releases`], so a test can wake the
+    /// reactor's capacity-release arm.
+    #[cfg(test)]
+    pub(in crate::zakura::header_sync) fn capacity_release_sender_for_test(
+        &self,
+    ) -> watch::Sender<u64> {
+        self.budget.0.released.clone()
+    }
+
     /// Retire locator work captured from an obsolete committed snapshot.
     ///
     /// Retire active requests separately so the reactor can cancel their network requests.

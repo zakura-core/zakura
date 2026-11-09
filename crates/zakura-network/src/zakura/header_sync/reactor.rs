@@ -495,6 +495,7 @@ impl HeaderSyncReactor {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
+        let mut maintenance = self.next_maintenance_deadline();
         let terminal_outcome = loop {
             if self
                 .state
@@ -537,7 +538,8 @@ impl HeaderSyncReactor {
                 caused!(self, ReactorCause::Event, self.handle_event(event));
                 handled_event = true;
             }
-            let maintenance = self.next_maintenance_deadline();
+            self.run_due_maintenance(maintenance);
+            maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
             zakura_rt::select! {
@@ -561,9 +563,8 @@ impl HeaderSyncReactor {
                     });
                 },
                 _ = capacity_releases.changed() => {},
-                _ = time::sleep_until(maintenance) => {
-                    self.maintenance_due(&mut committed_snapshots, &mut vct_root_repairs);
-                },
+                // Wakes the loop. The next turn runs the due maintenance.
+                _ = time::sleep_until(maintenance) => {},
                 event = self.lifecycle.recv() => match event {
                     Some(event) => {
                         observe!(
@@ -2675,24 +2676,23 @@ impl HeaderSyncReactor {
         }
     }
 
-    /// Runs maintenance once its deadline is due, after the inputs that could
-    /// retire due work for free, so a due deadline can't win over a ready
-    /// completion or repair status.
-    fn maintenance_due(
-        &mut self,
-        committed_snapshots: &mut Option<
-            watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
-        >,
-        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
-    ) {
-        self.settle_ready_inputs(committed_snapshots, vct_root_repairs);
-        caused!(self, ReactorCause::Maintenance, self.run_maintenance());
+    /// Runs maintenance if `maintenance`, the deadline the last turn computed,
+    /// has passed.
+    ///
+    /// Each turn calls this after it settles the ready inputs and takes its
+    /// queued events, rather than from the maintenance `select!` arm. So a due
+    /// deadline can't win over a ready completion or repair status, and inputs
+    /// that keep winning the biased `select!` can't starve it.
+    fn run_due_maintenance(&mut self, maintenance: Instant) {
+        if maintenance <= Instant::now() {
+            caused!(self, ReactorCause::Maintenance, self.run_maintenance());
+        }
     }
 
     /// Enforces the deadlines that a ready completion or repair status could
     /// retire for free, then refreshes statuses.
     ///
-    /// Only [`Self::maintenance_due`] calls this.
+    /// Only [`Self::run_due_maintenance`] calls this.
     fn run_maintenance(&mut self) {
         let now = Instant::now();
         if !self.report_fatal_vct_local_operation(now) {

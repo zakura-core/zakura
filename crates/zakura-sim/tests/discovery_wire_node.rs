@@ -7,8 +7,10 @@
 //!
 //! disc-2.2: sim-5's peers run a discovery script. A peer that answers the
 //! node's exchange gets its `Hello` and relayed record verified on
-//! `discovery_verify` tasks. A peer holds an answer until a virtual time,
-//! and sends its own requests.
+//! `discovery_verify` tasks, and the node dials a listening peer it holds
+//! as a static candidate, again and again, each connection with its own
+//! identity. A peer holds an answer until a virtual time, and sends its own
+//! requests.
 #![cfg(zakura_sim)]
 
 use zakura_network::zakura::{
@@ -21,9 +23,10 @@ use zakura_sim::{
         header_sync::wire_config,
         NetScenario,
     },
+    observe::TransportFact,
     peer::{
         discovery::{Answer, DiscoveryScript, Hold, Request},
-        PeerAction, PeerSpec,
+        peer_addr, PeerAction, PeerSpec,
     },
     MemorySink, NoChecks, Observation, Plan, RunReport, Sim,
 };
@@ -228,6 +231,65 @@ fn an_answering_peer_runs_discovery_verify() {
     let again = run_peers(Vec::new(), &peers);
     assert_eq!(report.log.entries(), again.log.entries());
     assert_eq!(report.end, again.end);
+}
+
+/// The node dials `peer-0`, which listens, because it holds it as a static
+/// candidate. Each dial registers a connection from the peer's one address,
+/// the exchange completes on it, and the bootstrap dial dials again. The
+/// peer's frames on each connection are placed on that connection, so the
+/// run ends with no harness failure.
+#[test]
+fn the_node_dials_a_listening_static_candidate() {
+    let peers = [discovering(
+        PeerSpec::listening(),
+        DiscoveryScript::default(),
+    )];
+    let report = run_peers(vec![0], &peers);
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let remote = peer_addr(0, 0).to_string();
+    let registered: Vec<u64> = report
+        .log
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.obs {
+            Observation::Transport {
+                connection: Some(connection),
+                remote: from,
+                event: TransportFact::Registered,
+                ..
+            } if *from == remote => Some(*connection),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        registered.len() >= 2,
+        "the node registered {registered:?} from {remote}"
+    );
+    let frames = peer_frames(&report);
+    for connection in &registered[..2] {
+        let rows: Vec<_> = frames
+            .iter()
+            .filter(|(on, ..)| on == connection)
+            .map(|(_, row, label)| (row.as_str(), *label))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("hello", "conformant"),
+                ("peers", "conformant"),
+                ("services", "conformant")
+            ],
+            "connection {connection}"
+        );
+    }
+    let closes = closes(&report);
+    assert!(
+        closes.len() >= 2
+            && closes
+                .iter()
+                .all(|cause| cause == "discovery_exchange_complete"),
+        "{closes:?}"
+    );
 }
 
 /// The message types the peers read from the node on discovery streams, in

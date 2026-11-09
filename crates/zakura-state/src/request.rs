@@ -209,7 +209,7 @@ impl PartialEq for BlockAdmission {
 }
 
 impl Eq for BlockAdmission {}
-use crate::{error::LayeredStateError, CommitSemanticallyVerifiedError};
+use crate::{error::LayeredStateError, CommitSemanticallyVerifiedError, ParentUtxos};
 
 /// Identify a spend by a transparent outpoint or revealed nullifier.
 ///
@@ -454,6 +454,16 @@ pub struct SemanticallyVerifiedBlock {
     /// This is process-local metadata, not serialized block data. Restored
     /// blocks have no order. Orders from different primary sessions cannot be compared.
     pub receipt_order: Option<u64>,
+    /// Outputs the state already found unspent at this block's parent, when the block
+    /// verifier checked its inputs.
+    ///
+    /// Contextual validation uses these outputs instead of looking them up again. It ignores
+    /// them unless their parent is this block's parent. Any spent output can be missing, and is
+    /// then looked up as usual. The default is empty.
+    ///
+    /// Unlike the fields derived from `block`, this map's locking scripts are not proportional to
+    /// the block's size. The state caps them per block when it creates the map.
+    pub parent_utxos: Arc<ParentUtxos>,
 }
 
 /// Data required to check a prepared mined block before optimistic relay.
@@ -768,6 +778,8 @@ impl ContextuallyVerifiedBlock {
             origin: _,
             auth_data_root: _,
             receipt_order,
+            // Already used by contextual validation to find `spent_outputs`.
+            parent_utxos: _,
         } = semantically_verified;
 
         let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
@@ -828,6 +840,8 @@ impl ContextuallyVerifiedBlock {
             // Not part of a contextual verification: the commitment check reads the block.
             origin: _,
             auth_data_root: _,
+            // The proposal's contextual verification already found the spent outputs.
+            parent_utxos: _,
         } = solved;
 
         Self {
@@ -890,6 +904,7 @@ impl CheckpointVerifiedBlock {
             origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: None,
+            parent_utxos: Default::default(),
         })
     }
 
@@ -935,6 +950,7 @@ impl SemanticallyVerifiedBlock {
             origin: crate::BlockOrigin::Network,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
+            parent_utxos: Default::default(),
         }
     }
 
@@ -994,6 +1010,7 @@ impl From<BlockHandle> for SemanticallyVerifiedBlock {
             origin: crate::BlockOrigin::Network,
             auth_data_root: Some(auth_data_root),
             receipt_order: None,
+            parent_utxos: Default::default(),
         }
     }
 }
@@ -1208,6 +1225,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: valid.receipt_order,
+            parent_utxos: Default::default(),
         }
     }
 }
@@ -1224,6 +1242,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             origin: crate::BlockOrigin::Network,
             auth_data_root: None,
             receipt_order: None,
+            parent_utxos: Default::default(),
         }
     }
 }

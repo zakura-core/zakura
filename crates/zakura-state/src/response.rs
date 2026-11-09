@@ -175,12 +175,14 @@ pub enum Response {
 pub enum ParentInputs {
     /// Every input is unspent at the parent, with the outputs that fit the retention budget.
     ///
-    /// The block verifier hands these outputs to its transaction checks, so they are read once
-    /// per block when retained. An absent entry must be looked up again, not treated as missing.
-    /// The map holds each retained output once while the block verifies, in addition to the
-    /// copies the transaction checks make of the outputs they spend. Its locking scripts are
-    /// capped per check, see `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
-    Unspent(Arc<HashMap<transparent::OutPoint, transparent::Utxo>>),
+    /// The block verifier hands these outputs to its transaction checks and then to contextual
+    /// validation in [`SemanticallyVerifiedBlock::parent_utxos`](crate::SemanticallyVerifiedBlock::parent_utxos),
+    /// so they are read once per block when retained. An absent entry must be looked up again,
+    /// not treated as missing. The map holds each retained output once until the block is
+    /// contextually validated, in addition to the copies the transaction checks make of the
+    /// outputs they spend. Its locking scripts are capped per check, see
+    /// `MAX_KEPT_PARENT_INPUT_BYTES` in `service::read::block`.
+    Unspent(Arc<ParentUtxos>),
     /// The parent is committed, and this input is not unspent in the parent's chain.
     Missing(transparent::OutPoint),
     /// The parent is neither in a non-finalized chain nor the finalized tip,
@@ -188,6 +190,76 @@ pub enum ParentInputs {
     ParentUnavailable,
     /// The state could not decide, for example because the parent context changed during the read.
     Inconclusive,
+}
+
+/// Outputs that the state found unspent in the chain ending at a block's parent.
+///
+/// Only the state creates these, when it answers [`Request::CheckParentInputs`], so contextual
+/// validation can use them without looking the outputs up again. The parent's hash fixes its
+/// chain, so the outputs stay unspent at that parent however the chain's finalized and
+/// non-finalized parts change later.
+///
+/// The map can omit spent outputs whose locking scripts did not fit the retention budget. An
+/// omitted output must be looked up again, not treated as missing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParentUtxos {
+    /// The block whose chain these outputs are unspent in.
+    ///
+    /// The default value has an all-zero hash and no outputs, so it never answers a lookup.
+    parent: block::Hash,
+    /// The retained outputs, with the index of the transaction that created each one.
+    utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+}
+
+impl ParentUtxos {
+    /// Creates the outputs that a parent input check found unspent at `parent`.
+    ///
+    /// The caller must have read every output in `utxos` as unspent in the chain ending at
+    /// `parent`.
+    pub(crate) fn new(
+        parent: block::Hash,
+        utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    ) -> Self {
+        Self { parent, utxos }
+    }
+
+    /// Creates outputs for a mocked parent input check.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn new_for_test(
+        parent: block::Hash,
+        utxos: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    ) -> Self {
+        Self::new(parent, utxos)
+    }
+
+    /// Returns the block whose chain these outputs are unspent in.
+    pub fn parent(&self) -> block::Hash {
+        self.parent
+    }
+
+    /// Returns the output at `outpoint`, if it was retained.
+    pub fn get(&self, outpoint: &transparent::OutPoint) -> Option<&transparent::Utxo> {
+        self.get_ordered(outpoint)
+            .map(|ordered_utxo| &ordered_utxo.utxo)
+    }
+
+    /// Returns the output at `outpoint` with the index of its transaction, if it was retained.
+    pub(crate) fn get_ordered(
+        &self,
+        outpoint: &transparent::OutPoint,
+    ) -> Option<&transparent::OrderedUtxo> {
+        self.utxos.get(outpoint)
+    }
+
+    /// Returns the number of retained outputs.
+    pub fn len(&self) -> usize {
+        self.utxos.len()
+    }
+
+    /// Returns `true` if no outputs were retained.
+    pub fn is_empty(&self) -> bool {
+        self.utxos.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

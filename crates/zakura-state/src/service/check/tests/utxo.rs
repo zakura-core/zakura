@@ -1,12 +1,12 @@
 //! Test vectors and randomised property tests for UTXO contextual validation
 
-use std::{env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 
 use proptest::prelude::*;
 
 use zakura_chain::{
     amount::Amount,
-    block::{Block, Height},
+    block::{self, Block, Height},
     fmt::TypeNameToDebug,
     serialization::ZcashDeserializeInto,
     transaction::{self, LockTime, Transaction},
@@ -21,7 +21,7 @@ use crate::{
         write::validate_and_commit_non_finalized,
     },
     tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase},
-    CheckpointVerifiedBlock,
+    CheckpointVerifiedBlock, ParentUtxos, SemanticallyVerifiedBlock,
     ValidateContextError::{
         DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
         MissingTransparentOutput, UnshieldedTransparentCoinbaseSpend,
@@ -115,6 +115,93 @@ fn reject_immature_coinbase_utxo_spend() {
             spend_height,
             min_spend_height,
             created_height
+        })
+    );
+}
+
+/// Returns block 1 with a transaction that spends an output no chain contains, the spent
+/// outpoint, and its output.
+fn block1_spending_unknown_output() -> (
+    SemanticallyVerifiedBlock,
+    transparent::OutPoint,
+    transparent::OrderedUtxo,
+) {
+    let outpoint = transparent::OutPoint {
+        hash: transaction::Hash([0x42; 32]),
+        index: 0,
+    };
+    let output = transparent::Output {
+        value: Amount::try_from(1_000).expect("the test amount is valid"),
+        lock_script: transparent::Script::new(&[0x51]),
+    };
+    let input = transparent::Input::PrevOut {
+        outpoint,
+        unlock_script: transparent::Script::new(&[]),
+        sequence: u32::MAX,
+    };
+
+    let mut block1 = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Block>()
+        .expect("block should deserialize");
+    block1.transactions[0] = transaction_v4_from_coinbase(&block1.transactions[0]).into();
+    block1.transactions.push(
+        transaction_v4_with_transparent_data([input], [(outpoint, output.clone())], []).into(),
+    );
+
+    (
+        Arc::new(block1).prepare(),
+        outpoint,
+        transparent::OrderedUtxo::new(output, Height(0), 1),
+    )
+}
+
+/// Contextual validation uses an output the state already found unspent at the block's parent,
+/// instead of looking it up in the chain again.
+#[test]
+fn accept_spend_found_unspent_at_the_parent() {
+    let _init_guard = zakura_test::init();
+
+    let (finalized_state, mut non_finalized_state, genesis) = new_state_with_mainnet_genesis();
+    let (mut block1, outpoint, spent) = block1_spending_unknown_output();
+    block1.parent_utxos = Arc::new(ParentUtxos::new(
+        genesis.hash,
+        HashMap::from([(outpoint, spent.clone())]),
+    ));
+
+    let commit_result =
+        validate_and_commit_non_finalized(&finalized_state.db, &mut non_finalized_state, block1);
+
+    assert_eq!(commit_result, Ok(()));
+    let tip = non_finalized_state
+        .best_chain()
+        .and_then(|chain| chain.tip_block())
+        .expect("block 1 was committed");
+    assert_eq!(tip.height, Height(1));
+    assert_eq!(tip.spent_outputs.get(&outpoint), Some(&spent));
+    // The chain never contained the output, so the spend could only come from the parent map.
+    assert!(finalized_state.utxo(&outpoint).is_none());
+}
+
+/// Outputs found at another parent don't stand in for the chain lookups.
+#[test]
+fn reject_spend_found_unspent_at_another_parent() {
+    let _init_guard = zakura_test::init();
+
+    let (finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+    let (mut block1, outpoint, spent) = block1_spending_unknown_output();
+    block1.parent_utxos = Arc::new(ParentUtxos::new(
+        block::Hash([1; 32]),
+        HashMap::from([(outpoint, spent)]),
+    ));
+
+    let commit_result =
+        validate_and_commit_non_finalized(&finalized_state.db, &mut non_finalized_state, block1);
+
+    assert_eq!(
+        commit_result,
+        Err(MissingTransparentOutput {
+            outpoint,
+            location: "the non-finalized and finalized chain",
         })
     );
 }

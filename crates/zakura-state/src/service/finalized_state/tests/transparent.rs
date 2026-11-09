@@ -132,6 +132,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         origin: crate::BlockOrigin::Network,
         auth_data_root: None,
         receipt_order: None,
+        parent_utxos: Default::default(),
     };
     let finalized = FinalizedBlock::from_checkpoint_verified(
         CheckpointVerifiedBlock(semantically_verified),

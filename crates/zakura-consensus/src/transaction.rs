@@ -218,7 +218,7 @@ pub enum Request {
         ///
         /// Inputs found here skip the state lookup. Outputs created in the same block stay in
         /// `known_utxos`, which is checked first. See `zakura_state::ParentInputs::Unspent`.
-        parent_utxos: Arc<HashMap<transparent::OutPoint, transparent::Utxo>>,
+        parent_utxos: Arc<zs::ParentUtxos>,
         /// The height of the block containing this transaction.
         height: block::Height,
         /// The time that the block was mined.
@@ -360,15 +360,15 @@ impl Request {
     pub fn known_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>> {
         match self {
             Request::Block { known_utxos, .. } => known_utxos.clone(),
-            Request::Mempool { .. } => HashMap::new().into(),
+            Request::Mempool { .. } => Arc::default(),
         }
     }
 
     /// The outputs already read as unspent at the parent of this request's block, if any.
-    fn parent_utxos(&self) -> Arc<HashMap<transparent::OutPoint, transparent::Utxo>> {
+    fn parent_utxos(&self) -> Arc<zs::ParentUtxos> {
         match self {
             Request::Block { parent_utxos, .. } => parent_utxos.clone(),
-            Request::Mempool { .. } => HashMap::new().into(),
+            Request::Mempool { .. } => Arc::default(),
         }
     }
 

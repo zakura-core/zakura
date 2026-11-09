@@ -13,7 +13,7 @@ use crate::{
         finalized_state::ZakuraDb,
         non_finalized_state::{SharedMap, SpendingTransactionId},
     },
-    SemanticallyVerifiedBlock,
+    ParentUtxos, SemanticallyVerifiedBlock,
     ValidateContextError::{
         self, DuplicateTransparentSpend, EarlyTransparentSpend, ImmatureTransparentCoinbaseSpend,
         MissingTransparentOutput, UnshieldedTransparentCoinbaseSpend,
@@ -42,6 +42,10 @@ use crate::{
 /// `non_finalized_chain_created_utxos` includes outputs that were later spent
 /// by the non-finalized chain. `non_finalized_chain_spent_utxos` takes
 /// precedence over it.
+///
+/// The chain lookups must describe the chain ending at the block's parent. Spends found in
+/// [`SemanticallyVerifiedBlock::parent_utxos`] for that parent skip them, because the state
+/// already found those outputs unspent in that chain.
 pub fn transparent_spend<'chain>(
     semantically_verified: &SemanticallyVerifiedBlock,
     non_finalized_chain_created_utxos: impl Fn(
@@ -51,6 +55,9 @@ pub fn transparent_spend<'chain>(
     finalized_state: &ZakuraDb,
 ) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
     let mut block_spends = HashMap::new();
+    let parent = semantically_verified.block.header().previous_block_hash;
+    let parent_utxos = Some(semantically_verified.parent_utxos.as_ref())
+        .filter(|parent_utxos| parent_utxos.parent() == parent);
 
     for (spend_tx_index_in_block, transaction) in semantically_verified
         .block
@@ -70,6 +77,7 @@ pub fn transparent_spend<'chain>(
                 spend,
                 spend_tx_index_in_block,
                 &semantically_verified.new_outputs,
+                parent_utxos,
                 &non_finalized_chain_created_utxos,
                 non_finalized_chain_spent_utxos,
                 finalized_state,
@@ -139,6 +147,7 @@ fn transparent_spend_chain_order<'chain>(
     spend: transparent::OutPoint,
     spend_tx_index_in_block: usize,
     block_new_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    parent_utxos: Option<&ParentUtxos>,
     non_finalized_chain_created_utxos: &impl Fn(
         &transparent::OutPoint,
     ) -> Option<&'chain transparent::OrderedUtxo>,
@@ -160,6 +169,12 @@ fn transparent_spend_chain_order<'chain>(
             // a unique spend of a previous transaction's output is ok
             return Ok(output.clone());
         }
+    }
+
+    if let Some(output) = parent_utxos.and_then(|parent_utxos| parent_utxos.get_ordered(&spend)) {
+        // The state found this output unspent in the chain ending at the parent, which is the
+        // chain the lookups below would read.
+        return Ok(output.clone());
     }
 
     if non_finalized_chain_spent_utxos.contains_key(&spend) {

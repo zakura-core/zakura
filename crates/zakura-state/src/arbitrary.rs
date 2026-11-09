@@ -106,6 +106,7 @@ impl ContextuallyVerifiedBlock {
             origin: _,
             auth_data_root: _,
             receipt_order,
+            parent_utxos: _,
         } = block.into();
 
         Self {

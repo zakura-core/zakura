@@ -1,0 +1,14 @@
+# A node round's apply installs its transition and then stores its new
+# selected tip deferred for a day past the header's time, recomputing
+# eligibility to match, though the run's clock admits it now. The
+# fixture's own preload applies faithfully. (Production's own planner
+# rejects a batch whose admission defers every header, preload included,
+# so the mutation sits after the install.) The reactor, the queue, the
+# storage adapter and the engine decide how the witness's rounds apply, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/transition", "crates/zakura-header-chain/src/graph"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

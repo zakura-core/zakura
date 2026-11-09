@@ -441,6 +441,7 @@ fn witness(
             Plan::from_fuzz(&plan),
             &property,
             Expect::Violated,
+            &[],
             &mut NullSink,
         );
         (result, clean)

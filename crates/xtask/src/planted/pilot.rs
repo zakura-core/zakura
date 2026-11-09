@@ -55,8 +55,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Located, Run,
-    Verdict,
+    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Expect, Located,
+    Run, Verdict,
 };
 use crate::{
     run_command,
@@ -679,7 +679,11 @@ fn witness_run(
     child: Duration,
     interrupt: &AtomicBool,
 ) -> Result<Recorded, BoxError> {
-    let expect = if mutated { "violated" } else { "holds" };
+    let expect = if mutated {
+        Expect::Violated(&[])
+    } else {
+        Expect::Holds
+    };
     let mut run = record(
         Command::new(sim),
         &case.harness,

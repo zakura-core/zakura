@@ -2,9 +2,11 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable>]
+//!     [--witness <property> --expect <holds|violated|applicable>
+//!     [--also-violates <ids>]]
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable>]
+//!     [--witness <property> --expect <holds|violated|applicable>
+//!     [--also-violates <ids>]]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
 //! zakura-sim versions --sim <name>
@@ -97,9 +99,11 @@ mod cli {
         let mut text = String::from(
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable>]\n  \
+             [--witness <property> --expect <holds|violated|applicable>\n      \
+             [--also-violates <ids>]]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable>]\n  \
+             [--witness <property> --expect <holds|violated|applicable>\n      \
+             [--also-violates <ids>]]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
              zakura-sim versions --sim <name>\n  \
@@ -121,6 +125,8 @@ mod cli {
              `--witness` judges the run as a witness test of the property, writes the\n\
              result to witness.json beside the trace, and exits 1 if the test fails.\n\
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
+             `--also-violates` lists, comma-separated, properties a `violated` witness\n\
+             test expects violated beside the property, as a planted bug's co-violations.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -215,6 +221,7 @@ mod cli {
         out: Option<PathBuf>,
         witness: Option<String>,
         expect: Option<String>,
+        also_violates: Option<String>,
     }
 
     /// `record`: runs one input on a harness and writes the trace.
@@ -266,19 +273,30 @@ mod cli {
                 ))
             }
         };
+        let also_violates: Vec<String> = match (&witness, flags.also_violates) {
+            (_, None) => Vec::new(),
+            (Some((_, Expect::Violated)), Some(ids)) => ids.split(',').map(str::to_owned).collect(),
+            (_, Some(_)) => {
+                return Err(Error::Usage(
+                    "--also-violates needs --expect violated".to_owned(),
+                ))
+            }
+        };
         let Some((property, expect)) = witness else {
             let trace = harness::record(entry, what, &out)
                 .map_err(|error| Error::Failed(error.to_string()))?;
             print_trace(&trace, &out);
             return Ok(());
         };
-        let (trace, result) = harness::record_witness(entry, what, &out, &property, expect)
-            .map_err(|error| Error::Failed(error.to_string()))?;
+        let (trace, result) =
+            harness::record_witness(entry, what, &out, &property, expect, &also_violates)
+                .map_err(|error| Error::Failed(error.to_string()))?;
         print_trace(&trace, &out);
         let error = result.as_ref().err().map(ToString::to_string);
         let file = json!({
             "property": property,
             "expect": expect.name(),
+            "also_violates": also_violates,
             "passed": result.is_ok(),
             "error": error,
         });
@@ -1080,6 +1098,7 @@ mod cli {
                 "--out" => flags.out.replace(value.into()).is_some(),
                 "--witness" => flags.witness.replace(value).is_some(),
                 "--expect" => flags.expect.replace(value).is_some(),
+                "--also-violates" => flags.also_violates.replace(value).is_some(),
                 _ => return Err(Error::Usage(format!("unknown flag `{flag}`"))),
             };
             if slot_taken {

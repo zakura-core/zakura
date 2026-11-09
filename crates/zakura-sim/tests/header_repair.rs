@@ -284,6 +284,7 @@ fn the_committed_repair_inputs_hold_stale_completion_inert() {
             plan(input),
             STALE_COMPLETION_INERT,
             Expect::Holds,
+            &[],
             &mut MemorySink::default(),
         );
         assert_eq!(result, Ok(()), "{stem}");

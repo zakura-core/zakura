@@ -43,6 +43,7 @@ fn the_stale_prepare_input_holds_stale_completion_inert() {
         Plan::from_fuzz(plan),
         STALE_COMPLETION_INERT,
         Expect::Holds,
+        &[],
         &mut MemorySink::default(),
     );
     assert_eq!(result, Ok(()));

@@ -24,7 +24,7 @@
 //!    Plan bytes), so both runs read the same committed witness. It then
 //!    rebuilds and records the input again, which must violate the case's
 //!    property and no property outside the case's `also_violates`, and pass
-//!    its witness test expecting `violated`;
+//!    its witness test expecting `violated` beside those;
 //! 3. runs a short campaign on the patched build: [`CAMPAIGN_INPUTS`] fuzz
 //!    inputs, drawn from a seed that the property's ID fixes, each of which
 //!    must hold or violate only the case's property, and a violation must
@@ -831,7 +831,7 @@ fn check_case(
         &harness,
         &input,
         &case.property,
-        "holds",
+        Expect::Holds,
         &scratch.join("baseline"),
         None,
     )?;
@@ -910,7 +910,7 @@ fn judge_patched(
         harness,
         input,
         &case.property,
-        "violated",
+        Expect::Violated(&case.also_violates),
         &trace,
         None,
     )?;
@@ -1046,7 +1046,7 @@ fn campaign(binary: &Path, harness: &str, case: &Case, dir: &Path) -> Result<Ver
             harness,
             &Located::Input(input.clone()),
             &case.property,
-            "violated",
+            Expect::Violated(&case.also_violates),
             &dir.join(format!("run-{index}")),
             None,
         )?;
@@ -1161,6 +1161,33 @@ fn cargo_sim(worktree: &Path, target: &Path) -> Command {
     command
 }
 
+/// What a witness test that [`record`] runs expects of the case's property.
+#[derive(Clone, Copy, Debug)]
+enum Expect<'a> {
+    /// The property applies and holds, and no property is violated.
+    Holds,
+    /// The property is violated, and no other property is, except the
+    /// listed ones, the case's `also_violates`.
+    Violated(&'a [String]),
+}
+
+impl Expect<'_> {
+    /// `zakura-sim record`'s `--expect` flag and value, then its
+    /// `--also-violates` flag and value if the list isn't empty.
+    fn args(self) -> Vec<String> {
+        match self {
+            Expect::Holds => vec!["--expect".to_owned(), "holds".to_owned()],
+            Expect::Violated(also_violates) => {
+                let mut args = vec!["--expect".to_owned(), "violated".to_owned()];
+                if !also_violates.is_empty() {
+                    args.extend(["--also-violates".to_owned(), also_violates.join(",")]);
+                }
+                args
+            }
+        }
+    }
+}
+
 /// Records `input`, a fuzz input or a typed scenario and its Plan bytes, on
 /// `harness` with `zakura_sim`, a `zakura-sim` command, as a witness test of
 /// `property` that expects `expect`, writing the trace to `out`, and reads
@@ -1175,7 +1202,7 @@ fn record(
     harness: &str,
     input: &Located,
     property: &str,
-    expect: &str,
+    expect: Expect<'_>,
     out: &Path,
     deadline: Option<(Duration, &AtomicBool)>,
 ) -> Result<Run, BoxError> {
@@ -1187,7 +1214,8 @@ fn record(
         .args(input_args(input)?)
         .arg("--out")
         .arg(out)
-        .args(["--witness", property, "--expect", expect]);
+        .args(["--witness", property])
+        .args(expect.args());
     let ended = match deadline {
         None => format!("exited with {}", zakura_sim.status()?),
         Some((deadline, interrupt)) => {
@@ -1479,6 +1507,19 @@ mod tests {
         assert_eq!(
             classify(ID, &[], &Run::Failed("build".to_owned())),
             Verdict::Failed("build".to_owned())
+        );
+    }
+
+    /// The witness test's flags carry the case's `also_violates` only for a
+    /// violated expectation, and only when the list isn't empty.
+    #[test]
+    fn witness_flags_carry_the_co_violations() {
+        let also = ["a/one".to_owned(), "b/two".to_owned()];
+        assert_eq!(Expect::Holds.args(), ["--expect", "holds"]);
+        assert_eq!(Expect::Violated(&[]).args(), ["--expect", "violated"]);
+        assert_eq!(
+            Expect::Violated(&also).args(),
+            ["--expect", "violated", "--also-violates", "a/one,b/two"]
         );
     }
 

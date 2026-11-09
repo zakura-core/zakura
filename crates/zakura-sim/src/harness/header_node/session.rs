@@ -72,7 +72,7 @@ use zakura_network::zakura::{
 };
 use zakura_rt::sim::RunId;
 
-use crate::{peer::peer_of, IdleStatus, Outcome, RunEnd};
+use crate::{peer::peer_of, property::EndedBy, IdleStatus, Outcome, RunEnd};
 
 /// One session or link fact about the node under test, in run order. Peers
 /// are named as the scenario names them.
@@ -257,6 +257,9 @@ struct Link {
     direction: ServicePeerDirection,
     admitted: bool,
     closed: bool,
+    /// Whether the harness closed it itself
+    /// ([`SessionEvidence::harness_closed`]).
+    closed_by_harness: bool,
 }
 
 impl SessionEvidence {
@@ -411,6 +414,7 @@ impl SessionEvidence {
             direction,
             admitted: false,
             closed: false,
+            closed_by_harness: false,
         };
         if ledger.links.insert(connection, link).is_some() {
             ledger.break_rule(format!(
@@ -434,6 +438,40 @@ impl SessionEvidence {
         ledger
             .facts
             .push(SessionFact::LinkClosed { peer, connection });
+    }
+
+    /// Records that the harness closed the link on `connection` itself, as a
+    /// script, relink or shutdown does. A service that cancels a link's
+    /// token reaches [`SessionEvidence::link_closed`] alone.
+    pub(crate) fn harness_closed(&self, connection: u64) {
+        if let Some(mut ledger) = self.live() {
+            if let Some(link) = ledger.links.get_mut(&connection) {
+                link.closed_by_harness = true;
+            }
+        }
+    }
+
+    /// Who ended the session `session_id` ([`EndedBy`]): the environment if
+    /// the harness closed the link that carries it, or linked its peer again
+    /// since, so the new session replaces it. Anything else is the node's,
+    /// including a session no harness link carries.
+    pub fn ended_by(&self, session_id: u64) -> EndedBy {
+        let ledger = self.ledger();
+        let Some(link) = ledger
+            .links
+            .values()
+            .find(|link| link.session_id == session_id)
+        else {
+            return EndedBy::Node;
+        };
+        let relinked = ledger.links.values().any(|other| {
+            other.peer == link.peer && other.origin.connection > link.origin.connection
+        });
+        if link.closed_by_harness || relinked {
+            EndedBy::Environment
+        } else {
+            EndedBy::Node
+        }
     }
 
     /// Feeds one of the reactor's events, keeping the session facts and
@@ -469,36 +507,31 @@ impl SessionEvidence {
         self.ledger().facts.clone()
     }
 
-    /// Whether the node's membership is `peer`'s one header session and
-    /// nothing else, unchanged since own-9 admitted it. That holds once
-    /// own-9's only `Session` row is `peer`'s header session, while the
-    /// reactor has admitted at most that session, and no session ended, was
-    /// refused or retired, and no generation exited or connection tore down.
-    /// Facts only accumulate, so once it stops holding, it never holds again.
-    /// The row comes before the reactor's admission and before any frame
-    /// the stream reads. `false` without own-9's facts.
+    /// Whether the node's membership is `peer` alone: own-9 has a `Session`
+    /// row for `peer`'s header session, every row is `peer`'s, and the
+    /// reactor admitted only `peer`'s sessions. A row comes before the
+    /// reactor's admission and before any frame its stream reads. `false`
+    /// without own-9's facts.
+    ///
+    /// Only the environment can add another peer, so this stops holding
+    /// only when it does. A session the node ends, refuses, retires or opens
+    /// again, a generation it exits and a connection it tears down all leave
+    /// it holding, since those are the node's own ends ([`EndedBy`]). The
+    /// caller checks the environment's other end of the membership, `peer`'s
+    /// own close.
     pub fn stable_membership(&self, peer: &str) -> bool {
         let ledger = self.ledger();
         let Some(own9) = &ledger.own9 else {
             return false;
         };
-        let [row] = &own9.rows[..] else {
-            return false;
-        };
-        row.kind == ZAKURA_STREAM_HEADER_SYNC
-            && row.peer.as_deref() == Some(peer)
-            && own9.exited.is_empty()
-            && own9.torn_down.is_empty()
-            && ledger.facts.iter().all(|fact| {
-                matches!(
-                    fact,
-                    SessionFact::SessionAdmitted {
-                        peer: admitted,
-                        session_id,
-                        replaced: None,
-                        ..
-                    } if admitted == peer && *session_id == row.session_id
-                )
+        let is_peer = |row: &Row| row.peer.as_deref() == Some(peer);
+        own9.rows
+            .iter()
+            .any(|row| is_peer(row) && row.kind == ZAKURA_STREAM_HEADER_SYNC)
+            && own9.rows.iter().all(is_peer)
+            && ledger.facts.iter().all(|fact| match fact {
+                SessionFact::SessionAdmitted { peer: admitted, .. } => admitted == peer,
+                _ => true,
             })
     }
 }

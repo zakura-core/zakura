@@ -28,9 +28,13 @@ pub struct ZcashReader<R> {
     limit: Option<u64>,
 }
 
-impl<'a, 'b> ZcashReader<&'a mut &'b [u8]> {
+impl<'a, 'b> ZcashReader<&'a mut (dyn Read + 'b)> {
     /// Read from bytes already in memory and track how many remain.
     /// The supplied slice advances past each byte consumed.
+    ///
+    /// The slice is read through the same type-erased reader as streams, so each
+    /// type's decoder is compiled once for both. The remaining byte count still
+    /// bounds collection counts before allocation.
     pub fn from_slice(bytes: &'a mut &'b [u8]) -> Self {
         let remaining = Some(bytes.len());
         Self {

@@ -736,6 +736,12 @@ impl Topology {
         }
     }
 
+    /// Opens the policy's hold number `hold`, from 0, whatever its trigger
+    /// says. Opening an open hold does nothing.
+    pub(crate) fn release(&self, hold: usize) {
+        self.effects.released.borrow_mut().push(hold);
+    }
+
     /// This topology, telling `tap` before it stops the node under test.
     pub fn with_tap(self, tap: TapShutdown) -> Self {
         Topology {
@@ -1347,9 +1353,7 @@ impl Control {
                         .push(step.peer.clone());
                 }
             }
-            ControlAction::Release { hold } => {
-                self.topology.effects.released.borrow_mut().push(hold);
-            }
+            ControlAction::Release { hold } => self.topology.release(hold),
             ControlAction::StopStorage => port()?.shut_down(),
             ControlAction::Commit { len } => self.commit(&*port()?, len)?,
             _ => unreachable!("only run-only steps run at their pick"),

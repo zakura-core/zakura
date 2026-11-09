@@ -121,7 +121,7 @@ def validate_candidate(root: Path, bundle: Path, selected: dict) -> None:
         _check_extends_committed(root, bundle, selected, scratch)
     subprocess.run(
         ["cargo", "run", "--release", "--locked", "-p", "zakura", "--bin", "zakurad",
-         "--features", "historical-treestate-tools", "--",
+         "--features", "debug-commands", "--",
          "verify-historical-treestates", "--network", "Mainnet",
          "--subtree-input", str(bundle / IMPORT.SUBTREE_BUNDLE_NAME),
          "--frontier-input", str(bundle / IMPORT.FRONTIER.name),

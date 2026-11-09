@@ -49,7 +49,7 @@
 //!
 //! The check applies once an adoption changes the generation while a
 //! current-started round is live, an ordinary round starts, a reset is
-//! acted, or an apply execution inserts headers. A broken rule is a claim break, which the tap hands
+//! acted, an apply execution inserts headers, or a locator read is judged. A broken rule is a claim break, which the tap hands
 //! [`Claim::ResetInvalidatesWork`](super::claim::Claim) at its drain. A
 //! locator `Started` whose read storage never reported is missing evidence,
 //! which fails the run.
@@ -405,6 +405,9 @@ impl RoundLife {
         else {
             return;
         };
+        // A judged read makes the check applicable, so a wrong first read
+        // keeps its trigger history.
+        self.applies();
         let projection = &durable.selected_projection;
         let selected: HashSet<String> = projection.iter().map(|entry| hash(entry.hash)).collect();
         let expected_tip = projection.last().map(|entry| point(*entry));

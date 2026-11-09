@@ -35,7 +35,7 @@ use super::{
     session::{SessionEvidence, SessionFact},
     tap,
 };
-use crate::Identity;
+use crate::{property::Assume, Identity};
 
 /// How long after the later of its submission, or its commit for a held
 /// reply, and the `Recover` pick each storage operation must complete.
@@ -148,6 +148,24 @@ impl RecoveryEvidence {
         match &self.0.borrow().as_ref()?.state {
             RecoveryState::Recovered(record) => Some((**record).clone()),
             RecoveryState::Establishing { .. } | RecoveryState::Unreached => None,
+        }
+    }
+
+    /// Whether `assume` holds after a step of a recovering run whose node's
+    /// session view is `sessions`. None holds before the `recovered` pick.
+    /// After it, `StableMembership` holds until a session is admitted or
+    /// ended or a link closes ([`membership_changed`]), `HonestPeer` until
+    /// the source's recorded session ends ([`session_lasts`]), and the rest
+    /// always, since recovery enforces them.
+    pub fn holds(&self, sessions: &SessionEvidence, assume: Assume) -> bool {
+        let Some(record) = self.record() else {
+            return false;
+        };
+        let facts = sessions.facts();
+        match assume {
+            Assume::StableMembership => !membership_changed(&facts, record.facts),
+            Assume::HonestPeer => session_lasts(&facts, record.facts, &record.source),
+            _ => true,
         }
     }
 
@@ -477,11 +495,134 @@ pub(super) fn cooldown_end(
 
 #[cfg(test)]
 mod tests {
+    use zakura_chain::block;
+    use zakura_network::zakura::{observe::ReactorEvent, ServicePeerDirection, SessionOrigin};
+
     use super::*;
 
     /// `ms` milliseconds into the run.
     fn at(ms: u64) -> SimInstant {
         SimInstant::from_start(Duration::from_millis(ms))
+    }
+
+    /// Every assumption a recover declares.
+    const DECLARED: [Assume; 5] = [
+        Assume::StableMembership,
+        Assume::HonestPeer,
+        Assume::BoundedStorage,
+        Assume::BoundedDelivery,
+        Assume::FairScheduling,
+    ];
+
+    /// `peer`'s peer ID, its one byte repeated.
+    fn id(peer: u8) -> ZakuraPeerId {
+        ZakuraPeerId::new(vec![peer; 32]).expect("32 bytes is a valid peer ID")
+    }
+
+    /// Links `name` (peer ID byte `peer`) to the node on connection
+    /// `session_id` and admits its session `session_id`, as a run's topology
+    /// and tap report them.
+    fn link(sessions: &SessionEvidence, peer: u8, name: &str, session_id: u64) {
+        let origin = SessionOrigin {
+            connection: session_id,
+            quic_stream: None,
+            generation: session_id,
+        };
+        let direction = ServicePeerDirection::Inbound;
+        sessions.link_opened(&id(peer), name, origin, session_id, name, direction);
+        sessions.reactor(&ReactorEvent::SessionAdmitted {
+            peer: id(peer),
+            session_id,
+            direction,
+            replaced: None,
+            origin: Some(origin),
+        });
+    }
+
+    /// Which of [`DECLARED`] `recovery` says hold over `sessions`.
+    fn holding(recovery: &RecoveryEvidence, sessions: &SessionEvidence) -> Vec<Assume> {
+        DECLARED
+            .into_iter()
+            .filter(|assume| recovery.holds(sessions, *assume))
+            .collect()
+    }
+
+    /// `mirror-0`'s recovery, `recovered` at `sessions`' current facts.
+    fn recovered(sessions: &SessionEvidence) -> RecoveryEvidence {
+        let recovery = RecoveryEvidence::default();
+        recovery.start("mirror-0".into(), at(0));
+        let source = Member {
+            peer: "mirror-0".into(),
+            session_id: 1,
+        };
+        let tip = (
+            Frontier::new(block::Height(8), block::Hash([8; 32])),
+            SuffixWork::zero(),
+        );
+        let record = RecoveryRecord {
+            membership: live_sessions(&sessions.facts()),
+            source,
+            node_tip: tip,
+            source_tip: tip,
+            source_chain: vec![tip.0],
+            facts: sessions.facts().len(),
+        };
+        if let Some(recovery) = recovery.0.borrow_mut().as_mut() {
+            recovery.state = RecoveryState::Recovered(Box::new(record));
+        }
+        recovery
+    }
+
+    /// A session view with `mirror-0`'s session 1 and `mirror-1`'s session 2
+    /// live.
+    fn two_links() -> SessionEvidence {
+        let sessions = SessionEvidence::default();
+        link(&sessions, 2, "mirror-0", 1);
+        link(&sessions, 3, "mirror-1", 2);
+        sessions
+    }
+
+    #[test]
+    fn hdr13_assumptions_hold_from_recovered_until_their_trigger() {
+        // Before the `recovered` pick none holds: with no recovery, while it
+        // establishes, and once it ended unreached.
+        let sessions = two_links();
+        let recovery = RecoveryEvidence::default();
+        assert_eq!(holding(&recovery, &sessions), []);
+        recovery.start("mirror-0".into(), at(0));
+        assert_eq!(holding(&recovery, &sessions), []);
+        recovery.give_up();
+        assert_eq!(holding(&recovery, &sessions), []);
+
+        // From the pick, all five hold.
+        assert_eq!(holding(&recovered(&sessions), &sessions), DECLARED);
+
+        // A session admitted or another peer's link closing after the pick
+        // ends `StableMembership` only.
+        let rest = [
+            Assume::BoundedStorage,
+            Assume::BoundedDelivery,
+            Assume::FairScheduling,
+        ];
+        let honest: Vec<Assume> = [Assume::HonestPeer].into_iter().chain(rest).collect();
+        let admitted = two_links();
+        let recovery = recovered(&admitted);
+        link(&admitted, 4, "mirror-2", 3);
+        assert_eq!(holding(&recovery, &admitted), honest);
+        let closed = two_links();
+        let recovery = recovered(&closed);
+        closed.link_closed(2);
+        assert_eq!(holding(&recovery, &closed), honest);
+
+        // The service ending the source's session while its link stays open
+        // ends `HonestPeer` too, and the other three keep holding.
+        let recovery = recovered(&sessions);
+        sessions.reactor(&ReactorEvent::SessionEnded {
+            peer: id(2),
+            session_id: 1,
+            reason: "unproductive",
+        });
+        assert_eq!(holding(&recovery, &sessions), rest);
     }
 
     #[test]

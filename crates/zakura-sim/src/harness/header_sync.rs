@@ -40,9 +40,7 @@ use super::{
         fault::{FaultCheck, FaultEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
-        recovery::{
-            membership_changed, session_lasts, RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND,
-        },
+        recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
         session::SessionEvidence,
         stale::StaleEvidence,
@@ -972,8 +970,8 @@ impl Subsystem for Storage {
     }
 
     /// A scenario with a `Recover` step declares hdr-13's five assumptions,
-    /// none of which holds before the `recovered` pick ([`recovery_holds`]).
-    /// Others declare none.
+    /// none of which holds before the `recovered` pick
+    /// ([`RecoveryEvidence::holds`]). Others declare none.
     fn assumptions(scenario: &StorageScenario) -> Assumptions<Self> {
         let Some(source) = scenario
             .controls
@@ -1009,7 +1007,7 @@ impl Subsystem for Storage {
                 params: serde_json::json!({ "contract": crate::record::CONTRACT_VERSION }),
             },
         ])
-        .holds_when(recovery_holds)
+        .holds_when(|storage, assume| storage.recovery.holds(&storage.sessions, assume))
     }
 
     /// The scenario [`grammar::decode`] reads from `prefix`. A prefix
@@ -1525,23 +1523,6 @@ pub fn progress_fixture(scenario: &WireScenario) -> bool {
                 holds: Vec::new(),
                 reply_holds: Vec::new(),
             }
-}
-
-/// Whether `assume` holds after a step of a recovering `storage` run. None
-/// holds before the `recovered` pick. After it, `StableMembership` holds
-/// until a session is admitted or ended or a link closes, `HonestPeer` until
-/// the source's recorded session ends, and the rest always, since recovery
-/// enforces them.
-fn recovery_holds(storage: &Storage, assume: Assume) -> bool {
-    let Some(record) = storage.recovery.record() else {
-        return false;
-    };
-    let facts = storage.sessions.facts();
-    match assume {
-        Assume::StableMembership => !membership_changed(&facts, record.facts),
-        Assume::HonestPeer => session_lasts(&facts, record.facts, &record.source),
-        _ => true,
-    }
 }
 
 /// Whether `assume` holds after a step of `wire`: `StableMembership` while

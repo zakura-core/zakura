@@ -1732,6 +1732,14 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "every_row_judges_a_pinned_history",
     "each_result_identity_names_one_expectation",
     "the_composition_checks_are_every_static_check",
+    "the_evaluator_refuses_each_single_defect",
+    "the_evaluator_refuses_manifest_defects",
+    "the_evaluator_accepts_genuine_results",
+    "the_evaluator_applies_contracts_and_narrowing",
+    "the_evaluator_joins_on_full_identity",
+    "the_evaluator_decides_contracts_through_their_keys",
+    "the_evaluator_binds_runners_and_traces",
+    "the_evaluator_accepts_real_storage_and_release_wake_histories",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.

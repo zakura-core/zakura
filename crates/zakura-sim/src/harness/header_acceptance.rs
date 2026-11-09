@@ -4,8 +4,7 @@
 //! per property. This manifest adds what header-sync acceptance needs on top:
 //! for every header ID, the results a frozen-head acceptance run must give,
 //! each a typed [`Expected`], and the contracts those results rely on.
-//! The gate evaluator that judges a run's result file against both lands
-//! next, in hdr-14.1b.
+//! [`evaluate`] judges a run's result file against both.
 //!
 //! The pieces, each with one job:
 //!
@@ -15,10 +14,11 @@
 //!   states and the [`NARROWING`] entries that release a result from one.
 //! * [`required`]: the obligation keys the manifest must cover, derived
 //!   from inventories the manifest doesn't control.
+//! * [`evaluate`]: the gate evaluator.
 //!
 //! Everything here is static data and pure functions. The acceptance tool
 //! (hdr-14.7) produces the result file, and `tests/header_acceptance.rs`
-//! holds the static checks.
+//! holds the static checks and the evaluator's controls.
 //!
 //! # Identity
 //!
@@ -26,10 +26,11 @@
 //! [`ExpectedId`] and the subject commit are equal, and each execution
 //! inside it is joined to its expected execution by its whole [`RunId`].
 //! Nothing here matches on a subset of those fields, such as a test's name
-//! without its file and package, or a case's name without its property. hdr-14.1b's evaluator controls change one field at a time and
-//! require the result to stop counting.
+//! without its file and package, or a case's name without its property. The evaluator's controls change one field at a time and require
+//! the result to stop counting.
 
 pub mod contracts;
+pub mod evaluate;
 pub mod required;
 pub mod rows;
 
@@ -39,6 +40,7 @@ pub use contracts::{
     contract_table, Contract, ContractId, ContractState, Narrowing, ResultCtx, NARROWING,
     REQUIRED_CONTRACTS,
 };
+pub use evaluate::{evaluate, Evaluation, ObligationState, Subject};
 pub use required::{required_keys, Inventories, Registered};
 pub use rows::{
     harness_matrix, rows, GateRequirement, NativeClass, NativeMutation, COMPOSITION_CHECKS,

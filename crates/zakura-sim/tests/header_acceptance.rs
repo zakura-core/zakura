@@ -1,6 +1,7 @@
 //! hdr-14's acceptance manifest: its static checks against the registry,
 //! `COVERAGE` and the committed directories, each with a control that one
-//! defect makes it refuse (Rule 16).
+//! defect makes it refuse, and the gate evaluator's negative controls and
+//! positive tests (Rule 16).
 //!
 //! Every test here is listed in `COMPOSITION_CHECKS`, so the acceptance run
 //! executes each by its exact name at the subject commit.
@@ -17,12 +18,19 @@ use zakura_sim::{
         coverage::{Bypass, COVERAGE},
         header_acceptance::{
             self,
-            contracts::{self, Contract, ContractId, ContractState, NarrowingTest},
+            contracts::{
+                self, Contract, ContractId, ContractState, Narrowing, NarrowingTest, RunBy,
+            },
+            evaluate::{
+                Actions, Actual, Companion, End, ExecMeta, Execution, Report, ResultFile,
+                ResultRecord, TestOutcome, TestRan,
+            },
             required::{gate_rule, required_keys, Inventories, Registered, GATE_OBLIGATIONS},
             rows::{self, NativeClass, HEADER_HARNESSES},
-            sim_test, CaseRef, CaseRun, Expected, ExpectedId, ExpectedResult, Found, Gate,
-            HistoryRef, Key, Manifest, RunId, TestRef, Tier, COMPOSITION_CHECKS, GATE_REQUIREMENTS,
-            NARROWING, NATIVE_MUTATIONS, NESTS, REQUIRED_CONTRACTS,
+            sim_test, Approval, CaseRef, CaseRun, Expected, ExpectedId, ExpectedResult, Found,
+            Gate, HistoryRef, Key, Manifest, ObligationState, RunId, TestRef, Tier,
+            COMPOSITION_CHECKS, GATE_REQUIREMENTS, NARROWING, NATIVE_MUTATIONS, NESTS,
+            REQUIRED_CONTRACTS,
         },
         HARNESSES,
     },
@@ -574,7 +582,7 @@ fn every_required_key_is_covered_once_with_its_gates() {
         open.expected = Expected::Open {
             reason: "replaced",
             owner: "test",
-            approval: header_acceptance::Approval::Pending,
+            approval: Approval::Pending,
             until: Some("hdr-14.4"),
         };
         m.expected.push(open);
@@ -2971,4 +2979,2175 @@ fn every_header_harness_has_its_needs_read() {
     let mut added = rows::HEADER_HARNESSES.to_vec();
     added.push("header-sync/unread");
     assert!(header_acceptance::needs_of(&added).is_err());
+}
+
+// The evaluator's tests run on a small manifest built here: one node
+// harness `t/node` registering `t/a` and `t/b`, a peerless node harness
+// `t/quiet` registering `t/q`, which the test narrowing entry releases from
+// C11, and a machine harness `t/machine`.
+
+/// The node harness.
+const NODE: &str = "t/node";
+/// The peerless node harness.
+const QUIET: &str = "t/quiet";
+/// The machine harness.
+const MACHINE: &str = "t/machine";
+/// The subject commit.
+const S: &str = "subject";
+/// The subject's source digest.
+const SOURCE: &str = "source-of-subject";
+/// The subject as the caller established it.
+const SUBJECT: header_acceptance::Subject<'static> = header_acceptance::Subject {
+    commit: S,
+    source: SOURCE,
+};
+
+/// A node-harness history of test `test`.
+const fn history(harness: &'static str, test: &'static str) -> HistoryRef {
+    HistoryRef {
+        harness,
+        witness: sim_test("tests/t.rs", test),
+        case: "only",
+    }
+}
+
+/// `t/a`'s history, where `t/b` stays `NotApplicable` with [`UNREACHED`].
+const HISTORY: HistoryRef = history(NODE, "t_holds");
+/// `t/q`'s history.
+const QUIET_HISTORY: HistoryRef = history(QUIET, "t_quiet_holds");
+/// `t/b`'s history, where it stays `NotApplicable`.
+const STAYS_HISTORY: HistoryRef = history(NODE, "t_stays");
+/// The native mutation's history: `raw-budget-lease`'s, as its
+/// classification names it.
+const NATIVE_HISTORY: HistoryRef = HistoryRef {
+    harness: NATIVE_HARNESS,
+    witness: sim_test(
+        "tests/header_node_capacity.rs",
+        "the_probe_matches_the_accounting_through_close_relink_and_shutdown",
+    ),
+    case: "plan 0 of inputs(16, 256)",
+};
+/// The harness the native mutation's history runs on.
+const NATIVE_HARNESS: &str = "header-sync/storage";
+/// Why `t/b` doesn't apply on [`HISTORY`].
+const UNREACHED: &str = "unreached here";
+/// Why `t/b` never applies.
+const NEVER: &str = "never applies";
+/// `t/b`'s expected `NotApplicable` on [`HISTORY`].
+const HOLDS_NA: &[header_acceptance::ExpectedNa] = &[header_acceptance::ExpectedNa {
+    property: "t/b",
+    reason: UNREACHED,
+}];
+/// A node planted case found at a step.
+const CASE: CaseRef = CaseRef {
+    property: "t/a",
+    name: "bug",
+};
+/// A node planted case found at the end.
+const END_CASE: CaseRef = CaseRef {
+    property: "t/a",
+    name: "late-bug",
+};
+/// A machine planted case.
+const MACHINE_CASE: CaseRef = CaseRef {
+    property: MACHINE,
+    name: "machine-bug",
+};
+/// The native mutation, a real integrity one, since `Key::Native` binds to
+/// its classification.
+const NATIVE: &str = "raw-budget-lease";
+/// Its diagnostic.
+const DIAGNOSTIC: &str = "OwnedMismatch";
+/// The proving tests and a plain test.
+const T3: TestRef = sim_test("tests/t.rs", "c3_holds");
+const T5: TestRef = sim_test("tests/t.rs", "c5_holds");
+const T11: TestRef = sim_test("tests/t.rs", "c11_holds");
+const TN: TestRef = sim_test("tests/t.rs", "n1_holds");
+const TP: TestRef = sim_test("tests/t.rs", "a_test");
+/// A standing gate obligation the real `GATE_OBLIGATIONS` permits as an
+/// approved standing `Open`.
+const STANDING: &str = "gate-3/no-request-row";
+
+/// A satisfied contract with its proving tests.
+fn satisfied(id: ContractId, test: &'static [TestRef]) -> Contract {
+    Contract {
+        id,
+        owner: "test",
+        statement: "test",
+        proving: test,
+        state: ContractState::Satisfied,
+        delivery: "test",
+    }
+}
+
+/// The test narrowing entry: `t/quiet` results don't read C11.
+fn quiet_entry(test: NarrowingTest) -> Narrowing {
+    Narrowing {
+        entry: "N1",
+        contracts: &[ContractId::C11],
+        releases: |ctx| ctx.harness.as_deref() == Some(QUIET),
+        reason: "t/quiet has no peers",
+        test,
+    }
+}
+
+/// An expected result.
+fn er(keys: Vec<Key>, gates: &[Gate], expected: Expected) -> ExpectedResult {
+    ExpectedResult {
+        keys,
+        gates: gates.to_vec(),
+        expected,
+    }
+}
+
+/// A test's witness key.
+fn witness_key(test: TestRef) -> Key {
+    Key::Witness {
+        package: test.package.into(),
+        file: test.file.into(),
+        test: test.test.into(),
+    }
+}
+
+/// The node history's `Holds` identity.
+fn holds_id() -> ExpectedId {
+    ExpectedId::Holds {
+        property: "t/a".into(),
+        run: HISTORY.into(),
+    }
+}
+
+/// The `StaysNotApplicable` identity.
+fn stays_id() -> ExpectedId {
+    ExpectedId::StaysNotApplicable {
+        property: "t/b".into(),
+        run: STAYS_HISTORY.into(),
+    }
+}
+
+/// The test manifest.
+fn manifest() -> Manifest {
+    let contract_tests = [
+        (ContractId::C3, T3),
+        (ContractId::C5, T5),
+        (ContractId::C11, T11),
+    ]
+    .map(|(id, test)| {
+        er(
+            vec![header_acceptance::contracts::contract_test_key(id, test)],
+            &[],
+            Expected::Passes { test },
+        )
+    });
+    let mut expected = vec![
+        er(
+            vec![Key::passing("t/a")],
+            &[Gate::G2],
+            Expected::Holds {
+                property: "t/a",
+                history: HISTORY,
+                not_applicable: HOLDS_NA,
+            },
+        ),
+        er(
+            vec![Key::passing("t/q")],
+            &[Gate::G5],
+            Expected::Holds {
+                property: "t/q",
+                history: QUIET_HISTORY,
+                not_applicable: &[],
+            },
+        ),
+        er(
+            vec![Key::passing("t/b")],
+            &[Gate::G2],
+            Expected::StaysNotApplicable {
+                property: "t/b",
+                history: STAYS_HISTORY,
+                reason: NEVER,
+                approval: Approval::Adam { record: "test" },
+                not_applicable: &[],
+            },
+        ),
+        er(
+            vec![
+                Key::catch("t/a"),
+                Key::Case {
+                    property: "t/a".into(),
+                    name: "bug".into(),
+                },
+            ],
+            &[Gate::G2],
+            Expected::Caught {
+                case: CASE,
+                harness: NODE,
+                set: &["t/a"],
+                found: Found::AtStep,
+                companions: &["close"],
+                not_applicable: &[],
+            },
+        ),
+        er(
+            vec![Key::Case {
+                property: "t/a".into(),
+                name: "late-bug".into(),
+            }],
+            &[Gate::G2],
+            Expected::Caught {
+                case: END_CASE,
+                harness: NODE,
+                set: &["t/a"],
+                found: Found::AtEnd,
+                companions: &[],
+                not_applicable: &[],
+            },
+        ),
+        er(
+            vec![Key::catch(MACHINE)],
+            &[Gate::G5],
+            Expected::MachineCaught {
+                case: MACHINE_CASE,
+                harness: MACHINE,
+            },
+        ),
+        er(
+            vec![Key::Replay {
+                run: HISTORY.into(),
+            }],
+            &[Gate::G1],
+            Expected::Replays {
+                run: HISTORY.into(),
+            },
+        ),
+        er(
+            vec![Key::Native {
+                patch: NATIVE.into(),
+            }],
+            &[Gate::G6],
+            Expected::IntegrityCaught {
+                patch: NATIVE,
+                history: NATIVE_HISTORY,
+                diagnostic: DIAGNOSTIC,
+                not_applicable: &[],
+            },
+        ),
+        er(
+            vec![Key::Requirement {
+                name: STANDING.into(),
+            }],
+            &[Gate::G3],
+            GATE_REQUIREMENTS
+                .iter()
+                .find(|r| r.name == STANDING)
+                .unwrap()
+                .expected
+                .clone(),
+        ),
+        er(vec![witness_key(TP)], &[], Expected::Passes { test: TP }),
+        er(
+            vec![Key::NarrowingTest { entry: "N1".into() }],
+            &[],
+            Expected::Passes { test: TN },
+        ),
+    ];
+    expected.extend(contract_tests);
+    Manifest {
+        expected,
+        contracts: vec![
+            satisfied(ContractId::C3, &[T3]),
+            satisfied(ContractId::C5, &[T5]),
+            satisfied(ContractId::C11, &[T11]),
+        ],
+        required_contracts: vec![ContractId::C3, ContractId::C5, ContractId::C11],
+        narrowing: vec![quiet_entry(NarrowingTest::Test(TN))],
+        machines: vec![MACHINE],
+        matrix: vec![
+            (NODE, "t/a", Status::Active),
+            (NODE, "t/b", Status::Active),
+            (QUIET, "t/q", Status::Active),
+            (MACHINE, MACHINE, Status::Active),
+            (NATIVE_HARNESS, "t/s", Status::Active),
+        ],
+    }
+}
+
+/// The required keys: exactly what the test manifest covers, with its
+/// gates.
+fn required(manifest: &Manifest) -> BTreeMap<Key, BTreeSet<Gate>> {
+    manifest
+        .expected
+        .iter()
+        .flat_map(|result| {
+            result
+                .keys
+                .iter()
+                .map(|key| (key.clone(), result.gates.iter().copied().collect()))
+        })
+        .collect()
+}
+
+/// Who runs `run` by its role: a planted case's baseline and patched
+/// runs are the planted runner's, every other execution the tool's.
+fn runner_of(run: &RunId) -> RunBy {
+    match run {
+        RunId::Case {
+            run: CaseRun::Baseline | CaseRun::Patched,
+            property,
+            ..
+        } if property != header_acceptance::NATIVE_DIR => RunBy::Planted,
+        _ => RunBy::Tool,
+    }
+}
+
+/// The trace digest the fixtures give `run`.
+fn trace_of(run: &RunId) -> String {
+    format!("trace of {run:?}")
+}
+
+/// A completed execution of `run` on `harness`, reporting `reports`.
+fn execution(run: RunId, harness: &str, reports: &[(&str, Report)]) -> Execution {
+    Execution {
+        trace: trace_of(&run),
+        meta: ExecMeta {
+            harness: harness.into(),
+            draft_override: Vec::new(),
+            run_by: runner_of(&run),
+            input: None,
+        },
+        run,
+        end: End::Completed,
+        reports: reports
+            .iter()
+            .map(|(id, report)| ((*id).to_owned(), report.clone()))
+            .collect(),
+        trigger: true,
+        leaked: 0,
+        actions: Actions::Complete,
+    }
+}
+
+/// `Held` with applicability.
+fn held() -> Report {
+    Report::Held { applicable: 3 }
+}
+
+/// `NotApplicable` for `reason`.
+fn na(reason: &str) -> Report {
+    Report::NotApplicable {
+        reason: Some(reason.into()),
+    }
+}
+
+/// A test result for `test`, which ran `ran` with `outcome`, from a binary
+/// embedding the subject's source.
+fn test_actual(ran: TestRef, outcome: TestOutcome) -> Actual {
+    Actual::Test {
+        ran: vec![TestRan {
+            package: ran.package.into(),
+            file: ran.file.into(),
+            test: ran.test.into(),
+            outcome,
+        }],
+        binary_source: Some(SOURCE.into()),
+    }
+}
+
+/// A passing test's record.
+fn test_record(test: TestRef) -> ResultRecord {
+    ResultRecord {
+        expected: Expected::Passes { test }.id().unwrap(),
+        commit: S.into(),
+        actual: test_actual(test, TestOutcome::Passed),
+    }
+}
+
+/// A node case's genuine three runs, found `found`.
+fn caught_actual(case: CaseRef, found: Found) -> Actual {
+    let mut patched = execution(
+        RunId::case(case, CaseRun::Patched),
+        NODE,
+        &[("t/a", Report::Violated), ("t/b", held())],
+    );
+    if found == Found::AtStep {
+        patched.end = End::Violation {
+            property: "t/a".into(),
+        };
+        patched.actions = Actions::Prefix;
+    }
+    let mut draft = execution(
+        RunId::case(case, CaseRun::Draft),
+        NODE,
+        &[("t/a", Report::Violated), ("t/b", held())],
+    );
+    draft.meta.draft_override = vec!["t/a".into()];
+    Actual::Caught {
+        baseline: execution(
+            RunId::case(case, CaseRun::Baseline),
+            NODE,
+            &[("t/a", held()), ("t/b", held())],
+        ),
+        patched,
+        companions: if case == CASE {
+            vec![Companion {
+                name: "close".into(),
+                trace: draft.trace.clone(),
+                run: draft.run.clone(),
+                held: true,
+            }]
+        } else {
+            Vec::new()
+        },
+        draft,
+    }
+}
+
+/// A genuine result file for the test manifest.
+fn results() -> ResultFile {
+    let record = |expected: ExpectedId, actual: Actual| ResultRecord {
+        expected,
+        commit: S.into(),
+        actual,
+    };
+    let native = |run| {
+        let mut run = execution(
+            RunId::native(NATIVE, run),
+            NATIVE_HARNESS,
+            &[("t/s", held())],
+        );
+        run.meta.input = Some(NATIVE_HISTORY.into());
+        run
+    };
+    let mut patched_native = native(CaseRun::Patched);
+    patched_native.end = End::HarnessFailure {
+        diagnostic: DIAGNOSTIC.into(),
+    };
+    ResultFile {
+        subject: S.into(),
+        subject_source: SOURCE.into(),
+        results: vec![
+            record(
+                holds_id(),
+                Actual::Run(execution(
+                    HISTORY.into(),
+                    NODE,
+                    &[("t/a", held()), ("t/b", na(UNREACHED))],
+                )),
+            ),
+            record(
+                ExpectedId::Holds {
+                    property: "t/q".into(),
+                    run: QUIET_HISTORY.into(),
+                },
+                Actual::Run(execution(QUIET_HISTORY.into(), QUIET, &[("t/q", held())])),
+            ),
+            record(
+                stays_id(),
+                Actual::Run(execution(
+                    STAYS_HISTORY.into(),
+                    NODE,
+                    &[("t/a", held()), ("t/b", na(NEVER))],
+                )),
+            ),
+            record(
+                ExpectedId::Caught(RunId::case(CASE, CaseRun::Patched)),
+                caught_actual(CASE, Found::AtStep),
+            ),
+            record(
+                ExpectedId::Caught(RunId::case(END_CASE, CaseRun::Patched)),
+                caught_actual(END_CASE, Found::AtEnd),
+            ),
+            record(
+                ExpectedId::MachineCaught(RunId::case(MACHINE_CASE, CaseRun::Patched)),
+                Actual::MachineCaught {
+                    baseline: execution(
+                        RunId::case(MACHINE_CASE, CaseRun::Baseline),
+                        MACHINE,
+                        &[(MACHINE, held())],
+                    ),
+                    patched: Execution {
+                        end: End::Violation {
+                            property: MACHINE.into(),
+                        },
+                        ..execution(
+                            RunId::case(MACHINE_CASE, CaseRun::Patched),
+                            MACHINE,
+                            &[(MACHINE, Report::Violated)],
+                        )
+                    },
+                },
+            ),
+            record(
+                ExpectedId::Replays(HISTORY.into()),
+                Actual::Replay {
+                    run: HISTORY.into(),
+                    of: trace_of(&HISTORY.into()),
+                    meta: ExecMeta {
+                        harness: NODE.into(),
+                        draft_override: Vec::new(),
+                        run_by: RunBy::Tool,
+                        input: None,
+                    },
+                    exact: true,
+                    reports_equal: true,
+                    stores_equal: true,
+                    fresh: true,
+                },
+            ),
+            record(
+                ExpectedId::IntegrityCaught(RunId::native(NATIVE, CaseRun::Patched)),
+                Actual::IntegrityCaught {
+                    unpatched: native(CaseRun::Unpatched),
+                    patched: patched_native,
+                    restored: native(CaseRun::Restored),
+                },
+            ),
+            test_record(TP),
+            test_record(TN),
+            test_record(T3),
+            test_record(T5),
+            test_record(T11),
+        ],
+    }
+}
+
+/// The state the test manifest's evaluation gives `key`.
+fn state(manifest: &Manifest, results: &ResultFile, key: &Key) -> ObligationState {
+    header_acceptance::evaluate(manifest, &required(manifest), results, SUBJECT)
+        .keys
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| panic!("{key:?} isn't a required key"))
+}
+
+/// Whether `state` is blocked.
+fn blocked(state: &ObligationState) -> bool {
+    matches!(state, ObligationState::Blocked { .. })
+}
+
+/// The record in `results` named `id`.
+fn record_mut<'r>(results: &'r mut ResultFile, id: &ExpectedId) -> &'r mut ResultRecord {
+    results
+        .results
+        .iter_mut()
+        .find(|record| &record.expected == id)
+        .unwrap()
+}
+
+/// The catch's three runs and companions in `results`.
+type CaughtRuns<'r> = (
+    &'r mut Execution,
+    &'r mut Execution,
+    &'r mut Execution,
+    &'r mut Vec<Companion>,
+);
+
+/// The at-step catch's runs in `results`.
+fn caught_runs(results: &mut ResultFile, case: CaseRef) -> CaughtRuns<'_> {
+    match &mut record_mut(
+        results,
+        &ExpectedId::Caught(RunId::case(case, CaseRun::Patched)),
+    )
+    .actual
+    {
+        Actual::Caught {
+            baseline,
+            patched,
+            draft,
+            companions,
+        } => (baseline, patched, draft, companions),
+        _ => unreachable!(),
+    }
+}
+
+/// The run of history result `id` in `results`.
+fn run_of<'r>(results: &'r mut ResultFile, id: &ExpectedId) -> &'r mut Execution {
+    match &mut record_mut(results, id).actual {
+        Actual::Run(run) => run,
+        _ => unreachable!(),
+    }
+}
+
+/// The machine catch's runs in `results`.
+fn machine_runs(results: &mut ResultFile) -> (&mut Execution, &mut Execution) {
+    match &mut record_mut(
+        results,
+        &ExpectedId::MachineCaught(RunId::case(MACHINE_CASE, CaseRun::Patched)),
+    )
+    .actual
+    {
+        Actual::MachineCaught { baseline, patched } => (baseline, patched),
+        _ => unreachable!(),
+    }
+}
+
+/// The integrity mutation's result in `results`.
+fn native_actual(results: &mut ResultFile) -> &mut Actual {
+    &mut record_mut(
+        results,
+        &ExpectedId::IntegrityCaught(RunId::native(NATIVE, CaseRun::Patched)),
+    )
+    .actual
+}
+
+/// The replay's result in `results`.
+fn replay_actual(results: &mut ResultFile) -> &mut Actual {
+    &mut record_mut(results, &ExpectedId::Replays(HISTORY.into())).actual
+}
+
+#[test]
+fn the_evaluator_accepts_genuine_results() {
+    let manifest = manifest();
+    let evaluation =
+        header_acceptance::evaluate(&manifest, &required(&manifest), &results(), SUBJECT);
+    assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
+    for (key, state) in &evaluation.keys {
+        let expected = if matches!(key, Key::Requirement { .. }) {
+            matches!(state, ObligationState::Excluded { .. })
+        } else {
+            *state == ObligationState::Verified
+        };
+        assert!(expected, "{key:?}: {state:?}");
+    }
+    assert!(evaluation.accepted());
+    assert!(
+        !evaluation.fully_accepted(),
+        "the standing exclusion is excluded"
+    );
+    assert!(evaluation.gates.values().all(|passes| *passes));
+
+    // A catch stopped at a step is a prefix: another property may still be
+    // open there.
+    let mut pending = results();
+    caught_runs(&mut pending, CASE).1.reports.insert(
+        "t/b".into(),
+        Report::Inconclusive {
+            reason: "obligation-open".into(),
+        },
+    );
+    assert_eq!(
+        state(&manifest, &pending, &Key::catch("t/a")),
+        ObligationState::Verified
+    );
+}
+
+/// An unpatched storage history and a release-wake history that pass, on
+/// their real harnesses' registered inventories, verify (Rule 16's
+/// positive tests).
+#[test]
+fn the_evaluator_accepts_real_storage_and_release_wake_histories() {
+    let committed = Manifest::committed();
+    let mut m = Manifest {
+        expected: Vec::new(),
+        contracts: Vec::new(),
+        required_contracts: Vec::new(),
+        narrowing: Vec::new(),
+        machines: Vec::new(),
+        matrix: Vec::new(),
+    };
+    let mut r = ResultFile {
+        subject: S.into(),
+        subject_source: SOURCE.into(),
+        results: Vec::new(),
+    };
+    let mut keys = Vec::new();
+    for (harness, test) in [
+        (
+            "header-sync/storage",
+            "the_close_relink_input_holds_chunk_budget_bound",
+        ),
+        (
+            "header-sync/release-wake",
+            "the_release_wake_input_holds_capacity_release_wakes",
+        ),
+    ] {
+        let (history, target) = rows::history_targets()
+            .into_iter()
+            .find(|(h, _)| h.harness == harness && h.witness.test == test)
+            .unwrap();
+        let ids: Vec<(&str, Report)> = committed
+            .matrix
+            .iter()
+            .filter(|(h, _, _)| *h == harness)
+            .map(|&(_, id, _)| (id, held()))
+            .collect();
+        m.matrix
+            .extend(committed.matrix.iter().filter(|(h, _, _)| *h == harness));
+        let key = Key::History {
+            run: history.into(),
+            target: target.into(),
+        };
+        m.expected.push(er(
+            vec![key.clone()],
+            &[Gate::G1],
+            Expected::Holds {
+                property: target,
+                history,
+                not_applicable: &[],
+            },
+        ));
+        r.results.push(ResultRecord {
+            expected: ExpectedId::Holds {
+                property: target.into(),
+                run: history.into(),
+            },
+            commit: S.into(),
+            actual: Actual::Run(execution(history.into(), harness, &ids)),
+        });
+        keys.push(key);
+    }
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &r, SUBJECT);
+    assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
+    for key in &keys {
+        assert_eq!(evaluation.keys[key], ObligationState::Verified, "{key:?}");
+    }
+    // The same storage history with one registered ID unreported fails.
+    if let Actual::Run(run) = &mut r.results[0].actual {
+        let first = run.reports.keys().next().cloned().unwrap();
+        run.reports.remove(&first);
+    }
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &r, SUBJECT);
+    assert!(blocked(&evaluation.keys[&keys[0]]));
+}
+
+/// Applies `defect` to a genuine result file and requires `key` to be
+/// blocked and acceptance to fail.
+fn refused(key: &Key, defect: impl FnOnce(&mut ResultFile)) {
+    let manifest = manifest();
+    let mut results = results();
+    defect(&mut results);
+    let evaluation =
+        header_acceptance::evaluate(&manifest, &required(&manifest), &results, SUBJECT);
+    assert!(
+        blocked(&evaluation.keys[key]),
+        "{key:?}: {:?}",
+        evaluation.keys[key]
+    );
+    assert!(!evaluation.accepted());
+}
+
+#[test]
+fn the_evaluator_refuses_each_single_defect() {
+    let holds = Key::passing("t/a");
+    let stays = Key::passing("t/b");
+    let catch = Key::catch("t/a");
+    let late = Key::Case {
+        property: "t/a".into(),
+        name: "late-bug".into(),
+    };
+    let machine = Key::catch(MACHINE);
+    let native = Key::Native {
+        patch: NATIVE.into(),
+    };
+    let replay = Key::Replay {
+        run: HISTORY.into(),
+    };
+    let test = witness_key(TP);
+    // A missing, duplicated or other-commit result.
+    refused(&holds, |r| {
+        r.results.retain(|record| record.expected != holds_id())
+    });
+    refused(&holds, |r| {
+        let copy = record_mut(r, &holds_id()).clone();
+        r.results.push(copy);
+    });
+    refused(&holds, |r| {
+        record_mut(r, &holds_id()).commit = "other".into()
+    });
+    // A test skipped, failed, run twice, not run, or run from another file.
+    let tp = Expected::Passes { test: TP }.id().unwrap();
+    for outcome in [TestOutcome::Skipped, TestOutcome::Failed] {
+        refused(&test, |r| {
+            record_mut(r, &tp).actual = test_actual(TP, outcome)
+        });
+    }
+    refused(&test, |r| {
+        if let Actual::Test { ran, .. } = &mut record_mut(r, &tp).actual {
+            let again = ran[0].clone();
+            ran.push(again);
+        }
+    });
+    refused(&test, |r| {
+        if let Actual::Test { ran, .. } = &mut record_mut(r, &tp).actual {
+            ran.clear();
+        }
+    });
+    refused(&test, |r| {
+        record_mut(r, &tp).actual =
+            test_actual(sim_test("tests/u.rs", TP.test), TestOutcome::Passed)
+    });
+    // A counted run that failed the harness, leaked a task, ended on a
+    // stopping violation, skipped or stopped its declared actions, or lost
+    // its target's applicability or trigger.
+    let defects: [fn(&mut Execution); 7] = [
+        |run| {
+            run.end = End::HarnessFailure {
+                diagnostic: DIAGNOSTIC.into(),
+            }
+        },
+        |run| run.leaked = 1,
+        |run| {
+            run.end = End::Violation {
+                property: "t/a".into(),
+            }
+        },
+        |run| run.actions = Actions::Incomplete,
+        |run| run.actions = Actions::Prefix,
+        |run| {
+            run.reports
+                .insert("t/a".into(), Report::Held { applicable: 0 });
+        },
+        |run| run.trigger = false,
+    ];
+    for defect in defects {
+        refused(&holds, |r| defect(run_of(r, &holds_id())));
+    }
+    // The other reports: the expected NotApplicable with another reason, or
+    // held instead; a missing or extra report; another property
+    // Inconclusive; and a Draft override on a normal run.
+    let report_defects: [fn(&mut Execution); 7] = [
+        |run| {
+            run.reports.insert("t/b".into(), na("another reason"));
+        },
+        |run| {
+            run.reports.insert("t/b".into(), held());
+        },
+        |run| {
+            run.reports.remove("t/b");
+        },
+        |run| {
+            run.reports.insert("t/c".into(), held());
+        },
+        |run| {
+            let b = run.reports.remove("t/b").unwrap();
+            run.reports.insert("t/c".into(), b);
+        },
+        |run| {
+            run.reports.insert(
+                "t/b".into(),
+                Report::Inconclusive {
+                    reason: "teardown-open".into(),
+                },
+            );
+        },
+        |run| run.meta.draft_override = vec!["t/a".into()],
+    ];
+    for defect in report_defects {
+        refused(&holds, |r| defect(run_of(r, &holds_id())));
+    }
+    // A StaysNotApplicable with another reason, an unrelated violation or a
+    // missing report.
+    let stays_defects: [fn(&mut Execution); 3] = [
+        |run| {
+            run.reports.insert("t/b".into(), na(UNREACHED));
+        },
+        |run| {
+            run.reports.insert("t/a".into(), Report::Violated);
+        },
+        |run| {
+            run.reports.remove("t/a");
+        },
+    ];
+    for defect in stays_defects {
+        refused(&stays, |r| defect(run_of(r, &stays_id())));
+    }
+    // A catch whose violated set is off by one ID, in the patched or Draft
+    // run, or whose target the patched run doesn't violate.
+    refused(&catch, |r| {
+        caught_runs(r, CASE)
+            .1
+            .reports
+            .insert("t/b".into(), Report::Violated);
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE)
+            .2
+            .reports
+            .insert("t/b".into(), Report::Violated);
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).1.reports.insert("t/a".into(), held());
+    });
+    // Stopped by a property outside its set, completed where its row says
+    // a step, a harness failure, or a lost patched trigger.
+    refused(&catch, |r| {
+        caught_runs(r, CASE).1.end = End::Violation {
+            property: "t/b".into(),
+        }
+    });
+    refused(&catch, |r| caught_runs(r, CASE).1.end = End::Completed);
+    refused(&catch, |r| {
+        caught_runs(r, CASE).1.end = End::HarnessFailure {
+            diagnostic: "x".into(),
+        }
+    });
+    refused(&catch, |r| caught_runs(r, CASE).1.trigger = false);
+    // A baseline that doesn't hold or lost its trigger, a Draft run that
+    // doesn't complete, a Draft run without its override, and an override
+    // on the patched or baseline run.
+    refused(&catch, |r| {
+        caught_runs(r, CASE)
+            .0
+            .reports
+            .insert("t/a".into(), Report::Violated);
+    });
+    refused(&catch, |r| caught_runs(r, CASE).0.trigger = false);
+    refused(&catch, |r| caught_runs(r, CASE).2.actions = Actions::Prefix);
+    refused(&catch, |r| {
+        caught_runs(r, CASE).2.meta.draft_override.clear()
+    });
+    refused(&late, |r| {
+        caught_runs(r, END_CASE).1.meta.draft_override = vec!["t/a".into()]
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).0.meta.draft_override = vec!["t/a".into()]
+    });
+    // A companion shown false, missing, twice, or judged on another run.
+    refused(&catch, |r| caught_runs(r, CASE).3[0].held = false);
+    refused(&catch, |r| caught_runs(r, CASE).3[0].name = "open".into());
+    refused(&catch, |r| caught_runs(r, CASE).3.clear());
+    refused(&catch, |r| {
+        let again = caught_runs(r, CASE).3[0].clone();
+        caught_runs(r, CASE).3.push(again);
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).3[0].run = RunId::case(CASE, CaseRun::Patched)
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).3[0].run = RunId::case(END_CASE, CaseRun::Draft)
+    });
+    // An inexact replay, unequal reports or stores, a replay that ran on
+    // another harness, or one with an override its run doesn't carry.
+    for field in 0..3 {
+        refused(&replay, |r| {
+            if let Actual::Replay {
+                exact,
+                reports_equal,
+                stores_equal,
+                ..
+            } = replay_actual(r)
+            {
+                *[exact, reports_equal, stores_equal][field] = false;
+            }
+        });
+    }
+    refused(&replay, |r| {
+        if let Actual::Replay { meta, .. } = replay_actual(r) {
+            meta.harness = QUIET.into();
+        }
+    });
+    refused(&replay, |r| {
+        if let Actual::Replay { meta, .. } = replay_actual(r) {
+            meta.draft_override = vec!["t/a".into()];
+        }
+    });
+    // A replay of an execution its own result didn't count: the history
+    // ran on another harness, or was killed, while the replay is unchanged.
+    refused(&replay, |r| {
+        if let Actual::Run(run) = &mut record_mut(r, &holds_id()).actual {
+            run.meta.harness = QUIET.into();
+        }
+    });
+    refused(&replay, |r| {
+        if let Actual::Run(run) = &mut record_mut(r, &holds_id()).actual {
+            run.end = End::Killed;
+        }
+    });
+    // A result of the wrong kind.
+    refused(&holds, |r| {
+        record_mut(r, &holds_id()).actual = test_actual(TP, TestOutcome::Passed)
+    });
+    // A machine catch that fails its harness, a baseline stopped by a
+    // violation, or a patched run that lost its trigger.
+    refused(&machine, |r| {
+        machine_runs(r).1.end = End::HarnessFailure {
+            diagnostic: "panic".into(),
+        }
+    });
+    refused(&machine, |r| {
+        machine_runs(r).0.end = End::Violation {
+            property: MACHINE.into(),
+        }
+    });
+    refused(&machine, |r| machine_runs(r).1.trigger = false);
+    // An integrity mutation whose clean history violates a property, stops
+    // its actions, leaks, or reports nothing, whose diagnostic differs, or
+    // whose runs ran another history.
+    let clean_defects: [fn(&mut Execution); 5] = [
+        |run| {
+            run.reports.insert("t/s".into(), Report::Violated);
+        },
+        |run| run.actions = Actions::Incomplete,
+        |run| run.leaked = 1,
+        |run| run.reports.clear(),
+        |run| run.trigger = false,
+    ];
+    for defect in clean_defects {
+        refused(&native, |r| {
+            if let Actual::IntegrityCaught { restored, .. } = native_actual(r) {
+                defect(restored);
+            }
+        });
+        refused(&native, |r| {
+            if let Actual::IntegrityCaught { unpatched, .. } = native_actual(r) {
+                defect(unpatched);
+            }
+        });
+    }
+    refused(&native, |r| {
+        if let Actual::IntegrityCaught { patched, .. } = native_actual(r) {
+            patched.end = End::HarnessFailure {
+                diagnostic: "ReservedMismatch".into(),
+            };
+        }
+    });
+    // Each of the three runs names the history it ran. One run, only, of
+    // another history on the same harness.
+    // Each of the three runs names the history it ran: each one, alone,
+    // naming a history that differs from it in one identity field.
+    let native_run: RunId = NATIVE_HISTORY.into();
+    let one_off: Vec<RunId> = {
+        let RunId::History {
+            harness,
+            package,
+            file,
+            test,
+            case,
+        } = native_run.clone()
+        else {
+            unreachable!()
+        };
+        let with = |f: &dyn Fn(&mut [&mut String; 5])| {
+            let (mut h, mut p, mut fi, mut name, mut c) = (
+                harness.clone(),
+                package.clone(),
+                file.clone(),
+                test.clone(),
+                case.clone(),
+            );
+            f(&mut [&mut h, &mut p, &mut fi, &mut name, &mut c]);
+            RunId::History {
+                harness: h,
+                package: p,
+                file: fi,
+                test: name,
+                case: c,
+            }
+        };
+        (0..5)
+            .map(|at| with(&|fields| fields[at].push_str("-other")))
+            .collect()
+    };
+    for which in [CaseRun::Unpatched, CaseRun::Patched, CaseRun::Restored] {
+        for other in &one_off {
+            refused(&native, |r| {
+                if let Actual::IntegrityCaught {
+                    unpatched,
+                    patched,
+                    restored,
+                } = native_actual(r)
+                {
+                    let run = match which {
+                        CaseRun::Unpatched => unpatched,
+                        CaseRun::Patched => patched,
+                        _ => restored,
+                    };
+                    run.meta.input = Some(other.clone());
+                }
+            });
+        }
+    }
+    // A non-native run that names an input.
+    refused(&Key::passing("t/a"), |r| {
+        run_of(r, &holds_id()).meta.input = Some(HISTORY.into())
+    });
+}
+
+/// Manifest-side defects: each must block the key it touches.
+#[test]
+fn the_evaluator_refuses_manifest_defects() {
+    let genuine = results();
+    let with = |change: &dyn Fn(&mut Manifest), key: &Key| {
+        let mut manifest = self::manifest();
+        let before = required(&manifest);
+        change(&mut manifest);
+        let evaluation = header_acceptance::evaluate(&manifest, &before, &genuine, SUBJECT);
+        assert!(
+            blocked(&evaluation.keys[key]),
+            "{key:?}: {:?}",
+            evaluation.keys[key]
+        );
+        evaluation
+    };
+    // A required key with no expected result.
+    with(
+        &|m| {
+            m.expected
+                .retain(|r| !r.keys.contains(&Key::passing("t/a")))
+        },
+        &Key::passing("t/a"),
+    );
+    // A gate tag dropped, which fails its gate too.
+    let evaluation = with(&|m| m.expected[0].gates.clear(), &Key::passing("t/a"));
+    assert!(!evaluation.gates[&Gate::G2]);
+    // An expected result whose payload doesn't name its key.
+    with(
+        &|m| {
+            if let Expected::Holds { property, .. } = &mut m.expected[0].expected {
+                *property = "t/b";
+            }
+        },
+        &Key::passing("t/a"),
+    );
+    // An unapproved standing Open, a transitional one, and an unapproved
+    // NotApplicable reason.
+    let standing = Key::Requirement {
+        name: STANDING.into(),
+    };
+    for (approval, until) in [
+        (Approval::Pending, None),
+        (Approval::Adam { record: "x" }, Some("hdr-14.3")),
+    ] {
+        with(
+            &|m| {
+                for result in &mut m.expected {
+                    if let Expected::Open {
+                        approval: a,
+                        until: u,
+                        ..
+                    } = &mut result.expected
+                    {
+                        *a = approval;
+                        *u = until;
+                    }
+                }
+            },
+            &standing,
+        );
+    }
+    with(
+        &|m| {
+            for result in &mut m.expected {
+                if let Expected::StaysNotApplicable { approval, .. } = &mut result.expected {
+                    *approval = Approval::Pending;
+                }
+            }
+        },
+        &Key::passing("t/b"),
+    );
+    // A machine case listed as a node catch, and a node case as a machine
+    // one.
+    with(&|m| m.machines.clear(), &Key::catch(MACHINE));
+    with(&|m| m.machines.push(NODE), &Key::catch("t/a"));
+    // A result naming no expected result is stray.
+    let mut stray = results();
+    stray
+        .results
+        .push(test_record(sim_test("tests/t.rs", "unlisted")));
+    let manifest = self::manifest();
+    let evaluation = header_acceptance::evaluate(&manifest, &required(&manifest), &stray, SUBJECT);
+    assert!(!evaluation.stray.is_empty());
+    assert!(!evaluation.accepted());
+}
+
+#[test]
+fn the_evaluator_applies_contracts_and_narrowing() {
+    let holds = Key::passing("t/a");
+    let quiet = Key::passing("t/q");
+    let replay = Key::Replay {
+        run: HISTORY.into(),
+    };
+    let standing = Key::Requirement {
+        name: STANDING.into(),
+    };
+    let excluded = |reason| ContractState::Excluded {
+        reason,
+        approval: Approval::Adam { record: "test" },
+    };
+    let blocked_c11 = |m: &mut Manifest| {
+        m.contracts[2].state = ContractState::Blocked { waiting_for: "E8" };
+    };
+
+    // A blocked contract blocks every result it applies to.
+    let mut m = manifest();
+    m.contracts[0].state = ContractState::Blocked { waiting_for: "E1" };
+    assert!(blocked(&state(&m, &results(), &holds)));
+
+    // A satisfied contract whose proving test failed, is missing, ran at
+    // another commit, or ran another test blocks.
+    let t3 = Expected::Passes { test: T3 }.id().unwrap();
+    let t3_defects: [fn(&mut ResultFile); 4] = [
+        |r| {
+            let t3 = Expected::Passes { test: T3 }.id().unwrap();
+            record_mut(r, &t3).actual = test_actual(T3, TestOutcome::Failed)
+        },
+        |r| {
+            let t3 = Expected::Passes { test: T3 }.id().unwrap();
+            r.results.retain(|record| record.expected != t3)
+        },
+        |r| {
+            let t3 = Expected::Passes { test: T3 }.id().unwrap();
+            record_mut(r, &t3).commit = "other".into()
+        },
+        |r| {
+            let t3 = Expected::Passes { test: T3 }.id().unwrap();
+            record_mut(r, &t3).actual = test_actual(T5, TestOutcome::Passed)
+        },
+    ];
+    let _ = t3;
+    for defect in t3_defects {
+        let mut results = results();
+        defect(&mut results);
+        assert!(blocked(&state(&manifest(), &results, &holds)));
+    }
+
+    // A required contract with its row deleted blocks.
+    let mut m = manifest();
+    m.contracts
+        .retain(|contract| contract.id != ContractId::C11);
+    assert!(blocked(&state(&m, &results(), &holds)));
+
+    // An approved exclusion excludes, an unapproved one blocks.
+    let mut m = manifest();
+    m.contracts[0].state = excluded("left out");
+    assert!(matches!(
+        state(&m, &results(), &holds),
+        ObligationState::Excluded { .. }
+    ));
+    m.contracts[0].state = ContractState::Excluded {
+        reason: "left out",
+        approval: Approval::Pending,
+    };
+    assert!(blocked(&state(&m, &results(), &holds)));
+
+    // A transitional Open stays blocked under an approved exclusion.
+    let mut m = manifest();
+    m.contracts[0].state = excluded("left out");
+    for result in &mut m.expected {
+        if let Expected::Open { until, .. } = &mut result.expected {
+            *until = Some("hdr-14.3");
+        }
+    }
+    assert!(blocked(&state(&m, &results(), &standing)));
+
+    // One excluded and one blocked dependency: blocked. So is an approved
+    // standing Open beside a blocked contract.
+    let mut m = manifest();
+    m.contracts[0].state = excluded("left out");
+    blocked_c11(&mut m);
+    assert!(blocked(&state(&m, &results(), &holds)));
+    assert!(blocked(&state(&m, &results(), &standing)));
+
+    // The narrowing entry releases t/quiet from a blocked C11, and only it.
+    let mut m = manifest();
+    blocked_c11(&mut m);
+    assert_eq!(state(&m, &results(), &quiet), ObligationState::Verified);
+    assert!(blocked(&state(&m, &results(), &holds)));
+    // A replay of a t/node run claiming t/quiet's harness isn't released.
+    let mut claimed = results();
+    if let Actual::Replay { meta, .. } = replay_actual(&mut claimed) {
+        meta.harness = QUIET.into();
+    }
+    assert!(blocked(&state(&m, &claimed, &replay)));
+
+    // An excluded C11 excludes exactly what the entry doesn't release, and
+    // a missing peerless result stays blocked.
+    let mut m = manifest();
+    m.contracts[2].state = excluded("no peer checkpoint");
+    assert_eq!(state(&m, &results(), &quiet), ObligationState::Verified);
+    assert!(matches!(
+        state(&m, &results(), &holds),
+        ObligationState::Excluded { .. }
+    ));
+    let mut missing = results();
+    missing.results.retain(|record| {
+        record.expected
+            != ExpectedId::Holds {
+                property: "t/q".into(),
+                run: QUIET_HISTORY.into(),
+            }
+    });
+    assert!(blocked(&state(&m, &missing, &quiet)));
+    // Whether C11 applies is a fact of the expected result's identity, not
+    // of its record: a missing or failing peerless result is still released
+    // from a blocked C11, so with nothing else applying it blocks on its own
+    // failure, and with an approved excluded C3 it's excluded.
+    let mut m = manifest();
+    blocked_c11(&mut m);
+    assert!(blocked(&state(&m, &missing, &quiet)));
+    m.contracts[0].state = excluded("no replay");
+    assert!(matches!(
+        state(&m, &missing, &quiet),
+        ObligationState::Excluded { .. }
+    ));
+    let mut failing = results();
+    run_of(
+        &mut failing,
+        &ExpectedId::Holds {
+            property: "t/q".into(),
+            run: QUIET_HISTORY.into(),
+        },
+    )
+    .leaked = 1;
+    assert!(matches!(
+        state(&m, &failing, &quiet),
+        ObligationState::Excluded { .. }
+    ));
+    // A result C11 does apply to, blocked, stays blocked beside C3's
+    // exclusion.
+    assert!(blocked(&state(&m, &results(), &holds)));
+
+    // An entry whose test is pending or failed releases nothing.
+    let mut m = manifest();
+    blocked_c11(&mut m);
+    let mut pending = m.clone();
+    pending.narrowing = vec![quiet_entry(NarrowingTest::Pending { until: "hdr-14.7a" })];
+    for result in &mut pending.expected {
+        if result
+            .keys
+            .contains(&Key::NarrowingTest { entry: "N1".into() })
+        {
+            result.expected = Expected::Open {
+                reason: "pending",
+                owner: "test",
+                approval: Approval::Pending,
+                until: Some("hdr-14.7a"),
+            };
+        }
+    }
+    assert!(blocked(&state(&pending, &results(), &quiet)));
+    let mut failed = results();
+    record_mut(&mut failed, &Expected::Passes { test: TN }.id().unwrap()).actual =
+        test_actual(TN, TestOutcome::Failed);
+    assert!(blocked(&state(&m, &failed, &quiet)));
+
+    // A key that shares a contract test's result keeps its own
+    // dependencies: with C11 blocked, the contract-test key verifies and
+    // the witness key on the same result doesn't.
+    let mut shared = manifest();
+    blocked_c11(&mut shared);
+    for result in &mut shared.expected {
+        if matches!(result.expected, Expected::Passes { test } if test == T3) {
+            result.keys.push(witness_key(T3));
+        }
+    }
+    let evaluation = header_acceptance::evaluate(&shared, &required(&shared), &results(), SUBJECT);
+    assert_eq!(
+        evaluation.keys[&header_acceptance::contracts::contract_test_key(ContractId::C3, T3)],
+        ObligationState::Verified
+    );
+    assert!(blocked(&evaluation.keys[&witness_key(T3)]));
+
+    // A blocked C5 blocks the other contracts' proving tests, so
+    // everything. So does C5's own proving test from a binary that doesn't
+    // embed the subject's source, and a subject source the tool couldn't
+    // read.
+    let mut m = manifest();
+    m.contracts[1].state = ContractState::Blocked { waiting_for: "E7" };
+    assert!(blocked(&state(&m, &results(), &quiet)));
+    let t5 = Expected::Passes { test: T5 }.id().unwrap();
+    for source in [None, Some("another-source".to_owned())] {
+        let mut stale = results();
+        if let Actual::Test { binary_source, .. } = &mut record_mut(&mut stale, &t5).actual {
+            *binary_source = source;
+        }
+        assert!(blocked(&state(&manifest(), &stale, &quiet)));
+        let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
+        assert!(blocked(&state(&manifest(), &stale, &c5_key)));
+    }
+    // An unknown digest anchors nothing, even when the caller's subject,
+    // the result file and every test binary all agree on it: C5's own test
+    // blocks, so its dependents do, and so does a composition check.
+    let unknown_subject = header_acceptance::Subject {
+        commit: S,
+        source: "unknown",
+    };
+    let check = "a_static_check";
+    let mut m = manifest();
+    m.expected.push(er(
+        vec![Key::Composition { test: check.into() }],
+        &[],
+        Expected::Passes {
+            test: sim_test(rows::ACCEPTANCE_TESTS, check),
+        },
+    ));
+    let mut unknown = results();
+    unknown
+        .results
+        .push(test_record(sim_test(rows::ACCEPTANCE_TESTS, check)));
+    unknown.subject_source = "unknown".into();
+    for record in &mut unknown.results {
+        if let Actual::Test { binary_source, .. } = &mut record.actual {
+            *binary_source = Some("unknown".into());
+        }
+    }
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &unknown, unknown_subject);
+    assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
+    let c5_key = header_acceptance::contracts::contract_test_key(ContractId::C5, T5);
+    assert!(blocked(&evaluation.keys[&c5_key]));
+    assert!(blocked(&evaluation.keys[&quiet]));
+    assert!(blocked(
+        &evaluation.keys[&Key::Composition { test: check.into() }]
+    ));
+    assert!(!evaluation.accepted());
+
+    // The committed manifest, with every contract as it stands on main,
+    // blocks everything on an empty result file.
+    let committed = Manifest::committed();
+    let empty = ResultFile {
+        subject: S.into(),
+        subject_source: SOURCE.into(),
+        results: Vec::new(),
+    };
+    let evaluation =
+        header_acceptance::evaluate(&committed, &committed_required(&committed), &empty, SUBJECT);
+    assert!(evaluation.stray.is_empty(), "{:?}", evaluation.stray);
+    assert!(!evaluation.accepted());
+    assert!(evaluation.gates.values().all(|passes| !passes));
+}
+
+/// Each result below matches its expected result in every identity field
+/// but one, and must stop counting.
+#[test]
+fn the_evaluator_joins_on_full_identity() {
+    let holds = Key::passing("t/a");
+    let catch = Key::catch("t/a");
+    let replay = Key::Replay {
+        run: HISTORY.into(),
+    };
+    let other = |history: HistoryRef| -> RunId { history.into() };
+    // The history's harness, file, test, package or case differs, in the
+    // result's claimed identity, and in the execution it carries.
+    for changed in [
+        HistoryRef {
+            harness: QUIET,
+            ..HISTORY
+        },
+        HistoryRef {
+            witness: sim_test("tests/u.rs", HISTORY.witness.test),
+            ..HISTORY
+        },
+        HistoryRef {
+            witness: sim_test(HISTORY.witness.file, "t_other"),
+            ..HISTORY
+        },
+        HistoryRef {
+            case: "other",
+            ..HISTORY
+        },
+        HistoryRef {
+            witness: TestRef {
+                package: "zakura-network",
+                ..HISTORY.witness
+            },
+            ..HISTORY
+        },
+    ] {
+        refused(&holds, |r| {
+            record_mut(r, &holds_id()).expected = ExpectedId::Holds {
+                property: "t/a".into(),
+                run: other(changed),
+            }
+        });
+        refused(&holds, |r| run_of(r, &holds_id()).run = other(changed));
+    }
+    // The same history, claimed for another property.
+    refused(&holds, |r| {
+        record_mut(r, &holds_id()).expected = ExpectedId::Holds {
+            property: "t/b".into(),
+            run: HISTORY.into(),
+        }
+    });
+    // The execution ran on another harness.
+    refused(&holds, |r| {
+        run_of(r, &holds_id()).meta.harness = QUIET.into()
+    });
+    // A catch's runs swapped between labels or cases.
+    refused(&catch, |r| {
+        caught_runs(r, CASE).1.run = RunId::case(CASE, CaseRun::Draft);
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).1.run = RunId::case(END_CASE, CaseRun::Patched);
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).2.run = RunId::case(
+            CaseRef {
+                property: "t/b",
+                ..CASE
+            },
+            CaseRun::Draft,
+        );
+    });
+    // A replay of another execution.
+    refused(&replay, |r| {
+        if let Actual::Replay { run, .. } = replay_actual(r) {
+            *run = other(HistoryRef {
+                case: "other",
+                ..HISTORY
+            });
+        }
+    });
+    // A test result claimed for the same name in another file or package,
+    // and a result that ran the same name from another file.
+    let test = witness_key(TP);
+    let tp = Expected::Passes { test: TP }.id().unwrap();
+    for changed in [
+        sim_test("tests/u.rs", TP.test),
+        TestRef {
+            package: "xtask",
+            ..TP
+        },
+    ] {
+        refused(&test, |r| {
+            record_mut(r, &tp).expected = Expected::Passes { test: changed }.id().unwrap()
+        });
+        refused(&test, |r| {
+            record_mut(r, &tp).actual = test_actual(changed, TestOutcome::Passed)
+        });
+    }
+}
+
+/// Contracts and narrowing decided only through their own required keys,
+/// and narrowing inputs taken only from the expected execution's role.
+#[test]
+fn the_evaluator_decides_contracts_through_their_keys() {
+    let quiet = Key::passing("t/q");
+    let holds = Key::passing("t/a");
+    let blocked_c11 = |m: &mut Manifest| {
+        m.contracts[2].state = ContractState::Blocked { waiting_for: "E8" };
+    };
+    // The narrowing entry's key removed from the manifest, with its passing
+    // record still in the result file, releases nothing.
+    let mut m = manifest();
+    blocked_c11(&mut m);
+    let before = required(&m);
+    m.expected
+        .retain(|r| !r.keys.contains(&Key::NarrowingTest { entry: "N1".into() }));
+    let evaluation = header_acceptance::evaluate(&m, &before, &results(), SUBJECT);
+    assert!(blocked(&evaluation.keys[&quiet]));
+    // A proving test's key covered twice, or with a gate tag, leaves its
+    // contract unproven.
+    let t3_key = header_acceptance::contracts::contract_test_key(ContractId::C3, T3);
+    let mut doubled = manifest();
+    let before = required(&doubled);
+    let at = doubled
+        .expected
+        .iter()
+        .position(|r| r.keys.contains(&t3_key))
+        .unwrap();
+    let copy = doubled.expected[at].clone();
+    doubled.expected.push(copy);
+    assert!(blocked(
+        &header_acceptance::evaluate(&doubled, &before, &results(), SUBJECT).keys[&holds]
+    ));
+    let mut tagged = manifest();
+    let before = required(&tagged);
+    tagged.expected[at].gates = vec![Gate::G1];
+    assert!(blocked(
+        &header_acceptance::evaluate(&tagged, &before, &results(), SUBJECT).keys[&holds]
+    ));
+
+    // A Draft replay that lost its override isn't released from a blocked
+    // C9 by an entry that releases runs with an empty override, so an
+    // excluded C11 can't turn its failure into an exclusion.
+    const TN2: TestRef = sim_test("tests/t.rs", "n2_holds");
+    const TC9: TestRef = sim_test("tests/t.rs", "c9_holds");
+    let draft_run = RunId::case(CASE, CaseRun::Draft);
+    let mut m = manifest();
+    m.contracts[2].state = ContractState::Excluded {
+        reason: "no peer checkpoint",
+        approval: Approval::Adam { record: "test" },
+    };
+    m.contracts.push(Contract {
+        state: ContractState::Blocked { waiting_for: "E5" },
+        ..satisfied(ContractId::C9, &[TC9])
+    });
+    m.required_contracts.push(ContractId::C9);
+    m.narrowing.push(Narrowing {
+        entry: "N2",
+        contracts: &[ContractId::C9],
+        releases: |ctx| {
+            !ctx.executions.is_empty() && ctx.executions.iter().all(|(empty, _)| *empty)
+        },
+        reason: "only Draft runs read the override",
+        test: NarrowingTest::Test(TN2),
+    });
+    m.expected.push(er(
+        vec![Key::NarrowingTest { entry: "N2".into() }],
+        &[],
+        Expected::Passes { test: TN2 },
+    ));
+    let replay = Key::Replay {
+        run: draft_run.clone(),
+    };
+    m.expected.push(er(
+        vec![replay.clone()],
+        &[Gate::G1],
+        Expected::Replays {
+            run: draft_run.clone(),
+        },
+    ));
+    let mut r = results();
+    r.results.push(test_record(TN2));
+    r.results.push(ResultRecord {
+        expected: ExpectedId::Replays(draft_run.clone()),
+        commit: S.into(),
+        actual: Actual::Replay {
+            run: draft_run.clone(),
+            of: trace_of(&draft_run),
+            meta: ExecMeta {
+                harness: NODE.into(),
+                draft_override: Vec::new(),
+                run_by: RunBy::Tool,
+                input: None,
+            },
+            exact: true,
+            reports_equal: true,
+            stores_equal: true,
+            fresh: true,
+        },
+    });
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &r, SUBJECT);
+    assert_eq!(
+        evaluation.keys[&Key::NarrowingTest { entry: "N2".into() }],
+        ObligationState::Verified
+    );
+    assert!(
+        blocked(&evaluation.keys[&replay]),
+        "{:?}",
+        evaluation.keys[&replay]
+    );
+    // With its override restored it still needs C9: the role, not the
+    // record, decides.
+    if let Actual::Replay { meta, .. } = &mut r.results.last_mut().unwrap().actual {
+        meta.draft_override = vec!["t/a".into()];
+    }
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &r, SUBJECT);
+    assert!(blocked(&evaluation.keys[&replay]));
+
+    // A replay of a planted patched run isn't released from a blocked C4
+    // by an entry for tool-run executions, whatever its record says.
+    const TN5: TestRef = sim_test("tests/t.rs", "n5_holds");
+    const TC4: TestRef = sim_test("tests/t.rs", "c4_holds");
+    let patched_run = RunId::case(CASE, CaseRun::Patched);
+    let mut m = manifest();
+    m.contracts.push(Contract {
+        state: ContractState::Blocked { waiting_for: "E6" },
+        ..satisfied(ContractId::C4, &[TC4])
+    });
+    m.required_contracts.push(ContractId::C4);
+    m.narrowing.push(Narrowing {
+        entry: "N5",
+        contracts: &[ContractId::C4],
+        releases: |ctx| {
+            !ctx.executions.is_empty() && ctx.executions.iter().all(|(_, by)| *by == RunBy::Tool)
+        },
+        reason: "only the planted runner's runs read C4",
+        test: NarrowingTest::Test(TN5),
+    });
+    m.expected.push(er(
+        vec![Key::NarrowingTest { entry: "N5".into() }],
+        &[],
+        Expected::Passes { test: TN5 },
+    ));
+    let replay = Key::Replay {
+        run: patched_run.clone(),
+    };
+    m.expected.push(er(
+        vec![replay.clone()],
+        &[Gate::G1],
+        Expected::Replays {
+            run: patched_run.clone(),
+        },
+    ));
+    let mut r = results();
+    r.results.push(test_record(TN5));
+    r.results.push(ResultRecord {
+        expected: ExpectedId::Replays(patched_run.clone()),
+        commit: S.into(),
+        actual: Actual::Replay {
+            of: trace_of(&patched_run),
+            run: patched_run,
+            meta: ExecMeta {
+                harness: NODE.into(),
+                draft_override: Vec::new(),
+                run_by: RunBy::Planted,
+                input: None,
+            },
+            exact: true,
+            reports_equal: true,
+            stores_equal: true,
+            fresh: true,
+        },
+    });
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &r, SUBJECT);
+    assert_eq!(
+        evaluation.keys[&Key::NarrowingTest { entry: "N5".into() }],
+        ObligationState::Verified
+    );
+    assert!(blocked(&evaluation.keys[&replay]));
+    // The tool's own history replay is released.
+    assert_eq!(
+        evaluation.keys[&Key::Replay {
+            run: HISTORY.into()
+        }],
+        ObligationState::Verified
+    );
+}
+
+/// Each execution's runner matches its role, a completed catch and a
+/// `StaysNotApplicable` get the whole-history rule, a machine catch's
+/// actions and leaks count, replays and companions name their execution's
+/// own trace, and precedence holds for an excluded C5.
+#[test]
+fn the_evaluator_binds_runners_and_traces() {
+    let catch = Key::catch("t/a");
+    let late = Key::Case {
+        property: "t/a".into(),
+        name: "late-bug".into(),
+    };
+    let stays = Key::passing("t/b");
+    let machine = Key::catch(MACHINE);
+    let native = Key::Native {
+        patch: NATIVE.into(),
+    };
+    let replay = Key::Replay {
+        run: HISTORY.into(),
+    };
+    // The runner each record names must be its role's.
+    refused(&replay, |r| {
+        if let Actual::Replay { meta, .. } = replay_actual(r) {
+            meta.run_by = RunBy::Planted;
+        }
+    });
+    refused(&catch, |r| caught_runs(r, CASE).0.meta.run_by = RunBy::Tool);
+    refused(&catch, |r| {
+        caught_runs(r, CASE).2.meta.run_by = RunBy::Planted
+    });
+    // A completed end-found catch with an unrelated Inconclusive or an
+    // unexpected NotApplicable.
+    refused(&late, |r| {
+        caught_runs(r, END_CASE).1.reports.insert(
+            "t/b".into(),
+            Report::Inconclusive {
+                reason: "obligation-open".into(),
+            },
+        );
+    });
+    refused(&late, |r| {
+        caught_runs(r, END_CASE)
+            .1
+            .reports
+            .insert("t/b".into(), na("why"));
+    });
+    // A StaysNotApplicable that lost its trigger.
+    refused(&stays, |r| run_of(r, &stays_id()).trigger = false);
+    // A machine baseline that didn't run its actions, or either machine run
+    // leaking.
+    refused(&machine, |r| {
+        machine_runs(r).0.actions = Actions::Incomplete
+    });
+    refused(&machine, |r| machine_runs(r).0.leaked = 1);
+    refused(&machine, |r| machine_runs(r).1.leaked = 1);
+    // A replay of another trace of the counted execution, and a companion
+    // judged on another trace of the Draft run.
+    refused(&replay, |r| {
+        if let Actual::Replay { of, .. } = replay_actual(r) {
+            *of = "another trace".into();
+        }
+    });
+    refused(&catch, |r| {
+        caught_runs(r, CASE).3[0].trace = "another trace".into()
+    });
+    // An integrity clean run with an unlisted NotApplicable.
+    refused(&native, |r| {
+        if let Actual::IntegrityCaught { restored, .. } = native_actual(r) {
+            restored.reports.insert("t/s".into(), na("why"));
+        }
+    });
+
+    // An excluded C5 excludes a contract whose proving test passed, and so
+    // its dependents. One whose proving test is missing, failed or from
+    // another commit still blocks them.
+    let mut m = manifest();
+    m.contracts[1].state = ContractState::Excluded {
+        reason: "no provenance",
+        approval: Approval::Adam { record: "test" },
+    };
+    assert!(matches!(
+        state(&m, &results(), &Key::passing("t/a")),
+        ObligationState::Excluded { .. }
+    ));
+    let t3 = Expected::Passes { test: T3 }.id().unwrap();
+    let mut missing = results();
+    missing.results.retain(|record| record.expected != t3);
+    let mut failed = results();
+    record_mut(&mut failed, &t3).actual = test_actual(T3, TestOutcome::Failed);
+    let mut stale = results();
+    record_mut(&mut stale, &t3).commit = "another commit".into();
+    for broken in [missing, failed, stale] {
+        assert!(blocked(&state(&m, &broken, &Key::passing("t/a"))));
+    }
+
+    // Two narrowing entries of one name release nothing.
+    let mut m = manifest();
+    m.contracts[2].state = ContractState::Blocked { waiting_for: "E8" };
+    m.narrowing.push(Narrowing {
+        releases: |ctx| ctx.harness.as_deref() == Some(NODE),
+        ..quiet_entry(NarrowingTest::Test(sim_test("tests/t.rs", "absent")))
+    });
+    assert!(blocked(&state(&m, &results(), &Key::passing("t/q"))));
+    assert!(blocked(&state(&m, &results(), &Key::passing("t/a"))));
+
+    // A composition check that didn't pass fails every gate, not only the
+    // overall acceptance.
+    let check = "a_static_check";
+    let mut m = manifest();
+    m.expected.push(er(
+        vec![Key::Composition { test: check.into() }],
+        &[],
+        Expected::Passes {
+            test: sim_test(rows::ACCEPTANCE_TESTS, check),
+        },
+    ));
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &results(), SUBJECT);
+    assert!(evaluation.gates.values().all(|passes| !passes));
+    let mut passing = results();
+    passing
+        .results
+        .push(test_record(sim_test(rows::ACCEPTANCE_TESTS, check)));
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &passing, SUBJECT);
+    assert!(evaluation.gates.values().all(|passes| *passes));
+    // A composition check carries its own provenance anchor, so an excluded
+    // C5 leaves it verified, and a gate can pass with that exclusion. One
+    // whose binary doesn't embed the subject's digest blocks, and fails
+    // every gate, whatever C5's standing.
+    m.contracts[1].state = ContractState::Excluded {
+        reason: "no provenance",
+        approval: Approval::Adam { record: "test" },
+    };
+    let evaluation = header_acceptance::evaluate(&m, &required(&m), &passing, SUBJECT);
+    assert_eq!(
+        evaluation.keys[&Key::Composition { test: check.into() }],
+        ObligationState::Verified
+    );
+    let mut unanchored = passing.clone();
+    if let Actual::Test { binary_source, .. } = &mut unanchored.results.last_mut().unwrap().actual {
+        *binary_source = None;
+    }
+    for contracts in [m.contracts.clone(), manifest().contracts] {
+        let m = Manifest {
+            contracts,
+            ..m.clone()
+        };
+        let evaluation = header_acceptance::evaluate(&m, &required(&m), &unanchored, SUBJECT);
+        assert!(blocked(
+            &evaluation.keys[&Key::Composition { test: check.into() }]
+        ));
+        assert!(evaluation.gates.values().all(|passes| !passes));
+    }
+
+    // A clean integrity run reporting a Held with no applicable step.
+    refused(&native, |r| {
+        if let Actual::IntegrityCaught { restored, .. } = native_actual(r) {
+            restored
+                .reports
+                .insert("t/s".into(), Report::Held { applicable: 0 });
+        }
+    });
+
+    // A record whose execution claims another history's identity indexes
+    // nothing: its trace neither disputes the genuine history's nor
+    // supplies one.
+    let mut misbound = results();
+    run_of(&mut misbound, &holds_id()).run = QUIET_HISTORY.into();
+    let genuine = manifest();
+    let evaluation = header_acceptance::evaluate(&genuine, &required(&genuine), &misbound, SUBJECT);
+    assert_eq!(
+        evaluation.keys[&Key::passing("t/q")],
+        ObligationState::Verified
+    );
+    assert!(blocked(&evaluation.keys[&Key::passing("t/a")]));
+    assert!(blocked(&evaluation.keys[&replay]));
+
+    // A result file whose two digests agree with each other but not with
+    // the subject the caller established is stray, and C5's bootstrap
+    // fails.
+    let mut dirty = results();
+    dirty.subject_source = "dirty-checkout".into();
+    let t5 = Expected::Passes { test: T5 }.id().unwrap();
+    if let Actual::Test { binary_source, .. } = &mut record_mut(&mut dirty, &t5).actual {
+        *binary_source = Some("dirty-checkout".into());
+    }
+    let evaluation = header_acceptance::evaluate(&genuine, &required(&genuine), &dirty, SUBJECT);
+    assert!(!evaluation.stray.is_empty());
+    assert!(blocked(
+        &evaluation.keys[&header_acceptance::contracts::contract_test_key(ContractId::C5, T5)]
+    ));
+    assert!(!evaluation.accepted());
+    assert!(evaluation.gates.values().all(|passes| !passes));
+
+    // A machine catch's patched run with failed action coverage, or a
+    // completed one that checked only a prefix.
+    refused(&machine, |r| {
+        machine_runs(r).1.actions = Actions::Incomplete
+    });
+    refused(&machine, |r| {
+        let (_, patched) = machine_runs(r);
+        patched.end = End::Completed;
+        patched.actions = Actions::Prefix;
+    });
+
+    // An approved standing Open that names no owner blocks.
+    let mut m = manifest();
+    let at = m
+        .expected
+        .iter()
+        .position(|r| matches!(r.expected, Expected::Open { until: None, .. }))
+        .unwrap();
+    let key = m.expected[at].keys[0].clone();
+    if let Expected::Open { owner, .. } = &mut m.expected[at].expected {
+        *owner = "";
+    }
+    assert!(blocked(&state(&m, &results(), &key)), "{key:?}");
+
+    // Any test whose record says its binary came from another source blocks
+    // its key, not only C5's own.
+    let t3 = Expected::Passes { test: T3 }.id().unwrap();
+    let t3_key = header_acceptance::contracts::contract_test_key(ContractId::C3, T3);
+    let mut stale = results();
+    if let Actual::Test { binary_source, .. } = &mut record_mut(&mut stale, &t3).actual {
+        *binary_source = Some("old-source".into());
+    }
+    assert!(blocked(&state(&manifest(), &stale, &t3_key)));
+    assert!(blocked(&state(&manifest(), &stale, &Key::passing("t/a"))));
+    // So does one whose digest couldn't be read, for a proving test and for
+    // a narrowing test, which then releases nothing.
+    let mut unread = results();
+    if let Actual::Test { binary_source, .. } = &mut record_mut(&mut unread, &t3).actual {
+        *binary_source = None;
+    }
+    assert!(blocked(&state(&manifest(), &unread, &t3_key)));
+    assert!(blocked(&state(&manifest(), &unread, &Key::passing("t/a"))));
+    let tn = Expected::Passes { test: TN }.id().unwrap();
+    let mut unread = results();
+    if let Actual::Test { binary_source, .. } = &mut record_mut(&mut unread, &tn).actual {
+        *binary_source = None;
+    }
+    let mut m = manifest();
+    m.contracts[2].state = ContractState::Blocked { waiting_for: "E8" };
+    assert!(blocked(&state(
+        &m,
+        &unread,
+        &Key::NarrowingTest { entry: "N1".into() }
+    )));
+    assert!(blocked(&state(&m, &unread, &Key::passing("t/q"))));
+
+    // A proving test's result covering another contract's key with the same
+    // test, or a narrowing test's covering another entry's, proves nothing
+    // for the key the required inventory names.
+    let mut m = manifest();
+    let at = m
+        .expected
+        .iter()
+        .position(|r| r.keys.contains(&t3_key))
+        .unwrap();
+    m.expected[at].keys = vec![header_acceptance::contracts::contract_test_key(
+        ContractId::C11,
+        T3,
+    )];
+    let fixed = required(&manifest());
+    let evaluation = header_acceptance::evaluate(&m, &fixed, &results(), SUBJECT);
+    assert!(blocked(&evaluation.keys[&t3_key]));
+    assert!(blocked(&evaluation.keys[&Key::passing("t/a")]));
+    let mut m = manifest();
+    m.contracts[2].state = ContractState::Blocked { waiting_for: "E8" };
+    let entry = m.narrowing[0].entry;
+    let at = m
+        .expected
+        .iter()
+        .position(|r| {
+            r.keys.contains(&Key::NarrowingTest {
+                entry: entry.into(),
+            })
+        })
+        .unwrap();
+    m.expected[at].keys = vec![Key::NarrowingTest {
+        entry: "N-other".into(),
+    }];
+    let evaluation = header_acceptance::evaluate(&m, &fixed, &results(), SUBJECT);
+    assert!(blocked(
+        &evaluation.keys[&Key::NarrowingTest {
+            entry: entry.into()
+        }]
+    ));
+    assert!(blocked(&evaluation.keys[&Key::passing("t/q")]));
+
+    // A replay naming an input, or run in the recording process.
+    refused(&replay, |r| {
+        if let Actual::Replay { meta, .. } = replay_actual(r) {
+            meta.input = Some(QUIET_HISTORY.into());
+        }
+    });
+    refused(&replay, |r| {
+        if let Actual::Replay { fresh, .. } = replay_actual(r) {
+            *fresh = false;
+        }
+    });
+
+    // A missing narrowing test fails every gate, even with every contract
+    // satisfied so that no result needs it.
+    let mut no_n = results();
+    let tn = Expected::Passes { test: TN }.id().unwrap();
+    no_n.results.retain(|record| record.expected != tn);
+    let genuine_m = manifest();
+    let evaluation = header_acceptance::evaluate(&genuine_m, &required(&genuine_m), &no_n, SUBJECT);
+    assert!(!evaluation.accepted());
+    assert!(evaluation.gates.values().all(|passes| !passes));
+
+    // A contract exclusion, or a standing Open, with no reason or an empty
+    // approval record, blocks instead of excluding.
+    for (reason, record) in [("", "a record"), ("a reason", "")] {
+        let mut m = manifest();
+        m.contracts[0].state = ContractState::Excluded {
+            reason,
+            approval: Approval::Adam { record },
+        };
+        assert!(
+            blocked(&state(&m, &results(), &Key::passing("t/a"))),
+            "{reason:?} {record:?}"
+        );
+        let mut m = manifest();
+        let at = m
+            .expected
+            .iter()
+            .position(|r| matches!(r.expected, Expected::Open { until: None, .. }))
+            .unwrap();
+        let key = m.expected[at].keys[0].clone();
+        if let Expected::Open {
+            reason: r,
+            approval,
+            ..
+        } = &mut m.expected[at].expected
+        {
+            *r = reason;
+            *approval = Approval::Adam { record };
+        }
+        assert!(blocked(&state(&m, &results(), &key)), "{key:?}");
+    }
+
+    // An approved StaysNotApplicable reason with an empty approval record,
+    // or an empty reason its report repeats.
+    let stays = Key::passing("t/b");
+    for (empty_reason, empty_record) in [(false, true), (true, false)] {
+        let mut m = manifest();
+        let mut r = results();
+        for result in &mut m.expected {
+            if let Expected::StaysNotApplicable {
+                reason, approval, ..
+            } = &mut result.expected
+            {
+                if empty_reason {
+                    *reason = "";
+                }
+                if empty_record {
+                    *approval = Approval::Adam { record: "" };
+                }
+            }
+        }
+        if empty_reason {
+            if let Some(Report::NotApplicable { reason }) =
+                run_of(&mut r, &stays_id()).reports.get_mut("t/b")
+            {
+                *reason = Some(String::new());
+            }
+        }
+        assert!(
+            blocked(&state(&m, &r, &stays)),
+            "{empty_reason} {empty_record}"
+        );
+    }
+
+    // An empty or unreadable trace names no execution.
+    for unusable in ["", "missing"] {
+        refused(&catch, |r| {
+            let (_, _, draft, companions) = caught_runs(r, CASE);
+            draft.trace = unusable.into();
+            companions[0].trace = unusable.into();
+        });
+        refused(&replay, |r| {
+            let id = holds_id();
+            run_of(r, &id).trace = unusable.into();
+            if let Actual::Replay { of, .. } = replay_actual(r) {
+                *of = unusable.into();
+            }
+        });
+    }
+    // A trace counts only from the expected record at the subject commit,
+    // named once: the counted execution under another commit, or repeated
+    // under another commit, supplies no trace, and the same execution under
+    // a stray identity neither supplies nor disputes one.
+    refused(&replay, |r| {
+        let id = holds_id();
+        record_mut(r, &id).commit = "another commit".into();
+    });
+    let counted = || {
+        results()
+            .results
+            .into_iter()
+            .find(|record| record.expected == holds_id())
+            .unwrap()
+    };
+    refused(&replay, |r| {
+        let mut repeated = counted();
+        repeated.commit = "another commit".into();
+        r.results.push(repeated);
+    });
+    let mut extra = results();
+    let mut stray = counted();
+    stray.expected = ExpectedId::Holds {
+        property: "t/unlisted".into(),
+        run: HISTORY.into(),
+    };
+    if let Actual::Run(run) = &mut stray.actual {
+        run.trace = "another trace".into();
+    }
+    extra.results.push(stray);
+    let manifest = manifest();
+    let evaluation = header_acceptance::evaluate(&manifest, &required(&manifest), &extra, SUBJECT);
+    assert_eq!(evaluation.keys[&replay], ObligationState::Verified);
+    assert!(!evaluation.stray.is_empty());
+
+    // A run that drops a NotApplicable its row lists.
+    refused(&Key::passing("t/a"), |r| {
+        let id = holds_id();
+        run_of(r, &id).reports.remove("t/b");
+    });
+
+    // A result for no expected identity, or an expected result with no key,
+    // fails every gate.
+    let mut unknown = results();
+    unknown
+        .results
+        .push(test_record(sim_test("tests/t.rs", "unlisted")));
+    let evaluation =
+        header_acceptance::evaluate(&manifest, &required(&manifest), &unknown, SUBJECT);
+    assert!(!evaluation.stray.is_empty());
+    assert!(evaluation.gates.values().all(|passes| !passes));
+    let mut keyless = manifest.clone();
+    keyless.expected.push(er(
+        Vec::new(),
+        &[Gate::G1],
+        Expected::Passes {
+            test: sim_test("tests/t.rs", "keyless"),
+        },
+    ));
+    let mut with_keyless = results();
+    with_keyless
+        .results
+        .push(test_record(sim_test("tests/t.rs", "keyless")));
+    let evaluation =
+        header_acceptance::evaluate(&keyless, &required(&keyless), &with_keyless, SUBJECT);
+    assert!(!evaluation.stray.is_empty());
+    assert!(!evaluation.accepted());
+    assert!(evaluation.gates.values().all(|passes| !passes));
 }

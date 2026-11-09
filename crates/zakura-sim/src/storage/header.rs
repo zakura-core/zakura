@@ -103,8 +103,9 @@ pub struct HeaderStorage {
     label: String,
     /// What each failed prepare and apply blamed.
     attributions: FaultAttributions,
-    /// Each engine run the last observation logged, with the fact that
-    /// carried it, until [`take_runs`](Self::take_runs) takes them.
+    /// Each engine run the last observation logged, with the sequence number
+    /// of the fact that carried it, or 0 for a harness commit's, which no
+    /// fact carries, until [`take_runs`](Self::take_runs) takes them.
     runs: Vec<(u64, Arc<EngineRun>)>,
 }
 
@@ -742,6 +743,14 @@ impl ActionSource for HeaderStorage {
             };
             self.runs.extend(run.map(|run| (fact.seq, run)));
         }
+        // A harness commit runs at its control step, which no storage action
+        // shares, so its run comes after this observation's facts' runs.
+        self.runs.extend(
+            self.port
+                .take_harness_runs()
+                .into_iter()
+                .map(|run| (0, run)),
+        );
         let mut sent: Vec<Observation> = facts
             .into_iter()
             .map(|fact| observation(fact, self.id.index))
@@ -766,8 +775,9 @@ impl ActionSource for HeaderStorage {
 }
 
 impl HeaderStorage {
-    /// Each apply's and reset's engine run the observations since the last
-    /// call logged, with the sequence number of the fact that carried it.
+    /// Each apply's, reset's and harness commit's engine run the observations
+    /// since the last call logged, in order, with the sequence number of the
+    /// fact that carried it, or 0 for a harness commit's.
     pub(crate) fn take_runs(&mut self) -> Vec<(u64, Arc<EngineRun>)> {
         std::mem::take(&mut self.runs)
     }

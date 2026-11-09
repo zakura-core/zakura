@@ -1236,8 +1236,8 @@ impl ReactorTap {
         (observer, tap)
     }
 
-    /// Hands the authority check each apply's and reset's engine run that
-    /// the header storage source just logged.
+    /// Hands the authority check each apply's, reset's and harness commit's
+    /// engine run that the header storage source just logged.
     pub(crate) fn engine_runs(
         &self,
         runs: &[(u64, Arc<zakura_storage::header::controlled::EngineRun>)],
@@ -1312,6 +1312,10 @@ impl ReactorTap {
                 }),
                 self.state.engine_generation(),
             );
+            // A harness commit's run, which no fact carries.
+            for (_, run) in runs.iter().filter(|(carried, _)| *carried == 0) {
+                rounds.harness_run(run);
+            }
         }
         if let Some(chain) = self
             .state

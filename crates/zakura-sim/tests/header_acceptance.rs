@@ -1282,6 +1282,7 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
                 "forks-sharing-a-header ",
                 "multi-page-sync ",
                 "relinked-mid-round ",
+                "harness-commit ",
             ]
             .iter()
             .flat_map(|name| plans(name, "inputs(8, 256)", 8))

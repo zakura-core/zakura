@@ -313,10 +313,11 @@ const CHAIN_CASES: [&str; 4] = [
     "reset-inside-status-floor ",
 ];
 /// Each authority witness's name, as its witness test prefixes its executions.
-const AUTHORITY_CASES: [&str; 3] = [
+const AUTHORITY_CASES: [&str; 4] = [
     "forks-sharing-a-header ",
     "multi-page-sync ",
     "relinked-mid-round ",
+    "harness-commit ",
 ];
 /// Each committed outstanding-work witness, by its fixture stem, which its
 /// witness test runs under its committed Plan.
@@ -1266,6 +1267,12 @@ fn hand_written_rows() -> Vec<Row> {
             Found::AtStep,
         ),
         (
+            "insertion-bump-skipped-by-commit",
+            STORAGE,
+            &[RESET] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
             "insertion-bump-skipped-held",
             STORAGE,
             &[RESET] as &'static [&'static str],
@@ -1440,6 +1447,12 @@ fn hand_written_rows() -> Vec<Row> {
         ),
         (
             "corrupted-best-score",
+            STORAGE,
+            &[COMMIT] as &'static [&'static str],
+            Found::AtStep,
+        ),
+        (
+            "corrupted-best-score-by-commit",
             STORAGE,
             &[COMMIT] as &'static [&'static str],
             Found::AtStep,

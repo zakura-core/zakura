@@ -101,12 +101,31 @@ pub fn relinked_mid_round() -> StorageScenario {
     }
 }
 
+/// The node and `mirror-0` both at A4, and a harness commit of two more
+/// main-line headers straight into the node's engine. The node has
+/// nothing to fetch, so the commit's engine run, which no storage fact
+/// carries, is the only run the commit-contents and insertion rules judge.
+pub fn harness_commit() -> StorageScenario {
+    StorageScenario {
+        node: Chain::main(4),
+        mirrors: vec![mirror(Chain::main(4))],
+        policy: Policy::converging(),
+        controls: vec![ControlStep {
+            peer: "node".to_owned(),
+            action: ControlAction::Commit { len: 2 },
+            when: None,
+        }],
+        weights: Default::default(),
+    }
+}
+
 /// Every witness, by name.
-fn witnesses() -> [(&'static str, StorageScenario); 3] {
+fn witnesses() -> [(&'static str, StorageScenario); 4] {
     [
         ("forks-sharing-a-header", forks_sharing_a_header()),
         ("multi-page-sync", multi_page_sync()),
         ("relinked-mid-round", relinked_mid_round()),
+        ("harness-commit", harness_commit()),
     ]
 }
 
@@ -160,6 +179,35 @@ fn starts(report: &RunReport) -> Vec<(u64, u64, String)> {
 /// Each witness holds `header-sync/commit-only-authorized` and applies,
 /// and the hdr-6 controls and `header-sync/reset-invalidates-work` hold or
 /// don't apply beside it.
+/// A harness commit is an engine run like an apply: on the harness-commit
+/// witness, where it's the only run that inserts, both the commit-contents
+/// rules and `reset-invalidates-work`'s insertion rule judge it, so both
+/// apply, and the node ends on the two committed headers.
+#[test]
+fn a_harness_commit_is_judged_as_an_engine_run() {
+    let scenario = harness_commit();
+    let tip = Chain::main(6).tip(&HeaderFixture::regtest());
+    for input in inputs(8, 256) {
+        let ports = Storage::prepare(&scenario);
+        let port = ports.node.clone();
+        let report =
+            run_prepared::<Storage>(&scenario, ports, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert_eq!(port.engine().snapshot().frontiers.header_best, tip);
+        for property in [COMMIT_ONLY_AUTHORIZED, RESET_INVALIDATES_WORK] {
+            assert!(
+                matches!(
+                    outcome(&report, property),
+                    PropertyOutcome::Held { applicable } if *applicable > 0
+                ),
+                "{property}: {:?}",
+                outcome(&report, property)
+            );
+        }
+    }
+}
+
 #[test]
 fn every_witness_holds_and_applies() {
     for (name, scenario) in witnesses() {
@@ -290,7 +338,7 @@ fn each_witness_takes_the_path_it_names() {
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed
 /// as `tests/fixtures/header-authority-<name>.json` with its Plan bytes
 /// beside it in `header-authority-<name>.plan`.
-fn committed_witnesses() -> [(&'static str, StorageScenario); 3] {
+fn committed_witnesses() -> [(&'static str, StorageScenario); 4] {
     witnesses()
 }
 

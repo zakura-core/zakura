@@ -1694,7 +1694,9 @@ impl Control {
 
 impl Control {
     /// Commits `len` fixture headers past `port`'s selected tip straight
-    /// into its engine, then records the engine's new state as `Published`.
+    /// into its engine, through the port's harness-commit hook, which
+    /// records the commit's engine run, then records the engine's new state
+    /// as `Published`.
     /// The step loop calls it outside any task, so the engine's watch sends
     /// wake no task before the record.
     fn commit(&self, port: &ControlledPort, len: u32) -> Result<(), String> {
@@ -1702,15 +1704,21 @@ impl Control {
         let snapshot = engine.snapshot();
         let tip = snapshot.frontiers.header_best;
         let headers = self.fixture.extend(tip, len, 0);
+        let hashes = headers.iter().map(|header| header.hash()).collect();
         let request = self.fixture.target_request(&snapshot, tip, &headers, 1);
-        let applied = ready(engine.prepare_header_target(request))
-            .and_then(|prepared| ready(engine.apply_header_target(prepared)))
-            .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
-        if !matches!(applied, ApplyHeaderTargetOutcome::Applied) {
-            return Err(format!(
-                "committing {len} headers on {tip:?} gave {applied:?}"
-            ));
-        }
+        // The port records the commit's engine run, so every check that
+        // judges engine runs judges it as it does an apply's.
+        port.harness_commit(hashes, |engine| {
+            let applied = ready(engine.prepare_header_target(request))
+                .and_then(|prepared| ready(engine.apply_header_target(prepared)))
+                .map_err(|error| format!("committing {len} headers on {tip:?} failed: {error}"))?;
+            if !matches!(applied, ApplyHeaderTargetOutcome::Applied) {
+                return Err(format!(
+                    "committing {len} headers on {tip:?} gave {applied:?}"
+                ));
+            }
+            Ok(())
+        })?;
         let published = engine.snapshot();
         self.adoption
             .as_ref()

@@ -500,6 +500,7 @@ fn accepted(through: Frontier) -> ReactorEvent {
         through,
         headers: cursor.headers,
         bytes: cursor.bytes,
+        stored: (through, cursor.headers, cursor.bytes),
         totals: Default::default(),
     }
 }
@@ -821,10 +822,72 @@ fn claims_record_what_their_pages_consumed() {
     assert!(found[0].contains("which no claim recorded"), "{found:?}");
 }
 
-/// `event`, an acceptance, one byte past its cursor.
+/// Pages that consume more than the updates granted break, though every
+/// cursor and total agrees with them. An acceptance whose stored cursor
+/// isn't the one asked for breaks too.
+#[test]
+fn pages_stay_within_their_credit_and_acceptance_stores_its_cursor() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[3].hash, genesis.hash);
+    // An Open granting exactly one two-header page.
+    let mut small = open(chain[3], &[genesis.hash]);
+    let page_bytes = u32::try_from(credit::page_size(2, AuxSchema::None)).expect("small");
+    if let ReactorEvent::CreditIssued {
+        objects,
+        bytes,
+        update,
+        ..
+    } = &mut small
+    {
+        (*objects, *bytes) = (2, page_bytes);
+        update.added_credit = Credit {
+            objects: 2,
+            bytes: page_bytes,
+        };
+    }
+    let base = || {
+        vec![
+            reserved(1, 10),
+            adopted(),
+            small.clone(),
+            started(round.clone(), &[genesis.hash]),
+        ]
+    };
+    let mut within = base();
+    within.extend([
+        claimed(chain[1], 2),
+        page(&round, genesis, &[chain[0].hash, chain[1].hash]),
+    ]);
+    assert_eq!(credit_breaks(&within), Vec::<String>::new());
+    let mut over = base();
+    over.extend([claimed(chain[1], 2), claimed(chain[2], 1)]);
+    let found = credit_breaks(&over);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("its updates granted")),
+        "{found:?}"
+    );
+    let mut stored_elsewhere = within;
+    let mut accepted = accepted(chain[1]);
+    if let ReactorEvent::CursorsAccepted { stored, .. } = &mut accepted {
+        stored.0 = chain[0];
+    }
+    stored_elsewhere.push(accepted);
+    let found = credit_breaks(&stored_elsewhere);
+    assert!(
+        found.iter().any(|found| found.contains("not the")),
+        "{found:?}"
+    );
+}
+
+/// `event`, an acceptance, one byte past its cursor, as asked for and as
+/// stored.
 fn one_byte_more_accepted(mut event: ReactorEvent) -> ReactorEvent {
-    if let ReactorEvent::CursorsAccepted { bytes, .. } = &mut event {
+    if let ReactorEvent::CursorsAccepted { bytes, stored, .. } = &mut event {
         *bytes += 1;
+        stored.2 += 1;
     }
     event
 }
@@ -1053,6 +1116,197 @@ fn a_second_submission_from_one_call_breaks_at_once() {
         found
             .iter()
             .any(|found| found.contains("reached storage again")),
+        "{found:?}"
+    );
+}
+
+/// An apply's owner, source and target are judged against its dispatch
+/// whether or not a prepare handed it headers. Without a handoff it breaks
+/// the submission rule at once, with its fields also compared. With one,
+/// a matching sealed insertion holds.
+#[test]
+fn an_apply_is_judged_with_or_without_a_handoff() {
+    use zakura_network::zakura::observe::{HeaderWorkEnd, PortCall};
+
+    let chain = main_chain(2);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[1].hash, genesis.hash);
+    let source = zakura_header_chain::SourceId::from_digest([2; 32]);
+    let dispatch = |check: &mut Authority| {
+        for (call, op) in [
+            (
+                1,
+                PortCall::Prepare {
+                    peer: mirror(),
+                    source,
+                    owner: round.owner,
+                    common_ancestor: genesis,
+                    target: chain[1],
+                    hashes: vec![chain[0].hash, chain[1].hash],
+                },
+            ),
+            (
+                2,
+                PortCall::Apply {
+                    peer: mirror(),
+                    source,
+                    owner: round.owner,
+                    target_tip_hash: chain[1].hash,
+                },
+            ),
+        ] {
+            check.observe(&ReactorEvent::Dispatched { call, op }, true, false);
+        }
+    };
+    let apply = |source: zakura_header_chain::SourceId| crate::observe::StorageFact::Submitted {
+        id: 2,
+        request: crate::observe::StorageRequest::ApplyHeaderTarget {
+            owner: crate::storage::work_owner(round.owner),
+            source: crate::storage::hex(&source.digest()),
+            parent: Some(crate::storage::hash(genesis.hash)),
+            target: crate::storage::hash(chain[1].hash),
+            hashes: Some(vec![
+                crate::storage::hash(chain[0].hash),
+                crate::storage::hash(chain[1].hash),
+            ]),
+        },
+        digest: String::new(),
+        call: Some(2),
+    };
+    let new_check = || {
+        Authority::new(
+            AuthorityEvidence::default(),
+            HeaderFixture::regtest(),
+            [0],
+            [],
+        )
+    };
+
+    let mut unhanded = new_check();
+    dispatch(&mut unhanded);
+    unhanded.storage([&apply(source)]);
+    let found = unhanded.drain(1);
+    assert!(
+        matches!(&found[..], [only] if only.contains("no prepare handed the apply")),
+        "{found:?}"
+    );
+
+    let mut other_source = new_check();
+    dispatch(&mut other_source);
+    other_source.storage([&apply(zakura_header_chain::SourceId::from_digest([3; 32]))]);
+    let found = other_source.drain(1);
+    assert!(
+        found.iter().any(|found| found.contains("source"))
+            && found
+                .iter()
+                .any(|found| found.contains("no prepare handed the apply")),
+        "{found:?}"
+    );
+
+    let mut handed = new_check();
+    dispatch(&mut handed);
+    handed.observe(
+        &ReactorEvent::HeadersEnded {
+            call: 1,
+            incarnation: 1,
+            headers: 2,
+            end: HeaderWorkEnd::HandedToApply { apply: 2 },
+        },
+        true,
+        false,
+    );
+    handed.storage([&apply(source)]);
+    assert_eq!(handed.drain(1), Vec::<String>::new());
+}
+
+/// The model's V1 page sizes are encoded V1 pages' payloads, each entry
+/// carrying its auxiliary record, so a wrong auxiliary byte count fails
+/// here.
+#[test]
+fn v1_page_sizes_are_encoded_pages() {
+    use zakura_chain::{block::merkle::AuthDataRoot, ironwood, orchard, sapling};
+    use zakura_header_chain::TreeAuxRecordV1;
+
+    let fixture = HeaderFixture::regtest();
+    for count in [1, 3] {
+        let headers = fixture.extend(fixture.anchor(), count, 0);
+        let page = RegtestMessage::Headers(Headers {
+            subscription_id: 1,
+            initial_target_tip_hash: headers.last().expect("one at least").hash(),
+            common_ancestor_height: block::Height(0),
+            common_ancestor_hash: fixture.anchor().hash,
+            reaches_initial_target: true,
+            tree_aux_schema: AuxSchema::V1,
+            entries: (1..)
+                .zip(headers)
+                .map(|(height, header)| HeaderEntry {
+                    header,
+                    body_size: 0,
+                    tree_aux: Some(TreeAuxRecordV1 {
+                        height: block::Height(height),
+                        sapling_root: sapling::tree::Root::default(),
+                        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                        ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+                        sapling_tx_count: 0,
+                        orchard_tx_count: 0,
+                        ironwood_tx_count: 0,
+                        auth_data_root: AuthDataRoot::from([0; 32]),
+                    }),
+                })
+                .collect(),
+        });
+        let frame = encode_frame(&page).expect("a V1 page encodes");
+        assert_eq!(
+            credit::page_size(u64::from(count), AuxSchema::V1),
+            u64::try_from(frame.payload.len()).expect("small"),
+            "{count} headers"
+        );
+    }
+    assert!(credit::smallest_page(AuxSchema::V1) > credit::smallest_page(AuxSchema::None));
+}
+
+/// Under a V1 Open, a claimed page is charged its V1 size: one charged as
+/// a plain page breaks, with its cursor and totals agreeing.
+#[test]
+fn a_v1_page_is_charged_its_auxiliary_records() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let mut v1 = open(chain[3], &[genesis.hash]);
+    let granted = u32::try_from(credit::page_size(2, AuxSchema::V1)).expect("small");
+    if let ReactorEvent::CreditIssued {
+        objects,
+        bytes,
+        update,
+        ..
+    } = &mut v1
+    {
+        (*objects, *bytes) = (2, granted);
+        update.tree_aux_schema = AuxSchema::V1;
+        update.added_credit = Credit {
+            objects: 2,
+            bytes: granted,
+        };
+    }
+    let claim = |charged: u64| ReactorEvent::CursorClaimed {
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        through: chain[1],
+        headers: 2,
+        bytes: charged,
+        page_last: chain[1],
+        page_headers: 2,
+        page_bytes: charged,
+        totals: Default::default(),
+    };
+    let with = |charged| credit_breaks(&[reserved(1, 10), v1.clone(), claim(charged)]);
+    assert_eq!(
+        with(credit::page_size(2, AuxSchema::V1)),
+        Vec::<String>::new()
+    );
+    let found = with(credit::page_size(2, AuxSchema::None));
+    assert!(
+        found.iter().any(|found| found.contains("which takes")),
         "{found:?}"
     );
 }

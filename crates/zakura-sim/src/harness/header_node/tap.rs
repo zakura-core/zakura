@@ -235,6 +235,9 @@ enum ProbeSlot {
 struct WorkCheck {
     ledger: HeaderWorkLedger,
     broken: Option<String>,
+    /// Whether a drain followed the first integrity failure, after which
+    /// the ledger folds nothing more.
+    stopped: bool,
     claims: Vec<ClaimBreak>,
     /// Whether the teardown check ran.
     finished: bool,
@@ -260,11 +263,16 @@ impl TapState {
     }
 
     /// Feeds `event` to the ownership check, keeping the first broken
-    /// integrity rule and every claim break.
+    /// integrity rule and every claim break. After an integrity failure the
+    /// ledger still folds the rest of that step's events, so a claim later
+    /// in the step drains ahead of the failure. It stops at the step's
+    /// drain.
     fn check_work(&self, event: &ReactorEvent) {
         let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
-        if work.broken.is_none() {
-            work.broken = work.ledger.observe(event).err();
+        if !work.stopped {
+            if let Err(rule) = work.ledger.observe(event) {
+                work.broken.get_or_insert(rule);
+            }
             let claims = work.ledger.take_claims();
             work.claims.extend(claims);
         }
@@ -278,13 +286,11 @@ impl TapState {
         if let Some(record) = self.claims.unreported(Some(step)) {
             return Err(record.detail);
         }
-        let claims = mem::take(
-            &mut self
-                .work
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .claims,
-        );
+        let claims = {
+            let mut work = self.work.lock().unwrap_or_else(PoisonError::into_inner);
+            work.stopped |= work.broken.is_some();
+            mem::take(&mut work.claims)
+        };
         for broken in claims {
             self.claims.record(ClaimRecord {
                 step,
@@ -371,6 +377,7 @@ impl TapState {
             released: work.ledger.released_rounds(),
             unsettled: work.ledger.unsettled_rounds(),
             stuck: work.ledger.stuck_rounds(),
+            tainted: work.ledger.tainted_rounds(),
             shutdown: self.shutdown.load(Ordering::Relaxed),
             settled: self.settled.load(Ordering::Relaxed),
         });

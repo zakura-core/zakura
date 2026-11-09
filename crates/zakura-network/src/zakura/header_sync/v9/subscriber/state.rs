@@ -510,6 +510,9 @@ impl SubscriberState {
         live.accepted = *cursor;
         #[cfg(any(test, zakura_sim))]
         if let Some(tap) = &self.credit {
+            let stored = *tools
+                .accepted(&id)
+                .expect("the subscription just accepted a cursor");
             tap.observer.observe(ReactorEvent::CursorsAccepted {
                 peer: tap.peer.clone(),
                 session_id: tap.session_id,
@@ -517,6 +520,11 @@ impl SubscriberState {
                 through: Frontier::new(cursor.height, cursor.hash),
                 headers: cursor.headers,
                 bytes: cursor.bytes,
+                stored: (
+                    Frontier::new(stored.height, stored.hash),
+                    stored.headers,
+                    stored.bytes,
+                ),
                 totals: totals(tools, id),
             });
         }

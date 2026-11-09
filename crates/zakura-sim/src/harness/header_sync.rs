@@ -1837,30 +1837,18 @@ mod tests {
             property.outcome,
             crate::PropertyOutcome::Violated { witness: vec![2] }
         );
-        let findings: Vec<(u64, &[u64], &str, &str)> = property
-            .violations
-            .iter()
-            .map(|v| {
-                (
-                    v.step,
-                    v.witness.as_slice(),
-                    v.expected.as_str(),
-                    v.actual.as_str(),
-                )
-            })
-            .collect();
+        let found = |expected: &str, actual: &str| crate::Violation {
+            property: OPERATION_IDS.to_owned(),
+            step: 2,
+            witness: vec![2],
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        };
         assert_eq!(
-            findings,
+            property.violations,
             [
-                (
-                    2,
-                    &[2][..],
-                    "operation 1 completes once",
-                    "operation 1 completed again"
-                ),
-                (
-                    2,
-                    &[2][..],
+                found("operation 1 completes once", "operation 1 completed again"),
+                found(
                     "a completion of a submitted operation, at most 2",
                     "operation 3 completed before its submission"
                 ),

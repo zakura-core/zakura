@@ -478,7 +478,8 @@ mod tests {
     use super::{
         chunk_budget_bound, stale_completion_inert, teardown_end_violations,
         teardown_returns_baseline, BudgetView, EndViolation, StaleView, TeardownView,
-        CACHED_PASS_REFILL, CHUNK_BUDGET_CAPACITY,
+        CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND, CHUNK_BUDGET_CAPACITY, STALE_COMPLETION_INERT,
+        TEARDOWN_RETURNS_BASELINE,
     };
     use crate::{
         harness::header_node::{
@@ -489,7 +490,7 @@ mod tests {
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim,
+        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
 
     /// The model's capacity and refill interval are production's.
@@ -938,10 +939,11 @@ mod tests {
                         held headers once settled, and no locator permit a pending storage \
                         read doesn't hold";
         let stale = "a stale completion's handler returns only its own round's budget";
-        /// A property, the claims the boundary broke, what the property
-        /// expects, and the two findings it reports.
+        /// A property, its ID, the claims the boundary broke, what the
+        /// property expects, and the two findings it reports.
         type Case<'e> = (
             Property<Probe>,
+            &'static str,
             &'static [Claim],
             &'e str,
             [&'static str; 2],
@@ -949,6 +951,7 @@ mod tests {
         let cases: [Case<'_>; 3] = [
             (
                 chunk_budget_bound(),
+                CHUNK_BUDGET_BOUND,
                 &[
                     Claim::BudgetOverCapacity,
                     Claim::LeakedLease,
@@ -959,6 +962,7 @@ mod tests {
             ),
             (
                 teardown_returns_baseline(),
+                TEARDOWN_RETURNS_BASELINE,
                 &[
                     Claim::LeakedReservation,
                     Claim::OverBudget,
@@ -969,6 +973,7 @@ mod tests {
             ),
             (
                 stale_completion_inert(),
+                STALE_COMPLETION_INERT,
                 &[
                     Claim::StaleCompletionEffect,
                     Claim::LeakedLease,
@@ -978,27 +983,18 @@ mod tests {
                 ["StaleCompletionEffect #0", "StaleCompletionEffect #2"],
             ),
         ];
-        for (property, claims, expected, [first, second]) in cases {
-            let id = property.id.to_string();
+        for (property, id, claims, expected, [first, second]) in cases {
             let report = run_property(property, &[Scripted::Breaks(claims)]);
-            let found: Vec<(u64, &[u64], &str, &str)> = report.properties[0]
-                .violations
-                .iter()
-                .map(|v| {
-                    (
-                        v.step,
-                        v.witness.as_slice(),
-                        v.expected.as_str(),
-                        v.actual.as_str(),
-                    )
-                })
-                .collect();
+            let found = |actual: &str| Violation {
+                property: id.to_owned(),
+                step: 1,
+                witness: vec![1],
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            };
             assert_eq!(
-                found,
-                [
-                    (1, &[1][..], expected, first),
-                    (1, &[1][..], expected, second)
-                ],
+                report.properties[0].violations,
+                [found(first), found(second)],
                 "{id}"
             );
             assert_eq!(

@@ -20,7 +20,7 @@ use zakura_sim::{
     observe::StreamId,
     property::{Property, Source},
     table::{rule_row, table_properties, GeneratedId, Template},
-    Observation, Outcome, PropertyOutcome, RunReport,
+    Observation, Outcome, PropertyOutcome, RunReport, Violation,
 };
 
 /// The `feed` stream: a subscription with its page and terminal outcome.
@@ -477,19 +477,20 @@ fn every_unjustified_punishment_is_a_violation() {
         closed("header_peer_fault"),
         on(2, closed("header_peer_fault")),
     ]]);
+    let id = "feed/s64v1/conformant-never-closes";
     let close = "a close with cause header_peer_fault";
     assert_eq!(
-        findings(&report, "feed/s64v1/conformant-never-closes"),
+        violations(&report, id),
         [
-            (
-                1,
-                &[1][..],
+            violation(
+                id,
+                (1, &[1]),
                 "connection 1's judged frames are all conformant, so no punishment",
                 close
             ),
-            (
-                1,
-                &[1][..],
+            violation(
+                id,
+                (1, &[1]),
                 "connection 2's judged frames are all conformant, so no punishment",
                 close
             ),
@@ -528,25 +529,31 @@ fn judged_on(
     ]
 }
 
-/// Each violation of `id` in `report`, as (step, witness, expected,
-/// actual).
-fn findings<'r>(report: &'r RunReport, id: &str) -> Vec<(u64, &'r [u64], &'r str, &'r str)> {
-    report
+/// Each violation the report of `id` in `report` keeps.
+fn violations<'r>(report: &'r RunReport, id: &str) -> &'r [Violation] {
+    &report
         .properties
         .iter()
         .find(|p| p.property == id)
         .unwrap_or_else(|| panic!("{id} is registered"))
         .violations
-        .iter()
-        .map(|v| {
-            (
-                v.step,
-                v.witness.as_slice(),
-                v.expected.as_str(),
-                v.actual.as_str(),
-            )
-        })
-        .collect()
+}
+
+/// A violation of `property` at `step`, with `witness`, `expected` and
+/// `actual`.
+fn violation(
+    property: &str,
+    (step, witness): (u64, &[u64]),
+    expected: &str,
+    actual: &str,
+) -> Violation {
+    Violation {
+        property: property.to_owned(),
+        step,
+        witness: witness.to_vec(),
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    }
 }
 
 /// C21: two faults on two connections that nothing punishes are two
@@ -564,19 +571,20 @@ fn every_unpunished_fault_at_a_boundary_is_reported() {
     let report = run_script(vec![first, vec![]]);
     // Step 1 judges both frames, step 2 is the empty batch, and the run
     // goes quiescent after step 3, when the node's task exits.
+    let id = "feed/s64v1/undeclared-type-closes";
     let open = "the scheduler is Quiescent after step 3 with the obligation from step 1 open";
     assert_eq!(
-        findings(&report, "feed/s64v1/undeclared-type-closes"),
+        violations(&report, id),
         [
-            (
-                3,
-                &[1, 3][..],
+            violation(
+                id,
+                (3, &[1, 3]),
                 "Session(\"1\") discharged before quiescence",
                 open
             ),
-            (
-                3,
-                &[1, 3][..],
+            violation(
+                id,
+                (3, &[1, 3]),
                 "Session(\"2\") discharged before quiescence",
                 open
             ),
@@ -599,18 +607,19 @@ fn every_cadence_punishment_at_a_boundary_is_reported() {
             Observation::Misbehavior { connection: 2 },
         ],
     ]);
+    let id = "test/s65v2/status/cadence-never-closes";
     assert_eq!(
-        findings(&report, "test/s65v2/status/cadence-never-closes"),
+        violations(&report, id),
         [
-            (
-                2,
-                &[2][..],
+            violation(
+                id,
+                (2, &[2]),
                 "connection 1's judged frames are all conformant, so no punishment",
                 "a close with cause request_protocol_reject"
             ),
-            (
-                2,
-                &[2][..],
+            violation(
+                id,
+                (2, &[2]),
                 "connection 2's judged frames are all conformant, so no punishment",
                 "a Misbehavior"
             ),

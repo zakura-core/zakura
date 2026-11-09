@@ -38,7 +38,7 @@ use zakura_sim::{
     property::{Assume, AssumeRecord, Assumptions, HasView, Property, Source},
     table::{sender_properties, table_properties, GeneratedId, Template},
     witness::{judge_report, Expect},
-    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport,
+    MemorySink, Observation, Plan, PlanInput, PropertyOutcome, RunReport, Violation,
 };
 
 /// Header sync's stream at the version it tables.
@@ -795,30 +795,21 @@ fn every_punishment_of_an_honest_peer_at_a_step_is_reported() {
         .iter()
         .find(|property| property.property == HONEST_NEVER_PUNISHED)
         .expect("registered");
-    let found: Vec<(u64, &[u64], &str, &str)> = honest
-        .violations
-        .iter()
-        .map(|v| {
-            (
-                v.step,
-                v.witness.as_slice(),
-                v.expected.as_str(),
-                v.actual.as_str(),
-            )
-        })
-        .collect();
+    let found = |expected: &str, actual: &str| Violation {
+        property: "session/honest-never-punished".to_owned(),
+        step: 2,
+        witness: vec![2],
+        expected: expected.to_owned(),
+        actual: actual.to_owned(),
+    };
     assert_eq!(
-        found,
+        honest.violations,
         [
-            (
-                2,
-                &[2][..],
+            found(
                 "honest peer-0's connection 1 is never punished",
                 "a close with cause ordered_read_rejected"
             ),
-            (
-                2,
-                &[2][..],
+            found(
                 "honest peer-0's connection 2 is never punished",
                 "a Misbehavior"
             ),

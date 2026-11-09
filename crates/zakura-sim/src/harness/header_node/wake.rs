@@ -358,11 +358,11 @@ mod tests {
 
     use super::{WakeEvidence, WakeFact};
     use crate::{
-        domain::header_sync::{capacity_release_wakes, WakeView},
+        domain::header_sync::{capacity_release_wakes, WakeView, CAPACITY_RELEASE_WAKES},
         peer::peer_id,
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         storage::hex,
-        ActionSource, Boundary, Identity, MemorySink, ObservationLog, PlanInput, Sim,
+        ActionSource, Boundary, Identity, MemorySink, ObservationLog, PlanInput, Sim, Violation,
     };
 
     /// Wake evidence with no tap behind it.
@@ -459,26 +459,17 @@ mod tests {
             &Sources::observed(&[Source::Schedule, Source::View]),
         );
         let report = sim.run(&mut checker, &mut MemorySink::default());
-        let found: Vec<(u64, &[u64], &str, &str)> = report.properties[0]
-            .violations
-            .iter()
-            .map(|v| {
-                (
-                    v.step,
-                    v.witness.as_slice(),
-                    v.expected.as_str(),
-                    v.actual.as_str(),
-                )
-            })
-            .collect();
-        let (first, second) = (discharged(&first, 3), discharged(&second, 4));
-        let open = "the scheduler is Quiescent after step 2 with the obligation from step 1 open";
+        let found = |expected: String| Violation {
+            property: CAPACITY_RELEASE_WAKES.to_owned(),
+            step: 2,
+            witness: vec![1, 2],
+            expected,
+            actual: "the scheduler is Quiescent after step 2 with the obligation from step 1 open"
+                .to_owned(),
+        };
         assert_eq!(
-            found,
-            [
-                (2, &[1, 2][..], first.as_str(), open),
-                (2, &[1, 2][..], second.as_str(), open),
-            ]
+            report.properties[0].violations,
+            [found(discharged(&first, 3)), found(discharged(&second, 4))]
         );
     }
 }

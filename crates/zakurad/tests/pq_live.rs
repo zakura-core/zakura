@@ -16,6 +16,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use eyre::{eyre, Result};
+use hex::FromHex;
 use zakura_chain::{
     amount::{Amount, NonNegative},
     parameters::NetworkUpgrade,
@@ -131,6 +132,26 @@ async fn pq_live_spend() -> Result<()> {
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| eyre!("the node reports its height"))?,
     )?;
+    // A v5 transaction names the upgrade whose rules it is made under, and the node refuses
+    // one that is not the upgrade in force, so take it from the chain rather than assuming.
+    let next_branch = chain
+        .pointer("/consensus/nextblock")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre!("the node reports the next block's consensus branch"))?;
+    let branch = zakura_chain::parameters::ConsensusBranchId::from_hex(next_branch)
+        .map_err(|error| eyre!("{next_branch} is not a consensus branch id: {error}"))?;
+    let upgrade = [
+        NetworkUpgrade::Nu7,
+        NetworkUpgrade::Nu6_3,
+        NetworkUpgrade::Nu6_2,
+        NetworkUpgrade::Nu6_1,
+        NetworkUpgrade::Nu6,
+        NetworkUpgrade::Nu5,
+    ]
+    .into_iter()
+    .find(|candidate| candidate.branch_id() == Some(branch))
+    .ok_or_else(|| eyre!("no known upgrade has consensus branch {next_branch}"))?;
+    println!("the next block is under {upgrade:?} (branch {next_branch})");
     let utxos: Vec<Utxo> = client
         .json_result_from_call(
             "getaddressutxos",
@@ -164,7 +185,7 @@ async fn pq_live_spend() -> Result<()> {
     let pq_script = Script::new(&output::output_script(PARAMETERS, &body)?.0);
 
     let transaction = |outpoint, unlock: Vec<u8>, outputs| Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
+        network_upgrade: upgrade,
         lock_time: LockTime::unlocked(),
         expiry_height: zakura_chain::block::Height(0),
         inputs: vec![Input::PrevOut {
@@ -230,7 +251,7 @@ async fn pq_live_spend() -> Result<()> {
         outputs[0] = Output::new((half - fee)?.constrain()?, address.script());
     }
     let digest = spend
-        .sighasher(NetworkUpgrade::Nu5, Arc::new(previous))?
+        .sighasher(upgrade, Arc::new(previous))?
         .sighash(HashType::ALL, Some((0, body.0.clone())));
     let mut signature = key.sign(
         &digest.0,

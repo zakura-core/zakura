@@ -2861,9 +2861,14 @@ impl HeaderSyncReactor {
                     }
                 }
             } else {
+                // A peer whose answer our own prepare or apply is still
+                // handling already answered, so the timeout isn't its fault.
+                // Charging it would also let a finished apply that the drain
+                // hasn't seen yet cost its peer a strike.
                 let session_id = self
                     .peer_work_queue
                     .active(&peer)
+                    .filter(|active| active.phase == HeaderTargetPhase::Receiving)
                     .map(|active| active.owner.session_id());
                 self.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
                 metrics::counter!("sync.header.target.timed_out.total").increment(1);

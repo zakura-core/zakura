@@ -65,12 +65,7 @@ impl EvictionFixture {
 
     /// Publish one request owned by `session_id` and let its deadline expire unanswered.
     fn time_out_one_request(&mut self, session_id: u64) {
-        seed_applying_request(
-            &mut self.reactor,
-            &self.snapshot,
-            self.peer.clone(),
-            session_id,
-        );
+        self.start_receiving(session_id);
         let deadline = Instant::now();
         self.reactor
             .state
@@ -181,6 +176,39 @@ fn unresponsive_header_peer_is_dropped_after_the_configured_strikes() {
         )),
         "the drop is reported as its own action: {actions:?}"
     );
+}
+
+/// A peer whose answer our own apply is still handling isn't charged when
+/// the request's deadline passes. It answered, and the apply may already
+/// have finished without the reactor having handled it yet.
+#[test]
+fn a_timeout_during_our_own_apply_charges_no_strike() {
+    let mut fixture = eviction_fixture(1, 7);
+    seed_applying_request(
+        &mut fixture.reactor,
+        &fixture.snapshot,
+        fixture.peer.clone(),
+        7,
+    );
+    let deadline = Instant::now();
+    fixture
+        .reactor
+        .state
+        .request_deadlines
+        .insert(fixture.peer.clone(), deadline);
+
+    fixture.reactor.retire_timed_out_requests(deadline);
+
+    assert!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(&fixture.peer)
+            .is_none(),
+        "the timed-out request still retires"
+    );
+    assert_eq!(fixture.unproductive_requests(), Some(0));
+    assert!(fixture.is_admitted() && !fixture.cancel.is_cancelled());
 }
 
 #[test]

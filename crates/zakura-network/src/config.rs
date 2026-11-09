@@ -35,11 +35,12 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        DEFAULT_ADVERT_WINDOW_FULL_BLOCK, DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
-        DEFAULT_ADVERT_WINDOW_SMALL_BLOCK, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
-        DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
-        DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
-        MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
+        DEFAULT_ADVERT_DELAY_MAX, DEFAULT_ADVERT_DELAY_MIN, DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
+        DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES, DEFAULT_CRAWL_NEW_PEER_INTERVAL,
+        DEFAULT_MAX_CONNS_PER_IP, DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT,
+        INBOUND_PEER_LIMIT_MULTIPLIER, MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR,
+        OUTBOUND_PEER_LIMIT_MULTIPLIER,
     },
     protocol::external::{canonical_peer_addr, canonical_socket_addr},
     zakura::ZakuraConfig,
@@ -417,7 +418,7 @@ pub struct Config {
     ///
     /// The delay grows linearly to `advert_delay_max` between the configured size thresholds.
     /// Each broadcast measures this delay once from its start, independently of peer requests
-    /// and uploads. Zero announces to every peer immediately. Defaults to zero.
+    /// and uploads. Zero announces to every peer immediately. Defaults to 500 ms.
     ///
     /// Experimental.
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
@@ -425,9 +426,9 @@ pub struct Config {
 
     /// The delay before announcing full-sized or unknown-sized blocks to remaining peers.
     ///
-    /// Must be at least `advert_delay_min`. Defaults to zero until measurements justify a
-    /// nonzero default. Delaying inventory can reduce redundant requests but does not bound
-    /// concurrent body writes.
+    /// Must be at least `advert_delay_min`. Defaults to 500 ms, the delay used in every
+    /// 80-node fleet measurement since staged announcements were introduced. Delaying inventory
+    /// can reduce redundant requests but does not bound concurrent body writes.
     /// The delay shares the daemon's [`crate::constants::BLOCK_GOSSIP_TIMEOUT`] budget with
     /// peer discovery and delivery tracking. A delay that exhausts that budget can prevent
     /// announcements to the remaining peers.
@@ -1047,8 +1048,8 @@ impl Default for Config {
             advert_window_small_block: DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
-            advert_delay_min: Duration::ZERO,
-            advert_delay_max: Duration::ZERO,
+            advert_delay_min: DEFAULT_ADVERT_DELAY_MIN,
+            advert_delay_max: DEFAULT_ADVERT_DELAY_MAX,
         }
     }
 }

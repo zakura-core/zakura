@@ -1924,8 +1924,8 @@ fn advert_delays_roundtrip_and_validate() {
     let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
     assert_eq!(config, roundtrip);
     let default: Config = toml::from_str("").unwrap();
-    assert_eq!(default.advert_delay_min, Duration::ZERO);
-    assert_eq!(default.advert_delay_max, Duration::ZERO);
+    assert_eq!(default.advert_delay_min, Duration::from_millis(500));
+    assert_eq!(default.advert_delay_max, Duration::from_millis(500));
     for text in [
         "advert_delay_min = '1s'\nadvert_delay_max = '500ms'",
         "advert_delay_min = '-1s'",

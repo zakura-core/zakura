@@ -17,7 +17,7 @@ index c488b85bd5..7592cd64d9 100644
      let answer = sink
          .queries
 diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
-index 3d5746878a..79e8a87e48 100644
+index 3d5746878a..57e76fb80e 100644
 --- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
 +++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
 @@ -186,6 +186,14 @@ impl<'a> FrameFilter<'a> {
@@ -25,12 +25,12 @@ index 3d5746878a..79e8a87e48 100644
              });
          }
 +        // Planted bypass: discovery's reader skips the maximum of its
-+        // `get-services` row, and a response's precheck, up to the frame cap.
++        // `get-services` row, a response's precheck and the frame cap.
 +        if rules == crate::zakura::discovery::wire::RULES
 +            && *rule == crate::zakura::discovery::wire::GET_SERVICES
 +            && payload_len > rule.payload.max()
 +        {
-+            return Ok(frame_cap);
++            return Ok(FRAME_HEADER_BYTES.saturating_add(payload_len));
 +        }
          if let (MessageRole::Response { .. }, Some(precheck)) = (rule.role, self.precheck) {
              precheck.check(message_type, payload_len)?;

@@ -1,8 +1,8 @@
-# Discovery's reader skips the maximum of its `services` row and its
-# precheck, and discovery drops a `services` frame over that maximum instead
-# of closing. Skipping the reader's check alone would leave discovery's
-# codec to close. The scenario's peer sends its held `Services` one byte
-# over the row's maximum, and the node never closes for it.
+# Discovery's reader skips the maximum of its `services` row, its precheck
+# and the frame cap, and discovery drops a `services` frame over that
+# maximum instead of closing. Skipping the reader's checks alone would leave
+# discovery's codec to close. The scenario's peer sends its held `Services`
+# one byte over the row's maximum, and the node never closes for it.
 # Besides the files the patch changes, the reader's read path and the rest
 # of discovery decide whether the frame reaches the drop.
 checks = [

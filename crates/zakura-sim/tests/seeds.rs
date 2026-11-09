@@ -14,7 +14,7 @@ use zakura_sim::{
         block_sync::BlockScenario,
         discovery,
         fixtures::{PickScenario, Variant, Which},
-        header_sync::{StorageScenario, WakeScenario},
+        header_sync::{FloodScenario, StorageScenario, WakeScenario},
         wire_plans::SavedPlan,
     },
     seed::{self, SeedError, SeedKind, SeedReport},
@@ -143,6 +143,8 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
         }
         "header-release-wake" => value(WakeScenario::Release),
         "header-release-wake-deferred" => value(WakeScenario::Deferred),
+        "header-flood-wire" => value(FloodScenario::Wire),
+        "header-flood-lifecycle" => value(FloodScenario::Lifecycle),
         _ => None,
     }
 }

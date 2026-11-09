@@ -1354,72 +1354,100 @@ where
         joinsplit_data: Option<&transaction::JoinSplitData<Groth16Proof>>,
         shielded_sighash: &SigHash,
     ) -> Result<AsyncChecks, TransactionError> {
+        match joinsplit_data {
+            Some(joinsplit_data) => Self::verify_joinsplit_data(joinsplit_data, shielded_sighash),
+            None => Ok(AsyncChecks::new()),
+        }
+    }
+
+    /// Queues the Groth16 proof check for each JoinSplit in `joinsplit_data`, and the
+    /// check of its `joinSplitSig` over `shielded_sighash`.
+    #[cfg(feature = "sprout")]
+    fn verify_joinsplit_data(
+        joinsplit_data: &transaction::JoinSplitData<Groth16Proof>,
+        shielded_sighash: &SigHash,
+    ) -> Result<AsyncChecks, TransactionError> {
         let mut checks = AsyncChecks::new();
 
-        if let Some(joinsplit_data) = joinsplit_data {
-            for joinsplit in joinsplit_data.joinsplits() {
-                // # Consensus
-                //
-                // > The proof π_ZKJoinSplit MUST be valid given a
-                // > primary input formed from the relevant other fields and h_{Sig}
-                //
-                // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
-                //
-                // Queue the verification of the Groth16 spend proof
-                // for each JoinSplit description while adding the
-                // resulting future to our collection of async
-                // checks that (at a minimum) must pass for the
-                // transaction to verify.
-                checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
-                    primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)?,
-                ));
-            }
-
+        for joinsplit in joinsplit_data.joinsplits() {
             // # Consensus
             //
-            // > If effectiveVersion ≥ 2 and nJoinSplit > 0, then:
-            // > - joinSplitPubKey MUST be a valid encoding of an Ed25519 validating key
-            // > - joinSplitSig MUST represent a valid signature under
-            //     joinSplitPubKey of dataToBeSigned, as defined in § 4.11
+            // > The proof π_ZKJoinSplit MUST be valid given a
+            // > primary input formed from the relevant other fields and h_{Sig}
             //
-            // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
             //
-            // The `if` part is indirectly enforced, since the `joinsplit_data`
-            // is only parsed if those conditions apply in
-            // [`Transaction::zcash_deserialize`].
-            //
-            // The valid encoding is defined in
-            //
-            // > A valid Ed25519 validating key is defined as a sequence of 32
-            // > bytes encoding a point on the Ed25519 curve
-            //
-            // https://zips.z.cash/protocol/protocol.pdf#concreteed25519
-            //
-            // which is enforced during signature verification, in both batched
-            // and single verification, when decompressing the encoded point.
-            //
-            // Queue the validation of the JoinSplit signature while
-            // adding the resulting future to our collection of
-            // async checks that (at a minimum) must pass for the
+            // Queue the verification of the Groth16 spend proof
+            // for each JoinSplit description while adding the
+            // resulting future to our collection of async
+            // checks that (at a minimum) must pass for the
             // transaction to verify.
-            //
-            // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
-            // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
-            let mut ed25519_verifier = primitives::ed25519::VERIFIER.clone();
-            let ed25519_item =
-                (joinsplit_data.pub_key, joinsplit_data.sig, shielded_sighash).into();
-
-            let queueing = primitives::flush::Queueing::for_request();
-            checks.push(async move {
-                let response = ed25519_verifier.ready().await?.call(ed25519_item);
-                if let Some(queueing) = queueing {
-                    queueing.enqueued(primitives::flush::Verifier::Ed25519);
-                }
-                response.await
-            });
+            checks.push(primitives::groth16::JOINSPLIT_VERIFIER.oneshot(
+                primitives::groth16::Item::from_joinsplit(joinsplit, &joinsplit_data.pub_key)?,
+            ));
         }
 
+        // # Consensus
+        //
+        // > If effectiveVersion ≥ 2 and nJoinSplit > 0, then:
+        // > - joinSplitPubKey MUST be a valid encoding of an Ed25519 validating key
+        // > - joinSplitSig MUST represent a valid signature under
+        //     joinSplitPubKey of dataToBeSigned, as defined in § 4.11
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#txnconsensus
+        //
+        // The `if` part is indirectly enforced, since the `joinsplit_data`
+        // is only parsed if those conditions apply in
+        // [`Transaction::zcash_deserialize`].
+        //
+        // The valid encoding is defined in
+        //
+        // > A valid Ed25519 validating key is defined as a sequence of 32
+        // > bytes encoding a point on the Ed25519 curve
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#concreteed25519
+        //
+        // which is enforced during signature verification, in both batched
+        // and single verification, when decompressing the encoded point.
+        //
+        // Queue the validation of the JoinSplit signature while
+        // adding the resulting future to our collection of
+        // async checks that (at a minimum) must pass for the
+        // transaction to verify.
+        //
+        // https://zips.z.cash/protocol/protocol.pdf#sproutnonmalleability
+        // https://zips.z.cash/protocol/protocol.pdf#txnencodingandconsensus
+        let mut ed25519_verifier = primitives::ed25519::VERIFIER.clone();
+        let ed25519_item = (
+            ed25519_zebra::VerificationKeyBytes::from(joinsplit_data.pub_key.0),
+            ed25519_zebra::Signature::from(joinsplit_data.sig.0),
+            shielded_sighash,
+        )
+            .into();
+
+        let queueing = primitives::flush::Queueing::for_request();
+        checks.push(async move {
+            let response = ed25519_verifier.ready().await?.call(ed25519_item);
+            if let Some(queueing) = queueing {
+                queueing.enqueued(primitives::flush::Verifier::Ed25519);
+            }
+            response.await
+        });
+
         Ok(checks)
+    }
+
+    /// Refuses to verify JoinSplit proofs and signatures, because this build has no Sprout
+    /// verifier.
+    ///
+    /// The refusal is a local capability limit, not a consensus verdict: see
+    /// [`TransactionError::SproutVerifierNotBuilt`].
+    #[cfg(not(feature = "sprout"))]
+    fn verify_joinsplit_data(
+        _joinsplit_data: &transaction::JoinSplitData<Groth16Proof>,
+        _shielded_sighash: &SigHash,
+    ) -> Result<AsyncChecks, TransactionError> {
+        Err(TransactionError::SproutVerifierNotBuilt)
     }
 
     /// Verifies a transaction's Sapling shielded data.

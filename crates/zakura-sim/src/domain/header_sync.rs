@@ -4,8 +4,11 @@
 //! trait, so a shared property can take the check over later by
 //! registering it against another view.
 
+use zakura_network::zakura::observe::EventQueue;
+
 use crate::{
     harness::header_node::{
+        adoption::{AdoptionEvidence, WatchRead},
         capacity::{BoundaryRead, CapacityEvidence},
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
@@ -577,6 +580,130 @@ fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
     view.wake().any_opened()
 }
 
+/// Under a wire flood, the run loop reads each externally published
+/// committed state from its watch before it takes a third wire event.
+pub const WATCH_OBSERVED_UNDER_FLOOD: &str = "header-sync/watch-observed-under-flood";
+
+/// Under lifecycle churn, the run loop reads each externally published
+/// committed state from its watch before it takes a third lifecycle event.
+pub const WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD: &str =
+    "header-sync/watch-observed-under-lifecycle-flood";
+
+/// What the flood checks read: one reactor's adoption evidence, which
+/// keeps publications, watch reads and taken events in order.
+pub trait AdoptionView {
+    /// The reactor's adoption evidence.
+    fn adoption(&self) -> &AdoptionEvidence;
+}
+
+/// [`WATCH_OBSERVED_UNDER_FLOOD`], as a harness whose view is an
+/// [`AdoptionView`] registers it.
+pub fn watch_observed_under_flood<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    watch_observed(
+        WATCH_OBSERVED_UNDER_FLOOD,
+        "the run loop reads each externally published committed state from its watch \
+         before it takes a third wire event",
+        check_watch_under_flood::<S>,
+        published_under_wire_flood::<S::View>,
+    )
+}
+
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`], as a harness whose view is an
+/// [`AdoptionView`] registers it.
+pub fn watch_observed_under_lifecycle_flood<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    watch_observed(
+        WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD,
+        "the run loop reads each externally published committed state from its watch \
+         before it takes a third lifecycle event",
+        check_watch_under_lifecycle_flood::<S>,
+        published_under_lifecycle_flood::<S::View>,
+    )
+}
+
+/// One watch property: `id`, claiming `claim`, checked by `check`, with
+/// trigger history `triggered`. A view check that marks its own open
+/// obligations, since the registry's bounds can't count taken events.
+fn watch_observed<S: HasView>(
+    id: &'static str,
+    claim: &'static str,
+    check: fn(&mut CheckCtx<'_, S>) -> Verdict,
+    triggered: fn(&S::View, &ObservationLog) -> bool,
+) -> Property<S> {
+    Property {
+        id: PropertyId::new(id),
+        claim,
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check,
+        witness: Some(TriggerHistory::View(triggered)),
+    }
+}
+
+/// Checks [`WATCH_OBSERVED_UNDER_FLOOD`] after each step.
+fn check_watch_under_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    check_watch_read(cx, EventQueue::Wire)
+}
+
+/// Checks [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`] after each step.
+fn check_watch_under_lifecycle_flood<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    check_watch_read(cx, EventQueue::Lifecycle)
+}
+
+/// Checks the watch rule for `queue` over the view's adoption evidence
+/// ([`AdoptionEvidence::watch_read`]). It applies once a state is
+/// published. A publication still waiting for its read or its third event
+/// leaves the run inconclusive if it ends there.
+fn check_watch_read<S>(cx: &mut CheckCtx<'_, S>, queue: EventQueue) -> Verdict
+where
+    S: HasView,
+    S::View: AdoptionView,
+{
+    match cx.view().adoption().watch_read(queue) {
+        WatchRead::Nothing => Verdict::NotApplicable,
+        WatchRead::Holds => Verdict::Holds,
+        WatchRead::Open => {
+            cx.unsettled(Inconclusive::ObligationOpen);
+            Verdict::Holds
+        }
+        WatchRead::Broken(why) => cx.violated(
+            "each published state is read from the committed watch before a third event \
+             from the flooded queue",
+            why,
+        ),
+    }
+}
+
+/// [`WATCH_OBSERVED_UNDER_FLOOD`]'s trigger history: a published state
+/// whose wire queue competed with its watch read
+/// ([`AdoptionEvidence::published_into_flood`]).
+fn published_under_wire_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
+    view.adoption().published_into_flood(EventQueue::Wire)
+}
+
+/// [`WATCH_OBSERVED_UNDER_LIFECYCLE_FLOOD`]'s trigger history: a published
+/// state whose lifecycle queue competed with its watch read.
+fn published_under_lifecycle_flood<V: AdoptionView>(view: &V, _: &ObservationLog) -> bool {
+    view.adoption().published_into_flood(EventQueue::Lifecycle)
+}
+
 /// [`STALE_COMPLETION_INERT`]'s trigger history: a prepare or apply ended
 /// stale.
 fn stale_ended<V: StaleView>(view: &V, _: &ObservationLog) -> bool {
@@ -629,18 +756,21 @@ mod tests {
     };
 
     use super::{
-        chunk_budget_bound, teardown_end_violations, teardown_returns_baseline, BudgetView,
-        EndViolation, TeardownView, CACHED_PASS_REFILL, CHUNK_BUDGET_CAPACITY,
+        chunk_budget_bound, stale_completion_inert, teardown_end_violations,
+        teardown_returns_baseline, BudgetView, EndViolation, StaleView, TeardownView,
+        CACHED_PASS_REFILL, CHUNK_BUDGET_BOUND, CHUNK_BUDGET_CAPACITY, STALE_COMPLETION_INERT,
+        TEARDOWN_RETURNS_BASELINE,
     };
     use crate::{
         harness::header_node::{
             capacity::{BoundaryRead, CapacityEvidence, CapacityReading},
             claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
+            stale::StaleEvidence,
         },
         property::{Assumptions, HasView, Registry, RegistryChecker, Source, Sources},
         property::{Property, Status},
         ActionSource, Boundary, HarnessFailure, Identity, MemorySink, ObservationLog, Outcome,
-        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim,
+        PlanInput, PropertyOutcome, RunEnd, RunReport, Sim, Violation,
     };
 
     /// The model's capacity and refill interval are production's.
@@ -656,6 +786,17 @@ mod tests {
         capacity: CapacityEvidence,
         claims: ClaimEvidence,
         rounds: SettlementEvidence,
+        stale_calls: StaleEvidence,
+    }
+
+    impl StaleView for Probe {
+        fn claims(&self) -> &ClaimEvidence {
+            &self.claims
+        }
+
+        fn stale_calls(&self) -> &StaleEvidence {
+            &self.stale_calls
+        }
     }
 
     impl TeardownView for Probe {
@@ -713,6 +854,7 @@ mod tests {
             settled: bool,
         },
         Broke(Claim),
+        Breaks(&'static [Claim]),
     }
 
     /// Records the next scripted evidence at each boundary, as a tap would.
@@ -781,6 +923,15 @@ mod tests {
                         shutdown: false,
                         settled: false,
                     });
+                }
+                Some(Scripted::Breaks(claims)) => {
+                    for (at, &claim) in claims.iter().enumerate() {
+                        self.probe.claims.record(ClaimRecord {
+                            step,
+                            claim,
+                            detail: format!("{claim:?} #{at}"),
+                        });
+                    }
                 }
                 None => {}
             }
@@ -1054,6 +1205,83 @@ mod tests {
             let violations = &report.properties[0].violations;
             assert_eq!(violations.len(), 1, "{claim:?}: {violations:?}");
             assert_eq!(violations[0].step, 2, "{claim:?}");
+        }
+    }
+
+    /// Every claim break one boundary's drain found survives into the
+    /// report, not just the first, for each check that reads claim breaks:
+    /// the first and third of three at step 1, in the order the tap found
+    /// them. The second is another rule's, which the check doesn't report.
+    #[test]
+    fn every_claim_break_at_a_boundary_is_reported() {
+        let budget = format!("at most {CHUNK_BUDGET_CAPACITY} headers reserved and owned");
+        let teardown = "a released round, and a stopped node, keeps no reservation, lease or \
+                        held headers once settled, and no locator permit a pending storage \
+                        read doesn't hold";
+        let stale = "a stale completion's handler returns only its own round's budget";
+        /// A property, its ID, the claims the boundary broke, what the
+        /// property expects, and the two findings it reports.
+        type Case<'e> = (
+            Property<Probe>,
+            &'static str,
+            &'static [Claim],
+            &'e str,
+            [&'static str; 2],
+        );
+        let cases: [Case<'_>; 3] = [
+            (
+                chunk_budget_bound(),
+                CHUNK_BUDGET_BOUND,
+                &[
+                    Claim::BudgetOverCapacity,
+                    Claim::LeakedLease,
+                    Claim::OverBudget,
+                ],
+                &budget,
+                ["BudgetOverCapacity #0", "OverBudget #2"],
+            ),
+            (
+                teardown_returns_baseline(),
+                TEARDOWN_RETURNS_BASELINE,
+                &[
+                    Claim::LeakedReservation,
+                    Claim::OverBudget,
+                    Claim::LeakedLease,
+                ],
+                teardown,
+                ["LeakedReservation #0", "LeakedLease #2"],
+            ),
+            (
+                stale_completion_inert(),
+                STALE_COMPLETION_INERT,
+                &[
+                    Claim::StaleCompletionEffect,
+                    Claim::LeakedLease,
+                    Claim::StaleCompletionEffect,
+                ],
+                stale,
+                ["StaleCompletionEffect #0", "StaleCompletionEffect #2"],
+            ),
+        ];
+        for (property, id, claims, expected, [first, second]) in cases {
+            let report = run_property(property, &[Scripted::Breaks(claims)]);
+            let found = |actual: &str| Violation {
+                property: id.to_owned(),
+                step: 1,
+                witness: vec![1],
+                expected: expected.to_owned(),
+                actual: actual.to_owned(),
+            };
+            assert_eq!(
+                report.properties[0].violations,
+                [found(first), found(second)],
+                "{id}"
+            );
+            assert_eq!(
+                report.properties[0].outcome,
+                PropertyOutcome::Violated { witness: vec![1] },
+                "{id}"
+            );
         }
     }
 }

@@ -1989,6 +1989,12 @@ fn hand_written_rows() -> Vec<Row> {
             &[SELECTED] as &'static [&'static str],
             Found::AtStep,
         ),
+        (
+            "selector-prefers-length",
+            STORAGE,
+            &[SELECTED] as &'static [&'static str],
+            Found::AtStep,
+        ),
     ]
     .into_iter()
     .enumerate()

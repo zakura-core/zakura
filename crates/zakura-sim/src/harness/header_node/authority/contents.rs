@@ -13,10 +13,11 @@
 //!   node's stored header hashes to its key, and each held header is
 //!   eligible exactly when neither it nor an ancestor stands invalidated by
 //!   the port's `Reset` facts and not reconsidered. The stored selected
-//!   projection is the ancestry from the finalized anchor to its own tip,
-//!   each entry the parent of the next by its header, and the verified
-//!   projection is unchanged, since header applies and resets never verify
-//!   bodies. Which tip is selected is `expected-chain-selected`'s.
+//!   projection is the ancestry from the finalized anchor to the engine's
+//!   selected frontier, each entry the parent of the next by its header,
+//!   and the verified projection is unchanged, since header applies and
+//!   resets never verify bodies. Which tip is selected is
+//!   `expected-chain-selected`'s.
 
 use std::collections::{HashMap, HashSet};
 
@@ -177,6 +178,15 @@ impl Contents {
             ));
         }
         let projection = &after.selected_projection;
+        // Ending at the engine's own selected frontier is consistency, not
+        // fork choice, which is `expected-chain-selected`'s.
+        let selected = after.metadata.frontiers.header_best;
+        if projection.last() != Some(&selected) {
+            found.push(format!(
+                "left the selected projection ending at {:?}, not the selected frontier {selected:?}",
+                projection.last()
+            ));
+        }
         if projection.first() != Some(&after.graph.finalized_frontier) {
             found.push(format!(
                 "left the selected projection starting at {:?}, not the finalized anchor {:?}",

@@ -61,12 +61,30 @@ pub const BLOCK_MINING_WAIT_TIME: Duration = Duration::from_secs(3);
 
 /// Returns `true` if `new_header` should replace the internal miner's current
 /// block template.
+/// Whether a template update should replace the work the solvers are on.
+///
+/// Each side is a header and the number of mempool transactions the block carries, with no
+/// current work expressed as `None`.
+///
+/// An update that says the work already issued is still valid normally does not replace it,
+/// so a change in the mempool does not throw away a partly solved block. An empty block is
+/// the exception. The template served the moment the parent changes carries no mempool
+/// transactions at all, so that a miner can start on the new parent without waiting for the
+/// mempool to catch up, and the update that then brings those transactions says the old work
+/// is still valid. A miner that kept it would mine an empty block on every parent, however
+/// much the mempool holds, so an empty block is the one piece of work worth giving up.
 fn should_replace_mining_template(
-    current_header: Option<block::Header>,
-    new_header: block::Header,
+    current: Option<(block::Header, usize)>,
+    new: (block::Header, usize),
     submit_old: Option<bool>,
 ) -> bool {
-    current_header != Some(new_header) && (current_header.is_none() || submit_old != Some(true))
+    let (new_header, new_transactions) = new;
+    let Some((current_header, current_transactions)) = current else {
+        return true;
+    };
+
+    current_header != new_header
+        && (submit_old != Some(true) || (current_transactions == 0 && new_transactions > 0))
 }
 
 /// Cancels mining when the current template changes or becomes unavailable.
@@ -347,8 +365,11 @@ where
         // would discard useful solver work.
         let template_replaced = template_sender.send_if_modified(|old_block| {
             if !should_replace_mining_template(
-                old_block.as_ref().map(|block| *block.header),
-                *block.header,
+                old_block.as_ref().map(|old| {
+                    // Every block carries a coinbase transaction that came from no mempool.
+                    (*old.header, old.transactions.len().saturating_sub(1))
+                }),
+                (*block.header, transaction_count),
                 submit_old,
             ) {
                 return false;
@@ -658,26 +679,61 @@ mod tests {
         let mut changed_header = current_header;
         changed_header.nonce.0[0] ^= 1;
 
-        assert!(should_replace_mining_template(None, current_header, None));
+        assert!(should_replace_mining_template(
+            None,
+            (current_header, 0),
+            None
+        ));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            current_header,
+            Some((current_header, 0)),
+            (current_header, 0),
             Some(false),
         ));
         assert!(!should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some((current_header, 2)),
+            (changed_header, 2),
             Some(true),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some((current_header, 2)),
+            (changed_header, 2),
             Some(false),
         ));
         assert!(should_replace_mining_template(
-            Some(current_header),
-            changed_header,
+            Some((current_header, 2)),
+            (changed_header, 2),
             None,
+        ));
+    }
+
+    /// Work on an empty block is given up for a template that carries transactions, because
+    /// the template served at a parent change never carries any.
+    #[test]
+    fn mining_template_gives_up_an_empty_block_for_transactions() {
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .expect("block 1 deserializes");
+        let current_header = *block.header;
+        let mut changed_header = current_header;
+        changed_header.nonce.0[0] ^= 1;
+
+        // The update that brings the mempool's transactions says the old work is still valid.
+        assert!(should_replace_mining_template(
+            Some((current_header, 0)),
+            (changed_header, 3),
+            Some(true),
+        ));
+        // Work that already carries transactions is kept, and so is work the update does not
+        // add to.
+        assert!(!should_replace_mining_template(
+            Some((current_header, 1)),
+            (changed_header, 3),
+            Some(true),
+        ));
+        assert!(!should_replace_mining_template(
+            Some((current_header, 0)),
+            (changed_header, 0),
+            Some(true),
         ));
     }
 
@@ -700,8 +756,8 @@ mod tests {
         // It must replace the harder header even though that fixed header would
         // still be valid to submit.
         assert!(should_replace_mining_template(
-            Some(standard),
-            minimum,
+            Some((standard, 0)),
+            (minimum, 0),
             Some(false),
         ));
     }

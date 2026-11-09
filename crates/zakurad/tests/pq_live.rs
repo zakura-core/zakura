@@ -12,6 +12,8 @@
 //!   cargo test -p zakura --features pq --test pq_live -- --nocapture --ignored
 //! ```
 #![cfg(feature = "pq")]
+// An operator reads this fixture's progress as it runs, so it reports on stdout.
+#![allow(clippy::print_stdout)]
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -70,12 +72,19 @@ struct NetworkParameters {
 
 async fn wait_for_mined(client: &RpcRequestClient, transaction: &Transaction) -> Result<u32> {
     let id = transaction.hash().to_string();
+    println!("waiting for {id} to be mined");
     // Blocks are mined on a target spacing of seconds, so minutes is a generous wait.
     for _ in 0..240 {
-        let raw: serde_json::Value = client
-            .json_result_from_call("getrawtransaction", format!(r#"["{id}", 1]"#))
+        // The node answers with an error while it is still verifying what it was just sent,
+        // and reports no height while the transaction only sits in the mempool. Both mean
+        // "not yet", so neither ends the wait.
+        let raw = client
+            .json_result_from_call::<serde_json::Value>(
+                "getrawtransaction",
+                format!(r#"["{id}", 1]"#),
+            )
             .await
-            .map_err(|error| eyre!(error))?;
+            .unwrap_or_default();
         if let Some(height) = raw.get("height").and_then(serde_json::Value::as_u64) {
             // The exact bytes the node returns must match what we signed and sent.
             let hex: HexData = client

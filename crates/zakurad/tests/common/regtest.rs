@@ -811,7 +811,7 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
     use zakura_chain::{parameters::testnet::RegtestParameters, transaction::HashType};
     use zcash_protocol::consensus::Parameters;
     use zcash_script::script::Code;
-    use zcash_transparent::pq::{output, template, ParameterSet};
+    use zcash_transparent::pq::{output, single_key, ParameterSet};
 
     /// Pushes `bytes` with the shortest opcode that can carry them, which is the only
     /// encoding a post-quantum input may use.
@@ -898,7 +898,7 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         Ok(PqFunded {
             kind: PqFundedKind::Pq {
                 parameters: set,
-                body: template::single_key_body(set, &keys[index][0].public_key())?,
+                body: single_key::body(set, &keys[index][0].public_key())?,
             },
             signers: vec![0],
         })
@@ -937,7 +937,7 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         PqFunded {
             kind: PqFundedKind::Restricted {
                 script: restricted,
-                revealed: template::single_key_body(schemes[0], &keys[0][0].public_key())?,
+                revealed: single_key::body(schemes[0], &keys[0][0].public_key())?,
             },
             signers: vec![0],
         },

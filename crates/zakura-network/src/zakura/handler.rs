@@ -328,6 +328,9 @@ pub struct ZakuraConfig {
     pub quic: QuicConfig,
     /// Total concurrent Zakura connections, inbound plus outbound.
     ///
+    /// Inbound peers hold at most three quarters of it, rounded up, so a
+    /// quarter, rounded down, always stays free for this node's dials (see
+    /// [`ZakuraLocalLimits::max_inbound_connections`]).
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) lowers a
     /// larger value at startup.
     pub max_connections: usize,
@@ -358,6 +361,9 @@ pub struct ZakuraConfig {
     /// the primary eclipse-resistance controls.
     pub max_connections_per_ip: usize,
     /// Connections concurrently running the control handshake.
+    ///
+    /// Inbound handshakes hold at most three quarters of it, rounded up, like
+    /// [`max_connections`](Self::max_connections).
     ///
     /// Also the QUIC connections that
     /// [`peer_memory_budget_bytes`](Self::peer_memory_budget_bytes) funds
@@ -831,7 +837,34 @@ impl ZakuraLocalLimits {
                 .saturating_mul(ZAKURA_CLOSING_CONNECTIONS_PER_LIVE),
         }
     }
+
+    /// Connections inbound peers may hold at once: `max_connections` less the
+    /// outbound reserve, a quarter rounded down (69 of the default 92).
+    ///
+    /// Peers that dial this node can't take the slots its own dials need, so
+    /// they can't crowd out the peers it chose. Dials may still use any free
+    /// slot, inbound's share included.
+    pub fn max_inbound_connections(&self) -> usize {
+        without_outbound_reserve(self.max_connections)
+    }
+
+    /// Control handshakes inbound peers may run at once:
+    /// `max_pending_handshakes` less the same outbound reserve (24 of the
+    /// default 32), as [`Self::max_inbound_connections`] explains.
+    pub fn max_inbound_handshakes(&self) -> usize {
+        without_outbound_reserve(self.max_pending_handshakes)
+    }
 }
+
+/// One cap's share left to inbound peers after reserving a quarter of it,
+/// rounded down, for this node's dials.
+fn without_outbound_reserve(cap: usize) -> usize {
+    cap.saturating_sub(cap / OUTBOUND_RESERVE_DIVISOR)
+}
+
+/// Inbound peers leave `1 / OUTBOUND_RESERVE_DIVISOR` of the connection and
+/// control-handshake caps to outbound work.
+const OUTBOUND_RESERVE_DIVISOR: usize = 4;
 
 /// Per-connection limits after negotiation and clamping.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2809,8 +2842,15 @@ pub struct ZakuraProtocolHandler {
     registry: Arc<ServiceRegistry>,
     trace: ZakuraTrace,
     next_stream_id: Arc<AtomicU64>,
+    /// Every established or handshaking connection, in either direction.
     admission: Arc<Semaphore>,
+    /// Inbound connections, which also hold an `admission` permit.
+    inbound_admission: Arc<Semaphore>,
+    /// Control handshakes in either direction.
     pending_handshakes: Arc<Semaphore>,
+    /// Inbound control handshakes, which also hold a `pending_handshakes`
+    /// permit.
+    inbound_handshakes: Arc<Semaphore>,
     /// Node-wide owners of raw frames, unfunded output, and request workers.
     resources: NodeResources,
     shutdown: CancellationToken,
@@ -2921,7 +2961,9 @@ impl ZakuraProtocolHandler {
             // and late completions from colliding after a node restart.
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
+            inbound_admission: Arc::new(Semaphore::new(limits.max_inbound_connections())),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
+            inbound_handshakes: Arc::new(Semaphore::new(limits.max_inbound_handshakes())),
             resources,
             shutdown: CancellationToken::new(),
             limits,
@@ -3051,8 +3093,10 @@ impl ZakuraProtocolHandler {
     /// releases the connection's pending count, so no admission decision sees
     /// the IP uncounted.
     fn claim_inbound(&self, connection: &Connection) -> Option<InboundClaim> {
+        let inbound = self.inbound_admission.clone().try_acquire_owned().ok()?;
         let admission = self.admission.clone().try_acquire_owned().ok()?;
         Some(InboundClaim {
+            _inbound: inbound,
             _admission: admission,
             control_handshake: self
                 .supervisor
@@ -3063,6 +3107,7 @@ impl ZakuraProtocolHandler {
     async fn serve_inbound(&self, connection: Connection, claim: Option<InboundClaim>) {
         let conn_id = trace_conn_id(&connection);
         let Some(InboundClaim {
+            _inbound,
             _admission,
             control_handshake,
         }) = claim
@@ -3165,7 +3210,18 @@ impl ZakuraProtocolHandler {
         remote_peer_id: &ZakuraPeerId,
         conn: &ZakuraConnTrace,
     ) -> Result<NativeHandshakeNegotiated, ZakuraHandlerError> {
-        let Ok(_handshake) = self.pending_handshakes.clone().try_acquire_owned() else {
+        // The shared permit is taken only once the inbound one is held, so a
+        // refused inbound handshake never holds a slot a dial needs.
+        let permits = self
+            .inbound_handshakes
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .and_then(|inbound| {
+                let shared = self.pending_handshakes.clone().try_acquire_owned().ok()?;
+                Some((inbound, shared))
+            });
+        let Some(_handshake) = permits else {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             conn.trace_connection(
                 "rejected.admission",
@@ -4456,9 +4512,9 @@ enum IpAdmission {
 }
 
 impl Acceptor for ZakuraProtocolHandler {
-    /// Applies zakura-quic ADM-3 rules 2 and 4 plus the connection cap before
-    /// any handshake work. The endpoint applies rules 3 and 5 itself, and
-    /// Zakura has no native IP ban list for rule 1.
+    /// Applies zakura-quic ADM-3 rules 2 and 4 plus the connection cap, each
+    /// within inbound's share, before any handshake work. The endpoint applies
+    /// rules 3 and 5 itself, and Zakura has no native IP ban list for rule 1.
     fn admit(&self, incoming: &IncomingInfo) -> Admit {
         if self.shutdown.is_cancelled() {
             return Admit::Ignore;
@@ -4481,12 +4537,22 @@ impl Acceptor for ZakuraProtocolHandler {
             metrics::counter!("zakura.p2p.conn.rejected.per_ip").increment(1);
             return Admit::Refuse;
         }
+        // Every pending transport handshake is inbound, so it counts against
+        // both the inbound share and the whole handshake budget.
         let control_handshakes = self
             .limits
             .max_pending_handshakes
             .saturating_sub(self.pending_handshakes.available_permits());
+        let inbound_control_handshakes = self
+            .limits
+            .max_inbound_handshakes()
+            .saturating_sub(self.inbound_handshakes.available_permits());
         if incoming.pending_total.saturating_add(control_handshakes)
             >= self.limits.max_pending_handshakes
+            || incoming
+                .pending_total
+                .saturating_add(inbound_control_handshakes)
+                >= self.limits.max_inbound_handshakes()
         {
             // As above: spoofed Initials could fill the budget, so an
             // unvalidated source gets a Retry instead of a refusal.
@@ -4497,7 +4563,9 @@ impl Acceptor for ZakuraProtocolHandler {
             metrics::counter!("zakura.p2p.conn.rejected.pending_handshake").increment(1);
             return Admit::Refuse;
         }
-        if self.admission.available_permits() == 0 {
+        if self.admission.available_permits() == 0
+            || self.inbound_admission.available_permits() == 0
+        {
             metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
             return Admit::Refuse;
         }
@@ -4518,6 +4586,9 @@ impl Acceptor for ZakuraProtocolHandler {
 /// An inbound connection's share of the connection cap and its per-IP control
 /// handshake slot, held from `Acceptor::handle` on.
 struct InboundClaim {
+    /// A slot within the inbound share (see
+    /// [`ZakuraLocalLimits::max_inbound_connections`]).
+    _inbound: OwnedSemaphorePermit,
     _admission: OwnedSemaphorePermit,
     control_handshake: ControlHandshakeGuard,
 }
@@ -13751,6 +13822,194 @@ mod tests {
                     Admit::Accept
                 );
             }
+        }
+    }
+
+    /// ADM-3's inbound share (#1367): once inbound connections or inbound
+    /// handshakes fill three quarters of their caps, the acceptor turns new
+    /// inbound attempts away, and a dial still finds the reserved quarter.
+    #[test]
+    fn inbound_load_leaves_the_outbound_reserve() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        assert_eq!(limits.max_inbound_connections(), 69);
+        assert_eq!(limits.max_inbound_handshakes(), 24);
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(limits.max_connections),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let attempt = |validated: bool, pending_total: usize| IncomingInfo {
+            remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),
+            validated,
+            pending_total,
+            pending_from_ip: 0,
+        };
+        let take = |semaphore: &Arc<Semaphore>, count: usize| {
+            semaphore
+                .clone()
+                .try_acquire_many_owned(u32::try_from(count).expect("test counts are small"))
+                .expect("the test holds free permits")
+        };
+
+        // Pending transport handshakes count against the inbound share, which
+        // fills before the whole budget does.
+        assert_eq!(handler.admit(&attempt(true, 23)), Admit::Accept);
+        assert_eq!(handler.admit(&attempt(true, 24)), Admit::Refuse);
+        assert_eq!(handler.admit(&attempt(false, 24)), Admit::Retry);
+
+        // So do inbound control handshakes, and dials keep the rest.
+        let inbound_handshakes = (
+            take(&handler.inbound_handshakes, 24),
+            take(&handler.pending_handshakes, 24),
+        );
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
+        assert_eq!(handler.pending_handshakes.available_permits(), 8);
+        drop(inbound_handshakes);
+
+        // Inbound connections stop at their share, and dials keep the rest.
+        let inbound = (
+            take(&handler.inbound_admission, 69),
+            take(&handler.admission, 69),
+        );
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Refuse);
+        let dials = take(&handler.admission, 23);
+        assert_eq!(handler.admission.available_permits(), 0);
+        drop((inbound, dials));
+        assert_eq!(handler.admit(&attempt(true, 0)), Admit::Accept);
+    }
+
+    /// Dials may use inbound's unused share, and once they fill the whole cap
+    /// inbound attempts are refused, as before the reserve.
+    #[test]
+    fn dials_may_use_the_inbound_share() {
+        let limits = ZakuraLocalLimits::from_config(&Config::default());
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(limits.max_connections),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        let _dials = handler
+            .admission
+            .clone()
+            .try_acquire_many_owned(u32::try_from(limits.max_connections).expect("92 fits"))
+            .expect("dials may take every slot");
+        assert_eq!(
+            handler.admit(&IncomingInfo {
+                remote: SocketAddr::new("203.0.113.9".parse().expect("test ip parses"), 8234),
+                validated: true,
+                pending_total: 0,
+                pending_from_ip: 0,
+            }),
+            Admit::Refuse
+        );
+    }
+
+    /// The real inbound paths hold the inbound share: `claim_inbound` holds a
+    /// connection slot from it until the claim drops, and the responder
+    /// handshake holds a handshake slot from it while it runs, so dials keep
+    /// the reserve in both.
+    #[tokio::test]
+    async fn inbound_paths_hold_the_inbound_share() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut limits = ZakuraLocalLimits::from_config(&Config::default());
+        limits.max_connections = 4;
+        limits.max_pending_handshakes = 4;
+        let handler = ZakuraProtocolHandler::new(
+            ZakuraSupervisorHandle::new(64),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+        );
+        assert_eq!(limits.max_inbound_connections(), 3);
+        assert_eq!(limits.max_inbound_handshakes(), 3);
+
+        let server = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0001)
+            .await?;
+        let (connection_tx, mut connection_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        server.serve(CaptureConnection {
+            alpn: P2P_V2_ALPN,
+            connection_tx,
+            stream_tx,
+        })?;
+        let server_addr = LocalEndpointFactory::node_addr(&server).await;
+        let client = LocalEndpointFactory::with_limits(&limits)
+            .endpoint(0x1367_0002)
+            .await?;
+        let mut client_connections = Vec::new();
+        let mut inbound = Vec::new();
+        for _ in 0..5 {
+            client_connections.push(client.connect(server_addr.clone(), &[P2P_V2_ALPN]).await?);
+            inbound.push(
+                timeout(Duration::from_secs(10), connection_rx.recv())
+                    .await?
+                    .expect("the capture acceptor sends each accepted connection"),
+            );
+        }
+
+        // Connection slots: the fourth inbound claim finds its share full
+        // while a dial still finds a slot.
+        let claims: Vec<_> = inbound[..3]
+            .iter()
+            .map(|connection| handler.claim_inbound(connection))
+            .collect();
+        assert!(claims.iter().all(Option::is_some));
+        assert!(handler.claim_inbound(&inbound[3]).is_none());
+        assert_eq!(handler.admission.available_permits(), 1);
+        drop(claims);
+        assert_eq!(handler.inbound_admission.available_permits(), 3);
+        assert_eq!(handler.admission.available_permits(), 4);
+
+        // Handshake slots: a responder handshake waiting for a hello that
+        // never comes holds one inbound and one shared slot.
+        let responder = |connection: Connection| {
+            let handler = handler.clone();
+            async move {
+                let peer = ZakuraPeerId::new(connection.remote_id().as_bytes().to_vec())?;
+                let conn = ZakuraConnTrace::new(&handler.trace, trace_conn_id(&connection), &peer);
+                handler
+                    .run_native_responder_handshake_with_permit(&connection, &peer, &conn)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let waiting = tokio::spawn(responder(inbound[0].clone()));
+        timeout(Duration::from_secs(10), async {
+            while handler.inbound_handshakes.available_permits() == 3 {
+                zakura_rt::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(handler.inbound_handshakes.available_permits(), 2);
+        assert_eq!(handler.pending_handshakes.available_permits(), 3);
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(handler.inbound_handshakes.available_permits(), 3);
+        assert_eq!(handler.pending_handshakes.available_permits(), 4);
+
+        // With the inbound share full, a responder handshake is refused
+        // without taking a shared slot.
+        let full = handler
+            .inbound_handshakes
+            .clone()
+            .try_acquire_many_owned(3)
+            .expect("the test holds free permits");
+        assert!(matches!(
+            responder(inbound[4].clone()).await,
+            Err(ZakuraHandlerError::ResourceLimit("pending handshake"))
+        ));
+        assert_eq!(handler.pending_handshakes.available_permits(), 4);
+        drop(full);
+        Ok(())
+    }
+
+    #[test]
+    fn outbound_reserve_rounds_down() {
+        for (cap, inbound) in [(1, 1), (3, 3), (4, 3), (16, 12), (32, 24), (92, 69)] {
+            assert_eq!(without_outbound_reserve(cap), inbound, "cap {cap}");
         }
     }
 

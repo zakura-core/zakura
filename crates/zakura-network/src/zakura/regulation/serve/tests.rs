@@ -977,6 +977,7 @@ fn sink_and_core(
     let commitments = Arc::new(Commitments {
         open: AtomicU32::new(1),
         limit: AtomicU32::new(1),
+        tap: std::sync::OnceLock::new(),
     });
     let (frames, queued) = mpsc::unbounded_channel();
     let core = SinkCore::new(
@@ -1008,6 +1009,7 @@ fn ending_publication_frees_the_count_before_a_peer_can_replace_its_request() {
         let counts = Arc::new(Commitments {
             open: AtomicU32::new(1),
             limit: AtomicU32::new(1),
+            tap: std::sync::OnceLock::new(),
         });
         let completed = Completions::default();
         let mut old = Commitment(Some(counts.clone()), tracked.then(|| completed.track(1)));

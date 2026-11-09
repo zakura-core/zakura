@@ -1,0 +1,16 @@
+# Discovery's reader skips the minimum of its `services` row, and discovery
+# drops a `services` frame under that minimum instead of closing. Skipping
+# the reader's check alone would leave discovery's codec to close. The
+# scenario's peer sends its held `Services` one byte under the row's
+# minimum, and the node never closes for it.
+# Besides the files the patch changes, the reader's read path and the rest
+# of discovery decide whether the frame reaches the drop.
+checks = [
+    "crates/zakura-network/src/zakura/discovery",
+    "crates/zakura-network/src/zakura/handler.rs",
+]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/services/short-payload-closes/drop-short-payload.scenario.json"
+plan = "qa/planted/discovery/s4v2/services/short-payload-closes/drop-short-payload.plan.bin"

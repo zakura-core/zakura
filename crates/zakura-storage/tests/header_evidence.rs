@@ -499,6 +499,7 @@ fn a_commit_of_a_read_is_unexpected() {
         #[cfg(zakura_sim)]
         executed: std::sync::Arc::new(zakura_storage::header::controlled::EngineRun {
             kind: zakura_storage::header::controlled::RunKind::Reset,
+            clock: zakura_rt::time::utc_now().into(),
             before: port.engine().durable_state(),
             after: port.engine().durable_state(),
         }),
@@ -566,6 +567,7 @@ fn a_reset_after_shutdown_is_unexpected() {
         #[cfg(zakura_sim)]
         executed: std::sync::Arc::new(zakura_storage::header::controlled::EngineRun {
             kind: zakura_storage::header::controlled::RunKind::Reset,
+            clock: zakura_rt::time::utc_now().into(),
             before: port.engine().durable_state(),
             after: port.engine().durable_state(),
         }),

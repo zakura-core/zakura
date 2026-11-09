@@ -187,6 +187,9 @@ pub enum RunKind {
 pub struct EngineRun {
     /// What ran.
     pub kind: RunKind,
+    /// The scenario clock when the run started. Virtual time doesn't advance
+    /// within a run, so it's the time the engine's clock read.
+    pub clock: chrono::DateTime<chrono::Utc>,
     /// Before the run.
     pub before: zakura_header_chain::DurableState,
     /// After the run.
@@ -979,7 +982,12 @@ impl ControlledPort {
                 op,
                 HeaderOp::ApplyHeaderTarget | HeaderOp::ContinuationLocator
             ))
-        .then(|| self.engine.durable_state());
+        .then(|| {
+            (
+                zakura_rt::time::utc_now().into(),
+                self.engine.durable_state(),
+            )
+        });
         // Runs without the bookkeeping lock, since the engine and a dropped
         // permit wake watchers and capacity waiters.
         let (reply, effects, result) = match early {
@@ -1009,12 +1017,13 @@ impl ControlledPort {
         }
         kinds.extend(effects.fire().into_iter().map(FactKind::Lease));
         #[cfg(zakura_sim)]
-        let executed = durable_before.map(|before| {
+        let executed = durable_before.map(|(clock, before)| {
             std::sync::Arc::new(EngineRun {
                 kind: match op {
                     HeaderOp::ApplyHeaderTarget => RunKind::Apply(id, result.clone()),
                     _ => RunKind::Locator(id),
                 },
+                clock,
                 before,
                 after: self.engine.durable_state(),
             })
@@ -1209,7 +1218,10 @@ impl ControlledPort {
             }
         };
         #[cfg(zakura_sim)]
-        let durable_before = self.engine.durable_state();
+        let (clock, durable_before) = (
+            zakura_rt::time::utc_now().into(),
+            self.engine.durable_state(),
+        );
         let applied = self
             .engine
             .operator(target, kind == ResetKind::Invalidate)
@@ -1224,6 +1236,7 @@ impl ControlledPort {
             #[cfg(zakura_sim)]
             executed: std::sync::Arc::new(EngineRun {
                 kind: RunKind::Reset,
+                clock,
                 before: durable_before,
                 after: self.engine.durable_state(),
             }),

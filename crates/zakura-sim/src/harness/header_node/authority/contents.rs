@@ -25,6 +25,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
+
 use zakura_chain::block;
 use zakura_header_chain::{
     BodyValidationState, DurableState, EngineMetadata, HeaderNode, HeaderValidationState,
@@ -76,6 +78,7 @@ impl Contents {
     pub(super) fn run(&mut self, run: &EngineRun) {
         let EngineRun {
             kind,
+            clock,
             before,
             after,
         } = run;
@@ -119,7 +122,25 @@ impl Contents {
                     ));
                 }
                 match result {
-                    ResultIdentity::Applied => true,
+                    ResultIdentity::Applied => {
+                        // An applied target holds every submitted header,
+                        // whether it inserted it or already held it.
+                        let mut missing: Vec<String> = payload
+                            .iter()
+                            .flatten()
+                            .filter(|sent| {
+                                !after.graph.nodes.keys().any(|key| hash(*key) == **sent)
+                            })
+                            .cloned()
+                            .collect();
+                        missing.sort_unstable();
+                        if !missing.is_empty() {
+                            found.push(format!(
+                                "returned Applied without holding submitted headers {missing:?}"
+                            ));
+                        }
+                        true
+                    }
                     ResultIdentity::ResourceStalled => {
                         if !inserted.is_empty() {
                             found.push(format!(
@@ -146,7 +167,7 @@ impl Contents {
             }
         };
         if success {
-            self.judge_state(before, after, &mut found);
+            self.judge_state(*clock, before, after, &mut found);
         }
         for detail in found {
             self.breaks
@@ -160,7 +181,13 @@ impl Contents {
     /// classified. Each is derived from the stored headers and the reset
     /// model, or must be unchanged from `before`, or is left to a named
     /// owner.
-    fn judge_state(&self, before: &DurableState, after: &DurableState, found: &mut Vec<String>) {
+    fn judge_state(
+        &self,
+        clock: DateTime<Utc>,
+        before: &DurableState,
+        after: &DurableState,
+        found: &mut Vec<String>,
+    ) {
         let DurableState {
             graph,
             metadata,
@@ -261,23 +288,19 @@ impl Contents {
         }
         found.extend(structure(graph));
         // A node held before and after changes only in its eligibility, which
-        // the model below judges, its validation from deferred to valid as
-        // the clock comes due, and its auxiliary delivery IDs, Rule 11's.
+        // the model below judges, and its auxiliary delivery IDs, Rule 11's.
+        // Its validation stays too: only a `ReevaluateDeferred` event promotes
+        // a held deferred header, the controlled port never sends one, and
+        // re-admitting a held header keeps its node.
         let mut changed: Vec<String> = before
             .graph
             .nodes
             .iter()
             .filter(|(key, old)| {
                 nodes.get(key).is_some_and(|new| {
-                    let promoted =
-                        matches!(old.validation, HeaderValidationState::DeferredUntil(_))
-                            && new.validation == HeaderValidationState::Valid;
                     let mut new = new.clone();
                     new.eligibility = old.eligibility.clone();
                     new.aux_delivery_ids = old.aux_delivery_ids.clone();
-                    if promoted {
-                        new.validation = old.validation;
-                    }
                     new != **old
                 })
             })
@@ -286,8 +309,24 @@ impl Contents {
         changed.sort_unstable();
         if !changed.is_empty() {
             found.push(format!(
-                "changed held nodes {changed:?} in more than their eligibility and a due \
-                 validation"
+                "changed held nodes {changed:?} in more than their eligibility"
+            ));
+        }
+        // A new header is valid unless its time is more than two hours past
+        // the run's clock, and then deferred until two hours before its time
+        // (the protocol's full-validator time rule).
+        let mut misdated: Vec<String> = nodes
+            .iter()
+            .filter(|(key, node)| {
+                !before.graph.nodes.contains_key(key)
+                    && node.validation != admitted(node.header.time, clock)
+            })
+            .map(|(key, _)| hash(*key))
+            .collect();
+        misdated.sort_unstable();
+        if !misdated.is_empty() {
+            found.push(format!(
+                "inserted {misdated:?} with a validation the clock {clock} doesn't give"
             ));
         }
         // A header apply admits a header with no body knowledge.
@@ -328,7 +367,11 @@ impl Contents {
                 selected_projection.last()
             ));
         }
-        if preferred_header_tip.is_some_and(|tip| tip != selected) {
+        // Integrated mode prefers the selected tip on equal work; headers-only
+        // keeps no preference.
+        if *preferred_header_tip
+            != (*mode == zakura_header_chain::EngineMode::Integrated).then_some(selected)
+        {
             found.push(format!(
                 "left the preferred tip {preferred_header_tip:?}, not the selected frontier"
             ));
@@ -460,6 +503,19 @@ fn structure(graph: &zakura_header_chain::GraphState) -> Vec<String> {
         found.push("left an eligible-tip index its nodes don't give".to_owned());
     }
     found
+}
+
+/// The validation header admission gives a header timed `time` at `clock`:
+/// `DeferredUntil` two hours before `time` when that's still ahead of
+/// `clock`, else `Valid`, as the protocol's full-validator time rule sets it.
+/// Header times are whole seconds.
+fn admitted(time: DateTime<Utc>, clock: DateTime<Utc>) -> HeaderValidationState {
+    const TWO_HOURS: i64 = 2 * 60 * 60;
+    let deadline = DateTime::<Utc>::from_timestamp(time.timestamp().saturating_sub(TWO_HOURS), 0);
+    match deadline {
+        Some(deadline) if deadline > clock => HeaderValidationState::DeferredUntil(deadline),
+        _ => HeaderValidationState::Valid,
+    }
 }
 
 /// Whether `node` or one of its held ancestors in `nodes` is in

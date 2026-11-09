@@ -1,0 +1,12 @@
+# Every selected-path locator keeps each entry's hash but gives the entry
+# one below the tip the height below it, so the reactor would reject an
+# honest page whose ancestor it names. The forks witness's node holds more
+# than one header above the anchor. The reactor, the queue, the storage
+# adapter and the locator builder decide how the witness's reads run, so
+# a change there can move the witness off it.
+checks = ["crates/zakura-network/src/zakura/header_sync", "crates/zakura-storage/src/header", "crates/zakura-header-chain/src/discovery"]
+
+[typed]
+harness = "header-sync/storage"
+scenario = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.json"
+plan = "crates/zakura-sim/tests/fixtures/header-authority-forks-sharing-a-header.plan"

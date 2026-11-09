@@ -8,7 +8,7 @@ use tower::BoxError;
 use zakura_chain::{
     block::{Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    serialization::ZcashDeserializeInto,
+    serialization::{BytesInDisplayOrder, ZcashDeserializeInto, ZcashSerialize},
     transaction::{self, UnminedTxId},
 };
 use zakura_node_services::mempool::{MempoolChange, MempoolTxSubscriber};
@@ -17,9 +17,6 @@ use zakura_test::{
     mock_service::{MockService, PanicAssertion},
     prelude::eyre::{eyre, Result},
 };
-
-#[cfg(feature = "indexer")]
-use zakura_chain::serialization::ZcashSerialize;
 
 use crate::indexer::{self, indexer_client::IndexerClient, BlockRangeRequest, BlockRequest, Empty};
 use crate::{
@@ -32,7 +29,6 @@ use crate::{
 };
 
 /// A funded serialized block for a mocked state response.
-#[cfg(feature = "indexer")]
 fn raw_block(bytes: Vec<u8>) -> zakura_node_services::block_memory::OwnedRawBlock {
     zakura_node_services::block_memory::ReadMemoryBudget::new(std::num::NonZeroU64::MAX)
         .try_reserve(0)
@@ -237,9 +233,37 @@ async fn test_get_block(
     });
 
     mock_read_service
-        .expect_request(ReadRequest::Block(HashOrHeight::Height(height)))
+        .expect_request(ReadRequest::RawBlock(HashOrHeight::Height(height)))
         .await
-        .respond(ReadResponse::Block(Some(block.clone().into())));
+        .respond(ReadResponse::RawBlock(Some(raw_block(
+            block.zcash_serialize_to_vec()?,
+        ))));
+
+    let response = request_task
+        .await?
+        .expect("get_block should succeed")
+        .into_inner();
+    assert_eq!(response.data, block.zcash_serialize_to_vec()?);
+    let (decoded_block, decoded_hash) = response.decode().expect("response should decode");
+    assert_eq!(decoded_hash, expected_hash);
+    assert_eq!(decoded_block.hash(), expected_hash);
+
+    // A block requested by hash returns the requested hash with the stored bytes.
+    let mut request_client = client.clone();
+    let request_task = tokio::spawn(async move {
+        request_client
+            .get_block(tonic::Request::new(BlockRequest {
+                hash_or_height: expected_hash.bytes_in_display_order().to_vec(),
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlock(HashOrHeight::Hash(expected_hash)))
+        .await
+        .respond(ReadResponse::RawBlock(Some(raw_block(
+            block.zcash_serialize_to_vec()?,
+        ))));
 
     let response = request_task
         .await?
@@ -248,6 +272,25 @@ async fn test_get_block(
     let (decoded_block, decoded_hash) = response.decode().expect("response should decode");
     assert_eq!(decoded_hash, expected_hash);
     assert_eq!(decoded_block.hash(), expected_hash);
+
+    // A block the state does not have is not found.
+    let request_task = tokio::spawn(async move {
+        client
+            .get_block(tonic::Request::new(BlockRequest {
+                hash_or_height: height.0.to_be_bytes().to_vec(),
+            }))
+            .await
+    });
+
+    mock_read_service
+        .expect_request(ReadRequest::RawBlock(HashOrHeight::Height(height)))
+        .await
+        .respond(ReadResponse::RawBlock(None));
+
+    let status = request_task
+        .await?
+        .expect_err("a missing block should not be found");
+    assert_eq!(status.code(), tonic::Code::NotFound);
 
     Ok(())
 }
@@ -339,11 +382,13 @@ async fn test_get_block_range(
         });
 
         mock_read_service
-            .expect_request(ReadRequest::Block(HashOrHeight::Height(Height(
+            .expect_request(ReadRequest::RawBlock(HashOrHeight::Height(Height(
                 expected_height,
             ))))
             .await
-            .respond(ReadResponse::Block(Some(expected_block.clone().into())));
+            .respond(ReadResponse::RawBlock(Some(raw_block(
+                expected_block.zcash_serialize_to_vec()?,
+            ))));
 
         let get_block_response = get_block_task
             .await?

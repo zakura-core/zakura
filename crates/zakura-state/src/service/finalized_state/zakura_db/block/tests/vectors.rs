@@ -721,6 +721,20 @@ fn test_block_db_round_trip_with(
                     .expect("serialization to vec never fails"),
                 "raw transaction bytes must match the transaction's consensus serialization",
             );
+
+            let (decoded, raw, height, _) = state
+                .transaction_and_raw(transaction.hash())
+                .unwrap()
+                .expect("transaction was stored with its block");
+            assert_eq!(*decoded, **transaction);
+            assert_eq!(height, finalized.height);
+            assert_eq!(
+                raw.to_vec(),
+                transaction
+                    .zcash_serialize_to_vec()
+                    .expect("serialization to vec never fails"),
+                "the stored bytes must match the decoded transaction",
+            );
         }
     }
 }

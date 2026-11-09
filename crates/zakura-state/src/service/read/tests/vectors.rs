@@ -800,6 +800,20 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         "raw_block should NOT find the side chain block by hash"
     );
 
+    // `any_transaction` returns each in-memory transaction with its bytes.
+    let (any_tx, raw) = crate::service::read::block::any_transaction(
+        non_finalized_state.chain_iter(),
+        &finalized_state.db,
+        best_chain_block.transactions[0].hash(),
+    )?
+    .expect("any_transaction should find the best chain transaction");
+    let tx: TransactionHandle = any_tx.into();
+    assert_eq!(*tx, *best_chain_block.transactions[0]);
+    assert_eq!(
+        *raw,
+        best_chain_block.transactions[0].zcash_serialize_to_vec()?
+    );
+
     for block in [&best_chain_block, &side_chain_block] {
         let transaction = &block.transactions[0];
         let raw = any_raw_transaction(

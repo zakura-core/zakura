@@ -1992,10 +1992,14 @@ pub enum ReadRequest {
     ///
     /// Returns
     ///
-    /// * [`ReadResponse::AnyChainTransaction(Some(AnyTx))`](ReadResponse::AnyChainTransaction)
+    /// * [`ReadResponse::AnyChainTransaction(Some((AnyTx, OwnedRawTransaction)))`](ReadResponse::AnyChainTransaction)
     ///   if the transaction is in any chain;
     /// * [`ReadResponse::AnyChainTransaction(None)`](ReadResponse::AnyChainTransaction)
     ///   otherwise.
+    ///
+    /// The response carries the transaction's Zcash consensus serialization, so
+    /// callers that need it do not serialize the transaction again. Finalized
+    /// transactions return their stored bytes.
     AnyChainTransaction(transaction::Hash),
 
     /// Looks up the Zcash consensus serialization of a transaction by hash in any chain.

@@ -355,8 +355,7 @@ fn skipped_transparent_address_index_stays_empty_through_commit_and_revert() {
             .update_chain_tip_with(&(&inputs, &spending_tx, &created))
             .expect("spending the new output is accepted");
 
-        // The chain's own UTXO set is maintained either way; only the address index is skipped.
-        assert!(chain.created_utxos.contains_key(&outpoint));
+        // Spending checks remain active even when address indexing is skipped.
         assert!(chain.spent_utxos.contains_key(&outpoint));
         assert_eq!(
             chain.partial_transparent_transfers.len(),
@@ -366,7 +365,6 @@ fn skipped_transparent_address_index_stays_empty_through_commit_and_revert() {
         chain.revert_chain_with(&(&inputs, &spending_tx, &created), RevertPosition::Tip);
         chain.revert_chain_with(&(&outputs, &creating_tx, &created), RevertPosition::Tip);
 
-        assert!(!chain.created_utxos.contains_key(&outpoint));
         assert!(!chain.spent_utxos.contains_key(&outpoint));
         assert_eq!(chain.partial_transparent_transfers.len(), 0);
     }

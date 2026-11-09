@@ -27,7 +27,9 @@
 //! property, panics a task, or ends at a harness failure is rejected.
 //!
 //! A default pick is the Plan's round-robin pick, and a default draw is the
-//! one an exhausted input gets. Every other pick or draw is non-default.
+//! one an exhausted input gets. A recovery pick or draw, which the recovery
+//! policy makes, counts as default too, since no byte made it. Every other
+//! pick or draw is non-default.
 //! Each accepted candidate has fewer non-default picks and draws than the
 //! one before, so the passes end. Only a pass 4 that reaches a fixed point
 //! shows that each remaining non-default pick is needed.
@@ -521,7 +523,8 @@ fn non_default(init: &[DrawRecord], steps: &[StepRecord]) -> u64 {
 /// draw with a bound other than 1, except the drain's picks, which take
 /// round-robin without reading the script. A default choice between two
 /// others is a [`PlanChoice::Default`] entry, and defaults after the last
-/// other choice need none.
+/// other choice need none. A recovery choice counts as a default: none is
+/// followed by a bytes choice, since recovery stops reading the script.
 fn script(init: &[DrawRecord], steps: &[StepRecord], drained: u64) -> Plan {
     let mut choices = Vec::new();
     let mut defaults = 0;
@@ -533,7 +536,7 @@ fn script(init: &[DrawRecord], steps: &[StepRecord], drained: u64) -> Plan {
             ));
             choices.push(choice);
         }
-        By::Default => defaults += 1,
+        By::Default | By::Recovery => defaults += 1,
         By::Forced => {}
     };
     let value = |draw: &DrawRecord| PlanChoice::Draw(draw.value);

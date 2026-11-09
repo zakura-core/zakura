@@ -72,6 +72,16 @@ pub trait ActionSource {
     fn observe(&mut self, _log: &mut ObservationLog) -> Result<(), String> {
         Ok(())
     }
+
+    /// True once one of this source's own actions started the run's
+    /// recovery phase. The run asks after each step that runs one of the
+    /// source's actions. From the next pick on, picks and draws follow the
+    /// recovery policy instead of the input (see the `plan` module), and
+    /// it stays on for the rest of the run, so a source must keep returning
+    /// true. The default never starts recovery.
+    fn recovering(&self) -> bool {
+        false
+    }
 }
 
 /// What one source offers at one step.

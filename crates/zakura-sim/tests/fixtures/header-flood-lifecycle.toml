@@ -1,0 +1,12 @@
+# The committed fuzz input `header-flood-lifecycle.bin`: the harness that runs it, the
+# generator version it was built for, and its SHA-256. Its first byte
+# picks the flood fixture, then come the Plan bytes.
+harness = "header-sync/flood"
+generator = 1
+sha256 = "c6cb751ad9f3fd753e9daf56679eb493fb513436068af23860f752cc21dddd7e"
+scenario_sha256 = "1bd5e9ccee0c1fdf999763d0adefec70a2c2dee97a02f93ed67beb92a9578f56"
+source = "crates/zakura-sim/tests/header_flood_watch.rs"
+
+[[witness]]
+property = "header-sync/watch-observed-under-lifecycle-flood"
+expect = "holds"

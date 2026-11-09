@@ -10,11 +10,11 @@ use std::{
 use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::BodyExt;
-use tower::{BoxError, Service};
+use tower::{BoxError, Layer, Service};
 
 use crate::server::{
     http::{HttpBody, HttpRequest, HttpResponse},
-    http_request_compatibility::HttpRequestMiddleware,
+    http_request_compatibility::{HttpRequestMiddleware, HttpRequestMiddlewareLayer},
 };
 
 /// A body that always returns an error, simulating a TCP RST during body collection.
@@ -89,6 +89,56 @@ async fn oversized_request_body_is_rejected() {
     let result = middleware.call(request).await;
 
     assert!(result.is_err(), "oversized request body should be rejected");
+}
+
+/// Returns the status a middleware built from `layer` gives a request with `origin`, if set.
+async fn status_for_origin(
+    layer: HttpRequestMiddlewareLayer,
+    origin: Option<&str>,
+) -> hyper::StatusCode {
+    let mut request = HttpRequest::builder()
+        .method("POST")
+        .header("content-type", "text/plain");
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let request = request
+        .body(HttpBody::from(
+            r#"{"jsonrpc":"2.0","method":"getinfo","id":1}"#,
+        ))
+        .expect("valid request");
+
+    layer
+        .layer(MockRpcService)
+        .call(request)
+        .await
+        .expect("the middleware answers every well-formed request")
+        .status()
+}
+
+/// A listener that rejects browser requests refuses any `Origin`, including the `null` origin
+/// of sandboxed and `file://` pages, but still serves clients that send none.
+#[tokio::test]
+async fn browser_requests_are_rejected_only_when_configured() {
+    let rejecting = || HttpRequestMiddlewareLayer::new(None, 4_096).reject_browser_requests();
+    for origin in ["https://attacker.example", "http://127.0.0.1:8232", "null"] {
+        assert_eq!(
+            status_for_origin(rejecting(), Some(origin)).await,
+            hyper::StatusCode::FORBIDDEN,
+            "a browser request from {origin} must be rejected"
+        );
+    }
+    assert_eq!(
+        status_for_origin(rejecting(), None).await,
+        hyper::StatusCode::OK
+    );
+
+    let default = HttpRequestMiddlewareLayer::new(None, 4_096);
+    assert_eq!(
+        status_for_origin(default, Some("https://attacker.example")).await,
+        hyper::StatusCode::OK,
+        "listeners keep accepting browser requests unless configured otherwise"
+    );
 }
 
 /// Sends `request` through the middleware and returns what the inner service received and

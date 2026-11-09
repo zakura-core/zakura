@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index 7aa1720809..16039012ce 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -1342,7 +1342,9 @@ impl HeaderSyncReactor {
+             {
+                 continue;
+             }
+-            self.consider_advertised_header_target(peer, target.session_id, target.status);
++            // Mutation: the cached pass drops the waiting peer instead of
++            // offering its target.
++            self.handle_peer_disconnected(&peer, target.session_id, "planted");
+         }
+         self.state.finish_cached_pass(opportunity, Instant::now());
+     }

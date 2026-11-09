@@ -298,7 +298,8 @@ fn apply_on_row(row: DiscoveryRow) {
 /// #2114's audit: the node checks a `Peers` against its own request's cap,
 /// `peers_cap(limit)`, which is under the row's maximum when its limit is
 /// under 32. In the over-owed witness, a node asking for [`LIMIT`] record
-/// gets a `Peers` one byte over that cap and under the row's maximum. The
+/// gets a `Peers` one byte over that cap and under the row's maximum, two
+/// validly signed records that decode. The
 /// peer's models label it `over-owed`, not `Conformant` and not
 /// `long-payload`. The node reads it, its claim of the answer refuses it,
 /// and the node closes the connection with a fault cause.

@@ -1,5 +1,5 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/requester.rs b/crates/zakura-network/src/zakura/discovery/requester.rs
-index 73beaa38bc..75e98e40e2 100644
+index 73beaa38bc..f6a73bfc4c 100644
 --- a/crates/zakura-network/src/zakura/discovery/requester.rs
 +++ b/crates/zakura-network/src/zakura/discovery/requester.rs
 @@ -419,7 +419,12 @@ impl Queries {
@@ -10,7 +10,7 @@ index 73beaa38bc..75e98e40e2 100644
 +        // Planted bypass: the node reserves the largest `Peers`, whatever
 +        // limit it asks for.
 +        let asked = Asked::Peers {
-+            limit: u16::try_from(MAX_DISCOVERY_RECORDS_PER_RESPONSE)
++            limit: u16::try_from(super::protocol::MAX_DISCOVERY_RECORDS_PER_RESPONSE)
 +                .expect("the largest wire limit fits u16"),
 +        };
          self.send_query(asked, &DiscoveryMessage::GetPeers(query))

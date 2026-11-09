@@ -1,5 +1,5 @@
 diff --git a/crates/zakura-network/src/zakura/discovery/requester.rs b/crates/zakura-network/src/zakura/discovery/requester.rs
-index 73beaa38bc..889d96f142 100644
+index 73beaa38bc..b1cd9fe710 100644
 --- a/crates/zakura-network/src/zakura/discovery/requester.rs
 +++ b/crates/zakura-network/src/zakura/discovery/requester.rs
 @@ -493,7 +493,12 @@ impl Queries {
@@ -16,20 +16,20 @@ index 73beaa38bc..889d96f142 100644
              .map(Some)
      }
  
-@@ -578,8 +583,14 @@ struct QueriesPrecheck(Arc<Mutex<LiveQueries>>);
+@@ -578,10 +583,12 @@ struct QueriesPrecheck(Arc<Mutex<LiveQueries>>);
  
  impl ResponsePrecheck for QueriesPrecheck {
      fn check(&self, message_type: u16, payload_len: usize) -> Result<(), FrameRejection> {
 -        lock(&self.0)
 -            .reservations
-+        let live = &mut *lock(&self.0);
-+        // Planted bypass: the reader queues a `Services` with no live query.
-+        if QueryKind::answered_by(message_type) == Some(QueryKind::Services)
-+            && !live.state.live.contains_key(&QueryKind::Services)
-+        {
+-            .admit(message_type, payload_len)
+-            .map_err(ClaimRefused::frame_rejection)
++        let admitted = lock(&self.0).reservations.admit(message_type, payload_len);
++        // Planted bypass: the reader queues a `Services` its reservations refuse.
++        if admitted.is_err() && QueryKind::answered_by(message_type) == Some(QueryKind::Services) {
 +            return Ok(());
 +        }
-+        live.reservations
-             .admit(message_type, payload_len)
-             .map_err(ClaimRefused::frame_rejection)
++        admitted.map_err(ClaimRefused::frame_rejection)
      }
+ }
+ 

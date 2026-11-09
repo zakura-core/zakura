@@ -21,6 +21,11 @@
 //! submitted it (`CallEnded` `dropped`). A prepare or apply can't time out.
 //! So a failure whose reply reached the reactor and is still untaken when a
 //! settled run ends means the reactor lost it, and breaks the rule.
+//!
+//! A dropped call forgives a reply that already reached the reactor only
+//! when the harness's `Shutdown` tore the reactor down, as the node's
+//! [`EndEvidence`] shows. A reactor that returned by itself drops its calls
+//! too, but nobody stopped it, so the reply it lost is still untaken.
 
 use std::{
     cell::RefCell,
@@ -30,7 +35,10 @@ use std::{
     time::Duration,
 };
 
-use super::adoption::settled;
+use super::{
+    adoption::settled,
+    ends::{EndEvidence, EndFact, EnvironmentAction},
+};
 use crate::{
     observe::{Entry, ReactorFact, StorageFact, StorageRequest, StorageResult},
     storage::{Blame, FaultAttributions, HEADER_SERVICE},
@@ -79,7 +87,9 @@ pub fn owed(
     entries: &[Entry],
     attributions: &FaultAttributions,
 ) -> Result<Vec<OwedPenalty>, String> {
-    let judge = Judge::over(Mode::Scan, &[], entries, attributions);
+    // A dropped call never takes its reply, so whether its drop forgives
+    // an untaken one changes nothing owed.
+    let judge = Judge::over(Mode::Scan, &[], entries, attributions, false);
     match judge.error {
         Some(why) => Err(why),
         None => Ok(judge.owed),
@@ -88,10 +98,21 @@ pub fn owed(
 
 /// The operations in `entries` that failed with a fault that would owe a
 /// penalty, and whose reply reached the reactor, which hasn't taken it by
-/// the log's end. A failure whose reply never reached it isn't listed (see
+/// the log's end. A failure whose reply never reached it isn't listed, nor
+/// is one whose call the harness's `Shutdown` dropped, as `ends` shows (see
 /// the module docs).
-pub fn untaken(entries: &[Entry], attributions: &FaultAttributions) -> Result<Vec<u64>, String> {
-    let judge = Judge::over(Mode::Scan, &[], entries, attributions);
+pub fn untaken(
+    entries: &[Entry],
+    attributions: &FaultAttributions,
+    ends: &EndEvidence,
+) -> Result<Vec<u64>, String> {
+    let judge = Judge::over(
+        Mode::Scan,
+        &[],
+        entries,
+        attributions,
+        harness_stopped(ends),
+    );
     match judge.error {
         Some(why) => Err(why),
         None => Ok(judge.untaken()),
@@ -171,6 +192,10 @@ struct Judge {
     /// before dropping the future, so the operation can still complete
     /// after it.
     dropped: BTreeSet<u64>,
+    /// Whether the harness's `Shutdown` is what tore the reactor down, as
+    /// [`harness_stopped`] reads the node's end evidence. Only then does a
+    /// dropped call forgive a reply that already reached the reactor.
+    stopped: bool,
     /// Every penalty owed so far, in the order the replies were taken.
     owed: Vec<OwedPenalty>,
     /// The penalties in [`Judge::owed`] whose call's handling hasn't ended,
@@ -198,15 +223,18 @@ struct Judge {
 
 impl Judge {
     /// A judge in `mode` that has read all of `facts`, then all of
-    /// `entries`.
+    /// `entries`, where `stopped` says whether the harness's `Shutdown` tore
+    /// the reactor down.
     fn over(
         mode: Mode,
         facts: &[CooldownFact],
         entries: &[Entry],
         attributions: &FaultAttributions,
+        stopped: bool,
     ) -> Self {
         let mut judge = Judge {
             mode,
+            stopped,
             ..Judge::default()
         };
         judge.cooldowns(facts);
@@ -392,10 +420,13 @@ impl Judge {
     fn reactor(&mut self, seq: u64, event: &ReactorFact) {
         match event {
             // A dropped call is never handled, and never takes its reply.
+            // Only the harness's stop forgives a reply already waiting.
             ReactorFact::CallEnded { call, end, .. } if end == "dropped" => {
                 self.dropped.insert(*call);
-                self.failed
-                    .retain(|_, (request, _)| request.call != Some(*call));
+                if self.stopped {
+                    self.failed
+                        .retain(|_, (request, _)| request.call != Some(*call));
+                }
             }
             ReactorFact::CallEnded { call, .. } => {
                 self.windows.entry(*call).or_default();
@@ -585,6 +616,29 @@ fn owes(
     Ok(owes_penalty(&request.source, category, &blame))
 }
 
+/// Whether the harness's `Shutdown` tore the node's reactor down, as `ends`
+/// shows: the harness began one, and the reactor didn't return by itself
+/// first. The tap records [`EndFact::ReactorExited`] only for a reactor
+/// that ended with no stop begun, and the harness records its `Shutdown`
+/// at the step's pick, before the teardown drops anything, so once this
+/// holds, every drop the log shows came from the harness's stop.
+fn harness_stopped(ends: &EndEvidence) -> bool {
+    let facts = ends.facts();
+    let shutdown = facts.iter().any(|(_, fact)| {
+        matches!(
+            fact,
+            EndFact::Environment {
+                action: EnvironmentAction::Shutdown,
+                ..
+            }
+        )
+    });
+    let exited = facts
+        .iter()
+        .any(|(_, fact)| matches!(fact, EndFact::ReactorExited { .. }));
+    shutdown && !exited
+}
+
 /// One fact about the node's readmission cooldowns, kept out of the log.
 /// Peers are written as the log writes them: the hex of their digest. `at`
 /// is the virtual time since the run's start that the reactor reported it
@@ -678,6 +732,9 @@ impl CooldownEvidence {
 pub struct FaultEvidence {
     attributions: FaultAttributions,
     cooldowns: CooldownEvidence,
+    /// The node's end facts, which say whether the harness's `Shutdown`
+    /// tore the reactor down.
+    ends: EndEvidence,
     /// The node's configured readmission cooldown.
     cooldown: Duration,
     settled: Rc<std::cell::Cell<Option<bool>>>,
@@ -722,6 +779,13 @@ impl FaultEvidence {
         }
     }
 
+    /// This evidence, reading the node's end facts from `ends`, so a call
+    /// the harness's `Shutdown` dropped forgives its untaken reply. Without
+    /// them, no drop does.
+    pub fn with_ends(self, ends: EndEvidence) -> Self {
+        FaultEvidence { ends, ..self }
+    }
+
     /// Whom each failed prepare and apply blamed.
     pub fn attributions(&self) -> &FaultAttributions {
         &self.attributions
@@ -764,6 +828,7 @@ impl FaultEvidence {
             ..Judge::default()
         });
         judge.cooldowns(&self.cooldowns.facts_after(judge.facts_read));
+        judge.stopped = harness_stopped(&self.ends);
         judge.read(entries, &self.attributions);
         let open = judge.open();
         let breaks = judge.unreported();
@@ -795,7 +860,13 @@ impl FaultEvidence {
         let mode = Mode::Judge {
             cooldown: self.cooldown,
         };
-        let judge = Judge::over(mode, &self.cooldowns.facts(), entries, &self.attributions);
+        let judge = Judge::over(
+            mode,
+            &self.cooldowns.facts(),
+            entries,
+            &self.attributions,
+            harness_stopped(&self.ends),
+        );
         let mut violated = judge.failures();
         if judge.error.is_some() {
             return FaultEnd {
@@ -1128,7 +1199,10 @@ mod tests {
         let mut log = failed_prepare(1, "aa", 3, "invalid_header");
         log.pop();
         assert_eq!(owed(&log, attributed.attributions()).unwrap(), Vec::new());
-        assert_eq!(untaken(&log, attributed.attributions()).unwrap(), vec![1]);
+        assert_eq!(
+            untaken(&log, attributed.attributions(), &EndEvidence::default()).unwrap(),
+            vec![1]
+        );
         assert!(
             matches!(violated(attributed.penalized(&log)), Some(why) if why.starts_with("UntakenFault")
             )
@@ -1143,7 +1217,7 @@ mod tests {
         // A failure that owes nothing isn't listed.
         let unblamed = evidence(&[(1, blame("bb"))]);
         assert_eq!(
-            untaken(&log, unblamed.attributions()).unwrap(),
+            untaken(&log, unblamed.attributions(), &EndEvidence::default()).unwrap(),
             Vec::<u64>::new()
         );
         assert_eq!(unblamed.penalized(&log), FaultEnd::default());
@@ -1154,7 +1228,8 @@ mod tests {
     /// dropped its call, before or after the operation completed.
     #[test]
     fn a_fault_that_never_reached_the_reactor_owes_nothing() {
-        let attributed = evidence(&[(1, blame("aa"))]);
+        let ends = shutdown_ends();
+        let attributed = evidence(&[(1, blame("aa"))]).with_ends(ends.clone());
         let dropped = reactor(ReactorFact::CallEnded {
             call: 1,
             end: "dropped".to_owned(),
@@ -1179,12 +1254,118 @@ mod tests {
         dropped_before.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
         for log in [undelivered, dropped_after, dropped_before] {
             assert_eq!(
-                untaken(&log, attributed.attributions()).unwrap(),
+                untaken(&log, attributed.attributions(), &ends).unwrap(),
                 Vec::<u64>::new()
             );
             assert_eq!(attributed.penalized(&log), FaultEnd::default(), "{log:?}");
-            assert_eq!(cooled(Vec::new()).check(&log), FaultCheck::Nothing);
+            assert_eq!(
+                cooled(Vec::new()).with_ends(ends.clone()).check(&log),
+                FaultCheck::Nothing
+            );
         }
+    }
+
+    /// End evidence where the harness's `Shutdown` stopped the node.
+    fn shutdown_ends() -> EndEvidence {
+        let ends = EndEvidence::default();
+        ends.record(EndFact::Environment {
+            peer: "node".to_owned(),
+            connection: None,
+            action: EnvironmentAction::Shutdown,
+        });
+        ends
+    }
+
+    /// A reply that reached the reactor and then a drop of its call: the
+    /// harness's `Shutdown` forgives it, but a reactor that returned by
+    /// itself lost it, even when a `Shutdown` follows its exit, and so does
+    /// a drop with no end evidence at all. Each case judged both at a check
+    /// and at a settled end.
+    #[test]
+    fn only_the_harness_shutdown_forgives_a_dropped_reply() {
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.pop();
+        log.push(reactor(ReactorFact::CallEnded {
+            call: 1,
+            end: "dropped".to_owned(),
+            op: Some(1),
+        }));
+        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        let exited = EndEvidence::default();
+        exited.record(EndFact::ReactorExited { step: 4 });
+        let exited_then_shutdown = EndEvidence::default();
+        exited_then_shutdown.record(EndFact::ReactorExited { step: 4 });
+        exited_then_shutdown.record(EndFact::Environment {
+            peer: "node".to_owned(),
+            connection: None,
+            action: EnvironmentAction::Shutdown,
+        });
+        // A close is the harness's too, but it stops no reactor.
+        let closed = EndEvidence::default();
+        closed.record(EndFact::Environment {
+            peer: "aa".to_owned(),
+            connection: Some(1),
+            action: EnvironmentAction::Close,
+        });
+        for (label, ends, forgiven) in [
+            ("shutdown", shutdown_ends(), true),
+            ("exited", exited, false),
+            ("exited, then shutdown", exited_then_shutdown, false),
+            ("closed", closed, false),
+            ("no end evidence", EndEvidence::default(), false),
+        ] {
+            let attributed = evidence(&[(1, blame("aa"))]).with_ends(ends.clone());
+            let listed = untaken(&log, attributed.attributions(), &ends).unwrap();
+            let end = attributed.penalized(&log);
+            let check = evidence(&[(1, blame("aa"))]).with_ends(ends).check(&log);
+            if forgiven {
+                assert_eq!(listed, Vec::<u64>::new(), "{label}");
+                assert_eq!(end, FaultEnd::default(), "{label}");
+                assert_eq!(check, FaultCheck::Nothing, "{label}");
+            } else {
+                assert_eq!(listed, vec![1], "{label}");
+                assert!(
+                    matches!(end.violated.as_slice(), [why]
+                        if why.starts_with("UntakenFault: operation 1 ")),
+                    "{label}: {end:?}"
+                );
+                assert!(
+                    matches!(&check, FaultCheck::Open(why)
+                        if why.starts_with("UntakenFault: operation 1 ")),
+                    "{label}: {check:?}"
+                );
+            }
+        }
+    }
+
+    /// The check reads the end evidence as it grows: a reactor that returns
+    /// by itself after a reply reached it leaves the reply untaken at the
+    /// check after its drain, and a `Shutdown` the harness begins later
+    /// doesn't forgive it, at a later check or at the end.
+    #[test]
+    fn a_shutdown_after_the_reactors_own_exit_forgives_nothing() {
+        let ends = EndEvidence::default();
+        let attributed = evidence(&[(1, blame("aa"))]).with_ends(ends.clone());
+        let mut log = failed_prepare(1, "aa", 3, "invalid_header");
+        log.pop();
+        log.push(reactor(ReactorFact::CallEnded {
+            call: 1,
+            end: "dropped".to_owned(),
+            op: Some(1),
+        }));
+        ends.record(EndFact::ReactorExited { step: 4 });
+        assert!(matches!(attributed.check(&log), FaultCheck::Open(_)));
+        ends.record(EndFact::Environment {
+            peer: "node".to_owned(),
+            connection: None,
+            action: EnvironmentAction::Shutdown,
+        });
+        log.push(storage(13, StorageFact::ReplyDropped { id: 1 }));
+        assert!(matches!(attributed.check(&log), FaultCheck::Open(_)));
+        assert!(matches!(
+            attributed.penalized(&log).violated.as_slice(),
+            [why] if why.starts_with("UntakenFault: operation 1 ")
+        ));
     }
 
     /// A settled run's end reports every open finding, not just the
@@ -1567,7 +1748,10 @@ mod tests {
             .map(|penalty| penalty.op)
             .collect();
         assert_eq!(owed, vec![1, 2]);
-        assert_eq!(untaken(&log, evidence.attributions()).unwrap(), vec![3]);
+        assert_eq!(
+            untaken(&log, evidence.attributions(), &EndEvidence::default()).unwrap(),
+            vec![3]
+        );
     }
 
     /// The check reads each cooldown fact once, as it arrives: a cooldown

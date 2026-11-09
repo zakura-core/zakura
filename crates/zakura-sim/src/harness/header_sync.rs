@@ -885,7 +885,8 @@ impl Subsystem for Storage {
             attributions,
             cooldowns,
             nodes[0].startup.config.unproductive_peer_cooldown,
-        );
+        )
+        .with_ends(ends.clone());
         let topology = Rc::new(
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
@@ -1272,7 +1273,8 @@ impl Subsystem for HeaderWire {
             attributions,
             cooldowns,
             header.startup.config.unproductive_peer_cooldown,
-        );
+        )
+        .with_ends(ends.clone());
         let (observer, tap) = TransportTap::with_sessions(
             sim,
             "node",

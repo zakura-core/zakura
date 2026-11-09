@@ -144,6 +144,10 @@ pub struct Config {
     /// Enabling this assumes the administrator has correctly configured
     /// firewall rules to restrict RPC access to trusted clients. Any client
     /// that can reach this listener can change the node's chain selection.
+    ///
+    /// A web browser on a trusted machine is inside that firewall, so this
+    /// listener rejects every request with an `Origin` header, which browsers
+    /// always send. A web page the operator visits can't use the listener.
     pub allow_unauthenticated_admin: bool,
 
     /// The maximum size of the response body in bytes.

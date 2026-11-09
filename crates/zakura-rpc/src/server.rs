@@ -277,6 +277,13 @@ impl RpcServer {
         } else {
             HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
+        // Credential-free admin methods trust the network boundary, which a local browser
+        // is already inside.
+        let http_middleware_layer = if surface == RpcSurface::WithAdmin {
+            http_middleware_layer.reject_browser_requests()
+        } else {
+            http_middleware_layer
+        };
 
         let max_response_body_size = conf.max_response_body_size;
         let rpc_service = RpcLoggerMiddleware::new(

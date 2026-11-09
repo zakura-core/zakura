@@ -145,6 +145,7 @@ stream_receive_window_bytes = 16777216
 [rpc]
 # Takes effect when enable_cookie_auth = false. The administrator is expected
 # to have correctly configured firewall rules restricting access to trusted clients.
+# Requests from web browsers (with an Origin header) are rejected.
 allow_unauthenticated_admin = false
 cookie_dir = "cache_dir"
 cookie_file_name = ".cookie"

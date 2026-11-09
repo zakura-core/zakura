@@ -233,6 +233,32 @@ async fn assert_segmented_listener_access(allow_unauthenticated_admin: bool) {
             serde_json::from_str(&response).expect("admin response should be JSON");
         assert_eq!(response["error"]["code"], expected_admin_error);
     }
+    // A web page can send this cross-origin `POST` without a CORS preflight.
+    let (status, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        HttpConnection::connect(primary_addr)
+            .await?
+            .post_from_browser(
+                r#"{"jsonrpc":"2.0","method":"getblockcount","id":11}"#,
+                "https://attacker.example",
+            )
+            .await
+    })
+    .await
+    .expect("browser request should finish before the timeout")
+    .expect("browser request should complete");
+    if allow_unauthenticated_admin {
+        assert_eq!(
+            status,
+            hyper::StatusCode::FORBIDDEN,
+            "a listener with unauthenticated admin methods must reject browser requests"
+        );
+    } else {
+        assert!(
+            status.is_success(),
+            "the restricted listener keeps its existing browser behavior"
+        );
+    }
+
     for method in ["stop", "generate", "addnode"] {
         assert!(!primary_methods.contains(method));
         let body = serde_json::json!({"jsonrpc": "2.0", "method": method, "id": 10}).to_string();

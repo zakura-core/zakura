@@ -121,6 +121,16 @@ async fn pq_live_spend() -> Result<()> {
         parameters.network
     );
 
+    let chain: serde_json::Value = client
+        .json_result_from_call("getblockchaininfo", "[]")
+        .await
+        .map_err(|error| eyre!(error))?;
+    let tip = u32::try_from(
+        chain
+            .get("blocks")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| eyre!("the node reports its height"))?,
+    )?;
     let utxos: Vec<Utxo> = client
         .json_result_from_call(
             "getaddressutxos",
@@ -128,10 +138,20 @@ async fn pq_live_spend() -> Result<()> {
         )
         .await
         .map_err(|error| eyre!(error))?;
+    // A coinbase output is spendable only once the chain is a maturity window past it, and on
+    // a fresh activation run every coin is a coinbase, so this waits for that window.
+    let maturity = zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
+    let candidates = utxos.len();
     let funding_source = utxos
         .into_iter()
+        .filter(|utxo| utxo.height + maturity <= tip)
         .max_by_key(|utxo| utxo.satoshis)
-        .ok_or_else(|| eyre!("{address} holds no spendable output yet"))?;
+        .ok_or_else(|| {
+            eyre!(
+                "none of {address}'s {candidates} outputs is mature at height {tip}; \
+                 the chain needs to be {maturity} blocks past one of them"
+            )
+        })?;
     let value: Amount<NonNegative> = funding_source.satoshis.try_into()?;
     println!(
         "spending {value:?} from {}:{} mined at {}",

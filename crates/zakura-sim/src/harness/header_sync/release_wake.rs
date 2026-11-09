@@ -4,24 +4,27 @@
 //! Plan bytes. It checks that property besides `header-sync/storage`'s,
 //! since no other harness declares the fixture.
 
+use std::rc::Rc;
+
 use serde::{Deserialize, Serialize};
+use zakura_scheduler::SimInstant;
 
 use super::{
     storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports, Storage,
     StorageScenario, StorageView, Weights,
 };
 use crate::{
-    domain::header_sync::capacity_release_wakes,
+    domain::header_sync::{capacity_release_wakes, CACHED_PASS_REFILL},
     harness::{
         header_node::{
             policy::{Allow, Hold, OpKind, Select, Trigger},
             wake::{WakeEvidence, WakeFixture},
-            Chain, ControlAction, ControlStep, Fork, Policy,
+            Chain, ControlAction, ControlStep, Fork, Policy, Topology,
         },
         Subsystem,
     },
     property::{EndViolation, HasView, Property, Sources},
-    ObservationLog, RunConfig, RunEnd, Sim,
+    ActionSource, Boundary, Identity, ObservationLog, RunConfig, RunEnd, Sim,
 };
 
 /// The headers of room the fixture's body lag leaves: the node's verified
@@ -54,7 +57,8 @@ pub enum WakeScenario {
     /// room, `mirror-0`'s prepare is released to fail with a local fault,
     /// so its handler retires the round and its leases return. A prepare's
     /// fault is a failure, not a resource stall, so discovery never
-    /// pauses. `mirror-1`'s prepare stays held.
+    /// pauses. `mirror-1`'s prepare stays held until the wake's deadline
+    /// has passed, then runs ([`Settle`]).
     Release,
     /// [`WakeScenario::Release`], with a fourth mirror at the node's tip
     /// that relinks [`DEFERRING_RELINKS`] times before `mirror-2` grows.
@@ -154,6 +158,58 @@ fn release() -> StorageScenario {
     }
 }
 
+/// The policy hold [`Settle`] opens: `mirror-1`'s, the second of
+/// [`release`]'s holds.
+const MIRROR_1_HOLD: usize = 1;
+
+/// Lets `mirror-1`'s held prepare run once the clock is past every opened
+/// wake's deadline, so a run can end with nothing held.
+///
+/// `header-sync/capacity-release-wakes` has concluded each wake's
+/// obligation by then, answered or not. An undeferred one expires the
+/// first time no task can run, and the clock moves only then. A deferred
+/// one expires once the clock passes its deadline, which is never more
+/// than [`CACHED_PASS_REFILL`] after the wake opened. So the release comes
+/// after the measured boundary, including when a bypass stopped the wake,
+/// and a run is the same as one without it up to that boundary. It offers
+/// no time boundary of its own, since one could change when the clock
+/// moves before that.
+struct Settle {
+    wake: WakeEvidence,
+    topology: Rc<Topology>,
+    /// Set once the release was picked.
+    done: bool,
+}
+
+impl Settle {
+    /// Whether a wake opened and the clock at `now` is past the deadline
+    /// of the last one.
+    fn due(&self, now: SimInstant) -> bool {
+        self.wake
+            .last_opened()
+            .and_then(|at| at.checked_add(CACHED_PASS_REFILL))
+            .is_some_and(|deadline| now > deadline)
+    }
+}
+
+impl ActionSource for Settle {
+    /// Offers `peer:node:settle` once, while [`Settle::due`].
+    fn enabled(&self, now: SimInstant, out: &mut Vec<(Identity, u64)>) {
+        if !self.done && self.due(now) {
+            out.push((Identity::peer("node", "settle"), 0));
+        }
+    }
+
+    /// None, as [`Settle`] says.
+    fn boundaries(&self, _now: SimInstant, _out: &mut Vec<Boundary>) {}
+
+    /// Opens `mirror-1`'s hold.
+    fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
+        self.done = true;
+        self.topology.release(MIRROR_1_HOLD);
+    }
+}
+
 /// `header-sync/storage` on a [`WakeScenario`], with the wake fixture
 /// declared.
 pub struct ReleaseWake(Storage);
@@ -208,9 +264,16 @@ impl Subsystem for ReleaseWake {
         }
     }
 
-    /// The storage harness on the fixture.
+    /// The storage harness on the fixture, with its [`Settle`] source.
     fn build(sim: &mut Sim, scenario: &WakeScenario, ports: Ports) -> Self {
-        ReleaseWake(Storage::build(sim, &scenario.storage(), ports))
+        let wake = ports.wake.clone();
+        let storage = Storage::build(sim, &scenario.storage(), ports);
+        sim.add_source(Box::new(Settle {
+            wake,
+            topology: storage.topology.clone(),
+            done: false,
+        }));
+        ReleaseWake(storage)
     }
 
     /// The storage harness's properties, then

@@ -627,12 +627,18 @@ pub struct FinalizedBlock {
     pub(super) treestate: Treestate,
     /// This block's deferred pool value balance change.
     pub(super) deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    /// The UTXOs spent by this block, if contextual validation already resolved them.
+    ///
+    /// When present, this contains the UTXO spent by every transparent input in the block, so
+    /// the finalized state doesn't read them from the database again. Checkpoint-verified
+    /// blocks don't have them, so their spent UTXOs are read from the database.
+    pub(super) spent_outputs: Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>>,
 }
 
 impl FinalizedBlock {
     /// Constructs [`FinalizedBlock`] from [`CheckpointVerifiedBlock`] and its [`Treestate`].
     pub fn from_checkpoint_verified(block: CheckpointVerifiedBlock, treestate: Treestate) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate)
+        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate, None)
     }
 
     /// Constructs [`FinalizedBlock`] from [`ContextuallyVerifiedBlock`] and its [`Treestate`].
@@ -640,11 +646,22 @@ impl FinalizedBlock {
         block: ContextuallyVerifiedBlock,
         treestate: Treestate,
     ) -> Self {
-        Self::from_semantically_verified(SemanticallyVerifiedBlock::from(block), treestate)
+        let spent_outputs = Arc::clone(&block.spent_outputs);
+
+        Self::from_semantically_verified(
+            SemanticallyVerifiedBlock::from(block),
+            treestate,
+            Some(spent_outputs),
+        )
     }
 
-    /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`] and its [`Treestate`].
-    fn from_semantically_verified(block: SemanticallyVerifiedBlock, treestate: Treestate) -> Self {
+    /// Constructs [`FinalizedBlock`] from [`SemanticallyVerifiedBlock`], its [`Treestate`], and
+    /// the UTXOs it spends, if contextual validation already resolved them.
+    fn from_semantically_verified(
+        block: SemanticallyVerifiedBlock,
+        treestate: Treestate,
+        spent_outputs: Option<Arc<HashMap<transparent::OutPoint, transparent::OrderedUtxo>>>,
+    ) -> Self {
         Self {
             block: block.block,
             hash: block.hash,
@@ -653,6 +670,7 @@ impl FinalizedBlock {
             transaction_hashes: block.transaction_hashes,
             treestate,
             deferred_pool_balance_change: block.deferred_pool_balance_change,
+            spent_outputs,
         }
     }
 }

@@ -10,20 +10,26 @@ use crate::config::ZakuradConfig;
 
 pub use self::{entry_point::EntryPoint, start::StartCmd};
 
+#[cfg(feature = "historical-treestate-tools")]
 use self::{
-    audit_historical_treestates::AuditHistoricalTreestatesCmd, generate::GenerateCmd,
-    prune_state::PruneStateCmd, rollback_state::RollbackStateCmd, tip_height::TipHeightCmd,
+    audit_historical_treestates::AuditHistoricalTreestatesCmd,
     verify_historical_treestates::VerifyHistoricalTreestatesCmd,
+};
+use self::{
+    generate::GenerateCmd, prune_state::PruneStateCmd, rollback_state::RollbackStateCmd,
+    tip_height::TipHeightCmd,
 };
 
 pub mod start;
 
+#[cfg(feature = "historical-treestate-tools")]
 mod audit_historical_treestates;
 mod entry_point;
 mod generate;
 pub mod prune_state;
 pub mod rollback_state;
 mod tip_height;
+#[cfg(feature = "historical-treestate-tools")]
 mod verify_historical_treestates;
 
 #[cfg(test)]
@@ -41,9 +47,11 @@ const LEGACY_CONFIG_FILE: &str = "zebrad.toml";
 #[derive(Debug, clap::Subcommand)]
 pub enum ZakuradCmd {
     /// Audit historical note commitment treestate serving in the state database
+    #[cfg(feature = "historical-treestate-tools")]
     AuditHistoricalTreestates(AuditHistoricalTreestatesCmd),
 
     /// Prove a historical subtree-root artifact against a note commitment frontier
+    #[cfg(feature = "historical-treestate-tools")]
     VerifyHistoricalTreestates(VerifyHistoricalTreestatesCmd),
 
     /// Generate a default `zakura.toml` configuration
@@ -75,12 +83,9 @@ impl ZakuradCmd {
             Start(_) => true,
 
             // Utility commands that don't use server components
-            AuditHistoricalTreestates(_)
-            | Generate(_)
-            | PruneState(_)
-            | RollbackState(_)
-            | TipHeight(_)
-            | VerifyHistoricalTreestates(_) => false,
+            Generate(_) | PruneState(_) | RollbackState(_) | TipHeight(_) => false,
+            #[cfg(feature = "historical-treestate-tools")]
+            AuditHistoricalTreestates(_) | VerifyHistoricalTreestates(_) => false,
         }
     }
 
@@ -94,12 +99,9 @@ impl ZakuradCmd {
             Start(_) => true,
 
             // Utility commands
-            AuditHistoricalTreestates(_)
-            | Generate(_)
-            | PruneState(_)
-            | RollbackState(_)
-            | TipHeight(_)
-            | VerifyHistoricalTreestates(_) => false,
+            Generate(_) | PruneState(_) | RollbackState(_) | TipHeight(_) => false,
+            #[cfg(feature = "historical-treestate-tools")]
+            AuditHistoricalTreestates(_) | VerifyHistoricalTreestates(_) => false,
         }
     }
 
@@ -118,12 +120,9 @@ impl ZakuradCmd {
             // This output:
             // - is used by automated tools, or
             // - needs to be read easily.
-            AuditHistoricalTreestates(_)
-            | Generate(_)
-            | PruneState(_)
-            | RollbackState(_)
-            | TipHeight(_)
-            | VerifyHistoricalTreestates(_) => true,
+            Generate(_) | PruneState(_) | RollbackState(_) | TipHeight(_) => true,
+            #[cfg(feature = "historical-treestate-tools")]
+            AuditHistoricalTreestates(_) | VerifyHistoricalTreestates(_) => true,
 
             // Commands that generate informative logging output by default.
             Start(_) => false,
@@ -144,12 +143,14 @@ impl ZakuradCmd {
     /// to turn the error into an exit status.
     pub(crate) fn run(&self, config: Arc<ZakuradConfig>) -> Result<(), Report> {
         match self {
+            #[cfg(feature = "historical-treestate-tools")]
             AuditHistoricalTreestates(cmd) => cmd.run(&config),
             Generate(cmd) => cmd.run(),
             PruneState(cmd) => cmd.run(&config),
             RollbackState(cmd) => cmd.run(&config),
             Start(cmd) => cmd.run(config),
             TipHeight(cmd) => cmd.run(&config),
+            #[cfg(feature = "historical-treestate-tools")]
             VerifyHistoricalTreestates(cmd) => cmd.run(),
         }
     }

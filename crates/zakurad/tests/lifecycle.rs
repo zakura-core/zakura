@@ -1101,20 +1101,22 @@ fn generate_reports_file_creation_failure() {
 fn failing_utility_command_exits_with_failure() {
     let scratch = Scratch::new();
     let config = scratch.write_config("zakura.toml", &scratch.regtest_config());
-    let missing = scratch.path().join("missing-subtrees.bin");
+    let missing = scratch.path().join("missing-state");
 
     let run = scratch.run(&mut scratch.command([
         OsStr::new("-c"),
         config.as_os_str(),
-        OsStr::new("verify-historical-treestates"),
+        OsStr::new("rollback-state"),
+        OsStr::new("--height"),
+        OsStr::new("5"),
         OsStr::new("--network"),
-        OsStr::new("Mainnet"),
-        OsStr::new("--subtree-input"),
+        OsStr::new("Testnet"),
+        OsStr::new("--cache-dir"),
         missing.as_os_str(),
     ]));
 
     run.assert_status(1)
-        .assert_stdout_contains("Subtree-root artifact verification failed")
+        .assert_stdout_contains("Failed to roll back finalized state")
         .assert_stdout_lacks("Starting zakurad");
 }
 
@@ -1135,15 +1137,20 @@ fn help_and_version_are_printed() {
     let scratch = Scratch::new();
 
     let mut help_args = vec![vec!["--help"], vec!["help"]];
-    for subcommand in [
-        "audit-historical-treestates",
+    let mut subcommands = vec![
         "generate",
         "prune-state",
         "rollback-state",
         "start",
         "tip-height",
-        "verify-historical-treestates",
-    ] {
+    ];
+    if cfg!(feature = "historical-treestate-tools") {
+        subcommands.extend([
+            "audit-historical-treestates",
+            "verify-historical-treestates",
+        ]);
+    }
+    for subcommand in subcommands {
         help_args.push(vec![subcommand, "--help"]);
     }
 
@@ -1174,14 +1181,33 @@ fn missing_arguments_use_parser_exit_status() {
         (&["-c"][..], "a value is required for '--config <CONFIG>'"),
         (&["rollback-state"][..], "--height <HEIGHT>"),
         (&["prune-state"][..], "--tx-retention <TX_RETENTION>"),
-        (
-            &["verify-historical-treestates"][..],
-            "--subtree-input <SUBTREE_INPUT>",
-        ),
     ] {
         let run = scratch.run(&mut scratch.command(args));
 
         run.assert_status(2).assert_stderr_contains(expected);
         assert_eq!(run.stdout, "", "parse errors write nothing to stdout");
+    }
+
+    #[cfg(feature = "historical-treestate-tools")]
+    scratch
+        .run(&mut scratch.command(["verify-historical-treestates"]))
+        .assert_status(2)
+        .assert_stderr_contains("--subtree-input <SUBTREE_INPUT>");
+}
+
+/// Builds without `historical-treestate-tools` reject its subcommands as unknown.
+#[cfg(not(feature = "historical-treestate-tools"))]
+#[test]
+fn historical_treestate_tools_need_their_feature() {
+    let scratch = Scratch::new();
+
+    for subcommand in [
+        "audit-historical-treestates",
+        "verify-historical-treestates",
+    ] {
+        scratch
+            .run(&mut scratch.command([subcommand]))
+            .assert_status(2)
+            .assert_stderr_contains("unrecognized subcommand");
     }
 }

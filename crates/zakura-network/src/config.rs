@@ -1102,6 +1102,12 @@ struct DTestnetParameters {
     slow_start_interval: Option<u32>,
     target_difficulty_limit: Option<String>,
     disable_pow: Option<bool>,
+    /// If `true`, a transaction may spend a coinbase output and still pay a transparent
+    /// address. Only a configured Testnet with an identity and peers of its own accepts it,
+    /// because it drops a rule the public networks keep. Regtest allows these spends
+    /// already.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_unshielded_coinbase_spends: Option<bool>,
     /// Height at which the MTP-plus-90-minutes rule activates.
     max_block_time_start_height: Option<u32>,
     genesis_hash: Option<String>,
@@ -1312,6 +1318,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             slow_start_interval: Some(params.slow_start_interval().0),
             target_difficulty_limit: Some(params.target_difficulty_limit().to_string()),
             disable_pow: Some(params.disable_pow()),
+            // Regtest allows these spends whatever the configuration says, and its
+            // deserializer rejects the setting, so only a configured Testnet writes it out.
+            allow_unshielded_coinbase_spends: (!params.is_regtest()
+                && params.should_allow_unshielded_coinbase_spends())
+            .then_some(true),
             max_block_time_start_height: Some(params.max_block_time_start_height().0),
             genesis_hash: Some(params.genesis_hash().to_string()),
             activation_heights: Some(params.activation_heights().into()),
@@ -1722,6 +1733,7 @@ where
         slow_start_interval,
         target_difficulty_limit,
         disable_pow,
+        allow_unshielded_coinbase_spends,
         max_block_time_start_height,
         genesis_hash,
         activation_heights,
@@ -1808,6 +1820,32 @@ where
 
     if let Some(disable_pow) = disable_pow {
         params_builder = params_builder.with_disable_pow(disable_pow);
+    }
+
+    if allow_unshielded_coinbase_spends == Some(true) {
+        // Letting a mining reward pay a transparent address is a rule the public networks
+        // keep, so only a chain that is nobody else's may drop it: it must say who it is,
+        // with a name and a magic of its own that is not the public Testnet's, and it must
+        // not reach the public network's peers.
+        if network_name.is_none()
+            || network_magic.is_none()
+            || network_magic == Some(magics::TESTNET.0)
+        {
+            return Err(de::Error::custom(
+                "unshielded coinbase spends on a configured Testnet require an explicit \
+                 network_name and network_magic of its own",
+            ));
+        }
+        if contains_default_initial_peers(initial_testnet_peers) {
+            return Err(de::Error::custom(
+                "unshielded coinbase spends on a configured Testnet require explicit, \
+                 isolated initial peers",
+            ));
+        }
+    }
+
+    if let Some(allow) = allow_unshielded_coinbase_spends {
+        params_builder = params_builder.with_unshielded_coinbase_spends(allow);
     }
 
     if let Some(height) = max_block_time_start_height {
@@ -1921,6 +1959,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
+        allow_unshielded_coinbase_spends,
         initial_nsm_value_balance,
         ..
     } = params;
@@ -1935,6 +1974,13 @@ where
         return Err(de::Error::custom(
             "inherit_activation_heights only applies to configured Testnets; \
              Regtest activation heights have their own defaults",
+        ));
+    }
+
+    if allow_unshielded_coinbase_spends.is_some() {
+        return Err(de::Error::custom(
+            "allow_unshielded_coinbase_spends only applies to configured Testnets; \
+             Regtest already lets a coinbase output be spent to a transparent address",
         ));
     }
 

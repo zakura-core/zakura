@@ -1103,7 +1103,8 @@ impl ParametersBuilder {
         self
     }
 
-    /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
+    /// Sets whether a transaction may spend a coinbase output and still pay a transparent
+    /// address, in the [`Parameters`] being built.
     pub fn with_unshielded_coinbase_spends(
         mut self,
         should_allow_unshielded_coinbase_spends: bool,

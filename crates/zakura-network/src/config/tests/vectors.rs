@@ -2010,6 +2010,61 @@ fn pq_activation_config_requires_an_isolated_network_and_support() {
 }
 
 #[test]
+fn only_an_isolated_custom_testnet_can_spend_a_coinbase_to_a_transparent_address() {
+    let source = r#"
+initial_testnet_peers = ["127.0.0.1:18333"]
+network = { network_name = "PqFork", checkpoints = true, network_magic = [80, 81, 84, 49], allow_unshielded_coinbase_spends = true }
+"#;
+    let config = toml::from_str::<Config>(source)
+        .expect("a configured Testnet with an identity of its own is isolated");
+    assert!(config.network.should_allow_unshielded_coinbase_spends());
+    // The setting survives being written back out and read again, so a node that rewrites
+    // its own configuration keeps the chain it was running.
+    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.network, config.network);
+
+    // A chain that is not its own may not drop a rule the public networks keep.
+    for (name, invalid) in [
+        (
+            "the public magic",
+            source.replace("[80, 81, 84, 49]", "[250, 26, 249, 191]"),
+        ),
+        ("the public name", source.replace("PqFork", "Testnet")),
+        (
+            "the public peers",
+            source.replace("initial_testnet_peers = [\"127.0.0.1:18333\"]", ""),
+        ),
+    ] {
+        assert!(
+            toml::from_str::<Config>(&invalid).is_err(),
+            "{name} must be rejected"
+        );
+    }
+
+    // Asking for it off is the default, and asking at all on Regtest is a mistake worth
+    // naming: Regtest allows these spends whatever the configuration says.
+    let off: Config = toml::from_str(&source.replace(
+        "allow_unshielded_coinbase_spends = true",
+        "allow_unshielded_coinbase_spends = false",
+    ))
+    .unwrap();
+    assert!(!off.network.should_allow_unshielded_coinbase_spends());
+    let default: Config = toml::from_str("network = 'Testnet'").unwrap();
+    assert!(!default.network.should_allow_unshielded_coinbase_spends());
+    let regtest = toml::from_str::<Config>(
+        "network = 'Regtest'\n[testnet_parameters]\nallow_unshielded_coinbase_spends = true",
+    )
+    .unwrap_err();
+    assert!(
+        regtest
+            .to_string()
+            .contains("only applies to configured Testnets"),
+        "{regtest}"
+    );
+    assert!(Network::new_regtest(Default::default()).should_allow_unshielded_coinbase_spends());
+}
+
+#[test]
 fn an_isolated_custom_testnet_can_ask_for_the_post_quantum_rules() {
     let source = r#"
 initial_testnet_peers = ["127.0.0.1:18333"]

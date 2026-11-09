@@ -32,6 +32,9 @@ class NetworkTests(unittest.TestCase):
             params = config['network']['network']
             self.assertEqual(params['activation_heights']['NU7'], 4465026)
             self.assertEqual(params['pq_activation_height'], 4559786)
+            # Every coin on an isolated run is a mining reward, so without this a
+            # transparent post-quantum output could never be funded.
+            self.assertTrue(params['allow_unshielded_coinbase_spends'])
             self.assertNotIn('max_block_time_start_height', params)
             self.assertEqual(params['checkpoints'][1], [4558785, list(bytes.fromhex(self.config['seed_finalized_hash'])[::-1])])
             self.assertEqual(len(params['checkpoints'][0][1]), 32)

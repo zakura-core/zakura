@@ -166,6 +166,7 @@ network_magic = {magic}
 checkpoints = {checkpoints}
 inherit_activation_heights = true
 pq_activation_height = {run['activation_height']}
+allow_unshielded_coinbase_spends = true
 [network.network.activation_heights]
 NU7 = {archive_seed.NU7_HEIGHT}
 [state]

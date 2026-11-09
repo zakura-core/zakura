@@ -6,6 +6,12 @@ NU7 retains its public Testnet activation at 4,465,026. Mining starts ten minute
 after both archive validators restore and verify the refreshed seed. Proof of
 work remains enabled, so activation can occur later than the countdown.
 
+Both validators run with `allow_unshielded_coinbase_spends`, so a transaction may
+spend a mining reward and still pay a transparent address. The public networks
+require such a spend to pay shielded addresses only; on a run whose every coin is
+a mining reward that would leave no way to fund the transparent post-quantum
+output the run exists to exercise.
+
 The controller, preparation node, and two validators use one dedicated host.
 Caddy serves the standalone dashboard and immutable seed files. The preparation
 node runs only while refreshing a seed and never mines.

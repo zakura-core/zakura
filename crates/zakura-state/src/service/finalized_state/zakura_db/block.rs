@@ -1020,7 +1020,9 @@ impl ZakuraDb {
             })
             .collect();
 
-        // Get a list of the spent UTXOs, before we delete any from the database.
+        // Get the spent UTXOs before deleting any from the database. Contextual validation
+        // already resolved them for contextually verified blocks; checkpoint-verified blocks
+        // read them here.
         let outpoints: Vec<transparent::OutPoint> = finalized
             .block
             .view()
@@ -1041,7 +1043,12 @@ impl ZakuraDb {
             Option<Vec<RawBytes>>,
         ) = rayon::join(
             || {
-                if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
+                if let Some(spent_outputs) = &finalized.spent_outputs {
+                    outpoints
+                        .into_iter()
+                        .map(|outpoint| resolved_spent_utxo(outpoint, spent_outputs))
+                        .collect()
+                } else if outpoints.len() >= super::PARALLEL_BLOCK_READ_THRESHOLD {
                     use rayon::prelude::*;
                     outpoints
                         .into_par_iter()
@@ -1278,6 +1285,29 @@ fn read_spent_utxo(
         .expect("already checked UTXO was in state or block");
 
     (outpoint, out_loc, utxo)
+}
+
+/// Returns a spent transparent UTXO and its output location from the UTXOs that contextual
+/// validation resolved, without reading the database.
+///
+/// The output location comes from the height and transaction index recorded in the
+/// [`transparent::OrderedUtxo`], so this works for UTXOs created in earlier blocks and in this
+/// block.
+fn resolved_spent_utxo(
+    outpoint: transparent::OutPoint,
+    spent_outputs: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) -> (transparent::OutPoint, OutputLocation, transparent::Utxo) {
+    let ordered_utxo = spent_outputs.get(&outpoint).expect(
+        "contextual validation resolves the UTXO spent by every transparent input in the block",
+    );
+    let tx_loc =
+        TransactionLocation::from_usize(ordered_utxo.utxo.height, ordered_utxo.tx_index_in_block);
+
+    (
+        outpoint,
+        OutputLocation::from_outpoint(tx_loc, &outpoint),
+        ordered_utxo.utxo.clone(),
+    )
 }
 
 /// Lookup the output location for an outpoint.

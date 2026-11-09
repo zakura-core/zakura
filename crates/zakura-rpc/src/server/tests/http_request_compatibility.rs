@@ -1,4 +1,4 @@
-//! Tests for the HTTP request compatibility middleware.
+//! Tests for the HTTP request compatibility middleware and JSON-RPC version mapping.
 
 use std::{
     future::Future,
@@ -14,7 +14,11 @@ use tower::{BoxError, Layer, Service};
 
 use crate::server::{
     http::{HttpBody, HttpRequest, HttpResponse},
-    http_request_compatibility::{HttpRequestMiddleware, HttpRequestMiddlewareLayer},
+    http_request_compatibility::{
+        request_to_json_rpc_2, response_from_json_rpc_2, HttpRequestMiddleware,
+        HttpRequestMiddlewareLayer, JsonRpc2Request, JsonRpcVersion,
+    },
+    jsonrpc::Body,
 };
 
 /// A body that always returns an error, simulating a TCP RST during body collection.
@@ -141,9 +145,8 @@ async fn browser_requests_are_rejected_only_when_configured() {
     );
 }
 
-/// Sends `request` through the middleware and returns what the inner service received and
-/// what the client gets back.
-async fn round_trip(request: impl Into<Bytes>, response: &'static str) -> (Bytes, Bytes) {
+/// Sends `request` through the middleware and returns the body the inner service received.
+async fn forwarded_body(request: impl Into<Bytes>) -> Bytes {
     let received = Arc::new(Mutex::new(None));
     let recorded = received.clone();
     let service = tower::service_fn(move |request: HttpRequest| {
@@ -153,7 +156,7 @@ async fn round_trip(request: impl Into<Bytes>, response: &'static str) -> (Bytes
             *recorded
                 .lock()
                 .expect("no test thread panics while holding the lock") = Some(body);
-            Ok::<_, BoxError>(HttpResponse::new(HttpBody::from(response)))
+            Ok::<_, BoxError>(HttpResponse::new(HttpBody::from("null")))
         }
     });
     // Match the server's limit of twice the maximum block size plus its JSON wrapper.
@@ -163,41 +166,167 @@ async fn round_trip(request: impl Into<Bytes>, response: &'static str) -> (Bytes
         .header("content-type", "application/json")
         .body(HttpBody::from(request.into()))
         .expect("valid request");
-    let response = middleware
+    middleware
         .call(request)
         .await
-        .expect("the inner service answers every request")
-        .into_body()
-        .collect()
-        .await
-        .expect("a full body can't fail")
-        .to_bytes();
+        .expect("the inner service answers every request");
     let received = received
         .lock()
         .expect("no test thread panics while holding the lock")
-        .take()
-        .expect("the middleware forwards the request to the inner service");
-    (received, response)
+        .take();
+    received.expect("the middleware forwards the request to the inner service")
 }
 
-/// A plain JSON-RPC 2.0 call reaches the server exactly as sent, and the server's response
-/// reaches the client exactly as sent.
+/// The middleware passes every body on as sent; the server maps JSON-RPC versions as it parses.
 #[tokio::test]
-async fn plain_json_rpc_2_call_and_response_pass_through_unchanged() {
+async fn middleware_forwards_bodies_unchanged() {
+    for request in [
+        r#"{"id": 3, "method": "getinfo", "jsonrpc": "2.0", "params": []}"#,
+        r#"{"jsonrpc":"1.0","method":"getinfo","params":[],"id":7}"#,
+        r#"{"method":"submitblock","params":["00ff"],"id":"miner"}"#,
+        "not json",
+    ] {
+        assert_eq!(forwarded_body(request).await, request.as_bytes());
+    }
+}
+
+/// Describes a parsed body, so tests can compare two parses.
+fn describe(body: &Body<'_>) -> String {
+    match body {
+        Body::Call(request) => format!("{request:?}"),
+        Body::Notification(notification) => format!("{notification:?}"),
+        Body::Error(response) => format!("{:?}", response.as_json()),
+        Body::Batch(entries) => format!("batch of {}", entries.len()),
+    }
+}
+
+/// Returns the converted body and version, failing if `request` is parsed as a plain call.
+fn converted(request: &str) -> (JsonRpcVersion, Vec<u8>) {
+    match request_to_json_rpc_2(request.as_bytes()) {
+        JsonRpc2Request::Plain(_) => panic!("{request} should be converted"),
+        JsonRpc2Request::Converted { version, body } => (version, body.into_owned()),
+    }
+}
+
+/// Every call parsed in one pass is the call the server would parse from the body as sent.
+///
+/// This covers the field orders, IDs, versions, methods, and parameters that decide whether a
+/// call is plain, and those that make the server read it as a notification.
+#[test]
+fn plain_calls_parse_like_the_server() {
+    let ids = [
+        None,
+        Some("0"),
+        Some("1"),
+        Some("18446744073709551615"),
+        Some("18446744073709551616"),
+        Some("-1"),
+        Some("1.5"),
+        Some("1e2"),
+        Some(r#""x""#),
+        Some(r#""\u0041""#),
+        Some(r#""""#),
+        Some("null"),
+        Some("true"),
+        Some("[]"),
+    ];
+    let versions = [r#""2.0""#, r#""2\u002e0""#, r#""1.0""#, "2"];
+    let methods = [r#""getinfo""#, r#""get\u0069nfo""#, "1"];
+    let params = [
+        None,
+        Some("[]"),
+        Some(r#"["00ff"]"#),
+        Some(r#"["a\"b"]"#),
+        Some("[ ]"),
+        Some("[1]"),
+        Some("{}"),
+    ];
+
+    let (mut calls, mut notifications) = (0, 0);
+    for id in ids {
+        for version in versions {
+            for method in methods {
+                for param in params {
+                    for extra in [false, true] {
+                        let mut fields = vec![
+                            format!(r#""jsonrpc":{version}"#),
+                            format!(r#""method":{method}"#),
+                        ];
+                        fields.extend(id.map(|id| format!(r#""id":{id}"#)));
+                        fields.extend(param.map(|params| format!(r#""params":{params}"#)));
+                        if extra {
+                            fields.push(r#""extra":0"#.to_string());
+                        }
+                        // Try every field order by rotating, and the reverse of each rotation.
+                        for rotation in 0..fields.len() {
+                            for reverse in [false, true] {
+                                let mut fields = fields.clone();
+                                fields.rotate_left(rotation);
+                                if reverse {
+                                    fields.reverse();
+                                }
+                                let request = format!("{{{}}}", fields.join(","));
+
+                                let JsonRpc2Request::Plain(plain) =
+                                    request_to_json_rpc_2(request.as_bytes())
+                                else {
+                                    continue;
+                                };
+                                match plain {
+                                    Body::Call(_) => calls += 1,
+                                    Body::Notification(_) => notifications += 1,
+                                    _ => panic!("{request} is parsed as neither call"),
+                                }
+                                assert_eq!(
+                                    describe(&plain),
+                                    describe(&Body::parse(request.as_bytes(), true, 1)),
+                                    "{request}",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        calls > 0 && notifications > 0,
+        "{calls} calls, {notifications} notifications"
+    );
+}
+
+/// A block's hex in `submitblock` is parsed in place, without copying or re-encoding the body.
+#[test]
+fn submitblock_hex_is_parsed_in_place() {
     let block = "00".repeat(2_000_000);
     let request =
         format!(r#"{{"id": 3, "method": "submitblock", "jsonrpc": "2.0", "params": ["{block}"]}}"#);
+
+    let JsonRpc2Request::Plain(Body::Call(call)) = request_to_json_rpc_2(request.as_bytes()) else {
+        panic!("a plain submitblock call is parsed in one pass");
+    };
+    let params = call.params.expect("the call has parameters");
+    let params = params.get().as_bytes().as_ptr_range();
+    let body = request.as_bytes().as_ptr_range();
+    assert!(body.start <= params.start && params.end <= body.end);
+    assert_eq!(call.method, "submitblock");
+}
+
+/// A plain call's response goes back exactly as the server sent it.
+#[test]
+fn json_rpc_2_responses_are_unchanged() {
     let response = r#"{"jsonrpc":"2.0","id":3,"result":null}"#;
-
-    let (received, returned) = round_trip(request.clone(), response).await;
-
-    assert_eq!(received, request.as_bytes());
-    assert_eq!(returned, response.as_bytes());
+    let json = serde_json::value::RawValue::from_string(response.to_string())
+        .expect("the response is JSON");
+    assert_eq!(
+        response_from_json_rpc_2(JsonRpcVersion::TwoPointZero, json),
+        response
+    );
 }
 
 /// A near-limit numeric array with a noncanonical final number keeps the conversion behavior.
-#[tokio::test]
-async fn large_numeric_array_is_normalized() {
+#[test]
+fn large_numeric_array_is_normalized() {
     let numbers = "0,".repeat(1_999_999);
     let request = format!(
         r#"{{"id": 1, "method": "submitblock", "jsonrpc": "2.0", "params": [{numbers}1e2]}}"#
@@ -205,16 +334,16 @@ async fn large_numeric_array_is_normalized() {
     let expected =
         format!(r#"{{"jsonrpc":"2.0","method":"submitblock","params":[{numbers}100.0],"id":1}}"#);
 
-    let (received, _) = round_trip(request, r#"{"jsonrpc":"2.0","id":1,"result":null}"#).await;
-
-    assert_eq!(received, expected.as_bytes());
+    assert_eq!(
+        converted(&request),
+        (JsonRpcVersion::TwoPointZero, expected.into_bytes())
+    );
 }
 
 /// JSON-RPC 2.0 calls that the server would read differently from their re-encoded form are
-/// still re-encoded before they reach it.
-#[tokio::test]
-async fn json_rpc_2_calls_the_server_reads_differently_are_still_re_encoded() {
-    let response = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+/// still re-encoded before the server parses them.
+#[test]
+fn json_rpc_2_calls_the_server_reads_differently_are_still_re_encoded() {
     for (request, forwarded) in [
         (
             r#"{"id": 1, "method": "getinfo", "jsonrpc": "2.0", "params": [0,0]}"#,
@@ -253,57 +382,76 @@ async fn json_rpc_2_calls_the_server_reads_differently_are_still_re_encoded() {
             r#"{"jsonrpc":"2.0","method":"getinfo","params":{"a":2},"id":1}"#,
         ),
     ] {
-        let (received, _) = round_trip(request, response).await;
         assert_eq!(
-            received,
-            forwarded.as_bytes(),
+            converted(request),
+            (JsonRpcVersion::TwoPointZero, forwarded.as_bytes().to_vec()),
             "{request} should reach the server as {forwarded}"
         );
     }
 }
 
+/// A body that isn't a call from a known version reaches the server unchanged.
+#[test]
+fn unknown_bodies_are_unchanged() {
+    for request in [
+        "not json",
+        "[]",
+        r#"[{"jsonrpc":"2.0","method":"getinfo","id":1}]"#,
+    ] {
+        assert_eq!(
+            converted(request),
+            (JsonRpcVersion::Unknown, request.as_bytes().to_vec())
+        );
+    }
+}
+
+/// Maps `response` to `version`, and parses it.
+fn response_in_version(version: JsonRpcVersion, response: &str) -> serde_json::Value {
+    let json = serde_json::value::RawValue::from_string(response.to_string())
+        .expect("the response is JSON");
+    serde_json::from_str(&response_from_json_rpc_2(version, json))
+        .expect("the mapped response is JSON")
+}
+
 /// A bitcoind-style request without a `jsonrpc` field reaches the server as JSON-RPC 2.0 with
 /// the same method, parameters and ID, and the response goes back without a `jsonrpc` field.
-#[tokio::test]
-async fn bitcoind_request_is_rewritten_to_json_rpc_2() {
-    let request = r#"{"method":"submitblock","params":["00ff"],"id":"miner"}"#;
-    let response = r#"{"jsonrpc":"2.0","id":"miner","result":null}"#;
+#[test]
+fn bitcoind_request_is_rewritten_to_json_rpc_2() {
+    let (version, received) =
+        converted(r#"{"method":"submitblock","params":["00ff"],"id":"miner"}"#);
 
-    let (received, returned) = round_trip(request, response).await;
-
+    assert_eq!(version, JsonRpcVersion::Bitcoind);
     let received: serde_json::Value =
         serde_json::from_slice(&received).expect("the rewritten request is JSON");
     assert_eq!(
         received,
         serde_json::json!({"jsonrpc": "2.0", "method": "submitblock", "params": ["00ff"], "id": "miner"})
     );
-    let returned: serde_json::Value =
-        serde_json::from_slice(&returned).expect("the rewritten response is JSON");
     assert_eq!(
-        returned,
+        response_in_version(version, r#"{"jsonrpc":"2.0","id":"miner","result":null}"#),
         serde_json::json!({"id": "miner", "result": null, "error": null})
     );
 }
 
 /// A lightwalletd-style `"jsonrpc": "1.0"` request reaches the server as JSON-RPC 2.0, and the
 /// response goes back labelled 1.0.
-#[tokio::test]
-async fn lightwalletd_request_is_rewritten_to_json_rpc_2() {
-    let request = r#"{"jsonrpc":"1.0","method":"getinfo","params":[],"id":7}"#;
-    let response = r#"{"jsonrpc":"2.0","id":7,"result":{"version":1}}"#;
+#[test]
+fn lightwalletd_request_is_rewritten_to_json_rpc_2() {
+    let (version, received) =
+        converted(r#"{"jsonrpc":"1.0","method":"getinfo","params":[],"id":7}"#);
 
-    let (received, returned) = round_trip(request, response).await;
-
+    assert_eq!(version, JsonRpcVersion::Lightwalletd);
     let received: serde_json::Value =
         serde_json::from_slice(&received).expect("the rewritten request is JSON");
     assert_eq!(
         received,
         serde_json::json!({"jsonrpc": "2.0", "method": "getinfo", "params": [], "id": 7})
     );
-    let returned: serde_json::Value =
-        serde_json::from_slice(&returned).expect("the rewritten response is JSON");
     assert_eq!(
-        returned,
+        response_in_version(
+            version,
+            r#"{"jsonrpc":"2.0","id":7,"result":{"version":1}}"#
+        ),
         serde_json::json!({"jsonrpc": "1.0", "id": 7, "result": {"version": 1}, "error": null})
     );
 }

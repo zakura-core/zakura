@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-fault-read-unavailable.bin`, a fuzz-12 item 7 witness whose run
+# shows Failed(Read, "unavailable"). Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "3d02dcd0e9bcaafc62244a808a883203467db0951a87f137991588c0f676eb23"
+scenario_sha256 = "7e0266087e85045c9fd30c7f2e911abff787c82a640dd394e7fc459702948bb4"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-reset-reply.bin`, a fuzz-12 item 7 witness whose run
+# shows ResetBetweenCommitAndDelivery. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "c61d5b182906c5abaf5db5c1b42cc9fb1819dacdc6a92e0716127e869b95539f"
+scenario_sha256 = "34013531810dd2530e6e3897232da212db757a437f29ca68adc339e444fd132a"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

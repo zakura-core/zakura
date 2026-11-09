@@ -59,6 +59,12 @@ pub trait ActionSource {
     /// Appends the instants where time must stop for this source.
     fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>);
 
+    /// Appends each action enabled at `now` only because no task is ready,
+    /// with the index `execute` takes. The run asks only at such a step, so
+    /// every wake a previous step queued has been handled. Like `enabled`,
+    /// it must be pure. The default appends nothing.
+    fn quiet(&self, _now: SimInstant, _out: &mut Vec<(Identity, u64)>) {}
+
     /// Runs the action `enabled` listed with index `local`, appending what
     /// happened to `log`.
     fn execute(&mut self, local: u64, log: &mut ObservationLog);

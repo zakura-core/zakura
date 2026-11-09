@@ -500,6 +500,7 @@ fn accepted(through: Frontier) -> ReactorEvent {
         through,
         headers: cursor.headers,
         bytes: cursor.bytes,
+        stored: (through, cursor.headers, cursor.bytes),
         totals: Default::default(),
     }
 }
@@ -821,10 +822,72 @@ fn claims_record_what_their_pages_consumed() {
     assert!(found[0].contains("which no claim recorded"), "{found:?}");
 }
 
-/// `event`, an acceptance, one byte past its cursor.
+/// Pages that consume more than the updates granted break, though every
+/// cursor and total agrees with them. An acceptance whose stored cursor
+/// isn't the one asked for breaks too.
+#[test]
+fn pages_stay_within_their_credit_and_acceptance_stores_its_cursor() {
+    let chain = main_chain(4);
+    let genesis = HeaderFixture::regtest().anchor();
+    let round = request(1, chain[3].hash, genesis.hash);
+    // An Open granting exactly one two-header page.
+    let mut small = open(chain[3], &[genesis.hash]);
+    let page_bytes = u32::try_from(credit::page_size(2, AuxSchema::None)).expect("small");
+    if let ReactorEvent::CreditIssued {
+        objects,
+        bytes,
+        update,
+        ..
+    } = &mut small
+    {
+        (*objects, *bytes) = (2, page_bytes);
+        update.added_credit = Credit {
+            objects: 2,
+            bytes: page_bytes,
+        };
+    }
+    let base = || {
+        vec![
+            reserved(1, 10),
+            adopted(),
+            small.clone(),
+            started(round.clone(), &[genesis.hash]),
+        ]
+    };
+    let mut within = base();
+    within.extend([
+        claimed(chain[1], 2),
+        page(&round, genesis, &[chain[0].hash, chain[1].hash]),
+    ]);
+    assert_eq!(credit_breaks(&within), Vec::<String>::new());
+    let mut over = base();
+    over.extend([claimed(chain[1], 2), claimed(chain[2], 1)]);
+    let found = credit_breaks(&over);
+    assert!(
+        found
+            .iter()
+            .any(|found| found.contains("its updates granted")),
+        "{found:?}"
+    );
+    let mut stored_elsewhere = within;
+    let mut accepted = accepted(chain[1]);
+    if let ReactorEvent::CursorsAccepted { stored, .. } = &mut accepted {
+        stored.0 = chain[0];
+    }
+    stored_elsewhere.push(accepted);
+    let found = credit_breaks(&stored_elsewhere);
+    assert!(
+        found.iter().any(|found| found.contains("not the")),
+        "{found:?}"
+    );
+}
+
+/// `event`, an acceptance, one byte past its cursor, as asked for and as
+/// stored.
 fn one_byte_more_accepted(mut event: ReactorEvent) -> ReactorEvent {
-    if let ReactorEvent::CursorsAccepted { bytes, .. } = &mut event {
+    if let ReactorEvent::CursorsAccepted { bytes, stored, .. } = &mut event {
         *bytes += 1;
+        stored.2 += 1;
     }
     event
 }

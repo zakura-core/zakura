@@ -544,6 +544,12 @@ impl<K: Eq + Hash + Clone, C: Clone + Eq> Subscriptions<K, C> {
         })
     }
 
+    /// The cursor `key` last accepted.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn accepted(&self, key: &K) -> Option<&C> {
+        self.live.get(key).map(|subscribed| &subscribed.accepted.0)
+    }
+
     /// The cursor of the last page received from `key`, or its start. The
     /// reactor checks a page's linkage against it.
     pub(crate) fn received(&self, key: &K) -> Option<&C> {

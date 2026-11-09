@@ -429,13 +429,16 @@ pub enum ReactorEvent {
         session_id: u64,
         /// The subscription.
         subscription: u64,
-        /// The last header the accepted cursors reach.
+        /// The last header of the cursor the reactor asked to accept.
         through: Frontier,
-        /// The header credit the subscription's pages consumed through it,
-        /// as its cursor records.
+        /// The header credit consumed through it, as that cursor records.
         headers: u64,
-        /// The byte credit the subscription's pages consumed through it.
+        /// The byte credit consumed through it, as that cursor records.
         bytes: u64,
+        /// The accepted cursor the subscription primitive stored, which
+        /// should be the one asked for: its header, and the header and byte
+        /// credit consumed through it.
+        stored: (Frontier, u64, u64),
         /// The subscription primitive's totals after the acceptance.
         totals: CreditTotals,
     },

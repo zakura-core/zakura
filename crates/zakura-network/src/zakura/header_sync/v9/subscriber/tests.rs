@@ -1204,6 +1204,11 @@ fn observed_credit_reports_each_open_grant_and_close() {
         through: Frontier::new(through.height, through.hash),
         headers: through.headers,
         bytes: through.bytes,
+        stored: (
+            Frontier::new(through.height, through.hash),
+            through.headers,
+            through.bytes,
+        ),
         totals,
     };
     let mut expected = vec![credit(CreditKind::Open, &open, totals(&[&open], None))];

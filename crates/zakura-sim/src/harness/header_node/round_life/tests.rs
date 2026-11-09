@@ -136,6 +136,7 @@ fn accepted(hash: block::Hash) -> ReactorEvent {
         through: Frontier::new(block::Height(1), hash),
         headers: 1,
         bytes: 263,
+        stored: (Frontier::new(block::Height(1), hash), 1, 263),
         totals: Default::default(),
     }
 }

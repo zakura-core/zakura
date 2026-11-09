@@ -4,7 +4,9 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
-use zakura_node_services::block_memory::{BlockHandle, HeaderHandle, TransactionHandle};
+use zakura_node_services::block_memory::{
+    BlockHandle, HeaderHandle, OwnedRawBlock, OwnedRawTransaction, TransactionHandle,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -520,6 +522,10 @@ pub enum ReadResponse {
     /// serialized size.
     BlockAndSize(Option<(BlockHandle, usize)>),
 
+    /// Response to [`ReadRequest::RawBlock`] with the specified block's
+    /// Zcash consensus serialization.
+    RawBlock(Option<OwnedRawBlock>),
+
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
@@ -537,6 +543,10 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::AnyChainTransaction`] with the specified transaction.
     AnyChainTransaction(Option<AnyTx>),
+
+    /// Response to [`ReadRequest::AnyChainRawTransaction`] with the specified
+    /// transaction's Zcash consensus serialization.
+    RawTransaction(Option<OwnedRawTransaction>),
 
     /// Response to [`ReadRequest::TransactionIdsForBlock`],
     /// with an list of transaction hashes in block order,
@@ -806,6 +816,8 @@ impl TryFrom<ReadResponse> for Response {
 
             ReadResponse::Depth(_)
             | ReadResponse::Transaction(_)
+            | ReadResponse::RawBlock(_)
+            | ReadResponse::RawTransaction(_)
             | ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)

@@ -329,9 +329,12 @@ fn a_weight_above_three_is_refused() {
     Storage::prepare(&scenario);
 }
 
-/// Generator 2 has no branch weights, so it can't encode one.
+/// Generator 3 encodes branch weights, so each witness round-trips
+/// through its canonical prefix.
 #[test]
-fn the_grammar_cant_encode_a_weight() {
-    assert!(grammar::encode(&weighted()).is_err());
-    assert!(grammar::encode(&longer()).is_ok());
+fn the_grammar_encodes_the_weighted_witnesses() {
+    for scenario in [equal(), longer(), weighted()] {
+        let prefix = grammar::encode(&scenario).unwrap();
+        assert_eq!(grammar::decode(&prefix).unwrap(), scenario);
+    }
 }

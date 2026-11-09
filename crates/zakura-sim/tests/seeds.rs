@@ -489,3 +489,84 @@ fn optional_seeds_are_quarantined_and_other_harnesses_counted() {
         SeedError::UnknownHarness("discovery/retired".to_owned())
     );
 }
+
+/// A sidecar edit.
+type Edit = Box<dyn Fn(String) -> String>;
+
+/// A copy of the committed `header-storage-default` seed, its sidecar with
+/// `edit` applied, its bytes with `bytes` applied, and every kept source, in
+/// a new directory, and the errors validating it gives.
+fn migrated_default(
+    edit: impl Fn(String) -> String,
+    bytes: impl Fn(&mut Vec<u8>),
+) -> Vec<SeedError> {
+    let dir = TempDir::new().unwrap();
+    let mut input = fs::read(fixtures().join("header-storage-default.bin")).unwrap();
+    let sidecar = fs::read_to_string(fixtures().join("header-storage-default.toml")).unwrap();
+    let digest = seed::sha256(&input);
+    bytes(&mut input);
+    let sidecar = edit(sidecar.replace(&digest, &seed::sha256(&input)));
+    fs::write(dir.path().join("seed.bin"), &input).unwrap();
+    fs::write(dir.path().join("seed.toml"), sidecar).unwrap();
+    let sources = dir.path().join(seed::SOURCES_DIR);
+    fs::create_dir(&sources).unwrap();
+    for source in fs::read_dir(fixtures().join(seed::SOURCES_DIR)).unwrap() {
+        let source = source.unwrap().path();
+        fs::copy(&source, sources.join(source.file_name().unwrap())).unwrap();
+    }
+    let report = load(&[dir.path().to_path_buf()], None);
+    report
+        .rejected
+        .into_iter()
+        .map(|failed| failed.error)
+        .collect()
+}
+
+/// A migrated seed's `derived_from` must name a kept source that migrates to
+/// the seed. One naming another seed's source, one naming a source that
+/// isn't kept, and one claiming the generator the seed is at are all
+/// rejected, and the unchanged copy is admitted.
+#[test]
+fn derived_seeds_must_migrate_from_their_kept_source() {
+    let keep = |sidecar: String| sidecar;
+    assert_eq!(migrated_default(keep, |_| {}), []);
+    const DEFAULT_SOURCE: &str = "251c8894a914f36210e128139a57ffbb34a6ea871511f1d91387ace64e538148";
+    const GROW_SOURCE: &str = "13a6f50ed23fbeabd2398d65f6da2ec0807869b1b64f185031c14b5ead5e7ee5";
+    let cases: [(Edit, &str); 3] = [
+        (
+            Box::new(|sidecar: String| sidecar.replace(DEFAULT_SOURCE, GROW_SOURCE)),
+            "migrates to other bytes",
+        ),
+        (
+            Box::new(|sidecar: String| sidecar.replace(DEFAULT_SOURCE, &"ab".repeat(32))),
+            "names no kept source",
+        ),
+        (
+            Box::new(|sidecar: String| sidecar.replace("generator = 2", "generator = 3")),
+            "not one older",
+        ),
+    ];
+    for (edit, reason) in cases {
+        let [error] = &migrated_default(edit, |_| {})[..] else {
+            panic!("{reason}: one rejection");
+        };
+        assert!(matches!(error, SeedError::Derived(_)), "{error:?}");
+        assert!(
+            error.to_string().contains(reason),
+            "{error} doesn't say {reason}"
+        );
+    }
+}
+
+/// A seed whose prefix carries another generator's version byte is
+/// rejected, though the harness would draw the default scenario for it and
+/// the sidecar records that scenario's digest.
+#[test]
+fn a_seed_for_another_generator_is_rejected() {
+    let drop_source =
+        |sidecar: String| sidecar[..sidecar.find("[derived_from]").unwrap()].to_owned();
+    assert_eq!(
+        migrated_default(drop_source, |input| input[0] = 2),
+        [SeedError::OtherGenerator]
+    );
+}

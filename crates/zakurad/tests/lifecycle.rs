@@ -1144,7 +1144,7 @@ fn help_and_version_are_printed() {
         "start",
         "tip-height",
     ];
-    if cfg!(feature = "historical-treestate-tools") {
+    if cfg!(feature = "debug-commands") {
         subcommands.extend([
             "audit-historical-treestates",
             "verify-historical-treestates",
@@ -1188,17 +1188,17 @@ fn missing_arguments_use_parser_exit_status() {
         assert_eq!(run.stdout, "", "parse errors write nothing to stdout");
     }
 
-    #[cfg(feature = "historical-treestate-tools")]
+    #[cfg(feature = "debug-commands")]
     scratch
         .run(&mut scratch.command(["verify-historical-treestates"]))
         .assert_status(2)
         .assert_stderr_contains("--subtree-input <SUBTREE_INPUT>");
 }
 
-/// Builds without `historical-treestate-tools` reject its subcommands as unknown.
-#[cfg(not(feature = "historical-treestate-tools"))]
+/// Builds without `debug-commands` reject its subcommands as unknown.
+#[cfg(not(feature = "debug-commands"))]
 #[test]
-fn historical_treestate_tools_need_their_feature() {
+fn debug_commands_need_their_feature() {
     let scratch = Scratch::new();
 
     for subcommand in [

@@ -1972,6 +1972,7 @@ mod tests {
                 headers: 1,
                 work: None,
                 first: None,
+                hashes: vec!["bb".to_owned()],
             };
             let failed = StorageResult::PrepareFailed {
                 category: "invalid_header".to_owned(),

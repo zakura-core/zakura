@@ -1,6 +1,6 @@
 [package]
 name = "zakura-rpc"
-version = "16.0.1"
+version = "17.0.0"
 authors.workspace = true
 description = "The Zakura node's JSON Remote Procedure Call (JSON-RPC) interface. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -90,6 +90,7 @@ tracing = { workspace = true }
 # Metrics collection
 metrics = { workspace = true }
 
+const-hex = { workspace = true }
 hex = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["serde_derive"] }
 
@@ -113,7 +114,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "17.0.0" }
 zakura-network = { path = "../zakura-network", version = "15.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "5.1.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.5" }
-zakura-state = { path = "../zakura-state", version = "15.0.0" }
+zakura-state = { path = "../zakura-state", version = "16.0.0" }
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
@@ -144,7 +145,7 @@ zakura-consensus = { path = "../zakura-consensus", version = "17.0.0", features 
 zakura-network = { path = "../zakura-network", version = "15.0.0", features = [
     "proptest-impl",
 ] }
-zakura-state = { path = "../zakura-state", version = "15.0.0", features = [
+zakura-state = { path = "../zakura-state", version = "16.0.0", features = [
     "proptest-impl",
 ] }
 

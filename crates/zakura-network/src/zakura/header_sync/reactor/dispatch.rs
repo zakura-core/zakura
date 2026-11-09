@@ -70,15 +70,20 @@ impl PortOperations {
     }
 
     /// The VCT local operation's outcome, if it's ready now.
+    ///
+    /// Both probes run past a spent coop budget, which would otherwise hide a
+    /// ready outcome. See `a_spent_budget_hides_no_ready_completion`.
     pub(super) fn ready_vct_local(&mut self) -> Option<StorageOutcome> {
-        let outcome = self.vct_local.as_mut()?.as_mut().now_or_never()?;
+        let outcome = coop::unconstrained(self.vct_local.as_mut()?.as_mut()).now_or_never()?;
         self.vct_local = None;
         Some(outcome)
     }
 
     /// Another call's outcome, if the shared ready queue shows one now.
     pub(super) fn ready_other(&mut self) -> Option<StorageOutcome> {
-        self.others.next().now_or_never().flatten()
+        coop::unconstrained(self.others.next())
+            .now_or_never()
+            .flatten()
     }
 }
 

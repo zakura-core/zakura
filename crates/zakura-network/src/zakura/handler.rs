@@ -4883,6 +4883,7 @@ async fn spawn_zakura_endpoint_inner(
             .for_node_connections(limits.max_connections),
         limits.max_frame_bytes,
     );
+    startup.max_connections = limits.max_connections;
     let (header_sync_fatal_tx, header_sync_fatal_rx) = mpsc::unbounded_channel();
     startup.fatal_events = Some(header_sync_fatal_tx);
     startup.use_direct_port();

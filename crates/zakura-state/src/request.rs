@@ -1958,6 +1958,18 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BlockAndSize(None)`](ReadResponse::BlockAndSize) otherwise.
     BlockAndSize(HashOrHeight),
 
+    /// Looks up the Zcash consensus serialization of a block by hash or height
+    /// in the current best chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::RawBlock(Some(OwnedRawBlock))`](ReadResponse::RawBlock) if the block is in the best chain;
+    /// * [`ReadResponse::RawBlock(None)`](ReadResponse::RawBlock) otherwise.
+    ///
+    /// Finalized blocks are read from their stored bytes without decoding them.
+    /// Like [`ReadRequest::Block`], a block whose body was pruned is not found.
+    RawBlock(HashOrHeight),
+
     /// Looks up a block header by hash or height in the current best chain.
     ///
     /// Returns
@@ -1980,11 +1992,26 @@ pub enum ReadRequest {
     ///
     /// Returns
     ///
-    /// * [`ReadResponse::AnyChainTransaction(Some(AnyTx))`](ReadResponse::AnyChainTransaction)
+    /// * [`ReadResponse::AnyChainTransaction(Some((AnyTx, OwnedRawTransaction)))`](ReadResponse::AnyChainTransaction)
     ///   if the transaction is in any chain;
     /// * [`ReadResponse::AnyChainTransaction(None)`](ReadResponse::AnyChainTransaction)
     ///   otherwise.
+    ///
+    /// The response carries the transaction's Zcash consensus serialization, so
+    /// callers that need it do not serialize the transaction again. Finalized
+    /// transactions return their stored bytes.
     AnyChainTransaction(transaction::Hash),
+
+    /// Looks up the Zcash consensus serialization of a transaction by hash in any chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::RawTransaction(Some(OwnedRawTransaction))`](ReadResponse::RawTransaction)
+    ///   if the transaction is in any chain;
+    /// * [`ReadResponse::RawTransaction(None)`](ReadResponse::RawTransaction) otherwise.
+    ///
+    /// Finalized transactions are read from their stored bytes without decoding them.
+    AnyChainRawTransaction(transaction::Hash),
 
     /// Looks up the transaction IDs for a block, using a block hash or height.
     ///
@@ -2011,6 +2038,15 @@ pub enum ReadRequest {
     ///
     /// Returned txids are in the order they appear in the block.
     AnyChainTransactionIdsForBlock(HashOrHeight),
+
+    /// Looks up which of the given transaction IDs are mined in the current best chain.
+    ///
+    /// Returns [`ReadResponse::MinedTransactionIds`] with the subset of the
+    /// requested IDs that are in the best chain.
+    ///
+    /// Only the transaction indexes are read, so the transactions are not read
+    /// or decoded. The cost is one index lookup per requested ID.
+    MinedTransactionIds(HashSet<transaction::Hash>),
 
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
@@ -2441,11 +2477,14 @@ impl ReadRequest {
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
             ReadRequest::BlockAndSize(_) => "block_and_size",
+            ReadRequest::RawBlock(_) => "raw_block",
             ReadRequest::BlockHeader(_) => "block_header",
             ReadRequest::Transaction(_) => "transaction",
             ReadRequest::AnyChainTransaction(_) => "any_chain_transaction",
+            ReadRequest::AnyChainRawTransaction(_) => "any_chain_raw_transaction",
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
+            ReadRequest::MinedTransactionIds(_) => "mined_transaction_ids",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             ReadRequest::CheckParentInputs { .. } => "check_parent_inputs",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",

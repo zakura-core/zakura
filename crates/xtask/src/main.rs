@@ -479,12 +479,17 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     )?;
     writeln!(
         output,
-        "With --targets, it runs only the cases whose harness a simulator fuzz target runs, and"
+        "With --targets, it runs only the fuzz-input cases whose harness a simulator fuzz target"
     )?;
     writeln!(
         output,
-        "also confirms each patched input through that target in fresh processes."
+        "runs, and also confirms each patched input through that target in fresh processes."
     )?;
+    writeln!(
+        output,
+        "A typed case has no fuzz input, so --targets skips it, and every run replays its"
+    )?;
+    writeln!(output, "patched trace Exact in a fresh process instead.")?;
     writeln!(
         output,
         "`planted pilot` runs the mutation pilot's paired experiments on the cases of"

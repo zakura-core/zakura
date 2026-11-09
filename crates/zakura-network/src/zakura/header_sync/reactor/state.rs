@@ -536,11 +536,23 @@ impl ReactorState {
     }
 
     /// Arm `peer`'s request deadline `timeout` after `now`.
-    ///
-    /// The first deadline armed after a session replacement is capped by the
-    /// replaced request's remaining time. See
-    /// [`PeerSchedule::replaced_request_budget`].
     pub(super) fn arm_request_deadline(
+        &mut self,
+        peer: ZakuraPeerId,
+        now: Instant,
+        timeout: Duration,
+    ) {
+        self.request_deadlines.insert(peer, now + timeout);
+    }
+
+    /// Arm the deadline of `peer`'s new ordinary request, `timeout` after
+    /// `now`, capped by and using up any
+    /// [`PeerSchedule::replaced_request_budget`].
+    ///
+    /// A repair request arms a full timeout and leaves the budget for the
+    /// next ordinary request. A repair timeout also excludes its supplier for
+    /// the repair episode, a larger penalty than the strike the budget is for.
+    pub(super) fn arm_ordinary_request_deadline(
         &mut self,
         peer: ZakuraPeerId,
         now: Instant,
@@ -551,11 +563,11 @@ impl ReactorState {
             .get_mut(&peer)
             .and_then(|schedule| schedule.replaced_request_budget.take());
         let timeout = carried.map_or(timeout, |carried| carried.min(timeout));
-        self.request_deadlines.insert(peer, now + timeout);
+        self.arm_request_deadline(peer, now, timeout);
     }
 
     /// Carry `budget`, the time left on the unanswered request that admitting
-    /// `peer`'s new session retired, to that session's first request.
+    /// `peer`'s new session retired, to that session's first ordinary request.
     pub(super) fn carry_replaced_request_budget(&mut self, peer: &ZakuraPeerId, budget: Duration) {
         if let Some(schedule) = self.peers.get_mut(peer) {
             schedule.replaced_request_budget = Some(
@@ -885,11 +897,11 @@ pub(super) struct PeerSchedule {
     /// since it last supplied usable work. See [`ReactorState::departed_strikes`].
     pub(super) unproductive_requests: u32,
     /// The time that was left on the unanswered request a session
-    /// replacement retired, until the next request start consumes it.
+    /// replacement retired, until the next ordinary request start consumes it.
     ///
     /// Without it, a peer could replace its session just before each timeout
-    /// and never be charged. The next request's timeout is capped by this
-    /// budget, counted from when the request is sent, so the node's own delay
+    /// and never be charged. The next ordinary request's timeout is capped by
+    /// this budget, counted from when the request is sent, so the node's own delay
     /// before sending isn't charged to the peer. A peer that answers within the
     /// budget re-arms a full timeout and pays nothing. A further replacement
     /// before any request keeps the budget.

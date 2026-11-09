@@ -1533,6 +1533,40 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
     assert!(deadline >= before + fixture.reactor.startup.request_timeout);
 }
 
+/// A carried replacement budget doesn't shorten a VCT repair request, whose
+/// timeout would also exclude the supplier for the repair episode. The repair
+/// gets a full timeout and the budget waits for the peer's next ordinary
+/// request.
+#[test]
+fn a_repair_request_leaves_a_carried_budget_for_ordinary_work() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    let carried = std::time::Duration::from_secs(1);
+    fixture
+        .reactor
+        .state
+        .carry_replaced_request_budget(peer, carried);
+    fixture.schedule();
+    let before = Instant::now();
+    fixture.advertise(&peers, 7);
+
+    assert!(matches!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .map(|active| &active.purpose),
+        Some(HeaderTargetPurpose::SelectedAuxiliaryRepair { .. })
+    ));
+    let deadline = fixture.reactor.state.request_deadlines[peer];
+    assert!(deadline >= before + fixture.reactor.startup.request_timeout);
+    assert_eq!(
+        fixture.reactor.state.peers[peer].replaced_request_budget,
+        Some(carried)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn unselected_supplier_waits_for_status_without_a_retry_deadline() {
     let mut fixture = ReadyVctRepairFixture::new();

@@ -2433,7 +2433,7 @@ impl HeaderSyncReactor {
                                 .expect("the request was just started")
                         )
                     );
-                    self.state.arm_request_deadline(
+                    self.state.arm_ordinary_request_deadline(
                         peer.clone(),
                         Instant::now(),
                         self.startup.request_timeout,

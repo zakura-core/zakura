@@ -1,5 +1,5 @@
-//! disc-3.1: witness scenarios for discovery's generated receiver
-//! properties, which `discovery/wire` registers. Each ID applies and holds
+//! disc-3.1: witness scenarios for discovery's generated receiver and
+//! sender properties, which `discovery/wire` registers. Each ID applies and holds
 //! in its witness, a run of the harness with one peer taking one
 //! [`DiscoveryAct`], and no other ID is violated there. Conformant controls
 //! show that `conformant-never-closes` and `cadence-never-closes` apply and
@@ -133,6 +133,18 @@ const ACTS: [DiscoveryAct; 29] = [
     },
 ];
 
+/// The IDs the honest exchange reaches: the receiver partner and the
+/// sender IDs of the node's own `Hello` and requests. The honest peer asks
+/// nothing, so the node's answers wait for the request runs ([`also`]).
+const HONEST: [&str; 6] = [
+    "conformant-never-closes",
+    "hello/sender-cadence",
+    "get-peers/sender-within-limit",
+    "get-peers/sender-cadence",
+    "get-services/sender-within-limit",
+    "get-services/sender-cadence",
+];
+
 /// The generated ID no discovery scenario reaches. The node asks for
 /// every service, so its `GetServices` owes the row's largest `Services`,
 /// and a larger one is `long-payload`.
@@ -145,6 +157,21 @@ fn reached(act: DiscoveryAct) -> String {
         Label::Conformant => id(&format!("{}/cadence-never-closes", act.row().name())),
         Label::UndeclaredType => id("undeclared-type-closes"),
         label => id(&format!("{}/{}-closes", act.row().name(), label.name())),
+    }
+}
+
+/// The IDs `act`'s witness also reaches: a request run's answers from the
+/// node, which reach their row's `sender-ends-once`.
+fn also(act: DiscoveryAct) -> Vec<String> {
+    match act {
+        DiscoveryAct::RequestRun { row } => {
+            let answer = match row {
+                DiscoveryRow::GetPeers => DiscoveryRow::Peers,
+                _ => DiscoveryRow::Services,
+            };
+            vec![id(&format!("{}/sender-ends-once", answer.name()))]
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -254,7 +281,9 @@ fn apply_on_row(row: DiscoveryRow) {
     for act in acts {
         let scenario = act_scenario(act);
         let report = run(&scenario);
-        witnessed(&report, act, &[reached(act)]);
+        let mut ids = vec![reached(act)];
+        ids.extend(also(act));
+        witnessed(&report, act, &ids);
         if act == OVER_OWED {
             over_owed_at_its_cap(&scenario, &report);
         }
@@ -335,7 +364,7 @@ fn fault_closes(report: &RunReport) -> Vec<String> {
 
 /// The witnesses reach every generated ID but the [`UNREACHED`] one, each
 /// act its own, and the honest exchange applies and holds
-/// `conformant-never-closes`. The act witnesses run in one test per row,
+/// `conformant-never-closes` and every sender ID. The act witnesses run in one test per row,
 /// below, so each test takes seconds.
 ///
 /// This fails if a witness stops reaching its ID, or the node punishes the
@@ -345,18 +374,15 @@ fn every_discovery_property_applies_in_its_witness() {
     let listed: Vec<String> = ACTS
         .into_iter()
         .map(reached)
-        .chain(
-            ["conformant-never-closes"]
-                .iter()
-                .chain(&UNREACHED)
-                .map(|suffix| id(suffix)),
-        )
+        .chain(ACTS.into_iter().flat_map(also))
+        .chain(HONEST.iter().chain(&UNREACHED).map(|suffix| id(suffix)))
         .collect();
     let distinct: BTreeSet<String> = listed.iter().cloned().collect();
     assert_eq!(distinct.len(), listed.len(), "{listed:?}");
     assert_eq!(distinct, generated().into_iter().collect());
     let report = run(&WireScenario::default());
-    witnessed(&report, "honest", &[]);
+    let honest: Vec<String> = HONEST.iter().map(|suffix| id(suffix)).collect();
+    witnessed(&report, "honest", &honest);
     assert_eq!(fault_closes(&report), Vec::<String>::new());
 }
 
@@ -373,7 +399,7 @@ fn hello_acts_apply_in_their_witnesses() {
 }
 
 /// Each `get-peers` ID applies and holds in its witness, with the request
-/// run's `cadence-never-closes`.
+/// run's `cadence-never-closes` and the node's answers' `peers/sender-ends-once`.
 #[test]
 fn get_peers_acts_apply_in_their_witnesses() {
     apply_on_row(DiscoveryRow::GetPeers);
@@ -389,7 +415,8 @@ fn peers_acts_apply_in_their_witnesses() {
 }
 
 /// Each `get-services` ID applies and holds in its witness, with the
-/// request run's `cadence-never-closes`.
+/// request run's `cadence-never-closes` and the node's answers'
+/// `services/sender-ends-once`.
 #[test]
 fn get_services_acts_apply_in_their_witnesses() {
     apply_on_row(DiscoveryRow::GetServices);

@@ -26,6 +26,11 @@
 //! against the peer updates the node had applied when it started writing
 //! the frame (M5-E2).
 //!
+//! Each `PeerReceived` on a discovery stream is followed by the frame's
+//! `NodeFrame`, which the [`DiscoverySender`] labels under the sender's
+//! rules against the peer frames the node had read when it started writing
+//! the frame.
+//!
 //! A discovery stream's frames are judged at the stage their label names
 //! ([`super::stage::discovery_stage`]), from the tap's `HeaderRead` and
 //! `FrameRead` (disc-3.1). The node may answer a request before it reads
@@ -69,6 +74,7 @@ use zakura_storage::header::Outcome;
 
 use super::{
     adapter::SenderAdapter,
+    discovery::DiscoverySender,
     stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
@@ -226,6 +232,8 @@ pub(crate) struct WireEvidence {
     sender: SenderAdapter,
     /// The discovery stream, whose frames are judged at their label's stage.
     discovery: Option<StreamId>,
+    /// Labels the node's frames on the discovery stream.
+    discovery_sender: Option<DiscoverySender>,
     /// Each discovery request the peer's models labelled `OverMargin`, its
     /// `PeerFrame` waiting to settle at its `FrameRead`.
     unsettled: BTreeMap<FrameKey, Observation>,
@@ -253,6 +261,7 @@ impl WireEvidence {
     pub(crate) fn with_discovery(discovery: StreamId) -> Self {
         WireEvidence {
             discovery: Some(discovery),
+            discovery_sender: Some(DiscoverySender::new(discovery)),
             ..WireEvidence::default()
         }
     }
@@ -272,8 +281,10 @@ impl WireEvidence {
                 ..
             } = &entry.obs
             {
-                if !self.on_discovery(*connection, event) {
-                    self.sender.node(*connection, event);
+                let on_discovery = self.on_discovery(*connection, event);
+                match self.discovery_sender.as_mut() {
+                    Some(sender) if on_discovery => sender.node(*connection, event),
+                    _ => self.sender.node(*connection, event),
                 }
             }
             match &entry.obs {
@@ -422,7 +433,9 @@ impl WireEvidence {
     fn on_discovery(&self, connection: u64, event: &TransportFact) -> bool {
         let quic_stream = match event {
             TransportFact::FrameWriteStarted { quic_stream, .. }
-            | TransportFact::Regulated { quic_stream, .. } => *quic_stream,
+            | TransportFact::Regulated { quic_stream, .. }
+            | TransportFact::HeaderRead { quic_stream, .. }
+            | TransportFact::FrameRead { quic_stream, .. } => *quic_stream,
             _ => return false,
         };
         self.is_discovery(connection, quic_stream)
@@ -499,17 +512,18 @@ impl WireEvidence {
                     payload,
                     credit,
                 };
-                if Some(stream) == self.discovery {
-                    return Some(Ok(vec![received]));
-                }
-                let node_frame =
-                    match self
+                let sent = match self.discovery_sender.as_mut() {
+                    Some(sender) if Some(stream) == self.discovery => {
+                        sender.received(connection, quic_stream, seq, &frame, at)
+                    }
+                    _ => self
                         .sender
-                        .received(connection, quic_stream, seq, &frame, at)
-                    {
-                        Ok(node_frame) => node_frame,
-                        Err(why) => return Some(Err(why)),
-                    };
+                        .received(connection, quic_stream, seq, &frame, at),
+                };
+                let node_frame = match sent {
+                    Ok(node_frame) => node_frame,
+                    Err(why) => return Some(Err(why)),
+                };
                 return Some(Ok(vec![received, node_frame]));
             }
         }]))

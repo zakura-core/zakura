@@ -14,6 +14,7 @@
 //!     [--quarantine <dir>] [--report <file>]
 //! zakura-sim suite [--out <file>] [--frozen]
 //! zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>
+//!     [--also-violates <ids>]
 //!     [--against <confirmation.json>]
 //! zakura-sim properties --sim <name>
 //! zakura-sim triage --sim <name> --out <dir> [--child-secs <s>] <input>...
@@ -111,6 +112,7 @@ mod cli {
              [--quarantine <dir>] [--report <file>]\n  \
              zakura-sim suite [--out <file>] [--frozen]\n  \
              zakura-sim confirm --sim <name> --input <file> --property <id> --out <dir>\n      \
+             [--also-violates <ids>]\n      \
              [--against <confirmation.json>]\n  \
              zakura-sim properties --sim <name>\n  \
              zakura-sim triage --sim <name> --out <dir> [--child-secs <s>]\n      \
@@ -126,7 +128,8 @@ mod cli {
              result to witness.json beside the trace, and exits 1 if the test fails.\n\
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `--also-violates` lists, comma-separated, properties a `violated` witness\n\
-             test expects violated beside the property, as a planted bug's co-violations.\n\
+             test or `confirm` expects violated beside the property, as a planted bug's\n\
+             co-violations.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -631,8 +634,15 @@ mod cli {
     /// confirmed.
     #[allow(clippy::print_stdout)]
     fn confirm(args: Vec<String>) -> Result<(), Error> {
-        let mut flags = [None, None, None, None, None];
-        let names = ["--sim", "--input", "--property", "--out", "--against"];
+        let mut flags = [None, None, None, None, None, None];
+        let names = [
+            "--sim",
+            "--input",
+            "--property",
+            "--out",
+            "--against",
+            "--also-violates",
+        ];
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
             let slot = names
@@ -646,7 +656,10 @@ mod cli {
                 return Err(Error::Usage(format!("{flag} given twice")));
             }
         }
-        let [sim, input, property, out, against] = flags;
+        let [sim, input, property, out, against, also_violates] = flags;
+        let also_violates: Vec<String> = also_violates
+            .map(|ids| ids.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
         let need = |value: Option<String>, flag: &str| {
             value.ok_or_else(|| Error::Usage(format!("`confirm` needs {flag}")))
         };
@@ -676,7 +689,7 @@ mod cli {
             }
         };
         let bytes = read(&input)?;
-        let mut confirmation = trace::confirm(entry, &bytes, &property, &out)
+        let mut confirmation = trace::confirm(entry, &bytes, &property, &also_violates, &out)
             .map_err(|error| Error::Failed(error.to_string()))?;
         if let Some(original) = &against {
             confirmation = confirmation.against(original);

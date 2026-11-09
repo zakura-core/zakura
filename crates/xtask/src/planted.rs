@@ -934,8 +934,9 @@ fn target_of(harnesses: &BTreeMap<String, Option<String>>, harness: &str) -> Opt
 /// Confirms `case`'s committed input in the patched `worktree` through the
 /// fuzz target `target`, which runs `harness`, in fresh processes, with
 /// [`sim_minimize::confirm`]: the target must crash with the case's
-/// property alone and name `harness`, `zakura-sim confirm` must find the
-/// property's trigger history, and a fresh replay must match Exact. Builds
+/// property, beside no other violation but the case's `also_violates`, and
+/// name `harness`, `zakura-sim confirm` must find the property's trigger
+/// history, and a fresh replay must match Exact. Builds
 /// under `builds`, which outlives the worktree, and writes under `scratch`.
 ///
 /// The builds are reused, so both pinned binaries must also name the
@@ -962,6 +963,7 @@ fn through_target(
         harness: harness.to_owned(),
         input: path::absolute(worktree.join(input))?,
         property: case.property.clone(),
+        also_violates: case.also_violates.clone(),
         out: out.clone(),
         budget: sim_minimize::Budget {
             runs: 1,

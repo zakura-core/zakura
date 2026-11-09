@@ -13,6 +13,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     io::Write,
     path::Path,
     path::PathBuf,
@@ -203,14 +204,20 @@ fn the_wake_fixtures_hold_under_every_plan() {
     }
 }
 
-/// What keeps `report`'s end from being settled. First, each prepare one
-/// of `scenario`'s holds picked that didn't complete, or whose reactor
+/// What the fixture still holds at `report`'s end. First, each prepare
+/// one of `scenario`'s holds picked that didn't complete, or whose reactor
 /// call didn't end. Then the work still in flight at the end that has
 /// waited longer than the scenario's policy bound: each of the node's
 /// reactor calls not yet ended, and each operation the node's storage
 /// still holds, with the virtual time it began. An operation no hold
 /// picked completes within the bound, so only held work can wait longer.
-/// A run whose list is empty ended with nothing held.
+///
+/// An empty list means the fixture holds nothing at the end, not that the
+/// node is idle. Its status refreshes keep starting rounds, so work younger
+/// than the bound can still be in flight when the budget runs out, and the
+/// drain offers no storage completions to finish it. No hold picks that
+/// work, so a drain that completes storage operations, as #1840 proposes,
+/// can finish it.
 fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
     let storage = scenario.storage();
     let bound = Duration::from_millis(
@@ -236,7 +243,7 @@ fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
     let mut completed = HashSet::new();
     let mut call_ended = HashSet::new();
     let mut taps = HashSet::new();
-    let mut instances = HashSet::new();
+    let mut storages = HashSet::new();
     let mut held = Vec::new();
     for entry in report.log.entries() {
         match &entry.obs {
@@ -256,8 +263,13 @@ fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
                     _ => {}
                 }
             }
-            Observation::Storage { instance, fact, .. } => {
-                instances.insert(*instance);
+            Observation::Storage {
+                service,
+                instance,
+                fact,
+                ..
+            } => {
+                storages.insert((service.clone(), *instance));
                 match fact {
                     StorageFact::Submitted { id, request, .. } => {
                         submitted.insert(*id, now);
@@ -272,21 +284,28 @@ fn stuck(scenario: WakeScenario, report: &RunReport) -> Vec<String> {
                 }
             }
             Observation::StorageState {
+                service,
                 instance,
-                state: StorageState::Header(state),
+                state,
                 ..
             } => {
-                instances.insert(*instance);
-                held = state.operations.clone();
+                storages.insert((service.clone(), *instance));
+                if let StorageState::Header(state) = state {
+                    held = state.operations.clone();
+                }
             }
             _ => {}
         }
     }
-    // Call and operation IDs are one tap's and one storage's, so they name
-    // the node's calls and operations only while the node's are the one
-    // tap and the one storage the run logs.
+    // A call's ID is its tap's, and an operation's is its storage's, which
+    // `(service, instance)` names. So bare IDs name the node's calls and
+    // operations only while the node's are the one tap and the one storage
+    // the run logs.
     assert_eq!(taps.len(), 1, "{taps:?}");
-    assert_eq!(instances.len(), 1, "{instances:?}");
+    assert!(
+        storages.len() == 1 && storages.iter().all(|(service, _)| service == "header"),
+        "{storages:?}"
+    );
     let unsettled_holds = picked
         .into_iter()
         .filter_map(|nth| prepares.get(nth - 1))
@@ -398,6 +417,8 @@ struct Measured {
     pending: Vec<Lifecycle>,
     /// Each obligation the property opened or concluded, with its step.
     lifecycle: Vec<(u64, Lifecycle)>,
+    /// Each step's enabled set, as a digest of its identities in order.
+    enabled: Vec<u64>,
     /// The first step whose enabled set offered [`SETTLE`].
     offered: Option<Offered>,
     /// The step and virtual time of each [`SETTLE`] pick.
@@ -418,10 +439,15 @@ impl Checker for Measured {
     /// Notes the first offer of [`SETTLE`] against the obligations the
     /// last step left open, then the step's own lifecycle events and pick.
     fn after_step(&mut self, cx: &StepCtx<'_>) -> Option<Violation> {
-        let offers = cx
+        let identities: Vec<String> = cx
             .enabled
             .iter()
-            .any(|enabled| enabled.identity.to_string() == SETTLE);
+            .map(|enabled| enabled.identity.to_string())
+            .collect();
+        let mut digest = DefaultHasher::new();
+        identities.hash(&mut digest);
+        self.enabled.push(digest.finish());
+        let offers = identities.iter().any(|identity| identity == SETTLE);
         if offers && self.offered.is_none() {
             self.offered = Some(Offered {
                 step: cx.step,
@@ -477,6 +503,7 @@ where
         open: 0,
         pending: Vec::new(),
         lifecycle: Vec::new(),
+        enabled: Vec::new(),
         offered: None,
         settles: Vec::new(),
     };
@@ -543,11 +570,23 @@ fn the_fixtures_settle_after_their_measured_boundary_and_not_before() {
             "{scenario:?}: a wake concluded before the offer: {concluded:?}"
         );
         assert_eq!(concluded, earlier(&before), "{scenario:?}");
+        // The wakes themselves, each with its peer, session, time and stamp.
+        let unsettled_facts = before.wake.facts();
+        assert_eq!(
+            unsettled_facts.get(..facts.len()),
+            Some(&facts[..]),
+            "{scenario:?}"
+        );
         assert!(before.offered.is_none(), "{scenario:?}");
         let index = usize::try_from(offered - 1).expect("a run's steps fit usize");
         assert_eq!(
             settled.picks[..index],
             unsettled.picks[..index],
+            "{scenario:?}"
+        );
+        assert_eq!(
+            after.enabled[..index],
+            before.enabled[..index],
             "{scenario:?}"
         );
         let prefix = |report: &RunReport| {

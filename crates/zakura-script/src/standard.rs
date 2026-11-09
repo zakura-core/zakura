@@ -99,6 +99,18 @@ pub fn count_script_push_ops(script_bytes: &[u8]) -> usize {
 /// Callers must ensure `spent_outputs.len()` matches the number of transparent inputs.
 /// If the lengths differ, `false` is returned.
 pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Output]) -> bool {
+    are_inputs_standard_with_pq(tx, spent_outputs, false)
+}
+
+/// [`are_inputs_standard`], with the post-quantum rules in force or not.
+///
+/// A post-quantum input is counted by the script its output commits to, since the solver
+/// has no template for it and the stack-depth rules below describe the legacy templates.
+pub fn are_inputs_standard_with_pq(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    pq_active: bool,
+) -> bool {
     if tx.inputs().len() != spent_outputs.len() {
         return false;
     }
@@ -107,6 +119,18 @@ pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Outpu
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
         };
+
+        #[cfg(feature = "pq")]
+        if pq_active {
+            if let Some(body) = authenticated_pq_body(unlock_script, &spent_output.lock_script) {
+                if body.sig_op_count(true) > MAX_P2SH_SIGOPS {
+                    return false;
+                }
+                continue;
+            }
+        }
+        #[cfg(not(feature = "pq"))]
+        let _ = pq_active;
 
         // Step 1: Classify the spent output's scriptPubKey via the zcash_script solver.
         let script_kind = match standard_script_kind(&spent_output.lock_script) {
@@ -171,4 +195,19 @@ pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Outpu
         }
     }
     true
+}
+
+/// The script a post-quantum output commits to, when this input reveals exactly that script.
+///
+/// Authentication happens before the body is used, so an input that names the wrong script
+/// gets no policy exemption from it.
+#[cfg(feature = "pq")]
+pub fn authenticated_pq_body(
+    unlock: &transparent::Script,
+    lock: &transparent::Script,
+) -> Option<script::Code> {
+    let lock = script::Code(lock.as_raw_bytes().to_vec());
+    let output = zcash_transparent::pq::output::parse_output(&lock).ok()??;
+    let spend = output.authenticate_spend(unlock.as_raw_bytes()).ok()?;
+    Some(script::Code(spend.body().to_vec()))
 }

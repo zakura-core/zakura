@@ -15,6 +15,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
+# Post-quantum transparent output relay, for chains that configure an activation height for it.
+pq = ["zakura-script/pq", "dep:zcash_transparent", "zcash_transparent/pq"]
+
 # Arbitrary error values, for the property tests of crates that share these errors.
 proptest-impl = ["proptest", "proptest-derive"]
 
@@ -24,6 +27,7 @@ zakura-node-services = { path = "../zakura-node-services", version = "6.0.0" }
 zakura-rt = { path = "../zakura-rt", version = "0.5.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.8" }
 zcash_script = { workspace = true }
+zcash_transparent = { workspace = true, optional = true }
 
 chrono = { workspace = true }
 metrics = { workspace = true }

@@ -921,6 +921,20 @@ pub fn standardness(
     tx: &VerifiedUnminedTx,
     max_datacarrier_bytes: u32,
 ) -> Result<(), NonStandardTransactionError> {
+    standardness_with_pq(tx, max_datacarrier_bytes, false)
+}
+
+/// [`standardness`], with the post-quantum rules in force or not.
+///
+/// Once they are, an authenticated post-quantum input is exempt from the scriptSig size and
+/// push-only rules, which are written for signatures a few dozen bytes long, and a
+/// post-quantum output of a defined format and scheme counts as standard. `pq_active` is
+/// always false in a build without the `pq` feature, where no chain can activate those rules.
+pub fn standardness_with_pq(
+    tx: &VerifiedUnminedTx,
+    max_datacarrier_bytes: u32,
+    pq_active: bool,
+) -> Result<(), NonStandardTransactionError> {
     use zcash_script::script::{self, Evaluable as _};
 
     let transaction = tx.transaction.transaction().as_ref();
@@ -932,11 +946,25 @@ pub fn standardness(
         return Err(NonStandardTransactionError::SproutJoinSplit);
     }
 
-    for input in transaction.inputs() {
+    for (input_index, input) in transaction.inputs().iter().enumerate() {
         let unlock_script = match input {
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
         };
+
+        // A post-quantum signature alone is larger than the standard scriptSig limit, so an
+        // input that reveals the script its output commits to is held to that spend's own
+        // bounds instead. Without the spent outputs there is no way to tell a post-quantum
+        // input from any other, so those callers keep the envelope rules below.
+        #[cfg(feature = "pq")]
+        if pq_active && spent_outputs.len() == transaction.inputs().len() {
+            let lock_script = &spent_outputs[input_index].lock_script;
+            if policy::authenticated_pq_body(unlock_script, lock_script).is_some() {
+                continue;
+            }
+        }
+        #[cfg(not(feature = "pq"))]
+        let _ = input_index;
 
         // Rule: scriptSig size must be within the standard limit.
         if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
@@ -958,7 +986,7 @@ pub fn standardness(
 
         // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
         // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-        if !policy::are_inputs_standard(transaction, spent_outputs) {
+        if !policy::are_inputs_standard_with_pq(transaction, spent_outputs, pq_active) {
             return Err(NonStandardTransactionError::NonStandardInputs);
         }
 
@@ -982,6 +1010,31 @@ pub fn standardness(
     for output in transaction.outputs() {
         let lock_script = &output.lock_script;
         let script_len = lock_script.as_raw_bytes().len();
+
+        // A post-quantum output is not one of the templates the solver knows, so once
+        // the chain applies those rules it has to be recognized here or every
+        // post-quantum payment would be turned away as non-standard. One whose format
+        // or scheme nothing defines stays non-standard, as consensus rejects it too.
+        #[cfg(feature = "pq")]
+        if pq_active {
+            use zcash_transparent::pq::output::{classify_created_output, CreatedOutput};
+
+            let code = script::Code(lock_script.as_raw_bytes().to_vec());
+            match classify_created_output(&code) {
+                CreatedOutput::Pq(_) => {
+                    // Rule: a payment output must not be dust, post-quantum or not.
+                    if output.is_dust() {
+                        return Err(NonStandardTransactionError::IsDust);
+                    }
+                    continue;
+                }
+                CreatedOutput::Malformed(_) => {
+                    return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
+                }
+                CreatedOutput::Legacy => {}
+            }
+        }
+
         let script_kind = policy::standard_script_kind(lock_script);
 
         match script_kind {

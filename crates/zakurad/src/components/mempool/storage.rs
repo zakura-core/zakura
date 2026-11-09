@@ -100,6 +100,11 @@ impl RemovedTransactionIds {
 
 /// Hold mempool verified and rejected mempool transactions.
 pub struct Storage {
+    /// The chain this mempool belongs to, which decides what its relay policy counts as
+    /// standard: on a chain that has activated the post-quantum transparent outputs, one
+    /// of those is an ordinary payment, and before that it is not.
+    network: zakura_chain::parameters::Network,
+
     /// The set of verified transactions in the mempool.
     verified: VerifiedSet,
 
@@ -150,8 +155,11 @@ impl Drop for Storage {
 
 impl Storage {
     #[allow(clippy::field_reassign_with_default)]
-    pub(crate) fn new(config: &config::Config) -> Self {
-        Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES)
+    pub(crate) fn new(
+        config: &config::Config,
+        network: &zakura_chain::parameters::Network,
+    ) -> Self {
+        Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES, network)
     }
 
     /// Constructs storage with a configurable rejection-list capacity.
@@ -162,6 +170,7 @@ impl Storage {
     fn new_with_rejection_list_capacity(
         config: &config::Config,
         rejection_list_capacity: usize,
+        network: &zakura_chain::parameters::Network,
     ) -> Self {
         assert!(
             rejection_list_capacity > 0,
@@ -169,6 +178,7 @@ impl Storage {
         );
 
         Self {
+            network: network.clone(),
             tx_cost_limit: config.tx_cost_limit,
             eviction_memory_time: config.eviction_memory_time,
             rejection_list_capacity,
@@ -185,8 +195,23 @@ impl Storage {
 
     /// Checks `tx` against the standardness rules both pools share, and
     /// caches the rejection if it breaks one. See [`zakura_mempool::standardness`].
-    fn reject_if_non_standard_tx(&mut self, tx: &VerifiedUnminedTx) -> Result<(), MempoolError> {
-        let Err(error) = zakura_mempool::standardness(tx, self.max_datacarrier_bytes) else {
+    ///
+    /// A mempool transaction is judged by the rules of the block it could go into, which
+    /// is the one after the tip, so `tip_height` decides whether the post-quantum rules
+    /// apply. An empty mempool before the genesis block has no tip.
+    fn reject_if_non_standard_tx(
+        &mut self,
+        tx: &VerifiedUnminedTx,
+        tip_height: Option<Height>,
+    ) -> Result<(), MempoolError> {
+        let height = tip_height
+            .and_then(|height| height + 1)
+            .unwrap_or(Height(0));
+        let pq_active = zakura_script::pq_outputs_active(&self.network, height);
+
+        let Err(error) =
+            zakura_mempool::standardness_with_pq(tx, self.max_datacarrier_bytes, pq_active)
+        else {
             return Ok(());
         };
         let inputs = tx.transaction.transaction().inputs().len();
@@ -308,7 +333,7 @@ impl Storage {
         }
 
         // Check that the transaction is standard.
-        if let Err(error) = self.reject_if_non_standard_tx(&tx) {
+        if let Err(error) = self.reject_if_non_standard_tx(&tx, height) {
             return (Err(error), HashSet::new());
         }
 

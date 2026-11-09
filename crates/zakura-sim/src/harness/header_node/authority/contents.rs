@@ -11,8 +11,10 @@
 //!   inserts nothing.
 //! - **Success.** After any other apply, and after every reset, the graph
 //!   is what its stored headers alone give: each node's key, hash, parent,
-//!   height and block work, and the children, height and eligible-tip
-//!   indexes rebuilt from the nodes. Each held header is
+//!   height, block work and cumulative work, and the children, height and
+//!   eligible-tip indexes rebuilt from the nodes. A node held before and
+//!   after changes only in its eligibility (and its auxiliary delivery IDs,
+//!   which Rule 11 leaves aside). Each held header is
 //!   eligible exactly when neither it nor an ancestor stands invalidated by
 //!   the port's `Reset` facts and not reconsidered. The stored selected
 //!   projection is the ancestry from the finalized anchor to the engine's
@@ -156,6 +158,29 @@ impl Contents {
     fn judge_state(&self, before: &DurableState, after: &DurableState, found: &mut Vec<String>) {
         let nodes = &after.graph.nodes;
         found.extend(structure(&after.graph));
+        // A header apply or reset changes a held node only in its
+        // eligibility, which the reset model judges below. Its auxiliary
+        // delivery IDs are Rule 11's.
+        let mut changed: Vec<String> = before
+            .graph
+            .nodes
+            .iter()
+            .filter(|(key, old)| {
+                nodes.get(key).is_some_and(|new| {
+                    let mut new = new.clone();
+                    new.eligibility = old.eligibility.clone();
+                    new.aux_delivery_ids = old.aux_delivery_ids.clone();
+                    new != **old
+                })
+            })
+            .map(|(key, _)| hash(*key))
+            .collect();
+        changed.sort_unstable();
+        if !changed.is_empty() {
+            found.push(format!(
+                "changed held nodes {changed:?} in more than their eligibility"
+            ));
+        }
         let invalidated: HashSet<&str> = self.invalidated.iter().map(String::as_str).collect();
         let mut wrong: Vec<String> = nodes
             .values()
@@ -228,11 +253,18 @@ fn structure(graph: &zakura_header_chain::GraphState) -> Vec<String> {
                 None => (node.hash == graph.finalized_frontier.hash)
                     .then_some(graph.finalized_frontier.height),
             };
+            // A node's cumulative work is its parent's plus its own. The
+            // finalized anchor's is its trusted origin.
+            let coordinate = match nodes.get(&node.header.previous_block_hash) {
+                Some(parent) => parent.work_coordinate().checked_add(node.block_work).ok(),
+                None => Some(node.work_coordinate()),
+            };
             node.hash != **key
                 || node.header.hash() != **key
                 || node.parent_hash != node.header.previous_block_hash
                 || Some(node.height) != height
                 || Some(node.block_work) != node.header.difficulty_threshold.to_work()
+                || Some(node.work_coordinate()) != coordinate
         })
         .map(|(key, _)| hash(*key))
         .collect();
@@ -240,7 +272,8 @@ fn structure(graph: &zakura_header_chain::GraphState) -> Vec<String> {
     let mut found = Vec::new();
     if !wrong.is_empty() {
         found.push(format!(
-            "left {wrong:?} with a hash, parent, height or block work its header doesn't give"
+            "left {wrong:?} with a hash, parent, height, block work or cumulative work its \
+             headers don't give"
         ));
     }
     let mut children: HashMap<block::Hash, HashSet<block::Hash>> = HashMap::new();

@@ -33,8 +33,9 @@
 //! - **Locator results.** Each locator storage read gives the engine's
 //!   selected path as the durable state the port recorded at the read
 //!   holds it: its tip is the selected projection's tip, its anchor the
-//!   finalized anchor, the anchor is among its entries, and every entry is
-//!   a header of the selected projection.
+//!   finalized anchor, the anchor is among its entries, its entries are
+//!   distinct and at most the protocol's 13, and every entry is a header of
+//!   the selected projection.
 //!   The read's generation doesn't vouch for its hashes.
 //! - **Locator consumption.** Every ordinary `Started` is reported under a
 //!   locator call's `Completion`, with that call's dispatched generation,
@@ -421,15 +422,23 @@ impl RoundLife {
         // separately recorded metadata, or a peer on another branch finds no
         // common ancestor.
         let anchored = hashes.contains(&anchor.hash);
+        // A locator names each header once and holds at most the protocol's
+        // entries, or the subscriber refuses to open from it.
+        let distinct: HashSet<&String> = hashes.iter().collect();
+        let well_formed = distinct.len() == hashes.len()
+            && hashes.len() <= zakura_header_chain::MAX_HEADER_LOCATOR_HASHES;
         if expected_tip.as_ref() != Some(tip)
             || *finalized != anchor
             || !off_path.is_empty()
             || !anchored
+            || !well_formed
         {
             self.breaks.push(format!(
                 "ResetInvalidatesWork: locator read {id} gave tip {tip:?} at anchor {finalized:?} \
-                 with {off_path:?} off the selected path and the anchor in it {anchored}, but \
-                 the engine held tip {expected_tip:?} at anchor {anchor:?}"
+                 with {off_path:?} off the selected path, the anchor in it {anchored} and \
+                 its {} entries distinct and within the limit {well_formed}, but the engine \
+                 held tip {expected_tip:?} at anchor {anchor:?}",
+                hashes.len()
             ));
         }
     }

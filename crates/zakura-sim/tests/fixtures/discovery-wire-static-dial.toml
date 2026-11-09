@@ -1,0 +1,9 @@
+# The committed fuzz input `discovery-wire-static-dial.bin`: the harness that
+# runs it, the generator version it was built for, and its SHA-256. Its
+# first two bytes pick the saved `static-dial` scenario, and
+# `discovery-wire-static-dial.end.json` is its pinned end record.
+harness = "discovery/wire"
+generator = 1
+sha256 = "9df02aeff60f85979be4737edbcd69757628a81b9b1201a48c64ab6b2eb18126"
+scenario_sha256 = "f6d5ed16207005dea9b835bfb63fe03f6d5b73465c7b3508706289eced9d853a"
+source = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"

@@ -13,6 +13,8 @@ mod runtime;
 mod sequence_file;
 mod service;
 #[cfg(zakura_sim)]
+pub use peer::DISCOVERY_INITIAL_EXCHANGE_TIMEOUT;
+#[cfg(zakura_sim)]
 pub(crate) use service::discovery_streams;
 #[cfg(any(test, feature = "p2p-fuzz"))]
 mod fuzz;

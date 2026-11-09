@@ -138,10 +138,22 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
+test = "regenerate_saved_plans"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved Plans"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_storage_seeds.rs"
 test = "regenerate_storage_seeds"
 run = false
 reason = "a tool, not a test: it rewrites the committed seeds"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"
+test = "regenerate_witness_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed witness seeds"
 
 [[ignored]]
 file = "crates/zakura-sim/tests/block_semantic_properties.rs"
@@ -349,6 +361,11 @@ reason = "no target yet; `cargo xtask sim-targets` checks one once its table ent
 harness = "header-sync/wire"
 owner = "E5a"
 reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
+
+[[missing-target]]
+harness = "discovery/wire"
+owner = "fuzz-10"
+reason = "no target yet; no plan maps it to a target, and disc-3 registers the properties one would check"
 
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and

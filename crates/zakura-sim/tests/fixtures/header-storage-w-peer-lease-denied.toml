@@ -1,0 +1,8 @@
+# The committed fuzz input `header-storage-w-peer-lease-denied.bin`, a fuzz-12 item 7 witness whose run
+# shows PeerLeaseDenied. Its 344-byte prefix is the scenario's canonical
+# encoding, then 1,024 Plan bytes.
+harness = "header-sync/storage"
+generator = 3
+sha256 = "fae6ebf03fb011673470a30e81fbfe763ae1a4bb99c4dbf2a99f0e4281befb03"
+scenario_sha256 = "14650468748c76b1bfd99743e47ed1122934577f786f8ef93a7d8353b671fbca"
+source = "crates/zakura-sim/tests/header_storage_witness_seeds.rs"

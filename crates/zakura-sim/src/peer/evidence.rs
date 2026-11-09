@@ -24,9 +24,28 @@
 //! Each `PeerReceived` on a header stream is followed by the frame's
 //! `NodeFrame`, which the [`SenderAdapter`] labels under the sender's rules
 //! against the peer updates the node had applied when it started writing
-//! the frame (M5-E2). A discovery stream's frames are logged and labelled,
-//! but the evidence judges none of them and labels none of the node's
-//! frames there: disc-3.1 places discovery's stages and its sender rules.
+//! the frame (M5-E2).
+//!
+//! Each `PeerReceived` on a discovery stream is followed by the frame's
+//! `NodeFrame`, which the [`DiscoverySender`] labels under the sender's
+//! rules against the peer frames the node had read when it started writing
+//! the frame.
+//!
+//! A discovery stream's frames are judged at the stage their label names
+//! ([`super::stage::discovery_stage`]), from the tap's `HeaderRead` and
+//! `FrameRead` (disc-3.1). The node may answer a request before it reads
+//! the next one, so a request the peer's models labelled `OverMargin`
+//! settles against the node's timing: its `PeerFrame` waits for its
+//! `FrameRead`. The node releases a request's commitment before it starts
+//! writing the answer, and it may admit a request well after its
+//! `FrameRead`, so the requests of its row the node had read by then, less
+//! the answers it had started writing, are never below the node's count.
+//! Within twice the row's `max_in_flight` the request settles `Conformant`.
+//! Past it the node may still admit the request, so its label stays
+//! `OverMargin` but its `FrameJudged` waits for the connection's close: a
+//! fault close is preceded by it, and any other close leaves it unjudged.
+//! A request the node never reads keeps the peer's label when its
+//! connection is torn down.
 //!
 //! It also projects the node's evidence onto P3b's observations:
 //! `FrameJudged` at the reader stage that decides the frame (M5-E1, see
@@ -48,15 +67,18 @@ use std::{
 };
 
 use zakura_chain::block;
-use zakura_network::zakura::{v9::RegtestMessage, Frame, MessageRole, MessageRule};
+use zakura_network::zakura::{
+    v9::RegtestMessage, wire_codec::WireMessage, DiscoveryMessage, Frame, MessageRole, MessageRule,
+};
 use zakura_storage::header::Outcome;
 
 use super::{
     adapter::SenderAdapter,
-    stage::{header_stage, NodeView, Stage},
+    discovery::DiscoverySender,
+    stage::{discovery_stage, header_stage, NodeView, Stage},
 };
 use crate::{
-    model::{FrameHeader, Label},
+    model::{is_fault_cause, FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{
         PeerCredit, ReactorFact, StorageFact, StorageRequest, StreamId, TransitionFact,
         TransportFact,
@@ -208,8 +230,29 @@ pub(crate) struct WireEvidence {
     late: Vec<Observation>,
     /// Labels the node's frames.
     sender: SenderAdapter,
-    /// The discovery stream, whose frames are logged and never judged.
+    /// The discovery stream, whose frames are judged at their label's stage.
     discovery: Option<StreamId>,
+    /// Labels the node's frames on the discovery stream.
+    discovery_sender: Option<DiscoverySender>,
+    /// Each discovery request the peer's models labelled `OverMargin`, its
+    /// `PeerFrame` waiting to settle at its `FrameRead`.
+    unsettled: BTreeMap<FrameKey, Observation>,
+    /// Each discovery request the node read past the margin, its
+    /// `PeerFrame` waiting for its connection's close.
+    unproven: BTreeMap<FrameKey, Observation>,
+    /// Each discovery request row's requests the node read and answers it
+    /// started writing, by connection, QUIC stream and request type.
+    margins: BTreeMap<(u64, u64, u16), Margin>,
+}
+
+/// One discovery request row's requests on one stream, as the node's
+/// reader and writer saw them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Margin {
+    /// Requests the node read.
+    read: u32,
+    /// Answers the node started writing.
+    answered: u32,
 }
 
 impl WireEvidence {
@@ -218,6 +261,7 @@ impl WireEvidence {
     pub(crate) fn with_discovery(discovery: StreamId) -> Self {
         WireEvidence {
             discovery: Some(discovery),
+            discovery_sender: Some(DiscoverySender::new(discovery)),
             ..WireEvidence::default()
         }
     }
@@ -237,8 +281,10 @@ impl WireEvidence {
                 ..
             } = &entry.obs
             {
-                if !self.on_discovery(*connection, event) {
-                    self.sender.node(*connection, event);
+                let on_discovery = self.on_discovery(*connection, event);
+                match self.discovery_sender.as_mut() {
+                    Some(sender) if on_discovery => sender.node(*connection, event),
+                    _ => self.sender.node(*connection, event),
                 }
             }
             match &entry.obs {
@@ -387,11 +433,12 @@ impl WireEvidence {
     fn on_discovery(&self, connection: u64, event: &TransportFact) -> bool {
         let quic_stream = match event {
             TransportFact::FrameWriteStarted { quic_stream, .. }
-            | TransportFact::Regulated { quic_stream, .. } => *quic_stream,
+            | TransportFact::Regulated { quic_stream, .. }
+            | TransportFact::HeaderRead { quic_stream, .. }
+            | TransportFact::FrameRead { quic_stream, .. } => *quic_stream,
             _ => return false,
         };
-        self.discovery.is_some()
-            && self.streams.get(&(connection, quic_stream)).copied() == self.discovery
+        self.is_discovery(connection, quic_stream)
     }
 
     /// The key of `remote` in [`WireEvidence::connections`].
@@ -417,11 +464,12 @@ impl WireEvidence {
                 payload,
                 prepares,
             } => {
-                self.labels.insert((connection, quic_stream, seq), label);
+                let key = (connection, quic_stream, seq);
+                self.labels.insert(key, label);
                 if let Some(page) = prepares {
-                    self.invalid.insert((connection, quic_stream, seq), page);
+                    self.invalid.insert(key, page);
                 }
-                Observation::PeerFrame {
+                let frame = Observation::PeerFrame {
                     connection,
                     stream,
                     quic_stream: Some(quic_stream),
@@ -432,7 +480,12 @@ impl WireEvidence {
                     exhausted,
                     exchange,
                     payload,
+                };
+                if Some(stream) == self.discovery && label == Label::OverMargin {
+                    self.unsettled.insert(key, frame);
+                    return Some(Ok(Vec::new()));
                 }
+                frame
             }
             RecordBody::Written { seq } => Observation::PeerWritten {
                 connection,
@@ -459,17 +512,18 @@ impl WireEvidence {
                     payload,
                     credit,
                 };
-                if Some(stream) == self.discovery {
-                    return Some(Ok(vec![received]));
-                }
-                let node_frame =
-                    match self
+                let sent = match self.discovery_sender.as_mut() {
+                    Some(sender) if Some(stream) == self.discovery => {
+                        sender.received(connection, quic_stream, seq, &frame, at)
+                    }
+                    _ => self
                         .sender
-                        .received(connection, quic_stream, seq, &frame, at)
-                    {
-                        Ok(node_frame) => node_frame,
-                        Err(why) => return Some(Err(why)),
-                    };
+                        .received(connection, quic_stream, seq, &frame, at),
+                };
+                let node_frame = match sent {
+                    Ok(node_frame) => node_frame,
+                    Err(why) => return Some(Err(why)),
+                };
                 return Some(Ok(vec![received, node_frame]));
             }
         }]))
@@ -528,6 +582,14 @@ impl WireEvidence {
                 TransportFact::FrameRead { quic_stream, seq } => {
                     let key = (*connection, *quic_stream, *seq);
                     match self.waiting.get(&key).map(|waiting| waiting.stage) {
+                        Some(Stage::Frame) if self.is_discovery(*connection, *quic_stream) => {
+                            let waiting = self.waiting.remove(&key).expect("it waits, just read");
+                            if self.discovery_read(key, waiting.row) {
+                                let judged = self.judged(key)?;
+                                self.late.extend(judged);
+                            }
+                            None
+                        }
                         Some(Stage::Frame) => {
                             self.waiting.remove(&key);
                             self.judged(key)?
@@ -545,10 +607,52 @@ impl WireEvidence {
                     }
                 }
                 TransportFact::CloseDecided { cause: Some(cause) } => {
-                    Some(Observation::ConnectionClosed {
+                    let closed = Observation::ConnectionClosed {
                         connection: *connection,
                         cause: cause.clone(),
-                    })
+                    };
+                    let unproven = take_connection(&mut self.unproven, *connection);
+                    if !is_fault_cause(cause) {
+                        self.late.extend(unproven.into_values());
+                        return Ok(Some(closed));
+                    }
+                    // A request the node may have admitted past the margin
+                    // justifies the fault close, and the close discharges
+                    // its `over-margin` obligation.
+                    let mut judged = Vec::new();
+                    for (key, frame) in unproven {
+                        judged.push(frame);
+                        judged.push(self.frame_judged(key)?);
+                    }
+                    judged.push(closed);
+                    let mut judged = judged.into_iter();
+                    let first = judged.next();
+                    self.late.extend(judged);
+                    first
+                }
+                TransportFact::FrameWriteStarted {
+                    quic_stream,
+                    message_type,
+                    ..
+                } if self.is_discovery(*connection, *quic_stream) => {
+                    let answers = discovery_row(*message_type).and_then(|row| match row.role {
+                        MessageRole::Response { request, .. } => Some(request),
+                        _ => None,
+                    });
+                    if let Some(request) = answers {
+                        self.margins
+                            .entry((*connection, *quic_stream, request))
+                            .or_default()
+                            .answered += 1;
+                    }
+                    None
+                }
+                TransportFact::TornDown => {
+                    for frames in [&mut self.unsettled, &mut self.unproven] {
+                        self.late
+                            .extend(take_connection(frames, *connection).into_values());
+                    }
+                    None
                 }
                 _ => None,
             },
@@ -655,6 +759,18 @@ impl WireEvidence {
             ));
         }
         if Some(stream) == self.discovery {
+            let stage = discovery_stage(self.labels[&key]);
+            if stage == Stage::Header {
+                return self.judged(key);
+            }
+            self.waiting.insert(
+                key,
+                Waiting {
+                    stage,
+                    row: discovery_row(header.message_type),
+                    payload_len: header.payload_len,
+                },
+            );
             return Ok(None);
         }
         let rules = rules(stream).ok_or_else(|| {
@@ -735,6 +851,46 @@ impl WireEvidence {
         Ok(None)
     }
 
+    /// Whether `connection`'s `quic_stream` is an admitted discovery stream.
+    fn is_discovery(&self, connection: u64, quic_stream: u64) -> bool {
+        self.discovery.is_some()
+            && self.streams.get(&(connection, quic_stream)).copied() == self.discovery
+    }
+
+    /// The node read discovery frame `key` of `row`. Counts a request, and
+    /// settles an `OverMargin` request against the requests of its row the
+    /// node has read and the answers it has started writing: within the
+    /// margin, its `PeerFrame` goes to the log relabelled `Conformant`.
+    /// Returns whether the frame is judged now, which a request past the
+    /// margin isn't.
+    fn discovery_read(&mut self, key: FrameKey, row: Option<&'static MessageRule>) -> bool {
+        let Some(row) = row else {
+            return true;
+        };
+        let MessageRole::Request { max_in_flight, .. } = row.role else {
+            return true;
+        };
+        let margin = self
+            .margins
+            .entry((key.0, key.1, row.message_type))
+            .or_default();
+        margin.read += 1;
+        let open = margin.read.saturating_sub(margin.answered);
+        let Some(mut frame) = self.unsettled.remove(&key) else {
+            return true;
+        };
+        if open > max_in_flight.saturating_mul(2) {
+            self.unproven.insert(key, frame);
+            return false;
+        }
+        if let Observation::PeerFrame { label, .. } = &mut frame {
+            *label = Label::Conformant;
+        }
+        self.labels.insert(key, Label::Conformant);
+        self.late.push(frame);
+        true
+    }
+
     /// The admitted stream of `connection`'s `quic_stream`.
     fn stream(&self, connection: u64, quic_stream: u64) -> Result<StreamId, String> {
         self.streams
@@ -771,6 +927,29 @@ impl WireEvidence {
             seq,
         })
     }
+}
+
+/// Removes and returns `connection`'s entries of `frames`.
+fn take_connection(
+    frames: &mut BTreeMap<FrameKey, Observation>,
+    connection: u64,
+) -> BTreeMap<FrameKey, Observation> {
+    let keys: Vec<FrameKey> = frames
+        .range((connection, 0, 0)..=(connection, u64::MAX, u64::MAX))
+        .map(|(key, _)| *key)
+        .collect();
+    keys.into_iter()
+        .map(|key| (key, frames.remove(&key).expect("just listed")))
+        .collect()
+}
+
+/// Discovery's row for `message_type`, if it has one.
+fn discovery_row(message_type: u16) -> Option<&'static MessageRule> {
+    FrameModel::new(
+        <DiscoveryMessage as WireMessage>::RULES,
+        ReaderEnd::Persistent,
+    )
+    .row(message_type)
 }
 
 /// The rows of a stream the wire harness runs, if it has a table.
@@ -1269,5 +1448,148 @@ mod tests {
         evidence.prepared(&prepare(3, 20, 7)).unwrap();
         evidence.prepared(&completed(3, Outcome::Engine)).unwrap();
         assert_eq!(judged(&mut evidence), vec![(1, 8)]);
+    }
+
+    /// A `GetPeers` the peer's models labelled `OverMargin` settles at its
+    /// `FrameRead`. With an answer the node had started writing, it's
+    /// within the margin and `Conformant`. With none, the node may still
+    /// have released a commitment it hadn't started writing, so it isn't
+    /// judged at its read: a fault close is preceded by its `FrameJudged`,
+    /// and any other close leaves it unjudged. A judgement at its read
+    /// would oblige `over-margin-closes` on a request the node admitted.
+    #[test]
+    fn an_over_margin_request_is_judged_only_when_it_settles() {
+        let stream = StreamId {
+            kind: 4,
+            version: 2,
+        };
+        let get_peers = discovery_row(u16::from(zakura_network::zakura::MSG_DISCOVERY_GET_PEERS))
+            .expect("discovery has get-peers");
+        let peers = discovery_row(u16::from(zakura_network::zakura::MSG_DISCOVERY_PEERS))
+            .expect("discovery has peers");
+        // Each case: whether an answer's write started before the third
+        // request's read, the close's cause, and what follows that read: the
+        // third request's `PeerFrame` by its label, its `FrameJudged`, and the
+        // close.
+        let cases = [
+            (
+                true,
+                "discovery_exchange_complete",
+                ["conformant", "judged", "closed"].as_slice(),
+            ),
+            (
+                false,
+                "discovery_exchange_complete",
+                &["closed", "over-margin"],
+            ),
+            (
+                false,
+                "service_protocol_reject",
+                &["over-margin", "judged", "closed"],
+            ),
+        ];
+        for (answered, cause, expected) in cases {
+            let records = PeerRecords::default();
+            records.borrow_mut().extend((0..3).map(|seq| PeerRecord {
+                remote: Remote::first(peer_addr(0, 0)),
+                quic_stream: 4,
+                body: RecordBody::Frame {
+                    seq,
+                    row: Some("get-peers".to_owned()),
+                    rule_stream: stream,
+                    label: if seq == 2 {
+                        Label::OverMargin
+                    } else {
+                        Label::Conformant
+                    },
+                    exhausted: false,
+                    exchange: Some(seq),
+                    payload: 6,
+                    prepares: None,
+                },
+            }));
+            let mut evidence = WireEvidence::with_discovery(stream);
+            let mut log = ObservationLog::default();
+            log.push(transport(1, Some(1), TransportFact::Registered));
+            log.push(Observation::Session {
+                connection: 1,
+                peer: "peer-0".to_owned(),
+                quic_stream: 4,
+                kind: 4,
+                version: 2,
+                session_id: 7,
+            });
+            let mut seq = 2;
+            let mut next = || {
+                seq += 1;
+                seq
+            };
+            for frame in 0..3 {
+                if frame == 2 && answered {
+                    log.push(transport(
+                        next(),
+                        Some(1),
+                        TransportFact::FrameWriteStarted {
+                            quic_stream: 4,
+                            seq: 0,
+                            message_type: peers.message_type,
+                        },
+                    ));
+                }
+                log.push(transport(
+                    next(),
+                    Some(1),
+                    TransportFact::HeaderRead {
+                        quic_stream: 4,
+                        seq: frame,
+                        message_type: get_peers.message_type,
+                        flags: 0,
+                        payload_len: 6,
+                    },
+                ));
+                log.push(transport(
+                    next(),
+                    Some(1),
+                    TransportFact::FrameRead {
+                        quic_stream: 4,
+                        seq: frame,
+                    },
+                ));
+            }
+            log.push(transport(
+                next(),
+                Some(1),
+                TransportFact::CloseDecided {
+                    cause: Some(cause.to_owned()),
+                },
+            ));
+            log.push(transport(next(), Some(1), TransportFact::TornDown));
+            evidence
+                .observe(&records, &mut log)
+                .expect("every record is placed");
+            let read = log
+                .entries()
+                .iter()
+                .rposition(|entry| {
+                    matches!(
+                        entry.obs,
+                        Observation::Transport {
+                            event: TransportFact::FrameRead { seq: 2, .. },
+                            ..
+                        }
+                    )
+                })
+                .expect("the third request is read");
+            let after: Vec<&str> = log.entries()[read..]
+                .iter()
+                .filter_map(|entry| match &entry.obs {
+                    Observation::PeerFrame { seq: 2, label, .. } => Some(label.name()),
+                    Observation::FrameJudged { seq: 2, .. } => Some("judged"),
+                    Observation::ConnectionClosed { .. } => Some("closed"),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(after, expected, "answered {answered}, {cause}");
+        }
     }
 }

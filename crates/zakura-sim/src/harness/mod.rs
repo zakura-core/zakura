@@ -132,6 +132,25 @@ pub trait Subsystem: HasView + Sized + 'static {
     /// Decodes a scenario from exactly [`Subsystem::SCENARIO_BYTES`] bytes of
     /// fuzz input.
     fn draw(prefix: &[u8]) -> Self::Scenario;
+
+    /// Whether this generator reads `prefix`, exactly
+    /// [`Subsystem::SCENARIO_BYTES`] long, as its own rather than drawing a
+    /// fallback scenario for it, as `draw` does for another generator's
+    /// prefix. Every prefix by default.
+    fn accepts(_prefix: &[u8]) -> bool {
+        true
+    }
+
+    /// Carries a full fuzz input built for an older `generator` to this one
+    /// with its meaning kept, as a seed's `derived_from` claims it was. Fails
+    /// by default: a harness that never changed its generator migrates
+    /// nothing.
+    fn migrate(_source: &[u8], generator: u32) -> Result<Vec<u8>, String> {
+        Err(format!(
+            "{} migrates no generator-{generator} input",
+            Self::NAME
+        ))
+    }
 }
 
 /// Why a harness couldn't run a scenario.
@@ -406,6 +425,10 @@ pub struct HarnessEntry {
     /// [`explore::run_bytes`]: a full fuzz input, the sink, and an extra
     /// checker.
     pub run_bytes: fn(&[u8], &mut dyn RecordSink, Option<&mut dyn Checker>) -> ExploreRun,
+    /// [`Subsystem::accepts`].
+    pub accepts: fn(&[u8]) -> bool,
+    /// [`Subsystem::migrate`].
+    pub migrate: fn(&[u8], u32) -> Result<Vec<u8>, String>,
 }
 
 /// [`HarnessEntry::witness`]: the serialized scenario, the input, the
@@ -416,14 +439,24 @@ pub type WitnessFn =
 impl HarnessEntry {
     /// The scenario that the full fuzz `input`'s prefix decodes to.
     pub fn scenario(&self, input: &[u8]) -> Value {
+        (self.draw)(&self.prefix(input))
+    }
+
+    /// Whether the harness's generator reads the full fuzz `input`'s prefix
+    /// as its own ([`Subsystem::accepts`]).
+    pub fn accepts_input(&self, input: &[u8]) -> bool {
+        (self.accepts)(&self.prefix(input))
+    }
+
+    /// The prefix `draw` reads from the full fuzz `input`: a machine's whole
+    /// input, else its first `scenario_bytes`, with missing bytes read as 0.
+    fn prefix(&self, input: &[u8]) -> Vec<u8> {
         let prefix = &input[..input.len().min(self.scenario_bytes)];
-        if self.machine || prefix.len() == self.scenario_bytes {
-            (self.draw)(prefix)
-        } else {
-            let mut padded = prefix.to_vec();
+        let mut padded = prefix.to_vec();
+        if !self.machine {
             padded.resize(self.scenario_bytes, 0);
-            (self.draw)(&padded)
         }
+        padded
     }
 
     /// Property `id`'s status in this harness, as the explorer's classifier
@@ -463,6 +496,8 @@ pub const fn entry<S: Subsystem>() -> HarnessEntry {
         properties: registered::<S>,
         witness: witness_value::<S>,
         run_bytes: explore::run_bytes::<S>,
+        accepts: S::accepts,
+        migrate: S::migrate,
     }
 }
 
@@ -493,6 +528,7 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<header_sync::RepairHarness>(),
     entry::<block_sync::Storage>(),
     entry::<header_sync::HeaderWire>(),
+    entry::<discovery_service::DiscoveryWire>(),
 ];
 
 /// The harness named `name`.

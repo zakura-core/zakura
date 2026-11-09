@@ -414,10 +414,12 @@ impl TapShutdown {
     /// every connection for a shutdown, as [`super::ends`] describes. Call
     /// it where the harness acts, before the action takes effect.
     pub fn environment(&self, peer: &str, connection: Option<u64>, action: EnvironmentAction) {
+        let after = self.0.buffer().last;
         self.0.ends.record(EndFact::Environment {
             peer: peer.to_owned(),
             connection,
             action,
+            after,
         });
     }
 

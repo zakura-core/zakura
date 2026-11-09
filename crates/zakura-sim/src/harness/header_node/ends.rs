@@ -58,6 +58,10 @@ pub enum EndFact {
         connection: Option<u64>,
         /// What it did.
         action: EnvironmentAction,
+        /// The number of the last reactor event the tap had handed out
+        /// when the harness acted, so a reader can tell the reactor's
+        /// events before the action from those after it.
+        after: u64,
     },
     /// The reactor's task ended without the harness stopping it and
     /// without unwinding.
@@ -152,6 +156,7 @@ mod tests {
             peer: "mirror-0".to_owned(),
             connection: Some(4),
             action: EnvironmentAction::Close,
+            after: 0,
         };
         ends.record(close.clone());
         assert_eq!(stamps.next(), 2, "another store's fact");

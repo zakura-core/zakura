@@ -87,18 +87,31 @@ fn second_link(sessions: &[SessionFact], peer: &str) -> u64 {
         .unwrap_or_else(|| panic!("{peer} is relinked: {sessions:#?}"))
 }
 
-/// The environment fact for `action` on `peer`'s `connection`.
+/// The environment fact for `action` on `peer`'s `connection`, with no
+/// reactor event before it, as [`facts`] writes every one.
 fn environment(peer: &str, connection: Option<u64>, action: EnvironmentAction) -> EndFact {
     EndFact::Environment {
         peer: peer.to_owned(),
         connection,
         action,
+        after: 0,
     }
 }
 
-/// The facts of `ends`, without their stamps.
+/// The facts of `ends`, without their stamps or the reactor event each
+/// environment action came after, which depends on the run's schedule.
 fn facts(ends: &[(u64, EndFact)]) -> Vec<EndFact> {
-    ends.iter().map(|(_, fact)| fact.clone()).collect()
+    ends.iter()
+        .map(|(_, fact)| match fact.clone() {
+            EndFact::Environment {
+                peer,
+                connection,
+                action,
+                ..
+            } => environment(&peer, connection, action),
+            exited @ EndFact::ReactorExited { .. } => exited,
+        })
+        .collect()
 }
 
 /// In the close-and-relink scenario, each mirror's `Close` and `Relink` step

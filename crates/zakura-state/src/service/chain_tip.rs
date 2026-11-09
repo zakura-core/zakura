@@ -697,6 +697,12 @@ impl ChainTipChange {
         // upgrade, but it has the same memory-pool requirement: once the chain tip
         // reaches its activation height, the mempool must drop any transactions
         // that are no longer valid under the new rule. So we also reset there.
+        //
+        // The post-quantum transparent output rules are the same kind of boundary. A script
+        // in their namespace can be hidden inside a pay-to-script-hash redeem script, which
+        // the legacy rules accept and these rules refuse, so a spend the mempool accepted
+        // before the height is invalid from it on without anything about the transaction
+        // changing. Growing the pool would keep it, and mining would still be offered it.
         // The next height is what the mempool verifies against; it always exists because the
         // chain tip height is far below `Height::MAX`.
         // TODO: confirm whether resetting at `activation_height - 1` (the `.next()` semantics
@@ -711,6 +717,7 @@ impl ChainTipChange {
             || self
                 .network
                 .is_temporary_orchard_disabling_soft_fork_activation_height(next_height)
+            || self.network.is_pq_activation_height(next_height)
         {
             TipAction::reset_with(block)
         } else {

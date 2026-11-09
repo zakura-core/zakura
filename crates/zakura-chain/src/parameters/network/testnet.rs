@@ -1787,6 +1787,17 @@ impl Network {
         }
     }
 
+    /// Returns whether `height` is the first height at which the post-quantum transparent
+    /// output rules apply.
+    ///
+    /// This is a boundary at which the mempool must revalidate what it holds. A script in the
+    /// post-quantum namespace can be hidden inside a pay-to-script-hash redeem script, which
+    /// the rules refuse once they apply, so a spend that was valid when it was accepted is
+    /// invalid from this height on, without anything about the transaction changing.
+    pub fn is_pq_activation_height(&self, height: Height) -> bool {
+        self.pq_activation_height() == Some(height)
+    }
+
     /// Returns the parameters of this network if it is a Testnet.
     pub fn parameters(&self) -> Option<Arc<Parameters>> {
         if let Self::Testnet(parameters) = self {

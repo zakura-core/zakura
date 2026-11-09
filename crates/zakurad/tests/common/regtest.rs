@@ -712,6 +712,12 @@ enum PqFundedKind {
         script: Vec<u8>,
         revealed: zcash_script::script::Code,
     },
+    /// An ordinary pay-to-script-hash output whose hidden redeem script is in the
+    /// post-quantum namespace and needs no signature. The legacy rules run that script and
+    /// accept it, these rules refuse it, and the output itself gives nothing away, so this
+    /// is the shape whose spend changes from valid to invalid at the activation height with
+    /// nothing about the transaction changed.
+    Wrapped { redeem: zcash_script::script::Code },
 }
 
 /// One funded output of the fixture that all three scenarios share.
@@ -740,6 +746,11 @@ impl PqFunded {
             )
             .script(),
             PqFundedKind::Restricted { script, .. } => Script::new(script),
+            PqFundedKind::Wrapped { redeem } => Address::from_script_hash(
+                NetworkKind::Regtest,
+                zcash_transparent::util::hash160::hash(&redeem.0),
+            )
+            .script(),
         }
     }
 
@@ -749,6 +760,7 @@ impl PqFunded {
             PqFundedKind::Pq { body, .. } => body,
             PqFundedKind::Legacy { redeem } => redeem,
             PqFundedKind::Restricted { revealed, .. } => revealed,
+            PqFundedKind::Wrapped { redeem } => redeem,
         }
     }
 
@@ -759,7 +771,7 @@ impl PqFunded {
         match &self.kind {
             PqFundedKind::Pq { parameters, .. } => Some(*parameters),
             PqFundedKind::Restricted { .. } => Some(zcash_transparent::pq::ParameterSet::Sha2_128f),
-            PqFundedKind::Legacy { .. } => None,
+            PqFundedKind::Legacy { .. } | PqFundedKind::Wrapped { .. } => None,
         }
     }
 
@@ -952,6 +964,20 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
         single(schemes[0])?,
         single(schemes[1])?,
         large,
+        // A namespace script hidden inside a pay-to-script-hash redeem script. `OP_0`,
+        // `OP_1` and a push of thirty-two bytes leave those bytes on the stack, so the
+        // legacy rules accept it, and its spend needs no signature at all.
+        PqFunded {
+            kind: PqFundedKind::Wrapped {
+                redeem: Code(
+                    [0x00u8, 0x51, 0x20]
+                        .into_iter()
+                        .chain([0x22; 32])
+                        .collect::<Vec<u8>>(),
+                ),
+            },
+            signers: Vec::new(),
+        },
     ];
     let mut config = os_assigned_rpc_port_config(false, &net)?;
     config.mempool.debug_enable_at_height = Some(0);
@@ -1115,11 +1141,71 @@ async fn pq_spend_test(scenario: PqSpendScenario) -> Result<()> {
             "both post-quantum schemes are refused before activation"
         );
     }
-    client.mine_proposed_block(&net).await?;
+    // A namespace script can also hide inside a pay-to-script-hash redeem script, where
+    // neither the output nor relay policy can see it, and where the legacy rules run it and
+    // accept the spend that reveals it. Admitted here, it is invalid from the activation
+    // height on with nothing about it changed, so the pool has to let it go when the chain
+    // reaches that boundary, and mining must not be offered it.
+    let wrapped_entry = &fixture[9];
+    let mut wrapped = transaction(
+        OutPoint {
+            hash: funding.hash(),
+            index: 9,
+        },
+        funded_value,
+        miner.script(),
+    );
+    install(
+        &mut wrapped,
+        0,
+        &wrapped_entry.arguments(Vec::new()),
+        wrapped_entry.revealed(),
+    );
+    let wrapped_fee = zakura_chain::transaction::zip317::conventional_fee(&wrapped);
+    if let Transaction::V5 { outputs, .. } = &mut wrapped {
+        outputs[0] = Output::new((funded_value - wrapped_fee)?.constrain()?, miner.script());
+    }
+    // There is nothing to sign, so the input is already final.
+    client.send_raw_transaction(&wrapped).await?;
+    let pool: Vec<String> = client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert!(
+        pool.contains(&wrapped.hash().to_string()),
+        "a wrapped namespace script is spendable before activation: {pool:?}"
+    );
+    // The chain reaches the last block under the old rules without carrying that spend, so
+    // the pool still holds it when the new rules begin to apply.
+    pq_mine_block_leaving_pool(&client, &net, wrapped_fee).await?;
     assert_eq!(
         client.blockchain_info().await?.blocks(),
         Height(activation.0 - 1),
         "admission checks the next block height"
+    );
+    let pool: Vec<String> = client
+        .json_result_from_call("getrawmempool", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    assert!(
+        !pool.contains(&wrapped.hash().to_string()),
+        "the pool lets go of a spend the new rules refuse: {pool:?}"
+    );
+    let offered: BlockTemplateResponse = client
+        .json_result_from_call("getblocktemplate", "[]")
+        .await
+        .map_err(|e| eyre!(e))?;
+    let offered = proposal_block_from_template(&offered, BlockTemplateTimeSource::default(), &net)?;
+    assert!(
+        !offered
+            .transactions
+            .iter()
+            .any(|tx| tx.hash() == wrapped.hash()),
+        "and mining is not offered it either"
+    );
+    assert!(
+        client.send_raw_transaction(&wrapped).await.is_err(),
+        "nor can it be accepted again"
     );
     // A valid fifteen-signature spend is accepted by consensus and refused by relay, which
     // caps how large a transaction it will forward.
@@ -1391,6 +1477,32 @@ async fn pq_mine_block_including(
     extra: &[Transaction],
     fees: Amount<NonNegative>,
 ) -> Result<Block> {
+    pq_mine_block(client, network, extra, i64::from(fees), true).await
+}
+
+/// Mines the next block carrying nothing the node offered from its mempool, so a transaction
+/// stays in the pool while the chain moves on past it. `pool_fees` is what the dropped
+/// transactions would have paid, which the coinbase gives up: a block may always claim fewer
+/// fees than it could.
+#[cfg(feature = "pq")]
+async fn pq_mine_block_leaving_pool(
+    client: &RpcRequestClient,
+    network: &Network,
+    pool_fees: Amount<NonNegative>,
+) -> Result<Block> {
+    pq_mine_block(client, network, &[], -i64::from(pool_fees), false).await
+}
+
+/// Mines the next block from the node's own template, with `extra` appended, the template's
+/// own transactions kept or dropped, and the coinbase's claim moved by `fee_change`.
+#[cfg(feature = "pq")]
+async fn pq_mine_block(
+    client: &RpcRequestClient,
+    network: &Network,
+    extra: &[Transaction],
+    fee_change: i64,
+    keep_template_transactions: bool,
+) -> Result<Block> {
     use zakura_chain::{
         block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash},
         serialization::BytesInDisplayOrder,
@@ -1402,11 +1514,15 @@ async fn pq_mine_block_including(
         .map_err(|e| eyre!(e))?;
     let mut block =
         proposal_block_from_template(&template, BlockTemplateTimeSource::default(), network)?;
+    if !keep_template_transactions {
+        block.transactions.truncate(1);
+    }
     for transaction in extra {
         block.transactions.push(Arc::new(transaction.clone()));
     }
     if let Transaction::V5 { outputs, .. } = Arc::make_mut(&mut block.transactions[0]) {
-        outputs[0] = Output::new((outputs[0].value() + fees)?, outputs[0].lock_script.clone());
+        let claim = Amount::try_from(i64::from(outputs[0].value()) + fee_change)?;
+        outputs[0] = Output::new(claim, outputs[0].lock_script.clone());
     }
     let auth_root: AuthDataRoot = block.transactions.iter().collect();
     let header = Arc::make_mut(&mut block.header);

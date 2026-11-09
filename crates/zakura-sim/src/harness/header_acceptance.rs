@@ -31,6 +31,7 @@
 
 pub mod contracts;
 pub mod evaluate;
+pub mod reasons;
 pub mod required;
 pub mod rows;
 
@@ -95,14 +96,22 @@ pub const PLAN: Approval = Approval::Adam {
     record: "hdr-14 plan, frozen 2026-11-08",
 };
 
-/// The tier a row's evidence runs in.
+/// A tier from properties.md's Tiers. A row's own `tier` is `Sim` or
+/// `Machine`, and every other tier gets a [`Key::Tier`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
-    /// A node harness under the simulator.
-    Sim,
+    /// The owning crate's table suite.
+    Table,
     /// A pure machine with no transport.
     Machine,
+    /// A node harness under the simulator.
+    Sim,
+    /// A real network.
+    Real,
 }
+
+/// Every tier properties.md names, in its order.
+pub const TIERS: [Tier; 4] = [Tier::Table, Tier::Machine, Tier::Sim, Tier::Real];
 
 /// A test, by its package, its file and its exact name. A result names the
 /// same three.
@@ -482,6 +491,23 @@ pub enum Key {
         /// The test's name, in `tests/header_acceptance.rs`.
         test: String,
     },
+    /// One `NotApplicable` reason in [`reasons::NA_REASONS`], shown at its
+    /// trigger.
+    NaReason {
+        /// The producer's file.
+        file: String,
+        /// The producer's function.
+        function: String,
+        /// The construction's position in the function.
+        index: usize,
+    },
+    /// A header ID's entry for a tier other than its own (item 6).
+    Tier {
+        /// The property.
+        property: String,
+        /// The tier, as its `Debug` name.
+        tier: String,
+    },
 }
 
 impl Key {
@@ -633,11 +659,6 @@ impl Key {
                     history, property, ..
                 },
             ) => RunId::from(*history) == *run && property == target,
-            // A missing-source test is transitional only as the one `Open`
-            // its owner PR is assigned.
-            (Key::MissingSource { .. }, Expected::Open { until: Some(_), .. }) => {
-                same_open(expected, &rows::MISSING_SOURCE)
-            }
             // A transitional Open on a passing or catch key must be exactly
             // the one `rows::owed_open` writes for that key: its reason,
             // owner, approval and PR.
@@ -675,6 +696,18 @@ impl Key {
                 same_open(expected, &canonical)
             }
             (Key::NaList { .. }, Expected::Open { .. }) => same_open(expected, &rows::NA_LIST),
+            (Key::NaReason { .. }, Expected::Open { .. }) => {
+                same_open(expected, &rows::REASON_TEST)
+            }
+            (Key::Tier { property, tier }, Expected::Open { .. }) => TIERS
+                .into_iter()
+                .find(|t| format!("{t:?}") == *tier)
+                .is_some_and(|t| same_open(expected, &rows::tier_exclusion(property, t))),
+            (Key::Tier { property, tier }, Expected::Passes { test }) => {
+                rows::TIER_TESTS.iter().any(|(p, t, covering)| {
+                    p == property && format!("{t:?}") == *tier && covering == test
+                })
+            }
             // An approved standing Open on a passing, catch or
             // missing-source key counts only as the exact exclusion
             // `STANDING_EXCLUSIONS` grants that key.
@@ -730,6 +763,9 @@ impl Key {
                         && matches!(narrowing.test, contracts::NarrowingTest::Pending { until }
                             if same_open(expected, &contracts::narrowing_open(until)))
                 })
+            }
+            (Key::MissingSource { harness, .. }, Expected::Passes { test: t }) => {
+                rows::missing_source_test(harness) == Some(*t)
             }
             (
                 Key::Case { .. } | Key::Replay { .. } | Key::Witness { .. } | Key::History { .. },
@@ -870,6 +906,8 @@ impl Manifest {
         expected.extend(contracts::narrowing_test_results(NARROWING));
         expected.extend(rows::composition_results());
         expected.extend(rows::missing_source_results(&needs()));
+        expected.extend(rows::reason_results());
+        expected.extend(rows::tier_results(&registered()));
         Manifest {
             expected,
             contracts,

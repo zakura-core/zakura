@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     contracts::{contract_test_key, Contract, ContractId, ContractState, Narrowing},
+    reasons::{NaKind, NaProducer},
     sim_test, Approval, CaseRun, Expected, ExpectedResult, Gate, HistoryRef, Key, RunId, TestRef,
-    PLAN,
+    Tier, PLAN, TIERS,
 };
 use crate::property::Status;
 
@@ -59,6 +60,8 @@ pub struct Inventories<'a> {
     pub requirements: &'a [GateObligation],
     /// The composition checks.
     pub composition: &'a [&'a str],
+    /// The `NotApplicable` producers.
+    pub reasons: &'a [NaProducer],
     /// The manifest's expected results, read only for the planted runs they
     /// count, each of which owes a replay and, when it completes, a cleanup
     /// comparison.
@@ -227,13 +230,6 @@ pub const GATE_5_BOUND_TABLE: &str =
 /// Why `gate-5/mixed-witness` is open until hdr-14.8.
 pub const GATE_5_MIXED_WITNESS: &str =
     "one storage scenario running all four Sim resource IDs together";
-
-/// Why `gate-6/not-applicable-reasons` is open until hdr-14.3.
-pub const GATE_6_NOT_APPLICABLE_REASONS: &str =
-    "one Passes per NA_REASONS entry, derived from the inventory";
-
-/// Why `gate-6/tiers` is open until hdr-14.3.
-pub const GATE_6_TIERS: &str = "each row's per-rule tier entries";
 
 /// Every gate obligation no row owns, with its gates and what may satisfy
 /// it, written from the spec's gate table.
@@ -461,24 +457,6 @@ pub static GATE_OBLIGATIONS: &[GateObligation] = &[
             reason: GATE_5_MIXED_WITNESS,
         },
     },
-    GateObligation {
-        name: "gate-6/not-applicable-reasons",
-        gates: &[Gate::G6],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.3",
-            reason: GATE_6_NOT_APPLICABLE_REASONS,
-        },
-    },
-    GateObligation {
-        name: "gate-6/tiers",
-        gates: &[Gate::G6],
-        permit: Permit::Until {
-            owner: "Adam's side",
-            pr: "hdr-14.3",
-            reason: GATE_6_TIERS,
-        },
-    },
 ];
 
 /// The gates a header ID's keys serve, written from the spec's gate table.
@@ -580,6 +558,8 @@ pub fn counted_runs(expected: &Expected) -> (Vec<RunId>, Vec<RunId>) {
 /// key, each `Satisfied` contract's proving test and each narrowing entry
 /// a test key, each requirement and composition check its key, and each
 /// counted execution a replay and, for a history, a cleanup comparison.
+/// Each `NotApplicable` reason owes its test, and each ID an entry for every
+/// tier other than its own.
 /// An ID [`gate_rule`] doesn't know gets no gates here, and the static
 /// check names it.
 pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
@@ -712,6 +692,36 @@ pub fn required_keys(inv: &Inventories<'_>) -> BTreeMap<Key, BTreeSet<Gate>> {
             for run in [CaseRun::Baseline, CaseRun::Draft] {
                 keys.insert(Key::Cleanup { run: case(run) }, BTreeSet::from([Gate::G1]));
             }
+        }
+    }
+    for producer in inv.reasons {
+        for (index, construction) in producer.constructions.iter().enumerate() {
+            if construction.kind != NaKind::MissingEvidence {
+                keys.insert(
+                    Key::NaReason {
+                        file: producer.file.to_owned(),
+                        function: producer.function.to_owned(),
+                        index,
+                    },
+                    BTreeSet::from([Gate::G6]),
+                );
+            }
+        }
+    }
+    for registration in inv.registered {
+        let own = if registration.machine {
+            Tier::Machine
+        } else {
+            Tier::Sim
+        };
+        for tier in TIERS.into_iter().filter(|tier| *tier != own) {
+            keys.insert(
+                Key::Tier {
+                    property: registration.property.clone(),
+                    tier: format!("{tier:?}"),
+                },
+                BTreeSet::from([Gate::G6]),
+            );
         }
     }
     for result in inv.expected {

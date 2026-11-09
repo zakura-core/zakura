@@ -321,6 +321,18 @@ const C16_PROVING: &[TestRef] = &[
     sim_test("tests/registry.rs", "every_violation_retained"),
 ];
 
+/// C20's proving tests.
+const C20_PROVING: &[TestRef] = &[
+    sim_test(
+        "tests/header_acceptance.rs",
+        "the_not_applicable_inventory_equals_a_source_scan",
+    ),
+    sim_test(
+        "tests/header_acceptance.rs",
+        "the_source_scan_refuses_an_unlisted_producer",
+    ),
+];
+
 /// A contract that waits for `delivery`, with no proving test yet.
 const fn blocked(
     id: ContractId,
@@ -340,8 +352,8 @@ const fn blocked(
     }
 }
 
-/// The contracts table, one row per contract. Only C3, C10 and C16 are
-/// delivered on `main`. C14's proving tests are the store inventory's
+/// The contracts table, one row per contract. C3, C10 and C16 are
+/// delivered on `main`, and C20 by hdr-14.3. C14's proving tests are the store inventory's
 /// producer tests, which hf-6 adds, so it stays blocked until then.
 pub fn contract_table() -> Vec<Contract> {
     use ContractId::*;
@@ -491,13 +503,15 @@ pub fn contract_table() -> Vec<Contract> {
             "An unread final capacity boundary concludes under C1's drain or fails the run.",
             "hf-4, with C2",
         ),
-        blocked(
-            C20,
-            "Adam's harness",
-            "NA_REASONS lists every reason a header check or the registry can give, and a \
-             source scan finds none outside it.",
-            "hdr-14.3",
-        ),
+        Contract {
+            id: C20,
+            owner: "Adam's harness",
+            statement: "NA_REASONS lists every NotApplicable a header check or the registry \
+                        constructs, and a source scan finds none outside it.",
+            proving: C20_PROVING,
+            state: ContractState::Satisfied,
+            delivery: "hdr-14.3",
+        },
         blocked(
             C21,
             "Adam's harness",

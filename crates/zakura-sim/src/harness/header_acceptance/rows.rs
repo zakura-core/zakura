@@ -1475,26 +1475,6 @@ pub static GATE_REQUIREMENTS: &[GateRequirement] = &[
             until: Some("hdr-14.8"),
         },
     },
-    GateRequirement {
-        name: "gate-6/not-applicable-reasons",
-        gates: &[Gate::G6],
-        expected: Expected::Open {
-            reason: obligation::GATE_6_NOT_APPLICABLE_REASONS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.3"),
-        },
-    },
-    GateRequirement {
-        name: "gate-6/tiers",
-        gates: &[Gate::G6],
-        expected: Expected::Open {
-            reason: obligation::GATE_6_TIERS,
-            owner: "Adam's side",
-            approval: Approval::Pending,
-            until: Some("hdr-14.3"),
-        },
-    },
 ];
 
 /// The [`GATE_REQUIREMENTS`] as expected results.
@@ -1740,6 +1720,8 @@ pub static COMPOSITION_CHECKS: &[&str] = &[
     "the_evaluator_decides_contracts_through_their_keys",
     "the_evaluator_binds_runners_and_traces",
     "the_evaluator_accepts_real_storage_and_release_wake_histories",
+    "the_not_applicable_inventory_equals_a_source_scan",
+    "the_source_scan_refuses_an_unlisted_producer",
 ];
 
 /// The [`COMPOSITION_CHECKS`] as expected results.
@@ -1801,27 +1783,172 @@ pub fn witness_results(rows: &[Row]) -> Vec<ExpectedResult> {
         .collect()
 }
 
-/// A missing-source test's `Open`, until hdr-14.3 maps the existing ones
-/// and adds the rest.
-pub const MISSING_SOURCE: Expected = Expected::Open {
-    reason: "a test that removes the source and shows a harness failure with no Held",
-    owner: "Adam's side",
-    approval: Approval::Pending,
-    until: Some("hdr-14.3"),
-};
+/// The file of the missing-source tests.
+const SOURCE_TESTS: &str = "tests/header_acceptance_sources.rs";
 
-/// The missing-source tests' expected results, each [`MISSING_SOURCE`].
+/// The test that drops each source `harness`'s properties need, one at a
+/// time, or `None` for a machine, which builds its view in its own driver
+/// with no source to drop.
+pub fn missing_source_test(harness: &str) -> Option<TestRef> {
+    let test = match harness {
+        SMOKE => "smoke_fails_without_each_source",
+        STORAGE => "storage_fails_without_each_source",
+        RELEASE_WAKE => "release_wake_fails_without_each_source",
+        WIRE => "wire_fails_without_each_source",
+        FLOOD => "flood_fails_without_each_source",
+        REPAIR => "repair_fails_without_each_source",
+        _ => return None,
+    };
+    Some(sim_test(SOURCE_TESTS, test))
+}
+
+/// The missing-source tests' expected results. Each node harness's test
+/// requires a harness failure naming each dropped source with no property
+/// `Held`, so it covers each of its harness's keys. A machine's keys are a
+/// standing `Open` awaiting approval.
 pub fn missing_source_results(keys: &[(String, String)]) -> Vec<ExpectedResult> {
-    keys.iter()
-        .map(|(harness, source)| {
-            result(
-                vec![Key::MissingSource {
-                    harness: harness.clone(),
-                    source: source.clone(),
-                }],
-                &[Gate::G6],
-                MISSING_SOURCE,
-            )
+    let mut by_harness: std::collections::BTreeMap<&str, Vec<Key>> = Default::default();
+    for (harness, source) in keys {
+        by_harness
+            .entry(harness)
+            .or_default()
+            .push(Key::MissingSource {
+                harness: harness.clone(),
+                source: source.clone(),
+            });
+    }
+    by_harness
+        .into_iter()
+        .map(|(harness, keys)| {
+            let expected = match missing_source_test(harness) {
+                Some(test) => Expected::Passes { test },
+                None => Expected::Open {
+                    reason: "a machine builds its one property's view in its own driver, so it \
+                             has no source a test could drop",
+                    owner: "hdr-14",
+                    approval: Approval::Pending,
+                    until: None,
+                },
+            };
+            result(keys, &[Gate::G6], expected)
         })
         .collect()
+}
+
+/// The `NotApplicable` reasons' expected results. On `main` a report
+/// doesn't name its reason, so no test can tell two reasons apart until E1
+/// (C1) makes `NotApplicable` carry one.
+pub fn reason_results() -> Vec<ExpectedResult> {
+    let mut results = Vec::new();
+    for producer in super::reasons::NA_REASONS {
+        for (index, construction) in producer.constructions.iter().enumerate() {
+            if construction.kind != super::reasons::NaKind::MissingEvidence {
+                results.push(result(
+                    vec![Key::NaReason {
+                        file: producer.file.to_owned(),
+                        function: producer.function.to_owned(),
+                        index,
+                    }],
+                    &[Gate::G6],
+                    REASON_TEST,
+                ));
+            }
+        }
+    }
+    results
+}
+
+/// A `NotApplicable` reason's test, until a report names its reason (E1).
+pub const REASON_TEST: Expected = Expected::Open {
+    reason: "a test that shows this reason at its trigger, once a report names its \
+             NotApplicable reason",
+    owner: "Adam's side",
+    approval: Approval::Pending,
+    until: Some("E1"),
+};
+
+/// Each non-`Real` tier exclusion Adam has approved, by its own
+/// `(property, tier)` key, so approving one rule's exclusion approves no
+/// other. None is approved on `main`.
+pub static TIER_APPROVALS: &[(&str, Tier, Approval)] = &[];
+
+/// Each result that covers a header rule in a tier other than its own, by
+/// `(property, tier)`, such as an owning crate's table suite that checks
+/// the whole rule. None exists on `main`, so every such key is an
+/// exclusion.
+pub static TIER_TESTS: &[(&str, Tier, TestRef)] = &[];
+
+/// Why `tier` has no result for `property` yet. Real has the plan's
+/// approved exclusion. The others await approval, rule by rule.
+pub fn tier_exclusion(property: &str, tier: Tier) -> Expected {
+    tier_exclusion_in(TIER_APPROVALS, property, tier)
+}
+
+/// [`tier_exclusion`] with `approvals` in place of [`TIER_APPROVALS`]. The
+/// `Real` exclusion is the plan's, for every rule; any other is approved
+/// only by its own entry.
+pub fn tier_exclusion_in(
+    approvals: &[(&str, Tier, Approval)],
+    property: &str,
+    tier: Tier,
+) -> Expected {
+    let own = approvals
+        .iter()
+        .find(|(p, t, _)| *p == property && *t == tier)
+        .map_or(Approval::Pending, |(_, _, approval)| *approval);
+    let (reason, approval) = match tier {
+        Tier::Real => (
+            "properties.md allows only safety properties over peer-visible events on Real, and \
+             nothing runs header properties there yet",
+            PLAN,
+        ),
+        Tier::Table if property.starts_with("header-sync/s5v9/") => (
+            "model_agreement compares the regulation primitives' admit-or-refuse answers with \
+             the models, but checks no content validation, closure or punishment, so it's \
+             supporting evidence only",
+            own,
+        ),
+        Tier::Table => (
+            "no table suite checks this rule whole, consequence included",
+            own,
+        ),
+        Tier::Machine => ("no machine harness checks this rule", own),
+        Tier::Sim => (
+            "this machine's model has no node-harness property of its own",
+            own,
+        ),
+    };
+    Expected::Open {
+        reason,
+        owner: "hdr-14",
+        approval,
+        until: None,
+    }
+}
+
+/// Every header ID's entry for each tier other than its own.
+pub fn tier_results(registered: &[super::Registered]) -> Vec<ExpectedResult> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut results = Vec::new();
+    for registration in registered {
+        if !seen.insert(registration.property.clone()) {
+            continue;
+        }
+        let own = if registration.machine {
+            Tier::Machine
+        } else {
+            Tier::Sim
+        };
+        for tier in super::TIERS.into_iter().filter(|tier| *tier != own) {
+            results.push(result(
+                vec![Key::Tier {
+                    property: registration.property.clone(),
+                    tier: format!("{tier:?}"),
+                }],
+                &[Gate::G6],
+                tier_exclusion(&registration.property, tier),
+            ));
+        }
+    }
+    results
 }

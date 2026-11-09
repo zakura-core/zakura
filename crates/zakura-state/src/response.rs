@@ -541,8 +541,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Transaction`] with the specified transaction.
     Transaction(Option<MinedTx>),
 
-    /// Response to [`ReadRequest::AnyChainTransaction`] with the specified transaction.
-    AnyChainTransaction(Option<AnyTx>),
+    /// Response to [`ReadRequest::AnyChainTransaction`] with the specified
+    /// transaction and its Zcash consensus serialization.
+    AnyChainTransaction(Option<(AnyTx, OwnedRawTransaction)>),
 
     /// Response to [`ReadRequest::AnyChainRawTransaction`] with the specified
     /// transaction's Zcash consensus serialization.

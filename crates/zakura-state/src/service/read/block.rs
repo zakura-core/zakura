@@ -229,14 +229,20 @@ where
     Ok(tip_height(chain, db).map(|tip| MinedTx::new(tx, height, 1 + tip.0 - height.0, time)))
 }
 
-/// Returns a [`AnyTx`] for a [`Transaction`] with [`transaction::Hash`],
-/// if one exists in any chain in `chains` or finalized `db`.
+/// Returns a [`AnyTx`] for a [`Transaction`] with [`transaction::Hash`], and the
+/// transaction's Zcash consensus serialization, if one exists in any chain in
+/// `chains` or finalized `db`.
 /// The first chain in `chains` must be the best chain.
+///
+/// Finalized transactions return their stored bytes, and non-finalized
+/// transactions are serialized from memory. The bytes keep their read-memory
+/// charge through their final clone.
+#[allow(clippy::unwrap_in_result)]
 pub fn any_transaction<'a>(
     chains: impl Iterator<Item = &'a Arc<Chain>>,
     db: &ZakuraDb,
     hash: transaction::Hash,
-) -> Result<Option<AnyTx>, ReadMemoryExhausted> {
+) -> Result<Option<(AnyTx, OwnedRawTransaction)>, ReadMemoryExhausted> {
     // # Correctness
     //
     // It is ok to do this lookup in multiple different calls. Finalized state updates
@@ -258,23 +264,30 @@ pub fn any_transaction<'a>(
             .map(|(tx, height, time)| (tx.clone(), height, time, i == 0, Some(chain)))
     });
     let transaction = match in_memory {
-        Some(transaction) => Some(transaction),
+        Some((tx, height, time, in_best_chain, chain)) => {
+            let bytes = tx
+                .zcash_serialize_to_vec()
+                .expect("serializing a transaction to a vec cannot fail");
+            let raw = db.retain_serialized_bytes(bytes)?;
+            Some((tx, raw, height, time, in_best_chain, chain))
+        }
         None => db
-            .transaction(hash)?
-            .map(|(tx, height, time)| (tx, height, time, true, None)),
+            .transaction_and_raw(hash)?
+            .map(|(tx, raw, height, time)| (tx, raw, height, time, true, None)),
     };
-    let Some((tx, height, time, in_best_chain, containing_chain)) = transaction else {
+    let Some((tx, raw, height, time, in_best_chain, containing_chain)) = transaction else {
         return Ok(None);
     };
 
-    if in_best_chain {
-        Ok(tip_height(best_chain, db)
-            .map(|tip| AnyTx::Mined(MinedTx::new(tx, height, 1 + tip.0 - height.0, time))))
+    let any_tx = if in_best_chain {
+        tip_height(best_chain, db)
+            .map(|tip| AnyTx::Mined(MinedTx::new(tx, height, 1 + tip.0 - height.0, time)))
     } else {
-        Ok(containing_chain
+        containing_chain
             .and_then(|chain| chain.block(height.into()))
-            .map(|block| AnyTx::Side((tx, block.hash))))
-    }
+            .map(|block| AnyTx::Side((tx, block.hash)))
+    };
+    Ok(any_tx.map(|any_tx| (any_tx, raw)))
 }
 
 /// Returns the Zcash consensus serialization of the [`Transaction`] with

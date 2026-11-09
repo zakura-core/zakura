@@ -561,23 +561,55 @@ impl ZakuraDb {
     /// The read reserves an upper bound on the decoded transaction before decoding it,
     /// and the result keeps its charge through its final clone. Capacity refusal
     /// returns an error.
-    #[allow(clippy::unwrap_in_result)]
     pub fn transaction(
         &self,
         hash: transaction::Hash,
     ) -> Result<Option<(TransactionHandle, Height, DateTime<Utc>)>, ReadMemoryExhausted> {
-        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
-        let Some(location) = self.transaction_location(hash) else {
-            return Ok(None);
-        };
-        let Some(header) = self.block_header(location.height.into()) else {
-            return Ok(None);
-        };
-        let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
+        let Some((raw, height, time)) = self.raw_transaction_with_context(hash) else {
             return Ok(None);
         };
         let transaction = self.decode_transaction(&raw)?;
-        Ok(Some((transaction, location.height, header.time)))
+        Ok(Some((transaction, height, time)))
+    }
+
+    /// Returns the [`Transaction`] with [`transaction::Hash`] like [`Self::transaction`],
+    /// along with its stored Zcash consensus serialization.
+    ///
+    /// The decoded transaction and its bytes each keep their read-memory charge
+    /// through their final clones. Capacity refusal returns an error.
+    #[allow(clippy::type_complexity)]
+    pub fn transaction_and_raw(
+        &self,
+        hash: transaction::Hash,
+    ) -> Result<
+        Option<(
+            TransactionHandle,
+            OwnedRawTransaction,
+            Height,
+            DateTime<Utc>,
+        )>,
+        ReadMemoryExhausted,
+    > {
+        let Some((raw, height, time)) = self.raw_transaction_with_context(hash) else {
+            return Ok(None);
+        };
+        let transaction = self.decode_transaction(&raw)?;
+        let raw = self.retain_serialized_bytes(raw.into_raw_bytes())?;
+        Ok(Some((transaction, raw, height, time)))
+    }
+
+    /// Reads the stored bytes of the transaction with `hash`, with its block
+    /// height and time, without read admission or decoding.
+    #[allow(clippy::unwrap_in_result)]
+    fn raw_transaction_with_context(
+        &self,
+        hash: transaction::Hash,
+    ) -> Option<(RawBytes, Height, DateTime<Utc>)> {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let location = self.transaction_location(hash)?;
+        let header = self.block_header(location.height.into())?;
+        let raw = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location)?;
+        Some((raw, location.height, header.time))
     }
 
     /// Returns the Zcash consensus serialization of the [`Transaction`] with

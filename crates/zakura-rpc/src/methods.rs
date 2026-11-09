@@ -3004,7 +3004,7 @@ where
         )
         .await?
         {
-            zakura_state::ReadResponse::AnyChainTransaction(Some(tx)) => Ok(
+            zakura_state::ReadResponse::AnyChainTransaction(Some((tx, raw))) => Ok(
                 if let Some((caller_block_hash, in_best_chain)) = caller_block_context {
                     // Use the caller-provided block context to avoid TOCTOU races
                     // between the validation query and the transaction fetch.
@@ -3022,8 +3022,9 @@ where
                     };
 
                     GetRawTransactionResponse::Object(Box::new(
-                        TransactionObject::from_transaction(
+                        TransactionObject::from_serialized_transaction(
                             raw_tx,
+                            raw.to_vec().into(),
                             height,
                             confirmations,
                             &self.network,
@@ -3051,8 +3052,9 @@ where
                             };
 
                             GetRawTransactionResponse::Object(Box::new(
-                                TransactionObject::from_transaction(
+                                TransactionObject::from_serialized_transaction(
                                     tx.tx.clone(),
+                                    raw.to_vec().into(),
                                     Some(tx.height),
                                     Some(tx.confirmations.into()),
                                     &self.network,
@@ -3066,8 +3068,9 @@ where
                             ))
                         }
                         AnyTx::Side((tx, block_hash)) => GetRawTransactionResponse::Object(
-                            Box::new(TransactionObject::from_transaction(
+                            Box::new(TransactionObject::from_serialized_transaction(
                                 tx.clone(),
+                                raw.to_vec().into(),
                                 None,
                                 None,
                                 &self.network,

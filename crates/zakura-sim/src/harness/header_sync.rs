@@ -34,7 +34,7 @@ use zakura_storage::header::{
 use super::{
     header_node::StartupFacts,
     header_node::{
-        adoption::{Acceptance, AdoptionEvidence, SessionLife},
+        adoption::{AdoptionEvidence, SessionLife},
         authority::AuthorityEvidence,
         capacity::CapacityEvidence,
         chain_effect::ChainEffectEvidence,

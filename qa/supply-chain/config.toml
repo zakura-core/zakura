@@ -51,16 +51,49 @@ notes = "These dependencies are behind `cfg(hax)` or `cfg(valgrind_ct_test)`, wh
 [policy.zakura]
 audit-as-crates-io = false
 
+[policy."zakura-address:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-bellman:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-bento-core:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-bento-macros:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-bento:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-bls12-381:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
 [policy.zakura-chain]
 audit-as-crates-io = false
 
 [policy.zakura-consensus]
 audit-as-crates-io = false
 
+[policy."zakura-equihash:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-halo2-gadgets:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-halo2-poseidon:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-halo2-proofs:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
 [policy.zakura-header-chain]
 audit-as-crates-io = false
 
 [policy.zakura-jsonl-trace]
+audit-as-crates-io = false
+
+[policy."zakura-jubjub:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
 audit-as-crates-io = false
 
 [policy.zakura-mempool]
@@ -75,7 +108,34 @@ audit-as-crates-io = false
 [policy.zakura-node-services]
 audit-as-crates-io = false
 
+[policy."zakura-note-encryption:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-orchard-legacy:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-orchard:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-pairing:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-pasta-curves:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-primitives:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-protocol:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
 [policy.zakura-quic]
+audit-as-crates-io = false
+
+[policy."zakura-reddsa:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-redjubjub:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
 audit-as-crates-io = false
 
 [policy.zakura-rpc]
@@ -84,14 +144,32 @@ audit-as-crates-io = false
 [policy.zakura-rt]
 audit-as-crates-io = false
 
+[policy."zakura-sapling-crypto:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
 [policy.zakura-scheduler]
 criteria = "safe-to-run"
 
 [policy.zakura-script]
 audit-as-crates-io = false
 
+[policy."zakura-sensei-artifacts:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-sensei-macros:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-sensei-shared:0.1.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-sensei:0.1.1@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
 [policy.zakura-sim]
 criteria = "safe-to-run"
+
+[policy."zakura-sinsemilla:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
 
 [policy.zakura-state]
 audit-as-crates-io = false
@@ -99,7 +177,16 @@ audit-as-crates-io = false
 [policy.zakura-test]
 audit-as-crates-io = false
 
+[policy."zakura-transparent:5.3.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
+[policy."zakura-udon:0.2.0@git:26d222cdde82f522d74e363666c887140e048a62"]
+audit-as-crates-io = false
+
 [policy.zakura-utils]
+audit-as-crates-io = false
+
+[policy."zakura-zcash-script:0.0.1@git:26d222cdde82f522d74e363666c887140e048a62"]
 audit-as-crates-io = false
 
 [[exemptions.addr2line]]
@@ -160,6 +247,11 @@ notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pen
 version = "0.15.11"
 criteria = "safe-to-deploy"
 
+[[exemptions.const-oid]]
+version = "0.10.2"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.criterion]]
 version = "0.8.2"
 criteria = "safe-to-run"
@@ -174,6 +266,11 @@ notes = "Benchmark-only plotting dependency upgraded with Criterion; pending aud
 version = "0.2.2"
 criteria = "safe-to-deploy"
 notes = "Common v3.0.0 dependency upgrade; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification. Preserve the prior audit hold for hazmat::SerializableState on [u128; N] until its status is checked against this release."
+
+[[exemptions.der]]
+version = "0.8.3"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.digest]]
 version = "0.11.3"
@@ -274,6 +371,11 @@ version = "0.0.10"
 criteria = "safe-to-deploy"
 notes = "Introduced with the hybrid key-exchange group (zakura-quic TLS-9), now X25519MLKEM1024, which takes ML-KEM-1024 from libcrux; exact-version exemption pending dedicated package review. This exemption is not an audit certification."
 
+[[exemptions.keccak]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
 [[exemptions.libm]]
 version = "0.2.16"
 criteria = "safe-to-deploy"
@@ -317,6 +419,11 @@ notes = "Audit hold: code generation can emit ParserState::repeat around PEEK_AL
 version = "2.8.7"
 criteria = "safe-to-deploy"
 notes = "Audit hold: validator.rs explicitly notes that empty-stack PEEK_ALL is non-progressing but classifies it as progressing. Repetitions such as PEEK_ALL* can pass validation and generate a parser that hangs indefinitely. Retain the exemption pending complete progress analysis."
+
+[[exemptions.pkcs8]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.poly1305]]
 version = "0.9.1"
@@ -403,6 +510,26 @@ condition, sha2 version, or direct callers change.
 version = "3.0.10"
 criteria = "safe-to-deploy"
 notes = "Build-time only: libcrux-macros, the proc macro of libcrux-ml-dsa (zakura-quic TLS-4), is built on syn 3. Exact-version exemption pending review. This exemption is not an audit certification."
+
+[[exemptions.sha3]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.signature]]
+version = "3.0.0"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.slh-dsa]]
+version = "0.2.0-rc.5"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
+
+[[exemptions.spki]]
+version = "0.8.1"
+criteria = "safe-to-deploy"
+notes = "Reached through the post-quantum signature dependency; exact-version audit backlog entry pending dedicated package review. This exemption is not an audit certification."
 
 [[exemptions.tar]]
 version = "0.4.45"

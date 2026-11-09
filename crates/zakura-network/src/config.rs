@@ -35,8 +35,8 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES, DEFAULT_ADVERT_WINDOW_MAX,
-        DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
+        DEFAULT_ADVERT_WINDOW_FULL_BLOCK, DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
+        DEFAULT_ADVERT_WINDOW_SMALL_BLOCK, DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
         DEFAULT_CRAWL_NEW_PEER_INTERVAL, DEFAULT_MAX_CONNS_PER_IP,
         DEFAULT_PEERSET_INITIAL_TARGET_SIZE, DNS_LOOKUP_TIMEOUT, INBOUND_PEER_LIMIT_MULTIPLIER,
         MAX_PEER_DISK_CACHE_SIZE, OUTBOUND_PEER_LIMIT_DIVISOR, OUTBOUND_PEER_LIMIT_MULTIPLIER,
@@ -384,18 +384,22 @@ pub struct Config {
     pub unconditional_peers: UnconditionalPeers,
     /// The initial peer count for full-sized or unknown-sized legacy blocks. At least 1.
     ///
-    /// The count grows linearly to `advert_window_max` as block size falls to
+    /// The count grows linearly to `advert_window_small_block` as block size falls to
     /// `advert_window_small_size_bytes`. Sidecars receive inventory immediately outside
     /// this group. All remaining peers receive inventory after the configured delay.
     ///
-    /// Experimental.
-    pub advert_window_min: usize,
-
-    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
-    /// Must be at least `advert_window_min`.
+    /// The previous name `advert_window_min` still loads.
     ///
     /// Experimental.
-    pub advert_window_max: usize,
+    pub advert_window_full_block: usize,
+
+    /// The initial peer count for blocks at or below `advert_window_small_size_bytes`.
+    /// Must be at least `advert_window_full_block`.
+    ///
+    /// The previous name `advert_window_max` still loads.
+    ///
+    /// Experimental.
+    pub advert_window_small_block: usize,
 
     /// The size at or below which broadcasts use the largest initial group and shortest delay.
     /// Must be below `advert_window_full_size_bytes`.
@@ -1039,8 +1043,8 @@ impl Default for Config {
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             expose_peer_addresses: false,
             unconditional_peers: UnconditionalPeers::default(),
-            advert_window_min: DEFAULT_ADVERT_WINDOW_MIN,
-            advert_window_max: DEFAULT_ADVERT_WINDOW_MAX,
+            advert_window_full_block: DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+            advert_window_small_block: DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
             advert_window_small_size_bytes: DEFAULT_ADVERT_WINDOW_SMALL_SIZE_BYTES,
             advert_window_full_size_bytes: DEFAULT_ADVERT_WINDOW_FULL_SIZE_BYTES,
             advert_delay_min: Duration::ZERO,
@@ -1246,9 +1250,11 @@ struct DConfig {
     unconditional_peers: UnconditionalPeers,
     /// `None` if the config does not set it, so [`resolve_advert_windows`] can derive it from
     /// the other bound.
-    advert_window_min: Option<usize>,
-    /// `None` if the config does not set it. See `advert_window_min`.
-    advert_window_max: Option<usize>,
+    #[serde(alias = "advert_window_min")]
+    advert_window_full_block: Option<usize>,
+    /// `None` if the config does not set it. See `advert_window_full_block`.
+    #[serde(alias = "advert_window_max")]
+    advert_window_small_block: Option<usize>,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
     #[serde(with = "zakura_chain::serialization::serde_adapters::duration")]
@@ -1279,8 +1285,8 @@ impl Default for DConfig {
             max_connections_per_ip: Some(config.max_connections_per_ip),
             expose_peer_addresses: config.expose_peer_addresses,
             unconditional_peers: config.unconditional_peers,
-            advert_window_min: None,
-            advert_window_max: None,
+            advert_window_full_block: None,
+            advert_window_small_block: None,
             advert_window_small_size_bytes: config.advert_window_small_size_bytes,
             advert_window_full_size_bytes: config.advert_window_full_size_bytes,
             advert_delay_min: config.advert_delay_min,
@@ -1355,8 +1361,8 @@ impl From<Config> for DConfig {
             max_connections_per_ip,
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay_min,
@@ -1403,8 +1409,8 @@ impl From<Config> for DConfig {
             max_connections_per_ip: Some(max_connections_per_ip),
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min: Some(advert_window_min),
-            advert_window_max: Some(advert_window_max),
+            advert_window_full_block: Some(advert_window_full_block),
+            advert_window_small_block: Some(advert_window_small_block),
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay_min,
@@ -1437,8 +1443,8 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay_min,
@@ -1446,11 +1452,11 @@ impl<'de> Deserialize<'de> for Config {
         } = DConfig::deserialize(deserializer)?;
 
         let p2p_stack = p2p_stack_from_config::<D>(p2p_stack, legacy_p2p, v2_p2p)?;
-        let (advert_window_min, advert_window_max) =
-            resolve_advert_windows(advert_window_min, advert_window_max);
+        let (advert_window_full_block, advert_window_small_block) =
+            resolve_advert_windows(advert_window_full_block, advert_window_small_block);
         validate_advert_fanout(
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay_min,
@@ -1599,8 +1605,8 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
             expose_peer_addresses,
             unconditional_peers,
-            advert_window_min,
-            advert_window_max,
+            advert_window_full_block,
+            advert_window_small_block,
             advert_window_small_size_bytes,
             advert_window_full_size_bytes,
             advert_delay_min,
@@ -1609,30 +1615,39 @@ impl<'de> Deserialize<'de> for Config {
     }
 }
 
-/// Resolves omitted initial-group bounds without changing explicitly configured values.
-fn resolve_advert_windows(min: Option<usize>, max: Option<usize>) -> (usize, usize) {
-    match (min, max) {
-        (Some(min), Some(max)) => (min, max),
-        (Some(min), None) => (min, DEFAULT_ADVERT_WINDOW_MAX.max(min)),
-        (None, Some(max)) => (DEFAULT_ADVERT_WINDOW_MIN.min(max), max),
-        (None, None) => (DEFAULT_ADVERT_WINDOW_MIN, DEFAULT_ADVERT_WINDOW_MAX),
+/// Resolves omitted initial-group windows without changing explicitly configured values.
+fn resolve_advert_windows(full_block: Option<usize>, small_block: Option<usize>) -> (usize, usize) {
+    match (full_block, small_block) {
+        (Some(full_block), Some(small_block)) => (full_block, small_block),
+        (Some(full_block), None) => (
+            full_block,
+            DEFAULT_ADVERT_WINDOW_SMALL_BLOCK.max(full_block),
+        ),
+        (None, Some(small_block)) => (
+            DEFAULT_ADVERT_WINDOW_FULL_BLOCK.min(small_block),
+            small_block,
+        ),
+        (None, None) => (
+            DEFAULT_ADVERT_WINDOW_FULL_BLOCK,
+            DEFAULT_ADVERT_WINDOW_SMALL_BLOCK,
+        ),
     }
 }
 
 /// Checks the block advert fan-out settings.
 fn validate_advert_fanout(
-    advert_window_min: usize,
-    advert_window_max: usize,
+    advert_window_full_block: usize,
+    advert_window_small_block: usize,
     advert_window_small_size_bytes: u64,
     advert_window_full_size_bytes: u64,
     advert_delay_min: Duration,
     advert_delay_max: Duration,
 ) -> Result<(), String> {
-    if advert_window_min == 0 || advert_window_min > advert_window_max {
+    if advert_window_full_block == 0 || advert_window_full_block > advert_window_small_block {
         return Err(format!(
-            "advert_window_min and advert_window_max must satisfy \
-             1 <= advert_window_min <= advert_window_max, \
-             got {advert_window_min} and {advert_window_max}"
+            "advert_window_full_block and advert_window_small_block must satisfy \
+             1 <= advert_window_full_block <= advert_window_small_block, \
+             got {advert_window_full_block} and {advert_window_small_block}"
         ));
     }
     if advert_window_small_size_bytes >= advert_window_full_size_bytes {

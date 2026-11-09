@@ -155,6 +155,18 @@ test = "regenerate_capacity_frontier_first_input"
 run = false
 reason = "a tool, not a test: it rewrites the committed frontier-first input"
 
+[[ignored]]
+file = "crates/zakura-sim/tests/header_flood_watch.rs"
+test = "regenerate_flood_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed inputs"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/header_release_wake.rs"
+test = "regenerate_release_wake_seeds"
+run = false
+reason = "a tool, not a test: it rewrites the committed inputs"
+
 # Commands the package rows don't cover: the doc tests, and the release and
 # AddressSanitizer runs of the scheduler and runtime that CI's
 # `zakura_sim release` and `zakura_sim asan` jobs make. The ASan lane needs
@@ -308,6 +320,16 @@ owner = "E5a"
 reason = "no target: the harness has a fixed scenario, and no plan maps it to a target"
 
 [[missing-target]]
+harness = "header-sync/flood"
+owner = "E5a"
+reason = "no target: the harness has two fixed scenarios, the flood fixtures, and no plan maps it to a target"
+
+[[missing-target]]
+harness = "header-sync/release-wake"
+owner = "E5a"
+reason = "no target: the harness has two fixed scenarios, the wake fixtures, and no plan maps it to a target"
+
+[[missing-target]]
 harness = "block-sync/storage"
 owner = "E5a"
 reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
@@ -320,24 +342,6 @@ reason = "no target yet; `cargo xtask sim-targets` checks one once its table ent
 # Planned rows from campaign.md's requirement map and the P4 plan. Each
 # stays in the report as unimplemented until its chunk registers it, and
 # then the check fails until its row here goes.
-[[pending]]
-id = "header-sync/capacity-release-wakes"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/watch-observed-under-flood"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/watch-observed-under-lifecycle-flood"
-kind = "property"
-owner = "P4b"
-plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
 [[pending]]
 id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"

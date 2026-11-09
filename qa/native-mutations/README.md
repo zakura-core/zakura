@@ -3,8 +3,10 @@
 Each patch here plants a bug that a named test detects outside the planted
 runner. The README beside each patch names that test and how to run it.
 
-`cargo xtask planted` reads a case file and a committed fuzz input for every
-patch under `qa/planted`. These patches have neither, so they live here.
+`cargo xtask planted` reads a case file for every patch under `qa/planted`,
+and the case file names either a committed fuzz input or a typed case: a
+committed scenario and the Plan bytes it runs under, for a scenario the fuzz
+grammar can't encode. These patches have no case file, so they live here.
 
 `cases.json` maps every patch to its package, exact test selector, source,
 and intended assertion. Most cases use library tests. The handoff case uses

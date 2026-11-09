@@ -201,8 +201,8 @@ fn invalid_preparation_context_is_stale() {
     }
 }
 
-/// ST2.2: a repair context, which a simulation can't resolve, fails
-/// through the typed contract as `Stale`.
+/// ST2.2: a repair context above the selected tip fails through the typed
+/// contract as `Stale`. `tests/header_repair.rs` resolves one.
 #[test]
 fn a_repair_context_is_stale() {
     let fixture = HeaderFixture::regtest();

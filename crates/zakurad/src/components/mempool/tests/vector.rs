@@ -307,13 +307,13 @@ fn transaction_data_failures_ban_every_version() {
 /// its upgrade, and the verifier rejects a mismatch before these checks.
 #[test]
 fn upgrade_dependent_failures_ban_only_v5_and_later() {
-    use zakura_chain::primitives::{ed25519, reddsa, redjubjub};
+    use zakura_chain::primitives::{reddsa, redjubjub};
 
     for error in [
         TransactionError::Script(zakura_script::Error::ScriptInvalid),
         TransactionError::SaplingVerificationFailed,
         TransactionError::Halo2VerificationFailed,
-        TransactionError::Ed25519(ed25519::Error::InvalidSignature),
+        TransactionError::Ed25519("invalid signature".to_owned()),
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
         TransactionError::DisabledAddToOrchardPool,

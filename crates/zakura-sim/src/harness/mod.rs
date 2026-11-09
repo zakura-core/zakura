@@ -488,6 +488,8 @@ pub static HARNESSES: &[HarnessEntry] = &[
     entry::<discovery::WaitComplete>(),
     entry::<header_sync::Smoke>(),
     entry::<header_sync::Storage>(),
+    entry::<header_sync::ReleaseWake>(),
+    entry::<header_sync::Flood>(),
     entry::<block_sync::Storage>(),
     entry::<header_sync::HeaderWire>(),
 ];

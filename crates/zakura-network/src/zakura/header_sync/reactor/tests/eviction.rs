@@ -645,6 +645,34 @@ async fn the_peer_identity_cap_follows_the_smaller_limit_with_a_floor() {
     }
 }
 
+/// Header serving and the lifecycle queue are sized for the header-sync peers
+/// the node can admit: the smaller of the peer limits and the admitted
+/// connections.
+#[test]
+fn serving_and_lifecycle_follow_the_admitted_header_peers() {
+    let cases = [
+        // (inbound, outbound, admitted connections, header peers)
+        (256, 256, 16, 16),
+        (256, 256, 200, 200),
+        (6, 6, 92, 12),
+    ];
+    for (inbound, outbound, connections, peers) in cases {
+        let mut startup = startup(CancellationToken::new());
+        startup.config.peer_limits.max_inbound_peers = inbound;
+        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.max_connections = connections;
+        let (handle, _actions, _reactor) =
+            build_header_sync_reactor(startup).expect("the sizing fixture builds");
+        let case = format!("{inbound} inbound, {outbound} outbound, {connections} connections");
+        assert_eq!(
+            handle.serving.limits(),
+            v9::serving_limits(v9::SERVE_PEER_OUTPUT_BYTES, peers, None),
+            "{case}"
+        );
+        assert_eq!(handle.lifecycle.capacity(), 2 * peers, "{case}");
+    }
+}
+
 /// Past the cap the cooldown that ends first is evicted, never the one just
 /// started, and refreshing a held cooldown evicts nothing.
 #[tokio::test(start_paused = true)]

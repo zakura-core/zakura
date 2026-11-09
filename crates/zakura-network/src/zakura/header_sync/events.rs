@@ -50,7 +50,8 @@ pub struct HeaderSyncStartup {
     /// Application frame cap for header-sync messages.
     pub max_frame_bytes: u32,
     /// The most connections the node admits at once, which caps how many
-    /// header-sync peers it can hold. Defaults to
+    /// header-sync peers it can hold. It sizes header serving, the lifecycle
+    /// queue and the per-identity state that outlives a session. Defaults to
     /// [`DEFAULT_ZAKURA_MAX_CONNECTIONS`](crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS).
     pub max_connections: usize,
     /// Per-request timeout.
@@ -172,7 +173,9 @@ pub(super) struct LifecycleEvent {
 }
 
 impl LifecycleSender {
-    /// Allocate two slots per configured peer, shared by pending admission and teardown.
+    /// Allocate two slots for each of `peers`, the header-sync peers the node
+    /// can admit at once: one for a session's pending admission and one
+    /// reserved for its teardown.
     pub(super) fn channel(peers: usize) -> (Self, mpsc::Receiver<LifecycleEvent>) {
         let (sender, receiver) = mpsc::channel(peers.max(1).saturating_mul(2));
         (
@@ -182,6 +185,12 @@ impl LifecycleSender {
             },
             receiver,
         )
+    }
+
+    /// The most events the queue holds at once.
+    #[cfg(test)]
+    pub(super) fn capacity(&self) -> usize {
+        self.sender.max_capacity()
     }
 
     /// Reserve cleanup before queueing a connection; duplicate/stale teardown is harmless.

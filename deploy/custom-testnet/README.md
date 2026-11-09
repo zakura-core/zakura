@@ -61,6 +61,12 @@ public validators must remain online. Checksum-verify the download before
 installing it as the initial seed. Subsequent resets reuse the refreshed local
 archive as their catch-up base.
 
+A refresh needs a trusted status URL that is still reporting the public Testnet,
+since that is what the refreshed archive is checked against. Set `refresh_seed`
+to `false` when no such reference is available: the reset then forks from the
+pinned archive seed at its recorded tip, which is all an isolated activation run
+needs. The reset fails rather than accepting a reference for another network.
+
 `install.py` installs the controller, preparation, validator, and reset service
 units, Caddy configuration, and operator command. It requires the existing
 binary, mounted storage, and a verified archive; it does not provision resources

@@ -8,7 +8,10 @@ use std::{collections::VecDeque, time::Duration};
 
 use zakura_chain::block;
 use zakura_header_chain::HeaderWorkAuthority;
-use zakura_rt::{collections::HashMap, time::Instant};
+use zakura_rt::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 pub(super) use super::StorageCall;
 pub use super::StorageCallKind;
@@ -71,6 +74,10 @@ pub(super) struct ReactorState {
     /// ends the earliest holds.
     pub(super) departed_strikes: HashMap<ZakuraPeerId, (u32, Instant)>,
     pub(super) request_deadlines: HashMap<ZakuraPeerId, Instant>,
+    /// Peers whose armed request deadline a carried replacement budget
+    /// shortened. A timeout under one costs only an ordinary timeout's strike.
+    /// See [`PeerSchedule::replaced_request_budget`].
+    pub(super) carried_request_deadlines: HashSet<ZakuraPeerId>,
     /// Sessions whose subscription this node closed, with the deadline for
     /// its terminal outcome. See [`super::HeaderSyncReactor::close_subscription`].
     pub(super) close_deadlines: HashMap<ZakuraPeerId, (u64, Instant)>,
@@ -113,6 +120,7 @@ impl ReactorState {
             cooldowns_installed: 0,
             departed_strikes: HashMap::new(),
             request_deadlines: HashMap::new(),
+            carried_request_deadlines: HashSet::new(),
             close_deadlines: HashMap::new(),
             pending_closes: HashMap::new(),
             pruned_peers: HashMap::new(),
@@ -558,24 +566,31 @@ impl ReactorState {
             .is_some_and(|stalled_at| committed.is_none_or(|committed| committed <= stalled_at))
     }
 
-    /// Arm `peer`'s request deadline `timeout` after `now`.
+    /// Arm `peer`'s request deadline `timeout` after `now`, as a full timeout.
     pub(super) fn arm_request_deadline(
         &mut self,
         peer: ZakuraPeerId,
         now: Instant,
         timeout: Duration,
     ) {
+        self.forget_carried_request_deadline(&peer);
         self.request_deadlines.insert(peer, now + timeout);
     }
 
-    /// Arm the deadline of `peer`'s new ordinary request, `timeout` after
-    /// `now`, capped by and using up any
-    /// [`PeerSchedule::replaced_request_budget`].
+    /// Forget that `peer`'s request deadline is a carried budget's.
     ///
-    /// A repair request arms a full timeout and leaves the budget for the
-    /// next ordinary request. A repair timeout also excludes its supplier for
-    /// the repair episode, a larger penalty than the strike the budget is for.
-    pub(super) fn arm_ordinary_request_deadline(
+    /// The set is almost always empty, and each staged page re-arms a
+    /// deadline, so the common path checks only its length.
+    fn forget_carried_request_deadline(&mut self, peer: &ZakuraPeerId) {
+        if !self.carried_request_deadlines.is_empty() {
+            self.carried_request_deadlines.remove(peer);
+        }
+    }
+
+    /// Arm the deadline of the request just started for `peer`, ordinary or
+    /// VCT repair, `timeout` after `now`, capped by and using up any
+    /// [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn arm_started_request_deadline(
         &mut self,
         peer: ZakuraPeerId,
         now: Instant,
@@ -584,13 +599,22 @@ impl ReactorState {
         let carried = self
             .peers
             .get_mut(&peer)
-            .and_then(|schedule| schedule.replaced_request_budget.take());
-        let timeout = carried.map_or(timeout, |carried| carried.min(timeout));
-        self.arm_request_deadline(peer, now, timeout);
+            .and_then(|schedule| schedule.replaced_request_budget.take())
+            .filter(|carried| *carried < timeout);
+        self.arm_request_deadline(peer.clone(), now, carried.unwrap_or(timeout));
+        if carried.is_some() {
+            self.carried_request_deadlines.insert(peer);
+        }
+    }
+
+    /// Whether `peer`'s armed request deadline is a carried replacement
+    /// budget's. See [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn request_deadline_is_carried(&self, peer: &ZakuraPeerId) -> bool {
+        self.carried_request_deadlines.contains(peer)
     }
 
     /// Carry `budget`, the time left on the unanswered request that admitting
-    /// `peer`'s new session retired, to that session's first ordinary request.
+    /// `peer`'s new session retired, to that session's first request.
     pub(super) fn carry_replaced_request_budget(&mut self, peer: &ZakuraPeerId, budget: Duration) {
         if let Some(schedule) = self.peers.get_mut(peer) {
             schedule.replaced_request_budget = Some(
@@ -602,6 +626,7 @@ impl ReactorState {
     }
 
     pub(super) fn clear_request_deadline(&mut self, peer: &ZakuraPeerId) {
+        self.forget_carried_request_deadline(peer);
         self.request_deadlines.remove(peer);
     }
 
@@ -660,6 +685,9 @@ impl ReactorState {
     /// supplier answered charges nothing. A `TargetNotSelected` answer waits for a status
     /// other than the one the request was built from. A local failure backs the repair off
     /// until [`VCT_REPAIR_RETRY_INTERVAL`] after `now`. A stale episode schedules nothing.
+    /// A timeout under a carried replacement budget rotates the supplier and
+    /// requeues the repair without excluding it. See
+    /// [`PeerSchedule::replaced_request_budget`].
     pub(super) fn schedule_repair_retry(
         &mut self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -680,6 +708,7 @@ impl ReactorState {
                         _ => task.retry(source).is_ok(),
                     },
                     VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
+                    VctRepairRetryAttribution::CarriedTimeout => task.requeue(source).is_ok(),
                     VctRepairRetryAttribution::Stale => false,
                     VctRepairRetryAttribution::Local => task
                         .defer_local_retry_until(now + VCT_REPAIR_RETRY_INTERVAL)
@@ -920,20 +949,38 @@ pub(super) struct PeerSchedule {
     /// since it last supplied usable work. See [`ReactorState::departed_strikes`].
     pub(super) unproductive_requests: u32,
     /// The time that was left on the unanswered request a session
-    /// replacement retired, until the next ordinary request start consumes it.
+    /// replacement retired, until the next request start consumes it.
     ///
-    /// Without it, a peer could replace its session just before each timeout
-    /// and never be charged. The next ordinary request's timeout is capped by
-    /// this budget, counted from when the request is sent, so the node's own delay
-    /// before sending isn't charged to the peer. A peer that answers within the
-    /// budget re-arms a full timeout and pays nothing. A further replacement
-    /// before any request keeps the budget.
+    /// The rule: a session replacement never gives a peer more unanswered
+    /// time, or a smaller penalty, than staying on one session would. Without
+    /// the budget, a peer could replace its session just before each timeout
+    /// and never be charged.
+    ///
+    /// So the next request started for the peer, ordinary or VCT repair, has
+    /// its timeout capped by this budget, counted from when the request is
+    /// sent, so the node's own delay before sending isn't charged to the peer.
+    /// A peer that answers within the budget re-arms a full timeout and pays
+    /// nothing. A further replacement before any request keeps the smaller
+    /// budget.
+    ///
+    /// A request that times out under the budget costs one strike, like an
+    /// ordinary timeout. A repair also requeues, without the episode exclusion
+    /// a full repair timeout adds, so the budget never costs more than the
+    /// strike a timeout on one session would. A sole repair supplier that
+    /// replaces just before each timeout therefore takes a strike each cycle
+    /// and reaches the strike limit.
     ///
     /// A replacement with very little time left can draw one strike before the
     /// new request even reaches the peer. That's accepted: the peer had already
     /// sat on the request for most of a timeout, a strike is one of the limit's
     /// three by default, and its next usable answer clears it. A grace period
     /// would need its own state so further replacements couldn't renew it.
+    ///
+    /// A first request that the peer ends with a terminal outcome, such as
+    /// `TargetNotRetained`, uses the budget up without a strike. That's out of
+    /// scope: on one session a peer can already hold a request for most of a
+    /// timeout and then decline it for free, so a replacement buys nothing
+    /// more.
     pub(super) replaced_request_budget: Option<Duration>,
 }
 
@@ -1538,6 +1585,8 @@ impl VctRepairStall {
 pub(super) enum VctRepairRetryAttribution {
     Supplier,
     ExcludedInput,
+    /// The supplier's request timed out under a carried replacement budget.
+    CarriedTimeout,
     Stale,
     Local,
 }
@@ -1552,13 +1601,17 @@ pub(super) struct VctRepairRetry {
 impl VctRepairRetryAttribution {
     /// Whether the failure charges the supplier and rotates it in the supplier order.
     pub(super) fn charges_supplier(self) -> bool {
-        matches!(self, Self::Supplier | Self::ExcludedInput)
+        matches!(
+            self,
+            Self::Supplier | Self::ExcludedInput | Self::CarriedTimeout
+        )
     }
 
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Supplier => "supplier_retry",
             Self::ExcludedInput => "excluded_input",
+            Self::CarriedTimeout => "carried_timeout",
             Self::Stale => "stale_episode",
             Self::Local => "local_backoff",
         }
@@ -1566,7 +1619,9 @@ impl VctRepairRetryAttribution {
 
     pub(super) fn stall_outcome(self) -> VctRepairStallOutcome {
         match self {
-            Self::Supplier | Self::ExcludedInput => VctRepairStallOutcome::SupplierFailure,
+            Self::Supplier | Self::ExcludedInput | Self::CarriedTimeout => {
+                VctRepairStallOutcome::SupplierFailure
+            }
             Self::Stale | Self::Local => VctRepairStallOutcome::LocalFailure,
         }
     }
@@ -1592,6 +1647,16 @@ impl VctRepairRetry {
             source,
             terminal,
             attribution: VctRepairRetryAttribution::Local,
+        }
+    }
+
+    /// A repair request timed out under a carried replacement budget. See
+    /// [`PeerSchedule::replaced_request_budget`].
+    pub(super) fn carried_timeout(source: zakura_header_chain::SourceId) -> Self {
+        Self {
+            source,
+            terminal: HeaderRequestTerminal::TimedOut,
+            attribution: VctRepairRetryAttribution::CarriedTimeout,
         }
     }
 

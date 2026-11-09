@@ -2438,7 +2438,7 @@ impl HeaderSyncReactor {
                                 .expect("the request was just started")
                         )
                     );
-                    self.state.arm_ordinary_request_deadline(
+                    self.state.arm_started_request_deadline(
                         peer.clone(),
                         Instant::now(),
                         self.startup.request_timeout,
@@ -2760,10 +2760,12 @@ impl HeaderSyncReactor {
                             .peer_work_queue
                             .active(&peer)
                             .map(|active| active.owner.session_id());
-                        self.retry_vct_repair(
-                            owner,
-                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut),
-                        );
+                        let retry = if self.state.request_deadline_is_carried(&peer) {
+                            VctRepairRetry::carried_timeout(source)
+                        } else {
+                            VctRepairRetry::supplier(source, HeaderRequestTerminal::TimedOut)
+                        };
+                        self.retry_vct_repair(owner, retry);
                         // A repair reserves aggregate header budget that ordinary staging cannot
                         // use, so a supplier that withholds its response until the deadline must
                         // be charged like any other unresponsive peer.

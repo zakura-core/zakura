@@ -454,17 +454,12 @@ impl Judge {
     /// Why the rule can't judge everything it read yet, if it can't: a
     /// penalty whose call's handling hasn't ended, or a failure whose reply
     /// reached the reactor, which hasn't taken it. The first of
-    /// [`Judge::open_at_end`]'s findings, in the check's words.
+    /// [`Judge::open_at_end`]'s findings.
     fn open(&self) -> Option<String> {
-        if let Some(index) = self.pending.first() {
-            let penalty = &self.owed[*index];
-            return Some(format!(
-                "{} operation {} failed with a header-peer fault of {} in session {}, and the \
-                 reactor hasn't finished handling call {:?}",
-                penalty.stage, penalty.op, penalty.source, penalty.session_id, penalty.call
-            ));
+        match self.pending.first() {
+            Some(&index) => Some(unhandled(&self.owed[index])),
+            None => self.untaken_findings().into_iter().next(),
         }
-        self.untaken_findings().into_iter().next()
     }
 
     /// Every finding still open when the run ends, each once: each penalty
@@ -475,20 +470,7 @@ impl Judge {
         let mut findings: Vec<String> = self
             .pending
             .iter()
-            .map(|&index| {
-                let penalty = &self.owed[index];
-                format!(
-                    "UnpenalizedFault: {} operation {} failed with a header-peer fault of {} in \
-                     session {}, and the reactor reported no {} Misbehavior from that session \
-                     while it handled call {:?}",
-                    penalty.stage,
-                    penalty.op,
-                    penalty.source,
-                    penalty.session_id,
-                    penalty.reason,
-                    penalty.call
-                )
-            })
+            .map(|&index| unhandled(&self.owed[index]))
             .collect();
         findings.extend(self.untaken_findings());
         findings
@@ -506,6 +488,18 @@ impl Judge {
             })
             .collect()
     }
+}
+
+/// The finding for `penalty`, whose call took its failed reply and hasn't
+/// finished handling it, so whether it penalized the fault can't be judged
+/// yet. The call may already have reported the `Misbehavior`, which counts
+/// only once its handling ends.
+fn unhandled(penalty: &OwedPenalty) -> String {
+    format!(
+        "UnhandledFault: {} operation {} failed with a header-peer fault of {} in session {}, \
+         and the reactor never finished handling call {:?}, which took its reply",
+        penalty.stage, penalty.op, penalty.source, penalty.session_id, penalty.call
+    )
 }
 
 /// Checks that `window`, the handling of `penalty`'s call, reported a
@@ -1183,26 +1177,33 @@ mod tests {
         mixed.extend(third);
         let end = attributed.penalized(&mixed);
         assert!(end.inconclusive.is_empty(), "{end:?}");
-        let ops: Vec<(&str, &str)> = end
-            .violated
-            .iter()
-            .map(|why| {
-                let kind = why.split(':').next().unwrap_or_default();
-                let op = why
-                    .split("operation ")
-                    .nth(1)
-                    .and_then(|rest| rest.split(' ').next())
-                    .unwrap_or_default();
-                (kind, op)
-            })
-            .collect();
         assert_eq!(
-            ops,
+            end.violated,
             [
-                ("UnpenalizedFault", "1"),
-                ("UnpenalizedFault", "2"),
-                ("UntakenFault", "3")
+                "UnhandledFault: prepare operation 1 failed with a header-peer fault of aa in \
+                 session 3, and the reactor never finished handling call Some(1), which took \
+                 its reply",
+                "UnhandledFault: prepare operation 2 failed with a header-peer fault of aa in \
+                 session 4, and the reactor never finished handling call Some(2), which took \
+                 its reply",
+                "UntakenFault: operation 3 failed with a header-peer fault whose reply reached \
+                 the reactor, which never took it",
             ]
+        );
+        // Call 2 already reported its matching penalty, but its handling
+        // never ended, so the finding stays unhandled, not unpenalized.
+        let mut partial = mixed.clone();
+        partial.push(reactor(ReactorFact::CallEnded {
+            call: 2,
+            end: "replied".to_owned(),
+            op: Some(2),
+        }));
+        partial.push(misbehavior("aa", 4));
+        let end = attributed.penalized(&partial);
+        assert_eq!(end.violated.len(), 3, "{end:?}");
+        assert!(
+            end.violated[1].starts_with("UnhandledFault: prepare operation 2 "),
+            "{end:?}"
         );
         for settled in [Some(false), None] {
             attributed.settled.set(settled);

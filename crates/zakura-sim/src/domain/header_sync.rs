@@ -13,15 +13,17 @@ use crate::{
         capacity::{BoundaryRead, CapacityEvidence},
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
+        ends::{EndEvidence, EndFact, EnvironmentAction},
+        hold_wake::{HoldWakeEvidence, HoldWakeFact},
         outstanding::OutstandingEvidence,
         round_life::RoundLifeEvidence,
         stale::StaleEvidence,
         wake::{WakeEvidence, WakeFact},
     },
     property::{
-        CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind, LivenessBound,
-        ObligationKey, Property, PropertyId, Source, Status, Subject, TriggerHistory, Unit,
-        Verdict,
+        Cardinality, CheckCtx, EndViolation, FactAnswer, HasView, Inconclusive, Kind,
+        LivenessBound, ObligationKey, Property, PropertyId, Source, Status, Subject,
+        TriggerHistory, Unit, Verdict,
     },
     ObservationLog,
 };
@@ -766,6 +768,135 @@ fn opened_at(wake: &WakeEvidence, subject: &str, stamp: u64) -> Option<SimInstan
 /// [`CAPACITY_RELEASE_WAKES`]'s trigger history: a release opened a wake.
 fn wake_opened<V: WakeView>(view: &V, _: &ObservationLog) -> bool {
     view.wake().any_opened()
+}
+
+/// A held storage operation whose reply reached the reactor's waiting call
+/// is handled before the reactor goes quiet.
+pub const HOLD_RELEASE_WAKES: &str = "header-sync/hold-release-wakes";
+
+/// What the hold-release check reads: one node's hold-wake facts and its
+/// end facts.
+pub trait HoldWakeView {
+    /// The node's hold-wake facts.
+    fn hold_wake(&self) -> &HoldWakeEvidence;
+
+    /// The harness's environment actions and the reactor's own exit.
+    fn ends(&self) -> &EndEvidence;
+}
+
+/// [`HOLD_RELEASE_WAKES`], as a harness whose view is a [`HoldWakeView`]
+/// registers it. It applies only where a hold picked a reactor call's
+/// operation and its reply was delivered
+/// ([`crate::harness::header_node::hold_wake`]).
+pub fn hold_release_wakes<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: HoldWakeView,
+{
+    Property {
+        id: PropertyId::new(HOLD_RELEASE_WAKES),
+        claim: "once a held storage operation's reply reaches the reactor's waiting call, \
+                whatever its result, the reactor handles that call before quiescence, unless \
+                the harness began stopping the node",
+        kind: Kind::Liveness {
+            bound: LivenessBound::BeforeQuiescence,
+        },
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_hold_release_wake::<S>,
+        witness: Some(TriggerHistory::View(hold_wake_opened::<S::View>)),
+    }
+}
+
+/// Checks [`HOLD_RELEASE_WAKES`] at the boundary after a step.
+///
+/// Each held reply the step delivered ([`HoldWakeFact::Opened`]) obliges
+/// the reactor to handle its call before quiescence. The call's handling
+/// answers it ([`HoldWakeFact::Handled`]), and so does the harness's
+/// `Shutdown` step, the only environment action that stops the reactor
+/// ([`EnvironmentAction::Shutdown`]). A reply delivered once the shutdown
+/// had begun opens nothing. A reactor that exits by itself answers nothing,
+/// so the obligation expires at the next quiescence. It applies once a held
+/// reply was delivered before any shutdown began.
+fn check_hold_release_wake<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: HoldWakeView,
+{
+    let view = cx.view();
+    let shutdown = shutdown_stamp(view.ends());
+    for stamp in cx.new_stamps().to_vec() {
+        if let Some(HoldWakeFact::Opened { op, .. }) = view.hold_wake().fact(stamp) {
+            if shutdown.is_some_and(|shutdown| shutdown < stamp) {
+                continue;
+            }
+            let mut obligation = cx.fact_obligation(
+                Some(stamp),
+                Subject::Operation(op),
+                hold_wake_answer::<S::View>,
+            );
+            // One shutdown ends every reply still waiting. A `Handled` names
+            // one operation, so it still answers only its own.
+            obligation.cardinality = Cardinality::Every;
+            cx.oblige(obligation);
+        }
+    }
+    if hold_wake_obliged(&view) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// The stamp of the harness's `Shutdown` step, if it began stopping the
+/// node.
+fn shutdown_stamp(ends: &EndEvidence) -> Option<u64> {
+    ends.facts().into_iter().find_map(|(at, fact)| {
+        matches!(
+            fact,
+            EndFact::Environment {
+                action: EnvironmentAction::Shutdown,
+                ..
+            }
+        )
+        .then_some(at)
+    })
+}
+
+/// Whether a held reply reached the reactor before any shutdown began, so
+/// [`check_hold_release_wake`] obliged its handling.
+fn hold_wake_obliged<V: HoldWakeView>(view: &V) -> bool {
+    let shutdown = shutdown_stamp(view.ends());
+    view.hold_wake().facts().into_iter().any(|(at, fact)| {
+        matches!(fact, HoldWakeFact::Opened { .. }) && shutdown.is_none_or(|shutdown| at < shutdown)
+    })
+}
+
+/// What the fact with `stamp` means for the held reply `key` names, as
+/// [`check_hold_release_wake`] describes.
+fn hold_wake_answer<V: HoldWakeView>(key: &ObligationKey, view: &V, stamp: u64) -> FactAnswer {
+    let Subject::Operation(held) = key.subject else {
+        return FactAnswer::Unrelated;
+    };
+    match view.hold_wake().fact(stamp) {
+        Some(HoldWakeFact::Handled { op, .. }) if op == held => return FactAnswer::Discharges,
+        Some(_) => return FactAnswer::Unrelated,
+        None => {}
+    }
+    match view.ends().fact(stamp) {
+        Some(EndFact::Environment {
+            action: EnvironmentAction::Shutdown,
+            ..
+        }) => FactAnswer::Discharges,
+        _ => FactAnswer::Unrelated,
+    }
+}
+
+/// [`HOLD_RELEASE_WAKES`]'s trigger history: a held reply reached the
+/// reactor before any shutdown began.
+fn hold_wake_opened<V: HoldWakeView>(view: &V, _: &ObservationLog) -> bool {
+    hold_wake_obliged(view)
 }
 
 /// Under a wire flood, the run loop reads each externally published

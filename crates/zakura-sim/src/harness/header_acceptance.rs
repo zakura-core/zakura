@@ -964,7 +964,9 @@ pub fn needs() -> Vec<(String, String)> {
 /// needs of, so a header harness added to the list without its registry
 /// here fails instead of owing no missing-source key.
 pub fn needs_of(harnesses: &[&str]) -> Result<Vec<(String, String)>, String> {
-    use super::header_sync::{Flood, HeaderWire, ReleaseWake, RepairHarness, Smoke, Storage};
+    use super::header_sync::{
+        Flood, HeaderWire, Liveness, ReleaseWake, RepairHarness, Smoke, Storage,
+    };
     use super::Subsystem;
     /// `S`'s needed sources, under its name.
     fn of<S: Subsystem>() -> Vec<(String, String)> {
@@ -990,6 +992,7 @@ pub fn needs_of(harnesses: &[&str]) -> Result<Vec<(String, String)>, String> {
             _ if harness == HeaderWire::NAME => of::<HeaderWire>(),
             _ if harness == Flood::NAME => of::<Flood>(),
             _ if harness == RepairHarness::NAME => of::<RepairHarness>(),
+            _ if harness == Liveness::NAME => of::<Liveness>(),
             _ => match machine {
                 Some(machine) => super::machine::needs(&machine)
                     .into_iter()

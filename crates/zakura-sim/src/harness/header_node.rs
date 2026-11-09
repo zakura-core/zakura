@@ -24,6 +24,7 @@ pub mod chain_effect;
 pub mod claim;
 pub mod ends;
 pub mod fault;
+pub mod hold_wake;
 pub mod outstanding;
 mod pair;
 pub mod policy;
@@ -75,6 +76,7 @@ use zakura_storage::header::{
 use self::{
     adoption::{AdoptionEvidence, SessionLife},
     ends::EnvironmentAction,
+    hold_wake::{HoldWakeCheck, HoldWakeEvidence},
     policy::{Hold, LinkEffect, Predicates, ReplyHold, Trigger},
     recovery::{Driver, RecoveryEvidence, RecoveryInputs, RECOVERED, RELINK, UNREACHED},
     session::SessionEvidence,
@@ -300,6 +302,9 @@ pub struct Effects {
 pub struct PolicySource {
     storage: HeaderStorage,
     tap: Option<ReactorTap>,
+    /// Finds which held operations' replies reached the reactor, once
+    /// [`PolicySource::with_hold_wakes`] turns it on.
+    hold_wake: Option<HoldWakeCheck>,
     port: Arc<ControlledPort>,
     base: Base,
     bound: Option<Duration>,
@@ -326,6 +331,7 @@ impl PolicySource {
         PolicySource {
             storage: HeaderStorage::new(sim, port.clone()),
             tap: None,
+            hold_wake: None,
             port,
             base: policy.base,
             bound: policy.bound_ms.map(Duration::from_millis),
@@ -357,6 +363,26 @@ impl PolicySource {
     pub fn with_tap(self, tap: ReactorTap) -> Self {
         PolicySource {
             tap: Some(tap),
+            ..self
+        }
+    }
+
+    /// This source, keeping `header-sync/hold-release-wakes`'s facts in
+    /// `evidence` ([`hold_wake`]), stamped with its tap's stamps. Call it
+    /// after [`PolicySource::with_tap`].
+    ///
+    /// # Panics
+    ///
+    /// If the source has no tap, which logs the reactor facts the check
+    /// reads.
+    pub fn with_hold_wakes(self, evidence: HoldWakeEvidence) -> Self {
+        let tap = self
+            .tap
+            .as_ref()
+            .expect("the hold-wake check reads the reactor facts the tap logs");
+        evidence.stamp_with(tap.stamps());
+        PolicySource {
+            hold_wake: Some(HoldWakeCheck::new(evidence)),
             ..self
         }
     }
@@ -482,8 +508,16 @@ impl ActionSource for PolicySource {
                     if let (StorageFact::ShutDown { .. }, Some(node)) = (fact, &node) {
                         predicates.record_link(LinkEffect::StorageStopped, node);
                     }
+                    if let Some(check) = &mut self.hold_wake {
+                        check.storage(fact, &predicates);
+                    }
                 }
-                Observation::Reactor { event, .. } => predicates.record_reactor(event),
+                Observation::Reactor { event, .. } => {
+                    predicates.record_reactor(event);
+                    if let Some(check) = &mut self.hold_wake {
+                        check.reactor(event);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1094,6 +1128,27 @@ impl Topology {
     /// was picked, or its reactor is cancelled.
     fn stopping(&self) -> bool {
         self.stopping.get() || self.nodes[0].shutdown.is_cancelled()
+    }
+
+    /// Begins the run's end, as the step loop picks it: the node under
+    /// test's stop, recorded as a `Shutdown` step's pick records it, unless
+    /// a `Shutdown` step already began it. [`Topology::finish`] carries it
+    /// out.
+    pub(crate) fn begin_finish(&self) {
+        if !self.shutdown_picked() {
+            self.expect_shutdown();
+        }
+    }
+
+    /// Ends every node's work, so a run can end idle: closes every link and
+    /// cancels the node under test's reactor, as a `Shutdown` step does,
+    /// then each mirror's. Run it from a harness task, after
+    /// [`Topology::begin_finish`].
+    pub(crate) fn finish(&self) {
+        self.shutdown();
+        for node in &self.nodes[1..] {
+            node.shutdown.cancel();
+        }
     }
 
     /// Whether the harness picked a `Shutdown` step, which begins the node

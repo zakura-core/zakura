@@ -1,0 +1,17 @@
+# The completion arm's guard reads a cached "nothing pending" flag that
+# only a handled completion refreshes, so a dispatch leaves it stale. The
+# input's first locator read is the reactor's first call, so the flag still
+# says nothing is pending when the read is held: the arm waits on a future
+# that never resolves, and the read's reply wakes a future nobody polls.
+# With one mirror ahead of the node, nothing else wakes the reactor, and the
+# obligation expires at the next quiescence.
+# Besides reactor.rs, which the patch changes, the queue and the offer
+# policy decide when the locator read is dispatched, and the session
+# readers decide which events wake the reactor. A change there can move the
+# input off its quiet release.
+checks = ["crates/zakura-network/src/zakura/header_sync"]
+
+[typed]
+harness = "header-sync/liveness"
+scenario = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.json"
+plan = "crates/zakura-sim/tests/fixtures/header-hold-held-locator.plan"

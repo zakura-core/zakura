@@ -506,6 +506,8 @@ pub fn gate_rule(property: &str) -> Option<Vec<Gate>> {
         | "header-sync/stale-completion-inert"
         | "header-sync/capacity-release-wakes"
         | "header-sync/outstanding-work-bounded"
+        // A held reply's wake, like a capacity release's.
+        | "header-sync/hold-release-wakes"
         | "header/reactor-policy"
         | "header/publisher-policy" => vec![G5],
         // Liveness and the step loop's own claims serve no single gate. The

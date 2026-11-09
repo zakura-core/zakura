@@ -6,15 +6,18 @@
 //! adversaries (M5-E1), checked by header sync's generated table properties
 //! and `session/honest-never-punished` (P3d). `header-sync/release-wake`
 //! runs `header-sync/storage` on the wake fixtures alone,
-//! `header-sync/flood` on the flood fixtures, and `header-sync/repair` on
-//! the VCT repair fixtures.
+//! `header-sync/flood` on the flood fixtures, `header-sync/repair` on the
+//! VCT repair fixtures, and `header-sync/liveness` on hdr-10's liveness
+//! fixtures.
 
 mod flood;
 pub mod grammar;
+pub mod liveness;
 mod release_wake;
 mod repair;
 
 pub use flood::{Flood, FloodScenario, FLOODERS};
+pub use liveness::Liveness;
 pub use release_wake::{ReleaseWake, WakeScenario};
 pub use repair::{RepairHarness, RepairScenario, REPAIR_HEIGHT, STALE_PEER, SUPPLIER, TIP};
 
@@ -44,6 +47,7 @@ use super::{
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
+        hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
         preload,
@@ -69,8 +73,8 @@ use crate::{
             chunk_budget_bound, commit_only_authorized, outstanding_end_violations,
             outstanding_work_bounded, reset_invalidates_work, stale_chain_effect_inert,
             stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
-            AdoptionView, AuthorityView, BudgetView, ChainView, OutstandingView, ResetView,
-            StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
+            AdoptionView, AuthorityView, BudgetView, ChainView, HoldWakeView, OutstandingView,
+            ResetView, StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -573,6 +577,10 @@ pub struct Ports {
     /// unless whoever prepared the ports declared a wake fixture
     /// ([`WakeEvidence::new`]).
     pub wake: WakeEvidence,
+    /// The node's held replies and their handling, which its storage source
+    /// finds during the run. Inert unless whoever prepared the ports armed it
+    /// ([`HoldWakeEvidence::armed`]).
+    pub hold_wake: HoldWakeEvidence,
     /// The harness's environment actions and the reactor's own exit, which
     /// the harness and the node's tap record during the run. It holds the
     /// node's stamps.
@@ -610,6 +618,8 @@ pub struct Storage {
     stale_calls: StaleEvidence,
     /// The node's wake facts, from its tap.
     wake: WakeEvidence,
+    /// The node's held replies and their handling, from its storage source.
+    hold_wake: HoldWakeEvidence,
     /// The harness's environment actions and the reactor's own exit, from
     /// its tap.
     ends: EndEvidence,
@@ -668,6 +678,9 @@ pub struct StorageView {
     /// The run's recovery: its source, where it is, and once the conditions
     /// held, their record. Only `header-sync/storage` recovers.
     pub recovery: RecoveryEvidence,
+    /// The node's held replies and their handling, which its storage source
+    /// finds during the run.
+    pub hold_wake: HoldWakeEvidence,
     /// The harness's environment actions and the reactor's own exit.
     pub ends: EndEvidence,
     /// The node's stamps, which every view-side fact above takes.
@@ -781,6 +794,18 @@ impl WakeView for StorageView {
     }
 }
 
+impl HoldWakeView for StorageView {
+    /// [`StorageView::hold_wake`].
+    fn hold_wake(&self) -> &HoldWakeEvidence {
+        &self.hold_wake
+    }
+
+    /// [`StorageView::ends`].
+    fn ends(&self) -> &EndEvidence {
+        &self.ends
+    }
+}
+
 impl HonestPeers for StorageView {
     /// True if `index` is in [`StorageView::honest_peers`].
     fn is_honest(&self, index: usize) -> bool {
@@ -806,6 +831,7 @@ impl HasView for Storage {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            hold_wake: self.hold_wake.clone(),
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
@@ -948,6 +974,7 @@ impl Subsystem for Storage {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            hold_wake: HoldWakeEvidence::default(),
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
@@ -1002,7 +1029,10 @@ impl Subsystem for Storage {
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
-        let storage = storage.with_tap(tap);
+        let mut storage = storage.with_tap(tap);
+        if ports.hold_wake.is_armed() {
+            storage = storage.with_hold_wakes(ports.hold_wake.clone());
+        }
         let predicates = storage.predicates();
         sim.add_source(Box::new(storage));
         let mut nodes = vec![HeaderNode::spawn(
@@ -1083,6 +1113,7 @@ impl Subsystem for Storage {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            hold_wake: ports.hold_wake,
             round_life: ports.round_life,
             chain_effect: ports.chain_effect,
             authority: ports.authority,
@@ -1260,6 +1291,9 @@ pub struct WirePorts {
     pub stale_calls: StaleEvidence,
     /// The node's wake facts, which its tap finds during the run.
     pub wake: WakeEvidence,
+    /// The node's held replies and their handling. Inert here, since this
+    /// harness's storage source keeps no hold-wake check.
+    pub hold_wake: HoldWakeEvidence,
     /// The node's end facts, which its tap records during the run. It holds
     /// the node's stamps.
     pub ends: EndEvidence,
@@ -1310,6 +1344,8 @@ pub struct HeaderWire {
     stale_calls: StaleEvidence,
     /// The node's wake facts, from its tap.
     wake: WakeEvidence,
+    /// The node's held replies and their handling, from its storage source.
+    hold_wake: HoldWakeEvidence,
     /// The harness's environment actions and the reactor's own exit, from
     /// its tap.
     ends: EndEvidence,
@@ -1352,6 +1388,7 @@ impl HasView for HeaderWire {
             rounds: self.rounds.clone(),
             stale_calls: self.stale_calls.clone(),
             wake: self.wake.clone(),
+            hold_wake: self.hold_wake.clone(),
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
@@ -1466,6 +1503,7 @@ impl Subsystem for HeaderWire {
             rounds: SettlementEvidence::default(),
             stale_calls: StaleEvidence::default(),
             wake: WakeEvidence::default(),
+            hold_wake: HoldWakeEvidence::default(),
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
@@ -1608,6 +1646,7 @@ impl Subsystem for HeaderWire {
             rounds: ports.rounds,
             stale_calls: ports.stale_calls,
             wake: ports.wake,
+            hold_wake: ports.hold_wake,
             round_life: ports.round_life,
             chain_effect: ports.chain_effect,
             authority: ports.authority,
@@ -2275,6 +2314,7 @@ mod tests {
                 rounds: SettlementEvidence::default(),
                 stale_calls: StaleEvidence::default(),
                 wake: WakeEvidence::default(),
+                hold_wake: HoldWakeEvidence::default(),
                 ends: EndEvidence::default(),
                 stamps: Stamps::default(),
                 round_life: RoundLifeEvidence::default(),

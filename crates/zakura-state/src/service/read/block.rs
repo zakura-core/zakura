@@ -20,7 +20,8 @@ use std::{
     },
 };
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, ReadMemoryExhausted, TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, OwnedRawTransaction,
+    ReadMemoryExhausted, TransactionHandle,
 };
 
 use chrono::{DateTime, Utc};
@@ -100,6 +101,39 @@ where
         return Ok(Some((contextual.block.clone(), size)));
     }
     db.block_and_size(hash_or_height)
+}
+
+/// Returns the Zcash consensus serialization of the [`Block`] with
+/// [`block::Hash`] or [`Height`], if it exists in the non-finalized `chain`
+/// or finalized `db`.
+///
+/// Finalized blocks are assembled from their stored bytes without decoding them,
+/// and non-finalized blocks are serialized from memory. Either result keeps its
+/// read-memory charge through its final clone. Missing or pruned bodies return
+/// `Ok(None)`, like [`block`].
+pub fn raw_block<C>(
+    chain: Option<C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Result<Option<OwnedRawBlock>, ReadMemoryExhausted>
+where
+    C: AsRef<Chain>,
+{
+    // # Correctness
+    //
+    // Since blocks are the same in the finalized and non-finalized state, we
+    // check the in-memory chain first, like [`block`].
+    if let Some(contextual) = chain
+        .as_ref()
+        .and_then(|chain| chain.as_ref().block(hash_or_height))
+    {
+        let bytes = contextual
+            .block
+            .zcash_serialize_to_vec()
+            .expect("serializing a block to a vec cannot fail");
+        return db.retain_serialized_bytes(bytes).map(Some);
+    }
+    db.raw_block_result(hash_or_height)
 }
 
 /// Returns the [`block::Header`] with [`block::Hash`] or
@@ -240,6 +274,30 @@ pub fn any_transaction<'a>(
             .and_then(|chain| chain.block(height.into()))
             .map(|block| AnyTx::Side((tx, block.hash))))
     }
+}
+
+/// Returns the Zcash consensus serialization of the [`Transaction`] with
+/// [`transaction::Hash`], if it exists in any chain in `chains` or finalized `db`.
+///
+/// Finalized transactions are returned from their stored bytes without decoding
+/// them, and non-finalized transactions are serialized from memory. Either result
+/// keeps its read-memory charge through its final clone.
+pub fn any_raw_transaction<'a>(
+    mut chains: impl Iterator<Item = &'a Arc<Chain>>,
+    db: &ZakuraDb,
+    hash: transaction::Hash,
+) -> Result<Option<OwnedRawTransaction>, ReadMemoryExhausted> {
+    // # Correctness
+    //
+    // It is ok to do this lookup in two different calls. Finalized state updates
+    // can only add overlapping blocks, and hashes are unique.
+    if let Some((tx, _, _)) = chains.find_map(|chain| chain.transaction(hash)) {
+        let bytes = tx
+            .zcash_serialize_to_vec()
+            .expect("serializing a transaction to a vec cannot fail");
+        return db.retain_serialized_bytes(bytes).map(Some);
+    }
+    db.raw_transaction_result(hash)
 }
 
 /// Returns the [`transaction::Hash`]es for the block with `hash_or_height`,

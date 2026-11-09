@@ -1958,6 +1958,18 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BlockAndSize(None)`](ReadResponse::BlockAndSize) otherwise.
     BlockAndSize(HashOrHeight),
 
+    /// Looks up the Zcash consensus serialization of a block by hash or height
+    /// in the current best chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::RawBlock(Some(OwnedRawBlock))`](ReadResponse::RawBlock) if the block is in the best chain;
+    /// * [`ReadResponse::RawBlock(None)`](ReadResponse::RawBlock) otherwise.
+    ///
+    /// Finalized blocks are read from their stored bytes without decoding them.
+    /// Like [`ReadRequest::Block`], a block whose body was pruned is not found.
+    RawBlock(HashOrHeight),
+
     /// Looks up a block header by hash or height in the current best chain.
     ///
     /// Returns
@@ -1985,6 +1997,17 @@ pub enum ReadRequest {
     /// * [`ReadResponse::AnyChainTransaction(None)`](ReadResponse::AnyChainTransaction)
     ///   otherwise.
     AnyChainTransaction(transaction::Hash),
+
+    /// Looks up the Zcash consensus serialization of a transaction by hash in any chain.
+    ///
+    /// Returns
+    ///
+    /// * [`ReadResponse::RawTransaction(Some(OwnedRawTransaction))`](ReadResponse::RawTransaction)
+    ///   if the transaction is in any chain;
+    /// * [`ReadResponse::RawTransaction(None)`](ReadResponse::RawTransaction) otherwise.
+    ///
+    /// Finalized transactions are read from their stored bytes without decoding them.
+    AnyChainRawTransaction(transaction::Hash),
 
     /// Looks up the transaction IDs for a block, using a block hash or height.
     ///
@@ -2441,9 +2464,11 @@ impl ReadRequest {
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
             ReadRequest::BlockAndSize(_) => "block_and_size",
+            ReadRequest::RawBlock(_) => "raw_block",
             ReadRequest::BlockHeader(_) => "block_header",
             ReadRequest::Transaction(_) => "transaction",
             ReadRequest::AnyChainTransaction(_) => "any_chain_transaction",
+            ReadRequest::AnyChainRawTransaction(_) => "any_chain_raw_transaction",
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",

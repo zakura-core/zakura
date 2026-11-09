@@ -3015,7 +3015,7 @@ impl Service<ReadRequest> for ReadStateService {
                 ))
             }
 
-            // Used by the get_block (raw) RPC and the StateService.
+            // Used by the indexer and the StateService.
             ReadRequest::Block(hash_or_height) => Ok(ReadResponse::Block(read::block(
                 state.latest_best_chain(),
                 &state.db,
@@ -3028,10 +3028,17 @@ impl Service<ReadRequest> for ReadStateService {
                 hash_or_height,
             )?)),
 
-            // Used by the get_block (raw) RPC and the StateService.
+            // Used by the get_block (verbose) RPC.
             ReadRequest::BlockAndSize(hash_or_height) => Ok(ReadResponse::BlockAndSize(
                 read::block_and_size(state.latest_best_chain(), &state.db, hash_or_height)?,
             )),
+
+            // Used by the get_block (raw) RPC.
+            ReadRequest::RawBlock(hash_or_height) => Ok(ReadResponse::RawBlock(read::raw_block(
+                state.latest_best_chain(),
+                &state.db,
+                hash_or_height,
+            )?)),
 
             // Used by the get_block (verbose) RPC and the StateService.
             ReadRequest::BlockHeader(hash_or_height) => {
@@ -3071,6 +3078,15 @@ impl Service<ReadRequest> for ReadStateService {
 
             ReadRequest::AnyChainTransaction(hash) => {
                 Ok(ReadResponse::AnyChainTransaction(read::any_transaction(
+                    state.latest_non_finalized_state().chain_iter(),
+                    &state.db,
+                    hash,
+                )?))
+            }
+
+            // Used by the get_raw_transaction (raw) RPC.
+            ReadRequest::AnyChainRawTransaction(hash) => {
+                Ok(ReadResponse::RawTransaction(read::any_raw_transaction(
                     state.latest_non_finalized_state().chain_iter(),
                     &state.db,
                     hash,

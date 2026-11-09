@@ -2415,17 +2415,14 @@ where
                 .map_error(server::error::LegacyCode::InvalidParameter)?;
 
         if verbosity == 0 {
-            let request = zakura_state::ReadRequest::Block(hash_or_height);
+            let request = zakura_state::ReadRequest::RawBlock(hash_or_height);
             let response = call_service(self.read_state.clone(), request).await?;
 
             match response {
-                zakura_state::ReadResponse::Block(Some(block)) => Ok(GetBlockResponse::Raw(
-                    block
-                        .zcash_serialize_to_vec()
-                        .expect("serialization to memory cannot fail")
-                        .into(),
-                )),
-                zakura_state::ReadResponse::Block(None) => {
+                zakura_state::ReadResponse::RawBlock(Some(block)) => {
+                    Ok(GetBlockResponse::Raw(block.to_vec().into()))
+                }
+                zakura_state::ReadResponse::RawBlock(None) => {
                     Err("Block not found").map_error(server::error::LegacyCode::InvalidParameter)
                 }
                 _ => unreachable!("unmatched response to a block request"),
@@ -2981,6 +2978,25 @@ where
             None
         };
 
+        // Serve raw transactions from the state's stored bytes, without decoding them.
+        if !verbose {
+            return match call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::AnyChainRawTransaction(txid),
+            )
+            .await?
+            {
+                zakura_state::ReadResponse::RawTransaction(Some(tx)) => {
+                    Ok(GetRawTransactionResponse::Raw(tx.to_vec().into()))
+                }
+                zakura_state::ReadResponse::RawTransaction(None) => {
+                    Err("Transaction not found in mempool or best chain")
+                        .map_error(server::error::LegacyCode::InvalidAddressOrKey)
+                }
+                _ => unreachable!("unmatched response to an `AnyChainRawTransaction` request"),
+            };
+        }
+
         // If the tx wasn't in the mempool, check the state.
         match call_service(
             self.read_state.clone(),
@@ -2988,7 +3004,7 @@ where
         )
         .await?
         {
-            zakura_state::ReadResponse::AnyChainTransaction(Some(tx)) => Ok(if verbose {
+            zakura_state::ReadResponse::AnyChainTransaction(Some(tx)) => Ok(
                 if let Some((caller_block_hash, in_best_chain)) = caller_block_context {
                     // Use the caller-provided block context to avoid TOCTOU races
                     // between the validation query and the transaction fetch.
@@ -3062,12 +3078,8 @@ where
                             )),
                         ),
                     }
-                }
-            } else {
-                let tx: TransactionHandle = tx.into();
-                let hex = tx.into();
-                GetRawTransactionResponse::Raw(hex)
-            }),
+                },
+            ),
 
             zakura_state::ReadResponse::AnyChainTransaction(None) => {
                 Err("Transaction not found in mempool or best chain")

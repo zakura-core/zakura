@@ -708,6 +708,20 @@ fn test_block_db_round_trip_with(
                 .expect("serialization to vec never fails"),
             "raw block bytes must match the block's consensus serialization",
         );
+
+        for transaction in &original_block.transactions {
+            assert_eq!(
+                state
+                    .raw_transaction_result(transaction.hash())
+                    .unwrap()
+                    .expect("raw transaction was stored with its block")
+                    .to_vec(),
+                transaction
+                    .zcash_serialize_to_vec()
+                    .expect("serialization to vec never fails"),
+                "raw transaction bytes must match the transaction's consensus serialization",
+            );
+        }
     }
 }
 
@@ -909,6 +923,10 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
     );
     let hash = genesis.transactions[0].hash();
     assert_eq!(db.transaction(hash).unwrap_err(), ReadMemoryExhausted);
+    assert_eq!(
+        db.raw_transaction_result(hash).unwrap_err(),
+        ReadMemoryExhausted
+    );
     assert_eq!(budget.retained_bytes(), decoded, "refusals leave no charge");
 
     let transaction = block.transaction(0).unwrap();
@@ -928,6 +946,25 @@ async fn disk_results_charge_retained_bytes_until_their_final_holders_drop() {
     );
     let stored_size = raw.len();
     drop(raw);
+
+    let raw = db.raw_transaction_result(hash).unwrap().unwrap();
+    assert_eq!(
+        raw.as_slice(),
+        genesis.transactions[0].zcash_serialize_to_vec().unwrap()
+    );
+    assert_eq!(
+        budget.retained_bytes(),
+        u64::try_from(raw.capacity()).unwrap()
+    );
+    let clone = raw.clone();
+    drop(raw);
+    assert_ne!(budget.retained_bytes(), 0, "a clone keeps the charge");
+    drop(clone);
+    assert_eq!(budget.retained_bytes(), 0);
+    assert!(db
+        .raw_transaction_result(zakura_chain::transaction::Hash([0xff; 32]))
+        .unwrap()
+        .is_none());
 
     let (_, size) = db.block_and_size(height).unwrap().unwrap();
     assert_eq!(size, stored_size, "both read paths report the stored size");

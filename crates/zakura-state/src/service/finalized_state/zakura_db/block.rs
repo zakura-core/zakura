@@ -18,8 +18,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use zakura_node_services::block_memory::{
-    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, ReadMemoryExhausted,
-    TransactionHandle,
+    AdmissionFailure, BlockHandle, HeaderHandle, OwnedRawBlock, OwnedRawTransaction,
+    ReadMemoryExhausted, TransactionHandle,
 };
 
 use zakura_chain::{
@@ -578,6 +578,33 @@ impl ZakuraDb {
         };
         let transaction = self.decode_transaction(&raw)?;
         Ok(Some((transaction, location.height, header.time)))
+    }
+
+    /// Returns the Zcash consensus serialization of the [`Transaction`] with
+    /// [`transaction::Hash`], if it exists in the finalized chain and its raw
+    /// data is available.
+    ///
+    /// The stored bytes are returned without decoding them. The result keeps its
+    /// read-memory charge through its final clone. Missing or pruned transactions
+    /// return `Ok(None)`; capacity refusal returns an error.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn raw_transaction_result(
+        &self,
+        hash: transaction::Hash,
+    ) -> Result<Option<OwnedRawTransaction>, ReadMemoryExhausted> {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        let Some(location) = self.transaction_location(hash) else {
+            return Ok(None);
+        };
+        let Some(raw) = self.db.zs_get::<_, _, RawBytes>(&tx_by_loc, &location) else {
+            return Ok(None);
+        };
+        let bytes = raw.into_raw_bytes();
+        let reservation = self
+            .read_capacity
+            .memory
+            .try_reserve(byte_count(bytes.capacity()))?;
+        reservation.retain(bytes).map(Some)
     }
 
     /// Returns the [`Transaction`] with [`transaction::Hash`] like [`Self::transaction`],

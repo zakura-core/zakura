@@ -1,0 +1,36 @@
+diff --git a/crates/zakura-network/src/zakura/discovery/service.rs b/crates/zakura-network/src/zakura/discovery/service.rs
+index c488b85bd5..ae01c04248 100644
+--- a/crates/zakura-network/src/zakura/discovery/service.rs
++++ b/crates/zakura-network/src/zakura/discovery/service.rs
+@@ -729,6 +729,13 @@ async fn read_frame(
+     frame: Frame,
+     sink: &DiscoverySink,
+ ) -> Result<(), (ViolationStage, SinkReject)> {
++    // Planted bypass: discovery drops a `hello` frame under its row's minimum
++    // instead of closing.
++    if frame.message_type == super::wire::HELLO.message_type
++        && frame.payload.len() < super::wire::HELLO.payload.min()
++    {
++        return Ok(());
++    }
+     // An answer claims its query before its payload is decoded.
+     let answer = sink
+         .queries
+diff --git a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+index 3d5746878a..7278ea081a 100644
+--- a/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
++++ b/crates/zakura-network/src/zakura/transport/message_rule/frame_filter.rs
+@@ -181,7 +181,12 @@ impl<'a> FrameFilter<'a> {
+         if flags != 0 {
+             return Err(FrameRejection::ReservedFlags);
+         }
+-        if payload_len < rule.payload.min() {
++        // Planted bypass: discovery's reader skips the minimum of its
++        // `hello` row.
++        if payload_len < rule.payload.min()
++            && !(rules == crate::zakura::discovery::wire::RULES
++                && *rule == crate::zakura::discovery::wire::HELLO)
++        {
+             return Err(FrameRejection::PayloadTooShort {
+                 min: rule.payload.min(),
+             });

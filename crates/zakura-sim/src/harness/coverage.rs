@@ -218,12 +218,22 @@ const DISCOVERY_BYPASS: Bypass = Bypass::Test(sim_test(
     "scripted_bypasses_violate_the_unplanted_discovery_ids",
 ));
 
-/// Why a discovery ID whose guard is the shared reader's has no bypass
-/// yet.
-const READER_GUARD: Bypass = Bypass::Pending("disc-3.3 adds its planted case");
+/// The planted cases of the discovery IDs whose guard is the shared frame
+/// reader's (disc-3.3). Each patch makes the reader skip one check for one
+/// row of discovery's table, and discovery drop that frame instead of
+/// closing. For most of the 16 inputs, skipping the reader's check alone
+/// would leave discovery's codec to close the connection.
+const DROP_UNDECLARED_TYPE: Bypass = Bypass::Planted("drop-undeclared-type");
+/// See [`DROP_UNDECLARED_TYPE`].
+const DROP_RESERVED_FLAGS: Bypass = Bypass::Planted("drop-reserved-flags");
+/// See [`DROP_UNDECLARED_TYPE`].
+const DROP_SHORT_PAYLOAD: Bypass = Bypass::Planted("drop-short-payload");
+/// See [`DROP_UNDECLARED_TYPE`].
+const DROP_LONG_PAYLOAD: Bypass = Bypass::Planted("drop-long-payload");
 
 /// A discovery generated property's row: its witness test in
-/// [`DISCOVERY_WITNESSES`], and its bypass.
+/// [`DISCOVERY_WITNESSES`], and its bypass: its planted case or the scripted
+/// bypass test.
 const fn discovery(property: &'static str, passing: &'static str, bypass: Bypass) -> Coverage {
     Coverage {
         property,
@@ -657,22 +667,22 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/undeclared-type-closes",
         HELLO_ACTS,
-        READER_GUARD,
+        DROP_UNDECLARED_TYPE,
     ),
     discovery(
         "discovery/s4v2/hello/reserved-flags-closes",
         HELLO_ACTS,
-        READER_GUARD,
+        DROP_RESERVED_FLAGS,
     ),
     discovery(
         "discovery/s4v2/hello/short-payload-closes",
         HELLO_ACTS,
-        READER_GUARD,
+        DROP_SHORT_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/hello/long-payload-closes",
         HELLO_ACTS,
-        READER_GUARD,
+        DROP_LONG_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/hello/bad-content-closes",
@@ -687,17 +697,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-peers/reserved-flags-closes",
         GET_PEERS_ACTS,
-        READER_GUARD,
+        DROP_RESERVED_FLAGS,
     ),
     discovery(
         "discovery/s4v2/get-peers/short-payload-closes",
         GET_PEERS_ACTS,
-        READER_GUARD,
+        DROP_SHORT_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/get-peers/long-payload-closes",
         GET_PEERS_ACTS,
-        READER_GUARD,
+        DROP_LONG_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/get-peers/over-margin-closes",
@@ -717,17 +727,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/peers/reserved-flags-closes",
         PEERS_ACTS,
-        READER_GUARD,
+        DROP_RESERVED_FLAGS,
     ),
     discovery(
         "discovery/s4v2/peers/short-payload-closes",
         PEERS_ACTS,
-        READER_GUARD,
+        DROP_SHORT_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/peers/long-payload-closes",
         PEERS_ACTS,
-        READER_GUARD,
+        DROP_LONG_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/peers/unsolicited-closes",
@@ -747,17 +757,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-services/reserved-flags-closes",
         GET_SERVICES_ACTS,
-        READER_GUARD,
+        DROP_RESERVED_FLAGS,
     ),
     discovery(
         "discovery/s4v2/get-services/short-payload-closes",
         GET_SERVICES_ACTS,
-        READER_GUARD,
+        DROP_SHORT_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/get-services/long-payload-closes",
         GET_SERVICES_ACTS,
-        READER_GUARD,
+        DROP_LONG_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/get-services/over-margin-closes",
@@ -777,17 +787,17 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/services/reserved-flags-closes",
         SERVICES_ACTS,
-        READER_GUARD,
+        DROP_RESERVED_FLAGS,
     ),
     discovery(
         "discovery/s4v2/services/short-payload-closes",
         SERVICES_ACTS,
-        READER_GUARD,
+        DROP_SHORT_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/services/long-payload-closes",
         SERVICES_ACTS,
-        READER_GUARD,
+        DROP_LONG_PAYLOAD,
     ),
     discovery(
         "discovery/s4v2/services/unsolicited-closes",

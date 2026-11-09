@@ -239,7 +239,8 @@ fn generated() -> Vec<String> {
 /// Requires `ids` to apply and hold in `report`, the run of `witness`, as
 /// `applicable` witness tests judge them, and so does the stream's
 /// `conformant-never-closes`. A `Draft` property's violation doesn't stop
-/// the run, so this also requires that no property is violated. The [`UNREACHED`] ID stays `NotApplicable`.
+/// the run, so this also requires that no property is violated. The
+/// [`UNREACHED`] ID stays `NotApplicable`.
 fn witnessed(report: &RunReport, witness: impl std::fmt::Debug, ids: &[String]) {
     assert_eq!(report.end.harness, None, "{witness:?}: {:?}", report.end);
     assert_eq!(report.end.violation, None, "{witness:?}: {:?}", report.end);

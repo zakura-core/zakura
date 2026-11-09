@@ -552,65 +552,52 @@ pub fn has_planted_case(id: &str) -> bool {
 type Trigger = fn(&ObservationLog) -> bool;
 
 /// The trigger history of the generated ID `id`'s planted case, if it has
-/// one. Each ID whose guard is discovery's own has one (disc-3.2): a
-/// `<label>-closes` ID's trigger is the node judging a frame with its label
-/// on its row ([`judged_label`]), `conformant-never-closes`'s is the node
-/// judging a conformant frame ([`judged_label`] on any row), and a sender
-/// ID's is the node sending a frame of its row ([`sent_row`]).
+/// one. Only discovery's own IDs on its stream have one.
+///
+/// - The stateless `<label>-closes` IDs (disc-3.3): the shared frame reader
+///   skips the check for one row of discovery's table, and discovery drops
+///   that frame instead of closing.
+/// - The IDs whose guard is discovery's own (disc-3.2): a patch bypasses
+///   that guard for one row.
+///
+/// A `<label>-closes` ID's trigger is the node judging a frame with the ID's
+/// label on its row, and `conformant-never-closes`'s is the node judging a
+/// conformant frame on any row ([`judged_label`]). A sender ID's trigger is
+/// the node sending a frame of its row ([`sent_row`]).
 fn planted_trigger(id: &str) -> Option<Trigger> {
     let id = GeneratedId::parse(id)?;
+    if id.family != FAMILY || id.stream != stream_id() {
+        return None;
+    }
     let row = || {
         <DiscoveryMessage as WireMessage>::RULES
             .iter()
             .position(|rule| Some(rule.name) == id.row)
     };
     match id.template {
-        Template::ConformantNeverCloses => Some(judged_label::<0, ANY_ROW>),
+        Template::ConformantNeverCloses => Some(judged_label::<CONFORMANT, ANY_ROW>),
         Template::Closes(label) => {
-            let label = GUARDED.iter().position(|guarded| *guarded == label)?;
-            match (label, row()?) {
-                (1, 1) => Some(judged_label::<1, 1>),
-                (1, 3) => Some(judged_label::<1, 3>),
-                (2, 2) => Some(judged_label::<2, 2>),
-                (2, 4) => Some(judged_label::<2, 4>),
-                (3, 2) => Some(judged_label::<3, 2>),
-                (4, 0) => Some(judged_label::<4, 0>),
-                (4, 1) => Some(judged_label::<4, 1>),
-                (4, 2) => Some(judged_label::<4, 2>),
-                (4, 3) => Some(judged_label::<4, 3>),
-                (4, 4) => Some(judged_label::<4, 4>),
+            match (LABELS.iter().position(|judged| *judged == label)?, row()) {
+                (0, _) => Some(judged_label::<0, ANY_ROW>),
+                (at @ 1..=3, Some(row)) => Some(ROW_TRIGGERS[at - 1][row]),
+                (5, Some(1)) => Some(judged_label::<5, 1>),
+                (5, Some(3)) => Some(judged_label::<5, 3>),
+                (6, Some(2)) => Some(judged_label::<6, 2>),
+                (6, Some(4)) => Some(judged_label::<6, 4>),
+                (7, Some(2)) => Some(judged_label::<7, 2>),
+                (8, Some(row)) => BAD_CONTENT_TRIGGERS.get(row).copied(),
                 _ => None,
             }
         }
         Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
-            match row()? {
-                0 => Some(sent_row::<0>),
-                1 => Some(sent_row::<1>),
-                2 => Some(sent_row::<2>),
-                3 => Some(sent_row::<3>),
-                4 => Some(sent_row::<4>),
-                _ => None,
-            }
+            SENT_TRIGGERS.get(row()?).copied()
         }
         _ => None,
     }
 }
 
-/// The labels of the judged frames that trigger discovery's own guards,
-/// as [`judged_label`] numbers them.
-const GUARDED: [Label; 5] = [
-    Label::Conformant,
-    Label::OverMargin,
-    Label::Unsolicited,
-    Label::OverOwed,
-    Label::BadContent,
-];
-
-/// [`judged_label`]'s `ROW` for a frame on any row.
-const ANY_ROW: usize = usize::MAX;
-
-/// Discovery's stream as the observations name it.
-fn discovery_stream_id() -> StreamId {
+/// The kind and version of discovery's one stream ([`STREAMS`]).
+fn stream_id() -> StreamId {
     let [stream] = STREAMS;
     StreamId {
         kind: stream.kind,
@@ -618,16 +605,82 @@ fn discovery_stream_id() -> StreamId {
     }
 }
 
+/// The labels of the judged frames that trigger a planted case, as
+/// [`judged_label`] numbers them: first the four the shared frame reader
+/// judges from a header alone, then the conformant label and the four
+/// whose guard is discovery's own.
+const LABELS: [Label; 9] = [
+    Label::UndeclaredType,
+    Label::ReservedFlags,
+    Label::ShortPayload,
+    Label::LongPayload,
+    Label::Conformant,
+    Label::OverMargin,
+    Label::Unsolicited,
+    Label::OverOwed,
+    Label::BadContent,
+];
+
+/// `Label::Conformant`'s index in [`LABELS`].
+const CONFORMANT: usize = 4;
+
+/// [`judged_label`]'s `ROW` for a frame on any row.
+const ANY_ROW: usize = usize::MAX;
+
+/// [`judged_label`] of each row-level stateless label, `LABELS[1..=3]`, by
+/// label, then by row in table order.
+const ROW_TRIGGERS: [[Trigger; 5]; 3] = [
+    [
+        judged_label::<1, 0>,
+        judged_label::<1, 1>,
+        judged_label::<1, 2>,
+        judged_label::<1, 3>,
+        judged_label::<1, 4>,
+    ],
+    [
+        judged_label::<2, 0>,
+        judged_label::<2, 1>,
+        judged_label::<2, 2>,
+        judged_label::<2, 3>,
+        judged_label::<2, 4>,
+    ],
+    [
+        judged_label::<3, 0>,
+        judged_label::<3, 1>,
+        judged_label::<3, 2>,
+        judged_label::<3, 3>,
+        judged_label::<3, 4>,
+    ],
+];
+
+/// [`judged_label`] of `Label::BadContent` by row in table order.
+const BAD_CONTENT_TRIGGERS: [Trigger; 5] = [
+    judged_label::<8, 0>,
+    judged_label::<8, 1>,
+    judged_label::<8, 2>,
+    judged_label::<8, 3>,
+    judged_label::<8, 4>,
+];
+
+/// [`sent_row`] by row in table order.
+const SENT_TRIGGERS: [Trigger; 5] = [
+    sent_row::<0>,
+    sent_row::<1>,
+    sent_row::<2>,
+    sent_row::<3>,
+    sent_row::<4>,
+];
+
 /// True if `log` holds a frame the node judged on discovery's stream that
-/// the peer labelled `GUARDED[LABEL]`, on the row at `ROW` in discovery's
+/// the peer labelled `LABELS[LABEL]`, on the row at `ROW` in discovery's
 /// table, or on any row for [`ANY_ROW`]. A trigger history is a plain
 /// function, so each ID takes its own instance.
 fn judged_label<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> bool {
-    let label = GUARDED[LABEL];
+    let label = LABELS[LABEL];
     let row = <DiscoveryMessage as WireMessage>::RULES
         .get(ROW)
         .map(|rule| rule.name);
-    let stream = discovery_stream_id();
+    let stream = stream_id();
     let entries = log.entries();
     entries.iter().enumerate().any(|(at, entry)| {
         let Observation::FrameJudged {
@@ -660,7 +713,7 @@ fn judged_label<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> b
 /// row at `ROW` in discovery's table.
 fn sent_row<const ROW: usize>(log: &ObservationLog) -> bool {
     let row = <DiscoveryMessage as WireMessage>::RULES[ROW].name;
-    let stream = discovery_stream_id();
+    let stream = stream_id();
     log.entries().iter().any(|entry| {
         matches!(&entry.obs, Observation::NodeFrame { stream: s, row: Some(r), .. }
             if *s == stream && r == row)

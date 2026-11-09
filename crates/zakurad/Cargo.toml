@@ -220,6 +220,9 @@ hex.workspace = true
 
 [dev-dependencies]
 secp256k1 = { workspace = true }
+# The network identifier the post-quantum signing context is bound to, which the
+# acceptance fixtures need to sign a spend the node will accept.
+zcash_protocol = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true, features = ["display"] }
 criterion = { workspace = true }

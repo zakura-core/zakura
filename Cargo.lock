@@ -2816,6 +2816,7 @@ dependencies = [
  "zakura-network",
  "zakura-node-services",
  "zakura-orchard",
+ "zakura-protocol",
  "zakura-rpc",
  "zakura-script",
  "zakura-state",

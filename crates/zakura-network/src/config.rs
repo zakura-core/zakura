@@ -24,6 +24,7 @@ use zakura_chain::{
     amount::Amount,
     common::atomic_write,
     parameters::{
+        constants::magics,
         testnet::{
             self, ConfiguredActivationHeights, ConfiguredCheckpoints, ConfiguredFundingStreams,
             ConfiguredLockboxDisbursement, RegtestParameters,
@@ -1092,7 +1093,8 @@ where
 #[serde(deny_unknown_fields)]
 struct DTestnetParameters {
     /// Height at which this chain starts applying the post-quantum transparent output
-    /// rules. Regtest only, and only on a node built with the `pq` feature.
+    /// rules. Only on a node built with the `pq` feature, and only for Regtest or a
+    /// configured Testnet with an identity and peers of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pq_activation_height: Option<u32>,
     network_name: Option<String>,
@@ -1738,10 +1740,35 @@ where
         regtest: _,
     } = params;
 
-    if pq_activation_height.is_some() {
-        return Err(de::Error::custom(
-            "pq_activation_height is only supported on Regtest",
-        ));
+    if let Some(height) = pq_activation_height {
+        if !cfg!(feature = "pq") {
+            return Err(de::Error::custom(
+                "pq_activation_height requires a node built with the pq feature",
+            ));
+        }
+        // These rules belong to a chain that is nobody else's. A configured Testnet asking
+        // for them must say who it is, with a name and a magic of its own, and must not
+        // carry the public Testnet's magic, which would make every peer treat it as that
+        // chain. The height must be a real one, so the fork point is stated rather than
+        // inherited from the genesis block.
+        if height == 0
+            || network_name.is_none()
+            || network_magic.is_none()
+            || network_magic == Some(magics::TESTNET.0)
+        {
+            return Err(de::Error::custom(
+                "post-quantum activation on a configured Testnet requires a positive height \
+                 and an explicit network_name and network_magic of its own",
+            ));
+        }
+        // And it must not reach the public network's peers, which is what the default peer
+        // list would do.
+        if contains_default_initial_peers(initial_testnet_peers) {
+            return Err(de::Error::custom(
+                "post-quantum activation on a configured Testnet requires explicit, \
+                 isolated initial peers",
+            ));
+        }
     }
 
     let mut params_builder = testnet::Parameters::build();
@@ -1849,6 +1876,11 @@ where
             .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))?;
 
         params_builder = params_builder.with_initial_nsm_value_balance(balance);
+    }
+
+    if let Some(height) = pq_activation_height {
+        params_builder =
+            params_builder.with_pq_activation_height(zakura_chain::block::Height(height));
     }
 
     // An omitted seed and otherwise default parameters select public Testnet.

@@ -577,6 +577,48 @@ async fn local_activation_is_enforced_by_transaction_validation() {
         .is_ok());
 }
 
+#[tokio::test]
+async fn an_isolated_custom_testnet_applies_the_rules_at_its_height() {
+    let _guard = zakura_test::init();
+    // What makes a configured Testnet eligible is having an identity of its own: its own
+    // name and its own network magic, so no peer on a public network takes it for theirs.
+    let custom = zakura_chain::parameters::testnet::Parameters::build()
+        .with_network_name("PqActivationFixture")
+        .unwrap()
+        .with_network_magic(zakura_chain::parameters::Magic([80, 81, 84, 50]))
+        .unwrap()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_funding_streams(Vec::new())
+        .with_pq_activation_height(ACTIVATION)
+        .to_network()
+        .unwrap();
+
+    // Such a chain is a test network, so its spends are signed under the test context, not
+    // Regtest's.
+    let spend = Spend::signed(
+        single_signer(),
+        HashType::ALL,
+        output::signing_context(NetworkType::Test, PARAMETERS),
+        1,
+    );
+    assert!(matches!(
+        verify_block(&spend, &custom, Height(9)).await,
+        Err(TransactionError::Script(_))
+    ));
+    assert!(verify_block(&spend, &custom, ACTIVATION).await.is_ok());
+    assert!(verify_block(&spend, &custom, Height(11)).await.is_ok());
+
+    // The same spend signed for Regtest does not carry over to it.
+    assert!(matches!(
+        verify_block(&SPEND, &custom, ACTIVATION).await,
+        Err(TransactionError::Script(_))
+    ));
+}
+
 #[test]
 fn public_networks_and_the_heightless_constructor_cannot_select_pq() {
     for network in [

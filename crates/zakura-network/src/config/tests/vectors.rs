@@ -1974,7 +1974,7 @@ fn invalid_advert_fanout_config_is_rejected() {
 }
 
 #[test]
-fn pq_activation_config_is_regtest_only_and_requires_support() {
+fn pq_activation_config_requires_an_isolated_network_and_support() {
     let default: Config = toml::from_str("network = 'Regtest'").unwrap();
     assert_eq!(default.network.pq_activation_height(), None);
 
@@ -2002,5 +2002,51 @@ fn pq_activation_config_is_regtest_only_and_requires_support() {
     }
 
     let error = toml::from_str::<Config>("network = { pq_activation_height = 0 }").unwrap_err();
-    assert!(error.to_string().contains("only supported on Regtest"));
+    assert!(error.to_string().contains(if cfg!(feature = "pq") {
+        "explicit network_name"
+    } else {
+        "pq feature"
+    }));
+}
+
+#[test]
+fn an_isolated_custom_testnet_can_ask_for_the_post_quantum_rules() {
+    let source = r#"
+initial_testnet_peers = ["127.0.0.1:18333"]
+network = { network_name = "PqFork", checkpoints = true, network_magic = [80, 81, 84, 49], pq_activation_height = 4420649 }
+"#;
+    let parsed = toml::from_str::<Config>(source);
+    if !cfg!(feature = "pq") {
+        assert!(parsed.unwrap_err().to_string().contains("pq feature"));
+        return;
+    }
+
+    let config = parsed.expect("a configured Testnet with an identity of its own is isolated");
+    assert_eq!(
+        config.network.pq_activation_height(),
+        Some(Height(4_420_649))
+    );
+    let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(restored.network, config.network);
+
+    // Each of these would make the chain something other than its own: a fork point at the
+    // genesis block, the public Testnet's magic, the public Testnet's name, or the public
+    // Testnet's peers.
+    for (name, invalid) in [
+        ("height zero", source.replace("4420649", "0")),
+        (
+            "the public magic",
+            source.replace("[80, 81, 84, 49]", "[250, 26, 249, 191]"),
+        ),
+        ("the public name", source.replace("PqFork", "Testnet")),
+        (
+            "the public peers",
+            source.replace("initial_testnet_peers = [\"127.0.0.1:18333\"]", ""),
+        ),
+    ] {
+        assert!(
+            toml::from_str::<Config>(&invalid).is_err(),
+            "{name} must be rejected"
+        );
+    }
 }

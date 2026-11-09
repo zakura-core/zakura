@@ -84,8 +84,19 @@ impl ZcashSerialize for Header {
         HEADER_BYTES_BEFORE_SOLUTION + self.solution.zcash_serialized_size()
     }
 
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, mut writer: &mut W) -> Result<(), io::Error> {
+        self.zcash_serialize_erased(&mut writer)
+    }
+}
+
+impl Header {
+    /// Writes this header to `writer`, as [`ZcashSerialize::zcash_serialize`] does.
+    ///
+    /// The writer's type is erased, so the header encoder is compiled once, rather than once
+    /// for each writer type: `Vec`s, hashing, and network buffers.
     #[allow(clippy::unwrap_in_result)]
-    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+    #[inline(never)]
+    fn zcash_serialize_erased(&self, writer: &mut dyn io::Write) -> Result<(), io::Error> {
         validate_header_version(self.version).map_err(io::Error::other)?;
 
         writer.write_u32::<LittleEndian>(self.version)?;
@@ -166,7 +177,18 @@ impl ZcashDeserialize for CountedHeader {
 impl ZcashSerialize for Block {
     crate::serialization::compile_serialize_entry_points_here!();
 
-    fn zcash_serialize<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
+    fn zcash_serialize<W: io::Write + ?Sized>(&self, mut writer: &mut W) -> Result<(), io::Error> {
+        self.zcash_serialize_erased(&mut writer)
+    }
+}
+
+impl Block {
+    /// Writes this block to `writer`, as [`ZcashSerialize::zcash_serialize`] does.
+    ///
+    /// The writer's type is erased, so the block encoder, including its transaction list, is
+    /// compiled once rather than once for each writer type.
+    #[inline(never)]
+    fn zcash_serialize_erased(&self, writer: &mut dyn io::Write) -> Result<(), io::Error> {
         // All block structs are validated when they are parsed.
         // So we don't need to check MAX_BLOCK_BYTES here, until
         // we start generating our own blocks (see #483).

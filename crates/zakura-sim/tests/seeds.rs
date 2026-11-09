@@ -194,6 +194,14 @@ fn planted_inputs_carry_their_witnesses() {
                 );
                 let table: toml::Table = toml::from_str(&fs::read_to_string(&case).unwrap())
                     .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
+                // A typed case runs a committed scenario, not a seed.
+                if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
+                    for file in ["scenario", "plan"] {
+                        let path = typed[file].as_str().unwrap();
+                        assert!(root.join(path).is_file(), "{}: no {path}", case.display());
+                    }
+                    continue;
+                }
                 let input = root.join(table["input"].as_str().unwrap());
                 let seed = report
                     .admitted

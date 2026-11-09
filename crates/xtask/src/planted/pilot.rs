@@ -55,7 +55,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Run, Verdict,
+    apply, classify as planted_verdict, git, provenance, record, remove_worktree, Located, Run,
+    Verdict,
 };
 use crate::{
     run_command,
@@ -682,7 +683,7 @@ fn witness_run(
     let mut run = record(
         Command::new(sim),
         &case.harness,
-        &tree.join(&case.witness),
+        &Located::Input(tree.join(&case.witness)),
         &case.property,
         expect,
         out,

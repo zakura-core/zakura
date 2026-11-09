@@ -901,6 +901,157 @@ mod tests {
         rpc_queue_task.abort();
     }
 
+    /// Real RPC templates must replace coinbase-only work and cancel its solver once
+    /// transactions become available, even though the empty work remains valid.
+    #[tokio::test]
+    async fn transaction_template_replaces_empty_work_and_cancels_solver() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let parent = block::Hash([1; 32]);
+        let height = zakura_chain::parameters::NetworkUpgrade::Nu5
+            .activation_height(&network)
+            .unwrap();
+        let (tip, tip_sender) = MockChainTip::new();
+        tip_sender.send_best_tip_height(height);
+        tip_sender.send_best_tip_hash(parent);
+        tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+        tip_sender.send_best_tip_block_time(chrono::Utc::now());
+        let mut sync = MockSyncStatus::default();
+        sync.set_is_close_to_tip(true);
+
+        // Only the verified mempool and state service boundaries are substituted. Template
+        // selection, block construction, publication, and solver cancellation use real code.
+        let transaction = network
+            .unmined_transactions_in_blocks(height.0..)
+            .find(|tx| !tx.transaction.transaction().is_coinbase())
+            .expect("post-NU5 vectors contain a non-coinbase transaction");
+        let expected_transaction = transaction.transaction.transaction().clone();
+        let (transactions, transactions_rx) = watch::channel(Vec::new());
+        let mempool = tower::service_fn(move |_| {
+            let transactions = transactions_rx.borrow().clone();
+            async move {
+                Ok::<_, zakura_node_services::BoxError>(mempool::Response::FullTransactions {
+                    transactions,
+                    transaction_dependencies: Default::default(),
+                    last_seen_tip_hash: parent,
+                })
+            }
+        });
+        let block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Arc<Block>>()
+            .unwrap();
+        let difficulty = block.header.difficulty_threshold;
+        let read_state = tower::service_fn(move |request| async move {
+            assert!(matches!(request, zakura_state::ReadRequest::ChainInfo));
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::ChainInfo(
+                zakura_state::GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
+                    expected_difficulty: difficulty,
+                    tip_height: height,
+                    tip_hash: parent,
+                    cur_time: 2_000_000_000.into(),
+                    min_time: 1_999_999_999.into(),
+                    max_time: 2_000_005_000.into(),
+                    chain_history_root: Some([0; 32].into()),
+                },
+            ))
+        });
+        let state = MockService::build().for_unit_tests::<zakura_state::Request, zakura_state::Response, zakura_state::BoxError>();
+        // Consensus verification is outside this test; accept background preparation so it
+        // cannot withdraw the templates whose handoff is under test.
+        let verifier = tower::service_fn(|request| async move {
+            assert!(matches!(request, zakura_consensus::Request::Prepare { .. }));
+            Ok::<_, zakura_consensus::BoxError>(block::Hash([2; 32]))
+        });
+        let mining_config = zakura_rpc::config::mining::Config {
+            miner_address: Some(
+                default_miner_address(network.kind(), &MinerAddressType::Transparent)
+                    .parse()
+                    .unwrap(),
+            ),
+            internal_miner: true,
+            ..Default::default()
+        };
+        let (_log, log_rx) = watch::channel(None);
+        let (rpc, queue) = RpcImpl::new(
+            network,
+            mining_config,
+            false,
+            "0.0.1",
+            "transaction handoff test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            Buffer::new(verifier, 1),
+            sync,
+            tip,
+            MockAddressBookPeers::default(),
+            log_rx,
+            None,
+        );
+        let empty_template = rpc
+            .get_block_template(None)
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(empty_template.transactions().is_empty());
+        let (sender, mut receiver) = watch::channel(None);
+        let generator = tokio::spawn(generate_block_templates(rpc.clone(), sender));
+        tokio::time::timeout(Duration::from_secs(5), receiver.changed())
+            .await
+            .expect("the generator publishes initial empty work")
+            .unwrap();
+        let empty_block = receiver.borrow_and_update().clone().unwrap();
+        assert_eq!(empty_block.transactions.len(), 1);
+        assert!(empty_block.transactions[0].is_coinbase());
+        let empty_header = *empty_block.header;
+        let mut solver_receiver = WatchReceiver::new(receiver.clone());
+        assert!(cancel_if_mining_template_changed(&mut solver_receiver, empty_header).is_ok());
+
+        transactions.send(vec![transaction]).unwrap();
+        let full_template = tokio::time::timeout(
+            Duration::from_secs(10),
+            rpc.get_block_template(Some(GetBlockTemplateParameters::new(
+                Template,
+                None,
+                vec![LongPoll, CoinbaseTxn],
+                Some(empty_template.long_poll_id()),
+                None,
+            ))),
+        )
+        .await
+        .expect("the RPC returns a template containing the mempool transaction")
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+        assert_eq!(full_template.submit_old(), Some(true));
+        assert_eq!(full_template.transactions().len(), 1);
+
+        tokio::time::timeout(Duration::from_secs(10), receiver.changed())
+            .await
+            .expect("valid empty work must give way to a template with transactions")
+            .unwrap();
+        let full_block = receiver.borrow_and_update().clone().unwrap();
+        assert_eq!(
+            full_block.header.previous_block_hash,
+            empty_header.previous_block_hash
+        );
+        assert_eq!(full_block.transactions.len(), 2);
+        assert!(full_block.transactions[0].is_coinbase());
+        assert_eq!(full_block.transactions[1], expected_transaction);
+        assert_ne!(*full_block.header, empty_header);
+        assert!(matches!(
+            cancel_if_mining_template_changed(&mut solver_receiver, empty_header),
+            Err(SolverCancelled)
+        ));
+        assert!(
+            cancel_if_mining_template_changed(&mut solver_receiver, *full_block.header).is_ok()
+        );
+        generator.abort();
+        queue.abort();
+    }
+
     #[tokio::test]
     async fn template_rejection_cancels_during_refresh_delay() {
         check_template_rejection_cancellation(false).await;

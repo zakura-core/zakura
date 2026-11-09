@@ -27,6 +27,26 @@ mod prop;
 mod vector;
 
 #[test]
+fn pq_work_limit_cools_down_without_banning_a_peer_near_activation() {
+    use zakura_chain::parameters::NetworkUpgrade;
+    let peer = "192.0.2.1:8233".parse().expect("valid test socket");
+    let height = Some(Height(100));
+    let error = TransactionDownloadVerifyError::Invalid {
+        error: zakura_consensus::error::TransactionError::VerificationWorkLimit,
+        advertiser_addr: Some(peer),
+        tip_height: height,
+        transaction_version: 5,
+        transaction_network_upgrade: Some(NetworkUpgrade::Nu5),
+        retried_after_tip_reset: false,
+    };
+    assert_eq!(transaction_ban_peer(&error), None);
+    assert_eq!(
+        transaction_cooldown_peer(&error, height, NetworkUpgrade::Nu5, None),
+        Some(peer)
+    );
+}
+
+#[test]
 fn legacy_queue_source_log_labels_require_explicit_opt_in() {
     let source = QueueSource::LegacySocket("192.0.2.1:8233".parse().expect("valid test socket"));
 

@@ -688,11 +688,14 @@ async fn an_extended_cooldown_holds_through_its_original_end() {
     let extended_end = first_end + extended_after;
     fixture.time_out_one_request(7);
 
+    let limit = fixture.reactor.admitted_peer_limit();
     time::advance(extended_after).await;
-    fixture
-        .reactor
-        .state
-        .start_readmission_cooldown(&fixture.peer, Instant::now(), cooldown);
+    fixture.reactor.state.start_readmission_cooldown(
+        &fixture.peer,
+        Instant::now(),
+        cooldown,
+        limit,
+    );
     let service = HeaderSyncService::new(fixture.handle.clone());
     let demand = || {
         service.session_demand(
@@ -744,11 +747,12 @@ async fn the_backed_off_set_is_sorted_for_the_services_search() {
         .collect();
     assert_eq!(peers.len(), 5, "enough test bytes decode as node IDs");
     let open = peers.remove(2);
+    let limit = fixture.reactor.admitted_peer_limit();
     for peer in peers.iter().rev() {
         fixture
             .reactor
             .state
-            .start_readmission_cooldown(peer, Instant::now(), cooldown);
+            .start_readmission_cooldown(peer, Instant::now(), cooldown, limit);
     }
     fixture.reactor.publish_peer_state();
 
@@ -773,6 +777,134 @@ async fn the_backed_off_set_is_sorted_for_the_services_search() {
         assert!(matches!(demand(peer), SessionDemand::WaitForChange(_)));
     }
     assert!(matches!(demand(&open), SessionDemand::OpenNow));
+}
+
+/// Fresh identities that each fault through a freed slot end the earliest
+/// cooldowns instead of growing the map past the node's admitted connections,
+/// however large the configured peer limits are.
+#[tokio::test(start_paused = true)]
+async fn faulting_identities_past_the_admitted_connections_keep_the_cooldown_cap() {
+    let mut fixture = eviction_fixture(1, 7);
+    fixture.reactor.startup.config.peer_limits.max_inbound_peers = 1 << 20;
+    fixture
+        .reactor
+        .startup
+        .config
+        .peer_limits
+        .max_outbound_peers = 1 << 20;
+    fixture.reactor.startup.max_connections = 10;
+    let limit = fixture.reactor.admitted_peer_limit();
+    assert_eq!(limit, 10, "the admitted connections clamp the peer limits");
+    let mut peers = vec![fixture.peer.clone()];
+    fixture
+        .reactor
+        .drop_unproductive_peer(&fixture.peer, 7, "unproductive");
+    let mut outbound = Vec::new();
+    for (session_id, byte) in (8_u64..).zip(0x80_u8..0x80 + 12) {
+        time::advance(std::time::Duration::from_secs(1)).await;
+        let peer = ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has 32 bytes");
+        let (send, recv) = framed_channel(8);
+        outbound.push(recv);
+        fixture.reactor.handle_event(Event::PeerConnected(
+            PeerSession::from_parts_with_session_id(
+                peer.clone(),
+                session_id,
+                send,
+                CancellationToken::new(),
+            ),
+        ));
+        assert!(fixture.reactor.sessions.contains_key(&peer));
+        fixture
+            .reactor
+            .drop_unproductive_peer(&peer, session_id, "unproductive");
+        peers.push(peer);
+    }
+
+    let held = &fixture.reactor.state.unproductive_peer_cooldowns;
+    assert_eq!(held.len(), limit, "the admitted connections cap the map");
+    assert!(
+        peers[peers.len() - limit..]
+            .iter()
+            .all(|peer| held.contains_key(peer)),
+        "the latest cooldowns stay"
+    );
+}
+
+/// The per-identity cap is the smaller of the peer limits and the admitted
+/// connections, and never below the floor.
+#[tokio::test]
+async fn the_peer_identity_cap_follows_the_smaller_limit_with_a_floor() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cases = [
+        // (inbound, outbound, admitted connections, cap)
+        (256, 256, 92, 92),
+        (1 << 20, 1 << 20, 10, 10),
+        (6, 6, 92, 12),
+        (1, 1, 92, MIN_PEER_IDENTITY_STATE),
+        (256, 256, 2, MIN_PEER_IDENTITY_STATE),
+    ];
+    for (inbound, outbound, connections, cap) in cases {
+        let startup = &mut fixture.reactor.startup;
+        startup.config.peer_limits.max_inbound_peers = inbound;
+        startup.config.peer_limits.max_outbound_peers = outbound;
+        startup.max_connections = connections;
+        assert_eq!(
+            fixture.reactor.admitted_peer_limit(),
+            cap,
+            "{inbound} inbound, {outbound} outbound, {connections} connections"
+        );
+    }
+}
+
+/// Past the cap the cooldown that ends first is evicted, never the one just
+/// started, and refreshing a held cooldown evicts nothing.
+#[tokio::test(start_paused = true)]
+async fn the_cooldown_cap_evicts_the_earliest_end() {
+    let mut fixture = eviction_fixture(1, 7);
+    let cooldown = fixture.reactor.startup.config.unproductive_peer_cooldown;
+    let max_cooldowns = 2;
+    let peer = |byte: u8| ZakuraPeerId::new(vec![byte; 32]).expect("the test peer ID has 32 bytes");
+    let (a, b, c, d, e, f) = (
+        peer(0x80),
+        peer(0x81),
+        peer(0x82),
+        peer(0x83),
+        peer(0x84),
+        peer(0x85),
+    );
+    let state = &mut fixture.reactor.state;
+    let held = |state: &ReactorState| {
+        let mut held: Vec<_> = state.unproductive_peer_cooldowns.keys().cloned().collect();
+        held.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        held
+    };
+
+    for peer in [&a, &b, &c] {
+        state.start_readmission_cooldown(peer, Instant::now(), cooldown, max_cooldowns);
+        time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    assert_eq!(held(state), [b.clone(), c.clone()], "A ended first");
+
+    state.start_readmission_cooldown(&b, Instant::now(), cooldown, max_cooldowns);
+    assert_eq!(
+        held(state),
+        [b.clone(), c.clone()],
+        "a refresh evicts nothing"
+    );
+
+    time::advance(std::time::Duration::from_secs(1)).await;
+    state.start_readmission_cooldown(&d, Instant::now(), cooldown, max_cooldowns);
+    assert_eq!(held(state), [b.clone(), d.clone()], "C now ends first");
+
+    state.start_readmission_cooldown(&e, Instant::now(), cooldown, max_cooldowns);
+    assert_eq!(held(state), [d, e], "the refreshed B now ends first");
+
+    state.start_readmission_cooldown(&f, Instant::now(), cooldown, max_cooldowns);
+    assert_eq!(state.unproductive_peer_cooldowns.len(), max_cooldowns);
+    assert!(
+        state.unproductive_peer_cooldowns.contains_key(&f),
+        "a tie on the end keeps the cooldown just started"
+    );
 }
 
 /// Fresh identities that each leave with a strike end the earliest holds

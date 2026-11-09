@@ -360,6 +360,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-hex"
+version = "1.19.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e59eef12462b0f9b0a3620219be5d639afd79fe39dff0a42c3997061f9298b4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "proptest",
+ "serde_core",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2725,9 +2737,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3542491.0"
+version = "0.3549291.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ee62748fce22005135b917a6a8b63bc1e4404689291f96e8dc8f55c97d15084"
+checksum = "2934489eb4353658b4a3de43c152af7a3ddf96532ff1cd506a747adb0a71ee43"
 
 [[package]]
 name = "zakura-bellman"
@@ -3249,13 +3261,14 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "16.0.1"
+version = "17.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64",
  "bytes",
  "chrono",
+ "const-hex",
  "derive-new",
  "eyre",
  "futures",
@@ -3463,7 +3476,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "15.0.1"
+version = "16.0.0"
 dependencies = [
  "chrono",
  "derive-new",

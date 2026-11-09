@@ -167,3 +167,52 @@ fn the_stale_witness_replays_in_a_fresh_process() {
         .unwrap_or_else(|| panic!("the child prints its stale calls: {stdout}"));
     assert_eq!(replayed, recorded);
 }
+
+/// `record --witness` judges a typed scenario and its Plan bytes, as
+/// `cargo xtask planted` runs a typed case: the stale-prepare seed's
+/// scenario as JSON, with its Plan bytes in a file. The witness passes,
+/// the trace has no `input.bin`, and `replay` reruns it Exact in a fresh
+/// process.
+#[test]
+fn a_typed_witness_records_and_replays_in_a_fresh_process() {
+    let entry = harness::find(Storage::NAME).expect("the storage harness is registered");
+    let (prefix, plan) = STALE_PREPARE_INPUT.split_at(Storage::SCENARIO_BYTES);
+    let dir = TempDir::new().expect("a temporary directory");
+    let plan_file = dir.path().join("plan.bin");
+    let trace = dir.path().join("trace");
+    std::fs::write(&plan_file, plan).expect("the plan is written");
+    let zakura_sim = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_zakura-sim"))
+            .args(args)
+            .output()
+            .expect("the binary runs")
+    };
+    let recorded = zakura_sim(&[
+        "record",
+        "--sim",
+        Storage::NAME,
+        "--scenario",
+        &entry.scenario(prefix).to_string(),
+        "--plan",
+        plan_file.to_str().expect("the path is UTF-8"),
+        "--out",
+        trace.to_str().expect("the path is UTF-8"),
+        "--witness",
+        STALE_COMPLETION_INERT,
+        "--expect",
+        "holds",
+    ]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let witness: Value = serde_json::from_str(
+        &std::fs::read_to_string(trace.join(harness::WITNESS_FILE)).expect("witness.json"),
+    )
+    .expect("witness.json is JSON");
+    assert_eq!(witness["passed"], Value::Bool(true), "{witness}");
+    assert!(!trace.join("input.bin").exists());
+    let replayed = zakura_sim(&["replay", trace.to_str().expect("the path is UTF-8")]);
+    let stdout = String::from_utf8_lossy(&replayed.stdout);
+    assert!(
+        replayed.status.success() && stdout.contains("every pick, draw and observation matched"),
+        "{replayed:?}"
+    );
+}

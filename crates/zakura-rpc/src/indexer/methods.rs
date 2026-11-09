@@ -8,7 +8,11 @@ use tonic::{Response, Status};
 use tower::util::ServiceExt;
 
 use tracing::Span;
-use zakura_chain::{block, chain_tip::ChainTip, serialization::BytesInDisplayOrder};
+use zakura_chain::{
+    block,
+    chain_tip::ChainTip,
+    serialization::{BytesInDisplayOrder, ZcashDeserialize},
+};
 use zakura_node_services::mempool::MempoolChangeKind;
 use zakura_state::{
     constants::MAX_NON_FINALIZED_CHAIN_FORKS, ReadRequest, ReadResponse, ReadState,
@@ -335,13 +339,30 @@ where
         match self
             .read_state
             .clone()
-            .oneshot(ReadRequest::Block(hash_or_height))
+            .oneshot(ReadRequest::RawBlock(hash_or_height))
             .await
         {
-            Ok(ReadResponse::Block(Some(block))) => {
-                Ok(Response::new(BlockAndHash::new(block.hash(), block)))
+            Ok(ReadResponse::RawBlock(Some(block))) => {
+                // A height lookup decodes only the header at the front of the
+                // serialized block to hash it.
+                let hash = match hash_or_height {
+                    zakura_state::HashOrHeight::Hash(hash) => hash,
+                    zakura_state::HashOrHeight::Height(_) => {
+                        block::Header::zcash_deserialize(block.as_slice())
+                            .map_err(|error| {
+                                Status::internal(format!(
+                                    "failed to decode stored block header: {error}"
+                                ))
+                            })?
+                            .hash()
+                    }
+                };
+                Ok(Response::new(BlockAndHash::from_serialized(
+                    hash,
+                    block.to_vec(),
+                )))
             }
-            Ok(ReadResponse::Block(None)) => Err(Status::not_found("block not found")),
+            Ok(ReadResponse::RawBlock(None)) => Err(Status::not_found("block not found")),
             Ok(_) => unreachable!("unexpected response type from ReadStateService"),
             Err(error) => Err(Status::unavailable(format!(
                 "failed to read block: {error}"

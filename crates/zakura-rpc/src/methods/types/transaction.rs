@@ -61,7 +61,7 @@ where
     FeeConstraint: amount::Constraint + Clone + Copy,
 {
     /// The hex-encoded serialized data for this transaction.
-    #[serde(with = "hex")]
+    #[serde(with = "crate::methods::hex_data")]
     #[getset(get = "pub")]
     pub(crate) data: SerializedTransaction,
 
@@ -470,7 +470,7 @@ pub struct TransactionObject {
     #[getset(get_copy = "pub")]
     pub(crate) in_active_chain: Option<bool>,
     /// The raw transaction, encoded as hex bytes.
-    #[serde(with = "hex")]
+    #[serde(with = "crate::methods::hex_data")]
     #[getset(get = "pub")]
     pub(crate) hex: SerializedTransaction,
     /// The height of the block in the best chain that contains the tx, -1 if
@@ -641,7 +641,7 @@ pub enum Input {
     /// A coinbase input.
     Coinbase {
         /// The coinbase scriptSig as hex.
-        #[serde(with = "hex")]
+        #[serde(with = "crate::methods::hex_data")]
         coinbase: Vec<u8>,
         /// The script sequence number.
         sequence: u32,
@@ -1165,7 +1165,6 @@ impl Default for TransactionObject {
 impl TransactionObject {
     /// Converts `tx` and `height` into a verbose
     /// [`GetRawTransactionResponse`](crate::methods::GetRawTransactionResponse).
-    #[allow(clippy::unwrap_in_result)]
     #[allow(clippy::too_many_arguments)]
     pub fn from_transaction(
         tx: impl AsRef<Transaction>,
@@ -1178,9 +1177,40 @@ impl TransactionObject {
         txid: transaction::Hash,
     ) -> Self {
         let tx = tx.as_ref();
+        Self::from_serialized_transaction(
+            tx,
+            tx.into(),
+            height,
+            confirmations,
+            network,
+            block_time,
+            block_hash,
+            in_active_chain,
+            txid,
+        )
+    }
+
+    /// Converts `tx` like [`Self::from_transaction`], using `hex` as its Zcash
+    /// consensus serialization instead of serializing it again.
+    ///
+    /// `hex` must be the serialization of `tx`.
+    #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_serialized_transaction(
+        tx: impl AsRef<Transaction>,
+        hex: SerializedTransaction,
+        height: Option<block::Height>,
+        confirmations: Option<i64>,
+        network: &Network,
+        block_time: Option<DateTime<Utc>>,
+        block_hash: Option<block::Hash>,
+        in_active_chain: Option<bool>,
+        txid: transaction::Hash,
+    ) -> Self {
+        let tx = tx.as_ref();
         let block_time = block_time.map(|bt| bt.timestamp());
         Self {
-            hex: tx.into(),
+            hex,
             height: if in_active_chain.unwrap_or_default() {
                 height.map(|height| height.0 as i32)
             } else if block_hash.is_some() {

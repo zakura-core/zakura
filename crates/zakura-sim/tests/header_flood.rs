@@ -18,7 +18,7 @@ use zakura_sim::{
         },
         header_sync::{
             storage_config, storage_properties, storage_sources, Dialer, MirrorSpec, Ports,
-            Storage, StorageScenario, StorageView,
+            Storage, StorageScenario, StorageView, Weights,
         },
         run_prepared, Subsystem,
     },
@@ -132,6 +132,7 @@ fn scenario(controls: Vec<ControlStep>) -> StorageScenario {
         }],
         policy: Policy::converging(),
         controls,
+        weights: Weights::default(),
     }
 }
 

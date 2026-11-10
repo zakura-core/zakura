@@ -15,26 +15,29 @@
 //! Six properties read it:
 //! - [`PAYLOAD_INVENTORY_AGREES`]: every captured runtime payload has a policy entry;
 //! - [`RETAINED_BYTE_BOUND`]: retained wire bytes stay within
-//!   `L + 401·b + Q·b`, after every step;
-//! - [`RESERVED_BYTE_BOUND`]: the byte budget stays within `M + 2·B + h·B`,
-//!   after every step, where `h` counts the charged handoffs open then, at
-//!   most one per live routine and none at rest (D2 in the lane 3 plan);
+//!   `L + 401·b + Q·b`, after every step, where `b` is the fixture's
+//!   largest body;
+//! - [`RESERVED_BYTE_BOUND`]: the byte budget stays within
+//!   `M + 2·k·B + h·B`, after every step, where `h` counts the charged
+//!   handoffs open then, at most one per live routine and none at rest (D2
+//!   in the lane 3 plan);
 //! - [`BUDGET_LEDGERS_AGREE`]: at rest, no handoff is open, and the byte
 //!   budget equals both the work queue's reserved tally and the routines'
 //!   unreceived estimates;
 //! - [`LOOKAHEAD_OVERSHOOT_BOUND`]: at rest, above-window retained bytes
 //!   plus outstanding above-window estimates stay within
-//!   `L + H + (W + 1)·B`;
+//!   `L + H + (W + 1)·k·B`;
 //! - [`TEARDOWN_RETURNS_BASELINE`]: once every peer has left, every
 //!   routine has ended and the sequencer's input queue is empty, at rest,
 //!   every charge is back to zero, serving leases and session slots
 //!   included.
 //!
-//! D2's `2·B` assumes each request asks for one body
+//! `B` is [`ESTIMATE_CEILING`], and `k` is
+//! `advertised_max_blocks_per_response()`, the most bodies one request asks
+//! for. D2's `2·B` assumes each request asks for one body
 //! (`BS_BLOCKS_PER_RESPONSE = 1`). [`Limits::reserved_bound`] and
-//! [`Limits::lookahead_bound`] allow one request's estimate,
-//! `advertised_max_blocks_per_response()·B`, per term, so the bounds stay
-//! sound if that constant grows.
+//! [`Limits::lookahead_bound`] allow one request's estimate, `k·B`, per
+//! term, so the bounds stay sound if that constant grows.
 //!
 //! Each check records its quantities' peaks in the run's report, since
 //! properties.md asks the report for each allowance's largest value.
@@ -201,6 +204,31 @@ impl Limits {
         self.lookahead
             .saturating_add(bodies.saturating_mul(self.largest_body))
     }
+}
+
+/// [`Limits::retained_bound`]'s formula, as a literal for `concat!`. The
+/// claim and the violation text of [`RETAINED_BYTE_BOUND`] both state it.
+macro_rules! retained_formula {
+    () => {
+        "L + 401·b + Q·b"
+    };
+}
+
+/// [`Limits::reserved_bound`]'s formula, as a literal for `concat!`. The
+/// claim and the violation text of [`RESERVED_BYTE_BOUND`] both state it.
+macro_rules! reserved_formula {
+    () => {
+        "M + 2·k·B + h·B"
+    };
+}
+
+/// [`Limits::lookahead_bound`]'s formula, as a literal for `concat!`. The
+/// claim and the violation text of [`LOOKAHEAD_OVERSHOOT_BOUND`] both state
+/// it.
+macro_rules! lookahead_formula {
+    () => {
+        "L + H + (W + 1)·k·B"
+    };
 }
 
 /// A holder of one retained body, by the tap's allocation number or the
@@ -1201,7 +1229,7 @@ where
     S::View: OwnerView,
 {
     const ID: &'static str = RETAINED_BYTE_BOUND;
-    const CLAIM: &'static str = "retained wire bytes stay within L + 401·B + Q·B";
+    const CLAIM: &'static str = concat!("retained wire bytes stay within ", retained_formula!());
     const UNIT: Unit = Unit::WireBytes;
     const NEEDS: &'static [Source] = &[Source::View];
     const WITNESS: fn(&ObservationLog) -> bool = commit_window_filled;
@@ -1234,7 +1262,11 @@ where
     fn violation(measured: &Measured<(), Self::Peaks>) -> (String, String) {
         (
             format!(
-                "the sequencer retains at most L + 401·b + Q·b = {} wire bytes",
+                concat!(
+                    "the sequencer retains at most ",
+                    retained_formula!(),
+                    " = {} wire bytes"
+                ),
                 measured.limit
             ),
             format!("it retains {}", measured.quantity),
@@ -1261,7 +1293,7 @@ where
     S::View: OwnerView,
 {
     const ID: &'static str = RESERVED_BYTE_BOUND;
-    const CLAIM: &'static str = "reserved request bytes stay within M + 2·B + h·B";
+    const CLAIM: &'static str = concat!("reserved request bytes stay within ", reserved_formula!());
     const UNIT: Unit = Unit::EstimateBytes;
     const NEEDS: &'static [Source] = &[Source::View];
     const WITNESS: fn(&ObservationLog) -> bool = budget_charged;
@@ -1310,9 +1342,12 @@ where
         } = &measured.terms;
         (
             format!(
-                "the byte budget counts at most M + 2·k·B + h·B = {} bytes, with M = {}, \
-                 k = {} and h = {handoffs}",
-                measured.limit, limits.budget, limits.per_request
+                concat!(
+                    "the byte budget counts at most ",
+                    reserved_formula!(),
+                    " = {} bytes, with M = {}, k = {} and h = {}"
+                ),
+                measured.limit, limits.budget, limits.per_request, handoffs
             ),
             format!("it counts {}, with {open} handoffs open", measured.quantity),
         )
@@ -1385,8 +1420,11 @@ where
     S::View: OwnerView,
 {
     const ID: &'static str = LOOKAHEAD_OVERSHOOT_BOUND;
-    const CLAIM: &'static str = "at rest, above-window retained bytes plus outstanding \
-                                 above-window estimates stay within L + H + (W + 1)·B";
+    const CLAIM: &'static str = concat!(
+        "at rest, above-window retained bytes plus outstanding above-window estimates \
+         stay within ",
+        lookahead_formula!()
+    );
     const UNIT: Unit = Unit::WireBytes;
     const NEEDS: &'static [Source] = &[Source::View, Source::Schedule];
     const WITNESS: fn(&ObservationLog) -> bool = above_window_requested;
@@ -1429,8 +1467,11 @@ where
         let LookaheadTerms { limits, quantities } = &measured.terms;
         (
             format!(
-                "above-window bytes R + E stay within L + H + (W + 1)·k·B = {}, with \
-                 L = {}, H = {}, W = {} and k = {}",
+                concat!(
+                    "above-window bytes R + E stay within ",
+                    lookahead_formula!(),
+                    " = {}, with L = {}, H = {}, W = {} and k = {}"
+                ),
                 measured.limit,
                 limits.lookahead,
                 quantities.hint_error,

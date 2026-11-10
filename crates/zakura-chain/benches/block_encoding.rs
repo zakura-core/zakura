@@ -6,7 +6,9 @@
 //! and `sha256d` passes over the same bytes give a floor to compare against.
 //!
 //! Set `ZAKURA_BENCH_BLOCK_BYTES` to a comma-separated list of target sizes.
-//! The default is `1000000,2000000`.
+//! The default is `1000000,2000000`. Blocks above `MAX_BLOCK_BYTES` are decoded
+//! as a header and a transaction list, which have no block-size limit, so the
+//! per-pass costs of larger proposed limits can be measured directly.
 
 // Disabled due to warnings in criterion macros
 #![allow(missing_docs)]
@@ -16,7 +18,7 @@ use std::{hint::black_box, io::Cursor, sync::Arc};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use zakura_chain::{
-    block::{merkle, Block},
+    block::{merkle, Block, Header, MAX_BLOCK_BYTES},
     parameters::NetworkUpgrade,
     serialization::{sha256d, ZcashDeserialize, ZcashSerialize},
     transaction::{Transaction, UnminedTx},
@@ -57,6 +59,18 @@ fn synthetic_block(target_bytes: usize, pool: &[Arc<Transaction>]) -> Block {
     block
 }
 
+/// Decodes `bytes` as a block, without the consensus block-size limit.
+fn decode_unbounded(mut bytes: &[u8]) -> Block {
+    let header = Header::zcash_deserialize_from_slice(&mut bytes).expect("valid header");
+    let transactions =
+        Vec::<Arc<Transaction>>::zcash_deserialize_from_slice(&mut bytes).expect("valid list");
+    assert!(bytes.is_empty(), "the block fills the bytes");
+    Block {
+        header: Arc::new(header),
+        transactions,
+    }
+}
+
 fn block_targets() -> Vec<usize> {
     std::env::var("ZAKURA_BENCH_BLOCK_BYTES")
         .unwrap_or_else(|_| "1000000,2000000".to_string())
@@ -93,22 +107,31 @@ fn block_encoding(c: &mut Criterion) {
             &bytes,
             |b, bytes| b.iter(|| black_box(hex::encode(bytes))),
         );
+        if bytes.len() <= MAX_BLOCK_BYTES as usize {
+            group.bench_with_input(
+                BenchmarkId::new("deserialize_slice", &label),
+                &bytes,
+                |b, bytes| {
+                    b.iter(|| {
+                        let mut slice = bytes.as_slice();
+                        black_box(Block::zcash_deserialize_from_slice(&mut slice).expect("valid"))
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("deserialize_cursor", &label),
+                &bytes,
+                |b, bytes| {
+                    b.iter(|| {
+                        black_box(Block::zcash_deserialize(Cursor::new(bytes)).expect("valid"))
+                    })
+                },
+            );
+        }
         group.bench_with_input(
-            BenchmarkId::new("deserialize_slice", &label),
+            BenchmarkId::new("deserialize_unbounded", &label),
             &bytes,
-            |b, bytes| {
-                b.iter(|| {
-                    let mut slice = bytes.as_slice();
-                    black_box(Block::zcash_deserialize_from_slice(&mut slice).expect("valid"))
-                })
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("deserialize_cursor", &label),
-            &bytes,
-            |b, bytes| {
-                b.iter(|| black_box(Block::zcash_deserialize(Cursor::new(bytes)).expect("valid")))
-            },
+            |b, bytes| b.iter(|| black_box(decode_unbounded(bytes))),
         );
         group.bench_with_input(BenchmarkId::new("serialize", &label), &block, |b, block| {
             b.iter(|| black_box(block.zcash_serialize_to_vec().expect("vec writes succeed")))

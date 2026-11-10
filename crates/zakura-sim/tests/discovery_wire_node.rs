@@ -13,23 +13,30 @@
 //! requests.
 #![cfg(zakura_sim)]
 
-use zakura_network::zakura::{
-    MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES, ZAKURA_CAP_DISCOVERY,
-    ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
+mod support;
+
+use support::steer::{before, steer, Steer};
+use zakura_chain::parameters::Network;
+use zakura_network::{
+    zakura::{
+        ZakuraLocalLimits, MSG_DISCOVERY_PEERS, MSG_DISCOVERY_SERVICES, ZAKURA_CAP_DISCOVERY,
+        ZAKURA_DISCOVERY_STREAM_VERSION, ZAKURA_STREAM_DISCOVERY,
+    },
+    Config,
 };
 use zakura_sim::{
     harness::{
         discovery_service::{spawn, NodeSpec},
         header_sync::wire_config,
-        NetScenario,
+        LinkEntry, LinkSpec, NetScenario,
     },
     model::Label,
-    observe::TransportFact,
+    observe::{DatagramOutcome, TransportFact},
     peer::{
         discovery::{Answer, DiscoveryScript, Hold, Request},
-        peer_addr, PeerAction, PeerSpec,
+        peer_addr, PeerAction, PeerSpec, NODE_ADDR,
     },
-    MemorySink, NoChecks, Observation, Plan, RunReport, Sim,
+    Checker, MemorySink, NoChecks, Observation, Plan, PlanInput, RunReport, Sim, StepCtx,
 };
 
 /// The tasks production's discovery startup and sessions spawn, by label:
@@ -304,6 +311,209 @@ fn the_node_dials_a_listening_static_candidate() {
                 .iter()
                 .all(|cause| cause == "discovery_exchange_complete"),
         "{closes:?}"
+    );
+}
+
+/// The node's datagrams to `peer` that [`a_redial_the_peer_never_handled`]
+/// drops, by ID on their link, from the log entries `entries`. Each redial
+/// after the node tore its first connection from `peer` down starts with a
+/// client Initial, padded to at least 1,200 bytes, and the redial's later
+/// datagrams are dropped until the node ends it with a registration or a
+/// failed dial. The first redial the node ends with a refused handshake is
+/// the last one dropped.
+fn dropped_redial(entries: &[zakura_sim::observe::Entry], peer: std::net::SocketAddr) -> Vec<u64> {
+    let remote = peer.to_string();
+    let to_peer = format!("{NODE_ADDR}->{peer}");
+    let mut torn_down = false;
+    let mut redialing = false;
+    let mut dropped = Vec::new();
+    for entry in entries {
+        match &entry.obs {
+            Observation::Transport {
+                remote: from,
+                event,
+                ..
+            } if *from == remote => match event {
+                TransportFact::TornDown => torn_down = true,
+                TransportFact::HandshakeRefused { .. } if redialing => return dropped,
+                TransportFact::Registered | TransportFact::DialFailed { .. } => redialing = false,
+                _ => {}
+            },
+            Observation::Datagram {
+                id,
+                link,
+                len,
+                outcome: DatagramOutcome::Sent,
+                ..
+            } if *link == to_peer && torn_down => {
+                if redialing {
+                    dropped.push(*id);
+                } else if *len >= 1_200 {
+                    redialing = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    dropped
+}
+
+/// The production QUIC handshake timeout a listening peer accepts with,
+/// from the config the wire node builds.
+fn handshake_timeout_ns() -> u64 {
+    let config = Config {
+        network: Network::new_regtest(Default::default()),
+        ..Config::default()
+    };
+    let timeout = ZakuraLocalLimits::from_config(&config)
+        .quic
+        .handshake_timeout()
+        .expect("production sets a handshake timeout");
+    u64::try_from(timeout.as_nanos()).expect("seconds fit u64 nanoseconds")
+}
+
+/// The node redials `peer-0`, which listens, and a focused Plan drops every
+/// datagram the node sends on the redial after its first Initial, until the
+/// node refuses the redial's handshake, at least the peer's QUIC
+/// handshake timeout after the redial's Initial. The peer's flight reaches the node, so the node's QUIC
+/// handshake completes, but the node's last flight never reaches the peer,
+/// whose handshake ends before `Acceptor::handle`. So the node refuses
+/// a handshake the peer never counted as a connection. The node's next
+/// connection to the peer registers, the exchange completes on it, and the
+/// peer's frames are placed on it.
+///
+/// This fails with `UnplacedRecord` if the node and the peer count the
+/// peer's connections apart (#2160), and if the drops, the refusal or the
+/// next connection never happened.
+#[test]
+fn a_redial_the_peer_never_handled() {
+    let peer = peer_addr(0, 0);
+    let net = NetScenario {
+        links: vec![LinkEntry {
+            src: NODE_ADDR,
+            dst: peer,
+            model: LinkSpec {
+                loss_budget: 64,
+                ..LinkSpec::default()
+            },
+        }],
+        loss_after_admission: true,
+        ..NetScenario::default()
+    };
+    let peers = [discovering(
+        PeerSpec::listening(),
+        DiscoveryScript::default(),
+    )];
+    let to_peer = format!("{NODE_ADDR}->{peer}");
+    let rule = |cx: &StepCtx<'_>| {
+        let drop = dropped_redial(before(cx), peer)
+            .into_iter()
+            .map(|id| format!("drop:{to_peer}:{id}"))
+            .find(|drop| cx.enabled.iter().any(|e| e.identity.to_string() == *drop));
+        Ok(drop.map_or(Steer::Fine, Steer::Pick))
+    };
+    let (report, ..) = steer(
+        Plan::from_fuzz(&[]),
+        &rule,
+        &mut |plan: PlanInput, checker: &mut dyn Checker| {
+            let mut sim = Sim::new(wire_config(), plan);
+            spawn(
+                &mut sim,
+                &net,
+                &NodeSpec {
+                    verification_slots: 1,
+                    static_candidates: vec![0],
+                    peer_sample_limit: None,
+                },
+                &peers,
+            );
+            let mut sink = MemorySink::default();
+            let report = sim.run(checker, &mut sink);
+            (report, sink.lines())
+        },
+    );
+    assert_eq!(report.end.harness, None, "{:?}", report.end);
+    let entries = report.log.entries();
+    let dropped = dropped_redial(entries, peer);
+    assert!(!dropped.is_empty(), "no redial datagram was dropped");
+    for id in &dropped {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(&entry.obs, Observation::Datagram {
+                id: lost,
+                link,
+                outcome: DatagramOutcome::Lost,
+                ..
+            } if lost == id && *link == to_peer)),
+            "the node's datagram {id} to the peer wasn't dropped"
+        );
+    }
+    let remote = peer.to_string();
+    let refused = entries
+        .iter()
+        .position(|entry| {
+            matches!(&entry.obs, Observation::Transport {
+                remote: from,
+                event: TransportFact::HandshakeRefused { .. },
+                ..
+            } if *from == remote)
+        })
+        .expect("the node refused the redial's handshake");
+    // The redial's Initial is the node's datagram to the peer just before
+    // the first one dropped.
+    let initial = dropped[0] - 1;
+    let initial_at = entries
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Datagram {
+                id,
+                link,
+                outcome: DatagramOutcome::Sent,
+                sent_at,
+                ..
+            } if *id == initial && *link == to_peer => Some(*sent_at),
+            _ => None,
+        })
+        .expect("the node sent the redial's Initial");
+    let refused_at = entries[..refused]
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.obs {
+            Observation::TimeAdvanced { to_ns, .. } => Some(to_ns),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        refused_at - initial_at >= handshake_timeout_ns(),
+        "the node refused the redial {} ns after its Initial",
+        refused_at - initial_at
+    );
+    let next = entries[refused..]
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::Transport {
+                connection: Some(connection),
+                remote: from,
+                event: TransportFact::Registered,
+                ..
+            } if *from == remote => Some(*connection),
+            _ => None,
+        })
+        .expect("the node registered a connection after the refusal");
+    let rows: Vec<_> = peer_frames(&report)
+        .into_iter()
+        .filter(|(on, ..)| *on == next)
+        .map(|(_, row, label)| (row, label))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("hello".to_owned(), "conformant"),
+            ("peers".to_owned(), "conformant"),
+            ("services".to_owned(), "conformant")
+        ],
+        "connection {next}"
     );
 }
 

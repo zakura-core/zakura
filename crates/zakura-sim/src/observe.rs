@@ -2117,6 +2117,21 @@ pub enum TransitionFact {
         /// Bytes the grant adds.
         bytes: u32,
     },
+    /// The node's serving counted the commitment of a request it admits,
+    /// before it checked the count against the margin.
+    CommitmentCounted {
+        /// The request's position among the stream's reads, if it was
+        /// tagged.
+        seq: Option<u64>,
+        /// The request row's message type.
+        message_type: u16,
+    },
+    /// The node's serving released one commitment of a request row: the
+    /// request's ending entered the output, or the request was dropped.
+    CommitmentReleased {
+        /// The request row's message type.
+        message_type: u16,
+    },
 }
 
 /// The subscriber precheck's verdict, in [`TransitionFact::HeaderChecked`].

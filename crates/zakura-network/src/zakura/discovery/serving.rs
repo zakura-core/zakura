@@ -150,6 +150,21 @@ impl ServingCapacity {
 }
 
 impl Serving {
+    /// Reports each commitment of `recv`'s requests on its stream's tap, if
+    /// it has one, with the frame each admitted request was read as. Call it
+    /// before `recv`'s reader can read a frame.
+    #[cfg(any(test, zakura_sim))]
+    pub(super) fn observe(&self, recv: &crate::zakura::FramedRecv) {
+        let Some(tap) = recv.stream_tap() else {
+            return;
+        };
+        tap.tag_frames();
+        self.get_peers
+            .observe_with(tap.clone(), GET_PEERS.message_type);
+        self.get_services
+            .observe_with(tap.clone(), GET_SERVICES.message_type);
+    }
+
     /// Waits until this session has written every answer it admitted.
     pub(super) fn answers_written(&self) -> AnswersWritten {
         AnswersWritten([

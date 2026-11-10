@@ -58,7 +58,7 @@ use crate::{
     evidence::{Checkpoint, EvidenceId, EvidenceKind, LiveEvidence},
     net::Net,
     observe::{HeaderCheckFact, SessionStepFact, TransitionFact, TransportFact, TransportLimits},
-    peer::{key_index, peer_addr, peer_of, NODE_ADDR},
+    peer::{key_index, peer_addr, peer_of, SharedIds, NODE_ADDR},
     ActionSource, Boundary, Identity, Observation, ObservationLog, Sim,
 };
 
@@ -252,6 +252,9 @@ pub struct TransportTap {
     peers: Vec<String>,
     /// Each registered connection's remote address.
     remotes: BTreeMap<u64, SocketAddr>,
+    /// Where it hands over the shared ID of each `registered` and
+    /// `handshake-refused` event it logs.
+    shared_ids: SharedIds,
 }
 
 /// What the observer and the reader share.
@@ -411,6 +414,7 @@ impl TransportTap {
             net,
             peers,
             remotes: BTreeMap::new(),
+            shared_ids: SharedIds::default(),
         };
         (observer, tap)
     }
@@ -418,6 +422,12 @@ impl TransportTap {
     /// The reporter the wire node's dials fail into.
     pub fn dials(&self) -> DialReporter {
         DialReporter(self.state.clone())
+    }
+
+    /// Where it hands over the shared ID of each `registered` and
+    /// `handshake-refused` event it logs, for the peers' evidence.
+    pub(crate) fn shared_ids(&self) -> SharedIds {
+        self.shared_ids.clone()
     }
 
     /// The remote address of registered connection `conn_id`.
@@ -435,10 +445,12 @@ impl TransportTap {
             .ok_or_else(|| format!("AmbiguousIdentity: no peer binds {remote}"))
     }
 
-    /// `event` as its connection, remote address and plain fields. A
-    /// `registered` event records its connection's address first.
+    /// `event`, numbered `seq`, as its connection, remote address and plain
+    /// fields. A `registered` event records its connection's address first.
+    /// It and a `handshake-refused` event hand over their shared ID.
     fn fact(
         &mut self,
+        seq: u64,
         event: Reported,
     ) -> Result<(Option<u64>, SocketAddr, TransportFact), String> {
         let event = match event {
@@ -462,15 +474,25 @@ impl TransportTap {
                     negotiated,
                 },
             ),
-            TransportEvent::HandshakeRefused { remote, reason } => {
+            TransportEvent::HandshakeRefused {
+                remote,
+                shared_id,
+                reason,
+            } => {
+                self.shared_ids.borrow_mut().insert(seq, shared_id);
                 (None, remote, TransportFact::HandshakeRefused { reason })
             }
-            TransportEvent::Registered { conn_id, remote } => {
+            TransportEvent::Registered {
+                conn_id,
+                remote,
+                shared_id,
+            } => {
                 if self.remotes.insert(conn_id, remote).is_some() {
                     return Err(format!(
                         "AmbiguousIdentity: connection {conn_id} registered twice"
                     ));
                 }
+                self.shared_ids.borrow_mut().insert(seq, shared_id);
                 (Some(conn_id), remote, TransportFact::Registered)
             }
             TransportEvent::Admitted {
@@ -739,6 +761,12 @@ fn transition(transition: Transition) -> Result<TransitionFact, String> {
             objects,
             bytes,
         },
+        Transition::CommitmentCounted { seq, message_type } => {
+            TransitionFact::CommitmentCounted { seq, message_type }
+        }
+        Transition::CommitmentReleased { message_type } => {
+            TransitionFact::CommitmentReleased { message_type }
+        }
         unknown => return Err(format!("UnknownEvent: the tap can't encode {unknown:?}")),
     })
 }
@@ -770,7 +798,7 @@ impl ActionSource for TransportTap {
         let last = events.last().map_or(self.delivered, |(seq, _)| *seq);
         let mut sent = Vec::with_capacity(events.len());
         for (seq, event) in events {
-            let (connection, remote, event) = self.fact(event)?;
+            let (connection, remote, event) = self.fact(seq, event)?;
             let session = match (&event, connection) {
                 (
                     TransportFact::Admitted {

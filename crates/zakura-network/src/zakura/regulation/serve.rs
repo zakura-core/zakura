@@ -221,6 +221,32 @@ pub(crate) enum OutputOrder {
 struct Commitments {
     open: AtomicU32,
     limit: AtomicU32,
+    /// The stream's tap and the row's message type, once the service attaches
+    /// them, which report each change of `open`.
+    #[cfg(any(test, zakura_sim))]
+    tap: std::sync::OnceLock<(Arc<crate::zakura::StreamTap>, u16)>,
+}
+
+#[cfg(any(test, zakura_sim))]
+impl Commitments {
+    /// Reports that the request the service handles now was counted.
+    fn counted(&self) {
+        if let Some((tap, message_type)) = self.tap.get() {
+            tap.regulated(crate::zakura::Transition::CommitmentCounted {
+                seq: tap.serving(),
+                message_type: *message_type,
+            });
+        }
+    }
+
+    /// Reports that one commitment was released.
+    fn released(&self) {
+        if let Some((tap, message_type)) = self.tap.get() {
+            tap.regulated(crate::zakura::Transition::CommitmentReleased {
+                message_type: *message_type,
+            });
+        }
+    }
 }
 
 /// Whether `open` commitments, this request's included, exceed `limit` within
@@ -254,6 +280,8 @@ impl Commitment {
     fn release(&mut self) {
         if let Some(counts) = self.0.take() {
             counts.open.fetch_sub(1, Ordering::AcqRel);
+            #[cfg(any(test, zakura_sim))]
+            counts.released();
         }
     }
 }
@@ -416,6 +444,8 @@ impl ServeCapacity {
             commitments: Arc::new(Commitments {
                 open: AtomicU32::new(0),
                 limit: AtomicU32::new(0),
+                #[cfg(any(test, zakura_sim))]
+                tap: std::sync::OnceLock::new(),
             }),
             unwritten: Arc::new(watch::Sender::new(0)),
             max_in_flight: self.max_in_flight,
@@ -469,6 +499,8 @@ impl<P: Produce> Serve<P> {
         completed: Option<Completion>,
     ) -> Result<(), ServeViolation> {
         let open = self.commitments.open.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(any(test, zakura_sim))]
+        self.commitments.counted();
         let commitment = Commitment(Some(self.commitments.clone()), completed);
         let limit = self.commitments.limit.load(Ordering::Acquire);
         if commitment_over_limit(open, limit)? {
@@ -505,6 +537,14 @@ impl<P: Produce> Serve<P> {
     #[cfg(any(test, zakura_sim))]
     pub(crate) fn open(&self) -> u32 {
         self.commitments.open.load(Ordering::Acquire)
+    }
+
+    /// Reports each commitment this session counts and releases on `tap`,
+    /// as the request row `message_type`'s. Only the first call attaches
+    /// one.
+    #[cfg(any(test, zakura_sim))]
+    pub(crate) fn observe_with(&self, tap: Arc<crate::zakura::StreamTap>, message_type: u16) {
+        let _ = self.commitments.tap.set((tap, message_type));
     }
 }
 

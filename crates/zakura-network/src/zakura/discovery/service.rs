@@ -583,6 +583,9 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         connection_cancel.clone(),
         close_cause.clone(),
     );
+    // Before the queries attach their precheck, which lets the reader read.
+    #[cfg(any(test, zakura_sim))]
+    serving.observe(&recv);
     let answers = serving.answers_written();
     let queries = Queries::new(
         query_pool,
@@ -1022,6 +1025,7 @@ mod tests {
             Some(anchor),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
+            crate::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
         );
         spawn_header_sync_reactor(startup).map_err(Into::into)
     }

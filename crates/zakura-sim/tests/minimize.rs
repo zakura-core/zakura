@@ -230,8 +230,13 @@ const ORIGINAL: [u8; 6] = [0, 7, 1, 9, 9, 9];
 
 /// Confirms `input` against `property` in a new directory.
 fn run(input: &[u8], property: &str) -> (Confirmation, TempDir) {
+    run_allowing(input, property, &[])
+}
+
+/// [`run`], expecting `also_violates` beside `property`.
+fn run_allowing(input: &[u8], property: &str, also_violates: &[String]) -> (Confirmation, TempDir) {
     let dir = TempDir::new().unwrap();
-    let confirmation = confirm(&PLANTED, input, property, dir.path()).unwrap();
+    let confirmation = confirm(&PLANTED, input, property, also_violates, dir.path()).unwrap();
     (confirmation, dir)
 }
 
@@ -324,6 +329,16 @@ fn incomplete_evidence_is_rejected() {
 fn several_failures_keep_every_report() {
     let (both, _dir) = run(&[4, 7, 1], A);
     assert_eq!(both.status, ConfirmStatus::SelectionUnsupported, "{both:?}");
+    let violated: Vec<_> = both.violated.iter().map(|v| v.property.as_str()).collect();
+    assert_eq!(violated, [A, B]);
+}
+
+/// The same input confirms against [`A`] when [`B`] is an expected
+/// co-violation, as a planted case's `also_violates` lists it.
+#[test]
+fn a_listed_co_violation_is_expected() {
+    let (both, _dir) = run_allowing(&[4, 7, 1], A, &[B.to_owned()]);
+    assert_eq!(both.status, ConfirmStatus::Confirmed, "{both:?}");
     let violated: Vec<_> = both.violated.iter().map(|v| v.property.as_str()).collect();
     assert_eq!(violated, [A, B]);
 }

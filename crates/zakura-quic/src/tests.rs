@@ -239,6 +239,25 @@ async fn dial_authenticates_both_sides_and_echoes() {
     .unwrap();
 }
 
+/// Both ends of a connection read the same shared ID, and a second
+/// connection between the same endpoints reads another.
+#[tokio::test]
+async fn both_ends_of_a_connection_share_its_id() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        let mut server = server();
+        let client = client();
+        let first = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let first_inbound = server.handled.recv().await.unwrap();
+        let second = client.connect(server.addr(), &[ALPN]).await.unwrap();
+        let second_inbound = server.handled.recv().await.unwrap();
+        assert_eq!(first.shared_id(), first_inbound.shared_id());
+        assert_eq!(second.shared_id(), second_inbound.shared_id());
+        assert_ne!(first.shared_id(), second.shared_id());
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn many_concurrent_streams_keep_their_data_apart() {
     tokio::time::timeout(TEST_TIMEOUT, async {

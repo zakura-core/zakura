@@ -1143,7 +1143,7 @@ impl StateCollector {
                 hit(StateFeature::Retired(Retirement::ConnectionTornDown));
             }
             TransportFact::Regulated { transition, .. } => {
-                hit(StateFeature::Transition(match transition {
+                let feature = match transition {
                     TransitionFact::OpenIssued { .. } => Transition::OpenIssued,
                     TransitionFact::OpenRetracted { .. } => Transition::OpenRetracted,
                     TransitionFact::GrantIssued { .. } => Transition::GrantIssued,
@@ -1158,7 +1158,11 @@ impl StateCollector {
                         HeaderCheckFact::AdmittedTerminal => Transition::HeaderTerminal,
                         HeaderCheckFact::Refused { reason } => Transition::refused(reason),
                     },
-                }));
+                    // Serving commitments are no subscription state.
+                    TransitionFact::CommitmentCounted { .. }
+                    | TransitionFact::CommitmentReleased { .. } => return,
+                };
+                hit(StateFeature::Transition(feature));
             }
             _ => {}
         }

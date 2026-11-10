@@ -99,6 +99,7 @@ fn startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         Some(anchor),
         ZakuraHeaderSyncConfig::default(),
         LOCAL_MAX_MESSAGE_BYTES,
+        zakura_network::zakura::DEFAULT_ZAKURA_MAX_CONNECTIONS,
     );
     startup.header_chain_port = Arc::new(InertHeaderChainPort);
     startup.shutdown = shutdown;
@@ -1222,6 +1223,9 @@ fn a_connection_is_observed_from_handshake_to_admission() {
     let TransportEvent::Admitted { session_id, .. } = events[4] else {
         panic!("the header stream is admitted once its member arrives: {events:?}");
     };
+    let TransportEvent::Registered { shared_id, .. } = events[1] else {
+        panic!("the connection registers after its handshake: {events:?}");
+    };
     assert_eq!(
         events,
         vec![
@@ -1234,6 +1238,7 @@ fn a_connection_is_observed_from_handshake_to_admission() {
             TransportEvent::Registered {
                 conn_id,
                 remote: peer_addr(),
+                shared_id,
             },
             TransportEvent::StreamRefused {
                 conn_id,

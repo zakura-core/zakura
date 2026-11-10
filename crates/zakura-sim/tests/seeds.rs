@@ -5,6 +5,7 @@
 mod support;
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -19,7 +20,9 @@ use zakura_sim::{
         fixtures::{PickScenario, Variant, Which},
         header_sync::{FloodScenario, RepairScenario, StorageScenario, WakeScenario},
         wire_plans::SavedPlan,
+        HARNESSES,
     },
+    planted,
     seed::{self, SeedError, SeedKind, SeedReport},
 };
 
@@ -189,59 +192,67 @@ fn committed_seeds_record_their_intended_scenarios() {
 
 /// Each planted case's committed input is a seed whose sidecar carries a
 /// witness of the case's property expecting `holds`, as `cargo xtask
-/// planted` checks it unpatched.
+/// planted` checks it unpatched. The test reads every case file at any
+/// depth under `qa/planted/`, and each must sit beside a patch the runner
+/// finds, so no case escapes either. Each case's property is one a
+/// harness reports.
 #[test]
 fn planted_inputs_carry_their_witnesses() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let catalogue = root.join(planted::PLANTED_DIR);
     let report = load(&[fixtures()], None);
-    let mut cases = 0;
-    for family in fs::read_dir(root.join("qa/planted")).unwrap() {
-        let family = family.unwrap().path();
-        if !family.is_dir() {
+    let reported: BTreeSet<String> = HARNESSES
+        .iter()
+        .flat_map(|entry| (entry.properties)())
+        .map(|property| property.id.to_string())
+        .collect();
+    let patches = planted::files(&catalogue, "patch").unwrap();
+    let cases = planted::files(&catalogue, "toml").unwrap();
+    assert_eq!(
+        cases.len(),
+        patches.len(),
+        "each case file has a patch, and each patch a case file"
+    );
+    for case in &cases {
+        assert!(
+            patches.contains(&case.with_extension("patch")),
+            "{}: the runner finds no patch beside it",
+            case.display()
+        );
+        let id = planted::property_id(&catalogue, case)
+            .unwrap_or_else(|| panic!("{}: no property", case.display()));
+        assert!(
+            reported.contains(&id),
+            "{}: no harness reports {id}",
+            case.display()
+        );
+        let table: toml::Table = toml::from_str(&fs::read_to_string(case).unwrap())
+            .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
+        // A typed case runs a committed scenario, not a seed.
+        if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
+            for file in ["scenario", "plan"] {
+                let path = typed[file].as_str().unwrap();
+                assert!(root.join(path).is_file(), "{}: no {path}", case.display());
+            }
             continue;
         }
-        for property in fs::read_dir(&family).unwrap() {
-            let property = property.unwrap().path();
-            for case in fs::read_dir(&property).unwrap() {
-                let case = case.unwrap().path();
-                if case.extension().is_none_or(|e| e != "toml") {
-                    continue;
-                }
-                cases += 1;
-                let id = format!(
-                    "{}/{}",
-                    family.file_name().unwrap().to_str().unwrap(),
-                    property.file_name().unwrap().to_str().unwrap()
-                );
-                let table: toml::Table = toml::from_str(&fs::read_to_string(&case).unwrap())
-                    .unwrap_or_else(|error| panic!("{}: {error}", case.display()));
-                // A typed case runs a committed scenario, not a seed.
-                if let Some(typed) = table.get("typed").and_then(toml::Value::as_table) {
-                    for file in ["scenario", "plan"] {
-                        let path = typed[file].as_str().unwrap();
-                        assert!(root.join(path).is_file(), "{}: no {path}", case.display());
-                    }
-                    continue;
-                }
-                let input = root.join(table["input"].as_str().unwrap());
-                let seed = report
-                    .admitted
-                    .iter()
-                    .find(|seed| seed.path == fixtures().join(input.file_name().unwrap()))
-                    .unwrap_or_else(|| panic!("{}: its input is no seed", case.display()));
-                assert!(
-                    seed.sidecar
-                        .witness
-                        .iter()
-                        .any(|witness| witness.property == id && witness.expect == "holds"),
-                    "{}: {} carries no `holds` witness of {id}",
-                    case.display(),
-                    seed.path.display()
-                );
-            }
-        }
+        let input = root.join(table["input"].as_str().unwrap());
+        let seed = report
+            .admitted
+            .iter()
+            .find(|seed| seed.path == fixtures().join(input.file_name().unwrap()))
+            .unwrap_or_else(|| panic!("{}: its input is no seed", case.display()));
+        assert!(
+            seed.sidecar
+                .witness
+                .iter()
+                .any(|witness| witness.property == id && witness.expect == "holds"),
+            "{}: {} carries no `holds` witness of {id}",
+            case.display(),
+            seed.path.display()
+        );
     }
-    assert!(cases > 0, "the planted cases are committed");
+    assert!(!cases.is_empty(), "the planted cases are committed");
 }
 
 /// A directory holding one seed, `seed.bin`, built from a committed seed.

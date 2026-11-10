@@ -380,6 +380,19 @@ impl Conn {
         self.inner.shared.stable_id
     }
 
+    /// An ID both ends of this connection derive from its TLS handshake, so
+    /// a test or the simulator can join what each end saw of it. Another
+    /// handshake gives another ID.
+    #[cfg(any(test, zakura_sim, feature = "test-support"))]
+    pub fn shared_id(&self) -> [u8; 16] {
+        *self
+            .inner
+            .shared
+            .shared_id
+            .get()
+            .expect("a Conn exists only once its handshake completed, which sets the ID")
+    }
+
     async fn request(
         &self,
         accepted: bool,

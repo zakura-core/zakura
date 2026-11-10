@@ -25,6 +25,100 @@ macro_rules! tap_end {
 pub(super) type PendingPortOperation =
     Pin<Box<dyn Future<Output = StorageOutcome> + Send + 'static>>;
 
+/// The reactor's in-flight storage calls, as one stream of their outcomes.
+///
+/// The VCT local operation owns a fatal deadline, so it's kept apart and
+/// polled directly before the rest. `FuturesUnordered` polls only futures its
+/// ready queue shows, and that queue can hide a woken future for a moment
+/// while another thread is mid-wake on it. A direct poll can't miss the
+/// operation's result.
+#[derive(Default)]
+pub(super) struct PortOperations {
+    /// The VCT local operation's call, while it runs.
+    vct_local: Option<PendingPortOperation>,
+    /// Every other call.
+    others: FuturesUnordered<PendingPortOperation>,
+}
+
+impl PortOperations {
+    /// Adds `operation`, the VCT local operation's call when `vct_local` is set.
+    ///
+    /// A VCT call still running from an operation the reactor already retired
+    /// joins the other calls.
+    pub(super) fn push(&mut self, operation: PendingPortOperation, vct_local: bool) {
+        if !vct_local {
+            self.others.push(operation);
+        } else if let Some(retired) = self.vct_local.replace(operation) {
+            self.others.push(retired);
+        }
+    }
+
+    /// The number of calls still running.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.others.len() + usize::from(self.vct_local.is_some())
+    }
+
+    /// Whether no call is running.
+    pub(super) fn is_empty(&self) -> bool {
+        self.vct_local.is_none() && self.others.is_empty()
+    }
+
+    /// The number of running calls other than the VCT local operation's.
+    pub(super) fn others_len(&self) -> usize {
+        self.others.len()
+    }
+
+    /// The VCT local operation's outcome, if it's ready now.
+    ///
+    /// Both probes run past a spent coop budget, which would otherwise hide a
+    /// ready outcome. See `a_spent_budget_hides_no_ready_completion`.
+    pub(super) fn ready_vct_local(&mut self) -> Option<StorageOutcome> {
+        let outcome = coop::unconstrained(self.vct_local.as_mut()?.as_mut()).now_or_never()?;
+        self.vct_local = None;
+        Some(outcome)
+    }
+
+    /// Another call's outcome, if the shared ready queue shows one now.
+    pub(super) fn ready_other(&mut self) -> Option<StorageOutcome> {
+        coop::unconstrained(self.others.next())
+            .now_or_never()
+            .flatten()
+    }
+}
+
+impl std::fmt::Debug for PortOperations {
+    /// Shows how many calls are running.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PortOperations")
+            .field("vct_local", &self.vct_local.is_some())
+            .field("others", &self.others.len())
+            .finish()
+    }
+}
+
+impl futures::Stream for PortOperations {
+    type Item = StorageOutcome;
+
+    /// Yields the VCT local operation's outcome first when it's ready, then
+    /// any other ready outcome. Ends only when no call is running.
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<StorageOutcome>> {
+        if let Some(operation) = self.vct_local.as_mut() {
+            if let std::task::Poll::Ready(outcome) = operation.as_mut().poll(cx) {
+                self.vct_local = None;
+                return std::task::Poll::Ready(Some(outcome));
+            }
+        }
+        match self.others.poll_next_unpin(cx) {
+            std::task::Poll::Ready(None) if self.vct_local.is_some() => std::task::Poll::Pending,
+            poll => poll,
+        }
+    }
+}
+
 /// The result of one direct header storage operation, with the identity that
 /// correlates it to the reactor's pending work.
 #[derive(Debug)]
@@ -549,13 +643,15 @@ impl HeaderSyncReactor {
                     }
                 }
             });
+        let vct_local = vct_local_operation.is_some();
         if let Some(operation) = vct_local_operation {
             self.state.vct_local_operation = Some(operation);
         }
         self.state.calls.accept(call);
         #[cfg(any(test, zakura_sim))]
         let operation = observe::PendingCall::new(operation, pending_tap);
-        self.pending_port_operations.push(Box::pin(operation));
+        self.pending_port_operations
+            .push(Box::pin(operation), vct_local);
         StorageDispatch::Started(call)
     }
 

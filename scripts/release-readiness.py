@@ -16,7 +16,15 @@ from pathlib import Path
 
 import changelog
 
-BLOCKS_PER_DAY = 1152
+# Mainnet's target block spacings in seconds, with the height each starts at,
+# mirroring `NetworkUpgrade::target_spacings`: 150 seconds from genesis, 75 from
+# Blossom, and 25 from the ZIP 259 NU7 activation. A self-test checks them
+# against the Rust sources.
+MAINNET_TARGET_SPACINGS = ((0, 150), (653_600, 75), (3_543_405, 25))
+# The fail-safe floor for ESTIMATED_RELEASE_HEIGHT is this many days of blocks
+# after the committed checkpoint.
+EOS_FLOOR_DAYS = 3
+REPO_ROOT = Path(__file__).resolve().parents[1]
 MINOR_CATEGORIES = {"Added", "Changed", "Deprecated", "Removed"}
 PATCH_WAIVABLE_CATEGORIES = {"Added", "Changed"}
 PATCH_WAIVER_PREFIX = "<!-- release-readiness: allow-patch"
@@ -235,11 +243,35 @@ def estimated_height(
         raise ReadinessError("bundle generation time is unexpectedly in the future")
 
     elapsed = max(timedelta(), now - generated_at) + timedelta(days=delay_days)
-    projected_blocks = math.ceil(elapsed.total_seconds() * BLOCKS_PER_DAY / 86400)
-    projected = bundle_height + projected_blocks
+    projected = bundle_height + blocks_after(bundle_height, elapsed.total_seconds())
     if projected >= 2**32:
         raise ReadinessError("projected release height exceeds the u32 range")
     return projected
+
+
+def blocks_after(height: int, seconds: float) -> int:
+    """Return how many Mainnet blocks follow `height` within `seconds` at target spacing.
+
+    Rounds up, so a projection never trails the target-spacing estimate.
+    """
+    current, remaining = height, seconds
+    for index, (_, spacing) in enumerate(MAINNET_TARGET_SPACINGS):
+        if index + 1 < len(MAINNET_TARGET_SPACINGS):
+            # The block at the next spacing's start height already uses that spacing.
+            until_next = max(MAINNET_TARGET_SPACINGS[index + 1][0] - current - 1, 0)
+            if until_next * spacing < remaining:
+                current += until_next
+                remaining -= until_next * spacing
+                continue
+        return current - height + math.ceil(remaining / spacing)
+    return current - height
+
+
+def eos_floor(height: int) -> int:
+    """Return the lowest ESTIMATED_RELEASE_HEIGHT allowed for a committed checkpoint at `height`."""
+    if height <= 0 or height >= 2**32:
+        raise ReadinessError("checkpoint height is outside the u32 block-height range")
+    return height + blocks_after(height, EOS_FLOOR_DAYS * 86400)
 
 
 def height_report(
@@ -436,6 +468,46 @@ class SelfTests(unittest.TestCase):
         now = generated + timedelta(hours=12)
         self.assertEqual(estimated_height(3_400_000, generated, now, 1), 3_401_728)
 
+    def test_height_projection_uses_nu7_spacing(self) -> None:
+        generated = datetime(2026, 11, 10, tzinfo=timezone.utc)
+        self.assertEqual(estimated_height(3_556_146, generated, generated, 1), 3_556_146 + 3456)
+        # 404 blocks at 75 seconds reach NU7 activation; the rest of the day runs at 25 seconds.
+        self.assertEqual(blocks_after(3_543_000, 86400), 404 + (86400 - 404 * 75) // 25)
+        self.assertEqual(blocks_after(3_543_000, 404 * 75), 404)
+
+    def test_eos_floor_is_three_days_of_blocks(self) -> None:
+        self.assertEqual(eos_floor(3_556_146), 3_556_146 + 3 * 3456)
+        self.assertEqual(eos_floor(3_400_000), 3_400_000 + 3 * 1152)
+        with self.assertRaises(ReadinessError):
+            eos_floor(0)
+
+    def test_spacings_match_the_rust_sources(self) -> None:
+        heights = (REPO_ROOT / "crates/zakura-chain/src/parameters/constants.rs").read_text()
+        mainnet = heights[heights.index("pub mod mainnet"):]
+        upgrades = (REPO_ROOT / "crates/zakura-chain/src/parameters/network_upgrade.rs").read_text()
+
+        def constant(source: str, name: str) -> int:
+            match = re.search(rf"\bconst {name}: \w+ = (?:Height\()?([0-9_]+)", source)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1).replace("_", ""))
+
+        function = re.search(r"fn target_spacings\(.*?\.into_iter\(\)", upgrades, re.DOTALL)
+        self.assertEqual(re.findall(r"NetworkUpgrade::(\w+)", function.group(0)),
+                         ["Genesis", "Blossom", "Nu7"])
+        self.assertEqual(MAINNET_TARGET_SPACINGS, (
+            (0, constant(upgrades, "PRE_BLOSSOM_POW_TARGET_SPACING")),
+            (constant(mainnet, "BLOSSOM"), constant(upgrades, "POST_BLOSSOM_POW_TARGET_SPACING")),
+            (constant(mainnet, "NU7"), constant(upgrades, "POST_NU7_POW_TARGET_SPACING")),
+        ))
+
+    def test_state_import_floor_matches(self) -> None:
+        importer = (REPO_ROOT / ".github/scripts/import-release-state.py").read_text()
+        match = re.search(r"^EOS_FLOOR_BLOCKS = ([0-9_]+)$", importer, re.MULTILINE)
+        self.assertIsNotNone(match)
+        # Bundle heights are all past NU7 activation, where the floor is a fixed block count.
+        post_nu7 = MAINNET_TARGET_SPACINGS[-1][0]
+        self.assertEqual(int(match.group(1).replace("_", "")), eos_floor(post_nu7) - post_nu7)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -450,6 +522,9 @@ def main() -> int:
     height_parser.add_argument("--resolution", type=Path, required=True)
     height_parser.add_argument("--expected-tag-delay-days", type=int, default=0)
 
+    floor_parser = subparsers.add_parser("eos-floor")
+    floor_parser.add_argument("--height", type=int, required=True)
+
     subparsers.add_parser("self-test")
 
     args = parser.parse_args()
@@ -461,6 +536,8 @@ def main() -> int:
                 args.resolution,
                 args.expected_tag_delay_days,
             )
+        elif args.command == "eos-floor":
+            report = eos_floor(args.height)
         else:
             suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1

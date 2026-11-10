@@ -277,8 +277,8 @@ is a manual release judgment.
 <summary>Optional: calculate the release tagging height</summary>
 
 - Find where the Zcash blockchain tip is now by using a [Zcash Block Explorer](https://mainnet.zcashexplorer.app/) or other tool.
-- Add `1152` blocks for each day until the release
-- For example, if the release is in 3 days, add `1152 * 3` to the current Mainnet block height
+- Add `3456` blocks for each day until the release: Mainnet has 25-second blocks since NU7
+- For example, if the release is in 3 days, add `3456 * 3` to the current Mainnet block height
 
 </details>
 

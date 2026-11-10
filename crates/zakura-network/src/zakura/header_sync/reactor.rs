@@ -100,7 +100,7 @@ mod dispatch;
 mod repair;
 mod trace;
 
-use dispatch::{end_retained, PendingPortOperation, StorageCompletion, StorageOutcome};
+use dispatch::{end_retained, PortOperations, StorageCompletion, StorageOutcome};
 use repair::vct_repair_predecessor;
 use trace::{header_direction_label, ordered_send_error_label};
 
@@ -284,7 +284,7 @@ fn build_header_sync_reactor(
         events: events_rx,
         lifecycle: lifecycle_rx,
         actions: actions_tx,
-        pending_port_operations: FuturesUnordered::new(),
+        pending_port_operations: PortOperations::default(),
         locator_capacity: std::sync::Arc::new(Semaphore::new(
             zakura_header_chain::MAX_STAGED_TARGETS_V1,
         )),
@@ -340,7 +340,7 @@ struct HeaderSyncReactor {
     lifecycle: mpsc::Receiver<super::events::LifecycleEvent>,
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
-    pending_port_operations: FuturesUnordered<PendingPortOperation>,
+    pending_port_operations: PortOperations,
     // Unlike queue ownership, this capacity survives eviction and caller timeouts.
     locator_capacity: std::sync::Arc<Semaphore>,
     locator_capacity_waiting: bool,
@@ -500,6 +500,7 @@ impl HeaderSyncReactor {
         let mut committed_snapshots = self.startup.committed_snapshots.clone();
         let mut vct_root_repairs = self.startup.vct_root_repairs.clone();
         let mut capacity_releases = self.peer_work_queue.capacity_releases();
+        let mut maintenance = self.next_maintenance_deadline();
         let terminal_outcome = loop {
             if self
                 .state
@@ -513,56 +514,8 @@ impl HeaderSyncReactor {
             if self.startup.shutdown.is_cancelled() {
                 break HeaderRequestTerminal::Shutdown;
             }
-            // Retire already-ready state operations before any event can enforce
-            // their hard deadlines. Bound this pass to the current operation set.
-            // A spent coop budget mustn't hide one. See `a_spent_budget_hides_no_ready_completion`.
-            for _ in 0..self.pending_port_operations.len() {
-                let Some(Some(completion)) =
-                    coop::unconstrained(self.pending_port_operations.next()).now_or_never()
-                else {
-                    break;
-                };
-                self.handle_port_completion(completion);
-            }
             // Inspect watches on every turn, even when peer queues never become empty.
-            // `changed` delivers a final unseen value before reporting channel closure.
-            // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
-            if let Some(snapshots) = committed_snapshots.as_mut() {
-                match coop::unconstrained(snapshots.changed()).now_or_never() {
-                    Some(Ok(())) => {
-                        let snapshot = snapshots.borrow_and_update().clone();
-                        if let Some(snapshot) = snapshot {
-                            observe!(
-                                self,
-                                ReactorEvent::WatchObserved {
-                                    state_version: snapshot.state_version,
-                                }
-                            );
-                            caused!(
-                                self,
-                                ReactorCause::Watch,
-                                self.observe_latest_committed_snapshot(snapshot)
-                            );
-                        }
-                    }
-                    Some(Err(_)) => committed_snapshots = None,
-                    None => {}
-                }
-            }
-            if let Some(repairs) = vct_root_repairs.as_mut() {
-                match coop::unconstrained(repairs.changed()).now_or_never() {
-                    Some(Ok(())) => {
-                        let status = *repairs.borrow_and_update();
-                        caused!(
-                            self,
-                            ReactorCause::Watch,
-                            self.observe_vct_root_repair(status)
-                        );
-                    }
-                    Some(Err(_)) => vct_root_repairs = None,
-                    None => {}
-                }
-            }
+            self.settle_ready_inputs(&mut committed_snapshots, &mut vct_root_repairs);
             // One item from each queue per turn prevents either queue monopolizing the loop.
             // Session readers wait for connection acknowledgement before publishing peer events.
             let mut handled_event = false;
@@ -590,7 +543,8 @@ impl HeaderSyncReactor {
                 caused!(self, ReactorCause::Event, self.handle_event(event));
                 handled_event = true;
             }
-            let maintenance = self.next_maintenance_deadline();
+            self.run_due_maintenance(&mut vct_root_repairs, maintenance);
+            maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             let locator_capacity = self.locator_capacity.clone();
             zakura_rt::select! {
@@ -614,9 +568,8 @@ impl HeaderSyncReactor {
                     });
                 },
                 _ = capacity_releases.changed() => {},
-                _ = time::sleep_until(maintenance) => {
-                    caused!(self, ReactorCause::Maintenance, self.refresh_statuses());
-                },
+                // Wakes the loop. The next turn runs the due maintenance.
+                _ = time::sleep_until(maintenance) => {},
                 event = self.lifecycle.recv() => match event {
                     Some(event) => {
                         observe!(
@@ -701,6 +654,86 @@ impl HeaderSyncReactor {
             ReactorCause::Shutdown,
             self.retire_all_peer_work(terminal_outcome)
         );
+    }
+
+    /// Handles the storage completions that are ready now, then reads both
+    /// watches, so a deadline checked afterward can't win over a result that
+    /// was ready when the turn started. Of the inputs that become ready while
+    /// the turn handles its events, only the VCT local operation and the
+    /// repair watch are checked again before deadlines, by
+    /// [`Self::run_due_maintenance`]. The rest wait for the next turn.
+    ///
+    /// The VCT local operation, whose deadline is fatal, is polled directly,
+    /// so its result never waits on the shared ready queue. See
+    /// [`PortOperations`]. It's polled before each other completion and once
+    /// at the end, since a handler can start its successor. Only the other
+    /// calls count toward the drain's bound, so that successor can't take an
+    /// older completion's turn.
+    fn settle_ready_inputs(
+        &mut self,
+        committed_snapshots: &mut Option<
+            watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
+        >,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    ) {
+        for _ in 0..self.pending_port_operations.others_len() {
+            if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+                self.handle_port_completion(completion);
+            }
+            let Some(completion) = self.pending_port_operations.ready_other() else {
+                break;
+            };
+            self.handle_port_completion(completion);
+        }
+        if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+            self.handle_port_completion(completion);
+        }
+        // `changed` delivers a final unseen value before reporting channel closure.
+        // A spent coop budget mustn't hide a change. See the `a_spent_budget_hides_no_*` tests.
+        if let Some(snapshots) = committed_snapshots.as_mut() {
+            match coop::unconstrained(snapshots.changed()).now_or_never() {
+                Some(Ok(())) => {
+                    let snapshot = snapshots.borrow_and_update().clone();
+                    if let Some(snapshot) = snapshot {
+                        observe!(
+                            self,
+                            ReactorEvent::WatchObserved {
+                                state_version: snapshot.state_version,
+                            }
+                        );
+                        caused!(
+                            self,
+                            ReactorCause::Watch,
+                            self.observe_latest_committed_snapshot(snapshot)
+                        );
+                    }
+                }
+                Some(Err(_)) => *committed_snapshots = None,
+                None => {}
+            }
+        }
+        self.probe_vct_root_repairs(vct_root_repairs);
+    }
+
+    /// Reads the VCT root repair watch if it changed.
+    fn probe_vct_root_repairs(
+        &mut self,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+    ) {
+        if let Some(repairs) = vct_root_repairs.as_mut() {
+            match coop::unconstrained(repairs.changed()).now_or_never() {
+                Some(Ok(())) => {
+                    let status = *repairs.borrow_and_update();
+                    caused!(
+                        self,
+                        ReactorCause::Watch,
+                        self.observe_vct_root_repair(status)
+                    );
+                }
+                Some(Err(_)) => *vct_root_repairs = None,
+                None => {}
+            }
+        }
     }
 
     /// Makes `cause` the reactor's unit of work, reports it, and returns the
@@ -2682,6 +2715,44 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Runs maintenance if `maintenance`, the deadline the last turn computed,
+    /// has passed.
+    ///
+    /// Each turn calls this after it settles the ready inputs and takes its
+    /// queued events, rather than from the maintenance `select!` arm, so
+    /// inputs that keep winning the biased `select!` can't starve it. The VCT
+    /// local operation and the repair watch can become ready while the turn
+    /// handles its events, so both are checked again first.
+    fn run_due_maintenance(
+        &mut self,
+        vct_root_repairs: &mut Option<watch::Receiver<zakura_header_chain::VctRootRepairStatus>>,
+        maintenance: Instant,
+    ) {
+        if maintenance <= Instant::now() {
+            if let Some(completion) = self.pending_port_operations.ready_vct_local() {
+                self.handle_port_completion(completion);
+            }
+            self.probe_vct_root_repairs(vct_root_repairs);
+            caused!(self, ReactorCause::Maintenance, self.run_maintenance());
+        }
+    }
+
+    /// Enforces the deadlines that a ready completion or repair status could
+    /// retire for free, then refreshes statuses.
+    ///
+    /// Only [`Self::run_due_maintenance`] calls this.
+    fn run_maintenance(&mut self) {
+        let now = Instant::now();
+        if !self.report_fatal_vct_local_operation(now) {
+            self.refresh_vct_repair_stall(now);
+            self.retire_timed_out_requests(now);
+        }
+        self.refresh_statuses();
+    }
+
+    /// Refreshes statuses and the other work that no ready input can retire.
+    ///
+    /// Request and local-operation deadlines are left to `run_maintenance`.
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
         // Pruned before the fatal check, since the cooldowns are maintenance
@@ -2689,11 +2760,9 @@ impl HeaderSyncReactor {
         if self.state.prune_readmission_cooldowns(now) {
             self.publish_peer_state();
         }
-        if self.report_fatal_vct_local_operation(now) {
+        if self.state.local_operation_fatal() {
             return;
         }
-        self.refresh_vct_repair_stall(now);
-        self.retire_timed_out_requests(now);
         self.state.prune_pruned_peers(now);
         self.retry_pending_closes(now);
         self.retire_unanswered_closes(now);
@@ -2816,9 +2885,14 @@ impl HeaderSyncReactor {
                     }
                 }
             } else {
+                // A peer whose answer our own prepare or apply is still
+                // handling already answered, so the timeout isn't its fault.
+                // Charging it would also let a finished apply that the drain
+                // hasn't seen yet cost its peer a strike.
                 let session_id = self
                     .peer_work_queue
                     .active(&peer)
+                    .filter(|active| active.phase == HeaderTargetPhase::Receiving)
                     .map(|active| active.owner.session_id());
                 self.retire_peer_work(&peer, HeaderRequestTerminal::TimedOut);
                 metrics::counter!("sync.header.target.timed_out.total").increment(1);

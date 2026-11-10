@@ -892,6 +892,13 @@ impl ReactorState {
         }
     }
 
+    /// Whether the local operation was already reported as fatal.
+    pub(super) fn local_operation_fatal(&self) -> bool {
+        self.vct_local_operation
+            .as_ref()
+            .is_some_and(|operation| operation.fatal_sent)
+    }
+
     /// Check the local operation's hard deadline at `now`.
     ///
     /// An expired operation is marked fatal once, and stays installed.

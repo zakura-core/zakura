@@ -809,6 +809,12 @@ struct RepairAwaitingSupplier {
     reactor: JoinHandle<()>,
     anchor: zakura_header_chain::Frontier,
     repair_header: zakura_header_chain::Frontier,
+    /// The supplier's session.
+    session: PeerSession,
+    /// The committed snapshot watch, kept open so tests can publish to it.
+    snapshots: watch::Sender<Option<zakura_header_chain::EngineSnapshot>>,
+    /// The repair owner's status watch, kept open so tests can publish to it.
+    repairs: watch::Sender<zakura_header_chain::VctRootRepairStatus>,
 }
 
 /// Drive a VCT repair to the moment the reactor can choose a supplier.
@@ -833,9 +839,9 @@ async fn repair_awaiting_supplier(
     let mut snapshot = committed_snapshot(anchor);
     snapshot.frontiers.header_best =
         zakura_header_chain::Frontier::new(block::Height(2), block::Hash([3; 32]));
-    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    let (snapshots, snapshots_rx) = watch::channel(Some(snapshot.clone()));
     startup.committed_snapshots = Some(snapshots_rx);
-    let (_repairs_tx, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
+    let (repairs, repairs_rx) = watch::channel(zakura_header_chain::VctRootRepairStatus {
         state: zakura_header_chain::VctRootRepairState::Unavailable {
             height: repair_header.height,
         },
@@ -885,6 +891,9 @@ async fn repair_awaiting_supplier(
         reactor,
         anchor,
         repair_header,
+        session,
+        snapshots,
+        repairs,
     }
 }
 
@@ -902,6 +911,7 @@ async fn vct_repair_accepts_a_supplier_ahead_of_the_stalled_branch() {
         reactor,
         anchor,
         repair_header,
+        ..
     } = repair_awaiting_supplier(startup(shutdown.clone()), |anchor| Status {
         work_anchor_height: anchor.height,
         work_anchor_hash: anchor.hash,
@@ -925,6 +935,73 @@ async fn vct_repair_accepts_a_supplier_ahead_of_the_stalled_branch() {
     assert_eq!(request.added_credit.objects, 1);
     assert_eq!(request.tree_aux_schema, AuxSchema::V1);
 
+    shutdown.cancel();
+    reactor.await.expect("the reactor task joins");
+}
+
+/// A repair status that ends the repair retires its expired supplier request
+/// for free, even when an unrelated snapshot is read first.
+///
+/// The repair owner publishes `Idle` and an unrelated commit publishes a new
+/// snapshot while the reactor waits, then the supplier's deadline passes. The
+/// snapshot's watch arm comes before the repair's, so reading the snapshot must
+/// not enforce the deadline. With a strike limit of one, a timeout charge
+/// would close the supplier's session.
+#[tokio::test(start_paused = true)]
+async fn an_ended_repair_retires_its_expired_supplier_request_without_a_charge() {
+    let shutdown = CancellationToken::new();
+    let mut startup = startup(shutdown.clone());
+    startup.config.max_unproductive_header_requests = 1;
+    let request_timeout = startup.request_timeout;
+    let RepairAwaitingSupplier {
+        handle: _handle,
+        mut outbound,
+        reactor,
+        session,
+        snapshots,
+        repairs,
+        ..
+    } = repair_awaiting_supplier(startup, |anchor| Status {
+        work_anchor_height: anchor.height,
+        work_anchor_hash: anchor.hash,
+        selected_tip_height: block::Height(9),
+        selected_tip_hash: block::Hash([9; 32]),
+        suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(9_u8),
+        oldest_retained_height: block::Height(5),
+        max_headers_per_response: 1,
+        max_subscriptions: 1,
+        max_message_bytes: 2_000_000,
+        tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+    })
+    .await;
+    let _request = outbound.recv().await.expect("the repair request is sent");
+    // Let the reactor finish its turn and wait in `select!`.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    snapshots.send_modify(|snapshot| {
+        let snapshot = snapshot.as_mut().expect("the fixture publishes a snapshot");
+        snapshot.state_version = snapshot
+            .state_version
+            .checked_next()
+            .expect("the fixture state version advances");
+    });
+    repairs
+        .send(zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Idle,
+            generation: 8,
+        })
+        .expect("the reactor holds the repair watch");
+    tokio::time::advance(request_timeout).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !session.cancel_token().is_cancelled(),
+        "the supplier of an ended repair is not charged for its deadline"
+    );
     shutdown.cancel();
     reactor.await.expect("the reactor task joins");
 }

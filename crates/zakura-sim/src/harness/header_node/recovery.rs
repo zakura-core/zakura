@@ -11,11 +11,18 @@
 //! - `peer:node:recovered`, once the source has an admitted session that's
 //!   still live, or
 //! - `peer:<source>:recovery-relink`, while it has none, unless the node's
-//!   readmission cooldown for the source still lasts. Time stops where it
-//!   ends.
+//!   readmission cooldown for the source still lasts, or a relink was
+//!   picked less than a readmission cooldown ago. Time stops where that
+//!   ends. A mirror runs the same code, so it can refuse the node for a
+//!   cooldown the node never sees, such as after a prefix that held the
+//!   node's serving storage. Waiting a cooldown after each relink that
+//!   didn't take outlasts it.
 //! - `peer:node:recovery-unreached`, once [`RECOVERY_RELINKS`] relinks are
 //!   carried out and settled without a live source. Its pick ends recovery
 //!   unreached, which offers nothing more.
+//!
+//! Time stops while any of these is due, so recovery ends, recovered or
+//! unreached, within [`recovery_window`] of the `Recover` pick.
 //!
 //! A quiet step has handled every admission, refusal, replacement and
 //! disconnect an earlier step queued, since an unhandled one leaves its
@@ -278,12 +285,18 @@ pub enum RecoveryState {
     Establishing {
         /// The relinks picked so far.
         relinks: u8,
+        /// When the last one was picked, as virtual time since the run's
+        /// start.
+        last: Option<Duration>,
     },
     /// The conditions held together at the `recovered` pick.
     Recovered(Box<RecoveryRecord>),
     /// Every relink was carried out and settled without a live source, at
     /// the `recovery-unreached` pick.
-    Unreached,
+    Unreached {
+        /// The step that picked `recovery-unreached`.
+        step: u64,
+    },
 }
 
 /// A disruption a typed test declares for its recovery, in its policy's
@@ -372,7 +385,7 @@ impl RecoveryEvidence {
     pub fn record(&self) -> Option<RecoveryRecord> {
         match &self.recovery.borrow().as_ref()?.state {
             RecoveryState::Recovered(record) => Some((**record).clone()),
-            RecoveryState::Establishing { .. } | RecoveryState::Unreached => None,
+            RecoveryState::Establishing { .. } | RecoveryState::Unreached { .. } => None,
         }
     }
 
@@ -384,19 +397,44 @@ impl RecoveryEvidence {
     /// closes the source's connection or relinks it, and both until it
     /// stops the node. A close is joined to the session it ends by its
     /// connection ([`RecoveryRecord::links`]), so closing a peer that was no
-    /// member, or another link of a member, changes nothing recorded. The rest always
-    /// hold, since recovery enforces them, except `FairScheduling` under
-    /// [`Disruption::Unfair`]. A session the node, or a mirror running the
-    /// same code, ends by itself breaks nothing, so an obligation the node
-    /// owes its honest source runs on to its deadline.
+    /// member, or another link of a member, changes nothing recorded. The rest always hold, since recovery
+    /// enforces them, except `FairScheduling` under [`Disruption::Unfair`].
+    /// A session the node, or a mirror running the same code, ends by
+    /// itself breaks nothing, so an obligation the node owes its honest
+    /// source runs on to its deadline.
+    ///
+    /// A recovery that ended unreached holds them too, `FairScheduling` as
+    /// above, from its pick on, unless the harness began stopping the node
+    /// first. Nothing in the environment can keep an
+    /// honest source away through three relinks: no control acts after the
+    /// `Recover` pick, and recovery waits out every readmission cooldown
+    /// the node reports. So only the node, or a mirror running the same
+    /// code, refusing or dropping it can, and
+    /// `header-sync/bounded-adversary-progress` counts that as violated
+    /// rather than as assumptions that never held (Evan, #2176).
     pub fn holds(&self, ends: &EndEvidence, assume: Assume) -> bool {
+        let fair = !self.disrupts(Disruption::Unfair);
+        if self.unreached_at().is_some() {
+            // A relink that settled after the harness began stopping the
+            // node can't show the node refusing its source.
+            let stopped = ends.facts().into_iter().any(|(_, fact)| {
+                matches!(
+                    fact,
+                    EndFact::Environment {
+                        action: EnvironmentAction::Shutdown,
+                        ..
+                    }
+                )
+            });
+            return !stopped && (assume != Assume::FairScheduling || fair);
+        }
         let Some(record) = self.record() else {
             return false;
         };
         let source_only = match assume {
             Assume::StableMembership => false,
             Assume::HonestPeer => true,
-            Assume::FairScheduling => return !self.disrupts(Disruption::Unfair),
+            Assume::FairScheduling => return fair,
             _ => return true,
         };
         !ends.facts().into_iter().any(|(stamp, fact)| {
@@ -482,31 +520,35 @@ impl RecoveryEvidence {
     /// Whether recovery ended unreached: every relink settled without a
     /// live source. It offers nothing more then.
     pub fn unreached(&self) -> bool {
-        matches!(
-            self.recovery
-                .borrow()
-                .as_ref()
-                .map(|recovery| &recovery.state),
-            Some(RecoveryState::Unreached)
-        )
+        self.unreached_at().is_some()
     }
 
-    /// Counts a relink pick and returns the source to relink.
-    pub(super) fn relinked(&self) -> String {
+    /// The step that ended recovery unreached, if it did.
+    pub fn unreached_at(&self) -> Option<u64> {
+        match self.recovery.borrow().as_ref()?.state {
+            RecoveryState::Unreached { step } => Some(step),
+            RecoveryState::Establishing { .. } | RecoveryState::Recovered(_) => None,
+        }
+    }
+
+    /// Counts a relink picked at `at`, as virtual time since the run's
+    /// start, and returns the source to relink.
+    pub(super) fn relinked(&self, at: Duration) -> String {
         let mut recovery = self.recovery.borrow_mut();
         let recovery = recovery
             .as_mut()
             .expect("a relink is offered only while recovery establishes");
-        if let RecoveryState::Establishing { relinks } = &mut recovery.state {
+        if let RecoveryState::Establishing { relinks, last } = &mut recovery.state {
             *relinks += 1;
+            *last = Some(at);
         }
         recovery.source.clone()
     }
 
-    /// Ends recovery unreached, at the `recovery-unreached` pick.
-    pub(super) fn give_up(&self) {
+    /// Ends recovery unreached, at the `recovery-unreached` pick at `step`.
+    pub(super) fn give_up(&self, step: u64) {
         if let Some(recovery) = self.recovery.borrow_mut().as_mut() {
-            recovery.state = RecoveryState::Unreached;
+            recovery.state = RecoveryState::Unreached { step };
         }
     }
 
@@ -517,7 +559,10 @@ impl RecoveryEvidence {
             source,
             started,
             baseline,
-            state: RecoveryState::Establishing { relinks: 0 },
+            state: RecoveryState::Establishing {
+                relinks: 0,
+                last: None,
+            },
         });
     }
 }
@@ -779,7 +824,8 @@ impl Driver {
     fn next(&self, now: SimInstant) -> Option<(String, Next)> {
         let Some(Recovery {
             source,
-            state: RecoveryState::Establishing { relinks },
+            started,
+            state: RecoveryState::Establishing { relinks, last },
             ..
         }) = self.evidence.get()
         else {
@@ -788,7 +834,12 @@ impl Driver {
         let next = next(
             relinks,
             self.inputs.source_session(&source).is_some(),
-            self.inputs.cooldown_until(&source),
+            relink_wait(
+                self.inputs.cooldown_until(&source),
+                last.unwrap_or_else(|| started.since_start()),
+                last.is_some(),
+                self.inputs.cooldown,
+            ),
             now,
         );
         Some((source, next))
@@ -812,10 +863,19 @@ impl Driver {
     }
 
     /// Appends where time must stop: the end of the source's cooldown, while
-    /// recovery waits for it.
+    /// recovery waits for it, and now, while a step it owes is due.
     pub(super) fn boundaries(&self, now: SimInstant, out: &mut Vec<crate::Boundary>) {
-        if let Some((_, Next::WaitUntil(until))) = self.next(now) {
-            out.push(crate::Boundary::Opens(until));
+        match self.next(now) {
+            Some((_, Next::WaitUntil(until))) => out.push(crate::Boundary::Opens(until)),
+            // A step recovery owes is due now, so time stops until it's
+            // picked. A time advance that's waited longer would otherwise
+            // win the pick, and a clock run to some later timer could put
+            // a relink, the conditions point or the verdict off without
+            // bound.
+            Some((_, Next::Recovered | Next::Relink | Next::GiveUp)) => {
+                out.push(crate::Boundary::Deadline(now));
+            }
+            None => {}
         }
     }
 
@@ -857,8 +917,9 @@ pub(super) enum Next {
     Recovered,
     /// The source has no live session, so a relink is offered.
     Relink,
-    /// The source has no live session, but the node's cooldown for it lasts
-    /// until this instant, where time stops.
+    /// The source has no live session, but the node's cooldown for it, or
+    /// the cooldown recovery allows after its last relink, lasts until this
+    /// instant, where time stops.
     WaitUntil(SimInstant),
     /// Every relink is carried out and settled without a live source, so
     /// `recovery-unreached` is offered.
@@ -866,9 +927,9 @@ pub(super) enum Next {
 }
 
 /// What establishing recovery offers at `now`, after `relinks` relinks,
-/// with or without a `live` source session, while the node's readmission
-/// cooldown for the source lasts until `cooldown`, as virtual time since the
-/// run's start.
+/// with or without a `live` source session, while a readmission cooldown
+/// for the source lasts until `cooldown`, as virtual time since the run's
+/// start.
 pub(super) fn next(relinks: u8, live: bool, cooldown: Option<Duration>, now: SimInstant) -> Next {
     if live {
         return Next::Recovered;
@@ -880,6 +941,39 @@ pub(super) fn next(relinks: u8, live: bool, cooldown: Option<Duration>, now: Sim
         Some(until) if until > now => Next::WaitUntil(until),
         _ => Next::Relink,
     }
+}
+
+/// Until when recovery waits before relinking its source, as virtual time
+/// since the run's start, from `from`, the last relink's pick, or the
+/// `Recover` pick before the first, which `relinked` says. It waits for the
+/// end of the node's own cooldown for the source, `node`, and after a relink
+/// that didn't take, for the `configured` cooldown after it too: the source
+/// may be refusing the node for a cooldown of its own, which the node can't
+/// see, that began before the relink was refused and lasts at most the
+/// configured cooldown, which mirrors share.
+///
+/// It never waits past the configured cooldown after `from`. Production
+/// installs no cooldown longer than that, so a longer one is the node's own
+/// fault, and the cap keeps it from postponing the verdict: recovery ends,
+/// recovered or unreached, within [`RECOVERY_RELINKS`] configured cooldowns
+/// of the `Recover` pick, in virtual time ([`recovery_window`]).
+pub(super) fn relink_wait(
+    node: Option<Duration>,
+    from: Duration,
+    relinked: bool,
+    configured: Duration,
+) -> Option<Duration> {
+    let cap = from.saturating_add(configured);
+    let after_relink = relinked.then_some(cap);
+    node.map(|node| node.min(cap)).max(after_relink)
+}
+
+/// The most virtual time recovery takes to end, recovered or unreached, from
+/// its `Recover` pick, with the node's `configured` readmission cooldown:
+/// [`RECOVERY_RELINKS`] of them, one before each relink at most
+/// ([`relink_wait`]). Admissions and refusals settle at the instant they come.
+pub fn recovery_window(configured: Duration) -> Duration {
+    configured.saturating_mul(u32::from(RECOVERY_RELINKS))
 }
 
 /// When the node's readmission cooldown for the peer whose digest is `hex`
@@ -1033,16 +1127,22 @@ mod tests {
 
     #[test]
     fn hdr13_assumptions_hold_from_recovered_until_the_environment_breaks_them() {
-        // Before the `recovered` pick none holds: with no recovery, while it
-        // establishes, and once it ended unreached.
+        // Before the `recovered` pick none holds: with no recovery, or while
+        // it establishes.
         let sessions = two_links();
         let ends = EndEvidence::default();
         let recovery = RecoveryEvidence::default();
         assert_eq!(holding(&recovery, &ends), []);
         recovery.start("mirror-0".into(), at(0), empty());
         assert_eq!(holding(&recovery, &ends), []);
-        recovery.give_up();
-        assert_eq!(holding(&recovery, &ends), []);
+        // Once it ended unreached, all five hold, so the property's check
+        // runs at that pick and counts it as violated, unless the harness
+        // began stopping the node first.
+        recovery.give_up(9);
+        assert_eq!(holding(&recovery, &ends), DECLARED);
+        let stopped = EndEvidence::default();
+        stopped.record(environment("node", EnvironmentAction::Shutdown));
+        assert_eq!(holding(&recovery, &stopped), []);
 
         // From the pick, all five hold. An environment action before the
         // pick, such as recovery's own relink, breaks nothing.
@@ -1183,6 +1283,46 @@ mod tests {
         assert_eq!(next(0, false, None, at(0)), Next::Relink);
     }
 
+    /// After a relink that didn't take, the next waits a configured cooldown
+    /// from it, which outlasts any cooldown the source began on the node
+    /// before it, unless the node's own lasts longer. The first relink waits
+    /// only for the node's.
+    #[test]
+    fn a_relink_waits_a_cooldown_after_the_last() {
+        let cooldown = Duration::from_secs(60);
+        let secs = Duration::from_secs;
+        // Before the first relink, only the node's own cooldown counts.
+        assert_eq!(relink_wait(None, secs(0), false, cooldown), None);
+        assert_eq!(
+            relink_wait(Some(secs(5)), secs(0), false, cooldown),
+            Some(secs(5))
+        );
+        // After one that didn't take, a configured cooldown from it too.
+        let last = secs(10);
+        assert_eq!(relink_wait(None, last, true, cooldown), Some(secs(70)));
+        assert_eq!(
+            relink_wait(Some(secs(65)), last, true, cooldown),
+            Some(secs(70))
+        );
+        // A node cooldown longer than the configured one is capped, so a
+        // node that reports one can't postpone the verdict.
+        assert_eq!(
+            relink_wait(Some(secs(4_000_000_000)), last, true, cooldown),
+            Some(secs(70))
+        );
+        assert_eq!(
+            relink_wait(Some(secs(4_000_000_000)), secs(0), false, cooldown),
+            Some(secs(60))
+        );
+        assert_eq!(recovery_window(cooldown), secs(180));
+        let until = relink_wait(None, last, true, cooldown);
+        assert_eq!(
+            next(1, false, until, at(30_000)),
+            Next::WaitUntil(at(70_000))
+        );
+        assert_eq!(next(1, false, until, at(70_000)), Next::Relink);
+    }
+
     #[test]
     fn the_later_of_a_started_cooldown_and_a_refusal_counts() {
         let facts = [
@@ -1217,7 +1357,7 @@ mod tests {
         let evidence = RecoveryEvidence::default();
         evidence.start("mirror-0".into(), at(0), empty());
         for _ in 0..RECOVERY_RELINKS {
-            assert_eq!(evidence.relinked(), "mirror-0");
+            assert_eq!(evidence.relinked(Duration::ZERO), "mirror-0");
         }
         // The third relink is picked but not yet settled: still
         // establishing, and its admission still recovers.
@@ -1225,7 +1365,7 @@ mod tests {
         assert_eq!(next(RECOVERY_RELINKS, true, None, at(0)), Next::Recovered);
         // It settled without a live source, and the quiet step's pick ends
         // recovery.
-        evidence.give_up();
+        evidence.give_up(9);
         assert!(evidence.unreached());
         assert_eq!(evidence.record(), None);
     }
@@ -1397,7 +1537,7 @@ mod tests {
             pending.progress(&adoption, &ends),
             RecoveryProgress::Pending
         );
-        pending.give_up();
+        pending.give_up(9);
         assert_eq!(
             pending.progress(&adoption, &ends),
             RecoveryProgress::Concluded

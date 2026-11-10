@@ -226,8 +226,9 @@ const RECOVERY_SUBJECT: &str = "recovery";
 /// `NotApplicable` there. Its assumptions hold from the `recovered` pick
 /// until the environment ends a member ([`RecoveryEvidence::holds`]), so a
 /// node that drops its honest source still owes the successor. A recovery
-/// that ends unreached never holds them, which leaves the run
-/// `Inconclusive`. hdr-13 decides how that counts.
+/// that ends unreached holds them too, since only the node, or a mirror
+/// running the same code, can keep an honest source away, so it's violated
+/// at that pick.
 ///
 /// [`RecoveryEvidence::holds`]: crate::harness::header_node::recovery::RecoveryEvidence::holds
 pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<S> {
@@ -254,8 +255,9 @@ pub fn bounded_adversary_progress<S: HasView<View = StorageView>>() -> Property<
     }
 }
 
-/// Checks [`BOUNDED_ADVERSARY_PROGRESS`]. At the `recovered` pick, with a
-/// successor owed ([`RecoveryObjective`]), it applies. If the reactor's
+/// Checks [`BOUNDED_ADVERSARY_PROGRESS`]. A recovery that ended unreached
+/// is violated at that pick. At the `recovered` pick, with a successor
+/// owed ([`RecoveryObjective`]), it applies. If the reactor's
 /// adopted tip already meets the objective, the pick discharges it at once.
 /// Otherwise it opens one obligation, which the first later
 /// `SnapshotAdopted` that meets it discharges ([`recovery_answer`]). Both
@@ -268,6 +270,12 @@ fn check_bounded_adversary_progress<S: HasView<View = StorageView>>(
     cx: &mut CheckCtx<'_, S>,
 ) -> Verdict {
     let view = cx.view();
+    if view.recovery.unreached_at() == Some(cx.step) {
+        return cx.violated(
+            "the node admits its honest source within recovery's relinks".to_owned(),
+            "every relink settled without a live session for the source".to_owned(),
+        );
+    }
     let Some((record, Some(_))) = view.recovery.objective() else {
         return Verdict::NotApplicable;
     };
@@ -303,7 +311,8 @@ fn recovery_answer(key: &ObligationKey, view: &StorageView, stamp: u64) -> FactA
 }
 
 /// [`BOUNDED_ADVERSARY_PROGRESS`]'s trigger history: the run reached the
-/// `recovered` pick owing a successor.
+/// `recovered` pick owing a successor, or ended recovery unreached, which
+/// the check judges at that pick.
 fn recovered_owing(view: &StorageView, _: &ObservationLog) -> bool {
-    matches!(view.recovery.objective(), Some((_, Some(_))))
+    view.recovery.unreached() || matches!(view.recovery.objective(), Some((_, Some(_))))
 }

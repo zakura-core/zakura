@@ -1922,12 +1922,16 @@ impl ActionSource for Control {
                     return;
                 }
                 UNREACHED => {
-                    driver.evidence.give_up();
+                    driver.evidence.give_up(log.step());
                     return;
                 }
                 RELINK => {
                     let step = ControlStep {
-                        peer: driver.evidence.relinked(),
+                        peer: driver.evidence.relinked(
+                            zakura_scheduler::hooks::now()
+                                .unwrap_or_default()
+                                .saturating_duration_since(SimInstant::from_start(Duration::ZERO)),
+                        ),
                         action: ControlAction::Relink,
                         when: None,
                     };

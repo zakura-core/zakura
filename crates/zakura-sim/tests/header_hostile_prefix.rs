@@ -18,8 +18,9 @@ use zakura_sim::{
     domain::header_sync_progress::{BOUNDED_ADVERSARY_PROGRESS, RECOVERY_PROGRESS_BOUND},
     harness::{
         header_node::{
-            recovery::{Disruption, RecoveryEvidence, RECOVERY_BOUND},
-            ControlAction,
+            policy::{Allow, OpKind, Select, Trigger},
+            recovery::{recovery_window, Disruption, RecoveryEvidence, RECOVERY_BOUND},
+            Chain, ControlAction,
         },
         header_sync::{grammar, Storage, StorageScenario},
         run_prepared, Subsystem,
@@ -659,4 +660,67 @@ fn an_unfair_plan_starves_the_recovery_the_fair_policy_completes() {
         "fair: applied {steps} steps after its pick; unfair: {:?} after, in {rounds} rounds",
         run.applied.map(|step| step - run.recovered)
     );
+}
+
+/// Recovery ends within its stated window. Every class witness reaches its
+/// `recovered` pick within `recovery_window` of its `Recover` pick, at the
+/// node's default readmission cooldown, under 8 plans. (A node that never
+/// lets its source back in ends unreached within it, which the planted
+/// `pause-outlasts-cooldown` case shows.)
+#[test]
+fn every_recovery_ends_within_its_window() {
+    let window = recovery_window(
+        zakura_network::zakura::ZakuraHeaderSyncConfig::default().unproductive_peer_cooldown,
+    );
+    for (class, scenario) in witnesses() {
+        for input in inputs(8, 256) {
+            let run = run(class, &scenario, input);
+            let started = run.recovery.started().expect("the recover is picked");
+            let record = run.recovery.record().expect("the pick wrote its record");
+            let took = record.at.saturating_duration_since(started);
+            assert!(took <= window, "{class}: {took:?} past {window:?}");
+        }
+    }
+}
+
+/// A source's own cooldown of the node, after a prefix that held the
+/// node's serving storage, isn't the node refusing its source. The node is
+/// at A8 and the source behind at A2. Every read lease the node takes to
+/// serve it is held, so the source times out three requests and drops the
+/// node, and the recover comes at that drop. Recovery's first relink is
+/// refused, and it waits a cooldown before the next, which is admitted, so
+/// it never ends unreached, under 8 plans. Nothing is owed, since the node
+/// holds the heaviest chain.
+#[test]
+fn a_source_cooling_down_on_the_node_isnt_unreached() {
+    let mut scenario = StorageScenario {
+        node: Chain::main(8),
+        ..storage_witnesses::recovering(vec![storage_witnesses::recover(Some(Trigger::Closed(
+            storage_witnesses::SOURCE.to_owned(),
+        )))])
+    };
+    scenario.mirrors[0].chain = Chain::main(2);
+    scenario.policy.holds.push(storage_witnesses::hold(
+        Select {
+            kind: Some(OpKind::Acquire),
+            ..Select::default()
+        },
+        Trigger::Released,
+        Allow::Engine,
+    ));
+    for input in inputs(8, 256) {
+        let run = run("cooldown", &scenario, input);
+        let relinks = run
+            .report
+            .picks
+            .iter()
+            .filter(|pick| pick.identity.ends_with(":recovery-relink"))
+            .count();
+        assert!(!run.recovery.unreached(), "recovery reaches its source");
+        assert!(relinks >= 2, "the first relink is refused: {relinks}");
+        assert_eq!(
+            outcome(&run.report, BOUNDED_ADVERSARY_PROGRESS),
+            &PropertyOutcome::NotApplicable
+        );
+    }
 }

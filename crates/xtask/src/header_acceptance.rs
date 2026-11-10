@@ -46,8 +46,9 @@
 //! anything a run started is alive, even after the runner is killed, no
 //! other run starts or clears its directory. INT, TERM or HUP ends every
 //! child the way its deadline would and fails the run ([`interrupted`]),
-//! whose last decision is a check just before the record's rename. The
-//! record names its subject, which a
+//! whose last decision is a check just before the record's rename. Each
+//! build uses only the flags the runner sets and the committed profiles
+//! ([`clean_build_env`]). The record names its subject, which a
 //! reader compares, since runs from different checkouts may share `--out`.
 //! `--out` must be on a local filesystem, where `flock` and `rename` hold.
 
@@ -199,6 +200,30 @@ fn options(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<Optio
     })
 }
 
+/// Removes, from this process's environment, the build settings an
+/// operator's shell could otherwise carry into every Cargo build the run
+/// starts: `CARGO_ENCODED_RUSTFLAGS`, which overrides the `RUSTFLAGS` a
+/// build sets; `RUSTFLAGS` itself; and every `CARGO_PROFILE_*`, which
+/// overrides the committed profiles (`planted` inherits `dev`). Every child
+/// inherits the result, so each build uses only the flags the runner or the
+/// planted runner sets and the profiles as committed. Cargo config files
+/// outside the repository, such as `~/.cargo/config.toml`, are the
+/// operator's. It runs first, before any thread or child.
+fn clean_build_env() {
+    let names: Vec<OsString> = env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name == "CARGO_ENCODED_RUSTFLAGS"
+                || name == "RUSTFLAGS"
+                || name.starts_with("CARGO_PROFILE_")
+        })
+        .collect();
+    for name in names {
+        env::remove_var(name);
+    }
+}
+
 /// Runs the acceptance run for the checkout at `repo_root`.
 pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Result<(), BoxError> {
     let mut args = args.peekable();
@@ -215,6 +240,7 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
     // A signal ends every child the way its deadline would, so nothing a
     // run started outlives an interrupted runner ([`interrupted`]).
     sim_minimize::install_interrupt_handler();
+    clean_build_env();
     if args.peek().map(String::as_str) == Some(IN_SUBJECT) {
         args.next();
         let commit = args.next().ok_or(UsageError("expected S's commit"))?;
@@ -3861,6 +3887,78 @@ mod tests {
             .env(INTERRUPTED_INNER, &out);
         let ended = child(&mut inner, &out.join("inner.log"), Duration::from_secs(60));
         fs::write(out.join("end"), ended.end.to_string()).unwrap();
+    }
+
+    /// The variable that has [`clean_env_helper`] run, naming its log.
+    #[cfg(unix)]
+    const CLEAN_ENV: &str = "XTASK_CLEAN_ENV";
+
+    /// A child of the runner inherits none of the build settings an
+    /// operator's environment could carry: [`clean_env_helper`] starts with
+    /// `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, a `CARGO_PROFILE_DEV_*` and a
+    /// `CARGO_PROFILE_PLANTED_*` set, calls [`run`], whose startup cleans
+    /// the environment, and then runs `env`, whose output holds none of
+    /// them.
+    #[cfg(unix)]
+    #[test]
+    fn the_runner_s_children_inherit_no_build_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("env.log");
+        let status = Command::new(env::current_exe().expect("the test binary has a path"))
+            .args([
+                "--exact",
+                "header_acceptance::tests::clean_env_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CLEAN_ENV, &log)
+            .env("CARGO_ENCODED_RUSTFLAGS", "-Cdebug-assertions=no")
+            .env("RUSTFLAGS", "-Cdebug-assertions=no")
+            .env("CARGO_PROFILE_DEV_PANIC", "abort")
+            .env("CARGO_PROFILE_PLANTED_OVERFLOW_CHECKS", "false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let seen = fs::read_to_string(&log).unwrap();
+        assert!(
+            seen.contains(&format!("{CLEAN_ENV}=")),
+            "the env ran: {seen}"
+        );
+        for name in [
+            "CARGO_ENCODED_RUSTFLAGS=",
+            "RUSTFLAGS=",
+            "CARGO_PROFILE_DEV_PANIC=",
+            "CARGO_PROFILE_PLANTED_OVERFLOW_CHECKS=",
+        ] {
+            assert!(
+                !seen.lines().any(|line| line.starts_with(name)),
+                "{name} reached the child"
+            );
+        }
+    }
+
+    /// Starts [`run`] and runs `env` into the log [`CLEAN_ENV`] names, run
+    /// only by [`the_runner_s_children_inherit_no_build_overrides`]. The
+    /// run is the xtask-built-at-S mode, outside the runner's checkout, so
+    /// after its startup it refuses before starting any child.
+    #[cfg(unix)]
+    #[test]
+    fn clean_env_helper() {
+        let Some(log) = env::var_os(CLEAN_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let dir = log.parent().expect("the log is in a directory");
+        let args = [
+            IN_SUBJECT.to_owned(),
+            "s".to_owned(),
+            "--out".to_owned(),
+            dir.join("out").display().to_string(),
+        ];
+        assert!(run(dir, args.into_iter()).is_err());
+        let ended = child(&mut Command::new("env"), &log, Duration::from_secs(60));
+        assert!(ended.exited());
     }
 
     /// The variable that has [`interrupted_flag_helper`] run, naming its

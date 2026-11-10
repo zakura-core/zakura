@@ -44,7 +44,10 @@
 //! fail. Its result file stays in the run directory the record's artifacts
 //! path names. Every child inherits the lock and [`RUN_MARK`], so while
 //! anything a run started is alive, even after the runner is killed, no
-//! other run starts or clears its directory. The record names its subject, which a
+//! other run starts or clears its directory. INT, TERM or HUP ends every
+//! child the way its deadline would and fails the run ([`interrupted`]),
+//! whose last decision is a check just before the record's rename. The
+//! record names its subject, which a
 //! reader compares, since runs from different checkouts may share `--out`.
 //! `--out` must be on a local filesystem, where `flock` and `rename` hold.
 
@@ -68,7 +71,7 @@ use serde_json::{json, Value};
 use crate::{
     planted::{self, provenance},
     sim::SIM_RUSTFLAGS,
-    sim_minimize::ChildEnd,
+    sim_minimize::{self, ChildEnd},
     BoxError, UsageError,
 };
 
@@ -209,6 +212,9 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
         );
         return Ok(());
     }
+    // A signal ends every child the way its deadline would, so nothing a
+    // run started outlives an interrupted runner ([`interrupted`]).
+    sim_minimize::install_interrupt_handler();
     if args.peek().map(String::as_str) == Some(IN_SUBJECT) {
         args.next();
         let commit = args.next().ok_or(UsageError("expected S's commit"))?;
@@ -243,6 +249,7 @@ pub(super) fn run(repo_root: &Path, args: impl Iterator<Item = String>) -> Resul
     let removed = remove_worktrees_under(repo_root, &run, &run_dir);
     let log = result?;
     removed?;
+    stop_if_interrupted()?;
     if ESCAPED.load(Ordering::Relaxed) {
         return Err(
             "a child's descendants couldn't be confirmed gone, so the record can't be trusted"
@@ -306,8 +313,18 @@ fn lock_out(out: &Path) -> Result<(fs::File, Option<PathBuf>), BoxError> {
         // SAFETY: `flock` takes a file descriptor this process holds open
         // and touches no memory.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            // What a run on this output left running, though not
+            // necessarily what holds the lock: a live run, or what survived
+            // one ([`survivors`]).
+            let found = match survivors(out) {
+                Ok(pids) if pids.is_empty() => String::new(),
+                Ok(pids) => format!(
+                    "; detected processes of a run on this output: {pids:?} (a live run, or survivors of one)"
+                ),
+                Err(why) => format!("; its processes can't be listed: {why}"),
+            };
             return Err(format!(
-                "another header-acceptance run holds {}",
+                "another header-acceptance run holds {}{found}",
                 out.join(LOCK_FILE).display()
             )
             .into());
@@ -661,6 +678,12 @@ fn publish_record(out: &Path, run_dir: &Path) -> Result<(), BoxError> {
     file.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
     file.sync_all()?;
     drop(file);
+    // The run's last decision: a signal seen here fails it with nothing
+    // published, and one after it doesn't undo the publication.
+    if let Err(error) = stop_if_interrupted() {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
     fs::rename(&staged, out.join(RECORD))?;
     if let Ok(dir) = fs::File::open(out) {
         let _ = dir.sync_all();
@@ -748,6 +771,7 @@ fn run_in_subject(
         .to_string_lossy()
         .into_owned();
     let log = run_at(repo_root, &options, &subject, contained, &run_id)?;
+    stop_if_interrupted()?;
     if ESCAPED.load(Ordering::Relaxed) {
         return Err(
             "a child's descendants couldn't be confirmed gone, so the record can't be trusted"
@@ -830,6 +854,7 @@ fn run_at(
     let removed = remove_worktree(root, options, &worktree);
     result?;
     removed?;
+    stop_if_interrupted()?;
     if ESCAPED.load(Ordering::Relaxed) {
         return Err(
             "a timed-out child's descendants couldn't be confirmed gone, so the \
@@ -1043,9 +1068,34 @@ impl Ended {
         matches!(self.end, ChildEnd::Exited(0))
     }
 
-    /// Whether it ran past its deadline or a signal killed it.
+    /// Whether it ran past its deadline, a signal killed it, or the run was
+    /// interrupted.
     fn killed(&self) -> bool {
-        matches!(self.end, ChildEnd::TimedOut | ChildEnd::Signaled(_))
+        matches!(
+            self.end,
+            ChildEnd::TimedOut | ChildEnd::Signaled(_) | ChildEnd::Interrupted
+        )
+    }
+}
+
+/// Whether INT, TERM or HUP arrived since the run installed its handler
+/// (`sim_minimize::install_interrupt_handler`). From then on [`child`]
+/// starts nothing and ends whatever it's running as its deadline would, and
+/// the run fails without publishing. The flag is never cleared, so cleanup
+/// that needs a child, such as removing worktrees, is left to the next
+/// run's [`clear_stale_runs`], as after a kill.
+fn interrupted() -> bool {
+    sim_minimize::INTERRUPTED.load(Ordering::SeqCst)
+}
+
+/// Fails once the run was [`interrupted`], so a task stops before it writes
+/// an artifact from an interrupted child's outcome, and the run before it
+/// publishes.
+fn stop_if_interrupted() -> Result<(), BoxError> {
+    if interrupted() {
+        Err("the run was interrupted".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -1088,6 +1138,9 @@ fn child(command: &mut Command, log: &Path, deadline: Duration) -> Ended {
     };
     let (mut process, mut live) = {
         let _spawn = spawn_lock();
+        if interrupted() {
+            return ended(ChildEnd::Interrupted);
+        }
         let Ok(process) = spawned() else {
             return ended(ChildEnd::Signaled(-1));
         };
@@ -1133,14 +1186,19 @@ fn child(command: &mut Command, log: &Path, deadline: Duration) -> Ended {
                 live.release();
                 sweep(&mut tree);
                 return ended(match status.code() {
+                    _ if interrupted() => ChildEnd::Interrupted,
                     _ if late => ChildEnd::TimedOut,
                     Some(code) => ChildEnd::Exited(code),
                     None => ChildEnd::Signaled(signal_of(status)),
                 });
             }
-            Ok(None) if late => {
+            Ok(None) if late || interrupted() => {
                 end_unreaped(&mut process, &mut tree, &mut live);
-                return ended(ChildEnd::TimedOut);
+                return ended(if late {
+                    ChildEnd::TimedOut
+                } else {
+                    ChildEnd::Interrupted
+                });
             }
             Ok(None) => {
                 // Under the subreaper a sweep finds every descendant from
@@ -1686,10 +1744,12 @@ fn run_tasks(
         }
     }
     for (property, cases) in &by_property {
+        stop_if_interrupted()?;
         run_planted(repo_root, options, property, cases, artifacts)?;
     }
     let mut broken: Option<String> = None;
     for (index, task) in tasks.iter().enumerate() {
+        stop_if_interrupted()?;
         let dir = artifacts.join(index.to_string());
         fs::create_dir_all(&dir)?;
         if let Some(test) = task.get("test") {
@@ -1714,6 +1774,7 @@ fn run_tasks(
                 (_, Some(integrity)) => run_integrity(options, subject, integrity, &dir, worktree),
                 _ => unreachable!("the task is a case or an integrity mutation"),
             };
+            stop_if_interrupted()?;
             if let Err(why) = ran {
                 fs::write(dir.join("setup.log"), format!("{why}\n"))?;
                 broken = Some(format!(
@@ -1745,6 +1806,7 @@ fn run_planted(
 ) -> Result<(), BoxError> {
     let stem = property.replace('/', "-");
     let ended = planted_child(repo_root, options, property, false, &stem)?;
+    stop_if_interrupted()?;
     let log = fs::read_to_string(&ended.log).unwrap_or_default();
     for (index, name) in cases {
         let dir = artifacts.join(index.to_string());
@@ -1766,6 +1828,7 @@ fn run_planted(
         )?;
     }
     let ended = planted_child(repo_root, options, property, true, &stem)?;
+    stop_if_interrupted()?;
     let log = fs::read_to_string(&ended.log).unwrap_or_default();
     for (index, name) in cases {
         let check = target_check(&log, ended.killed(), property, name);
@@ -1930,6 +1993,7 @@ fn run_test(
     // Writes a `test.json` that ran nothing, with `why` as its log, so the
     // result blocks.
     let ran_nothing = |why: &str, killed: bool| -> Result<(), BoxError> {
+        stop_if_interrupted()?;
         fs::write(&log, why)?;
         fs::write(
             out.join("test.json"),
@@ -2001,6 +2065,7 @@ fn run_test(
         .env("CARGO_TARGET_DIR", targets)
         .env("CARGO_TERM_COLOR", "never");
     let ended = child(&mut run, &log, options.deadline);
+    stop_if_interrupted()?;
     let text_log = fs::read_to_string(&log).unwrap_or_default();
     let tests = libtest(&text_log);
     let binary_source = match (fs::read(&executable), source) {
@@ -2329,6 +2394,7 @@ fn case_task(
             )
         }
     }
+    stop_if_interrupted()?;
     Ok(rebuilt)
 }
 
@@ -2370,6 +2436,7 @@ fn rebuild_case(
     };
     let source = checkout_digest(options, worktree)
         .map_or_else(|_| provenance::UNKNOWN.to_owned(), |read| read.source);
+    stop_if_interrupted()?;
     // The patch the rebuild applied, which the reader compares with the
     // case's committed patch at S.
     let patch_sha256: String = {
@@ -2423,6 +2490,7 @@ fn run_integrity(
             _ => Ok(()),
         };
         if let Err(why) = setup {
+            stop_if_interrupted()?;
             fs::write(dir.join("setup.log"), format!("{run}: {why}\n"))?;
             break;
         }
@@ -3664,6 +3732,209 @@ mod tests {
         let mut shell = Command::new("sh");
         shell.args(["-c", &script]);
         child(&mut shell, &out.join("shell.log"), Duration::from_secs(60));
+    }
+
+    /// The variable that has [`interrupted_runner_helper`] run as the outer
+    /// runner, naming its `--out`.
+    #[cfg(target_os = "linux")]
+    const INTERRUPTED_RUNNER: &str = "XTASK_INTERRUPTED_RUNNER";
+
+    /// The variable that has [`interrupted_runner_helper`] run as the inner
+    /// runner, the xtask built at S, naming the outer's `--out`.
+    #[cfg(target_os = "linux")]
+    const INTERRUPTED_INNER: &str = "XTASK_INTERRUPTED_INNER";
+
+    /// An interrupted runner leaves nothing running: the outer runner
+    /// ([`interrupted_runner_helper`]) takes the lock and runs the inner one
+    /// through [`child`], which runs a shell that starts a `sleep` and a
+    /// Python launcher's `sleep` with every inherited descriptor closed.
+    /// SIGINT to the outer ends its child as its deadline would: every one of
+    /// those processes is gone, the outer's child ended `Interrupted`, and
+    /// the lock is free with no survivor. Without the handler SIGINT kills
+    /// the outer, and the `sleep`s live on holding the lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interrupted_runner_ends_everything_it_started() {
+        let out = tempfile::tempdir().unwrap();
+        let mut helper = Command::new(env::current_exe().expect("the test binary has a path"))
+            .args([
+                "--exact",
+                "header_acceptance::tests::interrupted_runner_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(INTERRUPTED_RUNNER, out.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the test binary runs");
+        let read = |name: &str| -> Option<i32> {
+            fs::read_to_string(out.path().join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let started = Instant::now();
+        let (shell, sleeper, closed) = loop {
+            if let (Some(shell), Some(sleeper), Some(closed)) =
+                (read("shell.pid"), read("sleep.pid"), read("closed.pid"))
+            {
+                break (shell, sleeper, closed);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the inner runner started its shell"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let outer = i32::try_from(helper.id()).unwrap();
+        // SAFETY: `kill` has no memory-safety preconditions, and `outer` is
+        // this test's own unreaped child.
+        unsafe {
+            libc::kill(outer, libc::SIGINT);
+        }
+        let started = Instant::now();
+        while helper.try_wait().unwrap().is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the interrupted runner exits"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            fs::read_to_string(out.path().join("end")).unwrap_or_default(),
+            ChildEnd::Interrupted.to_string(),
+            "the outer runner's child ended interrupted"
+        );
+        for pid in [shell, sleeper, closed] {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            assert!(
+                stat.is_empty() || stat.contains(") Z "),
+                "{pid} outlived the interrupted run"
+            );
+        }
+        lock_out(out.path()).expect("the lock is free");
+        assert!(survivors(out.path()).unwrap().is_empty());
+    }
+
+    /// The outer and inner runners, run only by
+    /// [`an_interrupted_runner_ends_everything_it_started`]. Each installs
+    /// the handler and the subreaper as the runner does. The outer writes its
+    /// child's end to `end`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_runner_helper() {
+        if let Some(out) = env::var_os(INTERRUPTED_INNER).map(PathBuf::from) {
+            sim_minimize::install_interrupt_handler();
+            assert!(contain());
+            let script = format!(
+                "echo $$ > {dir}/shell.pid; sleep 60 & echo $! > {dir}/sleep.pid; \
+                 python3 -c 'import subprocess, sys; \
+                 p = subprocess.Popen([\"sleep\", \"60\"], close_fds=True); \
+                 open(sys.argv[1], \"w\").write(str(p.pid))' {dir}/closed.pid; \
+                 wait",
+                dir = out.display()
+            );
+            let mut shell = Command::new("sh");
+            shell.args(["-c", &script]);
+            child(&mut shell, &out.join("shell.log"), Duration::from_secs(60));
+            return;
+        }
+        let Some(out) = env::var_os(INTERRUPTED_RUNNER).map(PathBuf::from) else {
+            return;
+        };
+        sim_minimize::install_interrupt_handler();
+        assert!(contain());
+        let _lock = lock_out(&out).unwrap();
+        mark_descendants(&out);
+        let _sessions = track_sessions(&out);
+        let mut inner = Command::new(own_exe().unwrap());
+        inner
+            .args([
+                "--exact",
+                "header_acceptance::tests::interrupted_runner_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove(INTERRUPTED_RUNNER)
+            .env(INTERRUPTED_INNER, &out);
+        let ended = child(&mut inner, &out.join("inner.log"), Duration::from_secs(60));
+        fs::write(out.join("end"), ended.end.to_string()).unwrap();
+    }
+
+    /// The variable that has [`interrupted_flag_helper`] run, naming its
+    /// directory.
+    #[cfg(unix)]
+    const INTERRUPTED_FLAG: &str = "XTASK_INTERRUPTED_FLAG";
+
+    /// Once the run is interrupted, [`child`] starts nothing and reports
+    /// `Interrupted`, and [`publish_record`], the run's last decision,
+    /// publishes nothing and leaves no staged copy. The flag is set in a
+    /// process of its own ([`interrupted_flag_helper`]), since every `child`
+    /// in this test binary would see it.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_run_starts_and_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Command::new(env::current_exe().expect("the test binary has a path"))
+            .args([
+                "--exact",
+                "header_acceptance::tests::interrupted_flag_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(INTERRUPTED_FLAG, dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let report: Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("report.json")).unwrap())
+                .unwrap();
+        assert_eq!(report["end"], ChildEnd::Interrupted.to_string());
+        assert_eq!(report["ran"], false, "the child didn't start");
+        assert_eq!(report["published"], false);
+        assert_eq!(report["staged"], 0, "no staged record is left");
+        assert!(report["error"].as_str().unwrap().contains("interrupted"));
+    }
+
+    /// Sets the interrupt flag, then tries a child and a publication, run
+    /// only by [`an_interrupted_run_starts_and_publishes_nothing`].
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_flag_helper() {
+        let Some(dir) = env::var_os(INTERRUPTED_FLAG).map(PathBuf::from) else {
+            return;
+        };
+        sim_minimize::INTERRUPTED.store(true, Ordering::SeqCst);
+        let marker = dir.join("ran");
+        let mut touch = Command::new("touch");
+        touch.arg(&marker);
+        let ended = child(&mut touch, &dir.join("touch.log"), Duration::from_secs(60));
+        let out = dir.join("out");
+        let run_dir = out.join(RUNS).join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(run_dir.join(RECORD), r#"{"artifacts": "artifacts"}"#).unwrap();
+        let error = publish_record(&out, &run_dir).unwrap_err().to_string();
+        let staged = fs::read_dir(&out)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".record."))
+            .count();
+        fs::write(
+            dir.join("report.json"),
+            json!({
+                "end": ended.end.to_string(),
+                "ran": marker.exists(),
+                "published": out.join(RECORD).exists(),
+                "staged": staged,
+                "error": error,
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     /// A recorded session counts only this boot, and only while its number

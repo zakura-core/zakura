@@ -53,14 +53,15 @@ use super::{
         preload,
         recovery::{RecoveryEvidence, RecoveryInputs, RECOVERY_BOUND},
         reservation::ReservationEvidence,
+        retirement::RetirementEvidence,
         round_life::RoundLifeEvidence,
         session::SessionEvidence,
         stale::StaleEvidence,
         stamp::Stamps,
         tap::ReactorTap,
         wake::WakeEvidence,
-        Base, Chain, Control, ControlAction, ControlStep, DispatchFlag, Effects, Fork, HeaderNode,
-        Policy, PolicySource, Topology,
+        Base, Chain, Control, ControlAction, ControlStep, DelayedPage, DispatchFlag, Effects, Fork,
+        HeaderNode, Policy, PolicySource, Topology,
     },
     scenario::Rejection,
     wire_node::{TransportTap, WireNode},
@@ -71,10 +72,11 @@ use crate::{
     domain::{
         header_sync::{
             chunk_budget_bound, commit_only_authorized, outstanding_end_violations,
-            outstanding_work_bounded, reset_invalidates_work, stale_chain_effect_inert,
-            stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
-            AdoptionView, AuthorityView, BudgetView, ChainView, HoldWakeView, OutstandingView,
-            ResetView, StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
+            outstanding_work_bounded, peer_retirement_progress, reset_invalidates_work,
+            retirement_end_violations, stale_chain_effect_inert, stale_completion_inert,
+            teardown_end_violations, teardown_returns_baseline, AdoptionView, AuthorityView,
+            BudgetView, ChainView, HoldWakeView, OutstandingView, ResetView, RetirementView,
+            StaleView, TeardownView, WakeView, OUTSTANDING_WORK_BOUNDED,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -588,6 +590,9 @@ pub struct Ports {
     /// When the node's reset check first applied, which its tap finds
     /// during the run.
     pub round_life: RoundLifeEvidence,
+    /// When the node's departed-work check first applied, which its tap
+    /// finds during the run.
+    pub retirement: RetirementEvidence,
     /// When the node's stale-chain check first applied, which its tap
     /// finds during the run.
     pub chain_effect: ChainEffectEvidence,
@@ -599,6 +604,9 @@ pub struct Ports {
     pub outstanding: OutstandingEvidence,
     /// The run's recovery, which a `Recover` step starts.
     pub recovery: RecoveryEvidence,
+    /// The mirror whose first page on each link the harness holds back.
+    /// `None` unless whoever prepared the ports set one.
+    pub delayed_page: Option<DelayedPage>,
 }
 
 /// The node under test, named `node`, on a controlled port with mirror
@@ -627,6 +635,8 @@ pub struct Storage {
     stamps: Stamps,
     /// When the node's reset check first applied, from its tap.
     round_life: RoundLifeEvidence,
+    /// When the node's departed-work check first applied, from its tap.
+    retirement: RetirementEvidence,
     /// When the node's stale-chain check first applied, from its tap.
     chain_effect: ChainEffectEvidence,
     /// When the node's authority check first applied, from its tap.
@@ -687,6 +697,8 @@ pub struct StorageView {
     pub stamps: Stamps,
     /// When the node's reset check first applied.
     pub round_life: RoundLifeEvidence,
+    /// When the node's departed-work check first applied.
+    pub retirement: RetirementEvidence,
     /// When the node's stale-chain check first applied.
     pub chain_effect: ChainEffectEvidence,
     /// When the node's authority check first applied.
@@ -717,6 +729,23 @@ impl OutstandingView for StorageView {
     /// [`StorageView::outstanding`].
     fn outstanding(&self) -> &OutstandingEvidence {
         &self.outstanding
+    }
+}
+
+impl RetirementView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::ends`].
+    fn ends(&self) -> &EndEvidence {
+        &self.ends
+    }
+
+    /// [`StorageView::retirement`].
+    fn retirement(&self) -> &RetirementEvidence {
+        &self.retirement
     }
 }
 
@@ -835,6 +864,7 @@ impl HasView for Storage {
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
+            retirement: self.retirement.clone(),
             chain_effect: self.chain_effect.clone(),
             authority: self.authority.clone(),
             outstanding: self.outstanding.clone(),
@@ -849,14 +879,16 @@ impl HasView for Storage {
         self.faults.end(end);
         self.rounds.end(end);
         self.outstanding.end(end);
+        self.retirement.end(end);
     }
 
-    /// [`fault_end_violations`], [`teardown_end_violations`] and
-    /// [`outstanding_end_violations`].
+    /// [`fault_end_violations`], [`teardown_end_violations`],
+    /// [`outstanding_end_violations`] and [`retirement_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
         found.extend(outstanding_end_violations(&self.outstanding));
+        found.extend(retirement_end_violations(&self.retirement));
         found
     }
 
@@ -977,10 +1009,12 @@ impl Subsystem for Storage {
             hold_wake: HoldWakeEvidence::default(),
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
+            retirement: RetirementEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
             authority: AuthorityEvidence::default(),
             outstanding: OutstandingEvidence::default(),
             recovery: RecoveryEvidence::default(),
+            delayed_page: None,
         }
     }
 
@@ -1017,6 +1051,7 @@ impl Subsystem for Storage {
         let ends = tap.ends();
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
+        tap.watch_retirement(ports.retirement.clone());
         tap.watch_chain(ports.chain_effect.clone());
         let branches = scenario
             .mirrors
@@ -1072,7 +1107,8 @@ impl Subsystem for Storage {
         let topology = Rc::new(
             Topology::new(nodes, effects)
                 .with_tap(shutdown)
-                .with_sessions(ports.sessions.clone()),
+                .with_sessions(ports.sessions.clone())
+                .with_delayed_page(ports.delayed_page.clone()),
         );
         for (index, spec) in (1..).zip(&scenario.mirrors) {
             match spec.dialer {
@@ -1115,6 +1151,7 @@ impl Subsystem for Storage {
             wake: ports.wake,
             hold_wake: ports.hold_wake,
             round_life: ports.round_life,
+            retirement: ports.retirement,
             chain_effect: ports.chain_effect,
             authority: ports.authority,
             outstanding: ports.outstanding,
@@ -1300,6 +1337,9 @@ pub struct WirePorts {
     /// When the node's reset check first applied, which its tap finds
     /// during the run.
     pub round_life: RoundLifeEvidence,
+    /// When the node's departed-work check first applied, which its tap
+    /// finds during the run.
+    pub retirement: RetirementEvidence,
     /// When the node's stale-chain check first applied, which its tap
     /// finds during the run.
     pub chain_effect: ChainEffectEvidence,
@@ -1353,6 +1393,8 @@ pub struct HeaderWire {
     stamps: Stamps,
     /// When the node's reset check first applied, from its tap.
     round_life: RoundLifeEvidence,
+    /// When the node's departed-work check first applied, from its tap.
+    retirement: RetirementEvidence,
     /// When the node's stale-chain check first applied, from its tap.
     chain_effect: ChainEffectEvidence,
     /// When the node's authority check first applied, from its tap.
@@ -1392,6 +1434,7 @@ impl HasView for HeaderWire {
             ends: self.ends.clone(),
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
+            retirement: self.retirement.clone(),
             chain_effect: self.chain_effect.clone(),
             authority: self.authority.clone(),
             // The wire harness doesn't register outstanding-work-bounded.
@@ -1408,12 +1451,15 @@ impl HasView for HeaderWire {
         self.faults.end(end);
         self.sessions.end(end);
         self.rounds.end(end);
+        self.retirement.end(end);
     }
 
-    /// [`fault_end_violations`] and [`teardown_end_violations`].
+    /// [`fault_end_violations`], [`teardown_end_violations`] and
+    /// [`retirement_end_violations`].
     fn end_violations(&self, log: &ObservationLog) -> Vec<EndViolation> {
         let mut found = fault_end_violations(&self.faults, log);
         found.extend(teardown_end_violations(&self.rounds));
+        found.extend(retirement_end_violations(&self.retirement));
         found
     }
 
@@ -1506,6 +1552,7 @@ impl Subsystem for HeaderWire {
             hold_wake: HoldWakeEvidence::default(),
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
+            retirement: RetirementEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
             authority: AuthorityEvidence::default(),
         }
@@ -1552,6 +1599,7 @@ impl Subsystem for HeaderWire {
         let ends = tap.ends();
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
+        tap.watch_retirement(ports.retirement.clone());
         tap.watch_chain(ports.chain_effect.clone());
         let declared = ports
             .chains
@@ -1648,6 +1696,7 @@ impl Subsystem for HeaderWire {
             wake: ports.wake,
             hold_wake: ports.hold_wake,
             round_life: ports.round_life,
+            retirement: ports.retirement,
             chain_effect: ports.chain_effect,
             authority: ports.authority,
             ends,
@@ -1850,8 +1899,8 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 /// The storage harness's properties, [`OPERATION_IDS`],
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
 /// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
-/// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`] and
-/// [`COMMIT_ONLY_AUTHORIZED`], all active. A test harness that wraps [`Storage`] with its view registers
+/// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`],
+/// [`COMMIT_ONLY_AUTHORIZED`] and [`PEER_RETIREMENT_PROGRESS`], all active. A test harness that wraps [`Storage`] with its view registers
 /// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
@@ -1860,6 +1909,7 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 /// [`RESET_INVALIDATES_WORK`]: crate::domain::header_sync::RESET_INVALIDATES_WORK
 /// [`STALE_CHAIN_EFFECT_INERT`]: crate::domain::header_sync::STALE_CHAIN_EFFECT_INERT
 /// [`COMMIT_ONLY_AUTHORIZED`]: crate::domain::header_sync::COMMIT_ONLY_AUTHORIZED
+/// [`PEER_RETIREMENT_PROGRESS`]: crate::domain::header_sync::PEER_RETIREMENT_PROGRESS
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1890,6 +1940,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         stale_chain_effect_inert(),
         commit_only_authorized(),
         outstanding_work_bounded(),
+        peer_retirement_progress(),
     ]
 }
 
@@ -2318,6 +2369,7 @@ mod tests {
                 ends: EndEvidence::default(),
                 stamps: Stamps::default(),
                 round_life: RoundLifeEvidence::default(),
+                retirement: RetirementEvidence::default(),
                 chain_effect: ChainEffectEvidence::default(),
                 authority: AuthorityEvidence::default(),
                 outstanding: OutstandingEvidence::default(),

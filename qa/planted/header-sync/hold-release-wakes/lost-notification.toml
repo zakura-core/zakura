@@ -10,6 +10,10 @@
 # readers decide which events wake the reactor. A change there can move the
 # input off its quiet release.
 checks = ["crates/zakura-network/src/zakura/header_sync"]
+# A reactor that no longer wakes for a reply also never hands a departed
+# peer's target off, so a campaign input that draws a departure fixture
+# breaks `peer-retirement-progress`'s hand-off too.
+also_violates = ["header-sync/peer-retirement-progress"]
 
 [typed]
 harness = "header-sync/liveness"

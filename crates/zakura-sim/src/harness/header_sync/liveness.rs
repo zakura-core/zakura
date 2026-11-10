@@ -18,10 +18,9 @@
 //! [`LIVENESS_BUDGET`], puts the limit at more than twice each fixture's
 //! honest peak, which a test measures.
 //!
-//! Every fixture ends: once each held reply has been handled, or the clock
-//! has moved past it, which is when `header-sync/hold-release-wakes` has
-//! concluded its obligation either way, a [`Finish`] step stops every node,
-//! so the run ends idle rather than at its budget (Rule 13).
+//! Every fixture ends: once its obligations have concluded, a [`Finish`]
+//! step stops every node, so the run ends idle rather than at its budget
+//! (Rule 13).
 
 use std::rc::Rc;
 
@@ -32,12 +31,14 @@ use zakura_scheduler::SimInstant;
 
 use super::{storage_config, storage_properties, storage_sources, Ports, Storage, StorageView};
 use crate::{
-    domain::header_sync::hold_release_wakes,
+    domain::header_sync::{hold_release_wakes, open_retirement},
     harness::{
         header_node::{
+            ends::{EndEvidence, EndFact, EnvironmentAction},
             hold_wake::{HoldWakeEvidence, HoldWakeFact},
             policy::{Allow, Hold, OpKind, ReplyHold, Select, Trigger},
-            Chain, ControlAction, ControlStep, Policy, Topology,
+            retirement::{RetirementEvidence, Roles},
+            Chain, ControlAction, ControlStep, DelayedPage, Policy, Topology,
         },
         header_sync::{Dialer, MirrorSpec, StorageScenario},
         Subsystem,
@@ -47,10 +48,37 @@ use crate::{
 };
 
 /// The live steps a liveness run may take. The livelock limit is a tenth of
-/// it, 4,000 steps at one instant. The fixtures' honest runs take at most
-/// about 1,870 there, the serving ones, measured over 16 plans each, and
-/// a test keeps every fixture under half the limit.
-pub const LIVENESS_BUDGET: u64 = 40_000;
+/// it, 5,000 steps at one instant. The fixtures' honest runs take at most
+/// about 2,310 there, a relink departure's, measured over 16 plans each,
+/// and a test keeps every fixture under half the limit.
+pub const LIVENESS_BUDGET: u64 = 50_000;
+
+/// The departure and timeout fixtures' mirror A, the owner, whose slot goes.
+pub const OWNER: &str = "mirror-0";
+
+/// The departure and timeout fixtures' mirror B, the taker, which must take
+/// A's target up.
+pub const TAKER: &str = "mirror-1";
+
+/// When a departure or timeout fixture's script is done, from the run's
+/// start: past every hold and deadline its honest run reaches, the latest
+/// a late apply's, held 35 seconds after its submission at 20. A run whose
+/// fixture never got ready ends here, as `NotApplicable`, rather than at
+/// its budget. The late-page fixture's is [`LATE_PAGE_HORIZON`].
+pub const FIXTURE_HORIZON: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the late-page fixture holds A's first page, a second short of
+/// the 30-second request deadline its round's start armed.
+pub const LATE_PAGE_DELAY: std::time::Duration = std::time::Duration::from_secs(29);
+
+/// When the late-page fixture lets A's held prepare go, in virtual
+/// milliseconds: past the deadline the late page rearmed, 30 seconds after
+/// a page that comes 29 seconds after a start within the first second.
+const LATE_PAGE_PREPARE_MS: u64 = 70_000;
+
+/// [`FIXTURE_HORIZON`] for the late-page fixture, past its prepare's
+/// release.
+pub const LATE_PAGE_HORIZON: std::time::Duration = std::time::Duration::from_secs(80);
 
 /// A storage operation kind a hold fixture holds: the reactor's three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +104,51 @@ impl HeldKind {
             HeldKind::Apply => OpKind::Apply,
         }
     }
+}
+
+/// Where mirror A's round is when its session departs in a departure
+/// fixture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stage {
+    /// Awaiting its locator, whose read is held.
+    Awaiting,
+    /// Receiving pages: its first request is reserved.
+    Receiving,
+    /// Preparing, with its prepare held.
+    Preparing,
+    /// Applying, with its apply held.
+    Applying,
+}
+
+impl Stage {
+    /// Every stage, in order.
+    pub const ALL: [Stage; 4] = [
+        Stage::Awaiting,
+        Stage::Receiving,
+        Stage::Preparing,
+        Stage::Applying,
+    ];
+
+    /// The operation kind held in this stage, if any.
+    fn held(self) -> Option<OpKind> {
+        match self {
+            Stage::Awaiting => Some(OpKind::Locator),
+            Stage::Receiving => None,
+            Stage::Preparing => Some(OpKind::Prepare),
+            Stage::Applying => Some(OpKind::Apply),
+        }
+    }
+}
+
+/// How mirror A's session departs in a departure fixture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Departs {
+    /// The harness closes A's link, so the node ends its session.
+    Close,
+    /// The harness links A again, so the node replaces its session.
+    Relink,
 }
 
 /// One of the liveness fixtures. Each is a fixed storage scenario
@@ -109,9 +182,59 @@ pub enum LivenessScenario {
     /// plans the node begins stopping before its reactor handles the
     /// delivered reply.
     ShutdownAfterRelease,
+    /// The departure fixture: the node at A3, with mirror A ([`OWNER`])
+    /// and mirror B ([`TAKER`]) on one fixed chain whose tip, A6, is the
+    /// target. B starts at A3 and grows to A6 once A's locator read is
+    /// submitted, so A owns the target before B offers it, and is then
+    /// relinked, so its new session's first `Status` carries the target at
+    /// once. That admission readies the fixture. A's first locator read is
+    /// held until then, so every arm of A's deadline comes after it. Then A
+    /// departs, `by` a close or a relink, once B's new session is admitted
+    /// and A's round reaches `stage`. The operation the stage holds, if any,
+    /// is released once the reactor has seen A's session depart: at the
+    /// replacement's admission, or once the clock moves after a close.
+    Departure {
+        /// Where A's round is when it departs.
+        stage: Stage,
+        /// How it departs.
+        by: Departs,
+    },
+    /// The timeout fixture: the departure fixture with A's session live and
+    /// A's first prepare held for 35 virtual seconds, past the request
+    /// timeout, so production retires A's round for its deadline and the
+    /// cached pass hands the target to B. With `late_apply`, the prepare
+    /// runs 20 seconds after its submission and A's first apply is held for
+    /// 35 seconds after its own, so the apply's dispatch rearms the
+    /// deadline, and the round retires 30 seconds after that.
+    Timeout {
+        /// Whether the prepare runs late and the apply is held.
+        late_apply: bool,
+    },
+    /// The timeout fixture with A's first page held [`LATE_PAGE_DELAY`] on
+    /// its way to the node, so it arrives a second before the deadline its
+    /// round's start armed and rearms it, and the run's clock crosses the
+    /// first deadline with the round still live. A's prepare is held past
+    /// the rearmed deadline, so production retires A's round 30 seconds
+    /// after the page, and the cached pass hands the target to B.
+    LatePage,
 }
 
 impl LivenessScenario {
+    /// The departure and timeout fixtures' mirrors, for the hand-off rule,
+    /// or `None` for a hold fixture.
+    pub fn roles(self) -> Option<Roles> {
+        matches!(
+            self,
+            LivenessScenario::Departure { .. }
+                | LivenessScenario::Timeout { .. }
+                | LivenessScenario::LatePage
+        )
+        .then(|| Roles {
+            owner: OWNER.to_owned(),
+            taker: TAKER.to_owned(),
+        })
+    }
+
     /// Every fixture, in the order the scenario byte picks them.
     pub fn all() -> Vec<LivenessScenario> {
         let mut all: Vec<LivenessScenario> = HeldKind::ALL
@@ -128,7 +251,44 @@ impl LivenessScenario {
             LivenessScenario::ReplyHeld,
             LivenessScenario::ShutdownAfterRelease,
         ]);
+        all.extend(LivenessScenario::departures());
+        all.extend([false, true].map(|late_apply| LivenessScenario::Timeout { late_apply }));
+        all.push(LivenessScenario::LatePage);
         all
+    }
+
+    /// The hold fixtures, every one whose obligation a held reply opens.
+    pub fn holds() -> Vec<LivenessScenario> {
+        LivenessScenario::all()
+            .into_iter()
+            .filter(|fixture| {
+                !matches!(
+                    fixture,
+                    LivenessScenario::Departure { .. } | LivenessScenario::Timeout { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// When the fixture's script is done: [`LATE_PAGE_HORIZON`] for the
+    /// late-page fixture, [`FIXTURE_HORIZON`] for every other.
+    fn horizon(self) -> std::time::Duration {
+        match self {
+            LivenessScenario::LatePage => LATE_PAGE_HORIZON,
+            _ => FIXTURE_HORIZON,
+        }
+    }
+
+    /// The departure fixtures, each stage once by a close and once by a
+    /// relink.
+    pub fn departures() -> Vec<LivenessScenario> {
+        Stage::ALL
+            .into_iter()
+            .flat_map(|stage| {
+                [Departs::Close, Departs::Relink]
+                    .map(|by| LivenessScenario::Departure { stage, by })
+            })
+            .collect()
     }
 
     /// The storage scenario this fixture runs.
@@ -175,7 +335,134 @@ impl LivenessScenario {
                 });
                 scenario
             }
+            LivenessScenario::Departure { stage, by } => departure(stage, by),
+            LivenessScenario::Timeout { late_apply } => timeout(late_apply),
+            LivenessScenario::LatePage => late_page(),
         }
+    }
+}
+
+/// [`LivenessScenario::Timeout`]'s storage scenario: the preparing
+/// departure's, without A's departure or the release.
+fn timeout(late_apply: bool) -> StorageScenario {
+    let mut scenario = departure(Stage::Preparing, Departs::Close);
+    scenario.controls.retain(|step| step.peer == TAKER);
+    // The held call keeps the node's one local operation busy, which would
+    // keep B's round from preparing, so it's let go once A's deadline has
+    // passed.
+    if late_apply {
+        scenario.policy.holds[0].until = Trigger::VirtualTime(20_000);
+        scenario.policy.holds.push(Hold {
+            select: Select::nth(OpKind::Apply, 1),
+            until: Trigger::VirtualTime(35_000),
+            then: vec![Allow::Engine],
+            deadline_ms: None,
+        });
+    } else {
+        scenario.policy.holds[0].until = Trigger::VirtualTime(35_000);
+    }
+    scenario
+}
+
+/// [`LivenessScenario::LatePage`]'s storage scenario: the timeout
+/// fixture's, with A's prepare held until [`LATE_PAGE_PREPARE_MS`]. Its
+/// page's delay is the harness's, not storage's ([`Liveness::prepare`]).
+fn late_page() -> StorageScenario {
+    let mut scenario = timeout(false);
+    scenario.policy.holds[0].until = Trigger::VirtualTime(LATE_PAGE_PREPARE_MS);
+    scenario
+}
+
+/// [`LivenessScenario::Departure`]'s storage scenario.
+fn departure(stage: Stage, by: Departs) -> StorageScenario {
+    let (a, b) = (OWNER.to_owned(), TAKER.to_owned());
+    let step = |peer: &str, action, when| ControlStep {
+        peer: peer.to_owned(),
+        action,
+        when: Some(when),
+    };
+    let reached = match stage.held() {
+        Some(kind) => Trigger::Submitted(Select::nth(kind, 1)),
+        None => Trigger::ReservationOpened(a.clone()),
+    };
+    // The held operation is released only once the reactor has seen the
+    // departure. A replacement's admission is that unit. A close reaches
+    // the reactor some steps after the link closes, and always before the
+    // clock moves, so its release waits for the clock.
+    let (action, departed) = match by {
+        Departs::Close => (
+            ControlAction::Close,
+            Trigger::All(vec![
+                Trigger::Closed(a.clone()),
+                Trigger::VirtualTime(1_000),
+            ]),
+        ),
+        Departs::Relink => (
+            ControlAction::Relink,
+            Trigger::Count(2, Box::new(Trigger::SessionAdmitted(a.clone()))),
+        ),
+    };
+    // B's tip change would reach the node only behind B's one-second
+    // status floor, after the clock moves. A new session publishes its
+    // first `Status` at once, so B is relinked once it has grown.
+    let mut controls = vec![
+        step(
+            &b,
+            ControlAction::Grow { len: 3 },
+            Trigger::Submitted(Select::nth(OpKind::Locator, 1)),
+        ),
+        step(&b, ControlAction::Relink, Trigger::Grown(b.clone())),
+        step(
+            &a,
+            action,
+            Trigger::All(vec![
+                Trigger::Count(2, Box::new(Trigger::SessionAdmitted(b.clone()))),
+                reached,
+            ]),
+        ),
+    ];
+    let mut holds: Vec<_> = stage
+        .held()
+        .map(|kind| {
+            controls.push(step("node", ControlAction::Release { hold: 0 }, departed));
+            Hold {
+                select: Select::nth(kind, 1),
+                until: Trigger::Released,
+                then: vec![Allow::Engine],
+                deadline_ms: None,
+            }
+        })
+        .into_iter()
+        .collect();
+    // A's first locator read waits for B's new session, which readies the
+    // fixture, so A's round starts, and arms its deadline, only after. The
+    // awaiting stage holds that read past A's departure already.
+    if stage != Stage::Awaiting {
+        holds.push(Hold {
+            select: Select::nth(OpKind::Locator, 1),
+            until: Trigger::Count(2, Box::new(Trigger::SessionAdmitted(b.clone()))),
+            then: vec![Allow::Engine],
+            deadline_ms: None,
+        });
+    }
+    StorageScenario {
+        node: Chain::main(3),
+        mirrors: vec![
+            MirrorSpec {
+                chain: Chain::main(6),
+                dialer: Dialer::Mirror,
+            },
+            MirrorSpec {
+                chain: Chain::main(3),
+                dialer: Dialer::Mirror,
+            },
+        ],
+        policy: Policy {
+            holds,
+            ..Policy::converging()
+        },
+        controls,
+        weights: Default::default(),
     }
 }
 
@@ -205,16 +492,34 @@ fn held(kind: OpKind) -> StorageScenario {
     }
 }
 
-/// Ends a liveness run once its obligations have concluded: at least one
-/// held reply has reached the reactor, and each has been handled or the
-/// clock has moved past it, and the fixture's own `Shutdown` step, if it
-/// has one, was picked. Its pick begins the node under test's stop, as a
-/// `Shutdown` step's does, and its task then stops every node
-/// ([`Topology::finish`]). It offers no time boundary of its own, so it
-/// never changes when the clock moves before then.
+/// Ends a liveness run once its obligations have concluded, so it ends
+/// idle rather than at its budget. That's once each held reply that reached
+/// the reactor has been handled or the clock has moved past it, the
+/// fixture's key event has happened, and every
+/// `header-sync/peer-retirement-progress` obligation still open
+/// ([`open_retirement`]) is past its deadline. A hold fixture's key event is
+/// its first held reply, a departure fixture's the harness's close or
+/// relink of [`OWNER`] with the clock past it, and a timeout fixture's the
+/// clock past its horizon ([`LivenessScenario::horizon`]). A departure
+/// fixture whose departure never
+/// came also ends at the horizon. A `BeforeQuiescence` obligation concludes
+/// by the first quiescence after its trigger, and the clock moves only then.
+/// The fixture's own `Shutdown` step, if it has one, must be picked first.
+/// Its pick begins the node under test's stop, as a `Shutdown` step's does,
+/// and its task then stops every node ([`Topology::finish`]). It offers no
+/// time boundary of its own, so it never changes when the clock moves before
+/// then.
 struct Finish {
     hold_wake: HoldWakeEvidence,
+    ends: EndEvidence,
+    retirement: RetirementEvidence,
     topology: Rc<Topology>,
+    /// Which fixture it is, which says its key event.
+    kind: FixtureKind,
+    /// When its script is done ([`LivenessScenario::horizon`]).
+    horizon: std::time::Duration,
+    /// When the departure was first seen, once it was.
+    departed_at: Option<SimInstant>,
     /// Whether the fixture has its own `Shutdown` step, which must come
     /// first.
     waits_for_shutdown: bool,
@@ -232,12 +537,6 @@ impl Finish {
             return false;
         }
         let facts = self.hold_wake.facts();
-        let concluded = |call: u64, at: SimInstant| {
-            now > at
-                || facts.iter().any(|(_, fact)| {
-                    matches!(fact, HoldWakeFact::Handled { call: handled, .. } if *handled == call)
-                })
-        };
         let opened: Vec<(u64, SimInstant)> = facts
             .iter()
             .filter_map(|(_, fact)| match fact {
@@ -245,7 +544,23 @@ impl Finish {
                 HoldWakeFact::Handled { .. } => None,
             })
             .collect();
-        !opened.is_empty() && opened.into_iter().all(|(call, at)| concluded(call, at))
+        let handled = |call: u64| {
+            facts.iter().any(|(_, fact)| {
+                matches!(fact, HoldWakeFact::Handled { call: handled, .. } if *handled == call)
+            })
+        };
+        let replies_concluded = opened.iter().all(|(call, at)| now > *at || handled(*call));
+        let horizon = now > SimInstant::from_start(self.horizon);
+        let key_event = match self.kind {
+            FixtureKind::Hold => !opened.is_empty(),
+            FixtureKind::Departure => self.departed_at.is_some_and(|at| now > at) || horizon,
+            FixtureKind::Timeout => horizon,
+        };
+        replies_concluded
+            && key_event
+            && open_retirement(&self.retirement, &self.ends)
+                .into_iter()
+                .all(|open| now > open.deadline)
     }
 }
 
@@ -265,6 +580,71 @@ impl ActionSource for Finish {
         self.done = true;
         self.topology.begin_finish();
         self.to_task.send_replace(true);
+    }
+
+    /// Notes when the departure fixture's departure is first seen.
+    fn observe(&mut self, _log: &mut ObservationLog) -> Result<(), String> {
+        if self.kind == FixtureKind::Departure && self.departed_at.is_none() {
+            let departed = self.ends.facts().into_iter().any(|(_, fact)| {
+                matches!(
+                    fact,
+                    EndFact::Environment {
+                        ref peer,
+                        action: EnvironmentAction::Close | EnvironmentAction::Relink,
+                        ..
+                    } if peer == OWNER
+                )
+            });
+            if departed {
+                self.departed_at = Some(zakura_scheduler::hooks::now().unwrap_or_default());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which kind of liveness fixture a run is, for [`Finish`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixtureKind {
+    /// A hold fixture.
+    Hold,
+    /// A departure fixture.
+    Departure,
+    /// A timeout fixture.
+    Timeout,
+}
+
+/// Offers a time boundary one millisecond past each open request-deadline
+/// arm's deadline ([`open_retirement`]), so the clock reaches it even when
+/// no other timer would, and the registry can expire the arm's obligation
+/// (plan's acceptance: deadlines reach the clock). It offers no action.
+struct Deadlines {
+    retirement: RetirementEvidence,
+    ends: EndEvidence,
+}
+
+impl ActionSource for Deadlines {
+    /// None: it only stops the clock.
+    fn enabled(&self, _now: SimInstant, _out: &mut Vec<(Identity, u64)>) {}
+
+    /// One millisecond past each open deadline still ahead of `now`.
+    fn boundaries(&self, now: SimInstant, out: &mut Vec<Boundary>) {
+        out.extend(
+            open_retirement(&self.retirement, &self.ends)
+                .into_iter()
+                .filter(|open| open.timed)
+                .filter_map(|open| {
+                    open.deadline
+                        .checked_add(std::time::Duration::from_millis(1))
+                })
+                .filter(|at| *at > now)
+                .map(Boundary::Opens),
+        );
+    }
+
+    /// Never called: it offers no action.
+    fn execute(&mut self, _local: u64, _log: &mut ObservationLog) {
+        unreachable!("the deadline source offers no action")
     }
 }
 
@@ -322,10 +702,21 @@ impl Subsystem for Liveness {
     }
 
     /// The storage harness's ports for the fixture, with the hold-wake
-    /// evidence armed.
+    /// evidence armed, a departure or timeout fixture's hand-off rule for
+    /// its mirrors ([`LivenessScenario::roles`]), and the late-page
+    /// fixture's page delay on [`OWNER`].
     fn prepare(scenario: &LivenessScenario) -> Ports {
+        let retirement = scenario
+            .roles()
+            .map_or_else(RetirementEvidence::default, RetirementEvidence::armed);
+        let delayed_page = (*scenario == LivenessScenario::LatePage).then(|| DelayedPage {
+            mirror: OWNER.to_owned(),
+            by: LATE_PAGE_DELAY,
+        });
         Ports {
             hold_wake: HoldWakeEvidence::armed(),
+            retirement,
+            delayed_page,
             ..Storage::prepare(&scenario.storage())
         }
     }
@@ -334,6 +725,8 @@ impl Subsystem for Liveness {
     /// the task that carries the finish out.
     fn build(sim: &mut Sim, scenario: &LivenessScenario, ports: Ports) -> Self {
         let hold_wake = ports.hold_wake.clone();
+        let ends = ports.ends.clone();
+        let retirement = ports.retirement.clone();
         let storage = scenario.storage();
         let storage_harness = Storage::build(sim, &storage, ports);
         let topology = storage_harness.topology.clone();
@@ -347,9 +740,24 @@ impl Subsystem for Liveness {
             }
             task_topology.finish();
         });
+        sim.add_source(Box::new(Deadlines {
+            retirement: retirement.clone(),
+            ends: ends.clone(),
+        }));
         sim.add_source(Box::new(Finish {
             hold_wake,
+            ends,
+            retirement,
             topology,
+            kind: match scenario {
+                LivenessScenario::Departure { .. } => FixtureKind::Departure,
+                LivenessScenario::Timeout { .. } | LivenessScenario::LatePage => {
+                    FixtureKind::Timeout
+                }
+                _ => FixtureKind::Hold,
+            },
+            horizon: scenario.horizon(),
+            departed_at: None,
             waits_for_shutdown: storage
                 .controls
                 .iter()

@@ -1316,6 +1316,22 @@ fn pinned_histories() -> BTreeSet<(HistoryRef, &'static str)> {
             ]),
         ),
         (
+            "header-sync/liveness",
+            "tests/header_peer_retirement.rs",
+            "the_committed_fixtures_match_their_names",
+            Some("header-sync/peer-retirement-progress"),
+            owned(&[
+                "header-retire-timeout",
+                "header-retire-late-page",
+                "header-retire-awaiting-close",
+                "header-retire-preparing-close",
+                "header-retire-receiving-close",
+                "header-retire-receiving-relink",
+                "header-retire-preparing-relink",
+                "header-retire-applying-relink",
+            ]),
+        ),
+        (
             STORAGE,
             "tests/header_node_capacity.rs",
             "the_close_relink_input_holds_chunk_budget_bound",

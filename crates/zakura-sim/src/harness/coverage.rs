@@ -501,6 +501,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("completion-arm-removed"),
     },
     Coverage {
+        property: super::super::domain::header_sync::PEER_RETIREMENT_PROGRESS,
+        passing: passes(
+            "tests/header_peer_retirement.rs",
+            "the_committed_fixtures_match_their_names",
+        ),
+        bypass: Bypass::Planted("retained-owner"),
+    },
+    Coverage {
         property: super::header_sync::HEADER_FAULT_PENALIZED,
         passing: passes(
             "tests/header_wire_prepare_fault.rs",

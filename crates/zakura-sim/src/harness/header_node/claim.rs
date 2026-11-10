@@ -89,6 +89,12 @@ pub enum Claim {
     UnstagedHeaders,
     /// A prepare supplied its round from another source than its peer's.
     WrongSource,
+    /// A slot outlived its departed session's unit of work, or work started
+    /// or applied for a departed session ([`super::retirement`]).
+    PeerRetirementProgress,
+    /// A round retired for its session's departure or its timeout while
+    /// the queue still held it.
+    UnreleasedDepartedRound,
 }
 
 impl Claim {
@@ -102,6 +108,7 @@ impl Claim {
             ClaimRule::OpenReservation => Claim::OpenReservation,
             ClaimRule::UnreleasedObsoleteRound => Claim::UnreleasedObsoleteRound,
             ClaimRule::UnreleasedRound => Claim::OutstandingWork,
+            ClaimRule::UnreleasedDepartedRound => Claim::UnreleasedDepartedRound,
             ClaimRule::ForeignPage => Claim::ForeignPage,
             ClaimRule::UnstagedPage => Claim::UnstagedPage,
             ClaimRule::OverReservation => Claim::OverReservation,

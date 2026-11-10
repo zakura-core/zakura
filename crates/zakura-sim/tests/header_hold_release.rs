@@ -158,7 +158,7 @@ fn facts(report: &RunReport) -> Vec<Fact<'_>> {
 #[test]
 fn every_fixture_holds_and_takes_its_path() {
     let mut shut_first = 0;
-    for fixture in LivenessScenario::all() {
+    for fixture in LivenessScenario::holds() {
         let shutdown_fixture = fixture == LivenessScenario::ShutdownAfterRelease;
         let plans = if shutdown_fixture { 32 } else { 6 };
         for input in inputs(plans, 256) {

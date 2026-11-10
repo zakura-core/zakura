@@ -64,11 +64,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use zakura_header_chain::{BodyWorkOwner, HeaderSyncWorkOwner};
 use zakura_network::zakura::{
-    observe::{PortCall, ReactorEvent, RequestRef},
-    ServicePeerDirection, SessionOrigin, SessionStep, TransportEvent, ZakuraPeerId,
-    ZAKURA_STREAM_HEADER_SYNC,
+    observe::ReactorEvent, ServicePeerDirection, SessionOrigin, SessionStep, TransportEvent,
+    ZakuraPeerId, ZAKURA_STREAM_HEADER_SYNC,
 };
 use zakura_rt::sim::RunId;
 
@@ -189,12 +187,6 @@ struct SessionLedger {
     links: HashMap<u64, Link>,
     /// Each session that left the reactor's view, by peer and session ID.
     departed: HashSet<(ZakuraPeerId, u64)>,
-    /// Each live auxiliary repair with a dispatched call: its peer, and
-    /// whether that call is its apply.
-    repairs: HashMap<BodyWorkOwner, (ZakuraPeerId, bool)>,
-    /// The repairs that were preparing when their session left, each allowed
-    /// one apply.
-    kept: HashSet<BodyWorkOwner>,
     /// Own-9's facts, once the transport reports here.
     own9: Option<Own9>,
     /// Set once the run's log froze. Nothing changes the view after that.
@@ -629,9 +621,8 @@ impl SessionLedger {
             );
     }
 
-    /// Records `peer`'s session `session_id` as gone from the reactor's view,
-    /// keeping one apply for each of its repairs that was preparing. Under
-    /// own-9, it's retired at once if own-9 already retired its generation
+    /// Records `peer`'s session `session_id` as gone from the reactor's view.
+    /// Under own-9, it's retired at once if own-9 already retired its generation
     /// or connection, and left open otherwise.
     fn depart(&mut self, peer: &ZakuraPeerId, session_id: u64) {
         if !self.departed.insert((peer.clone(), session_id)) {
@@ -660,19 +651,6 @@ impl SessionLedger {
                 }
             }
         }
-        let preparing = self
-            .repairs
-            .iter()
-            .filter(|(owner, (of, applying))| {
-                owner.session_id() == session_id && of == peer && !applying
-            })
-            .map(|(owner, _)| *owner);
-        self.kept.extend(preparing);
-    }
-
-    /// Whether `peer`'s session `session_id` left the reactor's view.
-    fn departed(&self, peer: &ZakuraPeerId, session_id: u64) -> bool {
-        self.departed.contains(&(peer.clone(), session_id))
     }
 
     /// Checks `admitted`'s session against the link its origin names.
@@ -907,61 +885,6 @@ impl SessionLedger {
                     reason: (*reason).to_owned(),
                 });
                 self.depart(peer, *session_id);
-            }
-            ReactorEvent::Started { request, .. } => {
-                if self.departed(&request.peer, request.session_id) {
-                    let why = format!(
-                        "DepartedSessionWork: request {} started for {}'s session {}, after it \
-                         left the reactor's view",
-                        request.request_id,
-                        self.name(&request.peer),
-                        request.session_id
-                    );
-                    self.break_rule(why);
-                }
-            }
-            ReactorEvent::Retired {
-                request:
-                    RequestRef {
-                        owner: HeaderSyncWorkOwner::BodyRepair(repair),
-                        ..
-                    },
-                ..
-            } => {
-                self.repairs.remove(repair);
-                self.kept.remove(repair);
-            }
-            ReactorEvent::Dispatched {
-                op:
-                    PortCall::Prepare {
-                        peer,
-                        owner: HeaderSyncWorkOwner::BodyRepair(repair),
-                        ..
-                    },
-                ..
-            } => {
-                self.repairs.insert(*repair, (peer.clone(), false));
-            }
-            ReactorEvent::Dispatched {
-                call,
-                op: PortCall::Apply { peer, owner, .. },
-            } => {
-                let kept = match owner {
-                    HeaderSyncWorkOwner::Header(_) => false,
-                    HeaderSyncWorkOwner::BodyRepair(repair) => {
-                        self.repairs.insert(*repair, (peer.clone(), true));
-                        self.kept.remove(repair)
-                    }
-                };
-                if !kept && self.departed(peer, owner.session_id()) {
-                    let why = format!(
-                        "DepartedSessionWork: call {call} applies {}'s session {}, after it left \
-                         the reactor's view",
-                        self.name(peer),
-                        owner.session_id()
-                    );
-                    self.break_rule(why);
-                }
             }
             _ => {}
         }

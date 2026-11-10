@@ -156,6 +156,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed hold fixtures from their names"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/header_peer_retirement.rs"
+test = "regenerate_retirement_fixtures"
+run = false
+reason = "a tool, not a test: it rewrites the committed retirement fixtures from their names"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/header_stale_chain.rs"
 test = "regenerate_chain_witnesses"
 run = false
@@ -446,12 +452,6 @@ id = "header-sync/committed-state-adopted-under-flood"
 kind = "property"
 owner = "P4b"
 plan = "https://valargroup.getoutline.com/doc/cbd7a07a-99da-4ae7-9bdd-d4a15e950f51"
-
-[[pending]]
-id = "header-sync/peer-retirement-progress"
-kind = "property"
-owner = "H2"
-plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
 id = "header-sync/expected-chain-selected"

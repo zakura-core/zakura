@@ -69,6 +69,8 @@ const COMMIT: &str = "header-sync/commit-only-authorized";
 const OUTSTANDING: &str = "header-sync/outstanding-work-bounded";
 /// `header-sync/hold-release-wakes`.
 const HOLD: &str = "header-sync/hold-release-wakes";
+/// `header-sync/peer-retirement-progress`.
+const RETIREMENT: &str = "header-sync/peer-retirement-progress";
 /// `header-sync/honest-progress`.
 const PROGRESS_ID: &str = "header-sync/honest-progress";
 /// `header-sync/watch-observed-under-flood`.
@@ -86,7 +88,7 @@ const HONEST: &str = "session/honest-never-punished";
 /// What the storage harness registers, which the release-wake, flood and
 /// repair harnesses register too, and the wire harness all but its last,
 /// `outstanding-work-bounded`.
-const STORAGE_REGISTERS: [&str; 11] = [
+const STORAGE_REGISTERS: [&str; 12] = [
     SIM_WIDE[0],
     SIM_WIDE[1],
     OPERATION_IDS,
@@ -97,6 +99,7 @@ const STORAGE_REGISTERS: [&str; 11] = [
     RESET,
     CHAIN,
     COMMIT,
+    RETIREMENT,
     OUTSTANDING,
 ];
 
@@ -387,6 +390,30 @@ const HOLD_WITNESSES: HistoryRef = HistoryRef {
         "the_committed_fixtures_match_their_names",
     ),
     case: "header-hold-held-locator",
+};
+
+/// Each committed retirement fixture, by its fixture stem, which its
+/// witness test runs under the fixed Plan.
+const RETIRE_CASES: [&str; 8] = [
+    "header-retire-timeout",
+    "header-retire-late-page",
+    "header-retire-awaiting-close",
+    "header-retire-preparing-close",
+    "header-retire-receiving-close",
+    "header-retire-receiving-relink",
+    "header-retire-preparing-relink",
+    "header-retire-applying-relink",
+];
+
+/// The committed retirement fixtures, each holding and applying
+/// `peer-retirement-progress` under the fixed Plan.
+const RETIRE_WITNESSES: HistoryRef = HistoryRef {
+    harness: LIVENESS,
+    witness: sim_test(
+        "tests/header_peer_retirement.rs",
+        "the_committed_fixtures_match_their_names",
+    ),
+    case: "header-retire-timeout",
 };
 
 /// The flood witness test, which runs both committed flood inputs.
@@ -717,7 +744,10 @@ pub fn history_targets() -> Vec<(HistoryRef, &'static str)> {
         ));
     }
     // Each committed hdr-10 liveness fixture under the fixed Plan.
-    for (cases, history, id) in [(&HOLD_CASES[..], HOLD_WITNESSES, HOLD)] {
+    for (cases, history, id) in [
+        (&HOLD_CASES[..], HOLD_WITNESSES, HOLD),
+        (&RETIRE_CASES[..], RETIRE_WITNESSES, RETIREMENT),
+    ] {
         for &case in cases {
             histories.push((HistoryRef { case, ..history }, id));
         }
@@ -849,6 +879,7 @@ pub fn witness_tests() -> Vec<TestRef> {
         AUTHORITY_WITNESSES.witness,
         OUTSTANDING_WITNESSES.witness,
         HOLD_WITNESSES.witness,
+        RETIRE_WITNESSES.witness,
         RELEASE_INPUT.witness,
         FLOOD_WITNESS,
         MID_PREPARE.witness,
@@ -1856,6 +1887,35 @@ fn hand_written_rows() -> Vec<Row> {
     }
     rows.push(sim_row(HOLD, &[LIVENESS], hold));
 
+    let mut retirement = holds(RETIREMENT, G5, RETIRE_WITNESSES);
+    // `session-view` and `unreleased-retirement` are hdr-5's native
+    // mutations, moved here as cases of their own names.
+    for (index, name) in [
+        "kept-repair-widened",
+        "lost-timeout",
+        "retained-owner",
+        "session-view",
+        "spent-on-refusal",
+        "unreleased-retirement",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        retirement.extend(caught(
+            LIVENESS,
+            case(RETIREMENT, name),
+            &[RETIREMENT],
+            Found::AtStep,
+            G5,
+            index == 0,
+        ));
+    }
+    rows.push(sim_row(
+        RETIREMENT,
+        &[STORAGE, RELEASE_WAKE, WIRE, FLOOD, REPAIR, LIVENESS],
+        retirement,
+    ));
+
     let wakes = WAKES;
     let mut wake = holds(wakes, G5, RELEASE_INPUT);
     for (index, name) in [
@@ -2470,11 +2530,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
     },
     to_move("reordered-payload", COMMIT, "hdr-9c.2a"),
     to_move("secondary-reservation", OUTSTANDING, "hdr-9d.1"),
-    to_move(
-        "session-view",
-        "header-sync/peer-retirement-progress",
-        "hdr-10b",
-    ),
+    NativeMutation {
+        patch: "session-view",
+        class: NativeClass::Moved {
+            property: "header-sync/peer-retirement-progress",
+            case: "session-view",
+        },
+    },
     to_move(
         "short-cooldown",
         "header-sync/header-fault-penalized",
@@ -2496,11 +2558,13 @@ pub static NATIVE_MUTATIONS: &[NativeMutation] = &[
         "hdr-12b",
     ),
     to_move("swapped-payload", COMMIT, "hdr-9c.2a"),
-    to_move(
-        "unreleased-retirement",
-        "header-sync/peer-retirement-progress",
-        "hdr-10b",
-    ),
+    NativeMutation {
+        patch: "unreleased-retirement",
+        class: NativeClass::Moved {
+            property: "header-sync/peer-retirement-progress",
+            case: "unreleased-retirement",
+        },
+    },
     to_move(
         "unsent-tip",
         "header-sync/state-publication-consistent",

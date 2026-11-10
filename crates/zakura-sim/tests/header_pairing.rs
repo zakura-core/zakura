@@ -1287,10 +1287,19 @@ fn claims_after(events: Vec<ReactorEvent>) -> (RunReport, ClaimEvidence) {
     )
 }
 
-/// The retirement, on its peer's disconnect, of the round `events` started,
-/// which the queue still holds: an integrity failure until its own property
-/// takes it.
-fn disconnected(events: &[ReactorEvent]) -> ReactorEvent {
+/// The end of `events`' prepare call as replied, with no storage receipt
+/// for it to pair with: the pairer's integrity failure, a join between the
+/// reactor's facts and storage's.
+fn unpaired_reply() -> ReactorEvent {
+    ReactorEvent::CallEnded {
+        call: 1,
+        end: CallEnd::Replied,
+    }
+}
+
+/// The retirement, on shutdown, of the round `events` started, which the
+/// queue still holds: `outstanding-work-bounded`'s claim.
+fn shut_down(events: &[ReactorEvent]) -> ReactorEvent {
     let request = events
         .iter()
         .find_map(|event| match event {
@@ -1302,7 +1311,7 @@ fn disconnected(events: &[ReactorEvent]) -> ReactorEvent {
         request,
         phase: HeaderTargetPhase::Receiving,
         purpose: HeaderTargetPurpose::Normal,
-        reason: HeaderRequestTerminal::Disconnected,
+        reason: HeaderRequestTerminal::Shutdown,
     }
 }
 
@@ -1316,8 +1325,7 @@ fn a_claim_drains_before_its_steps_integrity_failure() {
     if let ReactorEvent::PageStaged { reserved_left, .. } = &mut events[3] {
         *reserved_left = 1;
     }
-    let unreleased = disconnected(&events);
-    events.push(unreleased.clone());
+    events.push(unpaired_reply());
     let (report, claims) = claims_after(events);
     let found: Vec<_> = claims.records();
     assert!(
@@ -1330,24 +1338,25 @@ fn a_claim_drains_before_its_steps_integrity_failure() {
     assert!(detail.starts_with("OverReservation"), "{detail}");
 
     let mut events = Vec::from(open_work(4));
-    events.push(unreleased);
+    events.push(unpaired_reply());
     let (report, claims) = claims_after(events);
     assert_eq!(claims.records(), []);
     let detail = evidence_failure(&report);
-    assert!(detail.starts_with("UnreleasedRound: round 1"), "{detail}");
+    assert!(
+        detail.starts_with("Mispaired: call 1 ended `replied`"),
+        "{detail}"
+    );
 
-    // The failure first, from the round's retirement before its page, then
-    // the claims its page and call make on the retired round: the ledger
-    // still folds the rest of the step, and they drain ahead of it.
+    // The failure's event first, then the shutdown's retirement of the
+    // round the queue still holds: that claim still drains ahead of it.
     let mut events = Vec::from(open_work(4));
-    let early = disconnected(&events);
-    events.insert(3, early);
+    events.push(unpaired_reply());
+    let unreleased = shut_down(&events);
+    events.push(unreleased);
     let (report, claims) = claims_after(events);
     let found = claims.records();
     assert!(
-        found
-            .iter()
-            .any(|record| record.detail.starts_with("WrongRound: call 1")),
+        matches!(&found[..], [only] if only.detail.starts_with("UnreleasedRound: round 1")),
         "{found:?}"
     );
     let detail = evidence_failure(&report);

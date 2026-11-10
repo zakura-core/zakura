@@ -30,6 +30,7 @@ mod pair;
 pub mod policy;
 pub mod recovery;
 pub mod reservation;
+pub mod retirement;
 pub mod round_life;
 pub mod session;
 pub mod stale;
@@ -749,6 +750,62 @@ pub struct Topology {
     sessions: Option<SessionEvidence>,
     /// Set once a `Shutdown` step was picked, which stops any churn.
     stopping: Cell<bool>,
+    /// The mirror whose pages the harness holds back, if any.
+    delayed_page: Option<DelayedPage>,
+}
+
+/// A mirror whose first `Headers` frame on each of its links the harness
+/// holds for `by` of virtual time before the node under test gets it, with
+/// every later frame behind it, as a slow path to the node would. It's how
+/// a fixture makes a page arrive just before the node's request deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelayedPage {
+    /// The mirror's name.
+    pub mirror: String,
+    /// How long its first page waits.
+    pub by: Duration,
+}
+
+/// Forwards each frame from `from_mirror` to `to_node`, in order, holding
+/// the first `Headers` frame for `by` of virtual time before it goes and
+/// reading nothing meanwhile, until the link closes or either stream ends.
+async fn delay_first_page(
+    mut from_mirror: FramedRecv,
+    to_node: FramedSend,
+    by: Duration,
+    cancel: CancellationToken,
+) {
+    let mut held = false;
+    loop {
+        let frame = zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            frame = from_mirror.recv() => frame,
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        if !held
+            && matches!(
+                decode_frame::<RegtestMessage>(&frame),
+                Ok(v9::Message::Headers(_))
+            )
+        {
+            held = true;
+            zakura_rt::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                () = zakura_rt::time::sleep(by) => {}
+            }
+        }
+        zakura_rt::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            sent = to_node.send(frame) => if sent.is_err() {
+                return;
+            },
+        }
+    }
 }
 
 /// The far end of a flooding link: the dialer's streams and its connection
@@ -850,6 +907,16 @@ impl Topology {
             tap: None,
             sessions: None,
             stopping: Cell::new(false),
+            delayed_page: None,
+        }
+    }
+
+    /// This topology, holding back `delayed`'s mirror's first page on each
+    /// of its links ([`DelayedPage`]).
+    pub fn with_delayed_page(self, delayed: Option<DelayedPage>) -> Self {
+        Topology {
+            delayed_page: delayed,
+            ..self
         }
     }
 
@@ -1074,6 +1141,23 @@ impl Topology {
                 });
                 continue;
             }
+            let delay = self
+                .delayed_page
+                .as_ref()
+                .filter(|delayed| local != 0 && delayed.mirror == self.nodes[local].name)
+                .map(|delayed| delayed.by);
+            let streams = match delay {
+                Some(by) => {
+                    let (from_node, to_node) = streams;
+                    let (to_relay, from_mirror) = framed_channel(LINK_DEPTH);
+                    zakura_rt::task::spawn_named(
+                        "delay-page",
+                        delay_first_page(from_mirror, to_node, by, token.clone()),
+                    );
+                    (from_node, to_relay)
+                }
+                None => streams,
+            };
             let peer = Peer::new_versioned(
                 id,
                 self.nodes[remote].id.clone(),

@@ -178,6 +178,15 @@ pub struct Config {
     #[serde(skip)]
     pub vct_fast_sync: bool,
 
+    /// Mirror of `network.zakura.trace_dir`, set by zakurad at startup.
+    ///
+    /// When set, the block writer appends a `tip_published` row to `chain_tip.jsonl` in this
+    /// directory each time a committed block becomes the best tip.
+    ///
+    /// Skipped in serde because users configure tracing under `[network.zakura]`.
+    #[serde(skip)]
+    pub trace_dir: Option<PathBuf>,
+
     /// Optional path to a frontier artifact used to anchor historical tree derivation.
     ///
     /// Mainnet's reviewed frontier grid is embedded in the binary, so the default `None` uses that
@@ -630,6 +639,7 @@ impl Default for Config {
             enable_zakura_header_seed_from_committed_blocks: false,
             checkpoint_sync: true,
             vct_fast_sync: true,
+            trace_dir: None,
             historical_frontier_artifact: None,
             delete_old_database: true,
             storage_mode: StorageMode::default(),

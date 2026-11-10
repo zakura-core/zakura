@@ -958,12 +958,12 @@ impl TapState {
             }
         }
         // Budget changes, credit and built closes, causes, headroom waits,
-        // deferred passes, taken events, watch reads, the reactor's and the
-        // service's sizes, completed targets, publisher starts and ends, the
-        // queue's slots, cursor claims and acceptances and the subscriber's
-        // and publisher's containers and the serving reports stay out of the
-        // log, whose format pinned Plans fix, and a teardown's returns after
-        // the run are expected.
+        // deferred passes, taken events, watch reads, stored snapshots, the
+        // reactor's and the service's sizes, completed targets, publisher
+        // starts and ends, the queue's slots, cursor claims and acceptances
+        // and the subscriber's and publisher's containers and the serving
+        // reports stay out of the log, whose format pinned Plans fix, and a
+        // teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -973,6 +973,7 @@ impl TapState {
                 | ReactorEvent::CachedPassDeferred { .. }
                 | ReactorEvent::EventTaken { .. }
                 | ReactorEvent::WatchObserved { .. }
+                | ReactorEvent::SnapshotStored { .. }
                 | ReactorEvent::Slots { .. }
                 | ReactorEvent::Sizes { .. }
                 | ReactorEvent::ServiceSizes { .. }

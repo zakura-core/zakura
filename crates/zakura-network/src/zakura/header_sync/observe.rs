@@ -733,6 +733,14 @@ pub enum ReactorEvent {
         /// The verified body tip.
         verified_best: Frontier,
     },
+    /// The reactor stored the snapshot it just adopted as its committed
+    /// state: its stored copy, whole, right after the store, so a store that
+    /// differs from the adoption it follows, in any field, or that left
+    /// nothing, shows.
+    SnapshotStored {
+        /// The stored copy, or `None` if the store left none.
+        snapshot: Option<EngineSnapshot>,
+    },
     /// The reactor queued `status` on `peer`'s session.
     StatusQueued {
         /// The peer.
@@ -788,6 +796,13 @@ impl ReactorEvent {
             oldest_retained: snapshot.oldest_retained_height,
             verified_generation: snapshot.verified_generation,
             verified_best: snapshot.frontiers.verified_best,
+        }
+    }
+
+    /// A `SnapshotStored` event for `snapshot`, the reactor's stored copy.
+    pub(crate) fn stored(snapshot: Option<&EngineSnapshot>) -> Self {
+        Self::SnapshotStored {
+            snapshot: snapshot.cloned(),
         }
     }
 

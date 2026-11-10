@@ -31,6 +31,12 @@ pub enum Expect {
     /// [`WitnessError::Fixed`]. No other property may be violated, except
     /// one the caller lists as an expected co-violation.
     Violated,
+    /// [`Expect::Violated`] for a nested case's exact set (C6): every
+    /// property the caller lists must be violated beside this one, and no
+    /// other may be. A case that can't break its property alone, such as a
+    /// punishment of an exhausted `Status`, which breaks
+    /// `conformant-never-closes` too, declares that set.
+    ViolatedSet,
     /// The property applies and holds. Other `Known` or `Draft` properties
     /// may report violations, as long as none stopped the run. A property
     /// with no trigger-history check passes on its outcome alone.
@@ -44,6 +50,7 @@ impl Expect {
             Expect::Holds => "holds",
             Expect::Violated => "violated",
             Expect::Applicable => "applicable",
+            Expect::ViolatedSet => "violated-set",
         }
     }
 }
@@ -53,10 +60,15 @@ impl FromStr for Expect {
 
     /// Reads [`Expect::name`].
     fn from_str(name: &str) -> Result<Expect, String> {
-        [Expect::Holds, Expect::Violated, Expect::Applicable]
-            .into_iter()
-            .find(|expect| expect.name() == name)
-            .ok_or_else(|| format!("`{name}` isn't holds, violated or applicable"))
+        [
+            Expect::Holds,
+            Expect::Violated,
+            Expect::Applicable,
+            Expect::ViolatedSet,
+        ]
+        .into_iter()
+        .find(|expect| expect.name() == name)
+        .ok_or_else(|| format!("`{name}` isn't holds, violated, applicable or violated-set"))
     }
 }
 
@@ -85,6 +97,38 @@ pub enum WitnessError {
     NoEnd,
     /// The run's report has no entry for the property.
     MissingReport,
+    /// The run's report has no entry for another registered property, so
+    /// the run's evidence is incomplete.
+    Unreported {
+        /// The registered property with no report.
+        property: String,
+    },
+    /// Another property is inconclusive under [`Expect::Holds`]: the run
+    /// left it unjudged, so the run can't show that nothing else broke.
+    UnrelatedInconclusive {
+        /// The inconclusive property.
+        property: String,
+        /// Its reason, such as `obligation-open`.
+        reason: String,
+    },
+    /// A violation of a property of an [`Expect::ViolatedSet`] test's set
+    /// isn't joined to the case's own break: its witness's first step isn't
+    /// the step of any of the property's step-found violations, or the run's
+    /// end found it, with no step of its own. With no step, the report kept none of
+    /// the member's violations to join.
+    Unjoined {
+        /// The set's property.
+        property: String,
+        /// The violation's step, if the report kept one.
+        step: Option<u64>,
+    },
+    /// A property of an [`Expect::ViolatedSet`] test's set wasn't violated.
+    SetMember {
+        /// The set's property.
+        property: String,
+        /// Its outcome, or `None` if the run doesn't report it.
+        outcome: Option<PropertyOutcome>,
+    },
     /// The property's outcome isn't the one the test expects.
     Outcome(PropertyOutcome),
     /// Another property was violated.
@@ -137,6 +181,31 @@ impl fmt::Display for WitnessError {
             WitnessError::ChangedFailure => f.write_str("the machine failure changed"),
             WitnessError::NoEnd => f.write_str("the run wrote no end record"),
             WitnessError::MissingReport => f.write_str("the run doesn't report the property"),
+            WitnessError::Unreported { property } => {
+                write!(f, "the run doesn't report {property}")
+            }
+            WitnessError::UnrelatedInconclusive { property, reason } => {
+                write!(f, "{property} is inconclusive: {reason}")
+            }
+            WitnessError::Unjoined {
+                property,
+                step: Some(step),
+            } => write!(
+                f,
+                "{property}'s violation at step {step} isn't tied to the case's own break"
+            ),
+            WitnessError::Unjoined {
+                property,
+                step: None,
+            } => write!(f, "the report keeps no violation of {property} to tie to the case's break"),
+            WitnessError::SetMember {
+                property,
+                outcome: Some(outcome),
+            } => write!(f, "{property} of the set isn't violated: {outcome:?}"),
+            WitnessError::SetMember {
+                property,
+                outcome: None,
+            } => write!(f, "the run doesn't report {property} of the set"),
             WitnessError::Outcome(outcome) => write!(f, "the property's outcome is {outcome:?}"),
             WitnessError::Unrelated { property } => write!(f, "{property} was violated"),
             WitnessError::LostTriggerHistory => {
@@ -171,6 +240,10 @@ impl WitnessError {
             WitnessError::HarnessEnd(_) => "harness-end",
             WitnessError::NoEnd => "no-end",
             WitnessError::MissingReport => "missing-report",
+            WitnessError::Unreported { .. } => "unreported",
+            WitnessError::UnrelatedInconclusive { .. } => "unrelated-inconclusive",
+            WitnessError::SetMember { .. } => "set-member",
+            WitnessError::Unjoined { .. } => "unjoined",
             WitnessError::Outcome(PropertyOutcome::Held { .. }) => "held",
             WitnessError::Outcome(PropertyOutcome::NotApplicable) => "not-applicable",
             WitnessError::Outcome(PropertyOutcome::Inconclusive { .. }) => "inconclusive",
@@ -219,7 +292,8 @@ pub fn witness<S: Subsystem>(
 ///
 /// An [`Expect::Violated`] test also passes when properties in
 /// `also_violates` are violated beside `property`: a bug that breaks
-/// `property` can break them too.
+/// `property` can break them too. An [`Expect::ViolatedSet`] test needs
+/// each of them violated.
 pub fn witness_into<S: Subsystem>(
     scenario: &S::Scenario,
     input: PlanInput,
@@ -385,6 +459,8 @@ struct Registered<S: HasView> {
     id: PropertyId,
     status: Status,
     trigger_history: Option<TriggerHistory<S>>,
+    /// Every property the harness registers, which the run must report.
+    every: Vec<String>,
 }
 
 impl<S: Subsystem> Registered<S> {
@@ -403,6 +479,11 @@ impl<S: Subsystem> Registered<S> {
             id: registered.id.clone(),
             status: registered.status,
             trigger_history: registered.witness,
+            every: registry
+                .properties()
+                .iter()
+                .map(|property| property.id.to_string())
+                .collect(),
         })
     }
 
@@ -425,6 +506,15 @@ impl<S: Subsystem> Registered<S> {
     ) -> Result<(), WitnessError> {
         judge_end(end, reports, property, self.status, expect, also_violates)?;
         acts_ran(end, log)?;
+        if let Some(missing) = self
+            .every
+            .iter()
+            .find(|id| !reports.iter().any(|report| &report.property == *id))
+        {
+            return Err(WitnessError::Unreported {
+                property: missing.clone(),
+            });
+        }
         match self.trigger(end, log, harness) {
             TriggerState::None | TriggerState::Reached => Ok(()),
             TriggerState::Lost => Err(WitnessError::LostTriggerHistory),
@@ -545,7 +635,11 @@ pub(crate) fn judge(
 
 /// [`judge`] on a run's `end` and property `reports`. Under
 /// [`Expect::Violated`], a violation of a property in `also_violates`
-/// isn't unrelated.
+/// isn't unrelated, and under [`Expect::ViolatedSet`] each of them must be
+/// violated. Under [`Expect::Holds`], and under a violated expectation for
+/// a run that went on to its end rather than stopping at its violation,
+/// another property the run left inconclusive fails the test too: the run
+/// can't show nothing else broke.
 fn judge_end(
     end: &RunEnd,
     reports: &[PropertyReport],
@@ -566,13 +660,12 @@ fn judge_end(
         .find(|r| r.property == property)
         .ok_or(WitnessError::MissingReport)?
         .outcome;
+    let violated = matches!(expect, Expect::Violated | Expect::ViolatedSet);
     // Another property's violation is unrelated to this one: one that
     // stopped the run fails every expectation, and one that didn't fails
     // all but `Applicable`. A `Violated` test expects `also_violates`.
-    let expected = |other: &str| {
-        other == property
-            || (expect == Expect::Violated && also_violates.iter().any(|a| a == other))
-    };
+    let expected =
+        |other: &str| other == property || (violated && also_violates.iter().any(|a| a == other));
     let unrelated = reports
         .iter()
         .filter(|r| !expected(&r.property))
@@ -582,43 +675,113 @@ fn judge_end(
         .as_ref()
         .map(|v| v.property.as_str())
         .filter(|p| !expected(p));
-    match expect {
-        Expect::Holds | Expect::Applicable => {
-            if let Some(stopped_by) = stopped_by {
-                return Err(WitnessError::Unrelated {
-                    property: stopped_by.to_owned(),
-                });
-            }
-            if let (Expect::Holds, Some(other)) = (expect, unrelated) {
-                return Err(WitnessError::Unrelated {
-                    property: other.property.clone(),
-                });
-            }
-            match outcome {
-                PropertyOutcome::Held { applicable } if *applicable > 0 => Ok(()),
-                outcome => Err(WitnessError::Outcome(outcome.clone())),
-            }
+    if let Some(stopped_by) = stopped_by {
+        return Err(WitnessError::Unrelated {
+            property: stopped_by.to_owned(),
+        });
+    }
+    if let (true, Some(other)) = (expect != Expect::Applicable, unrelated) {
+        return Err(WitnessError::Unrelated {
+            property: other.property.clone(),
+        });
+    }
+    // A run its violation stopped can leave another property's obligation
+    // open through no fault of its own, until #1840 gives such a run an
+    // ending. A run that went on to its end, as a `Draft` run does, can't.
+    let stopped = end.outcome == Outcome::Violation;
+    if expect == Expect::Holds || (violated && !stopped) {
+        let inconclusive = reports
+            .iter()
+            .filter(|r| !expected(&r.property))
+            .find_map(|r| match &r.outcome {
+                PropertyOutcome::Inconclusive { reason } => Some((&r.property, reason)),
+                _ => None,
+            });
+        if let Some((other, reason)) = inconclusive {
+            return Err(WitnessError::UnrelatedInconclusive {
+                property: other.clone(),
+                reason: reason.clone(),
+            });
         }
-        Expect::Violated => {
-            if let Some(stopped_by) = stopped_by {
-                return Err(WitnessError::Unrelated {
-                    property: stopped_by.to_owned(),
-                });
-            }
-            if let Some(other) = unrelated {
-                return Err(WitnessError::Unrelated {
-                    property: other.property.clone(),
-                });
-            }
+    }
+    match expect {
+        Expect::Holds | Expect::Applicable => match outcome {
+            PropertyOutcome::Held { applicable } if *applicable > 0 => Ok(()),
+            outcome => Err(WitnessError::Outcome(outcome.clone())),
+        },
+        Expect::Violated | Expect::ViolatedSet => {
             match (outcome, status) {
-                (PropertyOutcome::Violated { .. }, _) => Ok(()),
+                (PropertyOutcome::Violated { .. }, _) => {}
                 (PropertyOutcome::Held { .. }, Status::Known { issue }) => {
-                    Err(WitnessError::Fixed { issue })
+                    return Err(WitnessError::Fixed { issue })
                 }
-                (outcome, _) => Err(WitnessError::Outcome(outcome.clone())),
+                (outcome, _) => return Err(WitnessError::Outcome(outcome.clone())),
+            }
+            if expect == Expect::Violated {
+                return Ok(());
+            }
+            for member in also_violates {
+                let found = reports.iter().find(|r| &r.property == member);
+                if !found.is_some_and(|r| matches!(r.outcome, PropertyOutcome::Violated { .. })) {
+                    return Err(WitnessError::SetMember {
+                        property: member.clone(),
+                        outcome: found.map(|r| r.outcome.clone()),
+                    });
+                }
+            }
+            joined(reports, property, also_violates)
+        }
+    }
+}
+
+/// Checks that every violation of every property in `set` is tied to
+/// `property`'s own break (C6): the violation's cause, its witness's first
+/// step, is the step one of `property`'s step-found violations broke at. A
+/// step check's witness is just its step, and an obligation's starts at the
+/// step that opened it, followed by any deferrals and its expiry. So a
+/// member broken at the break's step joins, a nested expiry opened at it
+/// joins, and an expiry opened before it, which the break didn't cause,
+/// doesn't, even when it's deferred or expires at the break's step. A
+/// violation the run's end found, an expiry at an idle end included, is
+/// never a break and never joins, so it fails closed, and so does a member whose report kept none of
+/// its violations, or every member when the report kept none of
+/// `property`'s.
+///
+/// Within one step this can't tell subjects apart: two findings about
+/// different connections at the step of the case's break both join.
+fn joined(reports: &[PropertyReport], property: &str, set: &[String]) -> Result<(), WitnessError> {
+    let step_found = |report: &PropertyReport| {
+        let steps = report.violations.len().saturating_sub(report.end_found);
+        report.violations[..steps].to_vec()
+    };
+    let own = reports
+        .iter()
+        .find(|r| r.property == property)
+        .map(step_found)
+        .unwrap_or_default();
+    for member in set {
+        let Some(report) = reports.iter().find(|r| &r.property == member) else {
+            continue;
+        };
+        if report.violations.is_empty() {
+            return Err(WitnessError::Unjoined {
+                property: member.clone(),
+                step: None,
+            });
+        }
+        let steps = report.violations.len().saturating_sub(report.end_found);
+        for (at, violation) in report.violations.iter().enumerate() {
+            let cause = violation.witness.first().copied().unwrap_or(violation.step);
+            let tied = at < steps && own.iter().any(|break_| break_.step == cause);
+            if !tied {
+                return Err(WitnessError::Unjoined {
+                    property: member.clone(),
+                    step: Some(violation.step),
+                });
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -632,24 +795,42 @@ mod tests {
             end: RunEnd {
                 outcome: Outcome::Violation,
                 steps: 3,
-                violation: Some(Violation {
-                    property: property.to_owned(),
-                    step: 3,
-                    witness: vec![3],
-                    expected: String::new(),
-                    actual: String::new(),
-                }),
+                violation: Some(violation(property, 3, &[3])),
                 drain: None,
                 harness: None,
             },
-            properties: vec![PropertyReport::new(
-                property,
-                PropertyOutcome::Violated { witness: vec![3] },
-            )],
+            properties: vec![violated_report(property, &[(3, &[3])])],
             cleanup: Default::default(),
             log: Default::default(),
             picks: Vec::new(),
             resolved: Default::default(),
+        }
+    }
+
+    /// `property`'s violation at `step`, depending on `witness`.
+    fn violation(property: &str, step: u64, witness: &[u64]) -> Violation {
+        Violation {
+            property: property.to_owned(),
+            step,
+            witness: witness.to_vec(),
+            expected: String::new(),
+            actual: format!("a break at step {step}"),
+        }
+    }
+
+    /// A report of `property` violated once per `(step, witness)`.
+    fn violated_report(property: &str, found: &[(u64, &[u64])]) -> PropertyReport {
+        PropertyReport {
+            violations: found
+                .iter()
+                .map(|(step, witness)| violation(property, *step, witness))
+                .collect(),
+            ..PropertyReport::new(
+                property,
+                PropertyOutcome::Violated {
+                    witness: found[0].1.to_vec(),
+                },
+            )
         }
     }
 
@@ -755,5 +936,200 @@ mod tests {
             }))
         );
         assert_eq!(judged(&held, &also, Expect::Holds), unrelated);
+    }
+
+    /// C6: a violated expectation tolerates another property left
+    /// inconclusive only in a run its violation stopped. A run that went on
+    /// to its end, as a `Draft` run does, must leave nothing else open.
+    #[test]
+    fn a_finished_violated_run_refuses_an_unrelated_inconclusive() {
+        let mut report = stopped_by("test/own");
+        report.properties.push(PropertyReport::new(
+            "test/open",
+            PropertyOutcome::Inconclusive {
+                reason: "obligation-open".to_owned(),
+            },
+        ));
+        for expect in [Expect::Violated, Expect::ViolatedSet] {
+            assert_eq!(
+                judge(&report, "test/own", Status::Active, expect, &[]),
+                Ok(()),
+                "{expect:?}"
+            );
+        }
+        report.end.outcome = Outcome::Budget;
+        report.end.violation = None;
+        for expect in [Expect::Violated, Expect::ViolatedSet] {
+            assert_eq!(
+                judge(&report, "test/own", Status::Draft, expect, &[]),
+                Err(WitnessError::UnrelatedInconclusive {
+                    property: "test/open".to_owned(),
+                    reason: "obligation-open".to_owned()
+                }),
+                "{expect:?}"
+            );
+        }
+    }
+
+    /// C6: a nested case's exact set passes only with every member
+    /// violated beside the property. A member that holds or isn't reported
+    /// fails, and so does an unlisted extra.
+    #[test]
+    fn a_violated_set_needs_exactly_its_members() {
+        let set = ["test/co".to_owned()];
+        let judged = |report: &RunReport, set: &[String]| {
+            judge(report, "test/own", Status::Active, Expect::ViolatedSet, set)
+        };
+        let mut report = stopped_by("test/own");
+        assert_eq!(
+            judged(&report, &set),
+            Err(WitnessError::SetMember {
+                property: "test/co".to_owned(),
+                outcome: None
+            })
+        );
+        report.properties.push(PropertyReport::new(
+            "test/co",
+            PropertyOutcome::Held { applicable: 1 },
+        ));
+        assert_eq!(
+            judged(&report, &set),
+            Err(WitnessError::SetMember {
+                property: "test/co".to_owned(),
+                outcome: Some(PropertyOutcome::Held { applicable: 1 })
+            })
+        );
+        report.properties[1] = violated_report("test/co", &[(3, &[3])]);
+        assert_eq!(judged(&report, &set), Ok(()));
+        report.properties.push(PropertyReport::new(
+            "test/extra",
+            PropertyOutcome::Violated { witness: vec![3] },
+        ));
+        assert_eq!(
+            judged(&report, &set),
+            Err(WitnessError::Unrelated {
+                property: "test/extra".to_owned()
+            })
+        );
+        assert_eq!(
+            Expect::ViolatedSet.name().parse::<Expect>(),
+            Ok(Expect::ViolatedSet)
+        );
+    }
+
+    /// C6: every violation of every member must be tied to the case's own
+    /// break through its witness's first step. A member broken at the break's
+    /// step joins, and so does a nested expiry opened at it. A
+    /// member broken at another step only, one the run's end found, or one
+    /// whose report kept no violation fails closed. Two findings at the
+    /// break's step, as for two connections, both join: the witness can't
+    /// tell subjects apart within one step, and every one must join.
+    #[test]
+    fn every_member_violation_joins_the_case_s_break() {
+        let set = ["test/co".to_owned()];
+        let judged = |member: PropertyReport| {
+            let mut report = stopped_by("test/own");
+            report.properties.push(member);
+            judge(
+                &report,
+                "test/own",
+                Status::Active,
+                Expect::ViolatedSet,
+                &set,
+            )
+        };
+        let unjoined = |step| {
+            Err(WitnessError::Unjoined {
+                property: "test/co".to_owned(),
+                step,
+            })
+        };
+        assert_eq!(judged(violated_report("test/co", &[(3, &[3])])), Ok(()));
+        // An expiry's witness is its opening step and its expiry, as the
+        // registry builds it: one opened at the break joins it, and one
+        // opened before the break, which the break didn't cause, doesn't.
+        assert_eq!(judged(violated_report("test/co", &[(5, &[3, 5])])), Ok(()));
+        assert_eq!(
+            judged(violated_report("test/co", &[(5, &[1, 5])])),
+            unjoined(Some(5))
+        );
+        // Nor does one that expires at the break's step: its expiry step
+        // reports it, and only its opening is its cause.
+        let at_break = |member: PropertyReport| {
+            let mut report = stopped_by("test/own");
+            report.properties[0] = violated_report("test/own", &[(5, &[5])]);
+            report.properties.push(member);
+            judge(
+                &report,
+                "test/own",
+                Status::Active,
+                Expect::ViolatedSet,
+                &set,
+            )
+        };
+        assert_eq!(
+            at_break(violated_report("test/co", &[(5, &[1, 5])])),
+            unjoined(Some(5))
+        );
+        assert_eq!(at_break(violated_report("test/co", &[(5, &[5])])), Ok(()));
+        // A deferral adds a step to the witness, but the obligation's cause
+        // is still where it opened: one opened before the break and deferred
+        // at it doesn't join, and one opened at it and deferred later does.
+        assert_eq!(
+            at_break(violated_report("test/co", &[(7, &[1, 5, 7])])),
+            unjoined(Some(7))
+        );
+        assert_eq!(
+            at_break(violated_report("test/co", &[(7, &[5, 6, 7])])),
+            Ok(())
+        );
+        // When the case's own break is an expiry, its break step is where it
+        // expired: a member broken at its opening step doesn't join.
+        let after_expiry = |member: PropertyReport| {
+            let mut report = stopped_by("test/own");
+            report.properties[0] = violated_report("test/own", &[(3, &[1, 3])]);
+            report.properties.push(member);
+            judge(
+                &report,
+                "test/own",
+                Status::Active,
+                Expect::ViolatedSet,
+                &set,
+            )
+        };
+        assert_eq!(
+            after_expiry(violated_report("test/co", &[(1, &[1])])),
+            unjoined(Some(1))
+        );
+        assert_eq!(
+            after_expiry(violated_report("test/co", &[(3, &[3])])),
+            Ok(())
+        );
+        assert_eq!(
+            judged(violated_report("test/co", &[(2, &[2])])),
+            unjoined(Some(2))
+        );
+        // Two connections broken at the break's step both join, and every
+        // violation must: one at another step fails the set.
+        assert_eq!(
+            judged(violated_report("test/co", &[(3, &[3]), (3, &[3])])),
+            Ok(())
+        );
+        assert_eq!(
+            judged(violated_report("test/co", &[(3, &[3]), (2, &[2])])),
+            unjoined(Some(2))
+        );
+        let end_found = PropertyReport {
+            end_found: 1,
+            ..violated_report("test/co", &[(3, &[3])])
+        };
+        assert_eq!(judged(end_found), unjoined(Some(3)));
+        assert_eq!(
+            judged(PropertyReport::new(
+                "test/co",
+                PropertyOutcome::Violated { witness: vec![3] }
+            )),
+            unjoined(None)
+        );
     }
 }

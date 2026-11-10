@@ -1018,6 +1018,7 @@ fn end_record(
             .iter()
             .map(|report| PropertyReport {
                 violations: Vec::new(),
+                end_found: 0,
                 ..report.clone()
             })
             .collect(),

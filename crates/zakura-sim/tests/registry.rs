@@ -801,6 +801,9 @@ fn every_end_finding_is_kept() {
         ]
     );
     assert_eq!(kept(&ACTIVE), [(last, "active still open".to_owned())]);
+    // The end findings come last, and the report says how many there are.
+    assert_eq!(property_report(&report, &LEVEL).end_found, 3);
+    assert_eq!(property_report(&report, &ACTIVE).end_found, 1);
     assert_eq!(
         outcome(&report, &ACTIVE),
         PropertyOutcome::Violated {

@@ -332,6 +332,9 @@ struct PropertyState<V> {
     announced: bool,
     /// Every violation, in order.
     violations: Vec<Violation>,
+    /// How many of `violations`, the last ones, the run's end found: the
+    /// harness's end findings and the obligations its idle end expired.
+    end_found: usize,
     /// Open obligations, oldest first.
     open: Vec<Open<V>>,
     /// The step and time after which all the property's assumptions have
@@ -358,6 +361,7 @@ impl<V> PropertyState<V> {
             applicable: 0,
             announced: false,
             violations: Vec::new(),
+            end_found: 0,
             open: Vec::new(),
             holds_since: None,
             ever_held: false,
@@ -497,6 +501,7 @@ impl<S: HasView> RegistryChecker<S> {
             .find(|(property, _)| property.id == found.property)
             .map(|(_, state)| state);
         if let Some(state) = state {
+            state.end_found += 1;
             state.violations.push(Violation {
                 property: found.property.to_string(),
                 step: last,
@@ -509,7 +514,8 @@ impl<S: HasView> RegistryChecker<S> {
 
     /// Expires every obligation still deferred when the run went idle after
     /// step `last`, as the type's docs describe, emitting each expiry as the
-    /// other expiry paths do.
+    /// other expiry paths do. The run's end found each, so it counts among
+    /// `end_found`.
     fn expire_deferred(&mut self, last: u64) {
         for (property, state) in self.properties.iter().zip(&mut self.state) {
             let (expired, open) = std::mem::take(&mut state.open)
@@ -521,6 +527,7 @@ impl<S: HasView> RegistryChecker<S> {
                     property: property.id.clone(),
                     to: Lifecycle::Expired,
                 });
+                state.end_found += 1;
                 state
                     .violations
                     .push(idle_expiry(property, &open, last, self.last_now));
@@ -621,6 +628,7 @@ impl<S: HasView> Checker for RegistryChecker<S> {
                 excluded: state.excluded.clone(),
                 peaks: state.peaks.clone(),
                 violations: state.violations.clone(),
+                end_found: state.end_found,
             })
             .collect()
     }

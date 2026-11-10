@@ -9,7 +9,7 @@ use zakura_sim::{
     domain::discovery::WAIT_COMPLETE_WAKES,
     harness::{self, discovery::WaitComplete, Subsystem},
     property::{
-        HasView, Kind, LivenessBound, Property, PropertyId, Source, Status, Subject,
+        HasView, Kind, LivenessBound, Property, PropertyId, Source, Sources, Status, Subject,
         TriggerHistory, Verdict,
     },
     witness::{check_witness, witness, Expect, WitnessError, WitnessScenario},
@@ -129,14 +129,20 @@ fn unregistered_property_fails() {
 enum Behavior {
     /// Sleeps 1 ms at a time until the budget ends the run.
     Sleep,
+    /// Sleeps as [`Behavior::Sleep`] does, and [`OPEN`] opens its
+    /// obligation, which never closes.
+    Owe,
     /// Panics on its first poll.
     Panic,
 }
 
 /// One task, checked by properties whose verdicts don't depend on it: one
-/// that holds, a `Known` one that holds, one whose obligation never closes,
-/// one with no trigger-history check, and two that share an ID-aware one.
-struct Probe;
+/// that holds, a `Known` one that holds, one whose obligation never closes
+/// under [`Behavior::Owe`], one with no trigger-history check, and two that
+/// share an ID-aware one. Its view is whether the scenario owes.
+struct Probe {
+    owes: bool,
+}
 
 const HOLDS: &str = "test/holds";
 const KNOWN: &str = "test/known";
@@ -148,10 +154,12 @@ const NAMED: &str = "test/named";
 const NAMED_SIBLING: &str = "test/named-sibling";
 
 impl HasView for Probe {
-    type View = ();
+    type View = bool;
 
-    /// Nothing.
-    fn view(&self) {}
+    /// Whether [`OPEN`] owes.
+    fn view(&self) -> bool {
+        self.owes
+    }
 }
 
 impl Subsystem for Probe {
@@ -176,13 +184,20 @@ impl Subsystem for Probe {
         let behavior = *behavior;
         sim.scheduler().spawn_root("probe", async move {
             match behavior {
-                Behavior::Sleep => loop {
+                Behavior::Sleep | Behavior::Owe => loop {
                     sleep(Duration::from_millis(1)).await;
                 },
                 Behavior::Panic => panic!("the probe panics"),
             }
         });
-        Probe
+        Probe {
+            owes: matches!(behavior, Behavior::Owe),
+        }
+    }
+
+    /// The schedule, and the view that says whether [`OPEN`] owes.
+    fn sources() -> Sources {
+        Sources::observed(&[Source::Schedule, Source::View])
     }
 
     fn properties() -> Vec<Property<Self>> {
@@ -206,9 +221,12 @@ impl Subsystem for Probe {
                     bound: LivenessBound::VirtualTime(Duration::from_secs(3_600)),
                 },
                 assumes: &[],
-                needs: &[Source::Schedule],
+                needs: &[Source::Schedule, Source::View],
                 status: Status::Active,
                 check: |cx| {
+                    if !cx.view() {
+                        return Verdict::NotApplicable;
+                    }
                     let obligation =
                         cx.obligation(None, Subject::Owner("probe".into()), |_, _| false);
                     cx.oblige(obligation);
@@ -281,7 +299,7 @@ fn a_trigger_sees_its_property_id() {
 #[test]
 fn inconclusive_report_fails() {
     for expect in [Expect::Holds, Expect::Applicable, Expect::Violated] {
-        let result = witness(probe(Behavior::Sleep), OPEN, expect);
+        let result = witness(probe(Behavior::Owe), OPEN, expect);
         assert!(
             matches!(
                 result,
@@ -290,6 +308,45 @@ fn inconclusive_report_fails() {
             "{expect:?}: {result:?}"
         );
     }
+}
+
+/// C6: a property that holds while another is left open isn't a `Holds`
+/// witness, since the run can't show nothing else broke. `Applicable`
+/// claims no bug, so it still passes on the property's own outcome.
+#[test]
+fn holds_refuses_an_unrelated_inconclusive() {
+    assert_eq!(
+        witness(probe(Behavior::Owe), HOLDS, Expect::Holds),
+        Err(WitnessError::UnrelatedInconclusive {
+            property: OPEN.to_owned(),
+            reason: "obligation-open".to_owned()
+        })
+    );
+    check_witness(probe(Behavior::Owe), HOLDS, Expect::Applicable);
+}
+
+/// C6: a run whose report leaves out a registered property is incomplete
+/// evidence, whatever the target's own outcome.
+#[test]
+fn a_missing_report_fails() {
+    let mut report = harness::run_harness::<Probe>(
+        &Behavior::Sleep,
+        Plan::from_fuzz(&[]),
+        &mut zakura_sim::MemorySink::default(),
+        None,
+    )
+    .expect("the probe runs");
+    zakura_sim::witness::judge_report::<Probe>(&report, HOLDS, Expect::Holds)
+        .expect("the whole report passes");
+    report
+        .properties
+        .retain(|property| property.property != KNOWN);
+    assert_eq!(
+        zakura_sim::witness::judge_report::<Probe>(&report, HOLDS, Expect::Holds),
+        Err(WitnessError::Unreported {
+            property: KNOWN.to_owned()
+        })
+    );
 }
 
 /// A `Violated` witness test for a `Known` property fails with the "fixed?"

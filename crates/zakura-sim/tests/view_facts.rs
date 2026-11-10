@@ -532,6 +532,9 @@ fn a_deferral_with_nothing_armed_violates_when_the_run_goes_idle() {
         served.violations[0].actual,
         "the run went idle at 0 ns with it still open"
     );
+    // The run's end found it, not a step, so a nested judge can't take its
+    // reporting step for a break.
+    assert_eq!(served.end_found, served.violations.len(), "{served:?}");
 }
 
 /// While the task waits on storage, the scheduler alone looks deadlocked,

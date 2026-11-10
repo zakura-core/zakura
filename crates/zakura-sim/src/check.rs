@@ -105,6 +105,13 @@ pub struct PropertyReport {
     /// one again, in `ReplayReport::properties`.
     #[serde(skip)]
     pub violations: Vec<Violation>,
+    /// How many of `violations`, the last ones, the run's end found
+    /// ([`crate::property::HasView::end_violations`], or an obligation still
+    /// deferred when the run went idle) rather than a step's check. Each is
+    /// reported at the run's last step, which isn't the step of the break it
+    /// reports. 0 from a checker with no end findings.
+    #[serde(skip)]
+    pub end_found: usize,
 }
 
 impl PropertyReport {
@@ -118,6 +125,7 @@ impl PropertyReport {
             excluded: None,
             peaks: BTreeMap::new(),
             violations: Vec::new(),
+            end_found: 0,
         }
     }
 }

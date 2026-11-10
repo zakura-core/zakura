@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! zakura-sim record --sim <name> --input <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable>
+//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
 //!     [--also-violates <ids>]]
 //! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
-//!     [--witness <property> --expect <holds|violated|applicable>
+//!     [--witness <property> --expect <holds|violated|applicable|violated-set>
 //!     [--also-violates <ids>]]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
 //! zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]
@@ -100,10 +100,10 @@ mod cli {
         let mut text = String::from(
             "Usage:\n  \
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable>\n      \
+             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
              [--also-violates <ids>]]\n  \
              zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n      \
-             [--witness <property> --expect <holds|violated|applicable>\n      \
+             [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
              [--also-violates <ids>]]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
              zakura-sim shrink <dir> --out <dir> [--candidates <n>] [--wall-secs <s>]\n  \
@@ -129,7 +129,8 @@ mod cli {
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
              `--also-violates` lists, comma-separated, properties a `violated` witness\n\
              test or `confirm` expects violated beside the property, as a planted bug's\n\
-             co-violations.\n\
+             co-violations. Under `violated-set` each of them must be violated, as a\n\
+             nested case's exact set.\n\
              `replay` reruns a trace Exact and exits 0 only if every pick, draw and\n\
              observation matched. `--allow-build-mismatch` replays on a build that isn't\n\
              equivalent to the recording one, for diagnosis, and always exits 1.\n\
@@ -278,10 +279,12 @@ mod cli {
         };
         let also_violates: Vec<String> = match (&witness, flags.also_violates) {
             (_, None) => Vec::new(),
-            (Some((_, Expect::Violated)), Some(ids)) => ids.split(',').map(str::to_owned).collect(),
+            (Some((_, Expect::Violated | Expect::ViolatedSet)), Some(ids)) => {
+                ids.split(',').map(str::to_owned).collect()
+            }
             (_, Some(_)) => {
                 return Err(Error::Usage(
-                    "--also-violates needs --expect violated".to_owned(),
+                    "--also-violates needs --expect violated or violated-set".to_owned(),
                 ))
             }
         };

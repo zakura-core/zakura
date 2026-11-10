@@ -59,13 +59,14 @@ use super::{
 };
 use crate::{
     domain::{
+        block_sync::TEARDOWN_RETURNS_BASELINE as BLOCK_TEARDOWN_RETURNS_BASELINE,
         connection::{self, WireBounds, WireState},
         cross,
         header_sync::TeardownView as _,
         session,
     },
     peer::{key_index, peer_addr, peer_id, NODE_ADDR},
-    property::{Capture, HasView, Property, Source, Sources},
+    property::{Capture, HasView, Property, PropertyId, Source, Sources},
     RunConfig, Sim, TaskHold,
 };
 
@@ -497,11 +498,21 @@ impl Subsystem for SyncWire {
         }
     }
 
-    /// `sync/storage`'s properties ([`sync_properties`]), then the session
+    /// [`sync_properties`] that the wire tier can run, then the session
     /// properties the shared connection reaches, then the connection
-    /// properties a run with sampling taps reaches.
+    /// properties a run with sampling taps reaches. A property that reads
+    /// frames or closes, which the wire tier excludes ([`Self::sources`]),
+    /// runs on `block-sync/storage` and `sync/storage` instead, and so does
+    /// block sync's teardown rule, since no wire scenario stops the node.
     fn properties() -> Vec<Property<Self>> {
-        let mut properties = sync_properties();
+        let sources = Self::sources();
+        let mut properties: Vec<Property<Self>> = sync_properties()
+            .into_iter()
+            .filter(|property| {
+                sources.observes_all(property.needs)
+                    && property.id != PropertyId::new(BLOCK_TEARDOWN_RETURNS_BASELINE)
+            })
+            .collect();
         properties.extend(session::wire_properties());
         properties.extend(connection::wire_properties());
         properties

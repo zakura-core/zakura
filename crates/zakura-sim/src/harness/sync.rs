@@ -1084,8 +1084,8 @@ impl Subsystem for SyncStorage {
     /// [`sync_properties`] but those no `sync/storage` scenario can apply:
     /// block sync's stream-6 table wiring, whose close rules need a peer
     /// that sends malformed frames, and `capacity-release-wakes`, which needs
-    /// block capacity to fill. Every mirror here serves honestly, and
-    /// `block-sync/storage` and `sync/wire` run those IDs.
+    /// block capacity to fill. Every mirror here serves honestly, and block
+    /// sync's own harnesses run those IDs.
     fn properties() -> Vec<Property<Self>> {
         let wiring: Vec<PropertyId> = table_wiring_properties::<Self>()
             .into_iter()

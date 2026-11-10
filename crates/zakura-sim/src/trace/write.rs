@@ -287,6 +287,7 @@ mod tests {
             rng: RNG.into(),
             fixtures: Vec::new(),
             draft: Vec::new(),
+            plan: None,
             properties: Vec::new(),
             input: None,
             derived_from: None,

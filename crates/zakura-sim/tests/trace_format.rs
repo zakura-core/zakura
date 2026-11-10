@@ -33,8 +33,8 @@ use zakura_sim::{
     },
     trace::{
         meta::{
-            BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PropertyRef,
-            SchedulerRecord, RNG, UNKNOWN,
+            BlobRef, BudgetRecord, Derivation, DerivationTool, InputRef, PlanKind, PlanRef,
+            PropertyRef, SchedulerRecord, RNG, UNKNOWN,
         },
         BlobStore, BuildInfo, FileSink, Invalid, MetaRecord, Missing, ReadError, Refusal,
         TraceReader, MAX_BLOB_BYTES, MAX_INPUT_BYTES, MAX_JSON_DEPTH, MAX_LINE_BYTES,
@@ -83,6 +83,7 @@ fn meta() -> MetaRecord {
         properties: Vec::new(),
         draft: Vec::new(),
         input: None,
+        plan: None,
         derived_from: None,
     }
 }
@@ -1696,6 +1697,14 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
         vec(text(), 0..3),
         option::of((text(), edge_u64()).prop_map(|(sha256, len)| InputRef { sha256, len })),
         option::of(
+            (
+                prop_oneof![Just(PlanKind::Bytes), Just(PlanKind::Script)],
+                text(),
+                edge_u64(),
+            )
+                .prop_map(|(kind, sha256, len)| PlanRef { kind, sha256, len }),
+        ),
+        option::of(
             (text(), tool, any::<u32>()).prop_map(|(trace, tool, tool_version)| Derivation {
                 trace,
                 tool,
@@ -1716,7 +1725,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
                 build,
                 (sim, scenario, rng),
                 (scheduler, budget),
-                (assumptions, fixtures, properties, draft, input, derived_from),
+                (assumptions, fixtures, properties, draft, input, plan, derived_from),
             )| MetaRecord {
                 format,
                 contract,
@@ -1732,6 +1741,7 @@ fn meta_record() -> impl Strategy<Value = MetaRecord> {
                 properties,
                 draft,
                 input,
+                plan,
                 derived_from,
             },
         )
@@ -1802,6 +1812,7 @@ fn round_trip_edges() {
         properties: Vec::new(),
         draft: Vec::new(),
         input: None,
+        plan: None,
         derived_from: None,
     };
     let bare_step = StepRecord {

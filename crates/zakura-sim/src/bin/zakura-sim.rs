@@ -4,7 +4,7 @@
 //! zakura-sim record --sim <name> --input <file> --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable|violated-set>
 //!     [--also-violates <ids>]] [--draft <ids>]
-//! zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>
+//! zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>
 //!     [--witness <property> --expect <holds|violated|applicable|violated-set>
 //!     [--also-violates <ids>]] [--draft <ids>]
 //! zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]
@@ -102,7 +102,7 @@ mod cli {
              zakura-sim record --sim <name> --input <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
-             zakura-sim record --sim <name> --scenario <json> --plan <file> --out <dir>\n      \
+             zakura-sim record --sim <name> --scenario <json> (--plan|--script) <file> --out <dir>\n      \
              [--witness <property> --expect <holds|violated|applicable|violated-set>\n      \
              [--also-violates <ids>]] [--draft <ids>]\n  \
              zakura-sim replay <dir> [--allow-build-mismatch] [--prefix] [--observe] [--explain]\n  \
@@ -124,6 +124,8 @@ mod cli {
             "\n\
              `--input` is a full fuzz input: the scenario prefix, then the Plan bytes.\n\
              `--scenario` and `--plan` run Plan bytes against a given scenario.\n\
+             `--scenario` and `--script` run a scripted Plan, as JSON, against it.\n\
+             The trace's meta names the Plan bytes or script by digest.\n\
              `--witness` judges the run as a witness test of the property, writes the\n\
              result to witness.json beside the trace, and exits 1 if the test fails.\n\
              It takes a full fuzz input or a typed scenario and its Plan bytes alike.\n\
@@ -225,6 +227,7 @@ mod cli {
         input: Option<PathBuf>,
         scenario: Option<String>,
         plan: Option<PathBuf>,
+        script: Option<PathBuf>,
         out: Option<PathBuf>,
         witness: Option<String>,
         expect: Option<String>,
@@ -260,24 +263,40 @@ mod cli {
         };
         // A typed scenario has no `input.bin`, so its trace keeps the
         // scenario in its meta, and `replay` reruns it from there.
-        let (input, scenario, plan);
-        let what = match (flags.input, flags.scenario, flags.plan) {
-            (Some(path), None, None) => {
+        let (input, scenario, plan, script);
+        let parse_scenario = |text: &str| {
+            serde_json::from_str::<Value>(text)
+                .map_err(|error| Error::Usage(format!("--scenario isn't JSON: {error}")))
+        };
+        let what = match (flags.input, flags.scenario, flags.plan, flags.script) {
+            (Some(path), None, None, None) => {
                 input = read(&path)?;
                 RecordInput::Input(&input)
             }
-            (None, Some(text), Some(path)) => {
-                scenario = serde_json::from_str::<Value>(&text)
-                    .map_err(|error| Error::Usage(format!("--scenario isn't JSON: {error}")))?;
+            (None, Some(text), Some(path), None) => {
+                scenario = parse_scenario(&text)?;
                 plan = read(&path)?;
                 RecordInput::Plan {
                     scenario: &scenario,
                     plan: &plan,
                 }
             }
+            (None, Some(text), None, Some(path)) => {
+                scenario = parse_scenario(&text)?;
+                script =
+                    serde_json::from_slice::<zakura_sim::Plan>(&read(&path)?).map_err(|error| {
+                        Error::Failed(format!("{} isn't a Plan: {error}", path.display()))
+                    })?;
+                RecordInput::Script {
+                    scenario: &scenario,
+                    plan: &script,
+                    derived_from: None,
+                }
+            }
             _ => {
                 return Err(Error::Usage(
-                    "`record` takes either --input, or both --scenario and --plan".to_owned(),
+                    "`record` takes either --input, or --scenario with --plan or --script"
+                        .to_owned(),
                 ))
             }
         };
@@ -1121,6 +1140,7 @@ mod cli {
                 "--input" => flags.input.replace(value.into()).is_some(),
                 "--scenario" => flags.scenario.replace(value).is_some(),
                 "--plan" => flags.plan.replace(value.into()).is_some(),
+                "--script" => flags.script.replace(value.into()).is_some(),
                 "--out" => flags.out.replace(value.into()).is_some(),
                 "--witness" => flags.witness.replace(value).is_some(),
                 "--expect" => flags.expect.replace(value).is_some(),

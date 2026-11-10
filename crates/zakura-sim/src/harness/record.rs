@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use super::{HarnessEntry, HarnessError};
 use crate::{
     trace::{
-        meta::{hex, Derivation, InputRef},
+        meta::{hex, Derivation, InputRef, PlanRef},
         read::refuse_symlinked_dir,
         FileSink, ReadError, Trace, TraceReader, INPUT_FILE, MAX_INPUT_BYTES, TRACE_FILE,
     },
@@ -237,6 +237,13 @@ pub(crate) fn write_trace<T>(
     }
     let mut meta = (harness.meta)(scenario).map_err(RecordError::Harness)?;
     meta.derived_from = derived_from;
+    // A full input names its Plan bytes through `input`.
+    meta.plan = match (&plan, input) {
+        (_, Some(_)) => None,
+        (PlanInput::Bytes(bytes), None) => Some(PlanRef::bytes(bytes)),
+        (PlanInput::Script(script), None) => Some(PlanRef::script(script)),
+        (PlanInput::Trace(_) | PlanInput::Skip(_), None) => None,
+    };
     refuse_symlinked_dir(out).map_err(RecordError::Refused)?;
     if fs::symlink_metadata(out.join(TRACE_FILE)).is_ok() {
         return Err(RecordError::Io(io::Error::new(

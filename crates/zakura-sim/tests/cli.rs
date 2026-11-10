@@ -78,6 +78,53 @@ fn record_a_plan_against_a_scenario() {
     assert!(!out.join(INPUT_FILE).exists());
 }
 
+/// C18: `record --script` runs a scripted Plan against a scenario, its
+/// trace names the script by digest, and `replay` reruns it Exact.
+#[test]
+fn record_a_script_against_a_scenario() {
+    let dir = TempDir::new().unwrap();
+    let script = dir.path().join("plan.json");
+    std::fs::write(&script, "{\n  \"choices\": [\"default\"]\n}\n").unwrap();
+    let out = dir.path().join("trace");
+    let output = zakura_sim(&[
+        "record",
+        "--sim",
+        "discovery/wait-complete",
+        "--scenario",
+        "{}",
+        "--script",
+        script.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let trace = TraceReader::open(&out).unwrap();
+    assert_eq!(trace.meta.input, None);
+    let plan = trace.meta.plan.expect("a script names its Plan");
+    // The digest is of the Plan, whatever the file's formatting.
+    assert_eq!(
+        plan.sha256,
+        format!("{:x}", Sha256::digest(br#"{"choices":["default"]}"#))
+    );
+    let replay = zakura_sim(&["replay", out.to_str().unwrap()]);
+    assert!(replay.status.success(), "{replay:?}");
+
+    let both = zakura_sim(&[
+        "record",
+        "--sim",
+        "discovery/wait-complete",
+        "--scenario",
+        "{}",
+        "--script",
+        script.to_str().unwrap(),
+        "--plan",
+        script.to_str().unwrap(),
+        "--out",
+        dir.path().join("both").to_str().unwrap(),
+    ]);
+    assert_eq!(both.status.code(), Some(2), "{both:?}");
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let dir = TempDir::new().unwrap();

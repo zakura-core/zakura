@@ -283,6 +283,7 @@ pub fn meta<S: Subsystem>(scenario: &S::Scenario) -> Result<MetaRecord, HarnessE
         properties: registered::<S>(),
         draft: draft(),
         input: None,
+        plan: None,
         derived_from: None,
     })
 }

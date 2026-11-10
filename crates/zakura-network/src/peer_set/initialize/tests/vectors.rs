@@ -204,7 +204,9 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
     let config = Config {
         cache_dir: CacheDir::custom_path(cache_dir.path()),
         peerset_initial_target_size: 1,
-        initial_mainnet_peers: [seed.to_string()].into_iter().collect(),
+        initial_mainnet_peers: [seed.remove_socket_addr_privacy().to_string()]
+            .into_iter()
+            .collect(),
         ..test_defaults()
     };
     config
@@ -212,7 +214,12 @@ async fn single_startup_slot_dials_seed_and_keeps_cache_for_discovery() {
         .await
         .unwrap();
     let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
-    let selected = super::super::limit_initial_peers(&config, book_tx).await;
+    let selected = tokio::time::timeout(
+        PEER_CACHE_TEST_TIMEOUT,
+        super::super::limit_initial_peers(&config, book_tx),
+    )
+    .await
+    .expect("startup peer selection finishes within the test deadline");
     assert_eq!(selected, IndexSet::from([seed]));
     let mut discovered = IndexSet::new();
     while let Some(change) = book_rx.recv().await {
@@ -254,13 +261,18 @@ async fn startup_dial_limit_counts_ip_diversity_before_truncation() {
             file,
             cached
                 .iter()
-                .map(ToString::to_string)
+                .map(|peer| peer.remove_socket_addr_privacy().to_string())
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
         .unwrap();
         let (book_tx, mut book_rx) = tokio::sync::mpsc::channel(10);
-        let selected = super::super::limit_initial_peers(&config, book_tx).await;
+        let selected = tokio::time::timeout(
+            PEER_CACHE_TEST_TIMEOUT,
+            super::super::limit_initial_peers(&config, book_tx),
+        )
+        .await
+        .expect("startup peer selection finishes within the test deadline");
         let expected = if max_connections_per_ip == 1 {
             IndexSet::from([cached[0], cached[3], cached[4]])
         } else {

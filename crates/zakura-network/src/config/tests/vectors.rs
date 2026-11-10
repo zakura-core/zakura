@@ -94,7 +94,9 @@ async fn single_startup_slot_prefers_seed_over_cached_peer() {
     let mut config = Config {
         cache_dir: CacheDir::custom_path(cache_dir.path()),
         peerset_initial_target_size: 1,
-        initial_mainnet_peers: [seed.to_string()].into_iter().collect(),
+        initial_mainnet_peers: [seed.remove_socket_addr_privacy().to_string()]
+            .into_iter()
+            .collect(),
         ..Config::default()
     };
     config
@@ -102,7 +104,11 @@ async fn single_startup_slot_prefers_seed_over_cached_peer() {
         .await
         .unwrap();
     assert_eq!(
-        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![seed, cached]
     );
 
@@ -112,7 +118,11 @@ async fn single_startup_slot_prefers_seed_over_cached_peer() {
         .await
         .unwrap();
     assert_eq!(
-        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![seed, cached]
     );
     config
@@ -121,20 +131,36 @@ async fn single_startup_slot_prefers_seed_over_cached_peer() {
         .unwrap();
 
     // A seed already in the cache is deduplicated and the cache remains usable.
-    config.initial_mainnet_peers = [cached.to_string()].into_iter().collect();
+    config.initial_mainnet_peers = [cached.remove_socket_addr_privacy().to_string()]
+        .into_iter()
+        .collect();
     assert_eq!(
-        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![cached]
     );
     config.initial_mainnet_peers.clear();
     assert_eq!(
-        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![cached]
     );
-    config.initial_mainnet_peers = [seed.to_string()].into_iter().collect();
+    config.initial_mainnet_peers = [seed.remove_socket_addr_privacy().to_string()]
+        .into_iter()
+        .collect();
     config.cache_dir = CacheDir::disabled();
     assert_eq!(
-        config.initial_peers().await.into_iter().collect::<Vec<_>>(),
+        tokio::time::timeout(Duration::from_secs(5), config.initial_peers())
+            .await
+            .expect("loopback seed lookup finishes within the test deadline")
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![seed]
     );
 }

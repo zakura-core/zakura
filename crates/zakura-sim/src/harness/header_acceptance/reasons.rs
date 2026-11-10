@@ -143,6 +143,13 @@ pub static NOT_HEADER: &[NotHeader] = &[
         basis: Basis::NotNamedByHeader,
     },
     NotHeader {
+        file: "src/domain/cross.rs",
+        module: "cross",
+        why: "the sync/* checks across header sync and block sync, which call header sync's \
+              checks but which no header check calls",
+        basis: Basis::NotNamedByHeader,
+    },
+    NotHeader {
         file: "src/domain/discovery.rs",
         module: "discovery",
         why: "discovery's checks",
@@ -277,7 +284,7 @@ pub static NA_REASONS: &[NaProducer] = &[
     NaProducer {
         file: "src/table.rs",
         function: "check_generated",
-        fingerprint: "08aba84074181da9",
+        fingerprint: "26f09b8f3475e4e3",
         constructions: &[missing(RETURN)],
     },
     NaProducer {
@@ -357,6 +364,78 @@ pub static NA_REASONS: &[NaProducer] = &[
                 meaning: "the check never applied at any step",
                 line: "None => PropertyOutcome::NotApplicable,",
             },
+        ],
+    },
+    NaProducer {
+        file: "src/domain/connection.rs",
+        function: "verdict",
+        fingerprint: "88499ebb3405adb6",
+        constructions: &[
+            missing(RETURN),
+            step(
+                "the wire tap judged nothing the property covers at this step",
+                "None => Verdict::NotApplicable,",
+            ),
+        ],
+    },
+    NaProducer {
+        file: "src/domain/connection.rs",
+        function: "check_credit_isolated",
+        fingerprint: "f8b83e34be11d3f0",
+        constructions: &[step(
+            "the run samples no connection loads",
+            "None => Verdict::NotApplicable,",
+        )],
+    },
+    NaProducer {
+        file: "src/domain/connection.rs",
+        function: "check_send_isolated",
+        fingerprint: "98ad14c1908c58a9",
+        constructions: &[step(
+            "the run samples no connection loads",
+            "None => Verdict::NotApplicable,",
+        )],
+    },
+    NaProducer {
+        file: "src/domain/connection.rs",
+        function: "check_connection_shares_bound",
+        fingerprint: "e1d5acaf3ead2d01",
+        constructions: &[step(
+            "the run samples no connection loads",
+            "None => Verdict::NotApplicable,",
+        )],
+    },
+    NaProducer {
+        file: "src/domain/session.rs",
+        function: "check_replacement_preserves_authorization",
+        fingerprint: "77b0406fa875f002",
+        constructions: &[
+            step(
+                "no session row or stale registry write at this step",
+                RETURN,
+            ),
+            step(
+                "no session at this step replaced an earlier connection, and no stale registry \
+                 write was attempted",
+                "None => Verdict::NotApplicable,",
+            ),
+        ],
+    },
+    NaProducer {
+        file: "src/domain/session.rs",
+        function: "check_stalled_service_isolated",
+        fingerprint: "c27e64b13b2136ff",
+        constructions: &[
+            step(
+                "no block-sync request or handoff, close with a cause, or session exit at this \
+                 step",
+                RETURN,
+            ),
+            step(
+                "no wait ended, close was decided, or session exited at this step",
+                START,
+            ),
+            missing(RETURN),
         ],
     },
 ];

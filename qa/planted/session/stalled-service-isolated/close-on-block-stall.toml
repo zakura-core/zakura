@@ -1,0 +1,11 @@
+# Counts a slow block-sync range read as a dead peer: the routine's
+# liveness deadline fires after an eighth of the request timeout, and its
+# stall protocol ends the session with a request unanswered, which closes
+# the connection header sync and discovery share. The input holds every
+# mirror read for 5 seconds, so each block-sync session waits past the
+# shortened deadline.
+input = "crates/zakura-sim/tests/fixtures/sync-wire-stalled-blocks.bin"
+# Besides peer_routine.rs, which the patch changes, the routine's stall
+# state and the handler's close path decide whether a wait closes the
+# connection.
+checks = ["crates/zakura-network/src/zakura/block_sync", "crates/zakura-network/src/zakura/handler"]

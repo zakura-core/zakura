@@ -901,6 +901,17 @@ fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
     NodeId::from_bytes(&bytes).ok()
 }
 
+#[cfg(zakura_sim)]
+impl DiscoveryService {
+    /// Names the services whose sessions keep a connection open, as
+    /// zakurad's registry does, for a simulator node that builds its own
+    /// registry.
+    pub fn with_connection_owners(self, owners: Vec<Arc<dyn Service>>) -> Self {
+        self.set_connection_owners(owners);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

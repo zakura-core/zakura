@@ -1,0 +1,19 @@
+diff --git a/crates/zakura-network/src/zakura/handler.rs b/crates/zakura-network/src/zakura/handler.rs
+index 01196a06de..e9b8f2785f 100644
+--- a/crates/zakura-network/src/zakura/handler.rs
++++ b/crates/zakura-network/src/zakura/handler.rs
+@@ -3374,12 +3374,8 @@ impl ZakuraProtocolHandler {
+         if let Some(observer) = &self.transport_observer {
+             observer.connection(conn_id, connection_resources.probe(connection.load_probe()));
+         }
+-        // Set once, for the kinds this connection negotiated (zakura-quic
+-        // API-9). The handshake window stays inside it for the control stream.
+-        let _ = connection.set_limits(
+-            zakura_quic::ConnLimits::default()
+-                .with_receive_window(connection_resources.receive_window()),
+-        );
++        // Keep the handshake window: every service shares the control
++        // stream's connection-level credit.
+         let mut workers = JoinSet::new();
+         let (session_exit_tx, mut session_exit_rx) = mpsc::unbounded_channel();
+         let mut pending_sessions = PendingSessions::default();

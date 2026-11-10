@@ -119,6 +119,11 @@ struct TapState {
     handoffs: Mutex<BTreeMap<TaskId, Vec<u32>>>,
     /// The task that recorded the sequencer's ownership snapshots.
     sequencer: Mutex<Option<TaskId>>,
+    /// The peer and generation of the live routine whose snapshots each
+    /// task recorded.
+    routines: Mutex<BTreeMap<TaskId, (ZakuraPeerId, u64)>>,
+    /// Each peer's newest admitted routine generation.
+    admitted: Mutex<HashMap<ZakuraPeerId, u64>>,
 }
 
 /// Events recorded and not yet drained.
@@ -152,6 +157,11 @@ impl TapTeardown {
     /// Marks the teardown begun. Call it before the node drops anything.
     pub(crate) fn begin(&self) {
         self.0.teardown.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the teardown began.
+    pub(crate) fn begun(&self) -> bool {
+        self.0.teardown.load(Ordering::Relaxed)
     }
 }
 
@@ -247,6 +257,33 @@ impl TapHandoffs {
     }
 }
 
+/// Which routine runs on which task, by the routine snapshots each task
+/// recorded, and each peer's newest admitted routine generation.
+#[derive(Clone)]
+pub struct TapRoutines(Arc<TapState>);
+
+impl TapRoutines {
+    /// The peer and generation of the live routine that `task` runs.
+    pub fn routine(&self, task: TaskId) -> Option<(ZakuraPeerId, u64)> {
+        self.0
+            .routines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&task)
+            .cloned()
+    }
+
+    /// The newest routine generation block sync admitted for `peer`.
+    pub fn admitted(&self, peer: &ZakuraPeerId) -> Option<u64> {
+        self.0
+            .admitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .copied()
+    }
+}
+
 /// The observer block sync holds.
 struct TapObserver(Arc<TapState>);
 
@@ -273,7 +310,29 @@ impl BlockSyncObserver for TapObserver {
                 0
             }
         };
+        if let BlockEvent::SessionAdmitted {
+            peer, generation, ..
+        } = &event
+        {
+            let mut admitted = state
+                .admitted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let newest = admitted.entry(peer.clone()).or_default();
+            *newest = (*newest).max(*generation);
+        }
         if let Some(task) = hooks::current_task() {
+            if let BlockEvent::Routine(snapshot) = &event {
+                let mut routines = state
+                    .routines
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if snapshot.ended {
+                    routines.remove(&task);
+                } else {
+                    routines.insert(task, (snapshot.peer.clone(), snapshot.generation));
+                }
+            }
             if matches!(event, BlockEvent::Sequencer(_)) {
                 *state
                     .sequencer
@@ -340,6 +399,8 @@ impl BlockTap {
                 buffer: Mutex::default(),
                 handoffs: Mutex::default(),
                 sequencer: Mutex::default(),
+                routines: Mutex::default(),
+                admitted: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -397,6 +458,11 @@ impl BlockTap {
         TapHandoffs(self.state.clone())
     }
 
+    /// Which routine runs on which task, for a hold that pauses a routine.
+    pub fn routines(&self) -> TapRoutines {
+        TapRoutines(self.state.clone())
+    }
+
     /// The notice the harness gives this tap when it tears the node down.
     pub fn teardown(&self) -> TapTeardown {
         TapTeardown(self.state.clone())
@@ -428,6 +494,19 @@ impl BlockTap {
                 session_id: *session_id,
                 generation: *generation,
                 direction: direction(*way).to_owned(),
+            },
+            BlockEvent::StaleRegistryWrite {
+                peer: written,
+                writer,
+                generation,
+                entry_generation,
+                landed,
+            } => BlockSyncFact::StaleRegistryWrite {
+                peer: peer(written),
+                writer: writer.name().to_owned(),
+                generation: *generation,
+                entry_generation: *entry_generation,
+                landed: *landed,
             },
             BlockEvent::FrameJudged {
                 peer: sender,
@@ -510,6 +589,13 @@ impl BlockTap {
             } => BlockSyncFact::StaleScope {
                 body: body(held),
                 scope_epoch: scope_epoch.map(|epoch| epoch.get()),
+            },
+            BlockEvent::EpochApplied {
+                epoch,
+                verified_tip,
+            } => BlockSyncFact::EpochApplied {
+                epoch: epoch.get(),
+                verified_tip: verified_tip.0,
             },
             BlockEvent::ServingLease {
                 peer: requesting,

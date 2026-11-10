@@ -356,6 +356,26 @@ pub enum Observation {
         /// What happened.
         event: TransportFact,
     },
+    /// One event a peer's transport reported through its tap (sim-9.3), in
+    /// the order the transport reported it. A peer tap logs no session
+    /// rows, so the node's properties never read a peer's connections as
+    /// the node's.
+    PeerTransport {
+        /// The tap's registration index among the run's peer transport
+        /// taps, an index space of its own.
+        instance: u64,
+        /// The event's number, from 1 per tap.
+        seq: u64,
+        /// The peer's name, such as `mirror-0`.
+        peer: String,
+        /// The connection's registration ID in the peer's supervisor, or
+        /// `None` for an event the transport reports before registration.
+        connection: Option<u64>,
+        /// The remote address the connection was admitted from.
+        remote: String,
+        /// What happened.
+        event: TransportFact,
+    },
     /// The identity map placed a service session the node admitted: the
     /// connection from its `registered` event, the peer that bound the
     /// connection's remote address, and the stream from its `admitted`
@@ -1355,6 +1375,20 @@ pub enum BlockSyncFact {
         /// `inbound` or `outbound`.
         direction: String,
     },
+    /// A generation-gated peer-registry write met an entry another routine
+    /// generation owns: its attempt, before the gate, or its landing.
+    StaleRegistryWrite {
+        /// The entry's peer.
+        peer: String,
+        /// The writer, as the peer registry's method names it.
+        writer: String,
+        /// The generation the write came from.
+        generation: u64,
+        /// The generation that owns the entry.
+        entry_generation: u64,
+        /// Whether the write landed.
+        landed: bool,
+    },
     /// A routine took frame `seq` from its stream and is about to judge it.
     FrameJudged {
         /// The sending peer.
@@ -1434,6 +1468,14 @@ pub enum BlockSyncFact {
         /// The body work epoch the sequencer applied when it judged the
         /// body, or `None` before it had one.
         scope_epoch: Option<u64>,
+    },
+    /// The sequencer took a new body-work epoch, after it reset the work
+    /// queue above the verified tip and reauthorized its queued work.
+    EpochApplied {
+        /// The new epoch.
+        epoch: u64,
+        /// The verified tip it resets body work above.
+        verified_tip: u32,
     },
     /// A serving response took its execution lease, or released it.
     ServingLease {
@@ -1734,6 +1776,23 @@ pub(crate) fn transport_entries<'o>(
         .collect()
 }
 
+/// The events that peer transport tap `instance` logged in
+/// `observations`, in order.
+pub(crate) fn peer_transport_entries<'o>(
+    observations: impl IntoIterator<Item = &'o Observation>,
+    instance: u64,
+) -> Vec<&'o Observation> {
+    observations
+        .into_iter()
+        .filter(|obs| {
+            matches!(
+                obs,
+                Observation::PeerTransport { instance: index, .. } if *index == instance
+            )
+        })
+        .collect()
+}
+
 /// The events that reactor tap `instance` logged in `observations`, in
 /// order.
 pub(crate) fn reactor_entries<'o>(
@@ -1952,6 +2011,49 @@ pub enum TransportFact {
         /// The step.
         step: SessionStepFact,
     },
+    /// The ID both ends of the connection derive from its TLS handshake, as
+    /// hex. A tap that samples loads logs it right after `registered`, so a
+    /// check joins the node's and a peer's rows of one connection.
+    SharedId {
+        /// The ID.
+        id: String,
+    },
+    /// The connection's transport resources changed since the tap's last
+    /// sample of them (sim-9.3). The tap samples after every step, so a
+    /// change and its reversal within one step go unseen. QUIC's load
+    /// snapshot lags by up to its publish interval.
+    Load {
+        /// The QUIC receive window the connection set for its kinds, before
+        /// credit holds.
+        receive_window: u64,
+        /// `DATA_BLOCKED` frames the remote sent: times it found itself
+        /// blocked on this end's connection-level receive credit.
+        data_blocked: u64,
+        /// `STREAM_DATA_BLOCKED` frames the remote sent.
+        stream_data_blocked: u64,
+        /// Stream bytes this end's writers queued that QUIC hasn't accepted.
+        queued_send_bytes: u64,
+        /// Streams whose writes wait on flow control or the send window.
+        send_blocked_streams: u64,
+        /// Each negotiated kind's frame gates.
+        kinds: Vec<KindLoad>,
+    },
+}
+
+/// One stream kind's frame gates on one connection, in
+/// [`TransportFact::Load`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KindLoad {
+    /// The stream kind.
+    pub kind: u16,
+    /// Raw inbound frame bytes the kind's frames hold.
+    pub raw_held: u64,
+    /// The raw gate's capacity, as the gate reports it.
+    pub raw_capacity: u64,
+    /// Queued output frame bytes the kind's frames hold.
+    pub output_held: u64,
+    /// The output gate's capacity, as the gate reports it.
+    pub output_capacity: u64,
 }
 
 /// A service session's lifecycle step, in [`TransportFact::SessionLifecycle`].

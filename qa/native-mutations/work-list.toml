@@ -126,6 +126,23 @@ code = ["crates/zakura-network/src/zakura/block_sync/peer_routine/io.rs", "crate
 witness = { planted = "qa/planted/block-sync/budget-ledgers-agree/handoff-keeps-charge.toml" }
 
 [[entry]]
+id = "body-work-authority"
+kind = "shared-definition"
+claim = "Block sync queries and holds body work only under the authority of header sync's latest committed view."
+check = ["crates/zakura-sim/src/domain/block_sync_semantic/authority.rs", "crates/zakura-sim/src/domain/block_sync_semantic.rs"]
+shared = []
+
+[[entry.instance]]
+property = "block-sync/query-work-authorized"
+code = ["crates/zakura-network/src/zakura/block_sync/reactor.rs", "crates/zakura-network/src/zakura/block_sync/reactor/state.rs"]
+witness = { planted = "qa/planted/block-sync/query-work-authorized/accept-retired-authority.toml" }
+
+[[entry.instance]]
+property = "block-sync/frontier-work-consistent"
+code = ["crates/zakura-network/src/zakura/block_sync/sequencer_task/state.rs", "crates/zakura-network/src/zakura/block_sync/work_queue"]
+witness = { planted = "qa/planted/block-sync/frontier-work-consistent/omit-work-reset.toml" }
+
+[[entry]]
 id = "payload-inventory-agrees"
 kind = "single"
 claim = "At each sequencer boundary, every runtime payload has a policy entry with the same identity and decoded size."

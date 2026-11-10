@@ -138,6 +138,18 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/sync_wire.rs"
+test = "regenerate_saved_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved scenarios"
+
+[[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_saved_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved scenarios"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -241,6 +253,24 @@ package = "sim"
 name = "header_sync_storage"
 smoke-secs = 60
 args = ["-max_len=4096", "-len_control=0"]
+timeout-secs = 1800
+
+# `sync/storage`'s two-byte prefix picks a saved scenario or the default
+# one, so the target fuzzes the schedule of each.
+[[target]]
+package = "sim"
+name = "sync_storage"
+smoke-secs = 60
+timeout-secs = 1800
+
+# `sync/wire`'s two-byte prefix picks a saved scenario, fuzz-13's combined
+# actions (a chain change at a pipeline stage, a connection replacement and
+# a read stall), or the honest scenario. The target fuzzes the schedule of
+# each.
+[[target]]
+package = "sim"
+name = "sync_wire"
+smoke-secs = 60
 timeout-secs = 1800
 
 # `fixtures/all` picks any race fixture in any variant, so the target's runs
@@ -443,63 +473,9 @@ owner = "H5"
 plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
-id = "sync/storage"
-kind = "harness"
-owner = "P8a"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/block-requests-follow-headers"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "block-sync/query-work-authorized"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/header-reorg-retires-block-work"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "block-sync/frontier-work-consistent"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
 id = "sync/stale-block-completion-inert"
 kind = "property"
 owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/tips-consistent"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/wire"
-kind = "harness"
-owner = "P8c"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "session/replacement-preserves-authorization"
-kind = "property"
-owner = "P8c"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/teardown-returns-baseline"
-kind = "property"
-owner = "P8d"
 plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
 
 # The protocol-state features of the G1–G3 plan's feature table, whose

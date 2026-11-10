@@ -453,6 +453,7 @@ fn open_work(byte: u8) -> [ReactorEvent; 7] {
                 peer: peer.clone(),
                 source: SourceId::from_digest([byte; 32]),
                 owner,
+                common_ancestor: zakura_header_chain::Frontier::new(block::Height(0), hash),
                 target: zakura_header_chain::Frontier::new(block::Height(5), hash),
                 hashes: vec![hash; 5],
             },

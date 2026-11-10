@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..24e70d5c00 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2134,7 +2134,9 @@ impl HeaderSyncReactor {
+                     HeaderPortOperation::ApplyHeaderTarget {
+                         purpose: purpose.clone(),
+                         peer: peer.clone(),
+-                        source,
++                        // Mutation: the apply names another source than its
++                        // prepare.
++                        source: zakura_header_chain::SourceId::from_digest([0x44; 32]),
+                         owner,
+                         target,
+                     },

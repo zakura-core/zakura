@@ -869,6 +869,10 @@ pub enum StorageRequest {
         /// The first header, `common_ancestor`'s child on the target's
         /// branch. `None` for a request with no headers.
         first: Option<StoragePoint>,
+        /// Every header's hash, in the order the request sends them. Kept
+        /// view-side and off the trace, whose format pinned traces fix.
+        #[serde(skip)]
+        hashes: Vec<String>,
     },
     /// `apply_header_target`.
     ApplyHeaderTarget {
@@ -880,6 +884,10 @@ pub enum StorageRequest {
         parent: Option<String>,
         /// The target.
         target: String,
+        /// The sealed insertion's header hashes, in order, if this port
+        /// sealed the target. Kept view-side and off the trace.
+        #[serde(skip)]
+        hashes: Option<Vec<String>>,
     },
     /// `selected_chain_contains`.
     SelectedChainContains {

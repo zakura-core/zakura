@@ -76,6 +76,10 @@ fn prepare_for(call: u64, owner: HeaderSyncWorkOwner, incarnation: u64) -> [Reac
                 peer: mirror(),
                 source: SourceId::from_digest([2; 32]),
                 owner,
+                common_ancestor: Frontier {
+                    height: block::Height(0),
+                    hash: block::Hash([0; 32]),
+                },
                 target: Frontier {
                     height: block::Height(1),
                     hash: block::Hash([1; 32]),

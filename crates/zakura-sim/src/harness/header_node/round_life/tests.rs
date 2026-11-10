@@ -170,6 +170,7 @@ fn apply(call: u64, generation: u64) -> ReactorEvent {
             peer: mirror(),
             source: SourceId::from_digest([2; 32]),
             owner: owner(generation),
+            target_tip_hash: block::Hash([1; 32]),
         },
     }
 }
@@ -470,6 +471,7 @@ fn a_rewritten_anchor_does_not_hide_an_old_generation() {
             peer: mirror(),
             source: SourceId::from_digest([2; 32]),
             owner: HeaderSyncWorkOwner::Header(anchored(0, other).bind(7, NonZeroU64::MIN)),
+            target_tip_hash: other,
         },
     });
     events.push(cause(ReactorCause::Idle));

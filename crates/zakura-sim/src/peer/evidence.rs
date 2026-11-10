@@ -1469,6 +1469,7 @@ mod tests {
                 headers: 1,
                 work: None,
                 first: None,
+                hashes: Vec::new(),
             },
             digest: String::new(),
             call: None,

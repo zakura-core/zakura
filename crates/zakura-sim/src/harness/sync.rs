@@ -86,7 +86,7 @@ use crate::{
             semantic_properties, SemanticModel, SemanticView, FRONTIER_WORK_CONSISTENT,
             QUERY_WORK_AUTHORIZED,
         },
-        cross::{self, CrossModel, CrossView, Dag},
+        cross::{self, CrossModel, CrossView, Dag, ViewSample},
     },
     property::{Capture, CheckCtx, HasView, Kind, Property, PropertyId, Source, Sources, Status},
     storage::HEADER_SERVICE,
@@ -686,9 +686,10 @@ impl ActionSource for Control {
     }
 }
 
-/// Watches the node's engine at each observation: records a reorganization
-/// of its selected header chain as the node's `Reset` chain effect, for the
-/// block policy's triggers, and hands the cross model the engine's tips.
+/// Watches the node's engine at each observation: hands the cross model the
+/// engine's committed view, and records a reorganization of its selected
+/// header chain as the node's `Reset` chain effect, for the block policy's
+/// triggers.
 /// It's added before the block policy's source, so a step's effect counts
 /// in the same step.
 struct EngineWatch {
@@ -709,7 +710,14 @@ impl ActionSource for EngineWatch {
     }
 
     fn observe(&mut self, _: &mut ObservationLog) -> Result<(), String> {
-        let header_best = self.engine.view().frontiers.header_best;
+        let view = self.engine.view();
+        self.cross.borrow_mut().sample(ViewSample {
+            state_version: view.state_version.get(),
+            epoch: view.body_work_epoch.get(),
+            header_best: view.frontiers.header_best,
+            verified_best: view.frontiers.verified_best,
+        });
+        let header_best = view.frontiers.header_best;
         if header_best != self.header_best {
             let reorganized = !self
                 .cross
@@ -1083,13 +1091,13 @@ pub enum SavedSync {
     /// storage to admit four bodies. The node's header sync takes the fork,
     /// and its block sync downloads the fork's bodies.
     Reorg,
-    /// [`SavedSync::Reorg`]'s fork, made once the node's first needed-block
-    /// query reaches storage, which holds that query until the node's header
-    /// tip has left the old branch and [`RETIRED_QUERY_HOLD_MS`] have passed.
-    /// Virtual time moves only once no task can run, so by then the reactor
-    /// has adopted the fork's committed view, which retires the query, and
-    /// its reply reaches the reactor under the authority the reorganization
-    /// retired.
+    /// The mirrors' chain grows by four blocks once the node's first
+    /// needed-block query reaches storage, which holds that query for
+    /// [`RETIRED_QUERY_HOLD_MS`]. Virtual time moves only once no task can
+    /// run, so by then the reactor has adopted the longer chain's committed
+    /// view. Its new header target retires the query under the same
+    /// body-work epoch, and the query's reply reaches the reactor under the
+    /// retired authority.
     RetiredQuery,
 }
 
@@ -1130,7 +1138,10 @@ impl SavedSync {
     pub fn witnesses(self) -> &'static [(&'static str, &'static str)] {
         match self {
             SavedSync::Honest => &[],
-            SavedSync::Reorg => &[(FRONTIER_WORK_CONSISTENT, "holds")],
+            SavedSync::Reorg => &[
+                (FRONTIER_WORK_CONSISTENT, "holds"),
+                (cross::TIPS_CONSISTENT, "holds"),
+            ],
             SavedSync::RetiredQuery => &[(QUERY_WORK_AUTHORIZED, "holds")],
         }
     }
@@ -1176,17 +1187,14 @@ impl SavedSync {
                 let mut block_policy = block_node::Policy::converging();
                 block_policy.holds.push(block_policy::Hold {
                     select: query.clone(),
-                    until: Trigger::All(vec![
-                        Trigger::Reset("node".to_owned()),
-                        Trigger::VirtualTime(RETIRED_QUERY_HOLD_MS),
-                    ]),
+                    until: Trigger::VirtualTime(RETIRED_QUERY_HOLD_MS),
                     then: vec![block_policy::BlockAllow::Answer],
                     deadline_ms: None,
                 });
                 SyncScenario {
                     block_policy,
                     control: vec![SyncStep {
-                        action: fork,
+                        action: SyncAction::Grow { len: 4 },
                         when: Some(Trigger::Submitted(query)),
                     }],
                     ..two_mirrors

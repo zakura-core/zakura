@@ -11,3 +11,7 @@ source = "crates/zakura-sim/tests/sync_harness.rs"
 [[witness]]
 property = "block-sync/frontier-work-consistent"
 expect = "holds"
+
+[[witness]]
+property = "sync/tips-consistent"
+expect = "holds"

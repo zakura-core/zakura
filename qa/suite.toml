@@ -138,6 +138,12 @@ run = false
 reason = "a tool, not a test: it rewrites the committed saved Plans"
 
 [[ignored]]
+file = "crates/zakura-sim/tests/sync_harness.rs"
+test = "regenerate_saved_scenarios"
+run = false
+reason = "a tool, not a test: it rewrites the committed saved scenarios"
+
+[[ignored]]
 file = "crates/zakura-sim/tests/discovery_wire_lifecycle.rs"
 test = "regenerate_saved_plans"
 run = false
@@ -365,6 +371,11 @@ owner = "E5a"
 reason = "no target: the harness has three fixed scenarios, the repair fixtures, and no plan maps it to a target"
 
 [[missing-target]]
+harness = "sync/storage"
+owner = "P8d"
+reason = "no target yet; xsync-4 adds it with its curated seeds"
+
+[[missing-target]]
 harness = "block-sync/storage"
 owner = "E5a"
 reason = "no target yet; `cargo xtask sim-targets` checks one once its table entry, suite row and seeds land"
@@ -443,43 +454,7 @@ owner = "H5"
 plan = "https://valargroup.getoutline.com/doc/ec275c3b-a5ae-427b-898a-197cdd6d15db"
 
 [[pending]]
-id = "sync/storage"
-kind = "harness"
-owner = "P8a"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/block-requests-follow-headers"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "block-sync/query-work-authorized"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/header-reorg-retires-block-work"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "block-sync/frontier-work-consistent"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
 id = "sync/stale-block-completion-inert"
-kind = "property"
-owner = "P8b"
-plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"
-
-[[pending]]
-id = "sync/tips-consistent"
 kind = "property"
 owner = "P8b"
 plan = "https://valargroup.getoutline.com/doc/46ef78e4-cbeb-4349-aa6e-c75f55a96911"

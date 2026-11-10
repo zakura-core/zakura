@@ -971,6 +971,36 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("no-room-check"),
     },
     Coverage {
+        property: crate::domain::cross::TIPS_CONSISTENT,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "a_replaced_selection_starts_a_new_body_work_epoch",
+        ),
+        bypass: Bypass::Planted("keep-epoch-on-replaced-selection"),
+    },
+    Coverage {
+        property: crate::domain::cross::BLOCK_REQUESTS_FOLLOW_HEADERS,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "work_after_a_reorg_follows_the_new_branch",
+        ),
+        bypass: Bypass::Pending(
+            "the check passes an old-epoch request by its own branch: a routine may publish \
+             one before the epoch's reset reaches it, and the check doesn't bound that window",
+        ),
+    },
+    Coverage {
+        property: crate::domain::cross::HEADER_REORG_RETIRES_BLOCK_WORK,
+        passing: passes(
+            "tests/sync_properties.rs",
+            "work_after_a_reorg_follows_the_new_branch",
+        ),
+        bypass: Bypass::Pending(
+            "storage logs a submission when it takes it, not when the sequencer sends it, so \
+             the check can't tell a stale old-epoch submission from a detached one",
+        ),
+    },
+    Coverage {
         property: crate::domain::block_sync_semantic::QUERY_WORK_AUTHORIZED,
         passing: passes(
             "tests/sync_properties.rs",

@@ -1,5 +1,5 @@
 diff --git a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
-index f36982fa0e..e284db5d37 100644
+index f36982fa0e..35d7bde084 100644
 --- a/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
 +++ b/crates/zakura-network/src/zakura/block_sync/reactor/state.rs
 @@ -214,9 +214,7 @@ impl ReactorState {
@@ -13,7 +13,18 @@ index f36982fa0e..e284db5d37 100644
          let progress = &self.progress;
          if body_anchor.height != progress.verified_block_tip
              || body_anchor.hash != progress.verified_block_hash
-@@ -1083,8 +1081,8 @@ impl ReactorState {
+@@ -324,7 +322,9 @@ pub struct PendingNeededQuery {
+ impl PendingNeededQuery {
+     /// Whether `self` asks for the same metadata as `other`. Query IDs may differ.
+     fn covers(&self, other: &Self) -> bool {
+-        self.hint_revision == other.hint_revision
++        // One needed-block query at a time, whatever it asks for.
++        let _ = other;
++        true || self.hint_revision == other.hint_revision
+             && self.scope == other.scope
+             && self.from == other.from
+             && self.limit == other.limit
+@@ -1083,8 +1083,8 @@ impl ReactorState {
          .then_some(view.state_version);
  
          let current_scope = BodyWorkAuthority::for_view(&view);

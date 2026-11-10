@@ -19,6 +19,7 @@ use zakura_sim::{
         discovery, discovery_service,
         fixtures::{PickScenario, Variant, Which},
         header_sync::{FloodScenario, RepairScenario, StorageScenario, WakeScenario},
+        sync::SavedSync,
         wire_plans::SavedPlan,
         HARNESSES,
     },
@@ -92,6 +93,12 @@ fn intended(stem: &str) -> Option<serde_json::Value> {
             variant: Variant::Fixed,
             workers: 1,
         });
+    }
+    if let Some(saved) = SavedSync::ALL
+        .into_iter()
+        .find(|saved| stem == format!("sync-storage-{}", saved.name()))
+    {
+        return value(saved.scenario());
     }
     if let Some((_, scenario)) = storage_witnesses::witness_seeds()
         .into_iter()

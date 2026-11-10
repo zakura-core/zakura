@@ -5,7 +5,7 @@
 harness = "sync/storage"
 generator = 1
 sha256 = "66b2f4dc6fb0ed9f9af56bf6d9fa83d4be6bbae24170e4dee673fb233a03a160"
-scenario_sha256 = "6744e433ca4f2e5942d3225d90b66331a98c4528681a6562d7de16ecc1f41a99"
+scenario_sha256 = "5954d0fde8c2ec74b9428147bae73f7411191c20099d1721bd36468618a5c24a"
 source = "crates/zakura-sim/tests/sync_harness.rs"
 
 [[witness]]

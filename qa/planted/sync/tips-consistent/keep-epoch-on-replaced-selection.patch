@@ -1,0 +1,15 @@
+diff --git a/crates/zakura-header-chain/src/transition/planner/write_set.rs b/crates/zakura-header-chain/src/transition/planner/write_set.rs
+index 2b3c090075..18787f4815 100644
+--- a/crates/zakura-header-chain/src/transition/planner/write_set.rs
++++ b/crates/zakura-header-chain/src/transition/planner/write_set.rs
+@@ -345,7 +345,9 @@ pub(super) fn body_work_effect(
+     {
+         BodyWorkEffect::Preserved
+     } else {
+-        BodyWorkEffect::Invalidated
++        // Keep the body-work epoch across a replaced selection.
++        let _ = finality_lineage;
++        BodyWorkEffect::Preserved
+     }
+ }
+ 

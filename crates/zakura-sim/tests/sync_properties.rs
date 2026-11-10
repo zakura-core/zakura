@@ -8,7 +8,13 @@ mod support;
 
 use support::inputs;
 use zakura_sim::{
-    domain::block_sync_semantic::{SemanticModel, FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED},
+    domain::{
+        block_sync_semantic::{SemanticModel, FRONTIER_WORK_CONSISTENT, QUERY_WORK_AUTHORIZED},
+        cross::{
+            EpochHistory, BLOCK_REQUESTS_FOLLOW_HEADERS, HEADER_REORG_RETIRES_BLOCK_WORK,
+            TIPS_CONSISTENT,
+        },
+    },
     harness::{
         run_prepared,
         sync::{SavedSync, SyncStorage},
@@ -52,12 +58,11 @@ fn applicable_and_held(report: &RunReport, property: &str) {
 }
 
 /// `block-sync/query-work-authorized`'s witness: storage holds the node's
-/// first needed-block query until the mirrors' fork has reached the node's
-/// header tip and the node has gone idle. Header sync's apply publishes a
-/// committed view with a new authority, and the reactor's adoption retires
-/// the query, so its reply reaches the reactor under a retired authority
-/// and installs nothing. Under the committed
-/// input and every generated Plan.
+/// first needed-block query while the mirrors' chain grows. Header sync's
+/// apply publishes a committed view with a new header target, and the
+/// reactor's adoption retires the query under the same body-work epoch, so
+/// its reply reaches the reactor under a retired authority and installs
+/// nothing. Under the committed input and every generated Plan.
 #[test]
 fn a_reply_under_a_retired_authority_installs_nothing() {
     let committed = Plan::from_fuzz(&[]);
@@ -85,5 +90,42 @@ fn an_epoch_change_retires_the_old_epochs_work() {
             report.end
         );
         applicable_and_held(&report, FRONTIER_WORK_CONSISTENT);
+    }
+}
+
+/// `sync/tips-consistent`'s witness: the mirrors' fork reaches the engine
+/// through the node's header sync, and the engine publishes a view whose
+/// selected path replaced the last one's under a new body-work epoch.
+#[test]
+fn a_replaced_selection_starts_a_new_body_work_epoch() {
+    let committed = Plan::from_fuzz(&[]);
+    for input in std::iter::once(committed).chain(inputs(4, 256)) {
+        let report = run(SavedSync::Reorg, input);
+        assert!(
+            EpochHistory::of(&report.log).epoch_changed,
+            "{:?}",
+            report.end
+        );
+        applicable_and_held(&report, TIPS_CONSISTENT);
+    }
+}
+
+/// The Draft `sync/block-requests-follow-headers` and
+/// `sync/header-reorg-retires-block-work` apply and hold once the fork
+/// reaches block sync: the node requests and submits the fork's bodies
+/// under the new body-work epoch, each the fork's block at its height.
+#[test]
+fn work_after_a_reorg_follows_the_new_branch() {
+    let committed = Plan::from_fuzz(&[]);
+    for input in std::iter::once(committed).chain(inputs(4, 256)) {
+        let report = run(SavedSync::Reorg, input);
+        let history = EpochHistory::of(&report.log);
+        assert!(
+            history.request_after && history.submission_after,
+            "{history:?}: {:?}",
+            report.end
+        );
+        applicable_and_held(&report, BLOCK_REQUESTS_FOLLOW_HEADERS);
+        applicable_and_held(&report, HEADER_REORG_RETIRES_BLOCK_WORK);
     }
 }

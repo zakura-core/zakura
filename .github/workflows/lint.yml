@@ -252,6 +252,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_review*.py'
 
+      - name: Release notes drafter tests
+        if: ${{ !cancelled() }}
+        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_release_notes*.py'
+
       - name: Deployer tests
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s deploy/deployer -p 'test_*.py'

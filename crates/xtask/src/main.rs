@@ -7,6 +7,7 @@ use std::{
     process::{Command, ExitStatus},
 };
 
+mod header_acceptance;
 mod header_conformance;
 mod header_fuzz;
 mod planted;
@@ -148,6 +149,7 @@ fn try_main() -> Result<(), BoxError> {
                 targets,
             )
         }
+        Some("header-acceptance") => header_acceptance::run(&repo_root()?, args),
         Some("record") => sim::run(&repo_root()?, "record", args),
         Some("replay") => sim::run(&repo_root()?, "replay", args),
         Some("shrink") => sim::run(&repo_root()?, "shrink", args),
@@ -378,6 +380,10 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "  cargo xtask planted pilot (sensitivity|discovery) --out <dir> [--work <dir>]"
+    )?;
+    writeln!(
+        output,
+        "  cargo xtask header-acceptance [--out <dir>] [--deadline-secs <n>]"
     )?;
     writeln!(output, "      [--only <case-id>]... [--seed <n>]...")?;
     writeln!(

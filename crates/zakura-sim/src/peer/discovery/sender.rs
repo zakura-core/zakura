@@ -16,6 +16,11 @@
 //!   read releases its request.
 //! - An answer with no unanswered request of the peer's on the stream is
 //!   `Unsolicited`, so an exchange ends at most once.
+//! - An answer that carries more than its request asked for is
+//!   `OverOwed`: a `Peers` with more records than its `GetPeers` limit, or a
+//!   `Services` with a summary its `GetServices` didn't name. The node
+//!   answers a row's requests in the order it read them, and the peer's
+//!   frame record says what each request asked ([`Asked`]).
 //! - A conformant frame of a row with a cadence is charged to its
 //!   connection's bucket when the peer reads it, and an empty bucket marks
 //!   it `exhausted`.
@@ -29,9 +34,11 @@ use std::{
 };
 
 use zakura_network::zakura::{
-    wire_codec::WireMessage, DiscoveryMessage, Frame, MessageRole, MessageRule,
+    wire_codec::{decode_frame, WireMessage},
+    DiscoveryMessage, Frame, MessageRole, MessageRule,
 };
 
+use super::Asked;
 use crate::{
     model::{CadenceModel, Charge, FrameHeader, FrameModel, Label, ReaderEnd},
     observe::{StreamId, TransportFact},
@@ -82,7 +89,7 @@ impl DiscoverySender {
                 let Some(message_type) = ledger.headers.remove(&seq) else {
                     return;
                 };
-                (quic_stream, Pending::Read { message_type })
+                (quic_stream, Pending::Read { seq, message_type })
             }
             TransportFact::FrameWriteStarted {
                 quic_stream,
@@ -96,6 +103,17 @@ impl DiscoverySender {
             .or_default()
             .pending
             .push_back(pending);
+    }
+
+    /// The peer's frame `seq` on `connection`'s `quic_stream` is a request
+    /// that asked for `asked`. Its record is placed before the node's answer
+    /// to it, since the peer wrote it first.
+    pub(crate) fn asked(&mut self, connection: u64, quic_stream: u64, seq: u64, asked: Asked) {
+        self.streams
+            .entry((connection, quic_stream))
+            .or_default()
+            .asks
+            .insert(seq, asked);
     }
 
     /// A peer read `frame`, the node's `seq`-th on `connection`'s
@@ -124,7 +142,7 @@ impl DiscoverySender {
                 )
             })?;
             match pending {
-                Pending::Read { message_type } => ledger.read(message_type),
+                Pending::Read { seq, message_type } => ledger.read(seq, message_type),
                 Pending::Started {
                     seq: started,
                     message_type,
@@ -156,7 +174,9 @@ impl DiscoverySender {
         let envelope = ledger.frames.labels(&header);
         let row = ledger.frames.row(header.message_type);
         let label = match row {
-            Some(row) if envelope.is_conformant() => ledger.send(row),
+            Some(row) if envelope.is_conformant() => {
+                ledger.send(row, decode_frame::<DiscoveryMessage>(frame).ok().as_ref())
+            }
             _ => envelope.first(),
         };
         let exhausted = row.is_some_and(|row| {
@@ -182,8 +202,8 @@ impl DiscoverySender {
 /// What the tap logged on one stream that a later frame waits behind.
 #[derive(Clone, Copy, Debug)]
 enum Pending {
-    /// The node read a peer frame of `message_type`.
-    Read { message_type: u16 },
+    /// The node read the peer's frame `seq`, of `message_type`.
+    Read { seq: u64, message_type: u16 },
     /// The node started writing frame `seq` of `message_type`.
     Started { seq: u64, message_type: u16 },
 }
@@ -199,8 +219,11 @@ struct Ledger {
     /// The node's unanswered requests, by request type.
     asked: BTreeMap<u16, u32>,
     /// The peer's requests the node read and hasn't answered, by request
-    /// type.
-    owed: BTreeMap<u16, u32>,
+    /// type, oldest first, each with what it asked for if its record said.
+    owed: BTreeMap<u16, VecDeque<Option<Asked>>>,
+    /// What each of the peer's requests asked for, by `seq`, until the node
+    /// reads it.
+    asks: BTreeMap<u64, Asked>,
     frames: FrameModel,
 }
 
@@ -211,6 +234,7 @@ impl Default for Ledger {
             headers: BTreeMap::new(),
             asked: BTreeMap::new(),
             owed: BTreeMap::new(),
+            asks: BTreeMap::new(),
             frames: FrameModel::new(
                 <DiscoveryMessage as WireMessage>::RULES,
                 ReaderEnd::Persistent,
@@ -220,12 +244,14 @@ impl Default for Ledger {
 }
 
 impl Ledger {
-    /// The node read a peer frame of `message_type`: a request it now owes
-    /// an answer, or an answer that releases one of its requests.
-    fn read(&mut self, message_type: u16) {
+    /// The node read the peer's frame `seq`, of `message_type`: a request
+    /// it now owes an answer, or an answer that releases one of its
+    /// requests.
+    fn read(&mut self, seq: u64, message_type: u16) {
+        let asked = self.asks.remove(&seq);
         match self.frames.row(message_type).map(|row| row.role) {
             Some(MessageRole::Request { .. }) => {
-                *self.owed.entry(message_type).or_default() += 1;
+                self.owed.entry(message_type).or_default().push_back(asked);
             }
             Some(MessageRole::Response { request, .. }) => {
                 if let Some(asked) = self.asked.get_mut(&request) {
@@ -236,9 +262,9 @@ impl Ledger {
         }
     }
 
-    /// The sender label of the node sending a frame of `row`. A conformant
-    /// one is applied.
-    fn send(&mut self, row: &MessageRule) -> Label {
+    /// The sender label of the node sending a frame of `row` that decodes
+    /// as `message`. A conformant one is applied.
+    fn send(&mut self, row: &MessageRule, message: Option<&DiscoveryMessage>) -> Label {
         match row.role {
             MessageRole::Request { max_in_flight, .. } => {
                 let asked = self.asked.entry(row.message_type).or_default();
@@ -248,13 +274,21 @@ impl Ledger {
                 *asked += 1;
                 Label::Conformant
             }
-            MessageRole::Response { request, .. } => match self.owed.get_mut(&request) {
-                Some(owed) if *owed > 0 => {
-                    *owed -= 1;
-                    Label::Conformant
+            MessageRole::Response { request, .. } => {
+                let Some(owed) = self.owed.get_mut(&request).filter(|owed| !owed.is_empty()) else {
+                    return Label::Unsolicited;
+                };
+                let over = owed
+                    .front()
+                    .and_then(Option::as_ref)
+                    .zip(message)
+                    .is_some_and(|(asked, answer)| !asked.admits(answer));
+                if over {
+                    return Label::OverOwed;
                 }
-                _ => Label::Unsolicited,
-            },
+                owed.pop_front();
+                Label::Conformant
+            }
             _ => Label::Conformant,
         }
     }
@@ -263,11 +297,11 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use zakura_chain::parameters::Network;
-    use zakura_network::zakura::{wire_codec::encode_frame, ZakuraHandshakeConfig};
+    use zakura_network::zakura::{wire_codec::encode_frame, Services, ZakuraHandshakeConfig};
     use zakura_quic::NodeSecretKey;
 
     use super::*;
-    use crate::peer::discovery::{record, unix_now, Request, FIXTURE_ADDR};
+    use crate::peer::discovery::{record, services, unix_now, Request, FIXTURE_ADDR};
 
     /// Discovery's stream.
     const STREAM: StreamId = StreamId {
@@ -292,10 +326,14 @@ mod tests {
             }
         }
 
-        /// The node reads the peer's `message`.
+        /// The node reads the peer's `message`, whose record says what it
+        /// asks for.
         fn reads(&mut self, message: &DiscoveryMessage) {
             let seq = self.peer_seq;
             self.peer_seq += 1;
+            if let Some(asked) = Asked::of(message) {
+                self.sender.asked(1, 0, seq, asked);
+            }
             let header = TransportFact::HeaderRead {
                 quic_stream: 0,
                 seq,
@@ -387,5 +425,43 @@ mod tests {
             .map(|sent| node.writes(&hello, cadence.send_interval * sent).1)
             .collect();
         assert!(!spaced.contains(&true), "{spaced:?}");
+    }
+
+    /// An answer that carries more than its request asked for is
+    /// `OverOwed`, and changes no model state: the request stays owed, so
+    /// a later answer within it is `Conformant`. A `Peers` may carry at most
+    /// its `GetPeers` limit's records, and a `Services` only the summaries
+    /// its `GetServices` named.
+    #[test]
+    fn an_answer_past_its_request_is_over_owed() {
+        let at = Duration::ZERO;
+        let handshake =
+            ZakuraHandshakeConfig::for_network(&Network::new_regtest(Default::default()));
+        let authors = [3, 4].map(|byte| NodeSecretKey::from_bytes(&[byte; 32]));
+        let records: Vec<_> = authors
+            .iter()
+            .map(|author| record(author, &handshake, unix_now(), vec![FIXTURE_ADDR]))
+            .collect();
+        let peers = |count: usize| DiscoveryMessage::Peers {
+            records: records[..count].to_vec(),
+        };
+        let mut node = Node::new();
+        node.reads(&Request::GetOnePeer.message());
+        assert_eq!(node.writes(&peers(2), at).0, Label::OverOwed);
+        assert_eq!(node.writes(&peers(1), at).0, Label::Conformant);
+        assert_eq!(node.writes(&peers(0), at).0, Label::Unsolicited);
+        node.reads(&Request::GetPeers.message());
+        assert_eq!(node.writes(&peers(2), at).0, Label::Conformant);
+
+        let summarized = DiscoveryMessage::Services(services(authors[0].public()));
+        let empty = DiscoveryMessage::Services(Services {
+            summaries: Vec::new(),
+            ..services(authors[0].public())
+        });
+        node.reads(&Request::GetHeaderSyncService.message());
+        assert_eq!(node.writes(&summarized, at).0, Label::OverOwed);
+        assert_eq!(node.writes(&empty, at).0, Label::Conformant);
+        node.reads(&Request::GetServices.message());
+        assert_eq!(node.writes(&summarized, at).0, Label::Conformant);
     }
 }

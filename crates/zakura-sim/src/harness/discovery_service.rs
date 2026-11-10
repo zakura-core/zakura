@@ -53,7 +53,9 @@ use crate::{
     model::Label,
     observe::StreamId,
     peer::{
-        discovery::{discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold},
+        discovery::{
+            discovery_stream, Answer, DiscoveryAct, DiscoveryRow, DiscoveryScript, Hold, Request,
+        },
         key_index,
         limit::ADVERSARY_RATE,
         peer_addr, PeerAction, PeerCloses, PeerControl, PeerFailure, PeerRecords, PeerSpec,
@@ -63,7 +65,7 @@ use crate::{
         Assume, AssumeRecord, Assumptions, HasView, Property, Source, Sources, Status,
         TriggerHistory,
     },
-    table::{sender_properties, table_properties, GeneratedId, Template},
+    table::{sender_owed_properties, sender_properties, table_properties, GeneratedId, Template},
     Observation, ObservationLog, RunConfig, Sim,
 };
 
@@ -501,6 +503,30 @@ pub fn act_scenario(act: DiscoveryAct) -> WireScenario {
     }
 }
 
+/// The peers of `peers/sender-within-owed`'s scenario: the one that asks for
+/// one record, and two the node dials, so the node's book holds more records
+/// than that request asks for.
+pub const OWED_PEERS: usize = 3;
+
+/// The honest exchange with `peers` peers. The first dials the node and
+/// also sends `request` once. The node holds each other peer as a static
+/// candidate and dials it, which confirms that peer's record, so its book
+/// can sample the record for another peer's `GetPeers`.
+///
+/// # Panics
+///
+/// If `peers` is zero.
+pub fn asking_scenario(request: Request, peers: usize) -> WireScenario {
+    assert!(peers > 0, "a peer sends the request");
+    let mut scenario = WireScenario::default();
+    scenario.node.static_candidates = (1..peers).collect();
+    scenario.peers[0].script.push(PeerAction::Ask { request });
+    scenario
+        .peers
+        .extend((1..peers).map(|_| discovering(PeerSpec::listening(), DiscoveryScript::default())));
+    scenario
+}
+
 /// The family discovery's generated property IDs name.
 pub const FAMILY: &str = "discovery";
 
@@ -515,7 +541,9 @@ pub const STREAMS: [Stream; 1] = [Stream {
 }];
 
 /// `discovery/wire`'s properties: discovery's generated receiver
-/// properties, 31 IDs, then its sender properties, 7 IDs. An ID is a
+/// properties, 31 IDs, then its sender properties, 7 IDs, then the
+/// `sender-within-owed` IDs of `peers` and `services`
+/// ([`sender_owed_properties`]). An ID is a
 /// `Draft` until its planted case lands. An ID with a planted case checks
 /// that case's trigger history ([`planted_trigger`]). An ID no planted case
 /// violates alone, one of [`SCRIPTED`], is `Active` with the scripted
@@ -541,6 +569,7 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         });
     receiver
         .chain(sender_properties(FAMILY, &STREAMS))
+        .chain(sender_owed_properties(FAMILY, &STREAMS))
         .map(|property| match planted_trigger(property.id.as_str()) {
             Some(trigger) => Property {
                 witness: Some(TriggerHistory::Log(trigger)),
@@ -612,9 +641,10 @@ fn planted_trigger(id: &str) -> Option<Trigger> {
             }
         }
         Template::CadenceNeverCloses => CADENCE_TRIGGERS.get(row()?).copied(),
-        Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
-            SENT_TRIGGERS.get(row()?).copied()
-        }
+        Template::SenderWithinLimit
+        | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
+        | Template::SenderCadence => SENT_TRIGGERS.get(row()?).copied(),
         _ => None,
     }
 }

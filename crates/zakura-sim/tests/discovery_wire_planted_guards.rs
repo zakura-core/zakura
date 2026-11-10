@@ -17,13 +17,13 @@ use std::{
 
 use zakura_sim::{
     harness::{
-        discovery_service::{act_scenario, has_planted_case, DiscoveryWire, WireScenario, FAMILY},
+        discovery_service::{
+            act_scenario, asking_scenario, has_planted_case, DiscoveryWire, WireScenario, FAMILY,
+            OWED_PEERS,
+        },
         Subsystem,
     },
-    peer::{
-        discovery::{Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, Hold, Request},
-        PeerAction,
-    },
+    peer::discovery::{Answer, DiscoveryAct, DiscoveryRow, DiscoveryRule, Hold, Request},
 };
 
 /// The harness every case runs on.
@@ -44,8 +44,9 @@ enum Scenario {
     /// The honest exchange, with the peer holding `answer` past the node's
     /// exchange wait.
     Held(Answer),
-    /// The honest exchange, with the peer sending `request` once.
-    Asks(Request),
+    /// The honest exchange with this many peers, the first sending
+    /// `request` once ([`asking_scenario`]).
+    Asks(Request, usize),
 }
 
 impl Scenario {
@@ -67,11 +68,7 @@ impl Scenario {
                     });
                 scenario
             }
-            Scenario::Asks(request) => {
-                let mut scenario = WireScenario::default();
-                scenario.peers[0].script.push(PeerAction::Ask { request });
-                scenario
-            }
+            Scenario::Asks(request, peers) => asking_scenario(request, peers),
         }
     }
 }
@@ -162,7 +159,7 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
         (
             "peers/sender-ends-once",
             "answer-peers-twice",
-            Scenario::Asks(Request::GetPeers),
+            Scenario::Asks(Request::GetPeers, 1),
         ),
         (
             "get-services/sender-within-limit",
@@ -177,7 +174,17 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
         (
             "services/sender-ends-once",
             "answer-services-twice",
-            Scenario::Asks(Request::GetServices),
+            Scenario::Asks(Request::GetServices, 1),
+        ),
+        (
+            "peers/sender-within-owed",
+            "ignore-peers-limit",
+            Scenario::Asks(Request::GetOnePeer, OWED_PEERS),
+        ),
+        (
+            "services/sender-within-owed",
+            "ignore-wanted-services",
+            Scenario::Asks(Request::GetHeaderSyncService, 1),
         ),
     ]
 }

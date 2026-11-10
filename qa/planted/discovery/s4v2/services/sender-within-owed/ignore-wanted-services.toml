@@ -1,0 +1,11 @@
+# Discovery reports its own summary whatever services the `GetServices`
+# wants. The scenario's peer asks for header sync alone, which the node
+# doesn't run, so the node's answer carries a summary it didn't ask for.
+# Besides the files the patch changes, the rest of discovery decides whether
+# the frame reaches the bypass.
+checks = ["crates/zakura-network/src/zakura/discovery"]
+
+[typed]
+harness = "discovery/wire"
+scenario = "qa/planted/discovery/s4v2/services/sender-within-owed/ignore-wanted-services.scenario.json"
+plan = "qa/planted/discovery/s4v2/services/sender-within-owed/ignore-wanted-services.plan.bin"

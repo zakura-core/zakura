@@ -71,6 +71,9 @@ pub enum Template {
     /// Per response row that ends its exchange: the node ends only an open
     /// exchange, so it ends each at most once.
     SenderEndsOnce,
+    /// Per response row that answers a request: the node's answer carries
+    /// only what the peer's request asked for.
+    SenderWithinOwed,
     /// Per subscription row: the node's live subscriptions stay within
     /// `max_live`.
     SenderWithinLive,
@@ -96,6 +99,7 @@ impl Template {
             Template::SenderWithinLimit => "sender-within-limit".to_owned(),
             Template::SenderAnswersOpen => "sender-answers-open".to_owned(),
             Template::SenderEndsOnce => "sender-ends-once".to_owned(),
+            Template::SenderWithinOwed => "sender-within-owed".to_owned(),
             Template::SenderWithinLive => "sender-within-live".to_owned(),
             Template::SenderWithinCredit => "sender-within-credit".to_owned(),
             Template::SenderCadence => "sender-cadence".to_owned(),
@@ -114,6 +118,7 @@ impl Template {
             "sender-within-limit" => Some(Template::SenderWithinLimit),
             "sender-answers-open" => Some(Template::SenderAnswersOpen),
             "sender-ends-once" => Some(Template::SenderEndsOnce),
+            "sender-within-owed" => Some(Template::SenderWithinOwed),
             "sender-within-live" => Some(Template::SenderWithinLive),
             "sender-within-credit" => Some(Template::SenderWithinCredit),
             "sender-cadence" => Some(Template::SenderCadence),
@@ -153,6 +158,9 @@ impl Template {
                 "the node responds only within an exchange the peer opened"
             }
             Template::SenderEndsOnce => "the node ends only an open exchange, so each at most once",
+            Template::SenderWithinOwed => {
+                "the node's answer carries only what the peer's request asked for"
+            }
             Template::SenderWithinLive => "the node's live subscriptions stay within max_live",
             Template::SenderWithinCredit => {
                 "the node's pages stay within the credit the peer granted"
@@ -169,6 +177,7 @@ impl Template {
             Template::SenderWithinLimit
             | Template::SenderAnswersOpen
             | Template::SenderEndsOnce
+            | Template::SenderWithinOwed
             | Template::SenderWithinLive
             | Template::SenderWithinCredit
             | Template::SenderCadence => &[Source::Frames],
@@ -196,6 +205,7 @@ impl Template {
             | Template::SenderWithinLimit
             | Template::SenderAnswersOpen
             | Template::SenderEndsOnce
+            | Template::SenderWithinOwed
             | Template::SenderWithinLive
             | Template::SenderWithinCredit
             | Template::SenderCadence => Kind::Safety,
@@ -409,6 +419,40 @@ pub fn sender_properties<S: HasView>(family: &'static str, streams: &[Stream]) -
     properties
 }
 
+/// The `sender-within-owed` property of each response row in `streams` that
+/// answers a request, not a subscription. Only a family whose sender adapter
+/// knows what each of the peer's requests asked for, and labels an answer
+/// past it `OverOwed`, registers these: discovery's.
+pub fn sender_owed_properties<S: HasView>(
+    family: &'static str,
+    streams: &[Stream],
+) -> Vec<Property<S>> {
+    let mut properties = Vec::new();
+    for stream in streams {
+        let Some(rules) = stream.messages else {
+            continue;
+        };
+        for rule in rules {
+            let MessageRole::Response { request, .. } = rule.role else {
+                continue;
+            };
+            if !answers_request(streams, request) {
+                continue;
+            }
+            properties.push(generated(GeneratedId {
+                family,
+                stream: StreamId {
+                    kind: stream.kind,
+                    version: stream.version,
+                },
+                row: Some(rule.name),
+                template: Template::SenderWithinOwed,
+            }));
+        }
+    }
+    properties
+}
+
 /// True if `rule` declares a cadence.
 fn has_cadence(rule: &MessageRule) -> bool {
     match rule.role {
@@ -522,6 +566,7 @@ fn check_generated<S: HasView>(cx: &mut CheckCtx<'_, S>) -> Verdict {
         Template::SenderWithinLimit
         | Template::SenderAnswersOpen
         | Template::SenderEndsOnce
+        | Template::SenderWithinOwed
         | Template::SenderWithinLive
         | Template::SenderWithinCredit
         | Template::SenderCadence => {

@@ -24,14 +24,14 @@ use zakura_sim::{
     domain::discovery::LATE_RESPONSE_ADMITTED,
     harness::{
         discovery_service::{
-            act_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan, WireScenario,
-            FAMILY, SCRIPTED,
+            act_scenario, asking_scenario, wire_properties, DiscoveryWire, NodeHandle, SavedPlan,
+            WireScenario, FAMILY, OWED_PEERS, SCRIPTED,
         },
         run_prepared, HarnessError, Subsystem,
     },
     model::{is_fault_cause, Label},
     observe::{StreamId, TransportFact},
-    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule},
+    peer::discovery::{relayed_node, DiscoveryAct, DiscoveryRow, DiscoveryRule, Request},
     table::{GeneratedId, Template},
     witness::{judge_report, Expect},
     MemorySink, Observation, Plan, PropertyOutcome, RunReport,
@@ -151,6 +151,18 @@ const HONEST: [&str; 6] = [
     "get-peers/sender-cadence",
     "get-services/sender-within-limit",
     "get-services/sender-cadence",
+];
+
+/// The `sender-within-owed` IDs, which the node's answers to requests that
+/// ask for less than everything reach
+/// ([`answers_within_their_requests_hold_sender_within_owed`]).
+const OWED: [(&str, Request, usize); 2] = [
+    ("peers/sender-within-owed", Request::GetOnePeer, OWED_PEERS),
+    (
+        "services/sender-within-owed",
+        Request::GetHeaderSyncService,
+        1,
+    ),
 ];
 
 /// The generated ID no discovery scenario reaches. The node asks for
@@ -390,6 +402,7 @@ fn every_discovery_property_applies_in_its_witness() {
         .map(reached)
         .chain(ACTS.into_iter().flat_map(also))
         .chain(HONEST.iter().chain(&UNREACHED).map(|suffix| id(suffix)))
+        .chain(OWED.iter().map(|(suffix, ..)| id(suffix)))
         .collect();
     let distinct: BTreeSet<String> = listed.iter().cloned().collect();
     assert_eq!(distinct.len(), listed.len(), "{listed:?}");
@@ -398,6 +411,25 @@ fn every_discovery_property_applies_in_its_witness() {
     let honest: Vec<String> = HONEST.iter().map(|suffix| id(suffix)).collect();
     witnessed(&report, "honest", &honest);
     assert_eq!(fault_closes(&report), Vec::<String>::new());
+}
+
+/// The node's answers carry only what their requests asked for:
+/// `sender-within-owed` applies and holds on a `Peers` that answers a
+/// `GetPeers` for one record, and on a `Services` that answers a
+/// `GetServices` for header sync alone, which the node doesn't run. The
+/// `GetPeers` peer is one of [`OWED_PEERS`], so the node's book holds more
+/// records than it asks for. Each ID's planted case makes the node ignore
+/// what its request asked, and the same scenario then violates the ID.
+///
+/// This fails if the node's answer passes its request, or a witness stops
+/// reaching its ID.
+#[test]
+fn answers_within_their_requests_hold_sender_within_owed() {
+    for (suffix, request, peers) in OWED {
+        let report = run(&asking_scenario(request, peers));
+        witnessed(&report, request, &[id(suffix)]);
+        assert_eq!(fault_closes(&report), Vec::<String>::new(), "{request:?}");
+    }
 }
 
 /// `undeclared-type-closes` and each `hello` ID apply and hold in their

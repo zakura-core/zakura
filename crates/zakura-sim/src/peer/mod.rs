@@ -838,6 +838,7 @@ impl StreamModels {
                 // A frame's declared length is under 4 GiB.
                 payload: header.payload_len as u64,
                 prepares,
+                asks: None,
             }],
         }
     }

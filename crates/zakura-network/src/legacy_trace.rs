@@ -3,7 +3,6 @@
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceTable, JsonlTracer};
 
 use crate::{Config, PeerSocketAddr};
@@ -58,10 +57,7 @@ impl LegacyPeerTrace {
                 // Stable identifiers correlate endpoints across restarts without exposing raw
                 // addresses by default. These hashes are pseudonyms, not anonymization.
                 row.insert("peer".into(), peer_id(addr, self.expose_addresses).into());
-                row.insert(
-                    "ip_id".into(),
-                    format!("{:x}", Sha256::digest(addr.ip().to_string().as_bytes())).into(),
-                );
+                row.insert("ip_id".into(), pseudonym(&addr.ip().to_string()).into());
             }
             if let Value::Object(fields) = fields() {
                 row.extend(fields);
@@ -87,8 +83,16 @@ fn peer_id(addr: PeerSocketAddr, expose: bool) -> String {
     if expose {
         endpoint
     } else {
-        format!("{:x}", Sha256::digest(endpoint.as_bytes()))
+        pseudonym(&endpoint)
     }
+}
+
+fn pseudonym(value: &str) -> String {
+    blake2b_simd::Params::new()
+        .hash_length(32)
+        .hash(value.as_bytes())
+        .to_hex()
+        .to_string()
 }
 
 /// Records cancellation as well as completion, including an outer service timeout.

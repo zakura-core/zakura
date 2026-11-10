@@ -451,6 +451,36 @@ fn explicit_zakura_bootstrap_peers_override_network_defaults() {
     );
 }
 
+/// A bootstrap identity may list up to one discovery record's worth of
+/// distinct addresses, so its maintained dial always fits the dial reserve.
+#[test]
+fn bootstrap_identities_list_at_most_one_records_addresses() {
+    let _init_guard = zakura_test::init();
+
+    const NODE: &str = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
+    let config = |addr_count: u16, stack: &str| {
+        let peers = (0..addr_count)
+            .map(|port| format!("'{NODE}@127.0.0.1:{}'", 8233 + port))
+            // A repeated address counts once.
+            .chain([format!("'{NODE}@127.0.0.1:8233'")])
+            .collect::<Vec<_>>()
+            .join(", ");
+        toml::from_str::<Config>(&format!(
+            "network = 'Testnet'\np2p_stack = '{stack}'\n[zakura]\nbootstrap_peers = [{peers}]"
+        ))
+    };
+    let at_cap =
+        u16::try_from(crate::zakura::MAX_DIRECT_ADDRS_PER_RECORD).expect("the record cap is 8");
+
+    config(at_cap, "zakura").expect("a full record's worth of addresses loads");
+    let error = config(at_cap + 1, "zakura")
+        .expect_err("one address past a record can't fit the dial reserve")
+        .to_string();
+    assert!(error.contains("zakura.bootstrap_peers"), "{error}");
+    // Legacy-only nodes never dial bootstrap identities over v2.
+    config(at_cap + 1, "legacy").expect("legacy-only nodes ignore v2 bootstrap peers");
+}
+
 #[test]
 fn zakura_warns_on_loopback_listener_with_public_bootstrap_peers() {
     let _init_guard = zakura_test::init();

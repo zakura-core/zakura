@@ -456,6 +456,35 @@ impl ZakuraConfig {
         })
     }
 
+    /// Refuses a bootstrap identity listed with more distinct addresses than
+    /// one discovery record carries ([`discovery::MAX_DIRECT_ADDRS_PER_RECORD`]).
+    ///
+    /// A maintained dial claims a transport slot for each address at once, and
+    /// the dial reserve holds one record's worth (see
+    /// [`ZakuraLocalLimits::quic_bind_config`]), so a longer list could never
+    /// start while inbound peers and discovery fill the rest of the table.
+    /// Entries that don't parse are left to the dialer, which skips them.
+    pub fn validate_bootstrap_peers(&self) -> Result<(), String> {
+        let mut addrs_by_node = HashMap::<NodeId, HashSet<SocketAddr>>::new();
+        for node_addr in self
+            .bootstrap_peers
+            .iter()
+            .filter_map(|entry| discovery::parse_bootstrap_peer(entry).ok())
+        {
+            let addrs = addrs_by_node.entry(node_addr.id).or_default();
+            addrs.extend(node_addr.direct);
+            if addrs.len() > discovery::MAX_DIRECT_ADDRS_PER_RECORD {
+                return Err(format!(
+                    "zakura.bootstrap_peers lists more than {} addresses for node {}; \
+                     a discovery record holds at most that many",
+                    discovery::MAX_DIRECT_ADDRS_PER_RECORD,
+                    node_addr.id,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Return the effective per-IP admission cap, preserving a non-zero limit.
     pub fn max_connections_per_ip(&self) -> usize {
         if self.max_connections_per_ip == 0 {

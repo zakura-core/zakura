@@ -108,7 +108,10 @@ use super::{
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
     ends::{EndEvidence, EndFact, EnvironmentAction},
     fault::{CooldownEvidence, CooldownFact},
-    fork_choice::{ForkChoice, ForkChoiceEvidence},
+    fork_choice::{
+        settled::{ForkFixture, Outside},
+        ForkChoice, ForkChoiceEvidence,
+    },
     outstanding::{HeldHeaders, Outstanding, OutstandingEvidence},
     pair::{PairError, Pairer},
     policy::LinkEffect,
@@ -457,10 +460,14 @@ impl TapState {
             .unwrap_or_else(PoisonError::into_inner)
             .as_mut()
         {
-            Some(selection) => selection.drain(step).unwrap_or_else(|error| {
-                broken.get_or_insert(error);
-                selection.take_breaks()
-            }),
+            Some(selection) => {
+                let breaks = selection.drain(step).unwrap_or_else(|error| {
+                    broken.get_or_insert(error);
+                    selection.take_breaks()
+                });
+                selection.settle(step, self.outside());
+                breaks
+            }
             None => Vec::new(),
         };
         for detail in selected {
@@ -554,6 +561,32 @@ impl TapState {
         self.port
             .upgrade()
             .map_or(0, |port| port.engine().snapshot().header_generation.get())
+    }
+
+    /// What a settled point reads outside the reactor now: whether the
+    /// node's port has an operation pending or a reply held, whether the
+    /// harness closed or relinked a link, virtual time, and the scenario
+    /// clock.
+    fn outside(&self) -> Outside {
+        let port_busy = self
+            .port
+            .upgrade()
+            .is_some_and(|port| !port.pending().is_empty() || !port.committed().is_empty());
+        let environment_acted = self.ends.facts().iter().any(|(_, fact)| {
+            matches!(
+                fact,
+                EndFact::Environment {
+                    action: EnvironmentAction::Close | EnvironmentAction::Relink,
+                    ..
+                }
+            )
+        });
+        Outside {
+            port_busy,
+            environment_acted,
+            now: zakura_scheduler::hooks::now().unwrap_or_default(),
+            clock: zakura_rt::time::utc_now().into(),
+        }
     }
 
     /// The node's engine now, or `None` once its port is gone.
@@ -876,6 +909,18 @@ impl TapState {
                 .as_mut()
             {
                 authority.observe(&event, on_reactor, stale_handler);
+            }
+            if let Some(selection) = state
+                .fork_choice
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                selection.observe(
+                    &event,
+                    on_reactor,
+                    zakura_scheduler::hooks::now().unwrap_or_default(),
+                );
             }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();
@@ -1481,7 +1526,8 @@ impl ReactorTap {
     /// `branches`, as [`super::fork_choice`] describes, keeping when the
     /// check applied in `evidence`. It first judges the engine as it is
     /// now, before the reactor starts, with the headers it holds admitted
-    /// at `preloaded_at`, the clock they were committed at. Call it before
+    /// at `preloaded_at`, the clock they were committed at. In the fork
+    /// fixture, `fork`, it judges settled convergence too. Call it before
     /// the run starts. A harness that calls it must hand the tap the node's
     /// storage facts and engine runs.
     pub fn watch_fork_choice(
@@ -1490,6 +1536,7 @@ impl ReactorTap {
         fixture: HeaderFixture,
         branches: impl IntoIterator<Item = u8>,
         preloaded_at: chrono::DateTime<chrono::Utc>,
+        fork: Option<ForkFixture>,
     ) {
         let port = self
             .state
@@ -1497,7 +1544,7 @@ impl ReactorTap {
             .upgrade()
             .expect("the tap's port outlives its harness's setup");
         let engine = port.engine();
-        let check = ForkChoice::new(
+        let mut check = ForkChoice::new(
             evidence,
             fixture,
             branches,
@@ -1505,6 +1552,9 @@ impl ReactorTap {
             &engine.snapshot(),
             preloaded_at,
         );
+        if let Some(fork) = &fork {
+            check.settle_in(fork);
+        }
         *self
             .state
             .fork_choice

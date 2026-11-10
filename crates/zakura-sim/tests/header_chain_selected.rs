@@ -22,7 +22,7 @@ use zakura_sim::{
             policy::{OpKind, Select, Trigger},
             Base, Chain, ControlAction, ControlStep, Fork, Policy, Reset,
         },
-        header_sync::{Dialer, MirrorSpec, Storage, StorageScenario, Weights},
+        header_sync::{self, Dialer, MirrorSpec, Storage, StorageScenario, Weights},
         run_prepared, Subsystem,
     },
     observe::{StorageFact, StorageRequest, StorageResult},
@@ -275,12 +275,15 @@ fn first_executed_apply_target(report: &RunReport) -> Option<String> {
 }
 
 /// What a run of a witness left: its report, every tip the node's engine
-/// selected after a step, in order, and whether its engine held each
-/// mirror's tip at the end.
+/// selected after a step, in order, whether its engine held each mirror's
+/// tip at the end, and the settled points the property judged: steps after
+/// which no task could run and whose drain found every other settled-point
+/// condition.
 struct Ran {
     report: RunReport,
     selected: Vec<block::Hash>,
     holds_every_mirror_tip: bool,
+    settled_points: u64,
 }
 
 /// Runs `scenario` under `input`, which must end without a violation or
@@ -288,12 +291,23 @@ struct Ran {
 fn run(scenario: &StorageScenario, input: PlanInput) -> Ran {
     let ports = Storage::prepare(scenario);
     let port = ports.node.clone();
+    let evidence = ports.fork_choice.clone();
     let selected = RefCell::new(Vec::<block::Hash>::new());
-    let mut watch = after_step(|_| {
+    let settled_points = std::cell::Cell::new(0);
+    let mut watch = after_step(|cx| {
         let tip = port.engine().snapshot().frontiers.header_best.hash;
         let mut seen = selected.borrow_mut();
         if seen.last() != Some(&tip) {
             seen.push(tip);
+        }
+        let at_rest = matches!(
+            cx.status,
+            zakura_scheduler::Status::Quiescent
+                | zakura_scheduler::Status::WaitingOnTime
+                | zakura_scheduler::Status::WaitingOnExternal
+        );
+        if at_rest && evidence.settled_at(cx.step).is_some() {
+            settled_points.set(settled_points.get() + 1);
         }
         None
     });
@@ -318,6 +332,7 @@ fn run(scenario: &StorageScenario, input: PlanInput) -> Ran {
         report,
         selected: selected.into_inner(),
         holds_every_mirror_tip,
+        settled_points: settled_points.get(),
     }
 }
 
@@ -441,6 +456,35 @@ fn each_witness_offers_the_choice_it_names() {
         );
     }
     assert_eq!(orders.len(), 2, "both arrival orders ran");
+}
+
+/// The fork-fixture witnesses are declared as the fork fixture and reach
+/// settled points, where the property judges convergence and it holds. The
+/// others aren't declared, so they reach none: the reset and longer-fork
+/// witnesses preload the node or run controls, and the harness commit is a
+/// control.
+#[test]
+fn the_fork_fixture_settles_on_the_heaviest_tip() {
+    for input in inputs(8, 256) {
+        for (name, scenario) in witnesses() {
+            let declared = header_sync::fork_fixture(&scenario).is_some();
+            assert_eq!(
+                declared,
+                matches!(
+                    name,
+                    "stronger-first" | "stronger-last" | "three-forks" | "equal-work"
+                ),
+                "{name}"
+            );
+            let ran = run(&scenario, input.clone());
+            assert_eq!(
+                ran.settled_points > 0,
+                declared,
+                "{name}: {}",
+                ran.settled_points
+            );
+        }
+    }
 }
 
 /// The witnesses `cargo xtask planted` runs as typed cases, each committed

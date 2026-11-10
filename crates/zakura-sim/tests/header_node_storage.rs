@@ -1201,6 +1201,70 @@ fn prepared_target_follows_the_scenario_clock() {
     }
 }
 
+/// The fork fixture under a scenario clock three hours before genesis: two
+/// mirrors, preloaded on the host clock, offer three weight-2 headers and
+/// five unweighted ones, and the node admits every one deferred, so a
+/// correct engine stays on genesis. `header-sync/expected-chain-selected`'s
+/// selection rule holds, and its settled-convergence rule, which a header
+/// the run's clock defers would make wrong, finds no settled point.
+#[test]
+fn a_deferring_clock_keeps_the_fork_fixture_unsettled() {
+    let fixture = zakura_storage::header::fixture::HeaderFixture::regtest();
+    let genesis = u64::try_from(fixture.genesis_header().time.timestamp()).unwrap();
+    let fork = |branch, len, dialer| MirrorSpec {
+        chain: Chain {
+            main: 0,
+            fork: Some(Fork { branch, len }),
+        },
+        dialer,
+    };
+    let scenario = Probed {
+        storage: StorageScenario {
+            node: Chain::default(),
+            mirrors: vec![fork(1, 5, Dialer::Mirror), fork(2, 3, Dialer::Node)],
+            weights: zakura_sim::harness::header_sync::Weights {
+                branch_1: 0,
+                branch_2: 2,
+            },
+            policy: Policy {
+                base: Base::SuccessOnly,
+                bound_ms: Some(10),
+                holds: Vec::new(),
+                reply_holds: Vec::new(),
+            },
+            controls: Vec::new(),
+        },
+        probe: Probe::Idle,
+        utc_origin: Some(genesis - 3 * 60 * 60),
+        budget: None,
+    };
+    assert!(zakura_sim::harness::header_sync::fork_fixture(&scenario.storage).is_some());
+    for input in inputs(4, 256) {
+        let ready = Probing::prepare(&scenario);
+        let port = ready.ports.node.clone();
+        let evidence = ready.ports.fork_choice.clone();
+        let report =
+            run_prepared::<Probing>(&scenario, ready, input, &mut MemorySink::default(), None)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(report.end.violation, None, "{:?}", report.end);
+        assert_eq!(
+            port.engine().snapshot().frontiers.header_best,
+            fixture.anchor()
+        );
+        assert_eq!(evidence.settled_points(), 0);
+        let selected = report
+            .properties
+            .iter()
+            .find(|reported| reported.property == "header-sync/expected-chain-selected")
+            .expect("the property reports");
+        assert!(
+            matches!(selected.outcome, PropertyOutcome::Held { applicable } if applicable > 0),
+            "{:?}",
+            selected.outcome
+        );
+    }
+}
+
 /// A node preloaded with all 150 headers before the run, under a scenario
 /// clock that would defer its last 100: the preload ran on the host clock,
 /// before any run, so every header was admitted valid and the engine keeps

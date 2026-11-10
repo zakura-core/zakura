@@ -29,7 +29,7 @@ use crate::{
     },
     ObservationLog,
 };
-use zakura_scheduler::SimInstant;
+use zakura_scheduler::{SimInstant, Status as SchedulerStatus};
 
 /// The header chunk budget never holds more than its capacity, reserved
 /// and owned together.
@@ -547,7 +547,8 @@ fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
 }
 
 /// The node's engine selects a max-work eligible tip of the headers it
-/// holds, and scores it with its work above the anchor.
+/// holds, and scores it with its work above the anchor. In the fork
+/// fixture, a settled node is on the heaviest mirror chain.
 pub const EXPECTED_CHAIN_SELECTED: &str = "header-sync/expected-chain-selected";
 
 /// What the fork-choice check reads: one reactor's claim breaks and when
@@ -572,7 +573,8 @@ where
         claim: "at every engine snapshot record, the node's engine selects a max-work eligible \
                 tip of the headers it holds, by the fixture's work and the resets in force, \
                 with any max-work tip allowed on a tie, and scores it with that tip's work \
-                above the anchor",
+                above the anchor; and in the fork fixture, at every settled point, the \
+                engine is on a max-work tip over all mirrors' chains",
         kind: Kind::Safety,
         assumes: &[],
         needs: &[Source::View],
@@ -587,8 +589,13 @@ where
 /// The tap's fork-choice check
 /// ([`crate::harness::header_node::fork_choice`]) judges the engine before
 /// the run and the record each apply's, reset's and harness commit's engine
-/// run left. A break the step's drain found violates at once. It applies
-/// once a drain judged a record, until a drain found a run corrupt.
+/// run left. A break the step's drain found violates at once. In the fork
+/// fixture, a step after which no task can run, whose drain found every
+/// other settled-point condition, is a settled point, and the engine's tip
+/// there must be a heaviest mirror tip ([`settled`]). It applies once a
+/// drain judged a record, until a drain found a run corrupt.
+///
+/// [`settled`]: crate::harness::header_node::fork_choice::settled
 fn check_expected_chain_selected<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
 where
     S: HasView,
@@ -611,6 +618,23 @@ where
     // after it is judged here, so no later step counts as passed.
     if view.fork_choice().tainted_by(step) {
         return Verdict::NotApplicable;
+    }
+    // A settled point needs no task able to run after the step, which only
+    // the scheduler's status says.
+    let at_rest = matches!(
+        cx.status,
+        SchedulerStatus::Quiescent
+            | SchedulerStatus::WaitingOnTime
+            | SchedulerStatus::WaitingOnExternal
+    );
+    if let (true, Some(verdict)) = (at_rest, view.fork_choice().settled_at(step)) {
+        if let Some(detail) = verdict {
+            return cx.violated(
+                "a settled node in the fork fixture is on the heaviest mirror chain",
+                detail,
+            );
+        }
+        return Verdict::Holds;
     }
     if view.fork_choice().applicable_by(step) {
         Verdict::Holds

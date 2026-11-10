@@ -49,6 +49,9 @@
 //! its record is judged like an apply's, and the commit-contents check's
 //! taint covers it the same way.
 //!
+//! **Settled convergence.** In the fork fixture, the check also judges
+//! each settled point against the heaviest mirror chain ([`settled`]).
+//!
 //! The check applies at every judged record. A broken rule is a claim
 //! break, which the tap hands
 //! [`Claim::ExpectedChainSelected`](super::claim::Claim) at its drain. A
@@ -80,6 +83,11 @@ struct Store {
     tainted: Option<u64>,
     /// Whether a run since the last drain tainted it.
     taint_pending: bool,
+    /// The newest drain's settled point, if it found one: its step, and
+    /// the convergence break, if any.
+    settled: Option<(u64, Option<String>)>,
+    /// How many settled points the drains judged.
+    settled_points: u64,
 }
 
 /// When the fork-choice check first applied, shared by the tap and whoever
@@ -109,6 +117,25 @@ impl ForkChoiceEvidence {
     /// tainted, after which it judges nothing.
     pub fn tainted_by(&self, step: u64) -> bool {
         self.with(|store| store.tainted.is_some_and(|found| found <= step))
+    }
+
+    /// The settled point `step`'s drain found, if it found one: `Some(None)`
+    /// if convergence held there, `Some(Some(detail))` if it broke. Whether
+    /// no task can run after the step is the reader's to check.
+    pub fn settled_at(&self, step: u64) -> Option<Option<String>> {
+        self.with(|store| {
+            store
+                .settled
+                .as_ref()
+                .filter(|(found, _)| *found == step)
+                .map(|(_, verdict)| verdict.clone())
+        })
+    }
+
+    /// How many drains found every settled-point condition the tap reads,
+    /// whether or not a task could still run after their steps.
+    pub fn settled_points(&self) -> u64 {
+        self.with(|store| store.settled_points)
     }
 }
 
@@ -143,6 +170,10 @@ pub(super) struct ForkChoice {
     /// Whether the commit-contents check found a run corrupt, after which
     /// no record is judged.
     tainted: bool,
+    /// The newest record's selected tip.
+    selected: block::Hash,
+    /// The settled-convergence rule, in the fork fixture only.
+    settled: Option<settled::Settled>,
     /// The headers the judged reset runs left invalidated, as hex.
     invalidated: HashSet<String>,
     /// The drain's `Reset` facts not yet matched to their runs, oldest
@@ -176,6 +207,8 @@ impl ForkChoice {
             children: HashMap::new(),
             deferred: HashMap::new(),
             tainted: false,
+            selected: snapshot.frontiers.header_best.hash,
+            settled: None,
             invalidated: HashSet::new(),
             resets: VecDeque::new(),
             breaks: Vec::new(),
@@ -186,6 +219,43 @@ impl ForkChoice {
         // score the seed's snapshot copies from it is judged here.
         check.record("the engine before the run", seed, snapshot, clock, false);
         check
+    }
+
+    /// Judges settled convergence too, against `fork`'s mirrors.
+    pub(super) fn settle_in(&mut self, fork: &settled::ForkFixture) {
+        self.settled = Some(settled::Settled::new(&self.fixture, fork));
+    }
+
+    /// Notes `event`, which the reactor's own task reported when
+    /// `on_reactor`, at `now`, for settled points.
+    pub(super) fn observe(
+        &mut self,
+        event: &zakura_network::zakura::observe::ReactorEvent,
+        on_reactor: bool,
+        now: zakura_scheduler::SimInstant,
+    ) {
+        if let (Some(settled), true) = (self.settled.as_mut(), on_reactor) {
+            settled.observe(event, now);
+        }
+    }
+
+    /// Judges whether `step`'s drain, with `outside` as the tap reads it,
+    /// found a settled point, and keeps the verdict for the property, which
+    /// reads it only if no task can run after the step. Nothing is judged
+    /// once the check is tainted.
+    pub(super) fn settle(&mut self, step: u64, outside: settled::Outside) {
+        // No property checks step 0, the setup observation's, which may
+        // also run before the run's clock does.
+        let verdict = match (&mut self.settled, self.tainted) {
+            (Some(settled), false) if step > 0 => settled.judge(self.selected, outside),
+            _ => None,
+        };
+        self.evidence.with(|store| {
+            store.settled = verdict.map(|verdict| (step, verdict));
+            if store.settled.is_some() {
+                store.settled_points = store.settled_points.saturating_add(1);
+            }
+        });
     }
 
     /// Notes storage's `fact`: a reset's invalidation or reconsideration,
@@ -277,6 +347,7 @@ impl ForkChoice {
         clock: DateTime<Utc>,
         row_judged: bool,
     ) {
+        self.selected = snapshot.frontiers.header_best.hash;
         if self.tainted {
             return;
         }
@@ -438,5 +509,6 @@ fn deferred_at(time: DateTime<Utc>, clock: DateTime<Utc>) -> bool {
         .is_some_and(|deadline| deadline > clock)
 }
 
+pub mod settled;
 #[cfg(test)]
 mod tests;

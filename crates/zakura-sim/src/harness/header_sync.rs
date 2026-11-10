@@ -47,7 +47,7 @@ use super::{
         claim::{ClaimEvidence, SettlementEvidence},
         ends::EndEvidence,
         fault::{FaultCheck, FaultEvidence},
-        fork_choice::ForkChoiceEvidence,
+        fork_choice::{settled::ForkFixture, ForkChoiceEvidence},
         hold_wake::HoldWakeEvidence,
         outstanding::{admitted_peer_limit, OutstandingEvidence},
         policy::{self, Allow, Hold, OpKind, Select, Trigger},
@@ -536,6 +536,97 @@ impl StorageScenario {
             weights: Weights::default(),
         }
     }
+}
+
+/// The header window the reactor keeps ahead of verified bodies, restated
+/// from its `INTEGRATED_HEADER_BODY_WINDOW_V1`, which is the wire's
+/// `MAX_HS_RANGE`.
+pub const HEADER_BODY_WINDOW: u32 = 4_000;
+
+/// The reactor's refill batch, restated from its `HEADER_REFILL_BATCH_V1`:
+/// one maximum checkpoint gap plus its successor's first header. With less
+/// window left than this, it withholds a target the window doesn't reach.
+pub const HEADER_REFILL_BATCH: u32 = 401;
+
+/// The most headers the fork fixture's mirror chains hold together. The
+/// simulator never verifies a body, so the node's window stays the whole
+/// [`HEADER_BODY_WINDOW`] minus its selected height and the headers it has
+/// claimed. With every mirror chain counted, both stay at most this, so at
+/// least `HEADER_BODY_WINDOW - 2 * FORK_FIXTURE_MAX_HEADERS` is always left,
+/// more than a [`HEADER_REFILL_BATCH`]: no correct node waits on a body
+/// that never comes, which would settle it short of the heaviest tip.
+pub const FORK_FIXTURE_MAX_HEADERS: u32 = 1_000;
+
+/// `scenario`'s mirrors, if it's the fork fixture that settled convergence
+/// judges: the node at genesis, two or three mirrors whose initial chains
+/// are forks from one ancestor, none a prefix of another, holding at most
+/// [`FORK_FIXTURE_MAX_HEADERS`] headers together, storage success-only
+/// within a 10 ms bound, no holds and no controls. A mirror runs header
+/// sync too, so it may take a fork from the node later, but only one some
+/// mirror held at the start, so no mirror ever holds more work than the
+/// heaviest initial chain. See
+/// [`fork_choice::settled`](super::header_node::fork_choice::settled).
+pub fn fork_fixture(scenario: &StorageScenario) -> Option<ForkFixture> {
+    let Policy {
+        base,
+        bound_ms,
+        holds,
+        reply_holds,
+    } = &scenario.policy;
+    let declared = scenario.node == Chain::default()
+        && (2..=3).contains(&scenario.mirrors.len())
+        && *base == Base::SuccessOnly
+        && bound_ms.is_some_and(|bound| bound <= 10)
+        && holds.is_empty()
+        && reply_holds.is_empty()
+        && scenario.controls.is_empty()
+        && scenario
+            .mirrors
+            .iter()
+            .map(|mirror| {
+                mirror
+                    .chain
+                    .main
+                    .saturating_add(mirror.chain.fork.map_or(0, |fork| fork.len))
+            })
+            .fold(0u32, u32::saturating_add)
+            <= FORK_FIXTURE_MAX_HEADERS;
+    if !declared {
+        return None;
+    }
+    let fixture = scenario.weights.fixture();
+    let paths: Vec<Vec<zakura_chain::block::Hash>> = scenario
+        .mirrors
+        .iter()
+        .map(|mirror| {
+            mirror
+                .chain
+                .segments(&fixture)
+                .into_iter()
+                .flat_map(|(_, headers)| headers.into_iter().map(|header| header.hash()))
+                .collect()
+        })
+        .collect();
+    let mut shared = None;
+    for (index, left) in paths.iter().enumerate() {
+        for right in &paths[index + 1..] {
+            let common = left
+                .iter()
+                .zip(right)
+                .take_while(|(left, right)| left == right)
+                .count();
+            // A chain that's a prefix of another isn't a fork of it.
+            if common == left.len() || common == right.len() {
+                return None;
+            }
+            if *shared.get_or_insert(common) != common {
+                return None;
+            }
+        }
+    }
+    Some(ForkFixture {
+        mirrors: scenario.mirrors.iter().map(|mirror| mirror.chain).collect(),
+    })
 }
 
 /// `peer`'s control step `action`, offered once `when` holds.
@@ -1100,6 +1191,7 @@ impl Subsystem for Storage {
             ports.fixture.clone(),
             branches,
             ports.preloaded_at,
+            fork_fixture(scenario),
         );
 
         let shutdown = tap.shutdown();
@@ -2218,6 +2310,63 @@ impl OperationIds {
 mod tests {
     use super::*;
     use crate::observe::{StorageRequest, StorageResult};
+
+    /// The fork fixture's window constants restate production's, and its
+    /// header cap leaves more than a refill batch of window.
+    #[test]
+    fn the_fork_fixture_bound_restates_the_header_window() {
+        assert_eq!(HEADER_BODY_WINDOW, zakura_network::zakura::MAX_HS_RANGE);
+        let gap = zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+        assert_eq!(usize::try_from(HEADER_REFILL_BATCH).unwrap(), gap + 1);
+        const { assert!(HEADER_BODY_WINDOW - 2 * FORK_FIXTURE_MAX_HEADERS > HEADER_REFILL_BATCH) };
+    }
+
+    /// The fork fixture's mirrors on `chains`, from genesis, under the
+    /// fixture's policy.
+    fn forks(chains: Vec<Chain>) -> StorageScenario {
+        StorageScenario {
+            node: Chain::default(),
+            mirrors: chains
+                .into_iter()
+                .map(|chain| MirrorSpec {
+                    chain,
+                    dialer: Dialer::Mirror,
+                })
+                .collect(),
+            policy: Policy {
+                base: Base::SuccessOnly,
+                bound_ms: Some(10),
+                holds: Vec::new(),
+                reply_holds: Vec::new(),
+            },
+            controls: Vec::new(),
+            weights: Weights::default(),
+        }
+    }
+
+    /// Forks from one ancestor within the header cap are the fork fixture.
+    /// Past the cap, where a correct node's window could run out on bodies
+    /// the simulator never verifies, they aren't: two mirrors sharing
+    /// 4,000 main-line headers with one fork header each, for one. Nor are
+    /// chains one of which is a prefix of another, forks from two different
+    /// ancestors, one mirror, or a node off genesis.
+    #[test]
+    fn the_fork_fixture_declares_only_bounded_forks_from_one_ancestor() {
+        let fork = |main, branch, len| Chain {
+            main,
+            fork: Some(Fork { branch, len }),
+        };
+        assert!(fork_fixture(&forks(vec![fork(0, 1, 5), fork(0, 2, 3)])).is_some());
+        assert!(fork_fixture(&forks(vec![fork(10, 1, 490), fork(10, 2, 490)])).is_some());
+        assert!(fork_fixture(&forks(vec![fork(10, 1, 491), fork(10, 2, 490)])).is_none());
+        assert!(fork_fixture(&forks(vec![fork(4_000, 1, 1), fork(4_000, 2, 1)])).is_none());
+        assert!(fork_fixture(&forks(vec![Chain::main(5), Chain::main(3)])).is_none());
+        assert!(fork_fixture(&forks(vec![fork(2, 1, 2), fork(2, 2, 2), fork(0, 1, 2)])).is_none());
+        assert!(fork_fixture(&forks(vec![fork(0, 1, 5)])).is_none());
+        let mut off_genesis = forks(vec![fork(2, 1, 5), fork(2, 2, 3)]);
+        off_genesis.node = Chain::main(1);
+        assert!(fork_fixture(&off_genesis).is_none());
+    }
 
     /// A submission of operation `id`.
     fn submitted(id: u64) -> StorageFact {

@@ -19,6 +19,10 @@ use zakura_sim::{
         TEARDOWN_RETURNS_BASELINE,
     },
     harness::{
+        block_node::{
+            policy::{BlockAllow, BlockKind, Hold, Select, Trigger},
+            PROBE,
+        },
         block_sync::{BlockScenario, HandoffPause, MirrorSpec, Ports, Storage},
         header_sync::Dialer,
         run_prepared, Subsystem,
@@ -407,6 +411,62 @@ fn teardown_returns_session_slots() {
         assert_eq!(owners.session_slots(), 0);
     }
     check_witness(witness, TEARDOWN_RETURNS_BASELINE, Expect::Holds);
+}
+
+/// The served run with the node's first serving read, for height 1, held
+/// until the probe's link has closed and 60 s have passed since the read's
+/// submission. The read holds its serving lease and a clone of the probe
+/// session's sender, so the probe's session slot stays held after every
+/// link closes. Teardown waits for the lease, so it doesn't judge the slot
+/// while the read is in flight, and holds once the read returns it. Before
+/// settlement waited for serving leases, this run violated the property at
+/// step 10,012 with one session slot held.
+#[test]
+fn teardown_waits_for_a_serving_read_held_across_a_close() {
+    let mut scenario = BlockScenario::peers_leave_served();
+    scenario.policy.holds.push(Hold {
+        select: Select::nth(BlockKind::Read, 1),
+        until: Trigger::All(vec![
+            Trigger::Closed(PROBE.to_owned()),
+            Trigger::VirtualTime(60_000),
+        ]),
+        then: vec![BlockAllow::Serve],
+        deadline_ms: None,
+    });
+    let (report, ports) = node_run_with_ports(&scenario, Plan::from_fuzz(&[]));
+    let outcome = outcome(&report, TEARDOWN_RETURNS_BASELINE);
+    assert!(
+        matches!(outcome, PropertyOutcome::Held { applicable } if *applicable > 0),
+        "{outcome:?}"
+    );
+    let last_close = report
+        .log
+        .entries()
+        .iter()
+        .filter(|entry| matches!(entry.obs, Observation::ConnectionClosed { .. }))
+        .map(|entry| entry.step)
+        .max()
+        .expect("every link closes");
+    let released = report
+        .log
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.obs {
+            Observation::BlockSync {
+                event: BlockSyncFact::ServingLease { start: 1, step, .. },
+                ..
+            } if step == "released" => Some(entry.step),
+            _ => None,
+        })
+        .expect("the held read returns its lease");
+    assert!(
+        released > last_close,
+        "the read for height 1 returned its lease at step {released}, before the last \
+         close at step {last_close}"
+    );
+    let view = ports.view.borrow();
+    assert_eq!(view.owners.serving_leases(), 0);
+    assert_eq!(view.owners.session_slots(), 0);
 }
 
 /// P5.2: the short budget on 1, 2 and 4 workers, each with 2 and 4

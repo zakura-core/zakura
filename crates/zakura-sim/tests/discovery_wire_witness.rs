@@ -494,10 +494,9 @@ fn conformant_controls_hold_conformant_never_closes() {
 }
 
 /// The scripted history that violates `id` on connection 1, one batch per
-/// step: a fault the node never punishes, or the punishment of a peer whose
-/// row's bucket it emptied.
+/// step: a fault the node never punishes.
 fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
-    let peer = |label: Label, exhausted: bool| Observation::PeerFrame {
+    let peer = |label: Label| Observation::PeerFrame {
         connection: 1,
         stream: STREAM,
         quic_stream: Some(4),
@@ -505,7 +504,7 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         row: id.row.map(str::to_owned),
         rule_stream: STREAM,
         label,
-        exhausted,
+        exhausted: false,
         exchange: None,
         payload: 9,
     };
@@ -515,16 +514,8 @@ fn bypass(id: &GeneratedId<'_>) -> Vec<Vec<Observation>> {
         quic_stream: Some(4),
         seq: 0,
     };
-    let fault_close = Observation::ConnectionClosed {
-        connection: 1,
-        cause: "service_protocol_reject".to_owned(),
-    };
     match id.template {
-        Template::Closes(label) => vec![vec![peer(label, false)], vec![judged]],
-        Template::CadenceNeverCloses => vec![
-            vec![peer(Label::Conformant, true)],
-            vec![judged, fault_close],
-        ],
+        Template::Closes(label) => vec![vec![peer(label)], vec![judged]],
         template => panic!("no scripted bypass covers {template:?}"),
     }
 }

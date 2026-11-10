@@ -34,10 +34,10 @@ fn the_registered_stream_is_the_services() {
 
 /// The harness registers discovery's 31 generated receiver IDs, then its
 /// 7 sender IDs, then `discovery/late-response-admitted`, and no other
-/// property. The 16 stateless `<label>-closes` IDs and the 18 IDs whose
-/// guard is discovery's own and that a planted case violates alone have
-/// planted cases, are `Active` and check their cases' trigger histories.
-/// The 4 [`SCRIPTED`] IDs are `Active` with a scripted bypass, and the rest
+/// property. The 16 stateless `<label>-closes` IDs and the 21 IDs whose
+/// guard is discovery's own have planted cases, are `Active` and check
+/// their cases' trigger histories. The [`SCRIPTED`] ID no scenario reaches
+/// is `Active` with a scripted bypass, and the rest
 /// of the generated IDs are `Draft`s. The late-response ID is hand-written,
 /// not generated, so [`has_planted_case`] doesn't cover it: it is `Active`
 /// with its own planted case and trigger history. A receiver ID reads only
@@ -77,8 +77,9 @@ fn the_harness_registers_the_generated_discovery_ids() {
     // The stateless reader IDs: one per stream, `undeclared-type-closes`,
     // then three per row. Discovery's own guards: over-margin on 2 request
     // rows, unsolicited on 2 response rows, over-owed on peers, bad content
-    // on 5 rows, conformant-never-closes, and the 7 sender IDs.
-    assert_eq!(planted, 16 + 18, "{ids:?}");
+    // on 5 rows, cadence on 3 rows, conformant-never-closes, and the 7
+    // sender IDs.
+    assert_eq!(planted, 16 + 21, "{ids:?}");
     // Another family's ID with the same template and row has no case here.
     assert!(!has_planted_case("header-sync/s5v9/undeclared-type-closes"));
     assert!(!has_planted_case("discovery/s5v9/undeclared-type-closes"));

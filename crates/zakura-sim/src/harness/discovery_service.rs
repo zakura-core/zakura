@@ -554,16 +554,11 @@ pub fn wire_properties<S: HasView>() -> Vec<Property<S>> {
         .collect()
 }
 
-/// The generated IDs no planted case can violate alone, which a scripted
-/// bypass violates instead (disc-3.2). A bypass of a row's cadence punishes
-/// a conformant peer, so it violates `conformant-never-closes` too, and no
-/// scenario reaches `services/over-owed-closes`.
-pub const SCRIPTED: [&str; 4] = [
-    "discovery/s4v2/hello/cadence-never-closes",
-    "discovery/s4v2/get-peers/cadence-never-closes",
-    "discovery/s4v2/get-services/cadence-never-closes",
-    "discovery/s4v2/services/over-owed-closes",
-];
+/// The generated IDs no scenario reaches, which a scripted bypass violates
+/// instead of a planted case (disc-3.2). The node asks for every service,
+/// so its `GetServices` owes the row's largest `Services`, and a larger one
+/// is `long-payload`.
+pub const SCRIPTED: [&str; 1] = ["discovery/s4v2/services/over-owed-closes"];
 
 /// True if the generated ID `id` has a planted case under `qa/planted/`,
 /// so it isn't a `Draft`.
@@ -585,8 +580,10 @@ type Trigger = fn(&ObservationLog) -> bool;
 ///
 /// A `<label>-closes` ID's trigger is the node judging a frame with the ID's
 /// label on its row, and `conformant-never-closes`'s is the node judging a
-/// conformant frame on any row ([`judged_label`]). A sender ID's trigger is
-/// the node sending a frame of its row ([`sent_row`]).
+/// conformant frame on any row ([`judged_label`]). A `cadence-never-closes`
+/// ID's is the node judging a frame on its row that found the row's
+/// cadence bucket empty ([`judged_exhausted`]). A sender ID's trigger is the
+/// node sending a frame of its row ([`sent_row`]).
 fn planted_trigger(id: &str) -> Option<Trigger> {
     let id = GeneratedId::parse(id)?;
     if id.family != FAMILY || id.stream != stream_id() {
@@ -612,6 +609,7 @@ fn planted_trigger(id: &str) -> Option<Trigger> {
                 _ => None,
             }
         }
+        Template::CadenceNeverCloses => CADENCE_TRIGGERS.get(row()?).copied(),
         Template::SenderWithinLimit | Template::SenderEndsOnce | Template::SenderCadence => {
             SENT_TRIGGERS.get(row()?).copied()
         }
@@ -685,6 +683,15 @@ const BAD_CONTENT_TRIGGERS: [Trigger; 5] = [
     judged_label::<8, 4>,
 ];
 
+/// [`judged_exhausted`] by row in table order.
+const CADENCE_TRIGGERS: [Trigger; 5] = [
+    judged_exhausted::<0>,
+    judged_exhausted::<1>,
+    judged_exhausted::<2>,
+    judged_exhausted::<3>,
+    judged_exhausted::<4>,
+];
+
 /// [`sent_row`] by row in table order.
 const SENT_TRIGGERS: [Trigger; 5] = [
     sent_row::<0>,
@@ -728,6 +735,38 @@ fn judged_label<const LABEL: usize, const ROW: usize>(log: &ObservationLog) -> b
                 } if (*c, *s, *q, *n) == (connection, judged, quic_stream, seq)
                     && *l == label
                     && (row.is_none() || r.as_deref() == row))
+            })
+    })
+}
+
+/// True if `log` holds a frame the node judged on discovery's stream, on
+/// the row at `ROW` in discovery's table, that the peer sent into an empty
+/// cadence bucket.
+fn judged_exhausted<const ROW: usize>(log: &ObservationLog) -> bool {
+    let row = <DiscoveryMessage as WireMessage>::RULES[ROW].name;
+    let stream = stream_id();
+    let entries = log.entries();
+    entries.iter().enumerate().any(|(at, entry)| {
+        let Observation::FrameJudged {
+            connection,
+            stream: judged,
+            quic_stream,
+            seq,
+        } = entry.obs
+        else {
+            return false;
+        };
+        judged == stream
+            && entries[..at].iter().any(|sent| {
+                matches!(&sent.obs, Observation::PeerFrame {
+                    connection: c,
+                    stream: s,
+                    quic_stream: q,
+                    seq: n,
+                    row: Some(r),
+                    exhausted: true,
+                    ..
+                } if (*c, *s, *q, *n) == (connection, judged, quic_stream, seq) && r == row)
             })
     })
 }

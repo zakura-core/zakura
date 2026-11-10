@@ -1,7 +1,9 @@
 //! disc-3.2: the planted cases of the discovery IDs whose guard is
 //! discovery's own. Each case is a typed case under `qa/planted/<id>/`: a
-//! patch that bypasses one of discovery's guards for one row, and the
-//! scenario that reaches that guard, under the default Plan. A receiver ID's
+//! patch that bypasses one of discovery's guards for one row, or for a
+//! `cadence-never-closes` ID closes a peer that empties the row's cadence
+//! bucket, and the scenario that reaches that code, under the default Plan.
+//! A receiver ID's
 //! scenario is its act's witness ([`act_scenario`]). A sender ID's scenario
 //! is the honest exchange, with the peer asking once for an answer the node
 //! writes, or holding the answer to a request the node repeats past the
@@ -91,6 +93,11 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             bad(DiscoveryRule::HelloSignature),
         ),
         (
+            "hello/cadence-never-closes",
+            "close-on-empty-hello-bucket",
+            act(DiscoveryAct::HelloBurst),
+        ),
+        (
             "get-peers/over-margin-closes",
             "admit-past-margin",
             act(DiscoveryAct::OverMargin { row: GetPeers }),
@@ -99,6 +106,11 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             "get-peers/bad-content-closes",
             "drop-refused-get-peers",
             bad(DiscoveryRule::GetPeersLimit),
+        ),
+        (
+            "get-peers/cadence-never-closes",
+            "close-on-empty-get-peers-bucket",
+            act(DiscoveryAct::RequestRun { row: GetPeers }),
         ),
         (
             "peers/unsolicited-closes",
@@ -124,6 +136,11 @@ fn cases() -> Vec<(&'static str, &'static str, Scenario)> {
             "get-services/bad-content-closes",
             "drop-refused-get-services",
             bad(DiscoveryRule::GetServicesWanted),
+        ),
+        (
+            "get-services/cadence-never-closes",
+            "close-on-empty-get-services-bucket",
+            act(DiscoveryAct::RequestRun { row: GetServices }),
         ),
         (
             "services/unsolicited-closes",

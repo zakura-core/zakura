@@ -211,8 +211,8 @@ const NOT_OWED: &str = "header sync's responses answer a subscription, whose pag
 /// The file of `discovery/wire`'s witness tests (disc-3.1).
 const DISCOVERY_WITNESSES: &str = "tests/discovery_wire_witness.rs";
 
-/// The scripted bypass that violates each discovery ID no planted case can
-/// violate alone, `discovery_service::SCRIPTED`.
+/// The scripted bypass that violates each discovery ID no scenario reaches,
+/// `discovery_service::SCRIPTED`.
 const DISCOVERY_BYPASS: Bypass = Bypass::Test(sim_test(
     DISCOVERY_WITNESSES,
     "scripted_bypasses_violate_the_unplanted_discovery_ids",
@@ -700,7 +700,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/hello/cadence-never-closes",
         HELLO_ACTS,
-        DISCOVERY_BYPASS,
+        Bypass::Planted("close-on-empty-hello-bucket"),
     ),
     discovery(
         "discovery/s4v2/get-peers/reserved-flags-closes",
@@ -730,7 +730,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-peers/cadence-never-closes",
         GET_PEERS_ACTS,
-        DISCOVERY_BYPASS,
+        Bypass::Planted("close-on-empty-get-peers-bucket"),
     ),
     discovery(
         "discovery/s4v2/peers/reserved-flags-closes",
@@ -790,7 +790,7 @@ pub static COVERAGE: &[Coverage] = &[
     discovery(
         "discovery/s4v2/get-services/cadence-never-closes",
         GET_SERVICES_ACTS,
-        DISCOVERY_BYPASS,
+        Bypass::Planted("close-on-empty-get-services-bucket"),
     ),
     discovery(
         "discovery/s4v2/services/reserved-flags-closes",

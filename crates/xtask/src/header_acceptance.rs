@@ -1710,7 +1710,7 @@ fn run_tasks(
                 continue;
             }
             let ran = match (task.get("case"), task.get("integrity")) {
-                (Some(case), _) => rebuild_case(options, subject, case, &dir, worktree),
+                (Some(case), _) => case_task(options, subject, case, &dir, worktree)?,
                 (_, Some(integrity)) => run_integrity(options, subject, integrity, &dir, worktree),
                 _ => unreachable!("the task is a case or an integrity mutation"),
             };
@@ -2300,28 +2300,58 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Rebuilds case `case`'s patch in its own target directory, for its
-/// `Draft` run, and checks the binary embeds the patched checkout's source
-/// digest (C5). The `Draft` recording itself needs C9's override in
-/// `record`, so it waits for hdr-14.7b.
+/// Runs planted case `case`'s rebuild ([`rebuild_case`]) in a target
+/// directory of its own, `cases/<task index>` under the run directory, then
+/// removes that directory whatever the rebuild did, a missing one counting
+/// as removed. Nothing reads the binary after its provenance check, so each
+/// case's build (gigabytes) lasts only through it. hdr-14.7b, which records
+/// the `Draft` run from that binary, moves the removal after the recording.
+/// The outer error is the run's, a target it couldn't remove. The inner
+/// result is the rebuild's, a setup failure of this task.
+fn case_task(
+    options: &Options,
+    subject: &Subject,
+    case: &Value,
+    dir: &Path,
+    worktree: &Path,
+) -> Result<Result<(), BoxError>, BoxError> {
+    let target = options
+        .out
+        .join("cases")
+        .join(dir.file_name().unwrap_or_default());
+    let rebuilt = rebuild_case(options, subject, case, dir, worktree, &target);
+    match fs::remove_dir_all(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(
+                format!("case target {} can't be removed: {error}", target.display()).into(),
+            )
+        }
+    }
+    Ok(rebuilt)
+}
+
+/// Rebuilds case `case`'s patch in `target`, for its `Draft` run, and
+/// checks the binary embeds the patched checkout's source digest (C5),
+/// writing the check to `dir`'s `provenance.json`. A patch that doesn't
+/// apply or build is a refused check, not an error. The `Draft` recording
+/// itself needs C9's override in `record`, so it waits for hdr-14.7b.
 fn rebuild_case(
     options: &Options,
     subject: &Subject,
     case: &Value,
     dir: &Path,
     worktree: &Path,
+    target: &Path,
 ) -> Result<(), BoxError> {
     reset(options, worktree, &subject.commit)?;
     let patch = worktree.join(text(case, "patch")?);
     let applied = git(options, worktree, &["apply".as_ref(), patch.as_os_str()]);
-    let target = options
-        .out
-        .join("cases")
-        .join(dir.file_name().unwrap_or_default());
     let refused = match applied {
         Err(why) => Some(format!("the patch doesn't apply: {why}")),
         Ok(()) => {
-            let mut build = planted::cargo_sim(worktree, &target);
+            let mut build = planted::cargo_sim(worktree, target);
             let ended = child(&mut build, &dir.join("build.log"), options.deadline);
             match ended.exited_ok() {
                 Err(why) => Some(format!("the patched build {why}")),
@@ -3118,6 +3148,63 @@ mod tests {
                 .success());
         }
         repo
+    }
+
+    /// A case task removes its target directory whatever its rebuild did:
+    /// after a refused patch, with or without a target built, and after a
+    /// setup failure. A target it can't remove fails the run, not the task.
+    #[test]
+    fn a_case_task_drops_its_target_whatever_it_did() {
+        let repo = scratch_repo();
+        let head = planted::git(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let commit = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+        let out = tempfile::tempdir().unwrap();
+        let options = Options {
+            out: out.path().to_owned(),
+            deadline: Duration::from_secs(60),
+        };
+        let at = |commit: &str| Subject {
+            commit: commit.to_owned(),
+            source: "source".to_owned(),
+        };
+        let case = json!({ "patch": "missing.patch" });
+        let dir = out.path().join("artifacts/0");
+        let target = out.path().join("cases/0");
+        let task = |subject: &Subject| {
+            fs::create_dir_all(&dir).unwrap();
+            case_task(&options, subject, &case, &dir, repo.path())
+        };
+        let refused = || {
+            let check: Value =
+                serde_json::from_str(&fs::read_to_string(dir.join("provenance.json")).unwrap())
+                    .unwrap();
+            check["refused"].as_str().unwrap_or_default().to_owned()
+        };
+        // No target was ever built: the patch doesn't apply.
+        assert!(matches!(task(&at(&commit)), Ok(Ok(()))));
+        assert!(refused().contains("doesn't apply"), "{}", refused());
+        assert!(!target.exists());
+        // A target left from building is removed too.
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("marker"), "built").unwrap();
+        fs::remove_file(dir.join("provenance.json")).unwrap();
+        assert!(matches!(task(&at(&commit)), Ok(Ok(()))));
+        assert!(refused().contains("doesn't apply"));
+        assert!(!target.exists());
+        // A setup failure: the subject's commit doesn't exist.
+        fs::create_dir_all(&target).unwrap();
+        assert!(matches!(
+            task(&at("0000000000000000000000000000000000000000")),
+            Ok(Err(_))
+        ));
+        assert!(!target.exists());
+        // A target that can't be removed, even as root: a file, not a
+        // directory.
+        fs::write(&target, "not a directory").unwrap();
+        assert!(task(&at(&commit)).is_err());
     }
 
     /// The experiments run only as the xtask built in the runner's own

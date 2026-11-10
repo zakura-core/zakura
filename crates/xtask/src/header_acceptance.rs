@@ -3252,18 +3252,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runner = dir.path().join("runner");
         fs::copy(env::current_exe().unwrap(), &runner).unwrap();
-        let status = Command::new(&runner)
-            .args([
-                "--exact",
-                "header_acceptance::tests::exe_runner_helper",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(EXE_RUNNER, dir.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
+        // Another test's fork can briefly hold the copy's write descriptor
+        // open, and exec refuses a file open for writing (`ETXTBSY`) until
+        // that child execs, so the spawn is retried while it's busy.
+        let started = Instant::now();
+        let status = loop {
+            match Command::new(&runner)
+                .args([
+                    "--exact",
+                    "header_acceptance::tests::exe_runner_helper",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(EXE_RUNNER, dir.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && started.elapsed() < Duration::from_secs(10) =>
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                spawned => break spawned.unwrap(),
+            }
+        };
         assert!(status.success());
         assert!(!runner.exists(), "the runner's file was removed");
         assert_eq!(

@@ -36,11 +36,8 @@ fn peer_cache_ranks_by_rtt_with_stable_ties() {
         (5, None),
     ] {
         let addr = std::net::SocketAddr::from(([127, 0, 0, ip], 8233)).into();
-        book.update(MetaAddr::new_connected(
-            addr,
-            &PeerServices::NODE_NETWORK,
-            false,
-        ));
+        // Start with the measured response: adjacent same-state updates are ignored
+        // by the address book's concurrent-update guard.
         book.update(MetaAddr::new_responded(
             addr,
             millis.map(std::time::Duration::from_millis),

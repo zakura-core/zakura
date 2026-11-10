@@ -39,6 +39,9 @@ exclude = [
 [features]
 default = []
 
+# Accept a post-quantum activation height in a Regtest chain's configuration.
+pq = []
+
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin"]
 howudoin = []

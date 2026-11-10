@@ -277,6 +277,12 @@ pub enum TransactionError {
     #[error("mempool transaction has non-standard transparent inputs")]
     NonStandardInputs,
 
+    #[error(
+        "transparent output {output_index} is in the post-quantum namespace, and nothing \
+         defines how to spend it: {reason}"
+    )]
+    RestrictedPqOutput { output_index: usize, reason: String },
+
     #[error("transaction uses an incorrect consensus branch id")]
     WrongConsensusBranchId,
 
@@ -519,6 +525,7 @@ impl TransactionError {
             | Self::WrongConsensusBranchIdNu6_3GracePeriod => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
+            Self::RestrictedPqOutput { .. } => consensus("transaction.restricted_pq_output"),
             Self::WrongConsensusBranchId => consensus("transaction.wrong_consensus_branch_id"),
             Self::MissingConsensusBranchId => consensus("transaction.missing_consensus_branch_id"),
             Self::OrchardActionsExceedBlockLimit { .. } => {
@@ -608,7 +615,10 @@ impl TransactionError {
             | SproutJoinSplitsExceedBlockLimit { .. }
             | ShieldedCostExceedsBlockBudget { .. }
             | LockedUntilAfterBlockHeight(_)
-            | LockedUntilAfterBlockTime(_) => 100,
+            | LockedUntilAfterBlockTime(_)
+            // No honest wallet pays to an output nothing can spend, and a node
+            // applying these rules will not relay or mine one.
+            | RestrictedPqOutput { .. } => 100,
 
             // NU6.2 mempool transactions are invalid under NU6.3 rules, but
             // honest peers can relay them briefly while their chain tips converge.

@@ -1241,6 +1241,7 @@ impl ParametersBuilder {
         } = self;
         let mut parameters = Parameters {
             network_name,
+            pq_activation_height: None,
             network_magic,
             genesis_hash,
             activation_heights,
@@ -1380,6 +1381,13 @@ fn check_checkpoint_coverage(network: &Network) -> Result<(), ParametersBuilderE
 /// A struct of parameters for configuring Regtest in Zebra.
 #[derive(Debug, Default, Clone)]
 pub struct RegtestParameters {
+    /// Height at which this chain starts applying the post-quantum transparent output
+    /// rules. Off by default, and only a Regtest chain can set it: the format is not
+    /// deployed on any public network, so a height here is a local test decision rather
+    /// than a network upgrade. The node reads it from
+    /// `network.params.pq_activation_height` in its configuration file, and refuses it
+    /// unless the binary was built with the `pq` feature.
+    pub pq_activation_height: Option<Height>,
     /// The configured network upgrade activation heights to use on Regtest
     pub activation_heights: ConfiguredActivationHeights,
     /// Configured funding streams
@@ -1414,6 +1422,9 @@ impl From<ConfiguredActivationHeights> for RegtestParameters {
 /// Network consensus parameters for test networks such as Regtest and the default Testnet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Parameters {
+    /// Height at which the post-quantum transparent output rules start applying, set only
+    /// through the Regtest constructor. See [`RegtestParameters::pq_activation_height`].
+    pq_activation_height: Option<Height>,
     /// The name of this network to be used by the `Display` trait impl.
     network_name: String,
     /// The network magic, acts as an identifier for the network.
@@ -1515,6 +1526,7 @@ impl Parameters {
     /// checkpoint before Canopy activation, or if another parameter is invalid.
     pub fn new_regtest(
         RegtestParameters {
+            pq_activation_height,
             activation_heights,
             funding_streams,
             lockbox_disbursements,
@@ -1572,6 +1584,7 @@ impl Parameters {
         let parameters = Self {
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
+            pq_activation_height,
             ..parameters.finish()
         };
         check_derived_nsm_seed_schedule(&Network::new_configured_testnet(parameters.clone()))?;
@@ -1594,6 +1607,8 @@ impl Parameters {
             network_name,
             // Already checked network magic above
             network_magic: _,
+            // A local activation height is a validation rule, not part of Regtest's identity.
+            pq_activation_height: _,
             genesis_hash,
             // Activation heights are configurable on Regtest
             activation_heights: _,
@@ -1758,6 +1773,31 @@ impl Parameters {
 }
 
 impl Network {
+    /// The height at which this chain starts applying the post-quantum transparent output
+    /// rules, if it ever does.
+    ///
+    /// Only a Regtest chain can answer with a height: the public networks and ordinary
+    /// configured Testnets return `None`, because the format is not deployed on any of
+    /// them. Activating it on a public network will be a network upgrade with its own
+    /// height, not this setting.
+    pub fn pq_activation_height(&self) -> Option<Height> {
+        match self {
+            Self::Testnet(parameters) if parameters.is_regtest() => parameters.pq_activation_height,
+            _ => None,
+        }
+    }
+
+    /// Returns whether `height` is the first height at which the post-quantum transparent
+    /// output rules apply.
+    ///
+    /// This is a boundary at which the mempool must revalidate what it holds. A script in the
+    /// post-quantum namespace can be hidden inside a pay-to-script-hash redeem script, which
+    /// the rules refuse once they apply, so a spend that was valid when it was accepted is
+    /// invalid from this height on, without anything about the transaction changing.
+    pub fn is_pq_activation_height(&self, height: Height) -> bool {
+        self.pq_activation_height() == Some(height)
+    }
+
     /// Returns the parameters of this network if it is a Testnet.
     pub fn parameters(&self) -> Option<Arc<Parameters>> {
         if let Self::Testnet(parameters) = self {

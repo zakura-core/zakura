@@ -58,6 +58,24 @@ use super::{check, Request, Verifier};
 #[cfg(test)]
 mod prop;
 
+/// The post-quantum transparent output, once per signature scheme: the file is written
+/// against `crypto` and `PARAMETERS`, so each scheme runs every case.
+#[cfg(feature = "pq")]
+mod pq {
+    mod sha2_128f {
+        use zcash_transparent::pq::sha2_128f as crypto;
+        const PARAMETERS: zcash_transparent::pq::ParameterSet =
+            zcash_transparent::pq::ParameterSet::Sha2_128f;
+        include!("tests/pq.rs");
+    }
+    mod sha2_192s {
+        use zcash_transparent::pq::sha2_192s as crypto;
+        const PARAMETERS: zcash_transparent::pq::ParameterSet =
+            zcash_transparent::pq::ParameterSet::Sha2_192s;
+        include!("tests/pq.rs");
+    }
+}
+
 #[tokio::test]
 async fn cancelled_owned_transaction_verification_keeps_queued_script_charge() {
     use std::task::{Context, Waker};

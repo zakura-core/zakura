@@ -68,6 +68,10 @@ default-release-binaries = ["release_max_level_info", "prometheus", "indexer-rpc
 # because until then a pre-NU7 block with JoinSplits can still need full verification.
 default = ["default-release-binaries", "sprout"]
 
+# Post-quantum transparent output validation and relay, for chains that configure an
+# activation height for it. Public networks are unaffected either way.
+pq = ["zakura-consensus/pq", "zakura-network/pq", "zakura-script/pq", "dep:zcash_transparent", "zcash_transparent/pq"]
+
 # Legacy flags accepted for build compatibility; the progress display is removed.
 progress-bar = ["howudoin", "indicatif", "zakura-consensus/progress-bar", "zakura-state/progress-bar", "zakura-network/progress-bar"]
 howudoin = []
@@ -164,6 +168,7 @@ zakura-rpc = { path = "../zakura-rpc", version = "17.0.0", default-features = fa
 zakura-state = { path = "../zakura-state", version = "16.0.0" }
 zakura-script = { path = "../zakura-script", version = "5.0.5" }
 zcash_script = { workspace = true }
+zcash_transparent = { workspace = true, optional = true }
 
 # Only used to forward arithmetic features through Orchard and Halo 2. Cargo
 # feature unification applies it to the existing transitive dependencies.
@@ -219,6 +224,10 @@ derive-new.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+secp256k1 = { workspace = true }
+# The network identifier the post-quantum signing context is bound to, which the
+# acceptance fixtures need to sign a spend the node will accept.
+zcash_protocol = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true, features = ["display"] }
 criterion = { workspace = true }

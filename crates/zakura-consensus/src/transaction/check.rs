@@ -369,6 +369,54 @@ pub fn disabled_add_to_orchard_pool(
     Ok(())
 }
 
+/// Rejects a transaction that pays to a post-quantum output nothing can spend.
+///
+/// The post-quantum output namespace is wider than the one shape that is defined: it also
+/// covers formats, signature schemes and commitment lengths that no rules exist for. Those
+/// are restricted rather than left alone, because such a script is just three pushes, so
+/// under the legacy rules an empty scriptSig claims whatever it holds. A node applying
+/// these rules therefore refuses them to anyone, and refuses the payment that creates one
+/// as well, while the sender still has the coins — which is the whole reason the format and
+/// scheme sit in the output rather than in a script revealed only at spend time.
+///
+/// This bans nothing that was possible before: an output of a defined format and scheme is
+/// accepted, and so is every ordinary output, coinbase outputs included.
+#[cfg(feature = "pq")]
+pub fn pq_outputs_are_defined(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    use zcash_transparent::pq::output::{classify_created_output, CreatedOutput};
+
+    if !zakura_script::pq_outputs_active(network, height) {
+        return Ok(());
+    }
+
+    for (output_index, output) in tx.outputs().iter().enumerate() {
+        let script = script::Code(output.lock_script.as_raw_bytes().to_vec());
+        if let CreatedOutput::Malformed(error) = classify_created_output(&script) {
+            return Err(TransactionError::RestrictedPqOutput {
+                output_index,
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Accepts every output, because a node built without the `pq` feature never applies the
+/// post-quantum rules and so has no restricted outputs to reject.
+#[cfg(not(feature = "pq"))]
+pub fn pq_outputs_are_defined(
+    _tx: &Transaction,
+    _height: Height,
+    _network: &Network,
+) -> Result<(), TransactionError> {
+    Ok(())
+}
+
 /// Check that a coinbase transaction has no Orchard shielded bundle after NU6.3.
 ///
 /// From NU6.3 onward, shielded coinbase outputs use the Ironwood pool instead
@@ -794,6 +842,18 @@ pub(super) fn count_script_push_ops(script_bytes: &[u8]) -> usize {
 /// Callers must ensure `spent_outputs.len()` matches the number of transparent inputs.
 /// If the lengths differ, `false` is returned.
 pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Output]) -> bool {
+    are_inputs_standard_with_pq(tx, spent_outputs, false)
+}
+
+/// [`are_inputs_standard`], with the post-quantum rules in force or not.
+///
+/// A post-quantum input is counted by the script its output commits to, since the solver
+/// has no template for it and the stack-depth rules below describe the legacy templates.
+fn are_inputs_standard_with_pq(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    pq_active: bool,
+) -> bool {
     if tx.inputs().len() != spent_outputs.len() {
         return false;
     }
@@ -802,6 +862,18 @@ pub fn are_inputs_standard(tx: &Transaction, spent_outputs: &[transparent::Outpu
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
         };
+
+        #[cfg(feature = "pq")]
+        if pq_active {
+            if let Some(body) = authenticated_pq_body(unlock_script, &spent_output.lock_script) {
+                if body.sig_op_count(true) > MAX_P2SH_SIGOPS {
+                    return false;
+                }
+                continue;
+            }
+        }
+        #[cfg(not(feature = "pq"))]
+        let _ = pq_active;
 
         // Step 1: Classify the spent output's scriptPubKey via the zcash_script solver.
         let script_kind = match standard_script_kind(&spent_output.lock_script) {
@@ -885,6 +957,49 @@ pub fn mempool_standard_input_scripts(
     tx: &Transaction,
     spent_outputs: &[transparent::Output],
 ) -> Result<(), TransactionError> {
+    mempool_standard_input_scripts_with_pq(tx, spent_outputs, false)
+}
+
+/// [`mempool_standard_input_scripts`], under the rules in force at this network and height.
+///
+/// A post-quantum input is exempt from the scriptSig size and push-only rules, which are
+/// written for signatures a few dozen bytes long: one post-quantum signature alone is
+/// larger than the standard scriptSig limit. Its own bounds take over — the spend's scanner
+/// requires push-only serialization and caps the input's size — and nothing here verifies
+/// signatures in any case: the verifier still executes every input.
+pub fn mempool_standard_input_scripts_for_network(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    network: &Network,
+    height: Height,
+) -> Result<(), TransactionError> {
+    mempool_standard_input_scripts_with_pq(
+        tx,
+        spent_outputs,
+        zakura_script::pq_outputs_active(network, height),
+    )
+}
+
+/// The script a post-quantum output commits to, when this input reveals exactly that script.
+///
+/// Authentication happens before the body is used, so an input that names the wrong script
+/// gets no policy exemption from it.
+#[cfg(feature = "pq")]
+fn authenticated_pq_body(
+    unlock: &transparent::Script,
+    lock: &transparent::Script,
+) -> Option<script::Code> {
+    let lock = script::Code(lock.as_raw_bytes().to_vec());
+    let output = zcash_transparent::pq::output::parse_output(&lock).ok()??;
+    let spend = output.authenticate_spend(unlock.as_raw_bytes()).ok()?;
+    Some(script::Code(spend.body().to_vec()))
+}
+
+fn mempool_standard_input_scripts_with_pq(
+    tx: &Transaction,
+    spent_outputs: &[transparent::Output],
+    pq_active: bool,
+) -> Result<(), TransactionError> {
     if tx.inputs().len() != spent_outputs.len() {
         return Err(TransactionError::Other(format!(
             "spent_outputs must align with transaction inputs for non-coinbase txs: inputs={}, spent_outputs={}",
@@ -898,6 +1013,14 @@ pub fn mempool_standard_input_scripts(
             transparent::Input::PrevOut { unlock_script, .. } => unlock_script,
             transparent::Input::Coinbase { .. } => continue,
         };
+
+        #[cfg(feature = "pq")]
+        if pq_active
+            && authenticated_pq_body(unlock_script, &spent_outputs[input_index].lock_script)
+                .is_some()
+        {
+            continue;
+        }
 
         // Rule: the scriptSig must be within the standard size limit.
         let size = unlock_script.as_raw_bytes().len();
@@ -913,7 +1036,7 @@ pub fn mempool_standard_input_scripts(
 
     // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
     // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
-    if !are_inputs_standard(tx, spent_outputs) {
+    if !are_inputs_standard_with_pq(tx, spent_outputs, pq_active) {
         return Err(TransactionError::NonStandardInputs);
     }
 

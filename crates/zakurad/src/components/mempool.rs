@@ -386,6 +386,12 @@ fn peer_action(error: &TransactionError) -> PeerAction {
         // cooldown because an honest peer can still be before activation.
         DisabledAddToSproutPool => Cooldown,
 
+        // A post-quantum output nothing can spend. Only a deliberate payment
+        // creates one, but the height the rule starts at is this chain's own
+        // setting, so a peer that has not reached it yet can relay one in good
+        // faith.
+        RestrictedPqOutput { .. } => Cooldown,
+
         // These failures already received no mempool penalty. Preserve that
         // policy when peers disagree about the tip or network upgrade.
         WrongConsensusBranchId | UnsupportedByNetworkUpgrade(..) | ExpiredTransaction { .. } => {
@@ -773,7 +779,7 @@ impl Mempool {
             self.verification_finished.clone(),
         ));
         self.active_state = ActiveState::Enabled {
-            storage: storage::Storage::new(&self.config),
+            storage: storage::Storage::new(&self.config, self.chain_tip_change.network()),
             tx_downloads,
             pending_gossip_tx_ids: HashSet::new(),
             last_seen_tip_hash,

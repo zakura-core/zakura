@@ -9,6 +9,7 @@ use zakura_network::zakura::observe::EventQueue;
 use crate::{
     harness::header_node::{
         adoption::{AdoptionEvidence, WatchRead},
+        authority::AuthorityEvidence,
         capacity::{BoundaryRead, CapacityEvidence},
         chain_effect::ChainEffectEvidence,
         claim::{Claim, ClaimEvidence, SettlementEvidence},
@@ -456,6 +457,85 @@ where
 /// [`STALE_CHAIN_EFFECT_INERT`]'s trigger history: the check applied.
 fn chain_applied<V: ChainView>(view: &V, _: &ObservationLog) -> bool {
     view.chain_effect().any()
+}
+
+/// The node stages, prepares and commits only headers it asked for: each
+/// round's owner is bound to the `Open` the node built for it, and each
+/// staged page belongs to its round's session and subscription and lies
+/// on the requested path.
+pub const COMMIT_ONLY_AUTHORIZED: &str = "header-sync/commit-only-authorized";
+
+/// The claim rules [`COMMIT_ONLY_AUTHORIZED`] reports.
+const AUTHORITY_CLAIMS: [Claim; 3] = [
+    Claim::CommitOnlyAuthorized,
+    Claim::ForeignPage,
+    Claim::UnstagedPage,
+];
+
+/// What the authority check reads: one reactor's claim breaks and when the
+/// check first applied.
+pub trait AuthorityView {
+    /// The claim rules the reactor's tap found broken.
+    fn claims(&self) -> &ClaimEvidence;
+
+    /// When the reactor's authority check first applied.
+    fn authority(&self) -> &AuthorityEvidence;
+}
+
+/// [`COMMIT_ONLY_AUTHORIZED`], as a harness whose view is an
+/// [`AuthorityView`] registers it.
+pub fn commit_only_authorized<S>() -> Property<S>
+where
+    S: HasView,
+    S::View: AuthorityView,
+{
+    Property {
+        id: PropertyId::new(COMMIT_ONLY_AUTHORIZED),
+        claim: "each header round's owner is bound to the Open the node built for it, the node \
+                admits each session under its link's identity, and each staged page belongs to \
+                its round's session and subscription and lies on the path it asked for",
+        kind: Kind::Safety,
+        assumes: &[],
+        needs: &[Source::View],
+        status: Status::Active,
+        check: check_commit_only_authorized::<S>,
+        witness: Some(TriggerHistory::View(authority_applied::<S::View>)),
+    }
+}
+
+/// Checks [`COMMIT_ONLY_AUTHORIZED`] at the boundary after a step.
+///
+/// The tap's authority check ([`crate::harness::header_node::authority`])
+/// judges each `Started` and `PageStaged`, the ledger reports a foreign or
+/// unstaged page, and the session view an admission under another
+/// identity than its link's. A break the step's drain found violates at
+/// once. It applies once a drain found a start, a staged page or an
+/// admission's identity join.
+fn check_commit_only_authorized<S>(cx: &mut CheckCtx<'_, S>) -> Verdict
+where
+    S: HasView,
+    S::View: AuthorityView,
+{
+    let view = cx.view();
+    let step = cx.step;
+    let expected = "the node stages only headers it asked for, under the owner it bound";
+    let mut breaks = view.claims().at(step, &AUTHORITY_CLAIMS).into_iter();
+    if let Some(first) = breaks.next() {
+        for other in breaks {
+            cx.record_violation(expected, other.detail);
+        }
+        return cx.violated(expected, first.detail);
+    }
+    if view.authority().applicable_by(step) {
+        Verdict::Holds
+    } else {
+        Verdict::NotApplicable
+    }
+}
+
+/// [`COMMIT_ONLY_AUTHORIZED`]'s trigger history: the check applied.
+fn authority_applied<V: AuthorityView>(view: &V, _: &ObservationLog) -> bool {
+    view.authority().any()
 }
 
 /// In the wake fixture, a budget return that leaves room for an offer

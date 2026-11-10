@@ -55,6 +55,7 @@ impl Recorder {
                         | ReactorEvent::RoundReleased { .. }
                         | ReactorEvent::BudgetChanged { .. }
                         | ReactorEvent::CreditIssued { .. }
+                        | ReactorEvent::CursorsAccepted { .. }
                         | ReactorEvent::CauseSet { .. }
                         | ReactorEvent::HeadroomWait { .. }
                         | ReactorEvent::CachedPassDeferred { .. }

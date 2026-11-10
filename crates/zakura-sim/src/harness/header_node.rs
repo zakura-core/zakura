@@ -18,6 +18,7 @@
 //! [`capacity::CapacityEvidence`].
 
 pub mod adoption;
+pub mod authority;
 pub mod capacity;
 pub mod chain_effect;
 pub mod claim;
@@ -134,6 +135,11 @@ impl Chain {
         }
         segments.retain(|(_, headers)| !headers.is_empty());
         segments
+    }
+
+    /// The fixture branches its headers are on: 0, and its fork's.
+    pub fn branches(&self) -> impl Iterator<Item = u8> {
+        std::iter::once(0).chain(self.fork.map(|fork| fork.branch))
     }
 
     /// The chain's tip.

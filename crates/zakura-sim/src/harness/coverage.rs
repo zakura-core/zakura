@@ -451,6 +451,14 @@ pub static COVERAGE: &[Coverage] = &[
         bypass: Bypass::Planted("stale-adoption"),
     },
     Coverage {
+        property: super::super::domain::header_sync::COMMIT_ONLY_AUTHORIZED,
+        passing: passes(
+            "tests/header_authority.rs",
+            "every_witness_holds_and_applies",
+        ),
+        bypass: Bypass::Planted("wrong-request"),
+    },
+    Coverage {
         property: super::super::domain::header_sync::WATCH_OBSERVED_UNDER_FLOOD,
         passing: passes(
             "tests/header_flood_watch.rs",

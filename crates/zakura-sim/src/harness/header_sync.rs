@@ -38,6 +38,7 @@ use super::{
     header_node::StartupFacts,
     header_node::{
         adoption::{AdoptionEvidence, SessionLife},
+        authority::AuthorityEvidence,
         capacity::CapacityEvidence,
         chain_effect::ChainEffectEvidence,
         claim::{ClaimEvidence, SettlementEvidence},
@@ -64,9 +65,10 @@ use super::{
 use crate::{
     domain::{
         header_sync::{
-            chunk_budget_bound, reset_invalidates_work, stale_chain_effect_inert,
-            stale_completion_inert, teardown_end_violations, teardown_returns_baseline,
-            AdoptionView, BudgetView, ChainView, ResetView, StaleView, TeardownView, WakeView,
+            chunk_budget_bound, commit_only_authorized, reset_invalidates_work,
+            stale_chain_effect_inert, stale_completion_inert, teardown_end_violations,
+            teardown_returns_baseline, AdoptionView, AuthorityView, BudgetView, ChainView,
+            ResetView, StaleView, TeardownView, WakeView,
         },
         session::{honest_never_punished, HonestPeers},
     },
@@ -579,6 +581,9 @@ pub struct Ports {
     /// When the node's stale-chain check first applied, which its tap
     /// finds during the run.
     pub chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, which its tap finds
+    /// during the run.
+    pub authority: AuthorityEvidence,
     /// The run's recovery, which a `Recover` step starts.
     pub recovery: RecoveryEvidence,
 }
@@ -609,6 +614,8 @@ pub struct Storage {
     round_life: RoundLifeEvidence,
     /// When the node's stale-chain check first applied, from its tap.
     chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, from its tap.
+    authority: AuthorityEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The nodes and links. They live until the run ends, so no reactor sees
@@ -662,6 +669,20 @@ pub struct StorageView {
     pub round_life: RoundLifeEvidence,
     /// When the node's stale-chain check first applied.
     pub chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied.
+    pub authority: AuthorityEvidence,
+}
+
+impl AuthorityView for StorageView {
+    /// [`StorageView::claims`].
+    fn claims(&self) -> &ClaimEvidence {
+        &self.claims
+    }
+
+    /// [`StorageView::authority`].
+    fn authority(&self) -> &AuthorityEvidence {
+        &self.authority
+    }
 }
 
 impl ChainView for StorageView {
@@ -767,6 +788,7 @@ impl HasView for Storage {
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
             chain_effect: self.chain_effect.clone(),
+            authority: self.authority.clone(),
             recovery: self.recovery.clone(),
         }
     }
@@ -903,6 +925,7 @@ impl Subsystem for Storage {
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
+            authority: AuthorityEvidence::default(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -941,6 +964,12 @@ impl Subsystem for Storage {
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
         tap.watch_chain(ports.chain_effect.clone());
+        let branches = scenario
+            .mirrors
+            .iter()
+            .flat_map(|mirror| mirror.chain.branches())
+            .chain(scenario.node.branches());
+        tap.watch_authority(ports.authority.clone(), ports.fixture.clone(), branches, []);
 
         let shutdown = tap.shutdown();
         let attributions = storage.attributions();
@@ -1028,6 +1057,7 @@ impl Subsystem for Storage {
             wake: ports.wake,
             round_life: ports.round_life,
             chain_effect: ports.chain_effect,
+            authority: ports.authority,
             ends,
             stamps,
             faults,
@@ -1210,6 +1240,9 @@ pub struct WirePorts {
     /// When the node's stale-chain check first applied, which its tap
     /// finds during the run.
     pub chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, which its tap finds
+    /// during the run.
+    pub authority: AuthorityEvidence,
 }
 
 impl WirePorts {
@@ -1257,6 +1290,8 @@ pub struct HeaderWire {
     round_life: RoundLifeEvidence,
     /// When the node's stale-chain check first applied, from its tap.
     chain_effect: ChainEffectEvidence,
+    /// When the node's authority check first applied, from its tap.
+    authority: AuthorityEvidence,
     /// Whom the node's storage failures blamed.
     faults: FaultEvidence,
     /// The node's session view, joined to own-9's facts.
@@ -1292,6 +1327,7 @@ impl HasView for HeaderWire {
             stamps: self.stamps.clone(),
             round_life: self.round_life.clone(),
             chain_effect: self.chain_effect.clone(),
+            authority: self.authority.clone(),
             recovery: RecoveryEvidence::default(),
         }
     }
@@ -1401,6 +1437,7 @@ impl Subsystem for HeaderWire {
             ends: EndEvidence::default(),
             round_life: RoundLifeEvidence::default(),
             chain_effect: ChainEffectEvidence::default(),
+            authority: AuthorityEvidence::default(),
         }
     }
 
@@ -1446,6 +1483,18 @@ impl Subsystem for HeaderWire {
         let stamps = tap.stamps();
         tap.watch_rounds(ports.round_life.clone());
         tap.watch_chain(ports.chain_effect.clone());
+        let declared = ports
+            .chains
+            .iter()
+            .flatten()
+            .filter_map(|chain| chain.invalid_link());
+        // Every peer serves an honest chain on branch 0.
+        tap.watch_authority(
+            ports.authority.clone(),
+            ports.fixture.clone(),
+            scenario.node.branches(),
+            declared,
+        );
 
         let attributions = storage.attributions();
         let cooldowns = tap.cooldowns();
@@ -1529,6 +1578,7 @@ impl Subsystem for HeaderWire {
             wake: ports.wake,
             round_life: ports.round_life,
             chain_effect: ports.chain_effect,
+            authority: ports.authority,
             ends,
             stamps,
             faults,
@@ -1726,8 +1776,8 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 /// The storage harness's properties, [`OPERATION_IDS`],
 /// [`DIRECT_DISPATCH`], [`CHUNK_BUDGET_BOUND`],
 /// [`TEARDOWN_RETURNS_BASELINE`], [`STALE_COMPLETION_INERT`],
-/// [`RESET_INVALIDATES_WORK`] and [`STALE_CHAIN_EFFECT_INERT`], all
-/// active. A test harness that wraps [`Storage`] with its view registers
+/// [`RESET_INVALIDATES_WORK`], [`STALE_CHAIN_EFFECT_INERT`] and
+/// [`COMMIT_ONLY_AUTHORIZED`], all active. A test harness that wraps [`Storage`] with its view registers
 /// them too.
 ///
 /// [`CHUNK_BUDGET_BOUND`]: crate::domain::header_sync::CHUNK_BUDGET_BOUND
@@ -1735,6 +1785,7 @@ pub fn wire_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
 /// [`STALE_COMPLETION_INERT`]: crate::domain::header_sync::STALE_COMPLETION_INERT
 /// [`RESET_INVALIDATES_WORK`]: crate::domain::header_sync::RESET_INVALIDATES_WORK
 /// [`STALE_CHAIN_EFFECT_INERT`]: crate::domain::header_sync::STALE_CHAIN_EFFECT_INERT
+/// [`COMMIT_ONLY_AUTHORIZED`]: crate::domain::header_sync::COMMIT_ONLY_AUTHORIZED
 pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> {
     vec![
         Property {
@@ -1763,6 +1814,7 @@ pub fn storage_properties<S: HasView<View = StorageView>>() -> Vec<Property<S>> 
         stale_completion_inert(),
         reset_invalidates_work(),
         stale_chain_effect_inert(),
+        commit_only_authorized(),
     ]
 }
 
@@ -2179,6 +2231,7 @@ mod tests {
                 stamps: Stamps::default(),
                 round_life: RoundLifeEvidence::default(),
                 chain_effect: ChainEffectEvidence::default(),
+                authority: AuthorityEvidence::default(),
                 recovery: RecoveryEvidence::default(),
             }
         }

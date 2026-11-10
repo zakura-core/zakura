@@ -1,0 +1,14 @@
+diff --git a/crates/zakura-network/src/zakura/header_sync/reactor.rs b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+index d72b51d16b..d44a7744a4 100644
+--- a/crates/zakura-network/src/zakura/header_sync/reactor.rs
++++ b/crates/zakura-network/src/zakura/header_sync/reactor.rs
+@@ -2393,7 +2393,8 @@ impl HeaderSyncReactor {
+                 );
+                 let owner = target.scope.bind(
+                     session_id,
+-                    NonZeroU64::new(request_id.get()).expect("header-sync request IDs are nonzero"),
++                    NonZeroU64::new(request_id.get() + 1)
++                        .expect("header-sync request IDs are nonzero"),
+                 );
+                 let started = self.peer_work_queue.start(ActiveHeaderRequest::new(
+                     HeaderTargetPurpose::Normal,

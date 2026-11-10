@@ -104,6 +104,13 @@ pub enum ClaimRule {
     /// A round a new snapshot made obsolete retired while the queue still
     /// held it.
     UnreleasedObsoleteRound,
+    /// A page was staged on a round another session or subscription
+    /// requested.
+    ForeignPage,
+    /// A staged page left its round holding other headers than its earlier
+    /// pages and then its own, in order, or a count that isn't what it
+    /// staged.
+    UnstagedPage,
 }
 
 /// One break of a [`ClaimRule`], with its detail.
@@ -182,7 +189,7 @@ struct StagedHeaders<'a> {
     reserved_left: usize,
     /// The page's header hashes.
     hashes: &'a [block::Hash],
-    /// The hashes the round stored where the page went.
+    /// Every hash the round stored, the page's and its earlier pages'.
     stored: &'a [block::Hash],
     /// How many headers the round held after the page.
     staged_total: usize,
@@ -273,7 +280,9 @@ impl HeaderWorkLedger {
                     self.check_returned(incarnation, &format!("call {call} was handled"));
                 }
             }
-            ReactorEvent::Started { request, purpose } => self.start(request, purpose)?,
+            ReactorEvent::Started {
+                request, purpose, ..
+            } => self.start(request, purpose)?,
             ReactorEvent::Retired {
                 request, reason, ..
             } => {
@@ -348,12 +357,15 @@ impl HeaderWorkLedger {
                     || *from_session != request.session_id
                     || *subscription != request.request_id
                 {
-                    return Err(format!(
-                        "ForeignPage: a page from session {from_session}, subscription \
-                         {subscription} was staged on round {}, which session {} requested as \
-                         {}",
-                        request.incarnation, request.session_id, request.request_id
-                    ));
+                    self.claims.push(ClaimBreak {
+                        rule: ClaimRule::ForeignPage,
+                        detail: format!(
+                            "ForeignPage: a page from session {from_session}, subscription \
+                             {subscription} was staged on round {}, which session {} requested \
+                             as {}",
+                            request.incarnation, request.session_id, request.request_id
+                        ),
+                    });
                 }
                 self.stage(
                     *reservation,
@@ -808,15 +820,21 @@ impl HeaderWorkLedger {
             .get_mut(&request.incarnation)
             .expect("the round was found above");
         round.staged += headers;
-        round.hashes.extend_from_slice(stored);
-        if hashes.len() != headers || stored != hashes || staged_total != round.staged {
-            return Err(format!(
+        let before = std::mem::replace(&mut round.hashes, stored.to_vec());
+        let kept = stored.get(..before.len()) == Some(&before[..]);
+        let added = stored.get(before.len()..) == Some(hashes);
+        if hashes.len() != headers || !kept || !added || staged_total != round.staged {
+            let detail = format!(
                 "UnstagedPage: a page of {headers} headers with {} hashes left round {} \
                  holding {staged_total} of the {} it staged, or holding other headers",
                 hashes.len(),
                 request.incarnation,
                 round.staged
-            ));
+            );
+            self.claims.push(ClaimBreak {
+                rule: ClaimRule::UnstagedPage,
+                detail,
+            });
         }
         Ok(())
     }
@@ -1194,6 +1212,7 @@ mod tests {
         ReactorEvent::Started {
             request: request(byte, incarnation),
             purpose: crate::zakura::header_sync::HeaderTargetPurpose::Normal,
+            locator: Vec::new(),
         }
     }
 
@@ -1248,8 +1267,9 @@ mod tests {
             frame: None,
             headers,
             reserved_left: left,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; headers],
-            stored: vec![TIP; headers],
+            stored: vec![TIP; total],
             staged_total: total,
         }
     }
@@ -1673,11 +1693,12 @@ mod tests {
             frame: None,
             headers: 2,
             reserved_left: 3,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; 2],
             stored: vec![TIP; 2],
             staged_total: 2,
         });
-        refused_as(foreign, "ForeignPage");
+        claimed_as(foreign, ClaimRule::ForeignPage);
         let mut over = base.clone();
         over.push(staged(1, 1, 1, 6, 0, 6));
         refused_as(over, "OverReservation");
@@ -1897,6 +1918,7 @@ mod tests {
                 selected_target: zakura_header_chain::Frontier::new(block::Height(5), TIP),
                 repair_generation: 1,
             },
+            locator: Vec::new(),
         };
         fold(vec![repair(401), bound_to(401), repairing.clone()])
             .expect("a repair may reserve its whole request");
@@ -1944,6 +1966,7 @@ mod tests {
             frame: None,
             headers: 2,
             reserved_left: 3,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; 2],
             stored: vec![TIP; 2],
             staged_total: 2,
@@ -1969,6 +1992,7 @@ mod tests {
                 ReactorEvent::Started {
                     request: changed,
                     purpose: crate::zakura::header_sync::HeaderTargetPurpose::Normal,
+                    locator: Vec::new(),
                 },
             ],
             "UnreservedStart",
@@ -2082,22 +2106,23 @@ mod tests {
     }
 
     /// A staging report must show its page in the round: one whose policy
-    /// holds fewer headers than the round staged fails.
+    /// holds fewer headers than the round staged is a claim break.
     #[test]
     fn a_staged_page_is_in_its_round() {
-        refused_as(
+        claimed_as(
             vec![
                 opened(1, 1, 5),
                 bound(1, 1, 1),
                 started(1, 1),
                 staged(1, 1, 1, 3, 2, 0),
             ],
-            "UnstagedPage",
+            ClaimRule::UnstagedPage,
         );
     }
 
-    /// A page whose round stored other headers where it went fails, and so
-    /// does a call holding a lease staged for another round.
+    /// A page whose round stored other headers where it went fails, as does
+    /// one that left an earlier page's header changed, and so does a call
+    /// holding a lease staged for another round.
     #[test]
     fn a_round_stores_its_pages_and_holds_its_own_leases() {
         let base = vec![opened(1, 1, 5), bound(1, 1, 1), started(1, 1)];
@@ -2111,11 +2136,31 @@ mod tests {
             frame: None,
             headers: 2,
             reserved_left: 3,
+            ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
             hashes: vec![TIP; 2],
             stored: vec![TIP, block::Hash([8; 32])],
             staged_total: 2,
         });
-        refused_as(misstored, "UnstagedPage");
+        claimed_as(misstored, ClaimRule::UnstagedPage);
+        let mut rewritten = base.clone();
+        rewritten.extend([
+            staged(1, 1, 1, 2, 3, 2),
+            ReactorEvent::PageStaged {
+                from_peer: peer(1),
+                from_session: 1,
+                request: request(1, 1),
+                reservation: 1,
+                subscription: 1,
+                frame: None,
+                headers: 1,
+                reserved_left: 2,
+                ancestor: zakura_header_chain::Frontier::new(block::Height(0), TIP),
+                hashes: vec![TIP],
+                stored: vec![TIP, block::Hash([8; 32]), TIP],
+                staged_total: 3,
+            },
+        ]);
+        claimed_as(rewritten, ClaimRule::UnstagedPage);
         let mut foreign = base;
         foreign.extend([
             staged(1, 1, 1, 3, 2, 3),

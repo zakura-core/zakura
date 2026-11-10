@@ -87,6 +87,7 @@ use std::{
     time::Duration,
 };
 
+use zakura_chain::block;
 use zakura_network::zakura::{
     observe::{
         CallEnd, ClaimBreak, HeaderResourceProbe, HeaderSyncObserver, HeaderTargetPhase,
@@ -97,10 +98,11 @@ use zakura_network::zakura::{
 };
 use zakura_rt::sim::RunId;
 use zakura_scheduler::{SimInstant, TaskExit, TaskId};
-use zakura_storage::header::controlled::ControlledPort;
+use zakura_storage::header::{controlled::ControlledPort, fixture::HeaderFixture};
 
 use super::{
     adoption::{AdoptionEvidence, AdoptionFact},
+    authority::{Authority, AuthorityEvidence},
     capacity::{self, BoundaryRead, CapacityEvidence, CapacityReading, Expected, Limits},
     chain_effect::{ChainEffect, ChainEffectEvidence, EngineAt},
     claim::{Claim, ClaimEvidence, ClaimRecord, Settlement, SettlementEvidence},
@@ -206,6 +208,9 @@ struct TapState {
     /// Checks that no stale apply changes the engine and adoption never
     /// moves back. None until [`ReactorTap::watch_chain`].
     chain_effect: Mutex<Option<ChainEffect>>,
+    /// Checks rounds' owner binding and pages' paths. None until
+    /// [`ReactorTap::watch_authority`].
+    authority: Mutex<Option<Authority>>,
 }
 
 /// The resource probe a tap was handed.
@@ -324,6 +329,26 @@ impl TapState {
             self.claims.record(ClaimRecord {
                 step,
                 claim: Claim::StaleChainEffect,
+                detail,
+            });
+        }
+        let mut authorized = self.sessions.take_claims();
+        let joined = self.sessions.take_joined();
+        if let Some(authority) = self
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            if joined {
+                authority.applies();
+            }
+            authorized.extend(authority.drain(step));
+        }
+        for detail in authorized {
+            self.claims.record(ClaimRecord {
+                step,
+                claim: Claim::CommitOnlyAuthorized,
                 detail,
             });
         }
@@ -626,6 +651,14 @@ impl TapState {
             {
                 chain.observe(&event, on_reactor);
             }
+            if let Some(authority) = state
+                .authority
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                authority.observe(&event, on_reactor);
+            }
             if on_reactor {
                 let now = zakura_scheduler::hooks::now().unwrap_or_default();
                 state
@@ -636,9 +669,9 @@ impl TapState {
             }
         }
         // Budget changes, credit, causes, headroom waits, deferred passes,
-        // taken events, watch reads and the queue's slots stay out of the
-        // log, whose format pinned Plans fix, and a teardown's returns after
-        // the run are expected.
+        // taken events, watch reads, the queue's slots and cursor
+        // acceptances stay out of the log, whose format pinned Plans fix,
+        // and a teardown's returns after the run are expected.
         if matches!(
             event,
             ReactorEvent::BudgetChanged { .. }
@@ -649,6 +682,7 @@ impl TapState {
                 | ReactorEvent::EventTaken { .. }
                 | ReactorEvent::WatchObserved { .. }
                 | ReactorEvent::Slots { .. }
+                | ReactorEvent::CursorsAccepted { .. }
         ) {
             if let (true, ReactorEvent::HeadroomWait { peer, .. }) = (in_run, &event) {
                 state
@@ -916,6 +950,7 @@ impl ReactorTap {
                 wake: Mutex::new(WakeCheck::new(WakeEvidence::default(), wake_sessions)),
                 round_life: Mutex::default(),
                 chain_effect: Mutex::default(),
+                authority: Mutex::default(),
             }))
         });
         let state = observer.0.clone();
@@ -1044,6 +1079,26 @@ impl ReactorTap {
             .chain_effect
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(ChainEffect::new(evidence, engine));
+    }
+
+    /// Checks from now on that each round's owner is bound to its `Open`
+    /// and each staged page lies on its requested path among `fixture`'s
+    /// headers on `branches` and the scenario's `declared` `(parent,
+    /// header)` hash pairs, as [`super::authority`] describes, keeping when
+    /// the check applied in `evidence`. Call it before the run starts.
+    pub fn watch_authority(
+        &self,
+        evidence: AuthorityEvidence,
+        fixture: HeaderFixture,
+        branches: impl IntoIterator<Item = u8>,
+        declared: impl IntoIterator<Item = (block::Hash, block::Hash)>,
+    ) {
+        *self
+            .state
+            .authority
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Authority::new(evidence, fixture, branches, declared));
     }
 
     /// The node's stamps, which every fact the tap and the harness keep
@@ -1396,6 +1451,7 @@ fn fact(event: ReactorEvent) -> Result<ReactorFact, String> {
         ReactorEvent::Started {
             request: started,
             purpose: why,
+            ..
         } => ReactorFact::Started {
             request: request(started),
             purpose: purpose(why),

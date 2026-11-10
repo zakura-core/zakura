@@ -306,6 +306,7 @@ impl HasView for Planted {
             stamps: Default::default(),
             round_life: Default::default(),
             chain_effect: Default::default(),
+            authority: Default::default(),
             recovery: Default::default(),
         }
     }

@@ -388,10 +388,12 @@ fn result(result: &ResultIdentity) -> StorageResult {
         ResultIdentity::PortError => StorageResult::PortError,
         ResultIdentity::Locator {
             tip,
+            hashes,
             header_generation,
             finalized,
         } => StorageResult::Locator {
             tip: point(*tip),
+            hashes: hashes.iter().map(|each| hash(*each)).collect(),
             header_generation: header_generation.get(),
             finalized: point(*finalized),
         },

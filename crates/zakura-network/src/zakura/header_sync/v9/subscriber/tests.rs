@@ -1145,8 +1145,10 @@ impl HeaderSyncObserver for Recorded {
 }
 
 /// An observed subscriber reports each credit it gives as it records it,
-/// with its peer, session and subscription: the `Open`'s whole window, a
-/// grant through acceptance, and a grant through `grant_due`.
+/// with its peer, session and subscription, the update exactly as it built
+/// it and its target's height: the `Open`'s whole window, a grant through
+/// acceptance, and a grant through `grant_due`. Each acceptance reports the
+/// cursor it accepted through, before any grant it makes due.
 #[test]
 fn observed_credit_reports_each_open_and_grant() {
     let (tree, chain) = chain(20);
@@ -1168,7 +1170,23 @@ fn observed_credit_reports_each_open_and_grant() {
         target: chain[20],
         schema: AuxSchema::None,
     };
-    let mut grants = vec![(CreditKind::Open, open.added_credit)];
+    let credit = |kind, message: SubscribeHeaders| ReactorEvent::CreditIssued {
+        kind,
+        peer: peer.clone(),
+        session_id: 7,
+        subscription: id,
+        objects: message.added_credit.objects,
+        bytes: message.added_credit.bytes,
+        update: Box::new(message),
+        target_height: chain[20].height,
+    };
+    let accepted = |through: &Cursor| ReactorEvent::CursorsAccepted {
+        peer: peer.clone(),
+        session_id: 7,
+        subscription: id,
+        through: Frontier::new(through.height, through.hash),
+    };
+    let mut expected = vec![credit(CreditKind::Open, open)];
     let cursors: Vec<_> = (1..=8)
         .map(|height| {
             fixture
@@ -1182,23 +1200,14 @@ fn observed_credit_reports_each_open_and_grant() {
         .accept_through(id, &cursors[3], 8)
         .expect("a received cursor")
         .expect("four headers reach the prefix");
-    grants.push((CreditKind::Grant, grant.added_credit));
+    expected.push(accepted(&cursors[3]));
+    expected.push(credit(CreditKind::Grant, grant));
     assert_eq!(fixture.sub.accept_through(id, &cursors[7], 2), Ok(None));
+    expected.push(accepted(&cursors[7]));
     let grant = fixture.sub.grant_due(8).expect("a larger budget refills");
-    grants.push((CreditKind::Grant, grant.added_credit));
+    expected.push(credit(CreditKind::Grant, grant));
 
     let reported: Vec<_> = std::mem::take(&mut *recorded.0.lock().expect("unpoisoned"));
-    let expected: Vec<_> = grants
-        .into_iter()
-        .map(|(kind, credit)| ReactorEvent::CreditIssued {
-            kind,
-            peer: peer.clone(),
-            session_id: 7,
-            subscription: id,
-            objects: credit.objects,
-            bytes: credit.bytes,
-        })
-        .collect();
     assert_eq!(reported, expected);
 }
 

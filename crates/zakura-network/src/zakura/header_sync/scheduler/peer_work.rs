@@ -788,7 +788,7 @@ impl PeerWorkQueue {
         }
         self.policy.stage_page(peer, ancestor, entries, cursor);
         #[cfg(any(test, zakura_sim))]
-        self.report_staged(peer, hashes);
+        self.report_staged(peer, ancestor, hashes);
         debug_assert_eq!(
             self.owned_header_count(peer),
             self.policy
@@ -1072,20 +1072,17 @@ impl PeerWorkQueue {
 /// The queue's reports to its observer.
 #[cfg(any(test, zakura_sim))]
 impl PeerWorkQueue {
-    /// Report the page staged last, with its `hashes` and the headers its
-    /// round now holds, as the policy has it. Its spent reservation's end
-    /// reports after.
-    fn report_staged(&mut self, peer: &ZakuraPeerId, hashes: Vec<block::Hash>) {
+    /// Report the page staged last, with the `ancestor` it declared, its
+    /// `hashes` and the headers its round now holds, as the policy has it.
+    /// Its spent reservation's end reports after.
+    fn report_staged(&mut self, peer: &ZakuraPeerId, ancestor: Frontier, hashes: Vec<block::Hash>) {
         if let Some(staged) = self.observing.staged.take() {
             let entries = self
                 .policy
                 .active(peer)
                 .map_or(&[][..], |active| &active.entries[..]);
             let staged_total = entries.len();
-            let stored = entries[staged_total.saturating_sub(staged.headers)..]
-                .iter()
-                .map(|entry| entry.header.hash())
-                .collect();
+            let stored = entries.iter().map(|entry| entry.header.hash()).collect();
             staged.observer.observe(ReactorEvent::PageStaged {
                 from_peer: staged.arrival.from_peer,
                 from_session: staged.arrival.from_session,
@@ -1095,6 +1092,7 @@ impl PeerWorkQueue {
                 frame: staged.arrival.frame,
                 headers: staged.headers,
                 reserved_left: staged.reserved_left,
+                ancestor,
                 hashes,
                 stored,
                 staged_total,
@@ -2056,7 +2054,7 @@ mod tests {
             }]
         );
 
-        let staged = |hashes: Vec<block::Hash>, reserved_left, staged_total, frame| {
+        let staged = |hashes: Vec<block::Hash>, stored, reserved_left, staged_total, frame| {
             ReactorEvent::PageStaged {
                 from_peer: peer(1),
                 from_session: 7,
@@ -2066,7 +2064,8 @@ mod tests {
                 frame: Some(frame),
                 headers: hashes.len(),
                 reserved_left,
-                stored: hashes.clone(),
+                ancestor: snapshot().frontiers.finalized,
+                stored,
                 hashes,
                 staged_total,
             }
@@ -2080,7 +2079,7 @@ mod tests {
             recorder.take(),
             [
                 changed(BudgetOwner::Reservation(1), -2, 2),
-                staged(vec![first, second], 1, 2, 9),
+                staged(vec![first, second], vec![first, second], 1, 2, 9),
             ]
         );
 
@@ -2090,7 +2089,7 @@ mod tests {
             recorder.take(),
             [
                 changed(BudgetOwner::Reservation(1), -1, 1),
-                staged(vec![third], 0, 3, 10),
+                staged(vec![third], vec![first, second, third], 0, 3, 10),
                 ReactorEvent::ReservationEnded {
                     reservation: 1,
                     released: 0,

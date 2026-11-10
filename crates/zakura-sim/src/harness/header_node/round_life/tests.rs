@@ -18,6 +18,10 @@ use crate::observe::StoragePoint;
 /// The anchor every authority here names.
 const ANCHOR: block::Hash = block::Hash([1; 32]);
 
+/// The one entry of every locator read here, and of every new round's
+/// locator.
+const LOCATED: block::Hash = block::Hash([5; 32]);
+
 /// The mirror's peer ID.
 fn mirror() -> ZakuraPeerId {
     ZakuraPeerId::new(vec![2; 32]).expect("32 bytes is a valid peer ID")
@@ -86,6 +90,49 @@ fn started(incarnation: u64, generation: u64) -> ReactorEvent {
             target_tip_hash: block::Hash([3; 32]),
         },
         purpose: HeaderTargetPurpose::Normal,
+        locator: vec![LOCATED],
+    }
+}
+
+/// The subscriber's `Open` of the mirror's subscription 1 on session 7.
+fn open() -> ReactorEvent {
+    use zakura_network::zakura::v9::{Cursor, Operation, SubscribeHeaders};
+    ReactorEvent::CreditIssued {
+        kind: CreditKind::Open,
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        objects: 1,
+        bytes: 1,
+        update: Box::new(SubscribeHeaders {
+            operation: Operation::Open,
+            subscription_id: 1,
+            update_sequence: 0,
+            initial_target_tip_hash: block::Hash([3; 32]),
+            acknowledged: Cursor {
+                height: block::Height(0),
+                hash: LOCATED,
+                headers: 0,
+                bytes: 0,
+            },
+            locator_hashes: vec![LOCATED],
+            added_credit: zakura_network::zakura::Credit {
+                objects: 1,
+                bytes: 1,
+            },
+            tree_aux_schema: zakura_network::zakura::AuxSchema::None,
+        }),
+        target_height: block::Height(3),
+    }
+}
+
+/// The subscriber's acceptance of subscription 1's cursors through `hash`.
+fn accepted(hash: block::Hash) -> ReactorEvent {
+    ReactorEvent::CursorsAccepted {
+        peer: mirror(),
+        session_id: 7,
+        subscription: 1,
+        through: Frontier::new(block::Height(1), hash),
     }
 }
 
@@ -143,6 +190,7 @@ fn read(id: u64, generation: u64) -> StorageFact {
         outcome: "engine".to_owned(),
         result: StorageResult::Locator {
             tip: point.clone(),
+            hashes: vec![crate::storage::hash(LOCATED)],
             header_generation: generation,
             finalized: point,
         },
@@ -167,7 +215,7 @@ fn breaks(facts: &[StorageFact], events: &[ReactorEvent]) -> (Vec<String>, Round
     let evidence = RoundLifeEvidence::default();
     let mut check = RoundLife::new(evidence.clone(), 1);
     check.storage(facts, 1);
-    for event in events {
+    for event in std::iter::once(&open()).chain(events) {
         check.observe(event, true);
     }
     let breaks = check.drain(1).expect("no evidence is missing");
@@ -397,4 +445,66 @@ fn a_rewritten_anchor_does_not_hide_an_old_generation() {
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(found[0].contains("dispatched round 1's apply"), "{found:?}");
     assert!(found[1].contains("owner holds generation 0"), "{found:?}");
+}
+
+/// A round on a new `Open` hands on exactly its read's hashes, and one that
+/// hands on another locator breaks. A resumed round on the same
+/// subscription hands on one entry of its read, the subscription's last
+/// accepted cursor, and one that hands on any other entry breaks.
+#[test]
+fn a_round_hands_on_its_reads_locator() {
+    let start = |locator: Vec<block::Hash>, incarnation| {
+        let mut event = started(incarnation, 1);
+        if let ReactorEvent::Started {
+            locator: handed, ..
+        } = &mut event
+        {
+            *handed = locator;
+        }
+        event
+    };
+    let new_open = |locator| {
+        vec![
+            adopted(1),
+            locator_call(1),
+            cause(ReactorCause::Completion { call: 1 }),
+            start(locator, 1),
+        ]
+    };
+    assert_eq!(
+        breaks(&[submitted(1, 1), read(1, 1)], &new_open(vec![LOCATED])).0,
+        Vec::<String>::new()
+    );
+    let swapped = breaks(
+        &[submitted(1, 1), read(1, 1)],
+        &new_open(vec![block::Hash([6; 32])]),
+    )
+    .0;
+    assert!(swapped[0].contains("not its read's"), "{swapped:?}");
+
+    let resumed = |through, locator| {
+        let mut events = new_open(vec![LOCATED]);
+        events.extend([
+            accepted(through),
+            locator_call(2),
+            cause(ReactorCause::Completion { call: 2 }),
+            start(locator, 2),
+        ]);
+        events
+    };
+    let facts = [submitted(1, 1), read(1, 1), submitted(2, 2), read(2, 1)];
+    assert_eq!(
+        breaks(&facts, &resumed(LOCATED, vec![LOCATED])).0,
+        Vec::<String>::new()
+    );
+    let older = breaks(&facts, &resumed(block::Hash([6; 32]), vec![LOCATED])).0;
+    assert!(
+        older[0].contains("not its subscription's last accepted cursor"),
+        "{older:?}"
+    );
+}
+
+/// Locator call `call`, dispatched under generation 1.
+fn locator_call(call: u64) -> ReactorEvent {
+    locator(call, 1)
 }
